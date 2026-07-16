@@ -1,0 +1,41 @@
+[submodule "3rdparty/SDL2"]
+	path = 3rdparty/SDL2
+	url = https://github.com/libsdl-org/SDL.git
+	branch = SDL2
+[submodule "3rdparty/magic_enum"]
+	path = 3rdparty/magic_enum
+	url = https://github.com/Neargye/magic_enum.git
+[submodule "3rdparty/xxHash"]
+	path = 3rdparty/xxHash
+	url = https://github.com/Cyan4973/xxHash.git
+[submodule "3rdparty/Vulkan-Headers"]
+	path = 3rdparty/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "3rdparty/SPIRV-Tools"]
+	path = 3rdparty/SPIRV-Tools
+	url = https://github.com/KhronosGroup/SPIRV-Tools.git
+[submodule "3rdparty/SPIRV-Headers"]
+	path = 3rdparty/SPIRV-Headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git
+[submodule "3rdparty/VulkanMemoryAllocator"]
+	path = 3rdparty/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "3rdparty/ffmpeg-core"]
+	path = 3rdparty/ffmpeg-core
+	url = https://github.com/shadps4-emu/ext-ffmpeg-core.git
+	shallow = true
+[submodule "3rdparty/fmt"]
+	path = 3rdparty/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "3rdparty/tracy"]
+	path = 3rdparty/tracy
+	url = https://github.com/wolfpld/tracy.git
+[submodule "3rdparty/spdlog"]
+	path = 3rdparty/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "3rdparty/LibAtrac9"]
+	path = 3rdparty/LibAtrac9
+	url = https://github.com/shadps4-emu/ext-LibAtrac9.git
+[submodule "3rdparty/nlohmann_json"]
+	path = 3rdparty/nlohmann_json
+	url = https://github.com/nlohmann/json.git

@@ -1,0 +1,37 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug launcher UI",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\_Build\\vscode-clang\\launcher\\launcher.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}\\_Build\\vscode-clang\\launcher",
+            "environment": [],
+            "externalConsole": false
+        },
+        {
+            "name": "Debug kyty_emulator",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\_Build\\vscode-clang\\kyty_emulator.exe",
+            "args": [
+                "--game", "D:/gamesps5/PPSA07429",
+                "--printf-direction", "File",
+                "--graphics-debug-dump", "True"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}\\_Build\\vscode-clang",
+            "environment": [],
+            "externalConsole": true
+        },
+        {
+            "name": "Attach to running kyty_emulator",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processId": "${command:pickProcess}"
+        }
+    ]
+}

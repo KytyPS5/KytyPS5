@@ -1,0 +1,8 @@
+#message("${GIT_EXECUTABLE}")
+if(GIT_EXECUTABLE)
+	execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always OUTPUT_VARIABLE KYTY_GIT_VERSION)
+else()
+	set(KYTY_GIT_VERSION "unknown")
+endif()
+string(STRIP ${KYTY_GIT_VERSION} KYTY_GIT_VERSION)
+configure_file(${INPUT_FILE} ${OUTPUT_FILE})

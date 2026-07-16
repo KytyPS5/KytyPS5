@@ -1,0 +1,16 @@
+﻿{
+    "cmake.sourceDirectory": "${workspaceFolder}/src",
+    "cmake.buildDirectory": "${workspaceFolder}/_Build/vscode-clang",
+    "cmake.generator": "Ninja",
+    "cmake.environment": {
+        "CC": "clang-cl",
+        "CXX": "clang-cl",
+        "PATH": "${env:ProgramFiles}/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin;${env:ProgramFiles}/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja;${env:PATH}"
+    },
+    "cmake.configureSettings": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.0/msvc2022_64"
+    }
+}
+

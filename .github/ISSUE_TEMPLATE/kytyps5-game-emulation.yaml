@@ -1,0 +1,156 @@
+name: Game Emulation Bug Report
+description: Report KytyPS5 game boot, crash, freeze, rendering, audio, input, or gameplay behavior problems.
+title: "[GAME BUG]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Quick checks
+
+        Before submitting, please:
+        - Search existing issues first.
+        - Re-test with a clean game dump.
+        - Attach the complete log file instead of edited snippets.
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Game and build
+
+  - type: input
+    id: game-title
+    attributes:
+      label: Game title
+      description: Use the full title shown by the game or launcher.
+      placeholder: "Example: Astro Bot"
+    validations:
+      required: true
+
+  - type: input
+    id: game-id
+    attributes:
+      label: Game ID / serial
+      description: Enter the ID or serial when available. If you cannot find it, write "Unknown".
+      placeholder: "Example: PPSA12345 or Unknown"
+    validations:
+      required: true
+
+  - type: input
+    id: kyty-version
+    attributes:
+      label: KytyPS5 version
+      description: Include the exact build you tested so the report can be matched to the right code.
+      placeholder: "Example: v0.0.1"
+    validations:
+      required: true
+
+  - type: input
+    id: regression-builds
+    attributes:
+      label: Last working build / first broken build
+      description: Optional. Fill this in if the same game worked in an older KytyPS5 build.
+      placeholder: "Example: last worked in v0.0.1, first broke in v0.0.1"
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Problem details
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the failure or incorrect behavior as directly as possible.
+      placeholder: "Example: The game reaches the main menu, then freezes after selecting Continue."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the shortest path that triggers the problem from a fresh KytyPS5 start.
+      placeholder: |
+        1. Open KytyPS5.
+        2. Boot the game.
+        3. Select ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: Explain what should happen at the same point in the game.
+      placeholder: "Example: The save should load and gameplay should continue normally."
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Host system
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Include the operating system name, version, and edition when useful.
+      placeholder: "Example: Windows 11 Pro 25H2"
+    validations:
+      required: true
+
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: Include the exact processor model.
+      placeholder: "Example: AMD Ryzen 9 9950X3D"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Include the graphics card model and driver version when available.
+      placeholder: "Example: NVIDIA GeForce RTX 5080, driver 576.80"
+    validations:
+      required: true
+
+  - type: input
+    id: ram-vram
+    attributes:
+      label: RAM / VRAM
+      description: Include both system memory and video memory.
+      placeholder: "Example: 64 GB DDR5 RAM / 16 GB VRAM"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Evidence
+
+  - type: textarea
+    id: log-file
+    attributes:
+      label: Log file upload
+      description: Drag the full KytyPS5 log (_kyty.txt) into this box, or link to the complete unmodified file.
+      placeholder: "Attach the full log file here."
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots-video
+    attributes:
+      label: Screenshots/video
+      description: Optional. Add images or footage when the problem is visible or audible.
+      placeholder: "Drag and drop media here, or paste links."
+
+  - type: textarea
+    id: extra-notes
+    attributes:
+      label: Extra notes
+      description: Optional. Add settings, unusual hardware details, or anything else that may help.
+      placeholder: "Any extra context goes here."

@@ -30,17 +30,28 @@ graphical glitches, low compatibility, and poor performance.
 
 ## Screenshots
 
-| Disgaea 6 | Asterix & Obelix XXXL |
-| --- | --- |
-| <img src="docs/screenshots/ps5-01.png" width="300" alt="Disgaea 6 running in KytyPS5"> | <img src="docs/screenshots/ps5-02.png" width="300" alt="Asterix & Obelix XXXL running in KytyPS5"> |
-
-| Dreaming Sarah | Minecraft Legends |
-| --- | --- |
-| <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5"> | <img src="docs/screenshots/ps5-04.png" width="300" alt="Minecraft Legends running in KytyPS5"> |
-
-| SILENT HILL: The Short Message |
-| --- |
-| <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5"> |
+<table align="center">
+  <tr>
+    <td align="center">
+      <strong>Disgaea 6</strong><br>
+      <img src="docs/screenshots/ps5-01.png" width="300" alt="Disgaea 6 running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>Dreaming Sarah</strong><br>
+      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>Minecraft Legends</strong><br>
+      <img src="docs/screenshots/ps5-04.png" width="300" alt="Minecraft Legends running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>SILENT HILL: The Short Message</strong><br>
+      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
+    </td>
+  </tr>
+</table>
 
 ## Contributing
 

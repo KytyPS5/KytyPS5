@@ -247,7 +247,15 @@ static VulkanQueues VulkanFindQueues(VkPhysicalDevice device, VkSurfaceKHR surfa
 	}
 
 	select_queues(transfer_num, [](const auto& q) { return q.transfer; }, qs.transfer);
+	if (transfer_num != 0 && qs.transfer.empty() && !qs.graphics.empty() &&
+	    qs.graphics.front().transfer) {
+		qs.transfer.push_back(qs.graphics.front());
+	}
 	select_queues(present_num, [](const auto& q) { return q.present; }, qs.present);
+	if (present_num != 0 && qs.present.empty() && !qs.graphics.empty() &&
+	    qs.graphics.front().present) {
+		qs.present.push_back(qs.graphics.front());
+	}
 
 	return qs;
 }
@@ -370,11 +378,6 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 			LOGF("shaderStorageImageWriteWithoutFormat is not supported\n");
 			skip_device = true;
 		}
-		if (device_features2.features.shaderStorageImageReadWithoutFormat != VK_TRUE) {
-			LOGF("shaderStorageImageReadWithoutFormat is not supported\n");
-			skip_device = true;
-		}
-
 		if (device_features2.features.shaderImageGatherExtended != VK_TRUE) {
 			LOGF("shaderImageGatherExtended is not supported\n");
 			skip_device = true;
@@ -640,7 +643,6 @@ static VkDevice VulkanCreateDevice(VkPhysicalDevice physical_device, VkSurfaceKH
 	device_features.robustBufferAccess                   = VK_TRUE;
 	device_features.depthBounds                          = VK_TRUE;
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-	device_features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
@@ -909,7 +911,19 @@ static void VulkanCreateQueues(GraphicContext* ctx, const VulkanQueues& queues) 
 	ctx->queues[GraphicContext::QUEUE_UTIL].mutex = ctx->queues[GraphicContext::QUEUE_GFX].mutex;
 	LOGF("Vulkan queue: using graphics queue for utility submissions to preserve resource "
 	     "ordering\n");
-	get_queue(GraphicContext::QUEUE_PRESENT, queues.present[0], true);
+	if (queues.present[0].family == queues.graphics[0].family &&
+	    queues.present[0].index == queues.graphics[0].index) {
+		ctx->queues[GraphicContext::QUEUE_PRESENT].family =
+		    ctx->queues[GraphicContext::QUEUE_GFX].family;
+		ctx->queues[GraphicContext::QUEUE_PRESENT].index =
+		    ctx->queues[GraphicContext::QUEUE_GFX].index;
+		ctx->queues[GraphicContext::QUEUE_PRESENT].vk_queue =
+		    ctx->queues[GraphicContext::QUEUE_GFX].vk_queue;
+		ctx->queues[GraphicContext::QUEUE_PRESENT].mutex =
+		    ctx->queues[GraphicContext::QUEUE_GFX].mutex;
+	} else {
+		get_queue(GraphicContext::QUEUE_PRESENT, queues.present[0], true);
+	}
 
 	for (int id = 0; id < GraphicContext::QUEUE_COMPUTE_NUM; id++) {
 		bool with_mutex = (GraphicContext::QUEUE_COMPUTE_NUM == queues.compute.size());

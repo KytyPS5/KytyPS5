@@ -2455,9 +2455,6 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == VK_TRUE,
             "shaderStorageImageWriteWithoutFormat is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderStorageImageReadWithoutFormat == VK_TRUE,
-            "shaderStorageImageReadWithoutFormat is not supported");
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info{};
@@ -2472,7 +2469,6 @@ private:
     device_info.pQueueCreateInfos = &queue_info;
     VkPhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    device_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     device_info.pEnabledFeatures = &device_features;
     RequireVk(
         "VulkanHarness", "dispatch",
@@ -8320,9 +8316,8 @@ TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
   test.storage_image_dwords_per_pixel = 1;
   test.storage_image_rgba = std::vector<u32>(16, 0);
   test.expected_storage_image_rgba = expected_image;
-  test.required_spirv = {"OpCapability StorageImageReadWithoutFormat",
-                         "OpCapability StorageImageWriteWithoutFormat"};
-  test.forbidden_spirv = {"Rgba32f"};
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat"};
+  test.forbidden_spirv = {"OpCapability StorageImageReadWithoutFormat", "Rgba32f"};
   return test;
 }
 

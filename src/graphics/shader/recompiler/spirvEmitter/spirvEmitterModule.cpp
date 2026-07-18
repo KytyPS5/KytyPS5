@@ -497,7 +497,6 @@ void EmitHeaderAndTypes(EmitterState* state) {
 	}
 	if (state->storage_image_variable != 0 || state->storage_image_2d_array_variable != 0 ||
 	    state->storage_image_3d_variable != 0) {
-		state->builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
 		state->builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
 	}
 	if (state->needs_subgroup_ballot || state->needs_subgroup_shuffle ||

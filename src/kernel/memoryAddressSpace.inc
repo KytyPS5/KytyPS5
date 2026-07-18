@@ -13,6 +13,7 @@ public:
 	enum class FailureReason {
 		None,
 		BackingUnavailable,
+		BackingCommitFailed,
 		PhysicalRangeOutOfBounds,
 		HostAddressNotGranularityAligned,
 		SizeNotGranularityAligned,
@@ -35,9 +36,9 @@ public:
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 
-		m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE,
-		                              static_cast<DWORD>(m_size >> 32u),
-		                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		m_handle = CreateFileMappingA(
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
+		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
@@ -102,6 +103,7 @@ public:
 		switch (reason) {
 			case FailureReason::None: return "n/a";
 			case FailureReason::BackingUnavailable: return "backing-unavailable";
+			case FailureReason::BackingCommitFailed: return "backing-commit-failed";
 			case FailureReason::PhysicalRangeOutOfBounds: return "physical-range-out-of-bounds";
 			case FailureReason::HostAddressNotGranularityAligned:
 				return "host-address-not-64k-aligned";
@@ -165,6 +167,10 @@ public:
 			                                          : FailureReason::PhysicalRangeOutOfBounds);
 			return 0;
 		}
+		if (!EnsureBackingCommitted(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingCommitFailed);
+			return 0;
+		}
 
 		if (alignment == 0) {
 			alignment = 0x4000;
@@ -202,6 +208,10 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
 			                                          : FailureReason::PhysicalRangeOutOfBounds);
+			return false;
+		}
+		if (!EnsureBackingCommitted(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingCommitFailed);
 			return false;
 		}
 
@@ -274,6 +284,10 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
 			                                          : FailureReason::PhysicalRangeOutOfBounds);
+			return false;
+		}
+		if (!EnsureBackingCommitted(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingCommitFailed);
 			return false;
 		}
 
@@ -529,6 +543,9 @@ private:
 			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
 				return false;
 			}
+			if (!EnsureBackingCommitted(entry.backing_offset + current - entry.vaddr, bytes)) {
+				return false;
+			}
 			current += bytes;
 		}
 
@@ -594,6 +611,18 @@ private:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	[[nodiscard]] uint64_t    GetMappableTestSize() const { return m_granularity; }
 	static constexpr uint64_t PageSize() { return 0x4000; }
+
+	bool EnsureBackingCommitted(uint64_t backing_offset, uint64_t size) const {
+		if (!RangeOk(backing_offset, size)) {
+			return false;
+		}
+
+		const auto commit_start = backing_offset & ~(PageSize() - 1u);
+		const auto commit_end   = (backing_offset + size + PageSize() - 1u) & ~(PageSize() - 1u);
+		auto* committed = VirtualAlloc(m_backing_base + commit_start, commit_end - commit_start,
+		                               MEM_COMMIT, PAGE_READWRITE);
+		return committed == m_backing_base + commit_start;
+	}
 
 	[[nodiscard]] static bool IsPageAligned(uint64_t value) {
 		return (value & (PageSize() - 1u)) == 0;
@@ -1022,6 +1051,10 @@ private:
 	HANDLE   m_handle      = nullptr;
 	uint64_t m_granularity = 0x10000;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	bool EnsureBackingCommitted(uint64_t /*backing_offset*/, uint64_t /*size*/) const {
+		return true;
+	}
+
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 
 	static int GetProtect(VirtualMemory::Mode mode) {

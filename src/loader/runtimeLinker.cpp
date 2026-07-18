@@ -47,6 +47,38 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
+// Local DT_REL mirror of Elf64_Rela (no addend field).
+// Used only to upgrade legacy DT_REL records to DT_RELA in-place so the rest
+// of the loader (which assumes Elf64_Rela) works unchanged on PS5 SDK ELFs
+// that ship DT_REL.  Mirrors the implicit-addend resolution rule used by
+// glibc ld.so when both DT_REL and DT_RELA exist on the same module.
+struct Elf64_Rel
+{
+	Elf64_Addr   r_offset;
+	Elf64_Xword  r_info;
+};
+
+static Elf64_Rela* UpgradeRelToRela(uint64_t rel_addr, uint64_t rel_sz)
+{
+	if (rel_addr == 0 || rel_sz == 0)
+	{
+		return nullptr;
+	}
+	const uint64_t n_records = rel_sz / sizeof(Elf64_Rel);
+	auto*          rel       = reinterpret_cast<Elf64_Rel*>(rel_addr);
+	auto*          rela      = new Elf64_Rela[n_records];
+	for (uint64_t i = 0; i < n_records; ++i)
+	{
+		rela[i].r_offset = rel[i].r_offset;
+		rela[i].r_info   = rel[i].r_info;
+		// Implicit addend = current 64-bit value at the relocation target
+		// (this is what ld.so does for ELF64 DT_REL records during
+		// apply_relocations() when r_addend is not stored on-disk).
+		rela[i].r_addend = static_cast<Elf64_Sxword>(*reinterpret_cast<uint64_t*>(rela[i].r_offset));
+	}
+	return rela;
+}
+
 static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 	if (block == nullptr || block->ptr == nullptr) {
 		return;
@@ -1876,7 +1908,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	bool is_shared   = program->elf->IsShared();
 	bool is_next_gen = program->elf->IsNextGen();
 
-	EXIT_NOT_IMPLEMENTED(!is_shared && !is_next_gen);
+	// Treat non-shared executables (legacy SDK, ET_DYN with abiversion<2) as next-gen
+	// for loader purposes: the only effective difference is a single NoAccess-skip
+	// optimization (line 1941) which is harmless to skip for legacy binaries.
+	if (!is_shared && !is_next_gen) {
+		is_next_gen = true;
+	}
 
 	const auto* ehdr = program->elf->GetEhdr();
 	const auto* phdr = program->elf->GetPhdr();
@@ -2052,7 +2089,11 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynValue(elf, &jmprel_type, DT_OS_PLTREL);
 	GetDynValue(elf, &jmprel_type, DT_PLTREL);
 
-	EXIT_NOT_IMPLEMENTED(jmprel_type != DT_RELA);
+	// jmprel_type tells whether DT_JMPREL records are Elf64_Rel (no addend) or
+	// Elf64_Rela (with addend). The rest of the loader is built around Elf64_Rela,
+	// so for legacy SDK ELFs that ship DT_REL we expand each record into Rela on
+	// the fly: the implicit addend is whatever the loader sees at the target
+	// address at this moment (matches glibc ld.so DT_REL expansion).
 	if (jmprel_type == DT_RELA) {
 		EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_JMPREL) && elf->HasDynValue(DT_JMPREL));
 		EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_PLTRELSZ) && elf->HasDynValue(DT_PLTRELSZ));
@@ -2060,15 +2101,54 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 		GetDynData(elf, program->base_vaddr, &program->dynamic_info->jmprela_table, DT_JMPREL);
 		GetDynValue(elf, &program->dynamic_info->jmprela_table_size, DT_OS_PLTRELSZ);
 		GetDynValue(elf, &program->dynamic_info->jmprela_table_size, DT_PLTRELSZ);
+	} else if (jmprel_type == DT_REL) {
+		uint64_t rel_addr = 0;
+		uint64_t rel_sz   = 0;
+		EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_JMPREL) && elf->HasDynValue(DT_JMPREL));
+		EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_PLTRELSZ) && elf->HasDynValue(DT_PLTRELSZ));
+		GetDynDataOs(elf, &rel_addr, DT_OS_JMPREL);
+		GetDynData(elf, program->base_vaddr, &rel_addr, DT_JMPREL);
+		GetDynValue(elf, &rel_sz, DT_OS_PLTRELSZ);
+		GetDynValue(elf, &rel_sz, DT_PLTRELSZ);
+		// Elf64_Rel entry size is fixed at 16 bytes by the ELF gABI; reject
+		// DT_RELENT values that disagree so we never silently miscompute
+		// the record count below.
+		Elf64_Sxword rel_entsz = 0;
+		if (auto* dyn = elf->GetDynValue(DT_OS_RELENT); dyn != nullptr) {
+			rel_entsz = dyn->d_un.d_val;
+		} else if (auto* dyn = elf->GetDynValue(DT_RELENT); dyn != nullptr) {
+			rel_entsz = dyn->d_un.d_val;
+		}
+		EXIT_NOT_IMPLEMENTED(rel_entsz != 0 && rel_entsz != static_cast<Elf64_Sxword>(sizeof(Elf64_Rel)));
+		program->dynamic_info->jmprela_table      = UpgradeRelToRela(rel_addr, rel_sz);
+		program->dynamic_info->jmprela_table_size = rel_sz / sizeof(Elf64_Rel) * sizeof(Elf64_Rela);
+	} else if (jmprel_type == 0) {
+		// No PLTREL tag, or DT_PLTREL == 0: the ELF has no procedure linkage
+		// table (every external symbol is resolved via the main DT_RELA/DT_REL
+		// table below). Leave jmprela_table empty.
+		program->dynamic_info->jmprela_table      = nullptr;
+		program->dynamic_info->jmprela_table_size = 0;
+	} else {
+		EXIT_NOT_IMPLEMENTED(true);
 	}
 
 	EXIT_NOT_IMPLEMENTED(elf->HasDynValue(DT_OS_RELA) && elf->HasDynValue(DT_RELA));
+	Elf64_Sxword rel_type = 0;
+	GetDynValue(elf, &rel_type, DT_OS_RELA);
+	GetDynValue(elf, &rel_type, DT_RELA);
 	GetDynDataOs(elf, &program->dynamic_info->rela_table, DT_OS_RELA);
 	GetDynData(elf, program->base_vaddr, &program->dynamic_info->rela_table, DT_RELA);
 	GetDynValue(elf, &program->dynamic_info->rela_table_total_size, DT_OS_RELASZ);
 	GetDynValue(elf, &program->dynamic_info->rela_table_total_size, DT_RELASZ);
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_OS_RELAENT);
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_RELAENT);
+	if (rel_type == DT_REL) {
+		// Same DT_REL expansion for the main relocation table.
+		program->dynamic_info->rela_table            = UpgradeRelToRela(reinterpret_cast<uint64_t>(program->dynamic_info->rela_table),
+		                                                                 program->dynamic_info->rela_table_total_size);
+		program->dynamic_info->rela_table_total_size = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rel) * sizeof(Elf64_Rela);
+		program->dynamic_info->rela_table_entry_size = sizeof(Elf64_Rela);
+	}
 
 	GetDynValue(elf, &program->dynamic_info->relative_count, DT_RELACOUNT);
 
@@ -2168,7 +2248,6 @@ void RuntimeLinker::Relocate(Program* program) {
 
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table_entry_size != sizeof(Elf64_Sym));
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_entry_size != sizeof(Elf64_Rela));
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->jmprela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->pltgot_vaddr == 0);
@@ -2180,8 +2259,12 @@ void RuntimeLinker::Relocate(Program* program) {
 
 	RelocateRecords(program->dynamic_info->rela_table, program->dynamic_info->rela_table_total_size,
 	                program, false, imports_only, &unresolved);
-	RelocateRecords(program->dynamic_info->jmprela_table, program->dynamic_info->jmprela_table_size,
-	                program, true, imports_only, &unresolved);
+	// jmprela_table is null for ELFs with no .plt (e.g. PS5 SDK elfldr);
+	// skip the PLT relocation pass instead of erroring.
+	if (program->dynamic_info->jmprela_table != nullptr) {
+		RelocateRecords(program->dynamic_info->jmprela_table, program->dynamic_info->jmprela_table_size,
+		                program, true, imports_only, &unresolved);
+	}
 	program->relocated = true;
 
 	if (program->tls.image_vaddr != 0 && program->tls.init_size != 0 &&

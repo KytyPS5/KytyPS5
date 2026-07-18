@@ -45,6 +45,7 @@ constexpr int EV_CURRENT = 1;
 
 constexpr char ELFOSABI_FREEBSD = 9; // FreeBSD operating system
 
+constexpr Elf64_Half ET_DYN     = 3;      // Standard position-independent executable/shared object
 constexpr Elf64_Half ET_DYNEXEC = 0xfe10; // Executable file
 constexpr Elf64_Half ET_DYNAMIC = 0xfe18; // Shared
 
@@ -102,6 +103,8 @@ constexpr Elf64_Sxword DT_PREINIT_ARRAY          = 0x00000020;
 constexpr Elf64_Sxword DT_PREINIT_ARRAYSZ        = 0x00000021;
 constexpr Elf64_Sxword DT_REL                    = 0x00000011;
 constexpr Elf64_Sxword DT_RELA                   = 0x00000007;
+constexpr Elf64_Sxword DT_RELENT                 = 0x00000012;
+constexpr Elf64_Sxword DT_OS_RELENT              = 0x61000032;
 constexpr Elf64_Sxword DT_SONAME                 = 0x0000000e;
 constexpr Elf64_Sxword DT_TEXTREL                = 0x00000016;
 
@@ -283,7 +286,7 @@ public:
 
 	template <class T>
 	[[nodiscard]] T GetDynamicData(uint64_t offset) const {
-		return (m_dynamic_data == nullptr ? nullptr
+		return (m_dynamic_data == nullptr ? T{}
 		                                  : reinterpret_cast<T>(m_dynamic_data.get() + offset));
 	}
 

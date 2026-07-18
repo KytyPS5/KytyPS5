@@ -19,6 +19,10 @@
 #include <windows.h>
 #undef min
 #undef max
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+constexpr uint32_t PAGE_NOACCESS  = 0x01;
+constexpr uint32_t PAGE_READONLY  = 0x02;
+constexpr uint32_t PAGE_READWRITE = 0x04;
 #endif
 
 namespace Libs::Graphics {

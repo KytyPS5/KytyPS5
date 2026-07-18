@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 // IWYU pragma: end_exports
 
 #define KYTY_CLASS_NO_COPY(name)                                                                   \

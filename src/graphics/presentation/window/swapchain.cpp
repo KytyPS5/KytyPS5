@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/AsyncPipelineBuilder.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
@@ -48,7 +49,40 @@
 #include <memory>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+inline const char* string_VkResult(VkResult result) {
+	switch (result) {
+		case VK_SUCCESS: return "VK_SUCCESS";
+		case VK_NOT_READY: return "VK_NOT_READY";
+		case VK_TIMEOUT: return "VK_TIMEOUT";
+		case VK_EVENT_SET: return "VK_EVENT_SET";
+		case VK_EVENT_RESET: return "VK_EVENT_RESET";
+		case VK_INCOMPLETE: return "VK_INCOMPLETE";
+		case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+		case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+		case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+		case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+		default: return "VK_UNKNOWN_RESULT";
+	}
+}
+inline const char* string_VkImageLayout(VkImageLayout layout) {
+	switch (layout) {
+		case VK_IMAGE_LAYOUT_UNDEFINED: return "VK_IMAGE_LAYOUT_UNDEFINED";
+		case VK_IMAGE_LAYOUT_GENERAL: return "VK_IMAGE_LAYOUT_GENERAL";
+		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return "VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL";
+		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return "VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL";
+		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return "VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL";
+		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return "VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL";
+		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return "VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL";
+		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return "VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL";
+		case VK_IMAGE_LAYOUT_PREINITIALIZED: return "VK_IMAGE_LAYOUT_PREINITIALIZED";
+		case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: return "VK_IMAGE_LAYOUT_PRESENT_SRC_KHR";
+		default: return "VK_UNKNOWN_LAYOUT";
+	}
+}
+#else
 #include <vulkan/vk_enum_string_helper.h>
+#endif
 #include <vulkan/vk_platform.h>
 
 // IWYU pragma: no_include <intrin.h>
@@ -536,6 +570,10 @@ void WindowPresentFrame(PreparedFrame* frame) {
 
 	RenderDocOnPresent();
 	WindowUpdateTitle();
+
+	if (g_AsyncPipelineBuilder) {
+		g_AsyncPipelineBuilder->SaveCachePeriodically();
+	}
 }
 
 } // namespace Libs::Graphics

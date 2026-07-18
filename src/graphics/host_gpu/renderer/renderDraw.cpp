@@ -42,7 +42,34 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+inline const char* string_VkResult(VkResult result) {
+	switch (result) {
+		case VK_SUCCESS: return "VK_SUCCESS";
+		case VK_NOT_READY: return "VK_NOT_READY";
+		case VK_TIMEOUT: return "VK_TIMEOUT";
+		case VK_EVENT_SET: return "VK_EVENT_SET";
+		case VK_EVENT_RESET: return "VK_EVENT_RESET";
+		case VK_INCOMPLETE: return "VK_INCOMPLETE";
+		case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+		case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+		case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+		case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+		default: return "VK_UNKNOWN_RESULT";
+	}
+}
+inline const char* string_VkFormat(VkFormat format) {
+	switch (format) {
+		case VK_FORMAT_UNDEFINED: return "VK_FORMAT_UNDEFINED";
+		case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+		case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+		case VK_FORMAT_R32G32B32A32_SFLOAT: return "VK_FORMAT_R32G32B32A32_SFLOAT";
+		default: return "VK_UNKNOWN_FORMAT";
+	}
+}
+#else
 #include <vulkan/vk_enum_string_helper.h>
+#endif
 
 // IWYU pragma: no_forward_declare VkImageView_T
 
@@ -952,6 +979,10 @@ static void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer* buffer, HW::C
 		    state->framebuffer, state->color_info, state->color_count, &state->depth_info,
 		    &state->vs_input_info, ctx, sh_ctx, &state->ps_input_info, topology, state->ps_active,
 		    state->vs_shader, state->ps_shader);
+
+		if (pipeline == nullptr || pipeline->pipeline == nullptr) {
+			return; // Controlled bypass: wait/skip drawing until pipeline finishes background compilation
+		}
 
 		if (set_bind_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);

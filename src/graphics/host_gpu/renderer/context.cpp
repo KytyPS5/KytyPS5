@@ -10,19 +10,35 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
+#include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <memory>
-#include <vulkan/vk_enum_string_helper.h>
 namespace Libs::Graphics {
 static std::atomic<uint64_t> g_command_buffer_submit_seq = 0;
+
+static void RequireValidQueueId(int queue_id) {
+	EXIT_IF(queue_id < 0 || queue_id >= GraphicContext::QUEUES_NUM);
+}
+
+static void ResetNativeCommandBuffer(vk::CommandBuffer buffer) {
+	EXIT_IF(buffer == nullptr);
+	const auto result = buffer.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
+	if (result != vk::Result::eSuccess) {
+		EXIT("failed to reset Vulkan command buffer: %s (%d)\n", VulkanToString(result).c_str(),
+		     static_cast<int>(result));
+	}
+}
+
 class CommandPool {
 public:
 	CommandPool() = default;
@@ -34,18 +50,19 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandPool);
 
-	VulkanCommandPool* GetPool(int id) {
-		if (m_pool[id] == nullptr) {
-			Create(id);
+	VulkanCommandPool* GetPool(int queue_id) {
+		RequireValidQueueId(queue_id);
+		if (m_pools[queue_id] == nullptr) {
+			Create(queue_id);
 		}
-		return m_pool[id];
+		return m_pools[queue_id];
 	}
-
-private:
-	void Create(int id);
 	void DeleteAll();
 
-	VulkanCommandPool* m_pool[GraphicContext::QUEUES_NUM] = {};
+private:
+	void Create(int queue_id);
+
+	std::array<VulkanCommandPool*, GraphicContext::QUEUES_NUM> m_pools {};
 };
 
 RenderContext*                  g_render_ctx = nullptr;
@@ -78,70 +95,78 @@ void GraphicsRenderInit() {
 	g_render_ctx = new RenderContext;
 }
 
+void GraphicsRenderReleaseThreadCommandPools() {
+	if (g_render_ctx != nullptr) {
+		g_command_pool.DeleteAll();
+	}
+}
+
 void GraphicsRenderCreateContext() {
 	EXIT_IF(g_render_ctx == nullptr);
 
 	g_render_ctx->SetGraphicCtx(WindowGetGraphicContext());
 }
 
-void CommandPool::Create(int id) {
-	auto* ctx = g_render_ctx->GetGraphicCtx();
+void CommandPool::Create(int queue_id) {
+	RequireValidQueueId(queue_id);
+	EXIT_IF(g_render_ctx == nullptr);
 
-	EXIT_IF(id < 0 || id >= GraphicContext::QUEUES_NUM);
-	auto*& pool = m_pool[id];
+	auto*  ctx  = g_render_ctx->GetGraphicCtx();
+	auto*& pool = m_pools[queue_id];
 	EXIT_IF(pool != nullptr);
 
 	EXIT_IF(ctx == nullptr);
 	EXIT_IF(ctx->device == nullptr);
-	EXIT_IF(ctx->queues[id].family == static_cast<uint32_t>(-1));
+	EXIT_IF(ctx->queues[queue_id].family == static_cast<uint32_t>(-1));
 
 	pool = new VulkanCommandPool;
 
-	VkCommandPoolCreateInfo pool_info {};
-	pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.sType            = vk::StructureType::eCommandPoolCreateInfo;
 	pool_info.pNext            = nullptr;
-	pool_info.queueFamilyIndex = ctx->queues[id].family;
-	pool_info.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	pool_info.queueFamilyIndex = ctx->queues[queue_id].family;
+	pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 
-	vkCreateCommandPool(ctx->device, &pool_info, nullptr, &pool->pool);
-
-	EXIT_NOT_IMPLEMENTED(pool->pool == nullptr);
+	const auto result = ctx->device.createCommandPool(&pool_info, nullptr, &pool->pool);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pool->pool == nullptr);
 
 	pool->buffers_count = 8;
-	pool->buffers       = std::make_unique<VkCommandBuffer[]>(pool->buffers_count);
-	pool->fences        = std::make_unique<VkFence[]>(pool->buffers_count);
-	pool->semaphores    = std::make_unique<VkSemaphore[]>(pool->buffers_count);
+	pool->buffers       = std::make_unique<vk::CommandBuffer[]>(pool->buffers_count);
+	pool->fences        = std::make_unique<vk::Fence[]>(pool->buffers_count);
+	pool->semaphores    = std::make_unique<vk::Semaphore[]>(pool->buffers_count);
 	pool->busy          = std::make_unique<bool[]>(pool->buffers_count);
 
-	VkCommandBufferAllocateInfo alloc_info {};
-	alloc_info.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	vk::CommandBufferAllocateInfo alloc_info {};
+	alloc_info.sType              = vk::StructureType::eCommandBufferAllocateInfo;
 	alloc_info.commandPool        = pool->pool;
-	alloc_info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	alloc_info.level              = vk::CommandBufferLevel::ePrimary;
 	alloc_info.commandBufferCount = pool->buffers_count;
 
-	if (vkAllocateCommandBuffers(ctx->device, &alloc_info, pool->buffers.get()) != VK_SUCCESS) {
+	if (ctx->device.allocateCommandBuffers(&alloc_info, pool->buffers.get()) !=
+	    vk::Result::eSuccess) {
 		EXIT("Can't allocate command buffers");
 	}
 
 	for (uint32_t i = 0; i < pool->buffers_count; i++) {
 		pool->busy[i] = false;
 
-		VkFenceCreateInfo fence_info {};
-		fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		vk::FenceCreateInfo fence_info {};
+		fence_info.sType = vk::StructureType::eFenceCreateInfo;
 		fence_info.pNext = nullptr;
-		fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+		fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
 
-		if (vkCreateFence(ctx->device, &fence_info, nullptr, &pool->fences[i]) != VK_SUCCESS) {
+		if (ctx->device.createFence(&fence_info, nullptr, &pool->fences[i]) !=
+		    vk::Result::eSuccess) {
 			EXIT("Can't create fence");
 		}
 
-		VkSemaphoreCreateInfo semaphore_info {};
-		semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		vk::SemaphoreCreateInfo semaphore_info {};
+		semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 		semaphore_info.pNext = nullptr;
-		semaphore_info.flags = 0;
+		semaphore_info.flags = {};
 
-		if (vkCreateSemaphore(ctx->device, &semaphore_info, nullptr, &pool->semaphores[i]) !=
-		    VK_SUCCESS) {
+		if (ctx->device.createSemaphore(&semaphore_info, nullptr, &pool->semaphores[i]) !=
+		    vk::Result::eSuccess) {
 			EXIT("Can't create semaphore");
 		}
 
@@ -154,19 +179,19 @@ void CommandPool::Create(int id) {
 void CommandPool::DeleteAll() {
 	auto* ctx = g_render_ctx->GetGraphicCtx();
 
-	for (auto& pool: m_pool) {
+	for (auto& pool: m_pools) {
 		if (pool != nullptr) {
 			EXIT_IF(ctx == nullptr);
 			EXIT_IF(ctx->device == nullptr);
 
 			for (uint32_t i = 0; i < pool->buffers_count; i++) {
-				vkDestroySemaphore(ctx->device, pool->semaphores[i], nullptr);
-				vkDestroyFence(ctx->device, pool->fences[i], nullptr);
+				ctx->device.destroySemaphore(pool->semaphores[i], nullptr);
+				ctx->device.destroyFence(pool->fences[i], nullptr);
 			}
 
-			vkFreeCommandBuffers(ctx->device, pool->pool, pool->buffers_count, pool->buffers.get());
+			ctx->device.freeCommandBuffers(pool->pool, pool->buffers_count, pool->buffers.get());
 
-			vkDestroyCommandPool(ctx->device, pool->pool, nullptr);
+			ctx->device.destroyCommandPool(pool->pool, nullptr);
 
 			delete pool;
 			pool = nullptr;
@@ -186,6 +211,14 @@ bool CommandBuffer::IsInvalid() const {
 	return true;
 }
 
+vk::CommandBuffer CommandBuffer::Handle() const {
+	EXIT_IF(IsInvalid());
+
+	const auto handle = m_pool->buffers[m_index];
+	EXIT_IF(handle == nullptr);
+	return handle;
+}
+
 void CommandBuffer::Allocate() {
 	EXIT_IF(!IsInvalid());
 
@@ -196,7 +229,7 @@ void CommandBuffer::Allocate() {
 	for (uint32_t i = 0; i < m_pool->buffers_count; i++) {
 		if (!m_pool->busy[i]) {
 			m_pool->busy[i] = true;
-			vkResetCommandBuffer(m_pool->buffers[i], VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+			ResetNativeCommandBuffer(m_pool->buffers[i]);
 			m_index = i;
 			break;
 		}
@@ -215,9 +248,8 @@ void CommandBuffer::Free() {
 	m_host_stream.Release();
 
 	m_pool->busy[m_index] = false;
-	vkResetCommandBuffer(m_pool->buffers[m_index], VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
-	RecycleDescriptorsAfterFence();
-	m_fence_resources.ReleaseAfterFence();
+	ResetNativeCommandBuffer(m_pool->buffers[m_index]);
+	ReleaseResourcesAfterFence();
 	m_index = static_cast<uint32_t>(-1);
 
 	EXIT_NOT_IMPLEMENTED(!IsInvalid());
@@ -250,29 +282,25 @@ void CommandBuffer::RecycleDescriptorsAfterFence() {
 }
 
 void CommandBuffer::Begin() const {
-	EXIT_IF(IsInvalid());
+	auto buffer = Handle();
 
-	auto* buffer = m_pool->buffers[m_index];
-
-	VkCommandBufferBeginInfo begin_info {};
-	begin_info.sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.sType            = vk::StructureType::eCommandBufferBeginInfo;
 	begin_info.pNext            = nullptr;
-	begin_info.flags            = 0;
+	begin_info.flags            = {};
 	begin_info.pInheritanceInfo = nullptr;
 
-	auto result = vkBeginCommandBuffer(buffer, &begin_info);
+	auto result = buffer.begin(&begin_info);
 
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
 void CommandBuffer::End() const {
-	EXIT_IF(IsInvalid());
+	auto buffer = Handle();
 
-	auto* buffer = m_pool->buffers[m_index];
+	auto result = buffer.end();
 
-	auto result = vkEndCommandBuffer(buffer);
-
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
@@ -287,164 +315,53 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 }
 
 void CommandBuffer::Execute() {
-	EXIT_IF(IsInvalid());
-	EXIT_IF(m_execute);
-
-	auto* buffer = m_pool->buffers[m_index];
-	auto* fence  = m_pool->fences[m_index];
-
-	VkSubmitInfo submit_info {};
-	submit_info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submit_info.pNext                = nullptr;
-	submit_info.waitSemaphoreCount   = 0;
-	submit_info.pWaitSemaphores      = nullptr;
-	submit_info.pWaitDstStageMask    = nullptr;
-	submit_info.commandBufferCount   = 1;
-	submit_info.pCommandBuffers      = &buffer;
-	submit_info.signalSemaphoreCount = 0;
-	submit_info.pSignalSemaphores    = nullptr;
-
-	EXIT_IF(m_queue < 0 || m_queue >= GraphicContext::QUEUES_NUM);
-
-	const auto& queue = g_render_ctx->GetGraphicCtx()->queues[m_queue];
-
-	auto result = vkResetFences(g_render_ctx->GetGraphicCtx()->device, 1, &fence);
-	if (result != VK_SUCCESS) {
-		LOGF("vkResetFences failed before submit: %s (%d)\n", string_VkResult(result),
-		     static_cast<int>(result));
-	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
-
-	if (queue.mutex != nullptr) {
-		queue.mutex->Lock();
-	}
-
-	if (Config::GraphicsDebugDumpEnabled()) {
-		LOGF("vkQueueSubmit begin: queue=%d index=%u debug_op=%u debug_submit=%" PRIu64
-		     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     m_queue, m_index, m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1,
-		     m_debug_arg2, m_debug_arg3, m_debug_arg4);
-	}
-
-	result = vkQueueSubmit(queue.vk_queue, 1, &submit_info, fence);
-
-	if (queue.mutex != nullptr) {
-		queue.mutex->Unlock();
-	}
-
-	m_execute      = true;
-	m_fence_waited = false;
-	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-
-	if (result != VK_SUCCESS) {
-		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
-		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
-	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	Submit(nullptr, {}, nullptr);
 }
 
-void CommandBuffer::ExecuteWithSemaphore(VkSemaphore signal_semaphore) {
-	EXIT_IF(IsInvalid());
-	EXIT_IF(m_execute);
-
-	auto* buffer = m_pool->buffers[m_index];
-	auto* fence  = m_pool->fences[m_index];
-
-	if (signal_semaphore == nullptr) {
-		signal_semaphore = m_pool->semaphores[m_index];
-	}
-
-	VkSubmitInfo submit_info {};
-	submit_info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submit_info.pNext                = nullptr;
-	submit_info.waitSemaphoreCount   = 0;
-	submit_info.pWaitSemaphores      = nullptr;
-	submit_info.pWaitDstStageMask    = nullptr;
-	submit_info.commandBufferCount   = 1;
-	submit_info.pCommandBuffers      = &buffer;
-	submit_info.signalSemaphoreCount = 1;
-	submit_info.pSignalSemaphores    = &signal_semaphore;
-
-	EXIT_IF(m_queue < 0 || m_queue >= GraphicContext::QUEUES_NUM);
-
-	const auto& queue = g_render_ctx->GetGraphicCtx()->queues[m_queue];
-
-	auto result = vkResetFences(g_render_ctx->GetGraphicCtx()->device, 1, &fence);
-	if (result != VK_SUCCESS) {
-		LOGF("vkResetFences failed before submit: %s (%d)\n", string_VkResult(result),
-		     static_cast<int>(result));
-	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
-
-	if (queue.mutex != nullptr) {
-		queue.mutex->Lock();
-	}
-
-	if (Config::GraphicsDebugDumpEnabled()) {
-		LOGF("vkQueueSubmit begin: queue=%d index=%u signal_semaphore=%p debug_op=%u"
-		     " debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     m_queue, m_index, static_cast<void*>(signal_semaphore), m_debug_op, m_debug_submit_id,
-		     m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3, m_debug_arg4);
-	}
-
-	result = vkQueueSubmit(queue.vk_queue, 1, &submit_info, fence);
-
-	if (queue.mutex != nullptr) {
-		queue.mutex->Unlock();
-	}
-
-	m_execute      = true;
-	m_fence_waited = false;
-	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-
-	if (result != VK_SUCCESS) {
-		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
-		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
-	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+void CommandBuffer::ExecuteWithSemaphore(vk::Semaphore signal_semaphore) {
+	Submit(nullptr, {}, ResolveSignalSemaphore(signal_semaphore));
 }
 
-void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
-                                         VkPipelineStageFlags wait_stage,
-                                         VkSemaphore          signal_semaphore) {
-	EXIT_IF(IsInvalid());
-	EXIT_IF(m_execute);
+void CommandBuffer::ExecuteWithSemaphore(vk::Semaphore          wait_semaphore,
+                                         vk::PipelineStageFlags wait_stage,
+                                         vk::Semaphore          signal_semaphore) {
 	EXIT_IF(wait_semaphore == nullptr);
+	Submit(wait_semaphore, wait_stage, ResolveSignalSemaphore(signal_semaphore));
+}
 
-	auto* buffer = m_pool->buffers[m_index];
-	auto* fence  = m_pool->fences[m_index];
+void CommandBuffer::Submit(vk::Semaphore wait_semaphore, vk::PipelineStageFlags wait_stage,
+                           vk::Semaphore signal_semaphore) {
+	RequireValidQueueId(m_queue);
+	EXIT_IF(IsInvalid());
+	EXIT_IF(m_execute);
 
-	if (signal_semaphore == nullptr) {
-		signal_semaphore = m_pool->semaphores[m_index];
-	}
+	const bool has_wait   = wait_semaphore != nullptr;
+	const bool has_signal = signal_semaphore != nullptr;
+	auto       buffer     = Handle();
+	auto       fence      = m_pool->fences[m_index];
 
-	VkSubmitInfo submit_info {};
-	submit_info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	vk::SubmitInfo submit_info {};
+	submit_info.sType                = vk::StructureType::eSubmitInfo;
 	submit_info.pNext                = nullptr;
-	submit_info.waitSemaphoreCount   = 1;
-	submit_info.pWaitSemaphores      = &wait_semaphore;
-	submit_info.pWaitDstStageMask    = &wait_stage;
+	submit_info.waitSemaphoreCount   = has_wait ? 1u : 0u;
+	submit_info.pWaitSemaphores      = has_wait ? &wait_semaphore : nullptr;
+	submit_info.pWaitDstStageMask    = has_wait ? &wait_stage : nullptr;
 	submit_info.commandBufferCount   = 1;
 	submit_info.pCommandBuffers      = &buffer;
-	submit_info.signalSemaphoreCount = 1;
-	submit_info.pSignalSemaphores    = &signal_semaphore;
+	submit_info.signalSemaphoreCount = has_signal ? 1u : 0u;
+	submit_info.pSignalSemaphores    = has_signal ? &signal_semaphore : nullptr;
 
-	EXIT_IF(m_queue < 0 || m_queue >= GraphicContext::QUEUES_NUM);
+	auto* ctx = g_render_ctx->GetGraphicCtx();
+	EXIT_IF(ctx == nullptr);
+	EXIT_IF(ctx->device == nullptr);
+	const auto& queue = ctx->queues[m_queue];
 
-	const auto& queue = g_render_ctx->GetGraphicCtx()->queues[m_queue];
-
-	auto result = vkResetFences(g_render_ctx->GetGraphicCtx()->device, 1, &fence);
-	if (result != VK_SUCCESS) {
-		LOGF("vkResetFences failed before submit: %s (%d)\n", string_VkResult(result),
+	auto result = ctx->device.resetFences(1, &fence);
+	if (result != vk::Result::eSuccess) {
+		LOGF("vkResetFences failed before submit: %s (%d)\n", VulkanToString(result).c_str(),
 		     static_cast<int>(result));
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	if (queue.mutex != nullptr) {
 		queue.mutex->Lock();
@@ -458,7 +375,7 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
 		     m_debug_arg1, m_debug_arg2, m_debug_arg3, m_debug_arg4);
 	}
 
-	result = vkQueueSubmit(queue.vk_queue, 1, &submit_info, fence);
+	result = queue.vk_queue.submit(1, &submit_info, fence);
 
 	if (queue.mutex != nullptr) {
 		queue.mutex->Unlock();
@@ -468,30 +385,26 @@ void CommandBuffer::ExecuteWithSemaphore(VkSemaphore          wait_semaphore,
 	m_fence_waited = false;
 	m_submit_seq   = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 
-	if (result != VK_SUCCESS) {
+	if (result != vk::Result::eSuccess) {
 		LOGF("vkQueueSubmit failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
 		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
+		     VulkanToString(result).c_str(), static_cast<int>(result), m_queue, m_index,
+		     m_submit_seq, m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
+		     m_debug_arg3, m_debug_arg4);
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+vk::Semaphore CommandBuffer::ResolveSignalSemaphore(vk::Semaphore semaphore) const {
+	if (semaphore != nullptr) {
+		return semaphore;
+	}
+	EXIT_IF(IsInvalid());
+	return m_pool->semaphores[m_index];
 }
 
 void CommandBuffer::WaitForFence() {
-	const bool was_executed = m_execute;
-	WaitForFenceOnly();
-	if (was_executed) {
-		m_execute      = false;
-		m_fence_waited = false;
-		RecycleDescriptorsAfterFence();
-		m_fence_resources.ReleaseAfterFence();
-	}
-	for (auto* buffer: m_delete_after_fence) {
-		VulkanDeleteBuffer(g_render_ctx->GetGraphicCtx(), buffer);
-		delete buffer;
-	}
-	m_delete_after_fence.clear();
+	FinalizeFence(false);
 }
 
 void CommandBuffer::WaitForFenceOnly() {
@@ -499,34 +412,49 @@ void CommandBuffer::WaitForFenceOnly() {
 	if (!m_execute || m_fence_waited) {
 		return;
 	}
-	auto* device = g_render_ctx->GetGraphicCtx()->device;
-	auto  result = vkWaitForFences(device, 1, &m_pool->fences[m_index], VK_TRUE, UINT64_MAX);
-	if (result != VK_SUCCESS) {
+	auto device = g_render_ctx->GetGraphicCtx()->device;
+	auto result = device.waitForFences(1, &m_pool->fences[m_index], VK_TRUE, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
 		LOGF("vkWaitForFences failed: %s (%d), queue=%d index=%u submit_seq=%" PRIu64
 		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     string_VkResult(result), static_cast<int>(result), m_queue, m_index, m_submit_seq,
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
+		     VulkanToString(result).c_str(), static_cast<int>(result), m_queue, m_index,
+		     m_submit_seq, m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
+		     m_debug_arg3, m_debug_arg4);
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	m_fence_waited = true;
 }
 
 void CommandBuffer::WaitForFenceAndReset() {
+	FinalizeFence(true);
+}
+
+void CommandBuffer::FinalizeFence(bool reset_recording) {
 	const bool was_executed = m_execute;
 	WaitForFenceOnly();
 	if (was_executed) {
 		m_execute      = false;
 		m_fence_waited = false;
-		vkResetCommandBuffer(m_pool->buffers[m_index],
-		                     VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
-		m_recording_generation++;
+		if (reset_recording) {
+			ResetNativeCommandBuffer(m_pool->buffers[m_index]);
+			m_recording_generation++;
+		}
 	}
-	m_host_stream.Reset();
+	if (reset_recording) {
+		m_host_stream.Reset();
+	}
 	if (was_executed) {
-		RecycleDescriptorsAfterFence();
-		m_fence_resources.ReleaseAfterFence();
+		ReleaseResourcesAfterFence();
 	}
+	DeleteBuffersAfterFence();
+}
+
+void CommandBuffer::ReleaseResourcesAfterFence() {
+	RecycleDescriptorsAfterFence();
+	m_fence_resources.ReleaseAfterFence();
+}
+
+void CommandBuffer::DeleteBuffersAfterFence() {
 	for (auto* buffer: m_delete_after_fence) {
 		VulkanDeleteBuffer(g_render_ctx->GetGraphicCtx(), buffer);
 		delete buffer;
@@ -536,15 +464,13 @@ void CommandBuffer::WaitForFenceAndReset() {
 
 void CommandBuffer::BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorInfo* colors,
                                     uint32_t requested_color_count, RenderDepthInfo* depth) const {
-	EXIT_IF(IsInvalid());
-
-	auto* buffer = m_pool->buffers[m_index];
+	auto buffer = Handle();
 
 	EXIT_IF(framebuffer == nullptr);
 	EXIT_IF(colors == nullptr);
 	EXIT_IF(requested_color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 
-	bool     with_depth = (depth->format != VK_FORMAT_UNDEFINED && depth->vulkan_buffer != nullptr);
+	bool with_depth = (depth->format != vk::Format::eUndefined && depth->vulkan_buffer != nullptr);
 	uint32_t color_count = 0;
 	for (uint32_t i = 0; i < requested_color_count; i++) {
 		if (colors[i].vulkan_buffer == nullptr) {
@@ -556,16 +482,16 @@ void CommandBuffer::BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorI
 
 	EXIT_NOT_IMPLEMENTED(!with_depth && !with_color);
 
-	VkClearValue clears[RENDER_COLOR_ATTACHMENTS_MAX + 1] = {};
+	vk::ClearValue clears[RENDER_COLOR_ATTACHMENTS_MAX + 1] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
 		clears[i].color = colors[i].color_clear_value;
 	}
 	clears[color_count].depthStencil = {depth->depth_clear_value, depth->stencil_clear_value};
 
-	VkExtent2D extent = (with_color ? colors[0].extent : depth->vulkan_buffer->extent);
+	vk::Extent2D extent = (with_color ? colors[0].extent : depth->vulkan_buffer->extent);
 
-	VkRenderPassBeginInfo render_pass_info {};
-	render_pass_info.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	vk::RenderPassBeginInfo render_pass_info {};
+	render_pass_info.sType             = vk::StructureType::eRenderPassBeginInfo;
 	render_pass_info.pNext             = nullptr;
 	render_pass_info.renderPass        = framebuffer->render_pass;
 	render_pass_info.framebuffer       = framebuffer->framebuffer;
@@ -579,76 +505,78 @@ void CommandBuffer::BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorI
 		if (colors[i].vulkan_buffer->layout != color_initial_layout) {
 			if (graphics_debug_dump_enabled()) {
 				LOGF("BeginRenderPass: color%u initial barrier image=%p mem=%" PRIu64 " %s -> %s\n",
-				     i, reinterpret_cast<void*>(colors[i].vulkan_buffer->image),
+				     i, VulkanHandleToPointer(colors[i].vulkan_buffer->image),
 				     colors[i].vulkan_buffer->memory.unique_id,
-				     string_VkImageLayout(colors[i].vulkan_buffer->layout),
-				     string_VkImageLayout(color_initial_layout));
+				     VulkanToString(colors[i].vulkan_buffer->layout).c_str(),
+				     VulkanToString(color_initial_layout).c_str());
 			}
 
-			VkImageMemoryBarrier image_memory_barrier {};
-			image_memory_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-			image_memory_barrier.pNext         = nullptr;
-			image_memory_barrier.srcAccessMask = 0;
-			image_memory_barrier.dstAccessMask =
-			    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-			image_memory_barrier.oldLayout                       = colors[i].vulkan_buffer->layout;
-			image_memory_barrier.newLayout                       = color_initial_layout;
-			image_memory_barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-			image_memory_barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-			image_memory_barrier.image                           = colors[i].vulkan_buffer->image;
-			image_memory_barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+			vk::ImageMemoryBarrier image_memory_barrier {};
+			image_memory_barrier.sType               = vk::StructureType::eImageMemoryBarrier;
+			image_memory_barrier.pNext               = nullptr;
+			image_memory_barrier.srcAccessMask       = {};
+			image_memory_barrier.dstAccessMask       = vk::AccessFlagBits::eColorAttachmentRead |
+			                                           vk::AccessFlagBits::eColorAttachmentWrite;
+			image_memory_barrier.oldLayout           = colors[i].vulkan_buffer->layout;
+			image_memory_barrier.newLayout           = color_initial_layout;
+			image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			image_memory_barrier.image               = colors[i].vulkan_buffer->image;
+			image_memory_barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
 			image_memory_barrier.subresourceRange.baseMipLevel   = 0;
 			image_memory_barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
 			image_memory_barrier.subresourceRange.baseArrayLayer = 0;
 			image_memory_barrier.subresourceRange.layerCount     = colors[i].vulkan_buffer->layers;
 
-			vkCmdPipelineBarrier(buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
-			                     nullptr, 1, &image_memory_barrier);
+			buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+			                       vk::PipelineStageFlagBits::eColorAttachmentOutput,
+			                       vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1,
+			                       &image_memory_barrier);
 
 			colors[i].vulkan_buffer->layout = image_memory_barrier.newLayout;
 		} else if (graphics_debug_dump_enabled()) {
 			LOGF("BeginRenderPass: color%u initial image=%p mem=%" PRIu64 " layout=%s\n", i,
-			     reinterpret_cast<void*>(colors[i].vulkan_buffer->image),
+			     VulkanHandleToPointer(colors[i].vulkan_buffer->image),
 			     colors[i].vulkan_buffer->memory.unique_id,
-			     string_VkImageLayout(colors[i].vulkan_buffer->layout));
+			     VulkanToString(colors[i].vulkan_buffer->layout).c_str());
 		}
 	}
 
 	const auto depth_layout =
 	    (with_depth && framebuffer != nullptr ? framebuffer->depth_layout
-	                                          : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	                                          : vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 	if (with_depth && depth->vulkan_buffer->layout != depth_layout) {
-		VkImageMemoryBarrier image_memory_barrier {};
-		image_memory_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		image_memory_barrier.pNext         = nullptr;
-		image_memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+		vk::ImageMemoryBarrier image_memory_barrier {};
+		image_memory_barrier.sType = vk::StructureType::eImageMemoryBarrier;
+		image_memory_barrier.pNext = nullptr;
+		image_memory_barrier.srcAccessMask =
+		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 		image_memory_barrier.dstAccessMask =
-		    (depth_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-		         ? VK_ACCESS_MEMORY_READ_BIT
-		         : VK_ACCESS_MEMORY_WRITE_BIT);
+		    (depth_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		         ? vk::AccessFlagBits::eMemoryRead
+		         : vk::AccessFlagBits::eMemoryWrite);
 		image_memory_barrier.oldLayout           = depth->vulkan_buffer->layout;
 		image_memory_barrier.newLayout           = depth_layout;
 		image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		image_memory_barrier.image               = depth->vulkan_buffer->image;
 		image_memory_barrier.subresourceRange.aspectMask =
-		    DepthStencilAspectMask(depth->vulkan_buffer->format);
+		    ImageViewOps::DepthAspectMask(depth->vulkan_buffer->format);
 		image_memory_barrier.subresourceRange.baseMipLevel   = 0;
 		image_memory_barrier.subresourceRange.levelCount     = 1;
 		image_memory_barrier.subresourceRange.baseArrayLayer = 0;
 		image_memory_barrier.subresourceRange.layerCount     = depth->vulkan_buffer->layers;
 
-		vkCmdPipelineBarrier(
-		    buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-		    nullptr, 0, nullptr, 1, &image_memory_barrier);
+		buffer.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
+		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
+		    vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &image_memory_barrier);
 
 		depth->vulkan_buffer->layout = image_memory_barrier.newLayout;
 	}
 
-	vkCmdBeginRenderPass(buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+	buffer.beginRenderPass(&render_pass_info, vk::SubpassContents::eInline);
 
 	for (uint32_t i = 0; i < color_count; i++) {
 		colors[i].vulkan_buffer->layout = RENDER_COLOR_IMAGE_LAYOUT;
@@ -656,11 +584,9 @@ void CommandBuffer::BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorI
 }
 
 void CommandBuffer::EndRenderPass() const {
-	EXIT_IF(IsInvalid());
+	auto buffer = Handle();
 
-	auto* buffer = m_pool->buffers[m_index];
-
-	vkCmdEndRenderPass(buffer);
+	buffer.endRenderPass();
 }
 
 } // namespace Libs::Graphics

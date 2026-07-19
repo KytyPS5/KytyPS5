@@ -4,12 +4,12 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <map>
 #include <mutex>
 #include <tuple>
 #include <vk_mem_alloc.h>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -19,7 +19,7 @@ struct VulkanQueueInfo {
 	Common::Mutex* mutex    = nullptr;
 	uint32_t       family   = static_cast<uint32_t>(-1);
 	uint32_t       index    = static_cast<uint32_t>(-1);
-	VkQueue        vk_queue = nullptr;
+	vk::Queue      vk_queue = nullptr;
 };
 
 struct VulkanInstance {
@@ -33,51 +33,53 @@ struct VulkanInstance {
 	static constexpr int QUEUE_COMPUTE_START = 0;
 	static constexpr int QUEUE_COMPUTE_NUM   = 8;
 
-	VkInstance                       instance                          = nullptr;
-	VkDebugUtilsMessengerEXT         debug_messenger                   = nullptr;
-	VkPhysicalDevice                 physical_device                   = nullptr;
-	VkPhysicalDeviceProperties       physical_device_properties        = {};
-	VkPhysicalDeviceMemoryProperties physical_device_memory_properties = {};
-	VkDevice                         device                            = nullptr;
-	VmaAllocator                     allocator                         = nullptr;
-	bool                             memory_budget_ext_enabled         = false;
-	bool                             subgroup_size_control_enabled     = false;
-	uint32_t                         subgroup_size                     = 0;
-	uint32_t                         min_subgroup_size                 = 0;
-	uint32_t                         max_subgroup_size                 = 0;
-	VkShaderStageFlags               required_subgroup_size_stages     = 0;
-	VulkanQueueInfo                  queues[QUEUES_NUM];
+	vk::Instance                       instance                          = nullptr;
+	vk::DebugUtilsMessengerEXT         debug_messenger                   = nullptr;
+	vk::PhysicalDevice                 physical_device                   = nullptr;
+	vk::PhysicalDeviceProperties       physical_device_properties        = {};
+	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties = {};
+	vk::Device                         device                            = nullptr;
+	VmaAllocator                       allocator                         = nullptr;
+	bool                               memory_budget_ext_enabled         = false;
+	bool                               rt_extensions_enabled             = false;
+	bool                               subgroup_size_control_enabled     = false;
+	uint32_t                           subgroup_size                     = 0;
+	uint32_t                           min_subgroup_size                 = 0;
+	uint32_t                           max_subgroup_size                 = 0;
+	vk::ShaderStageFlags               required_subgroup_size_stages     = {};
+	VulkanQueueInfo                    queues[QUEUES_NUM];
 
-	[[nodiscard]] const VkPhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
+	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
 	}
 
-	[[nodiscard]] const VkPhysicalDeviceMemoryProperties&
+	[[nodiscard]] const vk::PhysicalDeviceMemoryProperties&
 	GetPhysicalDeviceMemoryProperties() const {
 		return physical_device_memory_properties;
 	}
 
-	[[nodiscard]] VkFormatProperties GetFormatProperties(VkFormat format) const {
+	[[nodiscard]] vk::FormatProperties GetFormatProperties(vk::Format format) const {
 		std::scoped_lock lock(m_format_properties_mutex);
 		auto [it, inserted] = m_format_properties.try_emplace(format);
 		if (inserted) {
-			vkGetPhysicalDeviceFormatProperties(physical_device, format, &it->second);
+			physical_device.getFormatProperties(format, &it->second);
 		}
 		return it->second;
 	}
 
-	[[nodiscard]] VkResult GetImageFormatProperties(VkFormat format, VkImageType type,
-	                                                VkImageTiling tiling, VkImageUsageFlags usage,
-	                                                VkImageCreateFlags       flags,
-	                                                VkImageFormatProperties* properties) const {
-		using Key =
-		    std::tuple<VkFormat, VkImageType, VkImageTiling, VkImageUsageFlags, VkImageCreateFlags>;
+	[[nodiscard]] vk::Result GetImageFormatProperties(vk::Format format, vk::ImageType type,
+	                                                  vk::ImageTiling            tiling,
+	                                                  vk::ImageUsageFlags        usage,
+	                                                  vk::ImageCreateFlags       flags,
+	                                                  vk::ImageFormatProperties* properties) const {
+		using Key = std::tuple<vk::Format, vk::ImageType, vk::ImageTiling, vk::ImageUsageFlags,
+		                       vk::ImageCreateFlags>;
 		std::scoped_lock lock(m_image_format_properties_mutex);
 		auto [it, inserted] =
 		    m_image_format_properties.try_emplace(Key {format, type, tiling, usage, flags});
 		if (inserted) {
-			it->second.first = vkGetPhysicalDeviceImageFormatProperties(
-			    physical_device, format, type, tiling, usage, flags, &it->second.second);
+			it->second.first = physical_device.getImageFormatProperties(format, type, tiling, usage,
+			                                                            flags, &it->second.second);
 		}
 		if (properties != nullptr) {
 			*properties = it->second.second;
@@ -85,18 +87,18 @@ struct VulkanInstance {
 		return it->second.first;
 	}
 
-	[[nodiscard]] VkDeviceSize StorageMinAlignment() const {
+	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
 		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
 		return alignment != 0 ? alignment : 1;
 	}
 
 private:
-	mutable std::mutex                             m_format_properties_mutex;
-	mutable std::map<VkFormat, VkFormatProperties> m_format_properties;
-	mutable std::mutex                             m_image_format_properties_mutex;
-	mutable std::map<
-	    std::tuple<VkFormat, VkImageType, VkImageTiling, VkImageUsageFlags, VkImageCreateFlags>,
-	    std::pair<VkResult, VkImageFormatProperties>>
+	mutable std::mutex                                 m_format_properties_mutex;
+	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
+	mutable std::mutex                                 m_image_format_properties_mutex;
+	mutable std::map<std::tuple<vk::Format, vk::ImageType, vk::ImageTiling, vk::ImageUsageFlags,
+	                            vk::ImageCreateFlags>,
+	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
 };
 

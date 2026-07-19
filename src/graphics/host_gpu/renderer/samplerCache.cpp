@@ -7,7 +7,7 @@
 
 namespace Libs::Graphics {
 
-VkSampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	Common::LockGuard lock(m_mutex);
 
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
@@ -33,12 +33,12 @@ VkSampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	auto to_vk_filter = [](uint8_t filter) {
 		switch (static_cast<Prospero::SamplerFilter>(filter)) {
 			case Prospero::SamplerFilter::kPoint:
-			case Prospero::SamplerFilter::kAnisoPoint: return VK_FILTER_NEAREST;
+			case Prospero::SamplerFilter::kAnisoPoint: return vk::Filter::eNearest;
 			case Prospero::SamplerFilter::kBilinear:
-			case Prospero::SamplerFilter::kAnisoLinear: return VK_FILTER_LINEAR;
+			case Prospero::SamplerFilter::kAnisoLinear: return vk::Filter::eLinear;
 			default: EXIT("unknown sampler filter: %u\n", filter);
 		}
-		return VK_FILTER_NEAREST;
+		return vk::Filter::eNearest;
 	};
 
 	const bool aniso = is_aniso_filter(mag_filter) || is_aniso_filter(min_filter);
@@ -61,53 +61,60 @@ VkSampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
 	}
 
-	VkSamplerCreateInfo sampler_info {};
+	vk::SamplerCreateInfo sampler_info {};
 
 	auto to_vk_address_mode = [](uint8_t clamp) {
 		switch (static_cast<Prospero::SamplerClampMode>(clamp)) {
-			case Prospero::SamplerClampMode::kWrap: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-			case Prospero::SamplerClampMode::kMirror: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-			case Prospero::SamplerClampMode::kClampLastTexel: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+			case Prospero::SamplerClampMode::kWrap: return vk::SamplerAddressMode::eRepeat;
+			case Prospero::SamplerClampMode::kMirror:
+				return vk::SamplerAddressMode::eMirroredRepeat;
+			case Prospero::SamplerClampMode::kClampLastTexel:
+				return vk::SamplerAddressMode::eClampToEdge;
 			case Prospero::SamplerClampMode::kMirrorOnceLastTexel:
-				return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+				return vk::SamplerAddressMode::eMirrorClampToEdge;
 			case Prospero::SamplerClampMode::kClampHalfBorder:
-				return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+				return vk::SamplerAddressMode::eClampToBorder;
 			case Prospero::SamplerClampMode::kMirrorOnceHalfBorder:
-				return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
-			case Prospero::SamplerClampMode::kClampBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+				return vk::SamplerAddressMode::eMirrorClampToEdge;
+			case Prospero::SamplerClampMode::kClampBorder:
+				return vk::SamplerAddressMode::eClampToBorder;
 			case Prospero::SamplerClampMode::kMirrorOnceBorder:
-				return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+				return vk::SamplerAddressMode::eMirrorClampToEdge;
 			default: EXIT("unknown clamp: %u\n", clamp);
 		}
-		return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	VkBorderColor border = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
+	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
+			border = vk::BorderColor::eIntTransparentBlack;
 			break;
-		case Prospero::SamplerBorderColor::kOpaqueBlack: border = VK_BORDER_COLOR_INT_OPAQUE_BLACK; break;
-		case Prospero::SamplerBorderColor::kOpaqueWhite: border = VK_BORDER_COLOR_INT_OPAQUE_WHITE; break;
+		case Prospero::SamplerBorderColor::kOpaqueBlack:
+			border = vk::BorderColor::eIntOpaqueBlack;
+			break;
+		case Prospero::SamplerBorderColor::kOpaqueWhite:
+			border = vk::BorderColor::eIntOpaqueWhite;
+			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
+			border = vk::BorderColor::eIntTransparentBlack;
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
 
-	sampler_info.sType     = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sampler_info.sType     = vk::StructureType::eSamplerCreateInfo;
 	sampler_info.pNext     = nullptr;
-	sampler_info.flags     = 0;
+	sampler_info.flags     = {};
 	sampler_info.magFilter = to_vk_filter(mag_filter);
 	sampler_info.minFilter = to_vk_filter(min_filter);
 	sampler_info.mipmapMode =
 	    (static_cast<Prospero::SamplerMipFilter>(mip_filter) == Prospero::SamplerMipFilter::kLinear
-	         ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-	         : VK_SAMPLER_MIPMAP_MODE_NEAREST);
+	         ? vk::SamplerMipmapMode::eLinear
+	         : vk::SamplerMipmapMode::eNearest);
 	sampler_info.addressModeU = to_vk_address_mode(r.ClampX());
 	sampler_info.addressModeV = to_vk_address_mode(r.ClampY());
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
@@ -116,17 +123,17 @@ VkSampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
-	sampler_info.compareOp               = static_cast<VkCompareOp>(r.DepthCompareFunc());
+	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
 	sampler_info.borderColor             = border;
 	sampler_info.unnormalizedCoordinates = (r.ForceUnormCoords() ? VK_TRUE : VK_FALSE);
 
 	if (r.ForceUnormCoords()) {
-		sampler_info.addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-		sampler_info.addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-		sampler_info.addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-		sampler_info.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		sampler_info.addressModeU     = vk::SamplerAddressMode::eClampToEdge;
+		sampler_info.addressModeV     = vk::SamplerAddressMode::eClampToEdge;
+		sampler_info.addressModeW     = vk::SamplerAddressMode::eClampToEdge;
+		sampler_info.mipmapMode       = vk::SamplerMipmapMode::eNearest;
 		sampler_info.minLod           = 0.0f;
 		sampler_info.maxLod           = 0.0f;
 		sampler_info.anisotropyEnable = VK_FALSE;
@@ -135,9 +142,10 @@ VkSampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		sampler_info.mipLodBias       = 0.0f;
 	}
 
-	VkSampler vk_sampler = nullptr;
-	vkCreateSampler(g_render_ctx->GetGraphicCtx()->device, &sampler_info, nullptr, &vk_sampler);
-	EXIT_NOT_IMPLEMENTED(vk_sampler == nullptr);
+	vk::Sampler vk_sampler = nullptr;
+	const auto  result =
+	    g_render_ctx->GetGraphicCtx()->device.createSampler(&sampler_info, nullptr, &vk_sampler);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
 
 	m_samplers.emplace(key, vk_sampler);
 	return vk_sampler;

@@ -1,8 +1,9 @@
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -36,16 +37,12 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
-uint32_t DescriptorPackedStride(const DescriptorValue& descriptor) {
-	const auto stride       = (descriptor.dwords[1] >> 16u) & 0x3fffu;
-	const auto swizzle      = (descriptor.dwords[1] >> 31u) & 1u;
-	const auto index_stride = (descriptor.dwords[3] >> 21u) & 3u;
-	const auto add_tid      = (descriptor.dwords[3] >> 23u) & 1u;
-	return stride | (swizzle << 14u) | (index_stride << 16u) | (add_tid << 20u);
-}
-
-uint32_t DescriptorBufferFormat(const DescriptorValue& descriptor) {
-	return (descriptor.dwords[3] >> 12u) & 0x7fu;
+bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
+	if (descriptor.dword_count != std::size(result.fields)) {
+		return false;
+	}
+	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
+	return true;
 }
 
 uint64_t AddressSpecialization(const AddressResource&           resource,
@@ -130,10 +127,16 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		return false;
 	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& buffer     = program.info.buffers[i];
-		const auto& descriptor = snapshot.buffers[i];
-		if (buffer.packed_stride != DescriptorPackedStride(descriptor) ||
-		    buffer.descriptor_format != DescriptorBufferFormat(descriptor)) {
+		const auto&          buffer = program.info.buffers[i];
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], descriptor)) {
+			if (error != nullptr) {
+				*error = fmt::format("buffer descriptor {} has invalid width", i);
+			}
+			return false;
+		}
+		if (buffer.packed_stride != descriptor.PackedStride() ||
+		    buffer.descriptor_format != descriptor.Format()) {
 			if (error != nullptr) {
 				*error = fmt::format("buffer descriptor {} no longer matches specialization", i);
 			}
@@ -297,8 +300,15 @@ bool SpecializeResources(Program* program, const ResourceSnapshot& snapshot, std
 
 	auto next = program->info;
 	for (uint32_t i = 0; i < next.buffers.size(); i++) {
-		next.buffers[i].packed_stride     = DescriptorPackedStride(snapshot.buffers[i]);
-		next.buffers[i].descriptor_format = DescriptorBufferFormat(snapshot.buffers[i]);
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], descriptor)) {
+			if (error != nullptr) {
+				*error = fmt::format("buffer descriptor {} has invalid width", i);
+			}
+			return false;
+		}
+		next.buffers[i].packed_stride     = descriptor.PackedStride();
+		next.buffers[i].descriptor_format = descriptor.Format();
 	}
 	for (uint32_t i = 0; i < next.addresses.size(); i++) {
 		next.addresses[i].specialized_base =

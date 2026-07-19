@@ -2,8 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RENDERDOC_H_
 
 #include "common/common.h"
-
-#include <vulkan/vulkan_core.h>
+#include "graphics/host_gpu/vulkanCommon.h"
 
 struct SDL_Window;
 
@@ -11,7 +10,7 @@ namespace Libs::Graphics {
 
 void RenderDocInit();
 bool RenderDocIsLoaded();
-void RenderDocSetActiveWindow(VkInstance instance, SDL_Window* window);
+void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window);
 void RenderDocRequestCapture();
 void RenderDocOnPresent();
 

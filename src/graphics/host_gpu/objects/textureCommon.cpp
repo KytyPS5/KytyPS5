@@ -5,8 +5,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +15,127 @@
 #include <cstring>
 
 namespace Libs::Graphics {
+namespace {
+
+struct RenderTargetFormatMapping {
+	Prospero::ChannelLayout layout;
+	Prospero::ChannelType   type;
+	Prospero::ChannelOrder  order;
+	RenderTargetFormatInfo  info;
+};
+
+constexpr RenderTargetFormatMapping kRenderTargetFormats[] = {
+    {Prospero::ChannelLayout::k8_8,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR8G8Unorm, 2}},
+    {Prospero::ChannelLayout::k8_8_8_8,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR8G8B8A8Unorm, 4}},
+    {Prospero::ChannelLayout::k8_8_8_8,
+     Prospero::ChannelType::kSNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR8G8B8A8Snorm, 4}},
+    {Prospero::ChannelLayout::k8_8_8_8,
+     Prospero::ChannelType::kSrgb,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR8G8B8A8Srgb, 4}},
+    {Prospero::ChannelLayout::k8_8_8_8,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kAlt,
+     {vk::Format::eB8G8R8A8Unorm, 4}},
+    {Prospero::ChannelLayout::k8_8_8_8,
+     Prospero::ChannelType::kSNorm,
+     Prospero::ChannelOrder::kAlt,
+     {vk::Format::eB8G8R8A8Snorm, 4}},
+    {Prospero::ChannelLayout::k8_8_8_8,
+     Prospero::ChannelType::kSrgb,
+     Prospero::ChannelOrder::kAlt,
+     {vk::Format::eB8G8R8A8Srgb, 4}},
+    {Prospero::ChannelLayout::k5_5_5_1,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR5G5B5A1UnormPack16, 2}},
+    {Prospero::ChannelLayout::k4_4_4_4,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kReversed,
+     {vk::Format::eB4G4R4A4UnormPack16, 2}},
+    {Prospero::ChannelLayout::k10_10_10_2,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eA2B10G10R10UnormPack32, 4}},
+    {Prospero::ChannelLayout::k10_10_10_2,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kAlt,
+     {vk::Format::eA2R10G10B10UnormPack32, 4}},
+    {Prospero::ChannelLayout::k11_11_10,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eB10G11R11UfloatPack32, 4}},
+    {Prospero::ChannelLayout::k16,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16Unorm, 2}},
+    {Prospero::ChannelLayout::k16,
+     Prospero::ChannelType::kUInt,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16Uint, 2}},
+    {Prospero::ChannelLayout::k16,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16Sfloat, 2}},
+    {Prospero::ChannelLayout::k16_16,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16G16Unorm, 4}},
+    {Prospero::ChannelLayout::k16_16,
+     Prospero::ChannelType::kSNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16G16Snorm, 4}},
+    {Prospero::ChannelLayout::k16_16,
+     Prospero::ChannelType::kUInt,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16G16Uint, 4}},
+    {Prospero::ChannelLayout::k16_16,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16G16Sfloat, 4}},
+    {Prospero::ChannelLayout::k16_16_16_16,
+     Prospero::ChannelType::kUNorm,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16G16B16A16Unorm, 8}},
+    {Prospero::ChannelLayout::k16_16_16_16,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR16G16B16A16Sfloat, 8}},
+    {Prospero::ChannelLayout::k16_16_16_16,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kAlt,
+     {vk::Format::eR16G16B16A16Sfloat, 8, Prospero::ColorMappingBgra}},
+    {Prospero::ChannelLayout::k16_16_16_16,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kReversed,
+     {vk::Format::eR16G16B16A16Sfloat, 8, Prospero::ColorMappingAbgr}},
+    {Prospero::ChannelLayout::k32,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR32Sfloat, 4}},
+    {Prospero::ChannelLayout::k32_32,
+     Prospero::ChannelType::kUInt,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR32G32Uint, 8}},
+    {Prospero::ChannelLayout::k32_32,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR32G32Sfloat, 8}},
+    {Prospero::ChannelLayout::k32_32_32_32,
+     Prospero::ChannelType::kFloat,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR32G32B32A32Sfloat, 16}},
+};
+
+} // namespace
 
 // TODO: cleanup!
 RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_t raw_type,
@@ -21,132 +143,25 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	const auto layout = static_cast<Prospero::ChannelLayout>(raw_layout);
 	const auto type   = static_cast<Prospero::ChannelType>(raw_type);
 	const auto order  = static_cast<Prospero::ChannelOrder>(raw_order);
-	const auto is     = [=](Prospero::ChannelLayout l, Prospero::ChannelType t,
-	                        Prospero::ChannelOrder o) {
-		return layout == l && type == t && order == o;
-	};
 
 	if (layout == Prospero::ChannelLayout::k8 && type == Prospero::ChannelType::kUNorm &&
 	    raw_order <= Prospero::GpuEnumValue(Prospero::ChannelOrder::kAltReversed)) {
-		return {VK_FORMAT_R8_UNORM, 1};
+		return {vk::Format::eR8Unorm, 1};
 	}
-	if (is(Prospero::ChannelLayout::k8_8, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R8G8_UNORM, 2};
-	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R8G8B8A8_UNORM, 4};
-	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R8G8B8A8_SNORM, 4};
-	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R8G8B8A8_SRGB, 4};
-	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kAlt)) {
-		return {VK_FORMAT_B8G8R8A8_UNORM, 4};
-	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm,
-	       Prospero::ChannelOrder::kAlt)) {
-		return {VK_FORMAT_B8G8R8A8_SNORM, 4};
-	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb,
-	       Prospero::ChannelOrder::kAlt)) {
-		return {VK_FORMAT_B8G8R8A8_SRGB, 4};
-	}
-	if (is(Prospero::ChannelLayout::k5_5_5_1, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R5G5B5A1_UNORM_PACK16, 2};
-	}
-	if (is(Prospero::ChannelLayout::k4_4_4_4, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kReversed)) {
-		return {VK_FORMAT_B4G4R4A4_UNORM_PACK16, 2};
-	}
-	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
-	}
-	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kAlt)) {
-		return {VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4};
-	}
-	if (is(Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4};
-	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16_UNORM, 2};
-	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUInt,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16_UINT, 2};
-	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16_SFLOAT, 2};
-	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16G16_UNORM, 4};
-	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kSNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16G16_SNORM, 4};
-	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUInt,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16G16_UINT, 4};
-	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16G16_SFLOAT, 4};
-	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUNorm,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16G16B16A16_UNORM, 8};
-	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
-	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kAlt)) {
-		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, Prospero::ColorMappingBgra};
-	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kReversed)) {
-		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, Prospero::ColorMappingAbgr};
-	}
-	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R32_SFLOAT, 4};
-	}
-	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kUInt,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R32G32_UINT, 8};
-	}
-	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R32G32_SFLOAT, 8};
-	}
-	if (is(Prospero::ChannelLayout::k32_32_32_32, Prospero::ChannelType::kFloat,
-	       Prospero::ChannelOrder::kStandard)) {
-		return {VK_FORMAT_R32G32B32A32_SFLOAT, 16};
+	for (const auto& mapping: kRenderTargetFormats) {
+		if (mapping.layout == layout && mapping.type == type && mapping.order == order) {
+			return mapping.info;
+		}
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n", raw_layout,
 	     raw_type, raw_order);
 }
 
-static uint64_t TextureUploadLevelSrcOffset(const TileSizeOffset& level_size) {
+static uint64_t GetLevelSrcOffset(const TileSizeOffset& level_size) {
 	return (level_size.src_size != 0 ? level_size.src_offset : level_size.offset);
 }
 
-static uint64_t TextureUploadLevelSrcSize(const TileSizeOffset& level_size) {
+static uint64_t GetLevelSrcSize(const TileSizeOffset& level_size) {
 	return (level_size.src_size != 0 ? level_size.src_size : level_size.size);
 }
 
@@ -156,11 +171,11 @@ uint64_t TextureUploadSliceSourceOffset(const TextureUploadLayout& layout, uint3
 	if (level >= 16 || layout.level_sizes[level].size == 0) {
 		EXIT("invalid texture upload slice source, level=%u slice=%u\n", level, slice);
 	}
-	const auto level_offset = TextureUploadLevelSrcOffset(layout.level_sizes[level]);
+	const auto level_offset = GetLevelSrcOffset(layout.level_sizes[level]);
 	const auto slice_stride =
 	    source_slice_layout == TextureUploadSliceLayout::MipChainPerSlice
 	        ? (layout.source_slice_stride != 0 ? layout.source_slice_stride : layout.slice_stride)
-	        : TextureUploadLevelSrcSize(layout.level_sizes[level]);
+	        : GetLevelSrcSize(layout.level_sizes[level]);
 	if (slice_stride != 0 && slice > (UINT64_MAX - level_offset) / slice_stride) {
 		EXIT("texture upload slice source offset overflow, level=%u slice=%u\n", level, slice);
 	}
@@ -178,7 +193,7 @@ uint64_t TextureCalcUploadSize(const TextureUploadLayout&          layout,
 	}
 
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto src_size = TextureUploadLevelSrcSize(layout.level_sizes[level]);
+		const auto src_size = GetLevelSrcSize(layout.level_sizes[level]);
 		for (uint32_t z = 0; z < depth; z++) {
 			size = std::max<uint64_t>(
 			    size,
@@ -191,7 +206,7 @@ uint64_t TextureCalcUploadSize(const TextureUploadLayout&          layout,
 
 void TextureCopyBufferBytes(GraphicContext* ctx, VulkanBuffer* src_buffer,
                             uint64_t src_buffer_offset, uint64_t copy_size,
-                            UtilScratchBuffer* dst) {
+                            Transfer::ScratchBuffer* dst) {
 	EXIT_IF(ctx == nullptr);
 	EXIT_IF(src_buffer == nullptr);
 	EXIT_IF(dst == nullptr);
@@ -209,7 +224,7 @@ void TextureCopyBufferBytes(GraphicContext* ctx, VulkanBuffer* src_buffer,
 		return;
 	}
 
-	if ((src_buffer->memory.property & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+	if (src_buffer->memory.property & vk::MemoryPropertyFlagBits::eHostVisible) {
 		void* data = nullptr;
 		VulkanMapMemory(ctx, &src_buffer->memory, &data);
 		std::memcpy(dst->Data(), static_cast<const uint8_t*>(data) + src_buffer_offset, available);
@@ -218,12 +233,12 @@ void TextureCopyBufferBytes(GraphicContext* ctx, VulkanBuffer* src_buffer,
 	}
 
 	VulkanBuffer readback {};
-	readback.usage           = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	readback.memory.property = static_cast<uint32_t>(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) |
-	                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-	                           VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+	readback.usage           = vk::BufferUsageFlagBits::eTransferDst;
+	readback.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
+	                           vk::MemoryPropertyFlagBits::eHostCoherent |
+	                           vk::MemoryPropertyFlagBits::eHostCached;
 	VulkanCreateBuffer(ctx, (src_buffer_offset + available + 3u) & ~uint64_t {3}, &readback);
-	UtilCopyBuffer(src_buffer, &readback, src_buffer_offset + available);
+	Transfer::CopyBuffer(src_buffer, &readback, src_buffer_offset + available);
 
 	void* data = nullptr;
 	VulkanMapMemory(ctx, &readback.memory, &data);
@@ -233,25 +248,25 @@ void TextureCopyBufferBytes(GraphicContext* ctx, VulkanBuffer* src_buffer,
 	VulkanDeleteBuffer(ctx, &readback);
 }
 
-VkComponentSwizzle TextureGetComponentSwizzle(uint8_t s) {
+vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t s) {
 	switch (static_cast<Prospero::CompSwizzle>(s)) {
-		case Prospero::CompSwizzle::kZero: return VK_COMPONENT_SWIZZLE_ZERO;
-		case Prospero::CompSwizzle::kOne: return VK_COMPONENT_SWIZZLE_ONE;
-		case Prospero::CompSwizzle::kRed: return VK_COMPONENT_SWIZZLE_R;
-		case Prospero::CompSwizzle::kGreen: return VK_COMPONENT_SWIZZLE_G;
-		case Prospero::CompSwizzle::kBlue: return VK_COMPONENT_SWIZZLE_B;
-		case Prospero::CompSwizzle::kAlpha: return VK_COMPONENT_SWIZZLE_A;
+		case Prospero::CompSwizzle::kZero: return vk::ComponentSwizzle::eZero;
+		case Prospero::CompSwizzle::kOne: return vk::ComponentSwizzle::eOne;
+		case Prospero::CompSwizzle::kRed: return vk::ComponentSwizzle::eR;
+		case Prospero::CompSwizzle::kGreen: return vk::ComponentSwizzle::eG;
+		case Prospero::CompSwizzle::kBlue: return vk::ComponentSwizzle::eB;
+		case Prospero::CompSwizzle::kAlpha: return vk::ComponentSwizzle::eA;
 		default: EXIT("unknown swizzle: %d\n", static_cast<int>(s));
 	}
-	return VK_COMPONENT_SWIZZLE_IDENTITY;
+	return vk::ComponentSwizzle::eIdentity;
 }
 
 static uint32_t TextureGetDstSel(uint32_t swizzle, uint32_t channel) {
 	return (swizzle >> (channel * 3u)) & 0x7u;
 }
 
-VkComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
-	VkComponentMapping components {};
+vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
+	vk::ComponentMapping components {};
 	components.r = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 0)));
 	components.g = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 1)));
 	components.b = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 2)));
@@ -259,57 +274,63 @@ VkComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
 	return components;
 }
 
-bool TextureCheckFormat(GraphicContext* ctx, VkImageCreateInfo* image_info) {
-	VkImageFormatProperties props {};
+bool TextureCheckFormat(GraphicContext* ctx, vk::ImageCreateInfo* image_info) {
+	vk::ImageFormatProperties props {};
 	if (ctx->GetImageFormatProperties(image_info->format, image_info->imageType, image_info->tiling,
 	                                  image_info->usage, image_info->flags,
-	                                  &props) == VK_ERROR_FORMAT_NOT_SUPPORTED) {
-		auto apply_fallback = [&](VkFormat replacement, const char* message) {
+	                                  &props) == vk::Result::eErrorFormatNotSupported) {
+		auto apply_fallback = [&](vk::Format replacement, const char* message) {
 			image_info->format = replacement;
 			const bool result  = TextureCheckFormat(ctx, image_info);
 			LOGF("%s [%s]\n", message, (!result ? "FAIL" : "SUCCESS"));
 			return result;
 		};
 
-		if (image_info->format == VK_FORMAT_R8G8B8A8_SRGB) {
+		if (image_info->format == vk::Format::eR8G8B8A8Srgb) {
 			// TODO() convert SRGB -> LINEAR in shader
-			return apply_fallback(VK_FORMAT_R8G8B8A8_UNORM,
-			                      "replace VK_FORMAT_R8G8B8A8_SRGB => VK_FORMAT_R8G8B8A8_UNORM");
+			return apply_fallback(
+			    vk::Format::eR8G8B8A8Unorm,
+			    "replace vk::Format::eR8G8B8A8Srgb => vk::Format::eR8G8B8A8Unorm");
 		}
-		if (image_info->format == VK_FORMAT_B8G8R8A8_SRGB) {
+		if (image_info->format == vk::Format::eB8G8R8A8Srgb) {
 			// TODO() convert SRGB -> LINEAR in shader
-			return apply_fallback(VK_FORMAT_B8G8R8A8_UNORM,
-			                      "replace VK_FORMAT_B8G8R8A8_SRGB => VK_FORMAT_B8G8R8A8_UNORM");
+			return apply_fallback(
+			    vk::Format::eB8G8R8A8Unorm,
+			    "replace vk::Format::eB8G8R8A8Srgb => vk::Format::eB8G8R8A8Unorm");
 		}
 		return false;
 	}
 	return true;
 }
 
-static bool TextureCheckFormatExact(GraphicContext* ctx, const VkImageCreateInfo& image_info) {
-	VkImageFormatProperties props {};
+static bool TextureCheckFormatExact(GraphicContext* ctx, const vk::ImageCreateInfo& image_info) {
+	vk::ImageFormatProperties props {};
 	return ctx->GetImageFormatProperties(image_info.format, image_info.imageType, image_info.tiling,
 	                                     image_info.usage, image_info.flags,
-	                                     &props) != VK_ERROR_FORMAT_NOT_SUPPORTED;
+	                                     &props) != vk::Result::eErrorFormatNotSupported;
 }
 
-bool TextureCheckStorageSwizzle(VkImageCreateInfo* image_info, VkComponentMapping* components) {
-	if ((image_info->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0) {
-		if (components->r == VK_COMPONENT_SWIZZLE_R && components->g == VK_COMPONENT_SWIZZLE_G &&
-		    components->b == VK_COMPONENT_SWIZZLE_B && components->a == VK_COMPONENT_SWIZZLE_A) {
+bool TextureCheckStorageSwizzle(vk::ImageCreateInfo* image_info, vk::ComponentMapping* components) {
+	if (image_info->usage & vk::ImageUsageFlagBits::eStorage) {
+		if (components->r == vk::ComponentSwizzle::eR &&
+		    components->g == vk::ComponentSwizzle::eG &&
+		    components->b == vk::ComponentSwizzle::eB &&
+		    components->a == vk::ComponentSwizzle::eA) {
 			return true;
 		}
 
-		if (components->r == VK_COMPONENT_SWIZZLE_B && components->g == VK_COMPONENT_SWIZZLE_G &&
-		    components->b == VK_COMPONENT_SWIZZLE_R && components->a == VK_COMPONENT_SWIZZLE_A &&
-		    image_info->format == VK_FORMAT_R8G8B8A8_SRGB) {
-			LOGF("replace VK_FORMAT_R8G8B8A8_SRGB => VK_FORMAT_B8G8R8A8_SRGB\n");
+		if (components->r == vk::ComponentSwizzle::eB &&
+		    components->g == vk::ComponentSwizzle::eG &&
+		    components->b == vk::ComponentSwizzle::eR &&
+		    components->a == vk::ComponentSwizzle::eA &&
+		    image_info->format == vk::Format::eR8G8B8A8Srgb) {
+			LOGF("replace vk::Format::eR8G8B8A8Srgb => vk::Format::eB8G8R8A8Srgb\n");
 
-			components->r      = VK_COMPONENT_SWIZZLE_R;
-			components->g      = VK_COMPONENT_SWIZZLE_G;
-			components->b      = VK_COMPONENT_SWIZZLE_B;
-			components->a      = VK_COMPONENT_SWIZZLE_A;
-			image_info->format = VK_FORMAT_B8G8R8A8_SRGB;
+			components->r      = vk::ComponentSwizzle::eR;
+			components->g      = vk::ComponentSwizzle::eG;
+			components->b      = vk::ComponentSwizzle::eB;
+			components->a      = vk::ComponentSwizzle::eA;
+			image_info->format = vk::Format::eB8G8R8A8Srgb;
 			return true;
 		}
 
@@ -320,35 +341,36 @@ bool TextureCheckStorageSwizzle(VkImageCreateInfo* image_info, VkComponentMappin
 	return true;
 }
 
-VkImageUsageFlags TextureGetUsage(TextureFormatUsage usage) {
-	VkImageUsageFlags vk_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+vk::ImageUsageFlags TextureGetUsage(TextureFormatUsage usage) {
+	vk::ImageUsageFlags vk_usage =
+	    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
 	if (TextureHasFormatUsage(usage, TextureFormatUsage::Sampled)) {
-		vk_usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+		vk_usage |= vk::ImageUsageFlagBits::eSampled;
 	}
 	if (TextureHasFormatUsage(usage, TextureFormatUsage::Storage)) {
-		vk_usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+		vk_usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return vk_usage;
 }
 
-VkImageUsageFlags TextureGetViewUsage(TextureFormatUsage usage) {
-	VkImageUsageFlags vk_usage = 0;
+vk::ImageUsageFlags TextureGetViewUsage(TextureFormatUsage usage) {
+	vk::ImageUsageFlags vk_usage = {};
 	if (TextureHasFormatUsage(usage, TextureFormatUsage::Sampled)) {
-		vk_usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+		vk_usage |= vk::ImageUsageFlagBits::eSampled;
 	}
 	if (TextureHasFormatUsage(usage, TextureFormatUsage::Storage)) {
-		vk_usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+		vk_usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return vk_usage;
 }
 
-VkFormat TextureGetFormat(uint32_t fmt, [[maybe_unused]] TextureFormatUsage usage) {
-	const auto vk_format = Prospero::SurfaceFormat(fmt);
-	if (vk_format != VK_FORMAT_UNDEFINED) {
+vk::Format TextureGetFormat(uint32_t fmt) {
+	const auto vk_format = VulkanFormat(fmt);
+	if (vk_format != vk::Format::eUndefined) {
 		return vk_format;
 	}
 	EXIT("unknown format: fmt = %u\n", fmt);
-	return VK_FORMAT_UNDEFINED;
+	return vk::Format::eUndefined;
 }
 
 static uint32_t AlignUpU32(uint32_t value, uint32_t alignment) {
@@ -426,16 +448,17 @@ static bool CalcStandard4kbVolumeMipLayout(uint32_t format, uint32_t pitch, uint
 	return out->block_slice_size != 0;
 }
 
-uint32_t TextureGetAtlasSliceYStride(VkFormat format, uint32_t mip_height, uint32_t depth,
+uint32_t TextureGetAtlasSliceYStride(vk::Format format, uint32_t mip_height, uint32_t depth,
                                      uint64_t levels) {
-	return (depth > 1 && levels > 1 && UtilIsBcFormat(format) ? AlignUpU32(mip_height, 4u)
-	                                                          : mip_height);
+	return (depth > 1 && levels > 1 && Transfer::IsBlockCompressedFormat(format)
+	            ? AlignUpU32(mip_height, 4u)
+	            : mip_height);
 }
 
-uint32_t TextureCalcStackedImageHeight(VkFormat format, uint32_t height, uint32_t depth,
+uint32_t TextureCalcStackedImageHeight(vk::Format format, uint32_t height, uint32_t depth,
                                        uint64_t levels) {
 	auto image_height = height * depth;
-	if (depth <= 1 || levels <= 1 || !UtilIsBcFormat(format)) {
+	if (depth <= 1 || levels <= 1 || !Transfer::IsBlockCompressedFormat(format)) {
 		return image_height;
 	}
 
@@ -452,7 +475,7 @@ uint32_t TextureCalcStackedImageHeight(VkFormat format, uint32_t height, uint32_
 	return image_height;
 }
 
-uint32_t TextureCalcMipmapAtlasImageHeight(VkFormat format, uint32_t width, uint32_t height,
+uint32_t TextureCalcMipmapAtlasImageHeight(vk::Format format, uint32_t width, uint32_t height,
                                            uint32_t depth, uint64_t levels) {
 	auto image_height = height * depth;
 	if (levels <= 1) {
@@ -461,7 +484,7 @@ uint32_t TextureCalcMipmapAtlasImageHeight(VkFormat format, uint32_t width, uint
 
 	uint32_t mip_height = height;
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto mipmap_offset = UtilCalcMipmapOffset(level, width, height);
+		const auto mipmap_offset = Transfer::MipmapAtlasOffset(level, width, height);
 		const auto mip_bottom =
 		    static_cast<uint32_t>(mipmap_offset.second) +
 		    TextureGetAtlasSliceYStride(format, mip_height, depth, levels) * depth;
@@ -495,20 +518,20 @@ bool TextureCanCreateCubeView(uint64_t type, uint32_t base_array, uint32_t layer
 	       layer_count % 6u == 0;
 }
 
-VkComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* vk_obj, VulkanMemory* mem,
-                                      const TextureImageCreateParams& params) {
+vk::ComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* vk_obj,
+                                        const TextureImageCreateParams& params) {
 	EXIT_IF(ctx == nullptr);
 	EXIT_IF(vk_obj == nullptr);
-	EXIT_IF(mem == nullptr);
 	EXIT_IF(params.owner == nullptr);
 
 	const bool array_texture  = TextureIsLayeredTexture(params.type);
 	const bool volume_texture = TextureIs3DTexture(params.type);
 
-	auto pixel_format = TextureGetFormat(params.fmt, params.format_usage);
-	EXIT_NOT_IMPLEMENTED(pixel_format == VK_FORMAT_UNDEFINED);
+	auto pixel_format = TextureGetFormat(params.fmt);
+	EXIT_NOT_IMPLEMENTED(pixel_format == vk::Format::eUndefined);
 	EXIT_NOT_IMPLEMENTED(params.width == 0);
 	EXIT_NOT_IMPLEMENTED(params.height == 0);
+	EXIT_NOT_IMPLEMENTED(params.depth == 0);
 	EXIT_NOT_IMPLEMENTED(params.levels == 0 || params.levels > 16);
 
 	uint32_t image_height = 0;
@@ -529,30 +552,31 @@ VkComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* vk_obj, 
 		image_mips = static_cast<uint32_t>(params.levels);
 	}
 
-	VkComponentMapping components =
+	vk::ComponentMapping components =
 	    TextureGetComponentMapping(static_cast<uint32_t>(params.swizzle));
 
-	VkImageCreateInfo image_info {};
-	image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	vk::ImageCreateInfo image_info {};
+	image_info.sType = vk::StructureType::eImageCreateInfo;
 	image_info.pNext = nullptr;
 	image_info.flags =
 	    (params.allow_cube_view && TextureCanCreateCubeView(params.type, 0, params.depth)
-	         ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT
-	         : 0) |
-	    (volume_texture ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0) |
-	    (params.compatible_format_views ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
-	image_info.imageType     = (volume_texture ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
+	         ? vk::ImageCreateFlagBits::eCubeCompatible
+	         : vk::ImageCreateFlags {}) |
+	    (volume_texture ? vk::ImageCreateFlagBits::e2DArrayCompatible : vk::ImageCreateFlags {}) |
+	    (params.compatible_format_views ? vk::ImageCreateFlagBits::eMutableFormat
+	                                    : vk::ImageCreateFlags {});
+	image_info.imageType     = (volume_texture ? vk::ImageType::e3D : vk::ImageType::e2D);
 	image_info.extent.width  = static_cast<uint32_t>(params.width);
 	image_info.extent.height = image_height;
 	image_info.extent.depth  = (volume_texture ? params.depth : 1);
 	image_info.mipLevels     = image_mips;
 	image_info.arrayLayers   = (array_texture ? params.depth : 1);
 	image_info.format        = pixel_format;
-	image_info.tiling        = VK_IMAGE_TILING_OPTIMAL;
-	image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	image_info.tiling        = vk::ImageTiling::eOptimal;
+	image_info.initialLayout = vk::ImageLayout::eUndefined;
 	image_info.usage         = TextureGetUsage(params.format_usage);
-	image_info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-	image_info.samples       = VK_SAMPLE_COUNT_1_BIT;
+	image_info.sharingMode   = vk::SharingMode::eExclusive;
+	image_info.samples       = vk::SampleCountFlagBits::e1;
 
 	const bool storage_view = TextureHasFormatUsage(params.view_usage, TextureFormatUsage::Storage);
 	if (storage_view && !TextureCheckStorageSwizzle(&image_info, &components)) {
@@ -565,10 +589,10 @@ VkComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* vk_obj, 
 			LOGF("\t %s swizzle 0x%08" PRIx64 " is not supported, using identity mapping\n",
 			     params.owner, params.swizzle);
 		}
-		components.r = VK_COMPONENT_SWIZZLE_R;
-		components.g = VK_COMPONENT_SWIZZLE_G;
-		components.b = VK_COMPONENT_SWIZZLE_B;
-		components.a = VK_COMPONENT_SWIZZLE_A;
+		components.r = vk::ComponentSwizzle::eR;
+		components.g = vk::ComponentSwizzle::eG;
+		components.b = vk::ComponentSwizzle::eB;
+		components.a = vk::ComponentSwizzle::eA;
 	}
 
 	const auto view_checked_format = image_info.format;
@@ -610,20 +634,16 @@ VkComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* vk_obj, 
 	vk_obj->image         = nullptr;
 	vk_obj->layout        = image_info.initialLayout;
 
-	UtilResetImageViews(vk_obj);
+	vk_obj->memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
 
-	mem->property = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	bool created = VulkanCreateImage(ctx, &image_info, vk_obj, mem);
+	bool created = VulkanCreateImage(ctx, image_info, vk_obj);
 	EXIT_NOT_IMPLEMENTED(!created);
-
-	vk_obj->memory = *mem;
 
 	return components;
 }
 
 void TextureCreateImageViews(GraphicContext* ctx, VulkanImage* vk_obj,
-                             VkComponentMapping components, uint64_t type, uint32_t base_array,
+                             vk::ComponentMapping components, uint64_t type, uint32_t base_array,
                              uint32_t base_level, uint32_t level_count, uint32_t depth,
                              bool allow_cube_view, TextureFormatUsage view_usage) {
 	EXIT_IF(ctx == nullptr);
@@ -635,46 +655,48 @@ void TextureCreateImageViews(GraphicContext* ctx, VulkanImage* vk_obj,
 	const auto layer_count     = (layered_texture && base_array < depth ? depth - base_array : 1u);
 	const auto volume_slices   = std::max(depth >> base_level, 1u);
 
-	VkImageViewUsageCreateInfo usage_info {};
-	usage_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+	vk::ImageViewUsageCreateInfo usage_info {};
+	usage_info.sType = vk::StructureType::eImageViewUsageCreateInfo;
 	usage_info.pNext = nullptr;
 	usage_info.usage = TextureGetViewUsage(view_usage);
 
-	VkImageViewCreateInfo create_info {};
-	create_info.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	create_info.pNext                           = (usage_info.usage != 0 ? &usage_info : nullptr);
-	create_info.flags                           = 0;
+	vk::ImageViewCreateInfo create_info {};
+	create_info.sType                           = vk::StructureType::eImageViewCreateInfo;
+	create_info.pNext                           = (usage_info.usage ? &usage_info : nullptr);
+	create_info.flags                           = {};
 	create_info.image                           = vk_obj->image;
-	create_info.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
+	create_info.viewType                        = vk::ImageViewType::e2D;
 	create_info.format                          = vk_obj->format;
 	create_info.components                      = components;
-	create_info.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	create_info.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	create_info.subresourceRange.baseArrayLayer = (layered_texture ? base_array : 0);
 	create_info.subresourceRange.baseMipLevel   = base_level;
 	create_info.subresourceRange.layerCount     = layer_count;
 	create_info.subresourceRange.levelCount     = level_count;
 	if (volume_texture) {
-		create_info.viewType                        = VK_IMAGE_VIEW_TYPE_3D;
+		create_info.viewType                        = vk::ImageViewType::e3D;
 		create_info.subresourceRange.baseArrayLayer = 0;
 		create_info.subresourceRange.layerCount     = 1;
 	} else if (allow_cube_view && TextureCanCreateCubeView(type, base_array, layer_count)) {
 		create_info.viewType =
-		    (layer_count > 6 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE);
+		    (layer_count > 6 ? vk::ImageViewType::eCubeArray : vk::ImageViewType::eCube);
 	} else if (layered_texture) {
-		create_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+		create_info.viewType = vk::ImageViewType::e2DArray;
 	}
 
-	vkCreateImageView(ctx->device, &create_info, nullptr,
-	                  &vk_obj->image_view[VulkanImage::VIEW_DEFAULT]);
-	EXIT_NOT_IMPLEMENTED(vk_obj->image_view[VulkanImage::VIEW_DEFAULT] == nullptr);
+	auto create_view = [&](int index) {
+		const auto result =
+		    ctx->device.createImageView(&create_info, nullptr, &vk_obj->image_view[index]);
+		if (result != vk::Result::eSuccess || vk_obj->image_view[index] == nullptr) {
+			EXIT("failed to create texture image view: result=%d format=%d index=%d\n",
+			     static_cast<int>(result), static_cast<int>(create_info.format), index);
+		}
+	};
+	create_view(VulkanImage::VIEW_DEFAULT);
 
-	if (!volume_texture || depth >= 1) {
-		create_info.viewType                    = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-		create_info.subresourceRange.layerCount = (volume_texture ? volume_slices : layer_count);
-		vkCreateImageView(ctx->device, &create_info, nullptr,
-		                  &vk_obj->image_view[VulkanImage::VIEW_DEFAULT_ARRAY]);
-		EXIT_NOT_IMPLEMENTED(vk_obj->image_view[VulkanImage::VIEW_DEFAULT_ARRAY] == nullptr);
-	}
+	create_info.viewType                    = vk::ImageViewType::e2DArray;
+	create_info.subresourceRange.layerCount = volume_texture ? volume_slices : layer_count;
+	create_view(VulkanImage::VIEW_DEFAULT_ARRAY);
 }
 
 static uint64_t CalcTextureSliceStride(const TileSizeOffset* level_sizes, uint64_t levels,
@@ -827,11 +849,10 @@ TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64
 	return layout;
 }
 
-std::vector<BufferImageCopy>
-TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_format, uint32_t width,
-                          uint32_t height, uint32_t depth, uint64_t levels, bool array_texture,
-                          bool volume_texture, TextureUploadDestination destination,
-                          TextureUploadSliceLayout slice_layout) {
+std::vector<BufferImageCopy> TextureBuildUploadRegions(
+    const TextureUploadLayout& layout, vk::Format image_format, uint32_t width, uint32_t height,
+    uint32_t depth, uint64_t levels, bool array_texture, bool volume_texture,
+    TextureUploadDestination destination, TextureUploadSliceLayout slice_layout) {
 	uint32_t mip_width  = width;
 	uint32_t mip_height = height;
 	uint32_t mip_pitch  = layout.pitch;
@@ -840,7 +861,7 @@ TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_form
 	for (uint32_t i = 0; i < levels; i++) {
 		EXIT_NOT_IMPLEMENTED(layout.level_sizes[i].size == 0);
 
-		const auto mipmap_offset = UtilCalcMipmapOffset(i, width, height);
+		const auto mipmap_offset = Transfer::MipmapAtlasOffset(i, width, height);
 
 		for (uint32_t z = 0; z < depth; z++) {
 			const auto region_index = i * depth + z;
@@ -854,7 +875,7 @@ TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_form
 			regions[region_index].height = mip_height;
 			regions[region_index].copy_height =
 			    (!array_texture && !volume_texture && depth > 1 && levels > 1 &&
-			             UtilIsBcFormat(image_format)
+			             Transfer::IsBlockCompressedFormat(image_format)
 			         ? TextureGetAtlasSliceYStride(image_format, mip_height, depth, levels)
 			         : 0);
 			regions[region_index].dst_layer = (array_texture ? z : 0);
@@ -904,14 +925,6 @@ TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_form
 	return regions;
 }
 
-static uint64_t GetLevelSrcOffset(const TileSizeOffset& level_size) {
-	return (level_size.src_size != 0 ? level_size.src_offset : level_size.offset);
-}
-
-static uint64_t GetLevelSrcSize(const TileSizeOffset& level_size) {
-	return (level_size.src_size != 0 ? level_size.src_size : level_size.size);
-}
-
 static uint64_t GetSliceSrcStride(const TextureUploadLayout& layout, uint32_t level,
                                   TextureUploadSliceLayout source_slice_layout) {
 	return (
@@ -930,8 +943,8 @@ static uint64_t FmaskRegionCopySize(const BufferImageCopy& region) {
 }
 
 static void UploadFmaskIdentity(GraphicContext* ctx, VulkanImage* vk_obj,
-                                const std::vector<BufferImageCopy>& regions, uint64_t dst_layout,
-                                const char* owner) {
+                                const std::vector<BufferImageCopy>& regions,
+                                vk::ImageLayout dst_layout, const char* owner) {
 	constexpr uint32_t kIdentityFmaskPattern = 0x76543210u;
 
 	std::vector<BufferImageCopy> upload_regions = regions;
@@ -947,13 +960,13 @@ static void UploadFmaskIdentity(GraphicContext* ctx, VulkanImage* vk_obj,
 	     ", upload_size=%" PRIu64 " regions=%zu\n",
 	     owner, kIdentityFmaskPattern, upload_size, upload_regions.size());
 
-	UtilScratchBuffer temp_buf(upload_size);
-	auto*             words = static_cast<uint32_t*>(temp_buf.Data());
+	Transfer::ScratchBuffer temp_buf(upload_size);
+	auto*                   words = static_cast<uint32_t*>(temp_buf.Data());
 	for (uint64_t i = 0; i < upload_size / sizeof(uint32_t); i++) {
 		words[i] = kIdentityFmaskPattern;
 	}
 
-	UtilFillImage(ctx, vk_obj, temp_buf.Data(), upload_size, upload_regions, dst_layout);
+	Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), upload_size, upload_regions, dst_layout);
 }
 
 void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const void* src_data,
@@ -961,19 +974,19 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
                              const TextureUploadLayout& layout, uint32_t fmt, uint64_t width,
                              uint64_t height, uint32_t depth, uint64_t levels,
                              TextureUploadSliceLayout source_slice_layout, const char* owner,
-                             uint64_t dst_layout) {
+                             vk::ImageLayout dst_layout) {
 	if (fmt == 0) {
 		EXIT("%s: legacy texture upload format unsupported: fmt=0 tile=%u size=%" PRIu64
 		     " extent=%" PRIu64 "x%" PRIu64 " depth=%u pitch=%u levels=%" PRIu64 "\n",
 		     owner, layout.tile, size, width, height, depth, layout.pitch, levels);
 	} else if (static_cast<Prospero::TileMode>(layout.tile) == Prospero::TileMode::kLinear) {
-		UtilFillImage(ctx, vk_obj, src_data, size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, src_data, size, regions, dst_layout);
 	} else if (layout.fmt_tiled_render_target) {
 		LOGF("%s: detiling typed render-target texture: fmt=%u tile=%u size=%" PRIu64
 		     " extent=%" PRIu64 "x%" PRIu64 " depth=%" PRIu64 " pitch=%u levels=%" PRIu64 "\n",
 		     owner, static_cast<uint32_t>(fmt), layout.tile, size, width, height,
 		     static_cast<uint64_t>(depth), layout.pitch, levels);
-		UtilScratchBuffer temp_buf(size);
+		Transfer::ScratchBuffer temp_buf(size);
 		for (uint32_t i = 0; i < levels; i++) {
 			for (uint32_t z = 0; z < depth; z++) {
 				const auto region_index = i * depth + z;
@@ -988,7 +1001,7 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 				    layout.level_sizes[i].x, layout.level_sizes[i].y);
 			}
 		}
-		UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
 	} else if (layout.fmt_tiled_depth) {
 		if (Prospero::IsFmaskTextureFormat(static_cast<uint32_t>(fmt))) {
 			UploadFmaskIdentity(ctx, vk_obj, regions, dst_layout, owner);
@@ -997,13 +1010,13 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 		const uint32_t bytes_per_element =
 		    Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt));
 		if (bytes_per_element == 1) {
-			UtilFillImage(ctx, vk_obj, src_data, size, regions, dst_layout);
+			Transfer::UploadImage(ctx, vk_obj, src_data, size, regions, dst_layout);
 		} else {
 			LOGF("%s: detiling typed depth texture: fmt=%u tile=%u size=%" PRIu64 " extent=%" PRIu64
 			     "x%" PRIu64 " depth=%" PRIu64 " pitch=%u levels=%" PRIu64 "\n",
 			     owner, static_cast<uint32_t>(fmt), layout.tile, size, width, height,
 			     static_cast<uint64_t>(depth), layout.pitch, levels);
-			UtilScratchBuffer temp_buf(size);
+			Transfer::ScratchBuffer temp_buf(size);
 			for (uint32_t i = 0; i < levels; i++) {
 				for (uint32_t z = 0; z < depth; z++) {
 					const auto region_index = i * depth + z;
@@ -1018,10 +1031,10 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 					    layout.level_sizes[i].size);
 				}
 			}
-			UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+			Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
 		}
 	} else if (layout.fmt_tiled_standard256b) {
-		UtilScratchBuffer temp_buf(size);
+		Transfer::ScratchBuffer temp_buf(size);
 		for (uint32_t i = 0; i < levels; i++) {
 			for (uint32_t z = 0; z < depth; z++) {
 				const auto region_index = i * depth + z;
@@ -1035,13 +1048,13 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 				    layout.level_sizes[i].size, layout.level_sizes[i].size);
 			}
 		}
-		UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
 	} else if (layout.fmt_tiled_standard4kb && layout.volume_texture) {
 		LOGF("%s: detiling typed Standard4KB 3D texture: fmt=%u tile=%u size=%" PRIu64
 		     " extent=%" PRIu64 "x%" PRIu64 " depth=%" PRIu64 " pitch=%u levels=%" PRIu64 "\n",
 		     owner, static_cast<uint32_t>(fmt), layout.tile, size, width, height,
 		     static_cast<uint64_t>(depth), layout.pitch, levels);
-		UtilScratchBuffer temp_buf(size);
+		Transfer::ScratchBuffer temp_buf(size);
 		if (levels == 1) {
 			TileConvertTiledToLinearStandard4KB3D(
 			    temp_buf.Data(), src_data, static_cast<uint32_t>(fmt), static_cast<uint32_t>(width),
@@ -1092,13 +1105,13 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 				}
 			}
 		}
-		UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
 	} else if (layout.fmt_tiled_standard4kb) {
 		LOGF("%s: detiling typed Standard4KB texture: fmt=%u tile=%u size=%" PRIu64
 		     " extent=%" PRIu64 "x%" PRIu64 " depth=%" PRIu64 " pitch=%u\n",
 		     owner, static_cast<uint32_t>(fmt), layout.tile, size, width, height,
 		     static_cast<uint64_t>(depth), layout.pitch);
-		UtilScratchBuffer temp_buf(size);
+		Transfer::ScratchBuffer temp_buf(size);
 		for (uint32_t i = 0; i < levels; i++) {
 			for (uint32_t z = 0; z < depth; z++) {
 				const auto region_index = i * depth + z;
@@ -1113,13 +1126,13 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 				    layout.level_sizes[i].x, layout.level_sizes[i].y);
 			}
 		}
-		UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
 	} else if (layout.fmt_tiled_standard64kb) {
 		LOGF("%s: detiling typed Standard64KB texture: fmt=%u tile=%u size=%" PRIu64
 		     " extent=%" PRIu64 "x%" PRIu64 " depth=%" PRIu64 " pitch=%u\n",
 		     owner, static_cast<uint32_t>(fmt), layout.tile, size, width, height,
 		     static_cast<uint64_t>(depth), layout.pitch);
-		UtilScratchBuffer temp_buf(size);
+		Transfer::ScratchBuffer temp_buf(size);
 		for (uint32_t i = 0; i < levels; i++) {
 			for (uint32_t z = 0; z < depth; z++) {
 				const auto region_index = i * depth + z;
@@ -1134,14 +1147,14 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 				    layout.level_sizes[i].x, layout.level_sizes[i].y);
 			}
 		}
-		UtilFillImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, temp_buf.Data(), size, regions, dst_layout);
 	} else if (layout.tile != 0) {
 		EXIT("%s: typed tiled upload still unsupported after sizing, using linear fallback: fmt=%u "
 		     "tile=%u size=%" PRIu64 " extent=%" PRIu64 "x%" PRIu64 " pitch=%u levels=%" PRIu64
 		     "\n",
 		     owner, static_cast<uint32_t>(fmt), layout.tile, size, width, height, layout.pitch,
 		     levels);
-		UtilFillImage(ctx, vk_obj, src_data, size, regions, dst_layout);
+		Transfer::UploadImage(ctx, vk_obj, src_data, size, regions, dst_layout);
 	}
 }
 

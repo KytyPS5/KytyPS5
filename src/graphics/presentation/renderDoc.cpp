@@ -99,12 +99,12 @@ static std::atomic<RenderDocState> g_state           = RenderDocState::Idle;
 static std::atomic_bool            g_init_done       = false;
 static std::atomic_bool            g_unavailable_log = false;
 
-static RenderDocDevicePointer GetRenderDocDevicePointer(VkInstance instance) {
+static RenderDocDevicePointer GetRenderDocDevicePointer(vk::Instance instance) {
 	if (instance == nullptr) {
 		return nullptr;
 	}
 
-	return reinterpret_cast<void*>(instance);
+	return VulkanHandleToPointer(instance);
 }
 
 static bool BindRenderDocApi(HMODULE module) {
@@ -191,7 +191,7 @@ bool RenderDocIsLoaded() {
 	return g_api != nullptr;
 }
 
-void RenderDocSetActiveWindow(VkInstance instance, SDL_Window* window) {
+void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window) {
 	if (g_api == nullptr) {
 		return;
 	}
@@ -284,7 +284,7 @@ void RenderDocInit() {}
 bool RenderDocIsLoaded() {
 	return false;
 }
-void RenderDocSetActiveWindow(VkInstance /*instance*/, SDL_Window* /*window*/) {}
+void RenderDocSetActiveWindow(vk::Instance /*instance*/, SDL_Window* /*window*/) {}
 void RenderDocRequestCapture() {}
 void RenderDocOnPresent() {}
 

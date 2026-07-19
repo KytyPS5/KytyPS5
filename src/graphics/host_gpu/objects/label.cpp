@@ -4,6 +4,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <memory>
@@ -25,12 +26,12 @@ struct LabelCallbacks {
 };
 
 struct LabelEvent final {
-	VkDevice device = nullptr;
-	VkEvent  event  = nullptr;
+	vk::Device device = nullptr;
+	vk::Event  event  = nullptr;
 
 	~LabelEvent() {
 		if (event != nullptr) {
-			vkDestroyEvent(device, event, nullptr);
+			device.destroyEvent(event, nullptr);
 		}
 	}
 };
@@ -41,7 +42,7 @@ struct LabelSubmission {
 };
 
 struct Label {
-	VkDevice                     device = nullptr;
+	vk::Device                   device = nullptr;
 	LabelStatus                  status = LabelStatus::New;
 	LabelCallbacks               callbacks;
 	std::vector<LabelSubmission> submissions;
@@ -115,14 +116,14 @@ void LabelManager::ThreadRun(void* data) {
 				    it->completion->event == nullptr) {
 					EXIT("GPU label submission has no completion event\n");
 				}
-				const auto status = vkGetEventStatus(it->completion->device, it->completion->event);
+				const auto status = it->completion->device.getEventStatus(it->completion->event);
 				switch (status) {
-					case VK_EVENT_SET:
+					case vk::Result::eEventSet:
 						fired_labels.push_back(it->callbacks);
 						finished_submissions.push_back(*it);
 						it = label->submissions.erase(it);
 						break;
-					case VK_EVENT_RESET: ++it; break;
+					case vk::Result::eEventReset: ++it; break;
 					default: EXIT("vkGetEventStatus returned an unexpected result\n");
 				}
 			}
@@ -270,24 +271,32 @@ void LabelManager::Set(CommandBuffer* buffer, Label* label) {
 	submission.completion         = std::make_shared<LabelEvent>();
 	submission.completion->device = label->device;
 
-	auto* vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
+	auto vk_buffer = buffer->Handle();
 
 	EXIT_NOT_IMPLEMENTED(vk_buffer == nullptr);
 
-	VkEventCreateInfo create_info {};
-	create_info.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
+	vk::EventCreateInfo create_info {};
+	create_info.sType = vk::StructureType::eEventCreateInfo;
 	create_info.pNext = nullptr;
-	create_info.flags = 0;
+	create_info.flags = {};
 
-	vkCreateEvent(label->device, &create_info, nullptr, &submission.completion->event);
-	EXIT_NOT_IMPLEMENTED(submission.completion->event == nullptr);
+	const auto create_result =
+	    label->device.createEvent(&create_info, nullptr, &submission.completion->event);
+	if (create_result != vk::Result::eSuccess || submission.completion->event == nullptr) {
+		EXIT("failed to create label event: %s (%d)\n", VulkanToString(create_result).c_str(),
+		     static_cast<int>(create_result));
+	}
 	buffer->RetainResourceUntilFence(submission.completion);
 
 	// Labels can be reused before an earlier end-of-pipe event has been
 	// observed by the polling thread. Capture a separate Vulkan event and
 	// callback snapshot for each set so older writes are not lost.
-	vkResetEvent(label->device, submission.completion->event);
-	vkCmdSetEvent(vk_buffer, submission.completion->event, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+	const auto reset_result = label->device.resetEvent(submission.completion->event);
+	if (reset_result != vk::Result::eSuccess) {
+		EXIT("failed to reset label event: %s (%d)\n", VulkanToString(reset_result).c_str(),
+		     static_cast<int>(reset_result));
+	}
+	vk_buffer.setEvent(submission.completion->event, vk::PipelineStageFlagBits::eBottomOfPipe);
 
 	label->submissions.push_back(submission);
 

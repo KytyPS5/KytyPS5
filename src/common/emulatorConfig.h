@@ -34,8 +34,6 @@ struct ConfigOptions {
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   spirv_debug_printf_enabled  = false;
-	bool                   pipeline_dump_enabled       = false;
-	std::filesystem::path  pipeline_dump_folder        = "_Pipelines";
 	bool                   renderdoc_enabled           = false;
 	bool                   ngg_rectlist_draw_enabled   = true;
 };
@@ -63,9 +61,6 @@ std::filesystem::path GetPrintfOutputFile();
 ProfilerDirection GetProfilerDirection();
 
 bool SpirvDebugPrintfEnabled();
-
-bool                  PipelineDumpEnabled();
-std::filesystem::path GetPipelineDumpFolder();
 
 bool RenderDocEnabled();
 bool NggRectlistDrawEnabled();

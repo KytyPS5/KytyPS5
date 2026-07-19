@@ -18,16 +18,17 @@ enum class ComponentType {
 
 struct BufferFormatInfo {
 	Prospero::BufferFormat format                  = Prospero::BufferFormat::kInvalid;
-	ComponentType   type                    = ComponentType::Unknown;
-	uint32_t        component_count         = 0;
-	uint32_t        byte_size               = 0;
-	uint32_t        component_bits[4]       = {};
-	uint32_t        component_bit_offset[4] = {};
-	bool            packed_bitfield         = false;
+	ComponentType          type                    = ComponentType::Unknown;
+	uint32_t               component_count         = 0;
+	uint32_t               byte_size               = 0;
+	uint32_t               component_bits[4]       = {};
+	uint32_t               component_bit_offset[4] = {};
+	bool                   packed_bitfield         = false;
 };
 
 constexpr Prospero::BufferFormat DecodeTBufferFormat(uint32_t data_format, uint32_t number_format) {
-	return static_cast<Prospero::BufferFormat>(((number_format & 0x7u) << 4u) | (data_format & 0xfu));
+	return static_cast<Prospero::BufferFormat>(((number_format & 0x7u) << 4u) |
+	                                           (data_format & 0xfu));
 }
 
 constexpr ComponentType GetFormatComponentType(Prospero::BufferFormat format) {
@@ -221,20 +222,6 @@ constexpr bool IsKnownFormat(Prospero::BufferFormat format) {
 
 constexpr uint32_t GetFormatComponentCount(Prospero::BufferFormat format) {
 	return GetFormatInfo(format).component_count;
-}
-
-constexpr uint32_t GetFormatByteSize(Prospero::BufferFormat format) {
-	return GetFormatInfo(format).byte_size;
-}
-
-constexpr uint32_t GetFormatComponentBits(Prospero::BufferFormat format, uint32_t component) {
-	const auto info = GetFormatInfo(format);
-	return component < info.component_count ? info.component_bits[component] : 0u;
-}
-
-constexpr uint32_t GetFormatComponentBitOffset(Prospero::BufferFormat format, uint32_t component) {
-	const auto info = GetFormatInfo(format);
-	return component < info.component_count ? info.component_bit_offset[component] : 0u;
 }
 
 constexpr uint32_t GetFormatComponentByteOffset(Prospero::BufferFormat format, uint32_t component) {

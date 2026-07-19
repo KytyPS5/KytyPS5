@@ -14,7 +14,7 @@ namespace Libs::Graphics {
 class GdsBuffer {
 public:
 	GdsBuffer() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~GdsBuffer() { KYTY_NOT_IMPLEMENTED; }
+	~GdsBuffer() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(GdsBuffer);
 
 	void Clear(GraphicContext* ctx, uint64_t dw_offset, uint32_t dw_num, uint32_t clear_value);

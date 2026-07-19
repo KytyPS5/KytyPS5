@@ -6,10 +6,10 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
-#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -575,8 +575,12 @@ static bool get_shader_program_address_register(uint8_t type, uint32_t* lo_offse
 		case Prospero::ShaderBinaryType::kPs: *lo_offset = Pm4::SPI_SHADER_PGM_LO_PS; return true;
 		case Prospero::ShaderBinaryType::kGs: *lo_offset = Pm4::SPI_SHADER_PGM_LO_ES; return true;
 		case Prospero::ShaderBinaryType::kHs: *lo_offset = Pm4::SPI_SHADER_PGM_LO_LS; return true;
-		case Prospero::ShaderBinaryType::kGsBack: *lo_offset = Pm4::SPI_SHADER_PGM_LO_GS; return true;
-		case Prospero::ShaderBinaryType::kHsBack: *lo_offset = Pm4::SPI_SHADER_PGM_LO_HS; return true;
+		case Prospero::ShaderBinaryType::kGsBack:
+			*lo_offset = Pm4::SPI_SHADER_PGM_LO_GS;
+			return true;
+		case Prospero::ShaderBinaryType::kHsBack:
+			*lo_offset = Pm4::SPI_SHADER_PGM_LO_HS;
+			return true;
 		case Prospero::ShaderBinaryType::kGsFront:
 		case Prospero::ShaderBinaryType::kHsFront:
 		case Prospero::ShaderBinaryType::kFs: return false;
@@ -1016,12 +1020,14 @@ int KYTY_SYSV_ABI GraphicsSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint3
 
 static uint32_t GraphicsPrimitiveTypeToGsOut(uint32_t prim_type) {
 	switch (static_cast<Prospero::PrimitiveType>(prim_type)) {
-		case Prospero::PrimitiveType::kPointList: return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kPoints);
+		case Prospero::PrimitiveType::kPointList:
+			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kPoints);
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kLineListAdjacency:
 		case Prospero::PrimitiveType::kLineStripAdjacency:
-		case Prospero::PrimitiveType::kLineLoop: return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kLines);
+		case Prospero::PrimitiveType::kLineLoop:
+			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kLines);
 		case Prospero::PrimitiveType::kRectList:
 			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::k2dRectangle);
 		case Prospero::PrimitiveType::kRectListLegacy:
@@ -1048,9 +1054,10 @@ int KYTY_SYSV_ABI GraphicsCreatePrimState(ShaderRegister* cx_regs, ShaderRegiste
 
 	EXIT_NOT_IMPLEMENTED(gs == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(hs != nullptr &&
-	                     static_cast<Prospero::ShaderBinaryType>(hs->type) != Prospero::ShaderBinaryType::kHs);
-	EXIT_NOT_IMPLEMENTED(static_cast<Prospero::ShaderBinaryType>(gs->type) != Prospero::ShaderBinaryType::kGs);
+	EXIT_NOT_IMPLEMENTED(hs != nullptr && static_cast<Prospero::ShaderBinaryType>(hs->type) !=
+	                                          Prospero::ShaderBinaryType::kHs);
+	EXIT_NOT_IMPLEMENTED(static_cast<Prospero::ShaderBinaryType>(gs->type) !=
+	                     Prospero::ShaderBinaryType::kGs);
 
 	if (cx_regs != nullptr) {
 		EXIT_NOT_IMPLEMENTED(hs != nullptr && hs->specials->vgt_shader_stages_en.offset !=

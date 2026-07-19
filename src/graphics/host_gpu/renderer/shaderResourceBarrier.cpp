@@ -1,71 +1,77 @@
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/descriptorCache.h"
-#include "graphics/shader/shaderBindings.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderBindings.h"
 
 #include <cstring>
 
 namespace Libs::Graphics {
 
-VkPipelineStageFlags ShaderPipelineStages(VkShaderStageFlags stages) {
-	VkPipelineStageFlags result = 0;
-	if ((stages & VK_SHADER_STAGE_VERTEX_BIT) != 0) {
-		result |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
+	vk::PipelineStageFlags result = {};
+	if (stages & vk::ShaderStageFlagBits::eVertex) {
+		result |= vk::PipelineStageFlagBits::eVertexShader;
 	}
-	if ((stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) {
-		result |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	if (stages & vk::ShaderStageFlagBits::eFragment) {
+		result |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if ((stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0) {
-		result |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	if (stages & vk::ShaderStageFlagBits::eCompute) {
+		result |= vk::PipelineStageFlagBits::eComputeShader;
 	}
-	EXIT_IF(result == 0);
+	EXIT_IF(!result);
 	return result;
 }
 
-VkMemoryBarrier MakeShaderWriteDependency() {
-	VkMemoryBarrier barrier {};
-	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-	                        VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
-	                        VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-	                        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-	                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+VulkanMemoryBarrier MakeShaderWriteDependency() {
+	VulkanMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+	                        vk::AccessFlagBits::eVertexAttributeRead |
+	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
+	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eColorAttachmentRead |
+	                        vk::AccessFlagBits::eColorAttachmentWrite;
 	return barrier;
 }
 
-VkImageMemoryBarrier MakeStorageImageDependency(const VulkanImage& image, bool read, bool written) {
+vk::ImageMemoryBarrier MakeStorageImageDependency(const VulkanImage& image, bool read,
+                                                  bool written) {
 	EXIT_IF(image.image == nullptr || image.type == VulkanImageType::DepthStencil);
 
-	VkImageMemoryBarrier barrier {};
-	barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-	barrier.dstAccessMask =
-	    (read ? VK_ACCESS_SHADER_READ_BIT : 0) | (written ? VK_ACCESS_SHADER_WRITE_BIT : 0);
+	vk::ImageMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eImageMemoryBarrier;
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = {};
+	if (read) {
+		barrier.dstAccessMask |= vk::AccessFlagBits::eShaderRead;
+	}
+	if (written) {
+		barrier.dstAccessMask |= vk::AccessFlagBits::eShaderWrite;
+	}
 	barrier.oldLayout                       = image.layout;
-	barrier.newLayout                       = VK_IMAGE_LAYOUT_GENERAL;
+	barrier.newLayout                       = vk::ImageLayout::eGeneral;
 	barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	barrier.image                           = image.image;
-	barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	barrier.subresourceRange.baseMipLevel   = 0;
 	barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
 	barrier.subresourceRange.baseArrayLayer = 0;
 	barrier.subresourceRange.layerCount     = image.layers;
-	EXIT_IF(barrier.dstAccessMask == 0 || barrier.subresourceRange.layerCount == 0);
+	EXIT_IF(!barrier.dstAccessMask || barrier.subresourceRange.layerCount == 0);
 	return barrier;
 }
 
-VkBufferMemoryBarrier MakeGdsDependency(const VulkanBuffer& buffer) {
+vk::BufferMemoryBarrier MakeGdsDependency(const VulkanBuffer& buffer) {
 	EXIT_IF(buffer.buffer == nullptr);
 
-	VkBufferMemoryBarrier barrier {};
-	barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-	barrier.srcAccessMask =
-	    VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-	barrier.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vk::BufferMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
+	barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.buffer              = buffer.buffer;
@@ -101,27 +107,21 @@ CollectShaderBufferWrites(const ShaderRecompiler::IR::Program&          program,
 	return writes;
 }
 
-bool MarkShaderAddressWrites(const std::vector<ShaderAddressWriteRange>& writes) {
-	if (!writes.empty()) {
-		EXIT("shader address writes are unsupported\n");
-	}
-	return false;
-}
-
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
 	return !CollectShaderBufferWrites(*runtime.program, *runtime.resources).empty();
 }
 
-void ShaderWriteBarrier(VkCommandBuffer vk_buffer, VkPipelineStageFlags source_stages) {
-	EXIT_IF(vk_buffer == nullptr || source_stages == 0);
+void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
-	vkCmdPipelineBarrier(
-	    vk_buffer, source_stages,
-	    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-	        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-	        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    0, 1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.pipelineBarrier(
+	    source_stages,
+	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eVertexInput |
+	        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader |
+	        vk::PipelineStageFlagBits::eTransfer |
+	        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	    vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 } // namespace Libs::Graphics

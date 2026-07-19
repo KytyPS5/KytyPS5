@@ -10,7 +10,7 @@ namespace Libs::Graphics {
 namespace Rt {
 
 void AppendHardwareRayTracingDeviceExtensions(
-    const std::vector<VkExtensionProperties>& available_extensions,
+    const std::vector<vk::ExtensionProperties>& available_extensions,
     std::vector<const char*>* device_extensions, GraphicContext* ctx);
 
 void LoadHardwareRayTracingFunctions(GraphicContext* ctx);

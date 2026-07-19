@@ -57,8 +57,6 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
-	::printf("  --pipeline-dump <true|false>         Enable pipeline dumps.\n");
-	::printf("  --pipeline-dump-folder <path>        Pipeline dump folder.\n");
 	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
 	         "4-vertex path.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -207,13 +205,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
-		} else if (arg == "--pipeline-dump") {
-			if (!ParseBool(value, options.config.pipeline_dump_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--pipeline-dump-folder") {
-			options.config.pipeline_dump_folder = value;
 		} else if (arg == "--ngg-rectlist-draw") {
 			if (!ParseBool(value, options.config.ngg_rectlist_draw_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

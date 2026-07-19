@@ -5,22 +5,22 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
 #include <cstddef>
 #include <unordered_map>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
 class SamplerCache {
 public:
 	SamplerCache() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~SamplerCache() { KYTY_NOT_IMPLEMENTED; }
+	~SamplerCache() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	VkSampler GetSampler(const ShaderSamplerResource& r);
+	vk::Sampler GetSampler(const ShaderSamplerResource& r);
 
 private:
 	using SamplerKey = std::array<uint32_t, 4>;
@@ -37,8 +37,8 @@ private:
 		}
 	};
 
-	Common::Mutex                                             m_mutex;
-	std::unordered_map<SamplerKey, VkSampler, SamplerKeyHash> m_samplers;
+	Common::Mutex                                               m_mutex;
+	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };
 
 } // namespace Libs::Graphics

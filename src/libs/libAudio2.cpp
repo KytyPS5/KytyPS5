@@ -366,7 +366,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	}
 
 	(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-	                                    blocking);
+	                                     blocking);
 }
 
 static void audioout2_close_audio_handle(int audio_handle) {

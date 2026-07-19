@@ -1526,9 +1526,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	switch (interrupt_selector) {
 		case 0x00:
 		case 0x03: with_interrupt = false; break;
-		case 0x01:
-			Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
-			return;
+		case 0x01: Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id); return;
 		case 0x02: with_interrupt = true; break;
 		default: EXIT("unknown interrupt_selector\n");
 	}
@@ -1540,11 +1538,11 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 		if (with_interrupt) {
 			if (with_writeback) {
-				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(
-				    m_submit_id, CurrentBuffer(), dst, data, interrupt_context_id);
+				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(m_submit_id, CurrentBuffer(), dst,
+				                                               data, interrupt_context_id);
 			} else {
-				Sync::WriteAtEndOfPipeWithInterrupt32(m_submit_id, CurrentBuffer(), dst,
-				                                              data, interrupt_context_id);
+				Sync::WriteAtEndOfPipeWithInterrupt32(m_submit_id, CurrentBuffer(), dst, data,
+				                                      interrupt_context_id);
 			}
 		} else if (with_writeback) {
 			Sync::WriteAtEndOfPipeWithWriteBack32(m_submit_id, CurrentBuffer(), dst, data);
@@ -1560,8 +1558,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
 					Sync::ReadGds(dst, value & 0xffffu, value >> 16u);
-					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst,
-					                                    value & 0xffffu, value >> 16u);
+					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,
+					                            value >> 16u);
 					return;
 				}
 			} else if (eop_event_type == 0x04 && cache_action == 0x00 && event_index == 0x05) {
@@ -1588,12 +1586,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 							Sync::WriteAtEndOfPipeWithInterruptWriteBack64(
 							    m_submit_id, CurrentBuffer(), dst, value, interrupt_context_id);
 						} else {
-							Sync::WriteAtEndOfPipeWithInterrupt64(
-							    m_submit_id, CurrentBuffer(), dst, value, interrupt_context_id);
+							Sync::WriteAtEndOfPipeWithInterrupt64(m_submit_id, CurrentBuffer(), dst,
+							                                      value, interrupt_context_id);
 						}
 					} else if (with_writeback) {
-						Sync::WriteAtEndOfPipeWithWriteBack64(m_submit_id, CurrentBuffer(),
-						                                              dst, value);
+						Sync::WriteAtEndOfPipeWithWriteBack64(m_submit_id, CurrentBuffer(), dst,
+						                                      value);
 					} else {
 						Sync::WriteAtEndOfPipe64(m_submit_id, CurrentBuffer(), dst, value);
 					}
@@ -1669,9 +1667,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						if (((eop_event_type == 0x04 && event_index == 0x05) ||
 						     (eop_event_type == 0x28 && event_index == 0x00)) &&
 						    !with_interrupt) {
-							Sync::WriteAtEndOfPipeClockCounter(
-							    m_submit_id, CurrentBuffer(), static_cast<uint64_t*>(dst_gpu_addr),
-							    clock);
+							Sync::WriteAtEndOfPipeClockCounter(m_submit_id, CurrentBuffer(),
+							                                   static_cast<uint64_t*>(dst_gpu_addr),
+							                                   clock);
 							return;
 						}
 						break;
@@ -1815,9 +1813,9 @@ void CommandProcessor::Flip() {
 
 	auto* command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
-	                                                       m_flip.flip_mode, m_flip.flip_arg);
+	                                               m_flip.flip_mode, m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
-	                                       m_flip.flip_mode, m_flip.flip_arg, request);
+	                               m_flip.flip_mode, m_flip.flip_arg, request);
 	m_scheduler.Flush();
 }
 
@@ -1836,10 +1834,10 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto* command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
-	                                                       m_flip.flip_mode, m_flip.flip_arg);
-	Sync::WriteAtEndOfPipeWithFlip32(
-	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
-	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request);
+	                                               m_flip.flip_mode, m_flip.flip_arg);
+	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
+	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
+	                                 m_flip.flip_arg, request);
 	m_scheduler.Flush();
 }
 
@@ -1864,7 +1862,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto* command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
-	                                                       m_flip.flip_mode, m_flip.flip_arg);
+	                                               m_flip.flip_mode, m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request);

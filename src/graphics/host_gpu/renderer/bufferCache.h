@@ -10,7 +10,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <vector>
 
 namespace Libs::Graphics {
 
@@ -75,16 +74,15 @@ public:
 	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
 	void SetTextureCache(TextureCache& texture_cache);
 
-	void RegisterForDelete(VulkanBuffer* buffer);
-	void DeleteAll(GraphicContext* ctx);
+	void ResetNullBuffer();
 
 private:
 	struct CachedBuffer;
 	struct ReadbackWorker;
 
-	Common::Mutex                                     m_mutex;
-	std::vector<VulkanBuffer*>                        m_delete_later;
-	std::shared_ptr<VulkanBuffer>                     m_null_buffer;
+	Common::Mutex                 m_mutex;
+	std::shared_ptr<VulkanBuffer> m_null_buffer;
+	// TODO: add LRU cache
 	std::map<uint64_t, std::unique_ptr<CachedBuffer>> m_buffers;
 	std::unique_ptr<ReadbackWorker>                   m_readback;
 	RangeSet                                          m_gpu_modified_ranges;

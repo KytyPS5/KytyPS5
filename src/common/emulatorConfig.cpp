@@ -85,14 +85,6 @@ bool SpirvDebugPrintfEnabled() {
 	return g_config->spirv_debug_printf_enabled;
 }
 
-bool PipelineDumpEnabled() {
-	return g_config->pipeline_dump_enabled;
-}
-
-std::filesystem::path GetPipelineDumpFolder() {
-	return g_config->pipeline_dump_folder;
-}
-
 bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }

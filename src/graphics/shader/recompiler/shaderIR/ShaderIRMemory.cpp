@@ -1,8 +1,7 @@
-#include "graphics/shader/recompiler/ShaderIR.h"
-
-#include "graphics/shader/recompiler/shaderIR/ShaderIRInternal.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderIR.h"
+#include "graphics/shader/recompiler/shaderIR/ShaderIRInternal.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -470,7 +469,6 @@ bool LowerImageOperation(const Decoder::Instruction& decoded, BasicBlock* block,
 	return true;
 }
 
-
 } // namespace
 
 bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* block,
@@ -646,7 +644,6 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 		default: return false;
 	}
 }
-
 
 bool IsMemoryOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {

@@ -9,7 +9,7 @@
 namespace Libs::Graphics::Rt {
 namespace {
 
-bool ExtensionAvailable(const std::vector<VkExtensionProperties>& available, const char* name) {
+bool ExtensionAvailable(const std::vector<vk::ExtensionProperties>& available, const char* name) {
 	return std::ranges::any_of(available, [name](const auto& extension) {
 		return std::strcmp(extension.extensionName, name) == 0;
 	});
@@ -26,7 +26,7 @@ void AppendExtensionIfMissing(std::vector<const char*>& extensions, const char* 
 } // namespace
 
 void AppendHardwareRayTracingDeviceExtensions(
-    const std::vector<VkExtensionProperties>& available_extensions,
+    const std::vector<vk::ExtensionProperties>& available_extensions,
     std::vector<const char*>* device_extensions, GraphicContext* ctx) {
 	EXIT_IF(device_extensions == nullptr || ctx == nullptr);
 
@@ -64,33 +64,13 @@ void LoadHardwareRayTracingFunctions(GraphicContext* ctx) {
 		return;
 	}
 
-	ctx->vkGetBufferDeviceAddressKHR = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(
-	    vkGetDeviceProcAddr(ctx->device, "vkGetBufferDeviceAddressKHR"));
-	if (ctx->vkGetBufferDeviceAddressKHR == nullptr) {
-		ctx->vkGetBufferDeviceAddressKHR = reinterpret_cast<PFN_vkGetBufferDeviceAddressKHR>(
-		    vkGetDeviceProcAddr(ctx->device, "vkGetBufferDeviceAddress"));
-	}
-	ctx->vkCreateAccelerationStructureKHR = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
-	    vkGetDeviceProcAddr(ctx->device, "vkCreateAccelerationStructureKHR"));
-	ctx->vkDestroyAccelerationStructureKHR =
-	    reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
-	        vkGetDeviceProcAddr(ctx->device, "vkDestroyAccelerationStructureKHR"));
-	ctx->vkGetAccelerationStructureBuildSizesKHR =
-	    reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
-	        vkGetDeviceProcAddr(ctx->device, "vkGetAccelerationStructureBuildSizesKHR"));
-	ctx->vkCmdBuildAccelerationStructuresKHR =
-	    reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
-	        vkGetDeviceProcAddr(ctx->device, "vkCmdBuildAccelerationStructuresKHR"));
-	ctx->vkGetAccelerationStructureDeviceAddressKHR =
-	    reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
-	        vkGetDeviceProcAddr(ctx->device, "vkGetAccelerationStructureDeviceAddressKHR"));
-
-	if (ctx->vkGetBufferDeviceAddressKHR == nullptr ||
-	    ctx->vkCreateAccelerationStructureKHR == nullptr ||
-	    ctx->vkDestroyAccelerationStructureKHR == nullptr ||
-	    ctx->vkGetAccelerationStructureBuildSizesKHR == nullptr ||
-	    ctx->vkCmdBuildAccelerationStructuresKHR == nullptr ||
-	    ctx->vkGetAccelerationStructureDeviceAddressKHR == nullptr) {
+	const auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	if (dispatcher.vkGetBufferDeviceAddressKHR == nullptr ||
+	    dispatcher.vkCreateAccelerationStructureKHR == nullptr ||
+	    dispatcher.vkDestroyAccelerationStructureKHR == nullptr ||
+	    dispatcher.vkGetAccelerationStructureBuildSizesKHR == nullptr ||
+	    dispatcher.vkCmdBuildAccelerationStructuresKHR == nullptr ||
+	    dispatcher.vkGetAccelerationStructureDeviceAddressKHR == nullptr) {
 		EXIT("Vulkan RT: failed to load required device functions\n");
 	}
 }

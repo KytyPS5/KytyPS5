@@ -913,9 +913,11 @@ uint32_t AddressSourceCount(const IR::Instruction& inst, uint32_t first_src);
 
 bool IsFormattedBufferComponent(const IR::Instruction& inst);
 
-Prospero::BufferFormat FormattedBufferFormat(const EmitterState& state, const IR::Instruction& inst);
+Prospero::BufferFormat FormattedBufferFormat(const EmitterState&    state,
+                                             const IR::Instruction& inst);
 
-IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst, Prospero::BufferFormat format);
+IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst,
+                                              Prospero::BufferFormat format);
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState* state, uint32_t value);
 
@@ -953,7 +955,7 @@ bool EmitTypedTBufferLoad(EmitterState* state, const IR::Instruction& inst,
 bool EmitFormattedBufferLoad(EmitterState* state, const IR::Instruction& inst);
 
 uint32_t FormattedBufferDwordStoreComponentCount(Prospero::BufferFormat format,
-                                                 uint32_t        opcode_components);
+                                                 uint32_t               opcode_components);
 
 bool EmitBufferIntegerFormatStore(EmitterState* state, const IR::Instruction& inst);
 

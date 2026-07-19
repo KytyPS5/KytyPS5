@@ -39,9 +39,9 @@
 #include <QUrl>
 #include <QtCore>
 
-#include "ui_configuration_list_widget.h"
-
 #include <memory>
+
+#include "ui_configuration_list_widget.h"
 
 constexpr char CONF_FILE_NAME[]    = "Kyty.ini";
 constexpr char CONF_ORG_NAME[]     = "Kyty";

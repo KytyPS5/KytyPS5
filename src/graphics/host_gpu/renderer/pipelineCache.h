@@ -14,8 +14,17 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
+#include <vulkan/vulkan_core.h>
+#include <mutex>
+#include <shared_mutex>
 
 namespace Libs::Graphics {
+
+extern std::shared_mutex g_pipeline_cache_mutex;
+VkPipelineCache GetVkPipelineCacheHandle();
+
+class AsyncPipelineBuilder; // Forward declaration
 
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -87,6 +96,8 @@ public:
 	~PipelineCache() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(PipelineCache);
 
+	friend class AsyncPipelineBuilder; // Friend declaration
+
 	struct Pipeline {
 		vk::PipelineLayout pipeline_layout = nullptr;
 		vk::Pipeline       pipeline        = nullptr;
@@ -111,6 +122,9 @@ public:
 	                                       const HW::ComputeShaderInfo* cs_regs,
 	                                       std::span<const uint32_t>    cs_spirv);
 
+	GraphicsPipeline* GetFallbackPipeline() { return &m_fallback_pipeline; }
+	void             InitializeFallbackPipeline();
+
 private:
 	struct GraphicsPipelineKey {
 		uint64_t                 render_pass_id = 0;
@@ -123,6 +137,19 @@ private:
 			       ps_shader_id == other.ps_shader_id && static_params == other.static_params;
 		}
 	};
+
+	GraphicsPipeline* GetOrCreateDynamicFallbackPipeline(
+		const GraphicsPipelineKey& key,
+		VulkanFramebuffer* framebuffer,
+		ShaderVertexInputInfo* vs_input_info,
+		ShaderPixelInputInfo* ps_input_info,
+		const PipelineStaticParameters& static_params,
+		const ShaderId& vs_id,
+		const ShaderId& ps_id,
+		bool ps_active,
+		VkPipelineCache pipeline_cache_handle,
+		const GraphicsPipeline& p
+	);
 
 	struct ComputePipelineKey {
 		ShaderId cs_shader_id;
@@ -179,7 +206,13 @@ private:
 	    m_graphics_pipelines;
 	std::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>, ComputePipelineKeyHash>
 	              m_compute_pipelines;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
+	                   GraphicsPipelineKeyHash>
+	    m_fallback_pipelines;
 	Common::Mutex m_mutex;
+
+	GraphicsPipeline m_fallback_pipeline{};
+	VkRenderPass     m_fallback_render_pass = nullptr;
 };
 
 void LogPipelineTrace(const char* phase, uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0,
@@ -191,10 +224,11 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
                             std::span<const uint32_t>       ps_shader,
                             const PipelineStaticParameters& static_params, uint32_t vs_hash0,
                             uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
-                            bool ps_active);
+                            bool ps_active, VkPipelineCache pipeline_cache = nullptr);
 void CreatePipelineInternal(PipelineCache::ComputePipeline* pipeline,
                             const ShaderComputeInputInfo*   input_info,
-                            std::span<const uint32_t>       cs_shader);
+                            std::span<const uint32_t>       cs_shader,
+                            VkPipelineCache                 pipeline_cache = nullptr);
 
 } // namespace Libs::Graphics
 

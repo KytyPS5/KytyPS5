@@ -17,8 +17,37 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <shared_mutex>
 #include <limits>
 #include <span>
+#if defined(__linux__)
+inline const char* string_VkResult(VkResult result) {
+	switch (result) {
+		case VK_SUCCESS: return "VK_SUCCESS";
+		case VK_NOT_READY: return "VK_NOT_READY";
+		case VK_TIMEOUT: return "VK_TIMEOUT";
+		case VK_EVENT_SET: return "VK_EVENT_SET";
+		case VK_EVENT_RESET: return "VK_EVENT_RESET";
+		case VK_INCOMPLETE: return "VK_INCOMPLETE";
+		case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+		case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+		case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+		case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+		default: return "VK_UNKNOWN_RESULT";
+	}
+}
+inline const char* string_VkFormat(VkFormat format) {
+	switch (format) {
+		case VK_FORMAT_UNDEFINED: return "VK_FORMAT_UNDEFINED";
+		case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+		case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+		case VK_FORMAT_R32G32B32A32_SFLOAT: return "VK_FORMAT_R32G32B32A32_SFLOAT";
+		default: return "VK_UNKNOWN_FORMAT";
+	}
+}
+#else
+#include <vulkan/vk_enum_string_helper.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -471,7 +500,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
                             std::span<const uint32_t>       ps_shader,
                             const PipelineStaticParameters& static_params, uint32_t vs_hash0,
                             uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
-                            bool ps_active) {
+                            bool ps_active, VkPipelineCache pipeline_cache) {
 	EXIT_IF(g_render_ctx == nullptr);
 	EXIT_IF(pipeline == nullptr);
 	EXIT_IF(render_pass == nullptr);
@@ -523,6 +552,10 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 	vert_shader_stage_info.module              = vert_shader_module;
 	vert_shader_stage_info.pName               = "main";
 	vert_shader_stage_info.pSpecializationInfo = nullptr;
+	if (vs_input_info->stage && vs_input_info->stage.program != nullptr) {
+		ConfigureSubgroupSize(gctx, VK_SHADER_STAGE_VERTEX_BIT, *vs_input_info->stage.program,
+		                      &vert_subgroup_size, &vert_shader_stage_info);
+	}
 	EXIT_IF(!vs_input_info->stage);
 	ConfigureSubgroupSize(gctx, vk::ShaderStageFlagBits::eVertex, *vs_input_info->stage.program,
 	                      &vert_subgroup_size, &vert_shader_stage_info);
@@ -537,6 +570,10 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 	frag_shader_stage_info.pName               = "main";
 	frag_shader_stage_info.pSpecializationInfo = nullptr;
 	if (ps_active) {
+		if (ps_input_info->stage && ps_input_info->stage.program != nullptr) {
+			ConfigureSubgroupSize(gctx, VK_SHADER_STAGE_FRAGMENT_BIT, *ps_input_info->stage.program,
+			                      &frag_subgroup_size, &frag_shader_stage_info);
+		}
 		EXIT_IF(!ps_input_info->stage);
 		ConfigureSubgroupSize(gctx, vk::ShaderStageFlagBits::eFragment,
 		                      *ps_input_info->stage.program, &frag_subgroup_size,
@@ -833,6 +870,17 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 	vk::PushConstantRange push_constant_info[2];
 	uint32_t              push_constant_info_num = 0;
 
+	if (vs_input_info->stage && vs_input_info->stage.program != nullptr) {
+		CreateLayout(set_layouts, &set_layouts_num, push_constant_info, &push_constant_info_num,
+		             *vs_input_info->stage.program, VK_SHADER_STAGE_VERTEX_BIT,
+		             DescriptorCache::Stage::Vertex);
+	}
+	if (ps_active) {
+		if (ps_input_info->stage && ps_input_info->stage.program != nullptr) {
+			CreateLayout(set_layouts, &set_layouts_num, push_constant_info, &push_constant_info_num,
+			             *ps_input_info->stage.program, VK_SHADER_STAGE_FRAGMENT_BIT,
+			             DescriptorCache::Stage::Pixel);
+		}
 	EXIT_IF(!vs_input_info->stage);
 	CreateLayout(set_layouts, &set_layouts_num, push_constant_info, &push_constant_info_num,
 	             *vs_input_info->stage.program, vk::ShaderStageFlagBits::eVertex,
@@ -946,6 +994,11 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
 		     scissor.extent.width, scissor.extent.height);
 	}
+	{
+		std::shared_lock<std::shared_mutex> lock(g_pipeline_cache_mutex);
+		result = vkCreateGraphicsPipelines(gctx->device, pipeline_cache, 1, &pipeline_info, nullptr,
+		                                   &pipeline->pipeline);
+	}
 	result = gctx->device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr,
 	                                              &pipeline->pipeline);
 	if (graphics_debug_dump_enabled()) {
@@ -965,7 +1018,8 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(PipelineCache::ComputePipeline* pipeline,
                             const ShaderComputeInputInfo*   input_info,
-                            std::span<const uint32_t>       cs_shader) {
+                            std::span<const uint32_t>       cs_shader,
+                            VkPipelineCache                 pipeline_cache) {
 	EXIT_IF(g_render_ctx == nullptr);
 	EXIT_IF(pipeline == nullptr);
 
@@ -1050,6 +1104,11 @@ void CreatePipelineInternal(PipelineCache::ComputePipeline* pipeline,
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline->pipeline_layout));
+	{
+		std::shared_lock<std::shared_mutex> lock(g_pipeline_cache_mutex);
+		result =
+		    vkCreateComputePipelines(gctx->device, pipeline_cache, 1, &info, nullptr, &pipeline->pipeline);
+	}
 	result = gctx->device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline->pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     VulkanToString(result).c_str(), static_cast<void*>(pipeline->pipeline));

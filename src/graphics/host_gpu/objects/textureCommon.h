@@ -5,16 +5,15 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/tile.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
 struct GraphicContext;
 struct VulkanImage;
-struct VulkanMemory;
 
 enum class TextureFormatUsage : uint32_t {
 	None    = 0,
@@ -48,7 +47,7 @@ enum class TextureUploadDestination { MipLevels, MipAtlas };
 enum class TextureUploadSliceLayout { MipChainPerSlice, MipLevelPerSlice };
 
 struct RenderTargetFormatInfo {
-	VkFormat                        format            = VK_FORMAT_UNDEFINED;
+	vk::Format                      format            = vk::Format::eUndefined;
 	uint32_t                        bytes_per_element = 0;
 	Prospero::ColorComponentMapping export_mapping;
 };
@@ -87,28 +86,28 @@ struct TextureImageCreateParams {
 	const char*              owner                    = nullptr;
 };
 
-VkComponentSwizzle TextureGetComponentSwizzle(uint8_t s);
-VkComponentMapping TextureGetComponentMapping(uint32_t swizzle);
-bool               TextureCheckFormat(GraphicContext* ctx, VkImageCreateInfo* image_info);
-bool TextureCheckStorageSwizzle(VkImageCreateInfo* image_info, VkComponentMapping* components);
-VkImageUsageFlags      TextureGetUsage(TextureFormatUsage usage);
-VkImageUsageFlags      TextureGetViewUsage(TextureFormatUsage usage);
-VkFormat               TextureGetFormat(uint32_t fmt, TextureFormatUsage usage);
+vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t s);
+vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle);
+bool                 TextureCheckFormat(GraphicContext* ctx, vk::ImageCreateInfo* image_info);
+bool TextureCheckStorageSwizzle(vk::ImageCreateInfo* image_info, vk::ComponentMapping* components);
+vk::ImageUsageFlags    TextureGetUsage(TextureFormatUsage usage);
+vk::ImageUsageFlags    TextureGetViewUsage(TextureFormatUsage usage);
+vk::Format             TextureGetFormat(uint32_t fmt);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t layout, uint32_t type, uint32_t order);
-uint32_t TextureGetAtlasSliceYStride(VkFormat format, uint32_t mip_height, uint32_t depth,
+uint32_t TextureGetAtlasSliceYStride(vk::Format format, uint32_t mip_height, uint32_t depth,
                                      uint64_t levels);
-uint32_t TextureCalcStackedImageHeight(VkFormat format, uint32_t height, uint32_t depth,
+uint32_t TextureCalcStackedImageHeight(vk::Format format, uint32_t height, uint32_t depth,
                                        uint64_t levels);
-uint32_t TextureCalcMipmapAtlasImageHeight(VkFormat format, uint32_t width, uint32_t height,
+uint32_t TextureCalcMipmapAtlasImageHeight(vk::Format format, uint32_t width, uint32_t height,
                                            uint32_t depth, uint64_t levels);
 bool     TextureIs3DTexture(uint64_t type);
 bool     TextureIsCubeTexture(uint64_t type);
 bool     TextureIsLayeredTexture(uint64_t type);
 bool     TextureCanCreateCubeView(uint64_t type, uint32_t base_array, uint32_t layer_count);
-VkComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* vk_obj, VulkanMemory* mem,
-                                      const TextureImageCreateParams& params);
+vk::ComponentMapping TextureCreateImage(GraphicContext* ctx, VulkanImage* image,
+                                        const TextureImageCreateParams& params);
 void TextureCreateImageViews(GraphicContext* ctx, VulkanImage* vk_obj,
-                             VkComponentMapping components, uint64_t type, uint32_t base_array,
+                             vk::ComponentMapping components, uint64_t type, uint32_t base_array,
                              uint32_t base_level, uint32_t level_count, uint32_t depth,
                              bool allow_cube_view, TextureFormatUsage view_usage);
 TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64_t height,
@@ -123,19 +122,19 @@ uint64_t TextureUploadSliceSourceOffset(const TextureUploadLayout& layout, uint3
 uint64_t TextureCalcUploadSize(const TextureUploadLayout&          layout,
                                const std::vector<BufferImageCopy>& regions, uint64_t levels,
                                uint32_t depth, TextureUploadSliceLayout source_slice_layout);
-std::vector<BufferImageCopy>
-TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_format, uint32_t width,
-                          uint32_t height, uint32_t depth, uint64_t levels, bool array_texture,
-                          bool volume_texture, TextureUploadDestination destination,
-                          TextureUploadSliceLayout slice_layout);
+std::vector<BufferImageCopy> TextureBuildUploadRegions(
+    const TextureUploadLayout& layout, vk::Format image_format, uint32_t width, uint32_t height,
+    uint32_t depth, uint64_t levels, bool array_texture, bool volume_texture,
+    TextureUploadDestination destination, TextureUploadSliceLayout slice_layout);
 void TextureCopyBufferBytes(GraphicContext* ctx, VulkanBuffer* src_buffer,
-                            uint64_t src_buffer_offset, uint64_t copy_size, UtilScratchBuffer* dst);
+                            uint64_t src_buffer_offset, uint64_t copy_size,
+                            Transfer::ScratchBuffer* dst);
 void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const void* src_data,
                              uint64_t size, const std::vector<BufferImageCopy>& regions,
                              const TextureUploadLayout& layout, uint32_t fmt, uint64_t width,
                              uint64_t height, uint32_t depth, uint64_t levels,
                              TextureUploadSliceLayout source_slice_layout, const char* owner,
-                             uint64_t dst_layout);
+                             vk::ImageLayout dst_layout);
 
 } // namespace Libs::Graphics
 

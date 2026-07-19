@@ -96,26 +96,26 @@ struct ShaderComputeInputInfo {
 };
 
 struct ShaderPixelInputInfo {
-	uint32_t           interpolator_settings[32]    = {0};
-	uint32_t           input_num                    = 0;
-	uint32_t           ps_system_input_base         = 0;
-	uint8_t            target_output_mode[8]        = {};
-	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping = {};
-	uint32_t           mrt_output_mask              = 0;
-	uint32_t           descriptor_set               = 0;
-	bool               ps_pos_x                     = false;
-	bool               ps_pos_y                     = false;
-	bool               ps_pos_xy                    = false;
-	bool               ps_pos_z                     = false;
-	bool               ps_pos_w                     = false;
-	bool               ps_front_face                = false;
-	bool               ps_no_perspective            = false;
-	bool               ps_pixel_kill_enable         = false;
-	bool               ps_depth_export_enable       = false;
-	bool               ps_sample_mask_export_enable = false;
-	bool               ps_early_z                   = false;
-	bool               ps_execute_on_noop           = false;
-	ShaderStageRuntime stage;
+	uint32_t                                       interpolator_settings[32]    = {0};
+	uint32_t                                       input_num                    = 0;
+	uint32_t                                       ps_system_input_base         = 0;
+	uint8_t                                        target_output_mode[8]        = {};
+	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	uint32_t                                       mrt_output_mask              = 0;
+	uint32_t                                       descriptor_set               = 0;
+	bool                                           ps_pos_x                     = false;
+	bool                                           ps_pos_y                     = false;
+	bool                                           ps_pos_xy                    = false;
+	bool                                           ps_pos_z                     = false;
+	bool                                           ps_pos_w                     = false;
+	bool                                           ps_front_face                = false;
+	bool                                           ps_no_perspective            = false;
+	bool                                           ps_pixel_kill_enable         = false;
+	bool                                           ps_depth_export_enable       = false;
+	bool                                           ps_sample_mask_export_enable = false;
+	bool                                           ps_early_z                   = false;
+	bool                                           ps_execute_on_noop           = false;
+	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
@@ -242,7 +242,6 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo* regs, const HW::ShaderRegis
                           std::vector<uint32_t>* spirv);
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo* regs, const HW::ShaderRegisters* sh,
                           ShaderComputeInputInfo* input_info, std::vector<uint32_t>* spirv);
-bool ShaderBindingResearchGuardEnabled();
 bool ShaderAddressValid(uint64_t addr);
 
 } // namespace Libs::Graphics

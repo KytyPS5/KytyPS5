@@ -57,6 +57,15 @@ constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED       = 1;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY = 8;
 
+enum class VideoOutEventKind : uintptr_t {
+	Flip           = VIDEO_OUT_EVENT_FLIP,
+	Vblank         = VIDEO_OUT_EVENT_VBLANK,
+	PreVblankStart = VIDEO_OUT_EVENT_PRE_VBLANK_START,
+	OutputMode     = VIDEO_OUT_EVENT_SET_MODE,
+};
+
+enum class FlipRequestSource { Cpu, GpuEop };
+
 struct VideoOutBufferAttribute2 {
 	uint32_t reserved0;
 	uint32_t tiling_mode;
@@ -160,31 +169,31 @@ struct VideoOutConfig {
 class FlipQueue {
 public:
 	FlipQueue() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~FlipQueue() { KYTY_NOT_IMPLEMENTED; }
+	~FlipQueue() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
-	bool Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool gpu_eop,
-	             uint64_t* request_id);
-	void Prepare(uint64_t request_id, Graphics::CommandBuffer* buffer);
+	bool     Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, FlipRequestSource source,
+	                 uint64_t* request_id);
+	void     Prepare(uint64_t request_id, Graphics::CommandBuffer* buffer);
 	uint64_t PrepareNextCpu(Graphics::CommandBuffer* buffer);
-	void Complete(uint64_t request_id);
-	void WaitForSubmitSlot();
-	bool Flip(uint32_t micros);
-	bool HasPending(VideoOutConfig* cfg, int start_index, int count);
-	void GetFlipStatus(VideoOutConfig* cfg, VideoOutFlipStatus* out);
-	void Wait(VideoOutConfig* cfg, int index);
+	void     Complete(uint64_t request_id);
+	void     WaitForSubmitSlot();
+	bool     Flip(uint32_t micros);
+	bool     HasPending(VideoOutConfig* cfg, int start_index, int count);
+	void     GetFlipStatus(VideoOutConfig* cfg, VideoOutFlipStatus* out);
+	void     Wait(VideoOutConfig* cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
 
 	struct Request {
-		uint64_t        id;
-		VideoOutConfig* cfg;
-		int             index;
-		int64_t         flip_arg;
-		uint64_t        submit_ptc;
-		bool            gpu_eop;
-		RequestState    state;
+		uint64_t                 id;
+		VideoOutConfig*          cfg;
+		int                      index;
+		int64_t                  flip_arg;
+		uint64_t                 submit_ptc;
+		FlipRequestSource        source;
+		RequestState             state;
 		Graphics::PreparedFrame* frame;
 	};
 
@@ -194,7 +203,7 @@ private:
 	Common::CondVar    m_done_cond_var;
 	std::list<Request> m_requests;
 	std::list<Request> m_cpu_requests;
-	bool               m_processing = false;
+	bool               m_processing      = false;
 	uint64_t           m_next_request_id = 1;
 };
 
@@ -203,7 +212,7 @@ public:
 	static constexpr int VIDEO_OUT_NUM_MAX = 2;
 
 	VideoOutContext() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~VideoOutContext() { KYTY_NOT_IMPLEMENTED; }
+	~VideoOutContext() { KYTY_NOT_IMPLEMENTED; }
 
 	KYTY_CLASS_NO_COPY(VideoOutContext);
 
@@ -239,6 +248,167 @@ private:
 };
 
 static VideoOutContext* g_video_out_context = nullptr;
+
+using VideoOutEventQueues = std::vector<EventQueue::KernelEqueue>;
+
+static uintptr_t VideoOutEventId(VideoOutEventKind kind) {
+	return static_cast<uintptr_t>(kind);
+}
+
+static VideoOutEventKind GetVideoOutEventKind(uintptr_t event_id) {
+	switch (event_id) {
+		case VIDEO_OUT_EVENT_FLIP: return VideoOutEventKind::Flip;
+		case VIDEO_OUT_EVENT_VBLANK: return VideoOutEventKind::Vblank;
+		case VIDEO_OUT_EVENT_PRE_VBLANK_START: return VideoOutEventKind::PreVblankStart;
+		case VIDEO_OUT_EVENT_SET_MODE: return VideoOutEventKind::OutputMode;
+		default: EXIT("unsupported video-out event id=%" PRIuPTR "\n", event_id);
+	}
+	return VideoOutEventKind::Flip;
+}
+
+static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutConfig&   video_out,
+                                                   VideoOutEventKind kind) {
+	switch (kind) {
+		case VideoOutEventKind::Flip: return video_out.flip_eqs;
+		case VideoOutEventKind::Vblank: return video_out.vblank_eqs;
+		case VideoOutEventKind::PreVblankStart: return video_out.pre_vblank_eqs;
+		case VideoOutEventKind::OutputMode: return video_out.output_mode_eqs;
+	}
+	EXIT("unsupported video-out event kind\n");
+	return video_out.flip_eqs;
+}
+
+static intptr_t MakeVideoOutEventData(intptr_t current_data, void* trigger_data) {
+	const uint64_t old_data = static_cast<uint64_t>(current_data);
+	uint64_t       counter  = (old_data >> 12u) & 0xfu;
+	if (counter != 0xfu) {
+		counter++;
+	}
+
+	const uint64_t time    = LibKernel::KernelReadTsc() & 0xfffu;
+	const uint64_t payload = static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data));
+
+	return static_cast<intptr_t>(time | (counter << 12u) |
+	                             ((payload & 0x0000ffffffffffffULL) << 16u));
+}
+
+static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
+	EXIT_IF(event == nullptr);
+	event->triggered    = false;
+	event->event.fflags = 0;
+	event->event.data   = 0;
+}
+
+static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
+	EXIT_IF(event == nullptr);
+
+	auto triggered_event = event->event;
+	triggered_event.fflags =
+	    triggered_event.fflags < 0xfu ? triggered_event.fflags + 1u : triggered_event.fflags;
+	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
+	if (event->triggered) {
+		event->pending_events.push_back(triggered_event);
+		return;
+	}
+	event->event     = triggered_event;
+	event->triggered = true;
+}
+
+static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
+                                     EventQueue::KernelEqueueEvent* event) {
+	EXIT_IF(event == nullptr);
+	EXIT_IF(event->filter.data == nullptr);
+	EXIT_NOT_IMPLEMENTED(event->event.filter != EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+
+	auto* video_out = static_cast<VideoOutConfig*>(event->filter.data);
+	auto& queues    = VideoOutEventQueuesFor(*video_out, GetVideoOutEventKind(event->event.ident));
+	Common::LockGuard lock(video_out->mutex);
+	EXIT_IF(queues.empty());
+	const auto entry = std::find(queues.begin(), queues.end(), eq);
+	EXIT_NOT_IMPLEMENTED(entry == queues.end());
+	*entry = nullptr;
+}
+
+static void TriggerVideoOutEventsLocked(const VideoOutEventQueues& queues, VideoOutEventKind kind,
+                                        void* trigger_data) {
+	for (auto eq: queues) {
+		if (eq == nullptr) {
+			continue;
+		}
+		const auto result = EventQueue::KernelTriggerEvent(
+		    eq, VideoOutEventId(kind), EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
+		EXIT_NOT_IMPLEMENTED(result != OK);
+	}
+}
+
+static void DeleteVideoOutEventsLocked(VideoOutEventQueues& queues, VideoOutEventKind kind) {
+	for (auto eq: queues) {
+		if (eq == nullptr) {
+			continue;
+		}
+		const auto result = EventQueue::KernelDeleteEvent(eq, VideoOutEventId(kind),
+		                                                  EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+		EXIT_NOT_IMPLEMENTED(result != OK);
+	}
+	queues.clear();
+}
+
+static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind,
+                                 void* udata) {
+	EXIT_IF(g_video_out_context == nullptr);
+
+	auto* video_out = g_video_out_context->Get(handle);
+	if (video_out == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+
+	Common::LockGuard lock(video_out->mutex);
+	if (kind == VideoOutEventKind::OutputMode) {
+		LOGF("\t eq     = 0x%016" PRIx64 "\n"
+		     "\t handle = %d\n"
+		     "\t udata  = 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(eq), handle, reinterpret_cast<uint64_t>(udata));
+	}
+	if (eq == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+	}
+	auto&       queues              = VideoOutEventQueuesFor(*video_out, kind);
+	const bool  add_queue           = std::find(queues.begin(), queues.end(), eq) == queues.end();
+	const bool  initially_triggered = kind == VideoOutEventKind::OutputMode;
+	void* const initial_trigger_data =
+	    initially_triggered ? reinterpret_cast<void*>(video_out->output_mode) : nullptr;
+
+	EventQueue::KernelEqueueEvent event {};
+	event.triggered    = initially_triggered;
+	event.event.ident  = VideoOutEventId(kind);
+	event.event.filter = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
+	event.event.udata  = udata;
+	event.event.fflags = initially_triggered ? 1u : 0u;
+	event.event.data   = initially_triggered ? MakeVideoOutEventData(0, initial_trigger_data) : 0;
+	event.filter.delete_event_func = RemoveVideoOutEventQueue;
+	event.filter.reset_func        = ResetVideoOutEvent;
+	event.filter.trigger_func      = TriggerVideoOutEvent;
+	event.filter.data              = video_out;
+
+	const int result = EventQueue::KernelAddEvent(eq, event);
+	if (result == OK && add_queue) {
+		queues.push_back(eq);
+	}
+	return result;
+}
+
+static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind) {
+	EXIT_IF(g_video_out_context == nullptr);
+
+	if (g_video_out_context->Get(handle) == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	if (eq == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
+	}
+	return EventQueue::KernelDeleteEvent(eq, VideoOutEventId(kind),
+	                                     EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+}
 
 static void WaitForNextVblank() {
 	static uint64_t next_vblank_ticks = 0;
@@ -284,6 +454,38 @@ static bool IsValidBufferIndex(int index) {
 
 static bool IsSpecialBufferIndex(int index) {
 	return index == VIDEO_OUT_BUFFER_INDEX_BLANK || index == VIDEO_OUT_BUFFER_INDEX_BLACK;
+}
+
+static bool IsValidFlipMode(int mode) {
+	return mode >= VIDEO_OUT_FLIP_MODE_VSYNC && mode <= VIDEO_OUT_FLIP_MODE_VSYNC_MULTI;
+}
+
+static int ReserveFlipRequest(int handle, int index, int flip_mode, int64_t flip_arg,
+                              FlipRequestSource source, uint64_t* request_id) {
+	EXIT_IF(g_video_out_context == nullptr || request_id == nullptr);
+
+	auto* video_out = g_video_out_context->Get(handle);
+	if (video_out == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	if (!IsValidFlipMode(flip_mode)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (!IsValidBufferIndex(index)) {
+		return VIDEO_OUT_ERROR_INVALID_INDEX;
+	}
+
+	Common::LockGuard lock(video_out->mutex);
+	if (video_out->closing ||
+	    (!IsSpecialBufferIndex(index) &&
+	     (video_out->unregistering[index] || video_out->buffers[index].buffer_vulkan == nullptr))) {
+		return VIDEO_OUT_ERROR_INVALID_INDEX;
+	}
+	if (!g_video_out_context->GetFlipQueue().Reserve(video_out, index, flip_arg, source,
+	                                                 request_id)) {
+		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+	}
+	return OK;
 }
 
 static Graphics::VideoOutInfo MakeVideoOutInfo(const VideoOutBufferAttribute2& attribute,
@@ -396,54 +598,27 @@ void VideoOutContext::Close(int handle) {
 	EXIT_NOT_IMPLEMENTED(handle >= VIDEO_OUT_NUM_MAX);
 	EXIT_NOT_IMPLEMENTED(!m_video_out_ctx[handle].opened);
 
-	m_video_out_ctx[handle].opened = false;
+	auto& config  = m_video_out_ctx[handle];
+	config.opened = false;
 
-	m_video_out_ctx[handle].mutex.Lock();
-	if (m_video_out_ctx[handle].closing) {
+	config.mutex.Lock();
+	if (config.closing) {
 		EXIT("video-out handle is already closing\n");
 	}
-	m_video_out_ctx[handle].closing = true;
-	if (m_flip_queue.HasPending(&m_video_out_ctx[handle], VIDEO_OUT_BUFFER_INDEX_BLACK,
+	config.closing = true;
+	if (m_flip_queue.HasPending(&config, VIDEO_OUT_BUFFER_INDEX_BLACK,
 	                            VIDEO_OUT_BUFFER_NUM_MAX - VIDEO_OUT_BUFFER_INDEX_BLACK)) {
 		EXIT("cannot close video-out handle with pending flips\n");
 	}
-	for (auto& flip_eq: m_video_out_ctx[handle].flip_eqs) {
-		if (flip_eq != nullptr) {
-			auto result = EventQueue::KernelDeleteEvent(flip_eq, VIDEO_OUT_EVENT_FLIP,
-			                                            EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-			EXIT_NOT_IMPLEMENTED(result != OK);
-		}
-	}
-	m_video_out_ctx[handle].flip_eqs.clear();
-	for (auto& vblank_eq: m_video_out_ctx[handle].pre_vblank_eqs) {
-		if (vblank_eq != nullptr) {
-			auto result = EventQueue::KernelDeleteEvent(vblank_eq, VIDEO_OUT_EVENT_PRE_VBLANK_START,
-			                                            EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-			EXIT_NOT_IMPLEMENTED(result != OK);
-		}
-	}
-	m_video_out_ctx[handle].pre_vblank_eqs.clear();
-	for (auto& vblank_eq: m_video_out_ctx[handle].vblank_eqs) {
-		if (vblank_eq != nullptr) {
-			auto result = EventQueue::KernelDeleteEvent(vblank_eq, VIDEO_OUT_EVENT_VBLANK,
-			                                            EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-			EXIT_NOT_IMPLEMENTED(result != OK);
-		}
-	}
-	m_video_out_ctx[handle].vblank_eqs.clear();
-	for (auto& output_mode_eq: m_video_out_ctx[handle].output_mode_eqs) {
-		if (output_mode_eq != nullptr) {
-			auto result = EventQueue::KernelDeleteEvent(output_mode_eq, VIDEO_OUT_EVENT_SET_MODE,
-			                                            EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-			EXIT_NOT_IMPLEMENTED(result != OK);
-		}
-	}
-	m_video_out_ctx[handle].output_mode_eqs.clear();
+	DeleteVideoOutEventsLocked(config.flip_eqs, VideoOutEventKind::Flip);
+	DeleteVideoOutEventsLocked(config.pre_vblank_eqs, VideoOutEventKind::PreVblankStart);
+	DeleteVideoOutEventsLocked(config.vblank_eqs, VideoOutEventKind::Vblank);
+	DeleteVideoOutEventsLocked(config.output_mode_eqs, VideoOutEventKind::OutputMode);
 
-	m_video_out_ctx[handle].flip_rate = 0;
+	config.flip_rate = 0;
 
 	std::vector<Graphics::VideoOutVulkanImage*> images;
-	for (const auto& buffer: m_video_out_ctx[handle].buffers) {
+	for (const auto& buffer: config.buffers) {
 		if ((buffer.buffer == nullptr) != (buffer.buffer_vulkan == nullptr) ||
 		    (buffer.buffer_vulkan != nullptr &&
 		     (buffer.buffer_size == 0 || buffer.buffer_pitch == 0))) {
@@ -459,21 +634,17 @@ void VideoOutContext::Close(int handle) {
 		}
 		Graphics::g_render_ctx->GetTextureCache()->UnregisterVideoOutSurfaces(images);
 	}
-	for (auto& buffer: m_video_out_ctx[handle].buffers) {
-		buffer.buffer        = nullptr;
-		buffer.buffer_vulkan = nullptr;
-		buffer.buffer_size   = 0;
-		buffer.buffer_pitch  = 0;
-		buffer.set_id        = 0;
+	for (auto& buffer: config.buffers) {
+		buffer = VideoOutBufferInfo {};
 	}
 
-	m_video_out_ctx[handle].buffers_sets.clear();
-	for (bool unregistering: m_video_out_ctx[handle].unregistering) {
+	config.buffers_sets.clear();
+	for (bool unregistering: config.unregistering) {
 		if (unregistering) {
 			EXIT("video-out close raced with buffer unregistration\n");
 		}
 	}
-	m_video_out_ctx[handle].mutex.Unlock();
+	config.mutex.Unlock();
 }
 
 VideoOutConfig* VideoOutContext::Get(int handle) {
@@ -503,15 +674,8 @@ void VideoOutContext::VblankBegin() {
 			ctx.pre_vblank_status.reserved           = LibKernel::KernelReadTsc();
 			ctx.pre_vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
 
-			for (auto& vblank_eq: ctx.pre_vblank_eqs) {
-				if (vblank_eq != nullptr) {
-					auto result = EventQueue::KernelTriggerEvent(
-					    vblank_eq, VIDEO_OUT_EVENT_PRE_VBLANK_START,
-					    EventQueue::KERNEL_EVFILT_VIDEO_OUT,
-					    reinterpret_cast<void*>(ctx.pre_vblank_status.count));
-					EXIT_NOT_IMPLEMENTED(result != OK);
-				}
-			}
+			TriggerVideoOutEventsLocked(ctx.pre_vblank_eqs, VideoOutEventKind::PreVblankStart,
+			                            reinterpret_cast<void*>(ctx.pre_vblank_status.count));
 			ctx.mutex.Unlock();
 		}
 	}
@@ -529,14 +693,8 @@ void VideoOutContext::VblankEnd() {
 			ctx.vblank_status.reserved           = LibKernel::KernelReadTsc();
 			ctx.vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
 
-			for (auto& vblank_eq: ctx.vblank_eqs) {
-				if (vblank_eq != nullptr) {
-					auto result = EventQueue::KernelTriggerEvent(
-					    vblank_eq, VIDEO_OUT_EVENT_VBLANK, EventQueue::KERNEL_EVFILT_VIDEO_OUT,
-					    reinterpret_cast<void*>(ctx.vblank_status.count));
-					EXIT_NOT_IMPLEMENTED(result != OK);
-				}
-			}
+			TriggerVideoOutEventsLocked(ctx.vblank_eqs, VideoOutEventKind::Vblank,
+			                            reinterpret_cast<void*>(ctx.vblank_status.count));
 			ctx.mutex.Unlock();
 		}
 	}
@@ -574,7 +732,7 @@ Presentation::DisplayBufferImage VideoOutContext::FindImage(const void* buffer,
 	return ret;
 }
 
-bool FlipQueue::Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool gpu_eop,
+bool FlipQueue::Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, FlipRequestSource source,
                         uint64_t* request_id) {
 	EXIT_IF(cfg == nullptr || request_id == nullptr);
 	Common::LockGuard lock(m_mutex);
@@ -582,7 +740,7 @@ bool FlipQueue::Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool g
 	if (m_requests.size() + m_cpu_requests.size() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
 		return false;
 	}
-	auto& pending = gpu_eop ? m_requests : m_cpu_requests;
+	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
 
 	Request r {};
 	r.id         = m_next_request_id++;
@@ -590,7 +748,7 @@ bool FlipQueue::Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool g
 	r.index      = index;
 	r.flip_arg   = flip_arg;
 	r.submit_ptc = LibKernel::KernelGetProcessTimeCounter();
-	r.gpu_eop    = gpu_eop;
+	r.source     = source;
 	r.state      = RequestState::Reserved;
 
 	pending.push_back(r);
@@ -598,7 +756,7 @@ bool FlipQueue::Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool g
 
 	cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
 	cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-	if (gpu_eop) {
+	if (source == FlipRequestSource::GpuEop) {
 		cfg->flip_status.gcQueueNum++;
 	}
 
@@ -782,7 +940,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	r.cfg->flip_status.flipArg                  = r.flip_arg;
 	r.cfg->flip_status.currentBuffer            = r.index;
 	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
-	if (r.gpu_eop && r.cfg->flip_status.gcQueueNum > 0) {
+	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
 		r.cfg->flip_status.gcQueueNum--;
 	}
 
@@ -792,14 +950,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
-	for (auto& flip_eq: r.cfg->flip_eqs) {
-		if (flip_eq != nullptr) {
-			auto result = EventQueue::KernelTriggerEvent(flip_eq, VIDEO_OUT_EVENT_FLIP,
-			                                             EventQueue::KERNEL_EVFILT_VIDEO_OUT,
-			                                             reinterpret_cast<void*>(r.flip_arg));
-			EXIT_NOT_IMPLEMENTED(result != OK);
-		}
-	}
+	TriggerVideoOutEventsLocked(r.cfg->flip_eqs, VideoOutEventKind::Flip,
+	                            reinterpret_cast<void*>(r.flip_arg));
 	r.cfg->mutex.Unlock();
 
 	if (Config::GraphicsDebugDumpEnabled() &&
@@ -926,398 +1078,42 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	return OK;
 }
 
-static void FlipEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	event->triggered    = false;
-	event->event.fflags = 0;
-	event->event.data   = 0;
-}
-
-static void FlipEventDeleteFunc(EventQueue::KernelEqueue                  eq,
-                                LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	EXIT_IF(event->filter.data == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(event->event.ident != VIDEO_OUT_EVENT_FLIP);
-	EXIT_NOT_IMPLEMENTED(event->event.filter != EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-
-	if (event->filter.data != nullptr) {
-		auto* video_out = static_cast<VideoOutConfig*>(event->filter.data);
-		video_out->mutex.Lock();
-		EXIT_IF(video_out->flip_eqs.empty());
-		auto it = std::find(video_out->flip_eqs.begin(), video_out->flip_eqs.end(), eq);
-		EXIT_NOT_IMPLEMENTED(it == video_out->flip_eqs.end());
-		*it = nullptr;
-		video_out->mutex.Unlock();
-	}
-}
-
-static intptr_t MakeVideoOutEventData(intptr_t current_data, void* trigger_data) {
-	const uint64_t old_data = static_cast<uint64_t>(current_data);
-	uint64_t       counter  = (old_data >> 12u) & 0xfu;
-	if (counter != 0xfu) {
-		counter++;
-	}
-
-	const uint64_t time    = LibKernel::KernelReadTsc() & 0xfffu;
-	const uint64_t payload = static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data));
-
-	return static_cast<intptr_t>(time | (counter << 12u) |
-	                             ((payload & 0x0000ffffffffffffULL) << 16u));
-}
-
-static void FlipEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
-                                 void*                                     trigger_data) {
-	EXIT_IF(event == nullptr);
-
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    ((triggered_event.fflags < 0xfu) ? triggered_event.fflags + 1u : triggered_event.fflags);
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-	} else {
-		event->event     = triggered_event;
-		event->triggered = true;
-	}
-}
-
-static void VblankEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	event->triggered    = false;
-	event->event.fflags = 0;
-	event->event.data   = 0;
-}
-
-static void VblankEventDeleteFunc(EventQueue::KernelEqueue                  eq,
-                                  LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	EXIT_IF(event->filter.data == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(event->event.ident != VIDEO_OUT_EVENT_VBLANK);
-	EXIT_NOT_IMPLEMENTED(event->event.filter != EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-
-	if (event->filter.data != nullptr) {
-		auto* video_out = static_cast<VideoOutConfig*>(event->filter.data);
-		video_out->mutex.Lock();
-		EXIT_IF(video_out->vblank_eqs.empty());
-		auto it = std::find(video_out->vblank_eqs.begin(), video_out->vblank_eqs.end(), eq);
-		EXIT_NOT_IMPLEMENTED(it == video_out->vblank_eqs.end());
-		*it = nullptr;
-		video_out->mutex.Unlock();
-	}
-}
-
-static void PreVblankEventDeleteFunc(EventQueue::KernelEqueue                  eq,
-                                     LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	EXIT_IF(event->filter.data == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(event->event.ident != VIDEO_OUT_EVENT_PRE_VBLANK_START);
-	EXIT_NOT_IMPLEMENTED(event->event.filter != EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-
-	if (event->filter.data != nullptr) {
-		auto* video_out = static_cast<VideoOutConfig*>(event->filter.data);
-		video_out->mutex.Lock();
-		EXIT_IF(video_out->pre_vblank_eqs.empty());
-		auto it = std::find(video_out->pre_vblank_eqs.begin(), video_out->pre_vblank_eqs.end(), eq);
-		EXIT_NOT_IMPLEMENTED(it == video_out->pre_vblank_eqs.end());
-		*it = nullptr;
-		video_out->mutex.Unlock();
-	}
-}
-
-static void VblankEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
-                                   void*                                     trigger_data) {
-	EXIT_IF(event == nullptr);
-
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    ((triggered_event.fflags < 0xfu) ? triggered_event.fflags + 1u : triggered_event.fflags);
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-	} else {
-		event->event     = triggered_event;
-		event->triggered = true;
-	}
-}
-
-static void OutputModeEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	event->triggered    = false;
-	event->event.fflags = 0;
-	event->event.data   = 0;
-}
-
-static void OutputModeEventDeleteFunc(EventQueue::KernelEqueue                  eq,
-                                      LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	EXIT_IF(event->filter.data == nullptr);
-
-	EXIT_NOT_IMPLEMENTED(event->event.ident != VIDEO_OUT_EVENT_SET_MODE);
-	EXIT_NOT_IMPLEMENTED(event->event.filter != EventQueue::KERNEL_EVFILT_VIDEO_OUT);
-
-	if (event->filter.data != nullptr) {
-		auto* video_out = static_cast<VideoOutConfig*>(event->filter.data);
-		video_out->mutex.Lock();
-		EXIT_IF(video_out->output_mode_eqs.empty());
-		auto it =
-		    std::find(video_out->output_mode_eqs.begin(), video_out->output_mode_eqs.end(), eq);
-		EXIT_NOT_IMPLEMENTED(it == video_out->output_mode_eqs.end());
-		*it = nullptr;
-		video_out->mutex.Unlock();
-	}
-}
-
-static void OutputModeEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
-                                       void*                                     trigger_data) {
-	EXIT_IF(event == nullptr);
-
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    ((triggered_event.fflags < 0xfu) ? triggered_event.fflags + 1u : triggered_event.fflags);
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-	} else {
-		event->event     = triggered_event;
-		event->triggered = true;
-	}
-}
-
 KYTY_SYSV_ABI int VideoOutDeleteFlipEvent(EventQueue::KernelEqueue eq, int handle) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	[[maybe_unused]] auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	if (eq == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	return EventQueue::KernelDeleteEvent(eq, VIDEO_OUT_EVENT_FLIP,
-	                                     EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+	return DeleteVideoOutEvent(handle, eq, VideoOutEventKind::Flip);
 }
 
 KYTY_SYSV_ABI int VideoOutAddFlipEvent(EventQueue::KernelEqueue eq, int handle, void* udata) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	ctx->mutex.Lock();
-
-	if (eq == nullptr) {
-		ctx->mutex.Unlock();
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	bool add_eq =
-	    (std::find(ctx->flip_eqs.begin(), ctx->flip_eqs.end(), eq) == ctx->flip_eqs.end());
-
-	EventQueue::KernelEqueueEvent event;
-	event.triggered                = false;
-	event.event.ident              = VIDEO_OUT_EVENT_FLIP;
-	event.event.filter             = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
-	event.event.udata              = udata;
-	event.event.fflags             = 0;
-	event.event.data               = 0;
-	event.filter.delete_event_func = FlipEventDeleteFunc;
-	event.filter.reset_func        = FlipEventResetFunc;
-	event.filter.trigger_func      = FlipEventTriggerFunc;
-	event.filter.data              = ctx;
-
-	int result = EventQueue::KernelAddEvent(eq, event);
-
-	if (add_eq) {
-		ctx->flip_eqs.push_back(eq);
-	}
-
-	ctx->mutex.Unlock();
-
-	return result;
+	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Flip, udata);
 }
 
 KYTY_SYSV_ABI int VideoOutDeleteVblankEvent(EventQueue::KernelEqueue eq, int handle) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	[[maybe_unused]] auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	if (eq == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	return EventQueue::KernelDeleteEvent(eq, VIDEO_OUT_EVENT_VBLANK,
-	                                     EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+	return DeleteVideoOutEvent(handle, eq, VideoOutEventKind::Vblank);
 }
 
 KYTY_SYSV_ABI int VideoOutDeletePreVblankStartEvent(EventQueue::KernelEqueue eq, int handle) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	[[maybe_unused]] auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	if (eq == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	return EventQueue::KernelDeleteEvent(eq, VIDEO_OUT_EVENT_PRE_VBLANK_START,
-	                                     EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+	return DeleteVideoOutEvent(handle, eq, VideoOutEventKind::PreVblankStart);
 }
 
 KYTY_SYSV_ABI int VideoOutAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                          void* udata) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	ctx->mutex.Lock();
-
-	if (eq == nullptr) {
-		ctx->mutex.Unlock();
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	bool add_eq =
-	    (std::find(ctx->vblank_eqs.begin(), ctx->vblank_eqs.end(), eq) == ctx->vblank_eqs.end());
-
-	EventQueue::KernelEqueueEvent event;
-	event.triggered                = false;
-	event.event.ident              = VIDEO_OUT_EVENT_VBLANK;
-	event.event.filter             = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
-	event.event.udata              = udata;
-	event.event.fflags             = 0;
-	event.event.data               = 0;
-	event.filter.delete_event_func = VblankEventDeleteFunc;
-	event.filter.reset_func        = VblankEventResetFunc;
-	event.filter.trigger_func      = VblankEventTriggerFunc;
-	event.filter.data              = ctx;
-
-	int result = EventQueue::KernelAddEvent(eq, event);
-
-	if (add_eq) {
-		ctx->vblank_eqs.push_back(eq);
-	}
-
-	ctx->mutex.Unlock();
-
-	return result;
+	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Vblank, udata);
 }
 
 KYTY_SYSV_ABI int VideoOutAddPreVblankStartEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                                  void* udata) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	ctx->mutex.Lock();
-
-	if (eq == nullptr) {
-		ctx->mutex.Unlock();
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	bool add_eq = (std::find(ctx->pre_vblank_eqs.begin(), ctx->pre_vblank_eqs.end(), eq) ==
-	               ctx->pre_vblank_eqs.end());
-
-	EventQueue::KernelEqueueEvent event;
-	event.triggered                = false;
-	event.event.ident              = VIDEO_OUT_EVENT_PRE_VBLANK_START;
-	event.event.filter             = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
-	event.event.udata              = udata;
-	event.event.fflags             = 0;
-	event.event.data               = 0;
-	event.filter.delete_event_func = PreVblankEventDeleteFunc;
-	event.filter.reset_func        = VblankEventResetFunc;
-	event.filter.trigger_func      = VblankEventTriggerFunc;
-	event.filter.data              = ctx;
-
-	int result = EventQueue::KernelAddEvent(eq, event);
-
-	if (add_eq) {
-		ctx->pre_vblank_eqs.push_back(eq);
-	}
-
-	ctx->mutex.Unlock();
-
-	return result;
+	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::PreVblankStart, udata);
 }
 
 KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                              void* udata) {
 	PRINT_NAME();
-
-	EXIT_IF(g_video_out_context == nullptr);
-
-	auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	ctx->mutex.Lock();
-
-	LOGF("\t eq     = 0x%016" PRIx64 "\n"
-	     "\t handle = %d\n"
-	     "\t udata  = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(eq), handle, reinterpret_cast<uint64_t>(udata));
-
-	if (eq == nullptr) {
-		ctx->mutex.Unlock();
-		return VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE;
-	}
-
-	bool add_eq = (std::find(ctx->output_mode_eqs.begin(), ctx->output_mode_eqs.end(), eq) ==
-	               ctx->output_mode_eqs.end());
-
-	EventQueue::KernelEqueueEvent event;
-	event.triggered    = true;
-	event.event.ident  = VIDEO_OUT_EVENT_SET_MODE;
-	event.event.filter = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
-	event.event.udata  = udata;
-	event.event.fflags = 1;
-	event.event.data   = MakeVideoOutEventData(0, reinterpret_cast<void*>(ctx->output_mode));
-	event.filter.delete_event_func = OutputModeEventDeleteFunc;
-	event.filter.reset_func        = OutputModeEventResetFunc;
-	event.filter.trigger_func      = OutputModeEventTriggerFunc;
-	event.filter.data              = ctx;
-
-	int result = EventQueue::KernelAddEvent(eq, event);
-
-	if (add_eq) {
-		ctx->output_mode_eqs.push_back(eq);
-	}
-
-	ctx->mutex.Unlock();
-
-	return result;
+	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
 static int RegisterBuffersInternal(VideoOutConfig* ctx, int set_id, int start_index,
@@ -1426,8 +1222,10 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	infos.reserve(static_cast<size_t>(buffer_num));
 
 	for (int i = 0; i < buffer_num; i++) {
+		LOGF("\t buffers[%d]: data=%p metadata=%p\n", i, buffers[i].data, buffers[i].metadata);
 		if (buffers[i].reserved[0] != nullptr || buffers[i].reserved[1] != nullptr) {
-			EXIT("video-out buffer reserved fields are unsupported\n");
+			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i, buffers[i].reserved[0],
+			     buffers[i].reserved[1]);
 		}
 		const auto data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
 		const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
@@ -1541,33 +1339,14 @@ namespace Libs::VideoOut {
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
 
-	EXIT_IF(g_video_out_context == nullptr);
-
-	auto* ctx = g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	if (flip_mode < VIDEO_OUT_FLIP_MODE_VSYNC || flip_mode > VIDEO_OUT_FLIP_MODE_VSYNC_MULTI) {
+	uint64_t  request_id = 0;
+	const int result =
+	    ReserveFlipRequest(handle, index, flip_mode, flip_arg, FlipRequestSource::Cpu, &request_id);
+	if (result == VIDEO_OUT_ERROR_INVALID_VALUE) {
 		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
-		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
-
-	if (!IsValidBufferIndex(index)) {
-		return VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
-	uint64_t request_id = 0;
-	{
-		Common::LockGuard lock(ctx->mutex);
-		const bool        special = IsSpecialBufferIndex(index);
-		if (ctx->closing || (!special && (ctx->unregistering[index] ||
-		                                  ctx->buffers[index].buffer_vulkan == nullptr))) {
-			return VIDEO_OUT_ERROR_INVALID_INDEX;
-		}
-		if (!g_video_out_context->GetFlipQueue().Reserve(ctx, index, flip_arg, false,
-		                                                 &request_id)) {
-			return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-		}
+	if (result != OK) {
+		return result;
 	}
 	Graphics::GraphicsRunSubmitFlipPreparation();
 
@@ -1583,30 +1362,10 @@ int DisplayBufferSubmitFlipFromGpu(Graphics::CommandBuffer* buffer, int handle, 
 	EXIT_IF(VideoOut::g_video_out_context == nullptr || Graphics::g_render_ctx == nullptr ||
 	        buffer == nullptr || request_id == nullptr);
 
-	auto* ctx = VideoOut::g_video_out_context->Get(handle);
-	if (ctx == nullptr) {
-		return VideoOut::VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	if (flip_mode < VideoOut::VIDEO_OUT_FLIP_MODE_VSYNC ||
-	    flip_mode > VideoOut::VIDEO_OUT_FLIP_MODE_VSYNC_MULTI) {
-		return VideoOut::VIDEO_OUT_ERROR_INVALID_VALUE;
-	}
-
-	if (!VideoOut::IsValidBufferIndex(index)) {
-		return VideoOut::VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
-	{
-		Common::LockGuard lock(ctx->mutex);
-		const bool        special = VideoOut::IsSpecialBufferIndex(index);
-		if (ctx->closing || (!special && (ctx->unregistering[index] ||
-		                                  ctx->buffers[index].buffer_vulkan == nullptr))) {
-			return VideoOut::VIDEO_OUT_ERROR_INVALID_INDEX;
-		}
-		if (!VideoOut::g_video_out_context->GetFlipQueue().Reserve(ctx, index, flip_arg, true,
-		                                                           request_id)) {
-			return VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-		}
+	const int result = VideoOut::ReserveFlipRequest(
+	    handle, index, flip_mode, flip_arg, VideoOut::FlipRequestSource::GpuEop, request_id);
+	if (result != OK) {
+		return result;
 	}
 	VideoOut::g_video_out_context->GetFlipQueue().Prepare(*request_id, buffer);
 
@@ -1899,14 +1658,8 @@ KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,
 
 	ctx->mutex.Lock();
 	ctx->output_mode = mode;
-	for (auto& output_mode_eq: ctx->output_mode_eqs) {
-		if (output_mode_eq != nullptr) {
-			auto trigger_result = EventQueue::KernelTriggerEvent(
-			    output_mode_eq, VIDEO_OUT_EVENT_SET_MODE, EventQueue::KERNEL_EVFILT_VIDEO_OUT,
-			    reinterpret_cast<void*>(ctx->output_mode));
-			EXIT_NOT_IMPLEMENTED(trigger_result != OK);
-		}
-	}
+	TriggerVideoOutEventsLocked(ctx->output_mode_eqs, VideoOutEventKind::OutputMode,
+	                            reinterpret_cast<void*>(ctx->output_mode));
 	ctx->mutex.Unlock();
 
 	return OK;

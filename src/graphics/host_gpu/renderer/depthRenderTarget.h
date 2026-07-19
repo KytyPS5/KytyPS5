@@ -3,9 +3,9 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -22,7 +22,7 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
 }
 
 struct RenderDepthInfo {
-	VkFormat                    format                   = VK_FORMAT_UNDEFINED;
+	vk::Format                  format                   = vk::Format::eUndefined;
 	uint32_t                    width                    = 0;
 	uint32_t                    height                   = 0;
 	bool                        htile                    = false;
@@ -41,7 +41,7 @@ struct RenderDepthInfo {
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
 	bool                        depth_write_enable       = false;
-	VkCompareOp                 depth_compare_op         = VK_COMPARE_OP_NEVER;
+	vk::CompareOp               depth_compare_op         = vk::CompareOp::eNever;
 	bool                        depth_bounds_test_enable = false;
 	float                       depth_min_bounds         = 0.0f;
 	float                       depth_max_bounds         = 0.0f;
@@ -53,7 +53,7 @@ struct RenderDepthInfo {
 	PipelineStencilDynamicState stencil_dynamic_front;
 	PipelineStencilDynamicState stencil_dynamic_back;
 	DepthStencilVulkanImage*    vulkan_buffer = nullptr;
-	VkImageView                 vulkan_view   = nullptr;
+	vk::ImageView               vulkan_view   = nullptr;
 	uint64_t                    vaddr[3]      = {};
 	uint64_t                    size[3]       = {};
 	int                         vaddr_num     = 0;
@@ -68,9 +68,9 @@ inline bool depth_attachment_read_only(const RenderDepthInfo* depth) {
 	       !depth->depth_write_enable && !stencil_write;
 }
 
-inline VkImageLayout depth_attachment_layout(const RenderDepthInfo* depth) {
-	return depth_attachment_read_only(depth) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-	                                         : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo* depth) {
+	return depth_attachment_read_only(depth) ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                                         : vk::ImageLayout::eDepthStencilAttachmentOptimal;
 }
 
 void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const HW::Context& hw,

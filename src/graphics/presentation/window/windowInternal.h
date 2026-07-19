@@ -4,21 +4,21 @@
 #include "SDL_video.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
 struct WindowGame;
 
 struct SurfaceCapabilities {
-	VkSurfaceCapabilitiesKHR        capabilities {};
-	std::vector<VkSurfaceFormatKHR> formats;
-	std::vector<VkPresentModeKHR>   present_modes;
-	bool                            format_srgb_bgra32  = false;
-	bool                            format_unorm_bgra32 = false;
+	vk::SurfaceCapabilitiesKHR        capabilities {};
+	std::vector<vk::SurfaceFormatKHR> formats;
+	std::vector<vk::PresentModeKHR>   present_modes;
+	bool                              format_srgb_bgra32  = false;
+	bool                              format_unorm_bgra32 = false;
 };
 
 struct WindowContext {
@@ -26,7 +26,7 @@ struct WindowContext {
 	VulkanSwapchain*     swapchain            = nullptr;
 	SDL_Window*          window               = nullptr;
 	bool                 window_hidden        = true;
-	VkSurfaceKHR         surface              = nullptr;
+	vk::SurfaceKHR       surface              = nullptr;
 	SurfaceCapabilities* surface_capabilities = nullptr;
 	WindowGame*          game                 = nullptr;
 
@@ -40,7 +40,7 @@ struct WindowContext {
 
 extern WindowContext* g_window_ctx;
 
-void VulkanGetSurfaceCapabilities(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
+void VulkanGetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
                                   SurfaceCapabilities* capabilities);
 VulkanSwapchain* VulkanCreateSwapchain(GraphicContext* ctx, uint32_t image_count);
 void             VulkanCreate(WindowContext* ctx);

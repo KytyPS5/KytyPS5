@@ -19,8 +19,6 @@ void RenderContext::SetGraphicCtx(GraphicContext* ctx) {
 }
 
 GraphicContext* RenderContext::GetGraphicCtx() {
-	EXIT_IF(g_render_ctx == nullptr);
-
 	{
 		Common::LockGuard lock(m_graphic_ctx_mutex);
 		if (m_graphic_ctx != nullptr) {

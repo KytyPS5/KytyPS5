@@ -726,13 +726,16 @@ bool IsFormattedBufferComponent(const IR::Instruction& inst) {
 	       inst.memory.data_dwords == 1u;
 }
 
-Prospero::BufferFormat FormattedBufferFormat(const EmitterState& state, const IR::Instruction& inst) {
+Prospero::BufferFormat FormattedBufferFormat(const EmitterState&    state,
+                                             const IR::Instruction& inst) {
 	return inst.memory.typed
 	           ? Format::DecodeTBufferFormat(inst.memory.data_format, inst.memory.number_format)
-	           : static_cast<Prospero::BufferFormat>(StorageBufferFormat(state, inst.memory, inst.pc));
+	           : static_cast<Prospero::BufferFormat>(
+	                 StorageBufferFormat(state, inst.memory, inst.pc));
 }
 
-IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst, Prospero::BufferFormat format) {
+IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst,
+                                              Prospero::BufferFormat format) {
 	auto rebased = inst;
 	if (inst.memory.typed || inst.memory.component_index == 0u) {
 		return rebased;
@@ -972,7 +975,7 @@ bool EmitFormattedBufferLoad(EmitterState* state, const IR::Instruction& inst) {
 }
 
 uint32_t FormattedBufferDwordStoreComponentCount(Prospero::BufferFormat format,
-                                                 uint32_t        opcode_components) {
+                                                 uint32_t               opcode_components) {
 	switch (format) {
 		case Prospero::BufferFormat::k32UInt:
 		case Prospero::BufferFormat::k32SInt:

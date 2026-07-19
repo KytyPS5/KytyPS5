@@ -299,8 +299,7 @@ static bool Gen5Standard64KBLayout(uint32_t format, uint32_t* bytes_per_element,
 	}
 }
 
-static bool Gen5Thin64KBBlockSizeFromElementBytes(uint32_t  bytes_per_element,
-                                                  uint32_t* block_width,
+static bool Gen5Thin64KBBlockSizeFromElementBytes(uint32_t bytes_per_element, uint32_t* block_width,
                                                   uint32_t* block_height) {
 	// AGC thin 64 KiB block table, shared by depth and render-target tiles.
 	switch (bytes_per_element) {
@@ -1089,12 +1088,11 @@ struct Standard64KB16Tables {
 	constexpr Standard64KB16Tables() {
 		for (uint32_t i = 0; i < 256; i++) {
 			uint32_t x_part = 0;
-			x_part ^= (i << 1u) & 0x0006u;
-			x_part ^= (i << 4u) & 0x0040u;
-			x_part ^= (i << 5u) & 0x0100u;
-			x_part ^= (i << 6u) & 0x0400u;
-			x_part ^= (i << 7u) & 0x1000u;
-			x_part ^= (i << 8u) & 0x4000u;
+			x_part ^= (i << 1u) & 0x000eu;
+			x_part ^= (i << 4u) & 0x0080u;
+			x_part ^= (i << 5u) & 0x0200u;
+			x_part ^= (i << 6u) & 0x0800u;
+			x_part ^= (i << 7u) & 0x2000u;
 			x_part ^= (i << 8u) & 0x8000u;
 
 			x_words[i] = x_part >> 1u;
@@ -1102,11 +1100,11 @@ struct Standard64KB16Tables {
 
 		for (uint32_t i = 0; i < 128; i++) {
 			uint32_t y_part = 0;
-			y_part ^= (i << 3u) & 0x0038u;
-			y_part ^= (i << 4u) & 0x0080u;
-			y_part ^= (i << 5u) & 0x0200u;
-			y_part ^= (i << 6u) & 0x0800u;
-			y_part ^= (i << 7u) & 0x2000u;
+			y_part ^= (i << 4u) & 0x0070u;
+			y_part ^= (i << 5u) & 0x0100u;
+			y_part ^= (i << 6u) & 0x0400u;
+			y_part ^= (i << 7u) & 0x1000u;
+			y_part ^= (i << 8u) & 0x4000u;
 
 			y_words[i] = y_part >> 1u;
 		}
@@ -1182,8 +1180,8 @@ static void ConvertRenderTargetTyped(uint32_t width, uint32_t height, uint32_t p
 
 	uint32_t block_width  = 0;
 	uint32_t block_height = 0;
-	EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
-	    static_cast<uint32_t>(sizeof(T)), &block_width, &block_height));
+	EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(static_cast<uint32_t>(sizeof(T)),
+	                                                            &block_width, &block_height));
 
 	const uint64_t blocks_per_row = (static_cast<uint64_t>(pitch) + block_width - 1u) / block_width;
 	const uint32_t block_columns  = (width == 0 ? 0 : 1u + (width - 1u) / block_width);
@@ -1394,86 +1392,96 @@ static const Standard64KB128Tables& GetStandard64KB128Tables() {
 	return tables;
 }
 
-void TileConvertTiledToLinearStandard64KB32(void* dst, const void* src, uint32_t width,
-                                            uint32_t height, uint32_t pitch, uint64_t size,
-                                            uint64_t src_size, uint32_t src_x, uint32_t src_y) {
-	KYTY_PROFILER_FUNCTION();
+template <typename T, uint32_t BlockWidth, uint32_t BlockHeight, uint32_t CopyBatch,
+          bool ExactSurfaceRequiresFullWidth, typename Tables>
+static void ConvertTiledToLinearStandard64KBElements(void* dst, const void* src, uint32_t width,
+                                                     uint32_t height, uint32_t pitch, uint64_t size,
+                                                     uint64_t src_size, uint32_t src_x,
+                                                     uint32_t src_y, const Tables& tables) {
+	static_assert(BlockWidth * BlockHeight * sizeof(T) == 64u * 1024u);
+	static_assert(CopyBatch != 0 && BlockWidth % CopyBatch == 0);
 
 	EXIT_IF(dst == nullptr || src == nullptr);
 	EXIT_NOT_IMPLEMENTED(pitch == 0);
 	const bool tail_block = (src_size != 0 && (src_x != 0 || src_y != 0 || size < src_size));
 	EXIT_NOT_IMPLEMENTED(width > pitch);
-	EXIT_NOT_IMPLEMENTED(tail_block && (src_x + width > 128u || src_y + height > 128u));
+	EXIT_NOT_IMPLEMENTED(tail_block &&
+	                     (src_x + width > BlockWidth || src_y + height > BlockHeight));
 
-	auto*       dst32 = static_cast<uint32_t*>(dst);
-	const auto* src32 = static_cast<const uint32_t*>(src);
-
-	const auto& tables         = GetStandard64KB32Tables();
-	const auto  size_words     = size >> 2u;
-	const auto  src_size_words = (src_size != 0 ? src_size : size) >> 2u;
+	auto*       dst_elements      = static_cast<T*>(dst);
+	const auto* src_elements      = static_cast<const T*>(src);
+	const auto  element_count     = size / sizeof(T);
+	const auto  src_element_count = (src_size != 0 ? src_size : size) / sizeof(T);
 	const auto  blocks_per_row =
-	    (tail_block ? 1u : static_cast<uint64_t>(AlignUp(pitch, 128u) >> 7u));
-	const auto dst_words = static_cast<uint64_t>(pitch) * height;
-	const bool exact_surface =
-	    (!tail_block && width == pitch && (size & 3u) == 0 && size_words == dst_words);
-	const auto* x_words = tables.x_words.data();
-	const auto* y_words = tables.y_words.data();
+	    tail_block ? 1u : static_cast<uint64_t>(AlignUp(pitch, BlockWidth) / BlockWidth);
+	const auto  dst_element_count = static_cast<uint64_t>(pitch) * height;
+	const bool  exact_surface = !tail_block && (!ExactSurfaceRequiresFullWidth || width == pitch) &&
+	                            size % sizeof(T) == 0 && element_count == dst_element_count;
+	const auto* x_elements    = tables.x_words.data();
+	const auto* y_elements    = tables.y_words.data();
 
 	if (!exact_surface) {
-		std::memset(dst32, 0, static_cast<size_t>(size));
+		std::memset(dst_elements, 0, static_cast<size_t>(size));
 	}
 
-	for (uint32_t block_y = 0; block_y < height; block_y += 128u) {
-		const uint32_t block_height = std::min(128u, height - block_y);
+	constexpr uint64_t ElementsPerBlock = BlockWidth * BlockHeight;
+	for (uint32_t block_y = 0; block_y < height; block_y += BlockHeight) {
+		const uint32_t copy_height = std::min(BlockHeight, height - block_y);
 
-		for (uint32_t block_x = 0; block_x < width; block_x += 128u) {
-			const uint32_t block_width = std::min(128u, width - block_x);
+		for (uint32_t block_x = 0; block_x < width; block_x += BlockWidth) {
+			const uint32_t copy_width = std::min(BlockWidth, width - block_x);
 			const uint64_t block_base =
-			    (tail_block
-			         ? 0u
-			         : (((static_cast<uint64_t>(block_y) >> 7u) * blocks_per_row) + (block_x >> 7u))
-			               << 14u);
-			const bool full_block =
-			    (!tail_block && block_width == 128u && block_height == 128u &&
-			     block_base + 16384u <= src_size_words &&
-			     (static_cast<uint64_t>(block_y + 127u) * pitch) + block_x + 127u < size_words);
+			    tail_block ? 0u
+			               : ((static_cast<uint64_t>(block_y / BlockHeight) * blocks_per_row) +
+			                  block_x / BlockWidth) *
+			                     ElementsPerBlock;
+			const bool full_block = !tail_block && copy_width == BlockWidth &&
+			                        copy_height == BlockHeight &&
+			                        block_base + ElementsPerBlock <= src_element_count &&
+			                        static_cast<uint64_t>(block_y + BlockHeight - 1u) * pitch +
+			                                block_x + BlockWidth - 1u <
+			                            element_count;
 
 			if (full_block) {
-				for (uint32_t local_y = 0; local_y < 128u; local_y++) {
+				for (uint32_t local_y = 0; local_y < BlockHeight; local_y++) {
 					const uint64_t dst_row =
-					    (static_cast<uint64_t>(block_y + local_y) * pitch) + block_x;
-					const uint64_t src_row = block_base + y_words[src_y + local_y];
+					    static_cast<uint64_t>(block_y + local_y) * pitch + block_x;
+					const uint64_t src_row = block_base + y_elements[src_y + local_y];
 
-					for (uint32_t local_x = 0; local_x < 128u; local_x += 4u) {
-						dst32[dst_row + local_x + 0u] =
-						    src32[src_row + x_words[src_x + local_x + 0u]];
-						dst32[dst_row + local_x + 1u] =
-						    src32[src_row + x_words[src_x + local_x + 1u]];
-						dst32[dst_row + local_x + 2u] =
-						    src32[src_row + x_words[src_x + local_x + 2u]];
-						dst32[dst_row + local_x + 3u] =
-						    src32[src_row + x_words[src_x + local_x + 3u]];
+					for (uint32_t local_x = 0; local_x < BlockWidth; local_x += CopyBatch) {
+						for (uint32_t i = 0; i < CopyBatch; i++) {
+							dst_elements[dst_row + local_x + i] =
+							    src_elements[src_row + x_elements[src_x + local_x + i]];
+						}
 					}
 				}
 				continue;
 			}
 
-			for (uint32_t local_y = 0; local_y < block_height; local_y++) {
-				const uint64_t dst_row =
-				    (static_cast<uint64_t>(block_y + local_y) * pitch) + block_x;
-				const uint64_t src_row = block_base + y_words[src_y + local_y];
+			for (uint32_t local_y = 0; local_y < copy_height; local_y++) {
+				const uint64_t dst_row = static_cast<uint64_t>(block_y + local_y) * pitch + block_x;
+				const uint64_t src_row = block_base + y_elements[src_y + local_y];
 
-				for (uint32_t local_x = 0; local_x < block_width; local_x++) {
+				for (uint32_t local_x = 0; local_x < copy_width; local_x++) {
 					const uint64_t dst_index = dst_row + local_x;
-					const uint64_t src_index = src_row + x_words[src_x + local_x];
+					const uint64_t src_index = src_row + x_elements[src_x + local_x];
 
-					if (src_index < src_size_words && dst_index < size_words) {
-						dst32[dst_index] = src32[src_index];
+					if (src_index < src_element_count && dst_index < element_count) {
+						dst_elements[dst_index] = src_elements[src_index];
 					}
 				}
 			}
 		}
 	}
+}
+
+void TileConvertTiledToLinearStandard64KB32(void* dst, const void* src, uint32_t width,
+                                            uint32_t height, uint32_t pitch, uint64_t size,
+                                            uint64_t src_size, uint32_t src_x, uint32_t src_y) {
+	KYTY_PROFILER_FUNCTION();
+
+	ConvertTiledToLinearStandard64KBElements<uint32_t, 128u, 128u, 4u, true>(
+	    dst, src, width, height, pitch, size, src_size, src_x, src_y, GetStandard64KB32Tables());
 }
 
 void TileConvertLinearToTiledStandard64KB32(void* dst, const void* src, uint32_t width,
@@ -1488,9 +1496,9 @@ void TileConvertLinearToTiledStandard64KB32(void* dst, const void* src, uint32_t
 		     dst, src, width, height, pitch, size);
 	}
 
-	auto*       dst32 = static_cast<uint32_t*>(dst);
-	const auto* src32 = static_cast<const uint32_t*>(src);
-	const auto& tables = GetStandard64KB32Tables();
+	auto*       dst32          = static_cast<uint32_t*>(dst);
+	const auto* src32          = static_cast<const uint32_t*>(src);
+	const auto& tables         = GetStandard64KB32Tables();
 	const auto  blocks_per_row = (static_cast<uint64_t>(pitch) + 127u) >> 7u;
 	const auto  block_rows     = (static_cast<uint64_t>(height) + 127u) >> 7u;
 	if (blocks_per_row > UINT64_MAX / block_rows / 65536u ||
@@ -1542,81 +1550,8 @@ void TileConvertTiledToLinearStandard64KB16(void* dst, const void* src, uint32_t
                                             uint64_t src_size, uint32_t src_x, uint32_t src_y) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_IF(dst == nullptr || src == nullptr);
-	EXIT_NOT_IMPLEMENTED(pitch == 0);
-	const bool tail_block = (src_size != 0 && (src_x != 0 || src_y != 0 || size < src_size));
-	EXIT_NOT_IMPLEMENTED(width > pitch);
-	EXIT_NOT_IMPLEMENTED(tail_block && (src_x + width > 256u || src_y + height > 128u));
-
-	auto*       dst16 = static_cast<uint16_t*>(dst);
-	const auto* src16 = static_cast<const uint16_t*>(src);
-
-	const auto& tables         = GetStandard64KB16Tables();
-	const auto  size_words     = size >> 1u;
-	const auto  src_size_words = (src_size != 0 ? src_size : size) >> 1u;
-	const auto  blocks_per_row =
-	    (tail_block ? 1u : static_cast<uint64_t>(AlignUp(pitch, 256u) >> 8u));
-	const auto dst_words = static_cast<uint64_t>(pitch) * height;
-	const bool exact_surface =
-	    (!tail_block && width == pitch && (size & 1u) == 0 && size_words == dst_words);
-	const auto* x_words = tables.x_words.data();
-	const auto* y_words = tables.y_words.data();
-
-	if (!exact_surface) {
-		std::memset(dst16, 0, static_cast<size_t>(size));
-	}
-
-	for (uint32_t block_y = 0; block_y < height; block_y += 128u) {
-		const uint32_t block_height = std::min(128u, height - block_y);
-
-		for (uint32_t block_x = 0; block_x < width; block_x += 256u) {
-			const uint32_t block_width = std::min(256u, width - block_x);
-			const uint64_t block_base =
-			    (tail_block
-			         ? 0u
-			         : (((static_cast<uint64_t>(block_y) >> 7u) * blocks_per_row) + (block_x >> 8u))
-			               << 15u);
-			const bool full_block =
-			    (!tail_block && block_width == 256u && block_height == 128u &&
-			     block_base + 32768u <= src_size_words &&
-			     (static_cast<uint64_t>(block_y + 127u) * pitch) + block_x + 255u < size_words);
-
-			if (full_block) {
-				for (uint32_t local_y = 0; local_y < 128u; local_y++) {
-					const uint64_t dst_row =
-					    (static_cast<uint64_t>(block_y + local_y) * pitch) + block_x;
-					const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-					for (uint32_t local_x = 0; local_x < 256u; local_x += 4u) {
-						dst16[dst_row + local_x + 0u] =
-						    src16[src_row + x_words[src_x + local_x + 0u]];
-						dst16[dst_row + local_x + 1u] =
-						    src16[src_row + x_words[src_x + local_x + 1u]];
-						dst16[dst_row + local_x + 2u] =
-						    src16[src_row + x_words[src_x + local_x + 2u]];
-						dst16[dst_row + local_x + 3u] =
-						    src16[src_row + x_words[src_x + local_x + 3u]];
-					}
-				}
-				continue;
-			}
-
-			for (uint32_t local_y = 0; local_y < block_height; local_y++) {
-				const uint64_t dst_row =
-				    (static_cast<uint64_t>(block_y + local_y) * pitch) + block_x;
-				const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-				for (uint32_t local_x = 0; local_x < block_width; local_x++) {
-					const uint64_t dst_index = dst_row + local_x;
-					const uint64_t src_index = src_row + x_words[src_x + local_x];
-
-					if (src_index < src_size_words && dst_index < size_words) {
-						dst16[dst_index] = src16[src_index];
-					}
-				}
-			}
-		}
-	}
+	ConvertTiledToLinearStandard64KBElements<uint16_t, 256u, 128u, 4u, true>(
+	    dst, src, width, height, pitch, size, src_size, src_x, src_y, GetStandard64KB16Tables());
 }
 
 static void TileConvertTiledToLinearStandard64KB8Elements(
@@ -1624,82 +1559,9 @@ static void TileConvertTiledToLinearStandard64KB8Elements(
     uint32_t pitch_elements, uint64_t size, uint64_t src_size, uint32_t src_x, uint32_t src_y) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_IF(dst == nullptr || src == nullptr);
-	EXIT_NOT_IMPLEMENTED(pitch_elements == 0);
-	const bool tail_block = (src_size != 0 && (src_x != 0 || src_y != 0 || size < src_size));
-	EXIT_NOT_IMPLEMENTED(width_elements > pitch_elements);
-	EXIT_NOT_IMPLEMENTED(tail_block &&
-	                     (src_x + width_elements > 256u || src_y + height_elements > 256u));
-
-	auto*       dst8 = static_cast<uint8_t*>(dst);
-	const auto* src8 = static_cast<const uint8_t*>(src);
-
-	const auto& tables         = GetStandard64KB8Tables();
-	const auto  size_words     = size;
-	const auto  src_size_words = (src_size != 0 ? src_size : size);
-	const auto  blocks_per_row =
-	    (tail_block ? 1u : static_cast<uint64_t>(AlignUp(pitch_elements, 256u) >> 8u));
-	const auto  dst_words     = static_cast<uint64_t>(pitch_elements) * height_elements;
-	const bool  exact_surface = (!tail_block && size_words == dst_words);
-	const auto* x_words       = tables.x_words.data();
-	const auto* y_words       = tables.y_words.data();
-
-	if (!exact_surface) {
-		std::memset(dst8, 0, static_cast<size_t>(size));
-	}
-
-	for (uint32_t block_y = 0; block_y < height_elements; block_y += 256u) {
-		const uint32_t block_height = std::min(256u, height_elements - block_y);
-
-		for (uint32_t block_x = 0; block_x < width_elements; block_x += 256u) {
-			const uint32_t block_width = std::min(256u, width_elements - block_x);
-			const uint64_t block_base =
-			    (tail_block
-			         ? 0u
-			         : (((static_cast<uint64_t>(block_y) >> 8u) * blocks_per_row) + (block_x >> 8u))
-			               << 16u);
-			const bool full_block =
-			    (!tail_block && block_width == 256u && block_height == 256u &&
-			     block_base + 65536u <= src_size_words &&
-			     (static_cast<uint64_t>(block_y + 255u) * pitch_elements) + block_x + 255u <
-			         size_words);
-
-			if (full_block) {
-				for (uint32_t local_y = 0; local_y < 256u; local_y++) {
-					const uint64_t dst_row =
-					    (static_cast<uint64_t>(block_y + local_y) * pitch_elements) + block_x;
-					const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-					for (uint32_t local_x = 0; local_x < 256u; local_x += 4u) {
-						dst8[dst_row + local_x + 0u] =
-						    src8[src_row + x_words[src_x + local_x + 0u]];
-						dst8[dst_row + local_x + 1u] =
-						    src8[src_row + x_words[src_x + local_x + 1u]];
-						dst8[dst_row + local_x + 2u] =
-						    src8[src_row + x_words[src_x + local_x + 2u]];
-						dst8[dst_row + local_x + 3u] =
-						    src8[src_row + x_words[src_x + local_x + 3u]];
-					}
-				}
-				continue;
-			}
-
-			for (uint32_t local_y = 0; local_y < block_height; local_y++) {
-				const uint64_t dst_row =
-				    (static_cast<uint64_t>(block_y + local_y) * pitch_elements) + block_x;
-				const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-				for (uint32_t local_x = 0; local_x < block_width; local_x++) {
-					const uint64_t dst_index = dst_row + local_x;
-					const uint64_t src_index = src_row + x_words[src_x + local_x];
-
-					if (src_index < src_size_words && dst_index < size_words) {
-						dst8[dst_index] = src8[src_index];
-					}
-				}
-			}
-		}
-	}
+	ConvertTiledToLinearStandard64KBElements<uint8_t, 256u, 256u, 4u, false>(
+	    dst, src, width_elements, height_elements, pitch_elements, size, src_size, src_x, src_y,
+	    GetStandard64KB8Tables());
 }
 
 static void TileConvertTiledToLinearStandard64KB64Elements(
@@ -1707,87 +1569,32 @@ static void TileConvertTiledToLinearStandard64KB64Elements(
     uint32_t pitch_elements, uint64_t size, uint64_t src_size, uint32_t src_x, uint32_t src_y) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_IF(dst == nullptr || src == nullptr);
-	EXIT_NOT_IMPLEMENTED(pitch_elements == 0);
-	const bool tail_block = (src_size != 0 && (src_x != 0 || src_y != 0 || size < src_size));
-	EXIT_NOT_IMPLEMENTED(width_elements > pitch_elements);
-	EXIT_NOT_IMPLEMENTED(tail_block &&
-	                     (src_x + width_elements > 128u || src_y + height_elements > 64u));
+	ConvertTiledToLinearStandard64KBElements<uint64_t, 128u, 64u, 8u, false>(
+	    dst, src, width_elements, height_elements, pitch_elements, size, src_size, src_x, src_y,
+	    GetStandard64KB64Tables());
+}
 
-	auto*       dst64 = static_cast<uint64_t*>(dst);
-	const auto* src64 = static_cast<const uint64_t*>(src);
-
+static void TileConvertLinearToTiledStandard64KB64Elements(
+    void* dst, const void* src, uint32_t width_elements, uint32_t height_elements,
+    uint32_t pitch_elements, uint64_t size, uint64_t dst_size, uint32_t dst_x, uint32_t dst_y) {
+	if (width_elements > pitch_elements) {
+		EXIT("invalid linear-to-Standard64KB64 tail conversion, extent=%ux%u pitch=%u "
+		     "size=0x%016" PRIx64 " dst_size=0x%016" PRIx64 " dst=%u,%u\n",
+		     width_elements, height_elements, pitch_elements, size, dst_size, dst_x, dst_y);
+	}
+	auto*       dst64          = static_cast<uint64_t*>(dst);
+	const auto* src64          = static_cast<const uint64_t*>(src);
 	const auto& tables         = GetStandard64KB64Tables();
 	const auto  size_words     = size >> 3u;
-	const auto  src_size_words = (src_size != 0 ? src_size : size) >> 3u;
-	const auto  blocks_per_row =
-	    (tail_block ? 1u : static_cast<uint64_t>(AlignUp(pitch_elements, 128u) >> 7u));
-	const auto  dst_words     = static_cast<uint64_t>(pitch_elements) * height_elements;
-	const bool  exact_surface = (!tail_block && (size & 7u) == 0 && size_words == dst_words);
-	const auto* x_words       = tables.x_words.data();
-	const auto* y_words       = tables.y_words.data();
-
-	if (!exact_surface) {
-		std::memset(dst64, 0, static_cast<size_t>(size));
-	}
-
-	for (uint32_t block_y = 0; block_y < height_elements; block_y += 64u) {
-		const uint32_t block_height = std::min(64u, height_elements - block_y);
-
-		for (uint32_t block_x = 0; block_x < width_elements; block_x += 128u) {
-			const uint32_t block_width = std::min(128u, width_elements - block_x);
-			const uint64_t block_base =
-			    (tail_block
-			         ? 0u
-			         : (((static_cast<uint64_t>(block_y) >> 6u) * blocks_per_row) + (block_x >> 7u))
-			               << 13u);
-			const bool full_block =
-			    (!tail_block && block_width == 128u && block_height == 64u &&
-			     block_base + 8192u <= src_size_words &&
-			     (static_cast<uint64_t>(block_y + 63u) * pitch_elements) + block_x + 127u <
-			         size_words);
-
-			if (full_block) {
-				for (uint32_t local_y = 0; local_y < 64u; local_y++) {
-					const uint64_t dst_row =
-					    (static_cast<uint64_t>(block_y + local_y) * pitch_elements) + block_x;
-					const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-					for (uint32_t local_x = 0; local_x < 128u; local_x += 8u) {
-						dst64[dst_row + local_x + 0u] =
-						    src64[src_row + x_words[src_x + local_x + 0u]];
-						dst64[dst_row + local_x + 1u] =
-						    src64[src_row + x_words[src_x + local_x + 1u]];
-						dst64[dst_row + local_x + 2u] =
-						    src64[src_row + x_words[src_x + local_x + 2u]];
-						dst64[dst_row + local_x + 3u] =
-						    src64[src_row + x_words[src_x + local_x + 3u]];
-						dst64[dst_row + local_x + 4u] =
-						    src64[src_row + x_words[src_x + local_x + 4u]];
-						dst64[dst_row + local_x + 5u] =
-						    src64[src_row + x_words[src_x + local_x + 5u]];
-						dst64[dst_row + local_x + 6u] =
-						    src64[src_row + x_words[src_x + local_x + 6u]];
-						dst64[dst_row + local_x + 7u] =
-						    src64[src_row + x_words[src_x + local_x + 7u]];
-					}
-				}
-				continue;
-			}
-
-			for (uint32_t local_y = 0; local_y < block_height; local_y++) {
-				const uint64_t dst_row =
-				    (static_cast<uint64_t>(block_y + local_y) * pitch_elements) + block_x;
-				const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-				for (uint32_t local_x = 0; local_x < block_width; local_x++) {
-					const uint64_t dst_index = dst_row + local_x;
-					const uint64_t src_index = src_row + x_words[src_x + local_x];
-
-					if (src_index < src_size_words && dst_index < size_words) {
-						dst64[dst_index] = src64[src_index];
-					}
-				}
+	const auto  dst_size_words = dst_size >> 3u;
+	for (uint32_t y = 0; y < height_elements; y++) {
+		const uint64_t src_row = static_cast<uint64_t>(y) * pitch_elements;
+		const uint64_t dst_row = tables.y_words[dst_y + y];
+		for (uint32_t x = 0; x < width_elements; x++) {
+			const uint64_t src_index = src_row + x;
+			const uint64_t dst_index = dst_row + tables.x_words[dst_x + x];
+			if (src_index < size_words && dst_index < dst_size_words) {
+				dst64[dst_index] = src64[src_index];
 			}
 		}
 	}
@@ -1798,82 +1605,9 @@ static void TileConvertTiledToLinearStandard64KB128Elements(
     uint32_t pitch_elements, uint64_t size, uint64_t src_size, uint32_t src_x, uint32_t src_y) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_IF(dst == nullptr || src == nullptr);
-	EXIT_NOT_IMPLEMENTED(pitch_elements == 0);
-	const bool tail_block = (src_size != 0 && (src_x != 0 || src_y != 0 || size < src_size));
-	EXIT_NOT_IMPLEMENTED(width_elements > pitch_elements);
-	EXIT_NOT_IMPLEMENTED(tail_block &&
-	                     (src_x + width_elements > 64u || src_y + height_elements > 64u));
-
-	auto*       dst128 = static_cast<Uint128*>(dst);
-	const auto* src128 = static_cast<const Uint128*>(src);
-
-	const auto& tables         = GetStandard64KB128Tables();
-	const auto  size_words     = size >> 4u;
-	const auto  src_size_words = (src_size != 0 ? src_size : size) >> 4u;
-	const auto  blocks_per_row =
-	    (tail_block ? 1u : static_cast<uint64_t>(AlignUp(pitch_elements, 64u) >> 6u));
-	const auto  dst_words     = static_cast<uint64_t>(pitch_elements) * height_elements;
-	const bool  exact_surface = (!tail_block && (size & 15u) == 0 && size_words == dst_words);
-	const auto* x_words       = tables.x_words.data();
-	const auto* y_words       = tables.y_words.data();
-
-	if (!exact_surface) {
-		std::memset(dst128, 0, static_cast<size_t>(size));
-	}
-
-	for (uint32_t block_y = 0; block_y < height_elements; block_y += 64u) {
-		const uint32_t block_height = std::min(64u, height_elements - block_y);
-
-		for (uint32_t block_x = 0; block_x < width_elements; block_x += 64u) {
-			const uint32_t block_width = std::min(64u, width_elements - block_x);
-			const uint64_t block_base =
-			    (tail_block
-			         ? 0u
-			         : (((static_cast<uint64_t>(block_y) >> 6u) * blocks_per_row) + (block_x >> 6u))
-			               << 12u);
-			const bool full_block =
-			    (!tail_block && block_width == 64u && block_height == 64u &&
-			     block_base + 4096u <= src_size_words &&
-			     (static_cast<uint64_t>(block_y + 63u) * pitch_elements) + block_x + 63u <
-			         size_words);
-
-			if (full_block) {
-				for (uint32_t local_y = 0; local_y < 64u; local_y++) {
-					const uint64_t dst_row =
-					    (static_cast<uint64_t>(block_y + local_y) * pitch_elements) + block_x;
-					const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-					for (uint32_t local_x = 0; local_x < 64u; local_x += 4u) {
-						dst128[dst_row + local_x + 0u] =
-						    src128[src_row + x_words[src_x + local_x + 0u]];
-						dst128[dst_row + local_x + 1u] =
-						    src128[src_row + x_words[src_x + local_x + 1u]];
-						dst128[dst_row + local_x + 2u] =
-						    src128[src_row + x_words[src_x + local_x + 2u]];
-						dst128[dst_row + local_x + 3u] =
-						    src128[src_row + x_words[src_x + local_x + 3u]];
-					}
-				}
-				continue;
-			}
-
-			for (uint32_t local_y = 0; local_y < block_height; local_y++) {
-				const uint64_t dst_row =
-				    (static_cast<uint64_t>(block_y + local_y) * pitch_elements) + block_x;
-				const uint64_t src_row = block_base + y_words[src_y + local_y];
-
-				for (uint32_t local_x = 0; local_x < block_width; local_x++) {
-					const uint64_t dst_index = dst_row + local_x;
-					const uint64_t src_index = src_row + x_words[src_x + local_x];
-
-					if (src_index < src_size_words && dst_index < size_words) {
-						dst128[dst_index] = src128[src_index];
-					}
-				}
-			}
-		}
-	}
+	ConvertTiledToLinearStandard64KBElements<Uint128, 64u, 64u, 4u, false>(
+	    dst, src, width_elements, height_elements, pitch_elements, size, src_size, src_x, src_y,
+	    GetStandard64KB128Tables());
 }
 
 void TileConvertTiledToLinearStandard64KB(void* dst, const void* src, uint32_t format,
@@ -2197,14 +1931,12 @@ static void TileConvertDepth(void* dst, const void* src, uint32_t format, uint32
 	const uint32_t block_width  = supported_bpe && bytes_per_element <= 2 ? 256u : 128u;
 	const uint32_t block_height = supported_bpe ? 65536u / (block_width * bytes_per_element) : 0;
 	if (dst == nullptr || src == nullptr || width == 0 || height == 0 || pitch < width ||
-	    !supported_bpe || pitch % block_width != 0 ||
-	    size == 0 || size % 65536u != 0) {
+	    !supported_bpe || pitch % block_width != 0 || size == 0 || size % 65536u != 0) {
 		EXIT("unsupported depth conversion, dst=%p src=%p format=%u "
 		     "extent=%ux%u pitch=%u size=0x%016" PRIx64 "\n",
 		     dst, src, format, width, height, pitch, size);
 	}
-	const uint64_t block_rows =
-	    (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
+	const uint64_t block_rows = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
 	const uint64_t blocks_per_row = pitch / block_width;
 	if (blocks_per_row > UINT64_MAX / block_rows ||
 	    blocks_per_row * block_rows > UINT64_MAX / 65536u ||
@@ -2474,8 +2206,20 @@ void TileConvertTiledToLinearRenderTarget(void* dst, const void* src, uint32_t w
 
 void TileConvertLinearToTiledRenderTarget(void* dst, const void* src, uint32_t width,
                                           uint32_t height, uint32_t pitch,
-                                          uint32_t bytes_per_element, uint64_t size) {
+                                          uint32_t bytes_per_element, uint64_t size,
+                                          uint64_t dst_size, uint32_t dst_x, uint32_t dst_y) {
 	KYTY_PROFILER_FUNCTION();
+	const bool tail_block = dst_size != 0 && (dst_x != 0 || dst_y != 0 || size < dst_size);
+	if (tail_block) {
+		// Not sure about this at all
+		if (bytes_per_element != 8) {
+			EXIT("unsupported linear-to-tiled render-target tail element size: %u\n",
+			     bytes_per_element);
+		}
+		TileConvertLinearToTiledStandard64KB64Elements(dst, src, width, height, pitch, size,
+		                                               dst_size, dst_x, dst_y);
+		return;
+	}
 
 	if (dst == nullptr || src == nullptr || width == 0 || height == 0 || pitch == 0 ||
 	    width > pitch || bytes_per_element == 0 || size == 0 || size % bytes_per_element != 0) {
@@ -2559,8 +2303,8 @@ bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch, uint32_t 
 uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element) {
 	uint32_t block_width  = 0;
 	uint32_t block_height = 0;
-	if (width == 0 || !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width,
-	                                                        &block_height)) {
+	if (width == 0 ||
+	    !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width, &block_height)) {
 		return 0;
 	}
 	const uint64_t pitch = (static_cast<uint64_t>(width) + block_width - 1u) &
@@ -2574,8 +2318,7 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 	uint32_t block_width  = 0;
 	uint32_t block_height = 0;
 	if (height == 0 || pitch == 0 ||
-	    !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width,
-	                                           &block_height) ||
+	    !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width, &block_height) ||
 	    pitch != TileGetRenderTargetPitch(width, bytes_per_element)) {
 		return false;
 	}
@@ -2618,8 +2361,8 @@ bool TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t pitc
 		default: return false;
 	}
 	TileGetTextureSize(format, width, height, pitch, levels,
-	                   Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget), total_size, level_sizes,
-	                   padded_size);
+	                   Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget), total_size,
+	                   level_sizes, padded_size);
 	return total_size->size != 0 && total_size->align == 65536;
 }
 
@@ -2701,8 +2444,8 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	    bytes_per_element != 0 && tile == 27 && levels == 1) {
 		uint32_t block_width  = 0;
 		uint32_t block_height = 0;
-		EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
-		    bytes_per_element, &block_width, &block_height));
+		EXIT_NOT_IMPLEMENTED(
+		    !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width, &block_height));
 
 		const uint32_t padded_width  = AlignUp(pitch, block_width);
 		const uint32_t padded_height = AlignUp(height, block_height);
@@ -2730,8 +2473,8 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	    bytes_per_element != 0 && tile == 27 && levels > 1) {
 		uint32_t block_width  = 0;
 		uint32_t block_height = 0;
-		EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
-		    bytes_per_element, &block_width, &block_height));
+		EXIT_NOT_IMPLEMENTED(
+		    !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width, &block_height));
 
 		const uint32_t     bytes_log2        = IntLog2(bytes_per_element);
 		const uint32_t     tail_width_limit  = block_width >> 1u;
@@ -2953,11 +2696,11 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	if (tile == 24 && levels == 1) {
 		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
 		if (bytes_per_element != 0) {
-			uint32_t block_width  = 0;
-			uint32_t block_height = 0;
-			const bool supported = bytes_per_element <= 4 &&
-			                       Gen5Thin64KBBlockSizeFromElementBytes(
-			                           bytes_per_element, &block_width, &block_height);
+			uint32_t   block_width  = 0;
+			uint32_t   block_height = 0;
+			const bool supported =
+			    bytes_per_element <= 4 && Gen5Thin64KBBlockSizeFromElementBytes(
+			                                  bytes_per_element, &block_width, &block_height);
 
 			if (supported) {
 				const uint32_t padded_width  = (pitch + block_width - 1u) & ~(block_width - 1u);
@@ -2987,11 +2730,11 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	if (tile == 24 && levels > 1) {
 		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
 		if (bytes_per_element != 0) {
-			uint32_t block_width  = 0;
-			uint32_t block_height = 0;
-			const bool supported = bytes_per_element <= 4 &&
-			                       Gen5Thin64KBBlockSizeFromElementBytes(
-			                           bytes_per_element, &block_width, &block_height);
+			uint32_t   block_width  = 0;
+			uint32_t   block_height = 0;
+			const bool supported =
+			    bytes_per_element <= 4 && Gen5Thin64KBBlockSizeFromElementBytes(
+			                                  bytes_per_element, &block_width, &block_height);
 
 			if (supported) {
 				static bool logged = false;
@@ -3234,7 +2977,8 @@ uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, u
 	uint32_t pitch = width;
 
 	if (tile == 27) {
-		if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format); bytes_per_element != 0) {
+		if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
+		    bytes_per_element != 0) {
 			uint32_t block_width  = 0;
 			uint32_t block_height = 0;
 			EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
@@ -3244,7 +2988,8 @@ uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, u
 	}
 
 	if (tile == 0) {
-		if (const auto bytes_per_element = Prospero::NumBytesPerElement(format); bytes_per_element != 0) {
+		if (const auto bytes_per_element = Prospero::NumBytesPerElement(format);
+		    bytes_per_element != 0) {
 			pitch = AlignUp(pitch * bytes_per_element, 256u) / bytes_per_element;
 		}
 	}
@@ -3260,10 +3005,10 @@ uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, u
 	}
 	if (tile == 24) {
 		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
-		uint32_t       block_width      = 0;
-		uint32_t       block_height     = 0;
-		if (bytes_per_element <= 4 && Gen5Thin64KBBlockSizeFromElementBytes(
-		                                  bytes_per_element, &block_width, &block_height)) {
+		uint32_t       block_width       = 0;
+		uint32_t       block_height      = 0;
+		if (bytes_per_element <= 4 &&
+		    Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width, &block_height)) {
 			pitch = AlignUp(pitch, block_width);
 		}
 	}

@@ -23,7 +23,7 @@ ShaderLaneMaskMode SelectGraphicsLaneMaskMode(const GraphicContext& context,
                                               uint32_t              guest_wave_size);
 
 ShaderSubgroupConfiguration ConfigureShaderSubgroup(const GraphicContext&                context,
-                                                    VkShaderStageFlagBits                stage,
+                                                    vk::ShaderStageFlagBits              stage,
                                                     const ShaderRecompiler::IR::Program& program);
 
 } // namespace Libs::Graphics

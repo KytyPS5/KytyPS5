@@ -575,11 +575,14 @@ struct SrtPlan {
 };
 
 struct BufferResource {
+	static constexpr uint32_t NoImageAlias = UINT32_MAX;
+
 	uint32_t source            = 0;
 	uint32_t first_use_pc      = 0;
 	uint32_t max_byte_extent   = 0;
 	uint32_t packed_stride     = 0;
 	uint32_t descriptor_format = 0;
+	uint32_t image_alias       = NoImageAlias;
 	bool     read              = false;
 	bool     written           = false;
 	bool     atomic            = false;

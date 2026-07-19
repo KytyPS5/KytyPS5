@@ -626,8 +626,8 @@ struct GeUserVgprEn {
 
 class Context {
 public:
-	Context()          = default;
-	virtual ~Context() = default;
+	Context()  = default;
+	~Context() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(Context);
 
@@ -723,10 +723,6 @@ public:
 		return m_depth_render_target.size;
 	}
 
-	void SetViewportZ(uint32_t viewport_id, float zmin, float zmax) {
-		m_screen_viewport.viewports[viewport_id].zmin = zmin;
-		m_screen_viewport.viewports[viewport_id].zmax = zmax;
-	}
 	void SetViewportZMin(uint32_t viewport_id, float zmin) {
 		m_screen_viewport.viewports[viewport_id].zmin = zmin;
 	}
@@ -942,8 +938,8 @@ private:
 
 class UserConfig {
 public:
-	UserConfig()          = default;
-	virtual ~UserConfig() = default;
+	UserConfig()  = default;
+	~UserConfig() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(UserConfig);
 
@@ -980,8 +976,8 @@ private:
 
 class Shader {
 public:
-	Shader()          = default;
-	virtual ~Shader() = default;
+	Shader()  = default;
+	~Shader() = default;
 
 	KYTY_CLASS_DEFAULT_COPY(Shader);
 

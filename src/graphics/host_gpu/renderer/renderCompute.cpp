@@ -14,15 +14,16 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
+#include "graphics/host_gpu/renderer/descriptors.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderInternal.h"
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/shaderSubgroup.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
@@ -38,9 +39,6 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
-#include <vulkan/vk_enum_string_helper.h>
-
-// IWYU pragma: no_forward_declare VkImageView_T
 
 namespace Libs::Graphics {
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
@@ -111,7 +109,7 @@ bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor
 		}
 	}
 
-	const bool size_xy_valid = z.size.valid && (z.size.x_max != 0 || z.size.y_max != 0);
+	const bool size_xy_valid = z.size.valid;
 	const bool wh_valid      = z.width_height_valid && z.width != 0 && z.height != 0;
 	if (!size_xy_valid && !wh_valid) {
 		// Prospero emits an exact full-surface metadata descriptor even
@@ -267,7 +265,8 @@ static bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input, cons
 			continue;
 		}
 		if (resource.written || !resource.read || resource.atomic || descriptor.Base48() == 0 ||
-		    descriptor_size == 0 || cache->HasMetaOverlap(descriptor.Base48(), descriptor_size)) {
+		    descriptor_size == 0 ||
+		    cache->QueryRegion(descriptor.Base48(), descriptor_size).metadata_pages) {
 			EXIT("unsupported HTile clear side-buffer access\n");
 		}
 		g_render_ctx->GetBufferCache()->ValidateGpuAccess(descriptor.Base48(), descriptor_size,
@@ -280,18 +279,6 @@ static bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input, cons
 	ValidateFullHtileClearDispatch(input, metadata_descriptor, group_x, group_y, group_z, mode);
 	if (!cache->ClearMeta(target.address)) {
 		EXIT("failed to record HTile compute clear\n");
-	}
-	const bool descriptor_backed =
-	    current_references != 0 && !z.size.valid && !z.width_height_valid && !z.pitch_height_valid;
-	const uint32_t source_bit = current_references == 0 ? 1u : descriptor_backed ? 2u : 4u;
-	static std::atomic<uint32_t> logged_sources {0};
-	if ((logged_sources.fetch_or(source_bit, std::memory_order_relaxed) & source_bit) == 0) {
-		LOGF("HTileClear: native virtual clear source=%s shader=0x%016" PRIx64 " addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     current_references == 0 ? "registered"
-		     : descriptor_backed     ? "descriptor"
-		                             : "derived",
-		     program.shader_hash, target.address, target.size);
 	}
 	return true;
 }
@@ -361,9 +348,7 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 		return false;
 	}
 	auto* cache = g_render_ctx->GetTextureCache();
-	if (!cache->ClearColorImageFromBuffer(command, descriptor.Base48(), size, packed_clear) &&
-	    !cache->ClearDepthImageFromBuffer(command, descriptor.Base48(), size, packed_clear) &&
-	    !cache->ClearStencilImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
+	if (!cache->ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
 		return false;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
@@ -543,23 +528,22 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 
 	for (;;) {
 		const auto recording_generation = buffer->GetRecordingGeneration();
-		auto*      vk_buffer            = buffer->GetPool()->buffers[buffer->GetIndex()];
+		auto       vk_buffer            = buffer->Handle();
 		auto*      pipeline             = g_render_ctx->GetPipelineCache()->CreateComputePipeline(
 		    &input_info, &sh_ctx->GetCs(), cs_shader);
 
-		vkCmdBindPipeline(vk_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
 
-		const auto address_writes = BindDescriptors(
-		    submit_id, buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline_layout,
-		    input_info.stage, VK_SHADER_STAGE_COMPUTE_BIT, DescriptorCache::Stage::Compute);
+		BindDescriptors(submit_id, buffer, vk::PipelineBindPoint::eCompute,
+		                pipeline->pipeline_layout, input_info.stage,
+		                vk::ShaderStageFlagBits::eCompute, DescriptorCache::Stage::Compute);
 		if (buffer->GetRecordingGeneration() != recording_generation) {
 			continue;
 		}
 
-		vkCmdDispatch(vk_buffer, thread_group_x, thread_group_y, thread_group_z);
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 		bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
-		has_storage_writes      = MarkShaderAddressWrites(address_writes) || has_storage_writes;
 		has_storage_writes =
 		    std::any_of(
 		        program.info.images.begin(), program.info.images.end(),
@@ -570,7 +554,7 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 		        }) ||
 		    has_storage_writes;
 		if (has_storage_writes) {
-			ShaderWriteBarrier(vk_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		break;
 	}

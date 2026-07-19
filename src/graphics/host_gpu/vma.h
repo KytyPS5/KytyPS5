@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_VMA_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 namespace Libs::Graphics {
 
@@ -16,12 +17,13 @@ uint64_t VulkanNextMemoryUniqueId();
 void     VulkanTrackAllocation(const VulkanMemory* memory);
 void     VulkanUntrackAllocation(const VulkanMemory* memory);
 void     VulkanLogMemoryBudget(GraphicContext* ctx);
-bool     VulkanAllocate(GraphicContext* ctx, VulkanMemory* memory);
-void     VulkanFree(GraphicContext* ctx, VulkanMemory* memory);
+void     VulkanCreateBuffer(GraphicContext* ctx, uint64_t size, VulkanBuffer* buffer);
+void     VulkanDeleteBuffer(GraphicContext* ctx, VulkanBuffer* buffer);
+bool     VulkanCreateImage(GraphicContext* ctx, const vk::ImageCreateInfo& image_info,
+                           VulkanImage* image);
+void     VulkanDeleteImage(GraphicContext* ctx, VulkanImage* image);
 void     VulkanMapMemory(GraphicContext* ctx, VulkanMemory* memory, void** data);
 void     VulkanUnmapMemory(GraphicContext* ctx, VulkanMemory* memory);
-void     VulkanBindImageMemory(GraphicContext* ctx, VulkanImage* image, VulkanMemory* memory);
-void     VulkanBindBufferMemory(GraphicContext* ctx, VulkanBuffer* buffer, VulkanMemory* memory);
 
 } // namespace Libs::Graphics
 

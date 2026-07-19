@@ -22,11 +22,10 @@ public:
 	~HostStreamBuffer();
 	KYTY_CLASS_NO_COPY(HostStreamBuffer);
 
-	[[nodiscard]] bool Copy(GraphicContext* ctx, const void* src, uint64_t size,
-	                        uint64_t alignment, VulkanBuffer** out_buffer, uint64_t* out_offset,
-	                        uint64_t* out_range);
-	void Reset() noexcept;
-	void Release() noexcept;
+	[[nodiscard]] bool Copy(GraphicContext* ctx, const void* src, uint64_t size, uint64_t alignment,
+	                        VulkanBuffer** out_buffer, uint64_t* out_offset, uint64_t* out_range);
+	void               Reset() noexcept;
+	void               Release() noexcept;
 
 private:
 	void EnsureBuffer(GraphicContext* ctx);
@@ -36,11 +35,11 @@ private:
 	// replaced by a single 64 MiB scheduler-watched ring; the BufferCache seam stays fixed.
 	static constexpr uint64_t CAPACITY = 16ull * 1024ull * 1024ull;
 
-	mutable std::mutex m_mutex;
-	GraphicContext*    m_ctx        = nullptr;
+	mutable std::mutex            m_mutex;
+	GraphicContext*               m_ctx = nullptr;
 	std::unique_ptr<VulkanBuffer> m_buffer;
-	void*              m_mapped     = nullptr;
-	uint64_t           m_offset     = 0;
+	void*                         m_mapped = nullptr;
+	uint64_t                      m_offset = 0;
 };
 
 } // namespace Libs::Graphics

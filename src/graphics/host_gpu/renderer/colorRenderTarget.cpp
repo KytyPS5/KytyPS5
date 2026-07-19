@@ -1,278 +1,28 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
-#include "common/common.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
-#include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
-#include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/displayBuffer.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
-#include <cstdarg>
-#include <cstdio>
-#include <limits>
-#include <vulkan/vk_enum_string_helper.h>
 
 namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
-
-static float ColorClearUnorm(uint32_t value, uint32_t bits) {
-	return static_cast<float>(value) / static_cast<float>((1u << bits) - 1u);
-}
-
-static float ColorClearSnorm(uint32_t value, uint32_t bits) {
-	const uint32_t mask     = (1u << bits) - 1u;
-	const uint32_t sign_bit = 1u << (bits - 1u);
-	value &= mask;
-
-	auto signed_value = static_cast<int32_t>(value);
-	if ((value & sign_bit) != 0) {
-		signed_value = static_cast<int32_t>(value | ~mask);
-	}
-
-	const auto denominator = static_cast<float>((1u << (bits - 1u)) - 1u);
-	return std::max(-1.0f, static_cast<float>(signed_value) / denominator);
-}
-
-static float ColorClearF16(uint32_t value) {
-	const uint32_t sign     = (value >> 15u) & 0x1u;
-	const uint32_t exponent = (value >> 10u) & 0x1fu;
-	const uint32_t mantissa = value & 0x3ffu;
-	const float    sign_mul = (sign != 0 ? -1.0f : 1.0f);
-
-	if (exponent == 0) {
-		if (mantissa == 0) {
-			return sign_mul * 0.0f;
-		}
-		return sign_mul * std::ldexp(static_cast<float>(mantissa), -24);
-	}
-
-	if (exponent == 0x1fu) {
-		return mantissa == 0 ? sign_mul * std::numeric_limits<float>::infinity()
-		                     : std::numeric_limits<float>::quiet_NaN();
-	}
-
-	return sign_mul *
-	       std::ldexp(static_cast<float>(0x400u | mantissa), static_cast<int>(exponent) - 25);
-}
-
-[[maybe_unused]] static VkClearColorValue ColorClearValue(const HW::RenderTarget& rt) {
-	const uint32_t c0 = rt.clear_word0.word0;
-	const uint32_t c1 = rt.clear_word1.word1;
-
-	VkClearColorValue color {};
-
-	switch (static_cast<Prospero::ChannelType>(rt.info.channel_type)) {
-		case Prospero::ChannelType::kUNorm:
-		case Prospero::ChannelType::kSrgb:
-			// SRGB clear words are still encoded as normalized component values.
-			switch (static_cast<Prospero::ChannelLayout>(rt.info.format)) {
-				case Prospero::ChannelLayout::k8:
-					color.float32[0] = ColorClearUnorm(c0 & 0xffu, 8);
-					color.float32[1] = 0.0f;
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k8_8:
-					color.float32[0] = ColorClearUnorm(c0 & 0xffu, 8);
-					color.float32[1] = ColorClearUnorm((c0 >> 8u) & 0xffu, 8);
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k8_8_8_8:
-					color.float32[0] = ColorClearUnorm(c0 & 0xffu, 8);
-					color.float32[1] = ColorClearUnorm((c0 >> 8u) & 0xffu, 8);
-					color.float32[2] = ColorClearUnorm((c0 >> 16u) & 0xffu, 8);
-					color.float32[3] = ColorClearUnorm((c0 >> 24u) & 0xffu, 8);
-					if (rt.info.channel_order ==
-					    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt)) {
-						std::swap(color.float32[0], color.float32[2]);
-					}
-					break;
-				case Prospero::ChannelLayout::k11_11_10:
-					color.float32[0] = 0.0f;
-					color.float32[1] = 0.0f;
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k10_10_10_2:
-					color.float32[0] = ColorClearUnorm(c0 & 0x3ffu, 10);
-					color.float32[1] = ColorClearUnorm((c0 >> 10u) & 0x3ffu, 10);
-					color.float32[2] = ColorClearUnorm((c0 >> 20u) & 0x3ffu, 10);
-					color.float32[3] = ColorClearUnorm((c0 >> 30u) & 0x3u, 2);
-					if (rt.info.channel_order ==
-					    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt)) {
-						std::swap(color.float32[0], color.float32[2]);
-					}
-					break;
-				case Prospero::ChannelLayout::k16_16:
-					color.float32[0] = 0.0f;
-					color.float32[1] = 0.0f;
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k32_32_32_32:
-					color.float32[0] = 0.0f;
-					color.float32[1] = 0.0f;
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				default:
-					EXIT("%s\n unsupported color clear format\n",
-					     Common::Concat(rt_print("RenderTarget", rt), "").c_str());
-			}
-			break;
-		case Prospero::ChannelType::kSNorm:
-			switch (static_cast<Prospero::ChannelLayout>(rt.info.format)) {
-				case Prospero::ChannelLayout::k16_16:
-					color.float32[0] = ColorClearSnorm(c0 & 0xffffu, 16);
-					color.float32[1] = ColorClearSnorm((c0 >> 16u) & 0xffffu, 16);
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k8_8_8_8:
-					color.float32[0] = ColorClearSnorm(c0 & 0xffu, 8);
-					color.float32[1] = ColorClearSnorm((c0 >> 8u) & 0xffu, 8);
-					color.float32[2] = ColorClearSnorm((c0 >> 16u) & 0xffu, 8);
-					color.float32[3] = ColorClearSnorm((c0 >> 24u) & 0xffu, 8);
-					if (rt.info.channel_order ==
-					    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt)) {
-						std::swap(color.float32[0], color.float32[2]);
-					}
-					break;
-				default:
-					EXIT("%s\n unsupported snorm color clear format\n",
-					     Common::Concat(rt_print("RenderTarget", rt), "").c_str());
-			}
-			break;
-		case Prospero::ChannelType::kFloat:
-			switch (static_cast<Prospero::ChannelLayout>(rt.info.format)) {
-				case Prospero::ChannelLayout::k16:
-					color.float32[0] = ColorClearF16(c0 & 0xffffu);
-					color.float32[1] = 0.0f;
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k16_16:
-					color.float32[0] = ColorClearF16(c0 & 0xffffu);
-					color.float32[1] = ColorClearF16((c0 >> 16u) & 0xffffu);
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				case Prospero::ChannelLayout::k16_16_16_16:
-					color.float32[0] = ColorClearF16(c0 & 0xffffu);
-					color.float32[1] = ColorClearF16((c0 >> 16u) & 0xffffu);
-					color.float32[2] = ColorClearF16(c1 & 0xffffu);
-					color.float32[3] = ColorClearF16((c1 >> 16u) & 0xffffu);
-					if (rt.info.channel_order ==
-					    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt)) {
-						std::swap(color.float32[0], color.float32[2]);
-					}
-					break;
-				case Prospero::ChannelLayout::k32:
-				case Prospero::ChannelLayout::k11_11_10:
-				case Prospero::ChannelLayout::k32_32_32_32:
-					color.float32[0] = 0.0f;
-					color.float32[1] = 0.0f;
-					color.float32[2] = 0.0f;
-					color.float32[3] = 1.0f;
-					break;
-				default:
-					EXIT("%s\n unsupported float color clear format\n",
-					     Common::Concat(rt_print("RenderTarget", rt), "").c_str());
-			}
-			break;
-		case Prospero::ChannelType::kUInt:
-		case Prospero::ChannelType::kSInt:
-			switch (static_cast<Prospero::ChannelLayout>(rt.info.format)) {
-				case Prospero::ChannelLayout::k8:
-					color.uint32[0] = c0;
-					color.uint32[1] = 0;
-					color.uint32[2] = 0;
-					color.uint32[3] = 1;
-					break;
-				case Prospero::ChannelLayout::k16:
-					color.uint32[0] = c0 & 0xffffu;
-					color.uint32[1] = 0;
-					color.uint32[2] = 0;
-					color.uint32[3] = 1;
-					break;
-				case Prospero::ChannelLayout::k16_16:
-					color.uint32[0] = c0 & 0xffffu;
-					color.uint32[1] = (c0 >> 16u) & 0xffffu;
-					color.uint32[2] = 0;
-					color.uint32[3] = 1;
-					break;
-				case Prospero::ChannelLayout::k8_8_8_8:
-					color.uint32[0] = c0 & 0xffu;
-					color.uint32[1] = (c0 >> 8u) & 0xffu;
-					color.uint32[2] = (c0 >> 16u) & 0xffu;
-					color.uint32[3] = c0 >> 24u;
-					if (rt.info.channel_order ==
-					    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt)) {
-						std::swap(color.uint32[0], color.uint32[2]);
-					}
-					break;
-				case Prospero::ChannelLayout::k32_32:
-					color.uint32[0] = c0;
-					color.uint32[1] = c1;
-					color.uint32[2] = 0;
-					color.uint32[3] = 1;
-					break;
-				default:
-					EXIT("%s\n unsupported integer color clear format\n",
-					     Common::Concat(rt_print("RenderTarget", rt), "").c_str());
-			}
-			break;
-		default:
-			EXIT("%s\n unsupported color clear number type\n",
-			     Common::Concat(rt_print("RenderTarget", rt), "").c_str());
-	}
-
-	EXIT_NOT_IMPLEMENTED(
-	    c1 != 0 &&
-	    !(rt.info.channel_type == Prospero::GpuEnumValue(Prospero::ChannelType::kFloat) &&
-	      rt.info.format == Prospero::GpuEnumValue(Prospero::ChannelLayout::k16_16_16_16)) &&
-	    !((rt.info.channel_type == Prospero::GpuEnumValue(Prospero::ChannelType::kUInt) ||
-	       rt.info.channel_type == Prospero::GpuEnumValue(Prospero::ChannelType::kSInt)) &&
-	      rt.info.format == Prospero::GpuEnumValue(Prospero::ChannelLayout::k32_32)));
-
-	return color;
-}
-
-static uint32_t RenderGetColorBpp(uint32_t dfmt) {
-	switch (static_cast<Prospero::ChannelLayout>(dfmt)) {
-		case Prospero::ChannelLayout::k8: return 8;
-		case Prospero::ChannelLayout::k16:
-		case Prospero::ChannelLayout::k8_8: return 16;
-		case Prospero::ChannelLayout::k32:
-		case Prospero::ChannelLayout::k16_16:
-		case Prospero::ChannelLayout::k11_11_10:
-		case Prospero::ChannelLayout::k10_10_10_2:
-		case Prospero::ChannelLayout::k8_8_8_8: return 32;
-		case Prospero::ChannelLayout::k32_32:
-		case Prospero::ChannelLayout::k16_16_16_16: return 64;
-		case Prospero::ChannelLayout::k32_32_32_32: return 128;
-		case Prospero::ChannelLayout::k5_5_5_1:
-		case Prospero::ChannelLayout::k4_4_4_4: return 16;
-		default: EXIT("unsupported render-target channel layout: %u\n", dfmt);
-	}
-}
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const HW::Context& hw,
@@ -312,7 +62,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		r->base_addr          = 0;
 		r->vulkan_buffer      = nullptr;
 		r->vulkan_view        = nullptr;
-		r->format             = VK_FORMAT_UNDEFINED;
+		r->format             = vk::Format::eUndefined;
 		r->extent             = {};
 		r->base_mip_level     = 0;
 		r->buffer_size        = 0;
@@ -369,16 +119,17 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 
 	// CB_COLOR_CONTROL describes the color-buffer operation / ROP3 logic op.
 	// ROP3 Copy is the normal color write path, not a render-target clear.
+	// SRGB clear words are still encoded as normalized component values.
 	// Fast color clears are metadata driven and must be handled explicitly when
 	// that metadata path is implemented; render-pass load must preserve contents.
 	r->color_clear_enable = false;
 	r->color_clear_value  = {};
 
-	uint32_t width  = 0;
-	uint32_t height = 0;
-	uint32_t pitch  = 0;
-	uint64_t size   = 0;
-	bool     tile   = false;
+	uint32_t   width  = 0;
+	uint32_t   height = 0;
+	uint32_t   pitch  = 0;
+	uint64_t   size   = 0;
+	bool       tile   = false;
 	const bool standard64 =
 	    rt.attrib3.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
 
@@ -394,17 +145,18 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		EXIT("linear mipmapped render targets are unsupported\n");
 	}
 
-	width                        = rt.attrib2.width + 1;
-	height                       = rt.attrib2.height + 1;
-	const auto bytes_per_element = RenderGetColorBpp(rt.info.format) / 8u;
+	width  = rt.attrib2.width + 1;
+	height = rt.attrib2.height + 1;
+	const auto target_format =
+	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
+	const auto bytes_per_element = target_format.bytes_per_element;
 	if (bytes_per_element == 0) {
 		EXIT("render-target format has no valid element size\n");
 	}
 	if (standard64 &&
 	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || levels != 1 ||
-	     rt.view.current_mip_level != 0 ||
-	     view.base_layer != 0 || view.image_layers != 1 || rt.attrib.num_samples != 0 ||
-	     rt.attrib.num_fragments != 0 || bytes_per_element != 4 ||
+	     rt.view.current_mip_level != 0 || view.base_layer != 0 || view.image_layers != 1 ||
+	     rt.attrib.num_samples != 0 || rt.attrib.num_fragments != 0 || bytes_per_element != 4 ||
 	     rt.pitch.pitch_div8_minus1 != 0 || (rt.base.addr & 0xffffu) != 0 ||
 	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
 	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
@@ -415,9 +167,8 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		     " dimension=%u depth=%u levels=%u layer=%u/%u samples=%u fragments=%u bpe=%u"
 		     " cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
 		     rt.base.addr, rt.attrib3.dimension, rt.attrib3.depth, levels, view.base_layer,
-		     view.image_layers,
-		     rt.attrib.num_samples, rt.attrib.num_fragments, bytes_per_element, rt.cmask.addr,
-		     rt.fmask.addr, rt.dcc_addr.addr);
+		     view.image_layers, rt.attrib.num_samples, rt.attrib.num_fragments, bytes_per_element,
+		     rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
 	}
 	if (rt.pitch.pitch_div8_minus1 != 0) {
 		pitch = (rt.pitch.pitch_div8_minus1 + 1u) << 3u;
@@ -438,7 +189,8 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		bool          valid_layout = false;
 		if (standard64) {
 			TileGetTextureSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), width,
-			                   height, pitch, levels, rt.attrib3.tile_mode, &layout, nullptr, nullptr);
+			                   height, pitch, levels, rt.attrib3.tile_mode, &layout, nullptr,
+			                   nullptr);
 			valid_layout = layout.size != 0 && layout.align == 65536;
 		} else {
 			valid_layout =
@@ -481,8 +233,8 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	if (!render_to_texture && (levels != 1 || rt.view.current_mip_level != 0)) {
 		EXIT("mipmapped display render targets are unsupported\n");
 	}
-	const VkExtent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
-	                                std::max(height >> rt.view.current_mip_level, 1u)};
+	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
+	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
 	if (decision_log_id < 128 || !render_to_texture) {
@@ -498,18 +250,15 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	}
 
 	if (render_to_texture) {
-		const auto rt_format = TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
-		                                                    rt.info.channel_order);
-
 		(void)reuse_existing_render_texture;
 		RenderTargetInfo target {};
 		target.address           = rt.base.addr;
 		target.size              = backing_size;
-		target.format            = rt_format.format;
+		target.format            = target_format.format;
 		target.width             = width;
 		target.height            = height;
 		target.pitch             = pitch;
-		target.bytes_per_element = rt_format.bytes_per_element;
+		target.bytes_per_element = target_format.bytes_per_element;
 		target.tile_mode         = rt.attrib3.tile_mode;
 		target.levels            = levels;
 		target.layers            = view.image_layers;
@@ -526,7 +275,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		r->extent         = view_extent;
 		r->base_mip_level = rt.view.current_mip_level;
 		r->buffer_size    = backing_size;
-		r->export_mapping = rt_format.export_mapping;
+		r->export_mapping = target_format.export_mapping;
 	} else {
 		const auto layout = static_cast<Prospero::ChannelLayout>(rt.info.format);
 		const auto type   = static_cast<Prospero::ChannelType>(rt.info.channel_type);
@@ -563,9 +312,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		r->extent         = video_image.image->extent;
 		r->base_mip_level = 0;
 		r->buffer_size    = video_image.size;
-		r->export_mapping = TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
-		                                                 rt.info.channel_order)
-		                        .export_mapping;
+		r->export_mapping = target_format.export_mapping;
 	}
 }
 

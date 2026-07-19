@@ -44,7 +44,9 @@ void TileConvertTiledToLinearRenderTarget(void* dst, const void* src, uint32_t w
                                           uint32_t src_y = 0);
 void TileConvertLinearToTiledRenderTarget(void* dst, const void* src, uint32_t width,
                                           uint32_t height, uint32_t pitch,
-                                          uint32_t bytes_per_element, uint64_t size);
+                                          uint32_t bytes_per_element, uint64_t size,
+                                          uint64_t dst_size = 0, uint32_t dst_x = 0,
+                                          uint32_t dst_y = 0);
 void TileConvertTiledToLinearStandard64KB(void* dst, const void* src, uint32_t format,
                                           uint32_t width, uint32_t height, uint32_t pitch,
                                           uint64_t size, uint64_t src_size = 0, uint32_t src_x = 0,

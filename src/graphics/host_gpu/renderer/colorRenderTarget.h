@@ -3,9 +3,9 @@
 
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -25,9 +25,9 @@ enum class RenderColorType {
 struct RenderColorInfo {
 	RenderColorType                 type             = RenderColorType::NoColorOutput;
 	VulkanImage*                    vulkan_buffer    = nullptr;
-	VkImageView                     vulkan_view      = nullptr;
-	VkFormat                        format           = VK_FORMAT_UNDEFINED;
-	VkExtent2D                      extent           = {};
+	vk::ImageView                   vulkan_view      = nullptr;
+	vk::Format                      format           = vk::Format::eUndefined;
+	vk::Extent2D                    extent           = {};
 	uint32_t                        base_mip_level   = 0;
 	uint32_t                        base_array_layer = 0;
 	uint64_t                        base_addr        = 0;
@@ -35,7 +35,7 @@ struct RenderColorInfo {
 	uint32_t                        target_slot      = 0;
 	Prospero::ColorComponentMapping export_mapping;
 	bool                            color_clear_enable = false;
-	VkClearColorValue               color_clear_value {};
+	vk::ClearColorValue             color_clear_value {};
 };
 
 void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const HW::Context& hw,

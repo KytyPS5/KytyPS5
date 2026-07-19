@@ -411,14 +411,16 @@ constexpr uint32_t EncodeSopp(uint32_t opcode, uint32_t simm = 0) {
 
 void TestNativeShaderResourceDependencies() {
 	const auto stages = ShaderPipelineStages(
-	    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
-	Check(stages == (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-	                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment |
+	    vk::ShaderStageFlagBits::eCompute);
+	Check(stages == (vk::PipelineStageFlagBits::eVertexShader |
+	                 vk::PipelineStageFlagBits::eFragmentShader |
+	                 vk::PipelineStageFlagBits::eComputeShader),
 	      "shader-stage dependency mapping was not exact");
 	const auto shader_barrier = MakeShaderWriteDependency();
-	Check(shader_barrier.srcAccessMask == VK_ACCESS_SHADER_WRITE_BIT &&
-	          (shader_barrier.dstAccessMask & VK_ACCESS_SHADER_READ_BIT) != 0 &&
-	          (shader_barrier.dstAccessMask & VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT) != 0,
+	Check(shader_barrier.srcAccessMask == vk::AccessFlagBits::eShaderWrite &&
+	          (shader_barrier.dstAccessMask & vk::AccessFlagBits::eShaderRead) &&
+	          (shader_barrier.dstAccessMask & vk::AccessFlagBits::eVertexAttributeRead),
 	      "shader-write dependency does not expose draw/dispatch buffer writes");
 
 	ShaderRecompiler::IR::Program program;
@@ -445,27 +447,27 @@ void TestNativeShaderResourceDependencies() {
 	      "graphics/compute write collector lost or invented a storage-buffer range");
 
 	VulkanImage image {VulkanImageType::StorageTexture};
-	image.image              = reinterpret_cast<VkImage>(uintptr_t {1});
-	image.layout             = VK_IMAGE_LAYOUT_GENERAL;
+	image.image              = reinterpret_cast<vk::Image::CType>(uintptr_t {1});
+	image.layout             = vk::ImageLayout::eGeneral;
 	image.layers             = 3;
 	const auto image_barrier = MakeStorageImageDependency(image, true, true);
-	Check(image_barrier.oldLayout == VK_IMAGE_LAYOUT_GENERAL &&
-	          image_barrier.newLayout == VK_IMAGE_LAYOUT_GENERAL &&
-	          (image_barrier.srcAccessMask & VK_ACCESS_MEMORY_WRITE_BIT) != 0 &&
-	          (image_barrier.dstAccessMask & VK_ACCESS_SHADER_READ_BIT) != 0 &&
-	          (image_barrier.dstAccessMask & VK_ACCESS_SHADER_WRITE_BIT) != 0 &&
+	Check(image_barrier.oldLayout == vk::ImageLayout::eGeneral &&
+	          image_barrier.newLayout == vk::ImageLayout::eGeneral &&
+	          (image_barrier.srcAccessMask & vk::AccessFlagBits::eMemoryWrite) &&
+	          (image_barrier.dstAccessMask & vk::AccessFlagBits::eShaderRead) &&
+	          (image_barrier.dstAccessMask & vk::AccessFlagBits::eShaderWrite) &&
 	          image_barrier.subresourceRange.levelCount == VK_REMAINING_MIP_LEVELS &&
 	          image_barrier.subresourceRange.layerCount == image.layers,
 	      "GENERAL storage-image dependency lacks a complete memory barrier");
 
 	VulkanBuffer buffer;
-	buffer.buffer          = reinterpret_cast<VkBuffer>(uintptr_t {1});
+	buffer.buffer          = reinterpret_cast<vk::Buffer::CType>(uintptr_t {1});
 	const auto gds_barrier = MakeGdsDependency(buffer);
-	Check((gds_barrier.srcAccessMask & VK_ACCESS_HOST_WRITE_BIT) != 0 &&
-	          (gds_barrier.srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) != 0 &&
-	          (gds_barrier.srcAccessMask & VK_ACCESS_SHADER_WRITE_BIT) != 0 &&
+	Check((gds_barrier.srcAccessMask & vk::AccessFlagBits::eHostWrite) &&
+	          (gds_barrier.srcAccessMask & vk::AccessFlagBits::eTransferWrite) &&
+	          (gds_barrier.srcAccessMask & vk::AccessFlagBits::eShaderWrite) &&
 	          gds_barrier.dstAccessMask ==
-	              (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) &&
+	              (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite) &&
 	          gds_barrier.size == VK_WHOLE_SIZE,
 	      "GDS dependency does not order host/transfer/shader writes");
 }
@@ -476,21 +478,21 @@ void TestNativeSubgroupPolicy() {
 	context.min_subgroup_size             = 32;
 	context.max_subgroup_size             = 32;
 	context.subgroup_size_control_enabled = true;
-	context.required_subgroup_size_stages = VK_SHADER_STAGE_ALL;
+	context.required_subgroup_size_stages = vk::ShaderStageFlagBits::eAll;
 	ShaderRecompiler::IR::Program safe;
 	safe.wave_size      = 32;
 	safe.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_VERTEX_BIT, safe).mode ==
+	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eVertex, safe).mode ==
 	          ShaderSubgroupMode::Natural,
 	      "native wave32 policy changed");
 	safe.wave_size = 64;
 	Check(SelectGraphicsLaneMaskMode(context, safe.wave_size) ==
 	              ShaderLaneMaskMode::PerInvocation &&
-	          ConfigureShaderSubgroup(context, VK_SHADER_STAGE_VERTEX_BIT, safe).mode ==
+	          ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eVertex, safe).mode ==
 	              ShaderSubgroupMode::Unsupported,
 	      "wave64 graphics mismatch accepted native-wave mask lowering");
 	safe.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
-	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_VERTEX_BIT, safe).mode ==
+	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eVertex, safe).mode ==
 	          ShaderSubgroupMode::PerInvocationGraphics,
 	      "wave64 graphics mismatch did not select per-invocation masks");
 
@@ -498,12 +500,12 @@ void TestNativeSubgroupPolicy() {
 	cross_lane.blocks.emplace_back().instructions.emplace_back().op =
 	    ShaderRecompiler::IR::Opcode::ReadLaneU32;
 	Check(ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(cross_lane) &&
-	          ConfigureShaderSubgroup(context, VK_SHADER_STAGE_VERTEX_BIT, cross_lane).mode ==
+	          ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eVertex, cross_lane).mode ==
 	              ShaderSubgroupMode::PerInvocationGraphics,
 	      "graphics mismatch did not select per-invocation masks");
 	auto cross_lane_compute           = cross_lane;
 	cross_lane_compute.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, cross_lane_compute).mode ==
+	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
 	          ShaderSubgroupMode::Unsupported,
 	      "cross-lane compute mismatch bypassed the exact subgroup requirement");
 
@@ -519,7 +521,7 @@ void TestNativeSubgroupPolicy() {
 	zero_bfm.src_count         = 2;
 	zero_bfm.scalar_sources[0] = 2;
 	Check(!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(zero_exec) &&
-	          ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, zero_exec).mode ==
+	          ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, zero_exec).mode ==
 	              ShaderSubgroupMode::FlattenedMasks,
 	      "compile-time uniform-zero EXEC write did not stay on the mask-free path");
 
@@ -550,23 +552,23 @@ void TestNativeSubgroupPolicy() {
 	ds_partial.lane_mask_mode                = ShaderLaneMaskMode::NativeWave;
 	ds_partial.blocks.emplace_back().instructions.emplace_back().op =
 	    ShaderRecompiler::IR::Opcode::DsAppend;
-	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, ds_partial).mode ==
+	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, ds_partial).mode ==
 	          ShaderSubgroupMode::Unsupported,
 	      "partial wave64 DS append bypassed the exact subgroup requirement");
 	context.max_subgroup_size = 64;
 	const auto controlled =
-	    ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, cross_lane_compute);
+	    ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, cross_lane_compute);
 	Check(controlled.mode == ShaderSubgroupMode::Controlled && controlled.required_size == 64,
 	      "supported controlled wave64 was not preferred over splitting");
 	context.subgroup_size                 = 64;
 	context.subgroup_size_control_enabled = false;
 	cross_lane.wave_size                  = 32;
 	cross_lane.lane_mask_mode             = ShaderLaneMaskMode::PerInvocation;
-	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_FRAGMENT_BIT, cross_lane).mode ==
+	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eFragment, cross_lane).mode ==
 	          ShaderSubgroupMode::Unsupported,
 	      "inverse graphics mismatch was accepted as one guest wave");
 	cross_lane_compute.wave_size = 32;
-	Check(ConfigureShaderSubgroup(context, VK_SHADER_STAGE_COMPUTE_BIT, cross_lane_compute).mode ==
+	Check(ConfigureShaderSubgroup(context, vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
 	          ShaderSubgroupMode::Unsupported,
 	      "inverse cross-lane compute mismatch was accepted");
 }
@@ -5720,7 +5722,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k16_16_16_16),
 	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kFloat),
 	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kReversed));
-	Check(format.format == VK_FORMAT_R16G16B16A16_SFLOAT && format.bytes_per_element == 8u,
+	Check(format.format == vk::Format::eR16G16B16A16Sfloat && format.bytes_per_element == 8u,
 	      "reverse RGBA16F render target did not retain its native host format "
 	      "and size");
 	Check(format.export_mapping == Prospero::ColorMappingAbgr &&
@@ -5735,7 +5737,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	    Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
 	    Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
 	    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
-	Check(legacy_alt.format == VK_FORMAT_B8G8R8A8_UNORM && legacy_alt.export_mapping.IsIdentity(),
+	Check(legacy_alt.format == vk::Format::eB8G8R8A8Unorm && legacy_alt.export_mapping.IsIdentity(),
 	      "legacy BGRA render target acquired a duplicate shader export mapping");
 
 	const uint32_t shader[] = {

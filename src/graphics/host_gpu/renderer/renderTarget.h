@@ -1,9 +1,10 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_
 
+#include "graphics/host_gpu/vulkanCommon.h"
+
 #include <cstdint>
 #include <type_traits>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -40,10 +41,10 @@ inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint3
 #pragma pack(push, 1)
 
 struct PipelineStencilStaticState {
-	VkStencilOp failOp      = VK_STENCIL_OP_KEEP;
-	VkStencilOp passOp      = VK_STENCIL_OP_KEEP;
-	VkStencilOp depthFailOp = VK_STENCIL_OP_KEEP;
-	VkCompareOp compareOp   = VK_COMPARE_OP_NEVER;
+	vk::StencilOp failOp      = vk::StencilOp::eKeep;
+	vk::StencilOp passOp      = vk::StencilOp::eKeep;
+	vk::StencilOp depthFailOp = vk::StencilOp::eKeep;
+	vk::CompareOp compareOp   = vk::CompareOp::eNever;
 };
 
 struct PipelineStencilDynamicState {
@@ -56,16 +57,17 @@ struct PipelineStencilDynamicState {
 
 inline constexpr bool stencil_face_accesses_attachment(const PipelineStencilStaticState&  state,
                                                        const PipelineStencilDynamicState& dynamic) {
-	return state.compareOp != VK_COMPARE_OP_ALWAYS ||
+	return state.compareOp != vk::CompareOp::eAlways ||
 	       (dynamic.writeMask != 0 &&
-	        (state.failOp != VK_STENCIL_OP_KEEP || state.passOp != VK_STENCIL_OP_KEEP ||
-	         state.depthFailOp != VK_STENCIL_OP_KEEP));
+	        (state.failOp != vk::StencilOp::eKeep || state.passOp != vk::StencilOp::eKeep ||
+	         state.depthFailOp != vk::StencilOp::eKeep));
 }
 
 static_assert(std::is_trivially_copyable_v<PipelineStencilStaticState>);
 static_assert(std::is_standard_layout_v<PipelineStencilStaticState>);
 static_assert(alignof(PipelineStencilStaticState) == 1);
-static_assert(sizeof(PipelineStencilStaticState) == sizeof(VkStencilOp) * 3 + sizeof(VkCompareOp));
+static_assert(sizeof(PipelineStencilStaticState) ==
+              sizeof(vk::StencilOp) * 3 + sizeof(vk::CompareOp));
 static_assert(std::is_trivially_copyable_v<PipelineStencilDynamicState>);
 static_assert(std::is_standard_layout_v<PipelineStencilDynamicState>);
 static_assert(alignof(PipelineStencilDynamicState) == 1);

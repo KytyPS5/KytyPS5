@@ -10,6 +10,7 @@ namespace Libs::Graphics {
 
 struct ImageImageCopy;
 struct RenderColorInfo;
+struct ShaderVertexInputInfo;
 
 #pragma pack(push, 1)
 
@@ -43,6 +44,8 @@ static_assert(sizeof(PipelineDynamicParameters) ==
 [[nodiscard]] ImageImageCopy MakeColorResolveCopy(const RenderColorInfo& src,
                                                   const RenderColorInfo& dst, uint32_t width,
                                                   uint32_t height);
+[[nodiscard]] int32_t        ResolveVertexOffset(uint32_t                     index_offset,
+                                                 const ShaderVertexInputInfo& vs_input_info);
 
 } // namespace Libs::Graphics
 

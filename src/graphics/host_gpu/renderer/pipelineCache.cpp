@@ -6,19 +6,14 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
-#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/utils.h"
 
 #include <atomic>
 #include <cstring>
-#include <fmt/format.h>
 #include <span>
 #include <utility>
 
@@ -170,30 +165,10 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-void PipelineCache::DeletePipelineInternal(Pipeline* p) {
-	EXIT_IF(g_render_ctx == nullptr);
-	EXIT_IF(p == nullptr);
-	EXIT_IF(p->pipeline == nullptr);
-	EXIT_IF(p->pipeline_layout == nullptr);
-
-	DumpPipeline("delete", *p);
-
-	auto* gctx = g_render_ctx->GetGraphicCtx();
-
-	EXIT_IF(gctx == nullptr);
-
-	VulkanDeviceWaitIdle(gctx);
-	vkDestroyPipeline(gctx->device, p->pipeline, nullptr);
-	vkDestroyPipelineLayout(gctx->device, p->pipeline_layout, nullptr);
-
-	p->pipeline        = nullptr;
-	p->pipeline_layout = nullptr;
-}
-
 PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
     VulkanFramebuffer* framebuffer, RenderColorInfo* colors, uint32_t color_count,
     RenderDepthInfo* depth, ShaderVertexInputInfo* vs_input_info, HW::Context* ctx,
-    HW::Shader* sh_ctx, ShaderPixelInputInfo* ps_input_info, VkPrimitiveTopology topology,
+    HW::Shader* sh_ctx, ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool ps_active, std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
@@ -242,7 +217,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	static_params.negative_one_to_one = !ctx->GetClipControl().dx_clip_space;
 	static_params.topology            = topology;
 	static_params.with_depth =
-	    (depth->format != VK_FORMAT_UNDEFINED && depth->vulkan_buffer != nullptr);
+	    (depth->format != vk::Format::eUndefined && depth->vulkan_buffer != nullptr);
 	static_params.depth_test_enable  = depth->depth_test_enable;
 	static_params.depth_write_enable = (depth->depth_write_enable && !depth->depth_clear_enable);
 	static_params.depth_compare_op   = depth->depth_compare_op;
@@ -303,6 +278,8 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		DumpPipeline("create", *iter->second);
+	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	EXIT_IF(!inserted);
 
 		// Fallback pipelines are kept alive in m_fallback_pipelines and cleaned up at teardown (DeleteAllPipelines)
 		// to avoid wait-idle stutters or destroying a pipeline currently in use by an in-flight frame.

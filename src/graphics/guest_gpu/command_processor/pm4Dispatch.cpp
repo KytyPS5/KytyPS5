@@ -2,19 +2,14 @@
 
 namespace Libs::Graphics {
 
-hw_ctx_parser_func_t   g_hw_ctx_func[Pm4::CX_NUM]          = {};
 hw_ctx_indirect_func_t g_hw_ctx_indirect_func[Pm4::CX_NUM] = {};
-hw_sh_parser_func_t    g_hw_sh_func[Pm4::SH_NUM]           = {};
 hw_sh_indirect_func_t  g_hw_sh_indirect_func[Pm4::SH_NUM]  = {};
-hw_uc_parser_func_t    g_hw_uc_func[Pm4::UC_NUM]           = {};
 hw_uc_indirect_func_t  g_hw_uc_indirect_func[Pm4::UC_NUM]  = {};
-cp_op_parser_func_t    g_cp_op_func[256]                   = {};
-cp_op_parser_func_t    g_cp_op_custom_func[Pm4::R_NUM]     = {};
 
-void GraphicsInitJmpTables() {
-	for (auto& func: g_hw_ctx_func) {
-		func = nullptr;
-	}
+namespace {
+
+constexpr auto MakeContextDispatchTable() {
+	std::array<hw_ctx_parser_func_t, Pm4::CX_NUM> g_hw_ctx_func {};
 
 	g_hw_ctx_func[Pm4::DB_RENDER_CONTROL]            = HwCtxSetRenderControl;
 	g_hw_ctx_func[Pm4::DB_COUNT_CONTROL]             = HwCtxSetDepthMetadataRegisters;
@@ -107,9 +102,11 @@ void GraphicsInitJmpTables() {
 		}
 	}
 
-	for (auto& func: g_hw_sh_func) {
-		func = nullptr;
-	}
+	return g_hw_ctx_func;
+}
+
+constexpr auto MakeShaderDispatchTable() {
+	std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func {};
 
 	for (uint32_t slot = 0; slot < 32; slot++) {
 		g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot * 1] = HwShSetPsUserSgpr;
@@ -174,9 +171,11 @@ void GraphicsInitJmpTables() {
 	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShIgnoreRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_REQ_CTRL_LSHS]        = HwShIgnoreRegisters;
 
-	for (auto& func: g_hw_uc_func) {
-		func = nullptr;
-	}
+	return g_hw_sh_func;
+}
+
+constexpr auto MakeUconfigDispatchTable() {
+	std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func {};
 
 	g_hw_uc_func[Pm4::VGT_PRIMITIVE_TYPE]        = HwUcSetPrimitiveType;
 	g_hw_uc_func[Pm4::VGT_INDEX_TYPE]            = HwUcSetIndexType;
@@ -191,9 +190,11 @@ void GraphicsInitJmpTables() {
 	g_hw_uc_func[Pm4::GDS_OA_COUNTER]            = HwUcSetGdsOaRegisters;
 	g_hw_uc_func[Pm4::GDS_OA_ADDRESS]            = HwUcSetGdsOaRegisters;
 
-	for (auto& func: g_cp_op_func) {
-		func = nullptr;
-	}
+	return g_hw_uc_func;
+}
+
+constexpr auto MakeOpcodeDispatchTable() {
+	std::array<cp_op_parser_func_t, 256> g_cp_op_func {};
 
 	g_cp_op_func[Pm4::IT_NOP]                       = CpOpNop;
 	g_cp_op_func[Pm4::IT_SET_BASE]                  = CpOpSetBase;
@@ -238,9 +239,11 @@ void GraphicsInitJmpTables() {
 	g_cp_op_func[Pm4::IT_WAIT_ON_DE_COUNTER_DIFF]   = CpOpWaitOnDeCounterDiff;
 	g_cp_op_func[Pm4::IT_GET_LOD_STATS]             = CpOpGetLodStats;
 
-	for (auto& func: g_cp_op_custom_func) {
-		func = nullptr;
-	}
+	return g_cp_op_func;
+}
+
+constexpr auto MakeCustomOpcodeDispatchTable() {
+	std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func {};
 
 	g_cp_op_custom_func[Pm4::R_DISPATCH_RESET] = CpOpDispatchReset;
 	g_cp_op_custom_func[Pm4::R_WAIT_MEM_32]    = CpOpWaitRegMem32;
@@ -252,6 +255,22 @@ void GraphicsInitJmpTables() {
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 
+	return g_cp_op_custom_func;
+}
+
+} // namespace
+
+constinit const std::array<hw_ctx_parser_func_t, Pm4::CX_NUM> g_hw_ctx_func =
+    MakeContextDispatchTable();
+constinit const std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func =
+    MakeShaderDispatchTable();
+constinit const std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func =
+    MakeUconfigDispatchTable();
+constinit const std::array<cp_op_parser_func_t, 256> g_cp_op_func = MakeOpcodeDispatchTable();
+constinit const std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func =
+    MakeCustomOpcodeDispatchTable();
+
+void GraphicsInitJmpTables() {
 	GraphicsInitJmpTablesCxIndirect();
 	GraphicsInitJmpTablesShIndirect();
 	GraphicsInitJmpTablesUcIndirect();

@@ -16,7 +16,8 @@
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/displayBuffer.h"
 
 #include <algorithm>
@@ -25,7 +26,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
-#include <vulkan/vk_enum_string_helper.h>
 
 namespace Libs::Graphics {
 
@@ -40,17 +40,17 @@ namespace Libs::Graphics {
 	EXIT("unsupported render state; details were printed above\n");
 }
 
-static VkStencilOp ConvertStencilOp(uint8_t value) {
+static vk::StencilOp ConvertStencilOp(uint8_t value) {
 	switch (static_cast<Prospero::StencilOp>(value)) {
-		case Prospero::StencilOp::kKeep: return VK_STENCIL_OP_KEEP;
-		case Prospero::StencilOp::kZero: return VK_STENCIL_OP_ZERO;
+		case Prospero::StencilOp::kKeep: return vk::StencilOp::eKeep;
+		case Prospero::StencilOp::kZero: return vk::StencilOp::eZero;
 		case Prospero::StencilOp::kReplaceTest:
-		case Prospero::StencilOp::kReplaceOp: return VK_STENCIL_OP_REPLACE;
-		case Prospero::StencilOp::kAddClamp: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
-		case Prospero::StencilOp::kSubClamp: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
-		case Prospero::StencilOp::kInvert: return VK_STENCIL_OP_INVERT;
-		case Prospero::StencilOp::kAddWrap: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
-		case Prospero::StencilOp::kSubWrap: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+		case Prospero::StencilOp::kReplaceOp: return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kAddClamp: return vk::StencilOp::eIncrementAndClamp;
+		case Prospero::StencilOp::kSubClamp: return vk::StencilOp::eDecrementAndClamp;
+		case Prospero::StencilOp::kInvert: return vk::StencilOp::eInvert;
+		case Prospero::StencilOp::kAddWrap: return vk::StencilOp::eIncrementAndWrap;
+		case Prospero::StencilOp::kSubWrap: return vk::StencilOp::eDecrementAndWrap;
 		default: DepthFatal("unsupported stencil operation");
 	}
 }
@@ -61,9 +61,9 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	       depth_fail == Prospero::GpuEnumValue(Prospero::StencilOp::kReplaceOp);
 }
 
-[[nodiscard]] static VkFormat ResolveHostDepthAttachmentFormat(GraphicContext*          ctx,
-                                                               const DepthFormatPolicy& policy,
-                                                               bool has_stencil) {
+[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(GraphicContext*          ctx,
+                                                                 const DepthFormatPolicy& policy,
+                                                                 bool has_stencil) {
 	if (!has_stencil) {
 		return policy.depth_attachment_format;
 	}
@@ -71,19 +71,20 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 		case Prospero::DepthFormat::kZ32F: return policy.stencil_attachment_formats.front();
 		case Prospero::DepthFormat::kZ16: {
 			if (ctx == nullptr) {
-				return VK_FORMAT_UNDEFINED;
+				return vk::Format::eUndefined;
 			}
 			for (const auto format: policy.stencil_attachment_formats) {
-				VkImageFormatProperties properties {};
-				if (ctx->GetImageFormatProperties(format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-				                                  DepthTargetImageUsage(), 0,
-				                                  &properties) == VK_SUCCESS) {
+				vk::ImageFormatProperties properties {};
+				if (ctx->GetImageFormatProperties(format, vk::ImageType::e2D,
+				                                  vk::ImageTiling::eOptimal,
+				                                  DepthTargetImageUsage(), vk::ImageCreateFlags {},
+				                                  &properties) == vk::Result::eSuccess) {
 					return format;
 				}
 			}
-			return VK_FORMAT_UNDEFINED;
+			return vk::Format::eUndefined;
 		}
-		default: return VK_FORMAT_UNDEFINED;
+		default: return vk::Format::eUndefined;
 	}
 }
 
@@ -126,10 +127,12 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	    z.htile_surface.prefetch_height == 0 && z.htile_surface.dst_outside_zero_to_one == 0 &&
 	    z.z_read_base_addr == 0 && z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
 	    z.stencil_write_base_addr == 0 && z.htile_data_base_addr == 0 &&
-	    !z.z_info.tile_surface_enable && !z.size.valid && !z.width_height_valid &&
-	    !z.pitch_height_valid && z.size.x_max == 0 && z.size.y_max == 0 &&
-	    z.pitch_div8_minus1 == 0 && z.height_div8_minus1 == 0 && z.slice_div64_minus1 == 0 &&
-	    z.width == 0 && z.height == 0;
+	    // DB_DEPTH_SIZE_XY is independent state and may remain programmed after the attachment
+	    // formats and addresses are unbound. A zero encoding is the valid 1x1 value, so its
+	    // presence alone must not manufacture a depth attachment.
+	    !z.z_info.tile_surface_enable && !z.width_height_valid && !z.pitch_height_valid &&
+	    z.size.x_max == 0 && z.size.y_max == 0 && z.pitch_div8_minus1 == 0 &&
+	    z.height_div8_minus1 == 0 && z.slice_div64_minus1 == 0 && z.width == 0 && z.height == 0;
 	if (attachment_unbound) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -170,7 +173,7 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	    z.htile_surface.prefetch_width != 0 || z.htile_surface.prefetch_height != 0 ||
 	    z.htile_surface.dst_outside_zero_to_one != 0 || z.z_read_base_addr == 0 ||
 	    z.z_write_base_addr != z.z_read_base_addr || (z.z_read_base_addr & 0xffffu) != 0 ||
-	    dc.zfunc > static_cast<uint8_t>(VK_COMPARE_OP_ALWAYS)) {
+	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
 		DepthFatal("unsupported depth register state");
 	}
 	if (msaa_compat) {
@@ -215,7 +218,7 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	} else if (z.htile_data_base_addr != 0) {
 		DepthFatal("HTile address without an enabled tile surface");
 	}
-	const bool size_xy_valid = z.size.valid && (z.size.x_max != 0 || z.size.y_max != 0);
+	const bool size_xy_valid = z.size.valid;
 	const bool wh_valid      = z.width_height_valid && z.width != 0 && z.height != 0;
 	if (!size_xy_valid && !wh_valid) {
 		DepthFatal("missing depth extent");
@@ -235,9 +238,9 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
 	r->format =
 	    ResolveHostDepthAttachmentFormat(g_render_ctx->GetGraphicCtx(), *policy, has_stencil);
-	if (r->format == VK_FORMAT_UNDEFINED) {
+	if (r->format == vk::Format::eUndefined) {
 		DepthFatal("no host depth/stencil format supports required usage for %s",
-		           string_VkFormat(ideal_format));
+		           VulkanToString(ideal_format).c_str());
 	}
 	const uint32_t guest_format = Prospero::GpuEnumValue(policy->guest_format);
 	const uint32_t bytes        = policy->bytes_per_element;
@@ -322,7 +325,7 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	r->depth_clear_value       = hw.GetDepthClearValue();
 	r->depth_test_enable       = dc.z_enable;
 	r->depth_write_enable      = dc.z_write_enable && !z.depth_view.depth_write_disable;
-	r->depth_compare_op        = static_cast<VkCompareOp>(dc.zfunc);
+	r->depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r->depth_bounds_test_enable = dc.depth_bounds_enable;
 	r->depth_min_bounds         = hw.GetDepthBoundsMin();
@@ -332,9 +335,9 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	r->stencil_clear_value  = hw.GetStencilClearValue();
 	r->stencil_test_enable  = dc.stencil_enable;
 	if (dc.stencil_enable) {
-		if (dc.stencilfunc > static_cast<uint8_t>(VK_COMPARE_OP_ALWAYS) ||
+		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
-		     dc.stencilfunc_bf > static_cast<uint8_t>(VK_COMPARE_OP_ALWAYS)) ||
+		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
 		    (UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
 		     sm.stencil_opval != sm.stencil_testval) ||
 		    (dc.backface_enable &&
@@ -344,14 +347,15 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		}
 		r->stencil_static_front = {
 		    ConvertStencilOp(sc.stencil_fail), ConvertStencilOp(sc.stencil_zpass),
-		    ConvertStencilOp(sc.stencil_zfail), static_cast<VkCompareOp>(dc.stencilfunc)};
+		    ConvertStencilOp(sc.stencil_zfail), static_cast<vk::CompareOp>(dc.stencilfunc)};
 		r->stencil_dynamic_front = {sm.stencil_mask,
 		                            rc.stencil_clear_enable ? 0u : sm.stencil_writemask,
 		                            sm.stencil_testval};
 		if (dc.backface_enable) {
-			r->stencil_static_back = {
-			    ConvertStencilOp(sc.stencil_fail_bf), ConvertStencilOp(sc.stencil_zpass_bf),
-			    ConvertStencilOp(sc.stencil_zfail_bf), static_cast<VkCompareOp>(dc.stencilfunc_bf)};
+			r->stencil_static_back  = {ConvertStencilOp(sc.stencil_fail_bf),
+			                           ConvertStencilOp(sc.stencil_zpass_bf),
+			                           ConvertStencilOp(sc.stencil_zfail_bf),
+			                           static_cast<vk::CompareOp>(dc.stencilfunc_bf)};
 			r->stencil_dynamic_back = {sm.stencil_mask_bf,
 			                           rc.stencil_clear_enable ? 0u : sm.stencil_writemask_bf,
 			                           sm.stencil_testval_bf};
@@ -400,7 +404,8 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 }
 
 void MarkRenderTargetGpuWritten(const RenderDepthInfo& target) {
-	const bool with_depth = target.format != VK_FORMAT_UNDEFINED && target.vulkan_buffer != nullptr;
+	const bool with_depth =
+	    target.format != vk::Format::eUndefined && target.vulkan_buffer != nullptr;
 
 	if (with_depth && !depth_attachment_read_only(&target)) {
 		g_render_ctx->GetTextureCache()->MarkGpuWritten(target.vulkan_buffer);

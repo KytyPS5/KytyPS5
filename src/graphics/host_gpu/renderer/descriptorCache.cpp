@@ -12,11 +12,11 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
-VkShaderStageFlags StageFlags(DescriptorCache::Stage stage) {
+vk::ShaderStageFlags StageFlags(DescriptorCache::Stage stage) {
 	switch (stage) {
-		case DescriptorCache::Stage::Vertex: return VK_SHADER_STAGE_VERTEX_BIT;
-		case DescriptorCache::Stage::Pixel: return VK_SHADER_STAGE_FRAGMENT_BIT;
-		case DescriptorCache::Stage::Compute: return VK_SHADER_STAGE_COMPUTE_BIT;
+		case DescriptorCache::Stage::Vertex: return vk::ShaderStageFlagBits::eVertex;
+		case DescriptorCache::Stage::Pixel: return vk::ShaderStageFlagBits::eFragment;
+		case DescriptorCache::Stage::Compute: return vk::ShaderStageFlagBits::eCompute;
 		default: EXIT("unknown descriptor stage\n");
 	}
 }
@@ -45,17 +45,17 @@ bool IsStorageImage(BindingKind kind) {
 	}
 }
 
-VkDescriptorType DescriptorType(BindingKind kind) {
+vk::DescriptorType DescriptorType(BindingKind kind) {
 	if (kind == BindingKind::Samplers) {
-		return VK_DESCRIPTOR_TYPE_SAMPLER;
+		return vk::DescriptorType::eSampler;
 	}
 	if (IsSampledImage(kind)) {
-		return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+		return vk::DescriptorType::eSampledImage;
 	}
 	if (IsStorageImage(kind)) {
-		return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		return vk::DescriptorType::eStorageImage;
 	}
-	return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	return vk::DescriptorType::eStorageBuffer;
 }
 
 uint32_t DescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding) {
@@ -76,23 +76,23 @@ std::vector<uint32_t> LayoutKey(DescriptorCache::Stage               stage,
 	return key;
 }
 
-VkImageLayout SampledLayout(const VulkanImage* image) {
+vk::ImageLayout SampledLayout(const VulkanImage* image) {
 	EXIT_IF(image == nullptr);
 	switch (image->layout) {
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return VK_IMAGE_LAYOUT_GENERAL;
+		case vk::ImageLayout::eTransferDstOptimal:
+		case vk::ImageLayout::eTransferSrcOptimal:
+		case vk::ImageLayout::eColorAttachmentOptimal: return vk::ImageLayout::eGeneral;
 		default: return image->layout;
 	}
 }
 
-VkDescriptorBufferInfo BufferInfo(const BufferView& view) {
+vk::DescriptorBufferInfo BufferInfo(const BufferView& view) {
 	EXIT_IF(view.buffer == nullptr || view.buffer->buffer == nullptr);
 	return {view.buffer->buffer, view.offset, view.range};
 }
 
-VkDescriptorImageInfo MakeDescriptorImageInfo(const DescriptorCache::TextureBinding& texture,
-                                              VkImageLayout                          layout) {
+vk::DescriptorImageInfo MakeDescriptorImageInfo(const DescriptorCache::TextureBinding& texture,
+                                                vk::ImageLayout                        layout) {
 	EXIT_IF(texture.image == nullptr || texture.view < 0 || texture.view >= VulkanImage::VIEW_MAX);
 	const auto view = texture.image_view != nullptr ? texture.image_view
 	                                                : texture.image->image_view[texture.view];
@@ -102,22 +102,17 @@ VkDescriptorImageInfo MakeDescriptorImageInfo(const DescriptorCache::TextureBind
 
 } // namespace
 
-void DescriptorCache::Init() {
-	m_initialized = true;
-}
-
-VkDescriptorSetLayout
+vk::DescriptorSetLayout
 DescriptorCache::GetDescriptorSetLayoutInternal(GraphicContext* gctx, Stage stage,
                                                 const ShaderRecompiler::IR::Program& program) {
 	EXIT_IF(gctx == nullptr);
-	Init();
 	const auto key = LayoutKey(stage, program);
 	if (const auto found = m_descriptor_set_layouts.find(key);
 	    found != m_descriptor_set_layouts.end()) {
 		return found->second;
 	}
 
-	std::vector<VkDescriptorSetLayoutBinding> bindings;
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
 	bindings.reserve(program.bindings.descriptors.size());
 	for (const auto& descriptor: program.bindings.descriptors) {
 		bindings.push_back({descriptor.binding, DescriptorType(descriptor.kind),
@@ -127,13 +122,13 @@ DescriptorCache::GetDescriptorSetLayoutInternal(GraphicContext* gctx, Stage stag
 		return nullptr;
 	}
 
-	VkDescriptorSetLayoutCreateInfo info {};
-	info.sType                   = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	info.bindingCount            = static_cast<uint32_t>(bindings.size());
-	info.pBindings               = bindings.data();
-	VkDescriptorSetLayout layout = nullptr;
-	vkCreateDescriptorSetLayout(gctx->device, &info, nullptr, &layout);
-	EXIT_NOT_IMPLEMENTED(layout == nullptr);
+	vk::DescriptorSetLayoutCreateInfo info {};
+	info.sType                     = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+	info.bindingCount              = static_cast<uint32_t>(bindings.size());
+	info.pBindings                 = bindings.data();
+	vk::DescriptorSetLayout layout = nullptr;
+	const auto result = gctx->device.createDescriptorSetLayout(&info, nullptr, &layout);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || layout == nullptr);
 	m_descriptor_set_layouts.emplace(key, layout);
 	return layout;
 }
@@ -141,24 +136,24 @@ DescriptorCache::GetDescriptorSetLayoutInternal(GraphicContext* gctx, Stage stag
 void DescriptorCache::CreatePool(GraphicContext* gctx) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(gctx == nullptr);
-	constexpr uint32_t         MaxSets = 512;
-	const VkDescriptorPoolSize sizes[] = {
-	    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	constexpr uint32_t           MaxSets = 512;
+	const vk::DescriptorPoolSize sizes[] = {
+	    {vk::DescriptorType::eStorageBuffer,
 	     MaxSets * (ShaderRecompiler::IR::ShaderInfo::MaxBuffers +
 	                ShaderRecompiler::IR::ShaderInfo::MaxAddresses + 3u)},
-	    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
-	    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
-	    {VK_DESCRIPTOR_TYPE_SAMPLER, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxSamplers},
+	    {vk::DescriptorType::eSampledImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
+	    {vk::DescriptorType::eStorageImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
+	    {vk::DescriptorType::eSampler, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxSamplers},
 	};
-	VkDescriptorPoolCreateInfo info {};
-	info.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	vk::DescriptorPoolCreateInfo info {};
+	info.sType         = vk::StructureType::eDescriptorPoolCreateInfo;
 	info.poolSizeCount = static_cast<uint32_t>(std::size(sizes));
 	info.pPoolSizes    = sizes;
 	info.maxSets       = MaxSets;
 	const auto pool_id = static_cast<int>(m_pools.size());
 	auto&      pool    = m_pools.emplace_back();
-	vkCreateDescriptorPool(gctx->device, &info, nullptr, &pool.pool);
-	EXIT_NOT_IMPLEMENTED(pool.pool == nullptr);
+	const auto result  = gctx->device.createDescriptorPool(&info, nullptr, &pool.pool);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || pool.pool == nullptr);
 	pool.next_free_pool = m_first_free_pool;
 	m_first_free_pool   = pool_id;
 }
@@ -182,23 +177,22 @@ VulkanDescriptorSet* DescriptorCache::Allocate(Stage                            
 	for (int attempt = 0; attempt < 2; attempt++) {
 		for (int pool_id = m_first_free_pool; pool_id != -1;
 		     pool_id     = m_pools[pool_id].next_free_pool) {
-			auto&                                    pool = m_pools[pool_id];
-			std::array<VkDescriptorSetLayout, Batch> layouts;
+			auto&                                      pool = m_pools[pool_id];
+			std::array<vk::DescriptorSetLayout, Batch> layouts;
 			layouts.fill(layout);
-			std::array<VkDescriptorSet, Batch> sets {};
-			VkDescriptorSetAllocateInfo        info {};
-			info.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+			std::array<vk::DescriptorSet, Batch> sets {};
+			vk::DescriptorSetAllocateInfo        info {};
+			info.sType              = vk::StructureType::eDescriptorSetAllocateInfo;
 			info.descriptorPool     = pool.pool;
 			info.descriptorSetCount = Batch;
 			info.pSetLayouts        = layouts.data();
-			if (vkAllocateDescriptorSets(gctx->device, &info, sets.data()) == VK_SUCCESS) {
+			if (gctx->device.allocateDescriptorSets(&info, sets.data()) == vk::Result::eSuccess) {
 				free_sets.reserve(free_sets.size() + Batch - 1u);
 				for (uint32_t i = 0; i + 1u < Batch; i++) {
 					free_sets.push_back(new VulkanDescriptorSet {sets[i], layout, pool_id});
 				}
 				return new VulkanDescriptorSet {sets.back(), layout, pool_id};
 			}
-			pool.free         = false;
 			m_first_free_pool = pool.next_free_pool;
 			break;
 		}
@@ -228,16 +222,16 @@ VulkanDescriptorSet* DescriptorCache::GetDescriptor(Stage                       
 
 	const auto descriptor_count = program.info.buffers.size() + program.info.images.size() +
 	                              program.info.samplers.size() + program.info.addresses.size() + 3u;
-	std::vector<VkDescriptorBufferInfo> buffer_infos;
-	std::vector<VkDescriptorImageInfo>  image_infos;
-	std::vector<VkWriteDescriptorSet>   writes;
+	std::vector<vk::DescriptorBufferInfo> buffer_infos;
+	std::vector<vk::DescriptorImageInfo>  image_infos;
+	std::vector<vk::WriteDescriptorSet>   writes;
 	buffer_infos.reserve(descriptor_count);
 	image_infos.reserve(descriptor_count);
 	writes.reserve(program.bindings.descriptors.size());
 
 	for (const auto& binding: program.bindings.descriptors) {
-		VkWriteDescriptorSet write {};
-		write.sType             = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		vk::WriteDescriptorSet write {};
+		write.sType             = vk::StructureType::eWriteDescriptorSet;
 		write.dstSet            = set->set;
 		write.dstBinding        = binding.binding;
 		write.descriptorType    = DescriptorType(binding.kind);
@@ -264,12 +258,12 @@ VulkanDescriptorSet* DescriptorCache::GetDescriptor(Stage                       
 				for (const auto resource: binding.resources) {
 					const auto sampler = data.samplers.at(resource);
 					EXIT_IF(sampler == nullptr);
-					image_infos.push_back({sampler, nullptr, VK_IMAGE_LAYOUT_UNDEFINED});
+					image_infos.push_back({sampler, nullptr, vk::ImageLayout::eUndefined});
 				}
 				break;
 			default: {
-				const auto layout = IsStorageImage(binding.kind) ? VK_IMAGE_LAYOUT_GENERAL
-				                                                 : VK_IMAGE_LAYOUT_UNDEFINED;
+				const auto layout = IsStorageImage(binding.kind) ? vk::ImageLayout::eGeneral
+				                                                 : vk::ImageLayout::eUndefined;
 				for (const auto resource: binding.resources) {
 					const auto& texture = data.images.at(resource);
 					image_infos.push_back(MakeDescriptorImageInfo(
@@ -287,12 +281,12 @@ VulkanDescriptorSet* DescriptorCache::GetDescriptor(Stage                       
 		}
 		writes.push_back(write);
 	}
-	vkUpdateDescriptorSets(gctx->device, static_cast<uint32_t>(writes.size()), writes.data(), 0,
-	                       nullptr);
+	gctx->device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0,
+	                                  nullptr);
 	return set;
 }
 
-VkDescriptorSetLayout
+vk::DescriptorSetLayout
 DescriptorCache::GetDescriptorSetLayout(Stage stage, const ShaderRecompiler::IR::Program& program) {
 	auto* gctx = g_render_ctx->GetGraphicCtx();
 	EXIT_IF(gctx == nullptr);

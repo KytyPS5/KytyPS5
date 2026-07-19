@@ -52,7 +52,6 @@ struct ShaderBufferResource {
 	[[nodiscard]] uint32_t DstSelXYZW() const { return (fields[3] >> 0u) & 0xFFFu; }
 	[[nodiscard]] bool     AddTid() const { return ((fields[3] >> 23u) & 0x1u) == 1; }
 	[[nodiscard]] uint8_t  IndexStride() const { return (fields[3] >> 21u) & 0x3u; }
-	[[nodiscard]] uint32_t IndexStrideRecords() const { return 8u << IndexStride(); }
 	[[nodiscard]] uint32_t PackedStride() const {
 		return Stride() | (static_cast<uint32_t>(SwizzleEnabled()) << 14u) |
 		       (static_cast<uint32_t>(IndexStride()) << 16u) |
@@ -64,17 +63,11 @@ struct ShaderBufferResource {
 	}
 	[[nodiscard]] uint8_t Format() const { return (fields[3] >> 12u) & 0x7Fu; }
 	[[nodiscard]] uint8_t OutOfBounds() const { return (fields[3] >> 28u) & 0x3u; }
+	[[nodiscard]] uint8_t Type() const { return (fields[3] >> 30u) & 0x3u; }
 };
 
 struct ShaderTextureResource {
 	uint32_t fields[8] = {0};
-
-	void UpdateAddress40(uint64_t gpu_addr) {
-		auto lo   = static_cast<uint32_t>(gpu_addr & 0xffffffffu);
-		auto hi   = static_cast<uint32_t>(gpu_addr >> 32u);
-		fields[0] = lo;
-		fields[1] = (fields[1] & 0xffffff00u) | (hi & 0x000000ffu);
-	}
 
 	[[nodiscard]] uint16_t MinLod() const { return (fields[1] >> 8u) & 0xFFFu; }
 	[[nodiscard]] uint8_t  DstSelX() const { return (fields[3] >> 0u) & 0x7u; }
@@ -124,8 +117,6 @@ struct ShaderTextureResource {
 
 struct ShaderSamplerResource {
 	uint32_t fields[4] = {0};
-
-	void UpdateIndex(uint32_t index) { fields[0] = index; }
 
 	[[nodiscard]] uint8_t  ClampX() const { return (fields[0] >> 0u) & 0x7u; }
 	[[nodiscard]] uint8_t  ClampY() const { return (fields[0] >> 3u) & 0x7u; }

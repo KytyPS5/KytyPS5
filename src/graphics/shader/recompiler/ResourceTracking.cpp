@@ -178,6 +178,7 @@ public:
 				}
 			}
 		}
+		LinkImageAliases();
 		m_program.info = std::move(m_info);
 		for (const auto& patch: m_patches) {
 			patch.inst->memory.resource        = patch.resource;
@@ -288,6 +289,24 @@ private:
 		resource->atomic          = resource->atomic || IsAtomic(inst.op);
 		resource->formatted       = resource->formatted || inst.memory.formatted;
 		resource->scalar = resource->scalar || inst.memory.kind == ResourceKind::ScalarBuffer;
+	}
+
+	void LinkImageAliases() {
+		for (auto& buffer: m_info.buffers) {
+			const auto* buffer_source = GetDescriptorSource(m_program, buffer.source);
+			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+				continue;
+			}
+			for (uint32_t i = 0; i < m_info.images.size(); i++) {
+				const auto* image_source = GetDescriptorSource(m_program, m_info.images[i].source);
+				if (image_source != nullptr && image_source->dword_count == 8 &&
+				    std::equal(buffer_source->dwords.begin(), buffer_source->dwords.begin() + 4,
+				               image_source->dwords.begin())) {
+					buffer.image_alias = i;
+					break;
+				}
+			}
+		}
 	}
 
 	uint32_t AddImage(const Instruction& inst) {

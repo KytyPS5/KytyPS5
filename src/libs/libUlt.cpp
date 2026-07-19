@@ -5,6 +5,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -18,10 +19,13 @@ namespace LibUlt {
 
 LIB_VERSION("Ult", 1, "Ult", 1, 1);
 
-constexpr int ULT_ERROR_NULL    = -2139029503; // 0x80810001
-constexpr int ULT_ERROR_INVALID = -2139029500; // 0x80810004
-constexpr int ULT_ERROR_STATE   = -2139029498; // 0x80810006
-constexpr int ULT_ERROR_AGAIN   = -2139029496; // 0x80810008
+constexpr int ULT_ERROR_NULL      = -2139029503; // 0x80810001
+constexpr int ULT_ERROR_ALIGNMENT = -2139029502; // 0x80810002
+constexpr int ULT_ERROR_RANGE     = -2139029501; // 0x80810003
+constexpr int ULT_ERROR_INVALID   = -2139029500; // 0x80810004
+constexpr int ULT_ERROR_STATE     = -2139029498; // 0x80810006
+constexpr int ULT_ERROR_BUSY      = -2139029497; // 0x80810007
+constexpr int ULT_ERROR_AGAIN     = -2139029496; // 0x80810008
 
 struct UltMutexOptParam {
 	uint32_t reserved_header[2];
@@ -36,6 +40,14 @@ struct UltUlthreadRuntimeOptParam {
 struct UltMutexState {
 	std::recursive_mutex mutex;
 	uint32_t             attribute = 0;
+};
+
+struct UltSemaphoreState {
+	std::mutex              mutex;
+	std::condition_variable available;
+	int32_t                 resources = 0;
+	uint32_t                waiters   = 0;
+	bool                    alive     = true;
 };
 
 struct UltResourcePoolState {
@@ -75,13 +87,14 @@ struct UltUlthreadState {
 	LibKernel::Pthread thread = nullptr;
 };
 
-static std::mutex                                                   g_ult_mutex;
-static std::unordered_map<void*, std::shared_ptr<UltMutexState>>    g_ult_mutexes;
-static std::unordered_map<void*, UltResourcePoolState>              g_ult_resource_pools;
-static std::unordered_map<void*, UltQueueDataResourcePoolState>     g_ult_queue_data_pools;
-static std::unordered_map<void*, std::shared_ptr<UltQueueState>>    g_ult_queues;
-static std::unordered_map<void*, UltRuntimeState>                   g_ult_runtimes;
-static std::unordered_map<void*, std::shared_ptr<UltUlthreadState>> g_ult_ulthreads;
+static std::mutex                                                    g_ult_mutex;
+static std::unordered_map<void*, std::shared_ptr<UltMutexState>>     g_ult_mutexes;
+static std::unordered_map<void*, std::shared_ptr<UltSemaphoreState>> g_ult_semaphores;
+static std::unordered_map<void*, UltResourcePoolState>               g_ult_resource_pools;
+static std::unordered_map<void*, UltQueueDataResourcePoolState>      g_ult_queue_data_pools;
+static std::unordered_map<void*, std::shared_ptr<UltQueueState>>     g_ult_queues;
+static std::unordered_map<void*, UltRuntimeState>                    g_ult_runtimes;
+static std::unordered_map<void*, std::shared_ptr<UltUlthreadState>>  g_ult_ulthreads;
 
 static uint64_t ult_align_up(uint64_t value, uint64_t alignment) {
 	return (value + alignment - 1u) & ~(alignment - 1u);
@@ -109,13 +122,27 @@ static int KYTY_SYSV_ABI UltInitialize() {
 static int KYTY_SYSV_ABI UltFinalize() {
 	PRINT_NAME();
 
-	std::scoped_lock lock(g_ult_mutex);
-	g_ult_mutexes.clear();
-	g_ult_resource_pools.clear();
-	g_ult_queue_data_pools.clear();
-	g_ult_queues.clear();
-	g_ult_runtimes.clear();
-	g_ult_ulthreads.clear();
+	std::vector<std::shared_ptr<UltSemaphoreState>> semaphores;
+	{
+		std::scoped_lock lock(g_ult_mutex);
+		semaphores.reserve(g_ult_semaphores.size());
+		for (auto& entry: g_ult_semaphores) {
+			auto&            state = entry.second;
+			std::scoped_lock state_lock(state->mutex);
+			state->alive = false;
+			semaphores.push_back(state);
+		}
+		g_ult_semaphores.clear();
+		g_ult_mutexes.clear();
+		g_ult_resource_pools.clear();
+		g_ult_queue_data_pools.clear();
+		g_ult_queues.clear();
+		g_ult_runtimes.clear();
+		g_ult_ulthreads.clear();
+	}
+	for (const auto& state: semaphores) {
+		state->available.notify_all();
+	}
 
 	return OK;
 }
@@ -540,6 +567,146 @@ static int KYTY_SYSV_ABI UltMutexUnlock(void* mutex) {
 	return OK;
 }
 
+static int UltSemaphoreGetState(void* semaphore, std::shared_ptr<UltSemaphoreState>* state) {
+	EXIT_IF(state == nullptr);
+
+	std::scoped_lock lock(g_ult_mutex);
+	auto             it = g_ult_semaphores.find(semaphore);
+	if (it == g_ult_semaphores.end()) {
+		return (semaphore == nullptr ? ULT_ERROR_NULL : ULT_ERROR_STATE);
+	}
+	*state = it->second;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI UltSemaphoreCreate(void* semaphore, const char* name,
+                                            int32_t     num_initial_resource,
+                                            void*       waiting_queue_resource_pool,
+                                            const void* opt_param, uint32_t build_version) {
+	PRINT_NAME();
+	(void)name;
+	(void)build_version;
+
+	if (semaphore == nullptr) {
+		return ULT_ERROR_NULL;
+	}
+	if ((reinterpret_cast<uintptr_t>(semaphore) & 7u) != 0 ||
+	    (opt_param != nullptr && (reinterpret_cast<uintptr_t>(opt_param) & 7u) != 0)) {
+		return ULT_ERROR_ALIGNMENT;
+	}
+	if (num_initial_resource < 0) {
+		return ULT_ERROR_RANGE;
+	}
+
+	auto state       = std::make_shared<UltSemaphoreState>();
+	state->resources = num_initial_resource;
+
+	std::scoped_lock lock(g_ult_mutex);
+	if (waiting_queue_resource_pool != nullptr &&
+	    g_ult_resource_pools.find(waiting_queue_resource_pool) == g_ult_resource_pools.end()) {
+		return ULT_ERROR_INVALID;
+	}
+	if (g_ult_semaphores.find(semaphore) != g_ult_semaphores.end()) {
+		return ULT_ERROR_STATE;
+	}
+	std::memset(semaphore, 0, 256);
+	g_ult_semaphores[semaphore] = std::move(state);
+	return OK;
+}
+
+static int KYTY_SYSV_ABI UltSemaphoreAcquire(void* semaphore, int32_t num_resource) {
+	PRINT_NAME();
+
+	if (num_resource <= 0) {
+		return ULT_ERROR_RANGE;
+	}
+	std::shared_ptr<UltSemaphoreState> state;
+	if (auto ret = UltSemaphoreGetState(semaphore, &state); ret != OK) {
+		return ret;
+	}
+
+	std::unique_lock lock(state->mutex);
+	if (!state->alive) {
+		return ULT_ERROR_STATE;
+	}
+	state->waiters++;
+	state->available.wait(lock, [&] { return !state->alive || state->resources >= num_resource; });
+	state->waiters--;
+	if (!state->alive) {
+		return ULT_ERROR_STATE;
+	}
+	state->resources -= num_resource;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI UltSemaphoreTryAcquire(void* semaphore, int32_t num_resource) {
+	PRINT_NAME();
+
+	if (num_resource <= 0) {
+		return ULT_ERROR_RANGE;
+	}
+	std::shared_ptr<UltSemaphoreState> state;
+	if (auto ret = UltSemaphoreGetState(semaphore, &state); ret != OK) {
+		return ret;
+	}
+
+	std::scoped_lock lock(state->mutex);
+	if (!state->alive) {
+		return ULT_ERROR_STATE;
+	}
+	if (state->resources < num_resource) {
+		return ULT_ERROR_AGAIN;
+	}
+	state->resources -= num_resource;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI UltSemaphoreRelease(void* semaphore, int32_t num_resource) {
+	PRINT_NAME();
+
+	if (num_resource <= 0) {
+		return ULT_ERROR_RANGE;
+	}
+	std::shared_ptr<UltSemaphoreState> state;
+	if (auto ret = UltSemaphoreGetState(semaphore, &state); ret != OK) {
+		return ret;
+	}
+
+	{
+		std::scoped_lock lock(state->mutex);
+		if (!state->alive) {
+			return ULT_ERROR_STATE;
+		}
+		if (state->resources > INT32_MAX - num_resource) {
+			return ULT_ERROR_RANGE;
+		}
+		state->resources += num_resource;
+	}
+	state->available.notify_all();
+	return OK;
+}
+
+static int KYTY_SYSV_ABI UltSemaphoreDestroy(void* semaphore) {
+	PRINT_NAME();
+
+	if (semaphore == nullptr) {
+		return ULT_ERROR_NULL;
+	}
+	std::scoped_lock global_lock(g_ult_mutex);
+	auto             it = g_ult_semaphores.find(semaphore);
+	if (it == g_ult_semaphores.end()) {
+		return ULT_ERROR_STATE;
+	}
+	auto             state = it->second;
+	std::scoped_lock state_lock(state->mutex);
+	if (state->waiters != 0) {
+		return ULT_ERROR_BUSY;
+	}
+	state->alive = false;
+	g_ult_semaphores.erase(it);
+	return OK;
+}
+
 LIB_DEFINE(InitUlt_1) {
 	LIB_FUNC("hZIg1EWGsHM", UltInitialize);
 	LIB_FUNC("d-kSG2fLrvI", UltFinalize);
@@ -559,6 +726,11 @@ LIB_DEFINE(InitUlt_1) {
 	LIB_FUNC("mmt8Sa6tL6c", UltMutexCreate);
 	LIB_FUNC("8hEGkR1pfr8", UltMutexLock);
 	LIB_FUNC("h0XebKiMBtk", UltMutexUnlock);
+	LIB_FUNC("h5QlIYj+Ro8", UltSemaphoreCreate);
+	LIB_FUNC("QAH1ofI97vU", UltSemaphoreAcquire);
+	LIB_FUNC("HA1Ldbi3lPY", UltSemaphoreTryAcquire);
+	LIB_FUNC("lbtk5X1mecw", UltSemaphoreRelease);
+	LIB_FUNC("izXyehpoZGo", UltSemaphoreDestroy);
 }
 
 } // namespace LibUlt

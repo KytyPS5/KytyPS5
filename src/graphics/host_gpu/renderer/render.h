@@ -4,10 +4,10 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/streamBuffer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <memory>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -69,7 +69,7 @@ private:
 class CommandBuffer {
 public:
 	explicit CommandBuffer(int queue): m_queue(queue) { Allocate(); }
-	virtual ~CommandBuffer() { Free(); }
+	~CommandBuffer() { Free(); }
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
@@ -80,9 +80,9 @@ public:
 	void Begin() const;
 	void End() const;
 	void Execute();
-	void ExecuteWithSemaphore(VkSemaphore signal_semaphore = nullptr);
-	void ExecuteWithSemaphore(VkSemaphore wait_semaphore, VkPipelineStageFlags wait_stage,
-	                          VkSemaphore signal_semaphore);
+	void ExecuteWithSemaphore(vk::Semaphore signal_semaphore = nullptr);
+	void ExecuteWithSemaphore(vk::Semaphore wait_semaphore, vk::PipelineStageFlags wait_stage,
+	                          vk::Semaphore signal_semaphore);
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorInfo* colors,
@@ -95,16 +95,21 @@ public:
 	void RetainResourceUntilFence(std::shared_ptr<void> resource);
 	void RecycleDescriptorAfterFence(VulkanDescriptorSet* set);
 
-	[[nodiscard]] uint32_t GetIndex() const { return m_index; }
-	[[nodiscard]] int      GetQueue() const { return m_queue; }
-	VulkanCommandPool*     GetPool() { return m_pool; }
-	[[nodiscard]] bool     IsExecute() const { return m_execute; }
+	[[nodiscard]] vk::CommandBuffer Handle() const;
+	[[nodiscard]] int               GetQueue() const { return m_queue; }
+	[[nodiscard]] bool              IsExecute() const { return m_execute; }
 	[[nodiscard]] uint64_t GetRecordingGeneration() const { return m_recording_generation; }
 
 private:
 	friend class BufferCache;
 
-	void RecycleDescriptorsAfterFence();
+	void Submit(vk::Semaphore wait_semaphore, vk::PipelineStageFlags wait_stage,
+	            vk::Semaphore signal_semaphore);
+	[[nodiscard]] vk::Semaphore ResolveSignalSemaphore(vk::Semaphore semaphore) const;
+	void                        FinalizeFence(bool reset_recording);
+	void                        ReleaseResourcesAfterFence();
+	void                        DeleteBuffersAfterFence();
+	void                        RecycleDescriptorsAfterFence();
 
 	VulkanCommandPool*                m_pool                 = nullptr;
 	uint32_t                          m_index                = static_cast<uint32_t>(-1);
@@ -142,6 +147,7 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 
 void GraphicsRenderInit();
 void GraphicsRenderCreateContext();
+void GraphicsRenderReleaseThreadCommandPools();
 
 [[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,

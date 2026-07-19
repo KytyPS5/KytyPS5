@@ -24,7 +24,7 @@ constexpr int AGC_USER_INTERRUPT_EVENT = 0x1800;
 class RenderContext {
 public:
 	RenderContext() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~RenderContext() { KYTY_NOT_IMPLEMENTED; }
+	~RenderContext() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(RenderContext);
 
 	void            SetGraphicCtx(GraphicContext* ctx);

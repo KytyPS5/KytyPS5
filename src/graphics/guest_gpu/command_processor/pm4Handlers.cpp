@@ -4138,7 +4138,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		HW::DepthDepthSizeXY r;
 		r.x_max = KYTY_PM4_GET(value, DB_DEPTH_SIZE_XY, X_MAX);
 		r.y_max = KYTY_PM4_GET(value, DB_DEPTH_SIZE_XY, Y_MAX);
-		r.valid = (r.x_max != 0 || r.y_max != 0);
+		r.valid = true;
 		cp->GetCtx()->SetDepthDepthSizeXY(r);
 	};
 	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_SIZE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {

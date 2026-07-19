@@ -227,6 +227,21 @@ void TestScalarAndVectorBufferAlias() {
         "scalar/vector alias did not share one dense index");
 }
 
+void TestBufferImageAliasIsLinkedDuringTracking() {
+  Program program;
+  program.blocks.resize(1);
+  program.blocks[0].instructions = {
+      BufferUse(4, 0), BufferUse(8, 8),
+      ImageUse(12, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Dim2D)};
+
+  Prepare(&program);
+  Check(program.info.buffers.size() == 2 && program.info.images.size() == 1 &&
+            program.info.buffers[0].image_alias == 0 &&
+            program.info.buffers[1].image_alias == BufferResource::NoImageAlias,
+        "buffer/image descriptor provenance aliases were not linked during tracking");
+}
+
 void TestImagesAndSamplers() {
   Program program;
   program.blocks.resize(1);
@@ -1793,6 +1808,7 @@ int main() {
   try {
     RUN(TestDenseBufferPatching);
     RUN(TestScalarAndVectorBufferAlias);
+    RUN(TestBufferImageAliasIsLinkedDuringTracking);
     RUN(TestImagesAndSamplers);
     RUN(TestDynamicPhiResource);
     RUN(TestTrackingRequiresCompletedSrtPlan);

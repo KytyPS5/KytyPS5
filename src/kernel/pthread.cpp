@@ -1318,13 +1318,6 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 	auto  vaddr   = reinterpret_cast<uint64_t>(addr);
 	auto* program = rt->FindProgramByAddr(vaddr);
 
-	EXIT_NOT_IMPLEMENTED(program == nullptr);
-
-	auto* obj    = new PthreadStaticObject;
-	obj->program = program;
-	obj->type    = type;
-	obj->vaddr   = vaddr;
-
 	std::string name = fmt::format("Static{:016x}", vaddr);
 
 	int result = OK;
@@ -1344,6 +1337,17 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 	}
 
 	EXIT_NOT_IMPLEMENTED(result != OK);
+
+	// Heap-backed lazy pthread objects are valid. Initialize them without requiring
+	// an owning ELF segment; only segment-backed objects need module-unload cleanup bookkeeping.
+	if (program == nullptr) {
+		return addr;
+	}
+
+	auto* obj    = new PthreadStaticObject;
+	obj->program = program;
+	obj->type    = type;
+	obj->vaddr   = vaddr;
 
 	const auto it = std::find(m_objects.begin(), m_objects.end(), nullptr);
 	if (it != m_objects.end()) {

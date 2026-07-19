@@ -18,11 +18,11 @@ struct DisplayBufferImage {
 };
 
 DisplayBufferImage DisplayBufferFind(uint64_t addr, bool render_target = false);
-int  DisplayBufferSubmitFlipFromGpu(Graphics::CommandBuffer* buffer, int handle, int index,
-                                    int flip_mode, int64_t flip_arg, uint64_t* request_id);
+int      DisplayBufferSubmitFlipFromGpu(Graphics::CommandBuffer* buffer, int handle, int index,
+                                        int flip_mode, int64_t flip_arg, uint64_t* request_id);
 uint64_t DisplayBufferPrepareNextFlipOnGpu(Graphics::CommandBuffer* buffer);
-void DisplayBufferCompleteFlipFromGpu(uint64_t request_id);
-void DisplayBufferWaitForFlipQueueSlot();
+void     DisplayBufferCompleteFlipFromGpu(uint64_t request_id);
+void     DisplayBufferWaitForFlipQueueSlot();
 
 } // namespace Libs::Presentation
 

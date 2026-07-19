@@ -1,10 +1,11 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUG_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUG_H_
 
+#include "graphics/host_gpu/vulkanCommon.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -37,7 +38,7 @@ void                     hw_print(const HW::Context& hw);
 void                     hw_check(const HW::Context& hw);
 void                     LogDrawPhase(const char* draw_name, const char* phase);
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
-                               VkExtent2D extent);
+                               vk::Extent2D extent);
 
 } // namespace Libs::Graphics
 

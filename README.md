@@ -62,6 +62,17 @@ Code contributions should be focused, build successfully on Windows, and include
 where practical. Because KytyPS5 is still evolving quickly, consider opening an issue before
 starting a large change.
 
+### Formatting
+
+Set up the clang-format hook after cloning:
+
+```powershell
+python -m pip install pre-commit
+python -m pre_commit install --install-hooks
+```
+
+It formats staged `.cpp`, `.h`, and `.inc` files in `src`.
+
 ## Developer Information
 
 The PS5 graphics architecture is based on AMD RDNA 2. Use AMD's
@@ -95,7 +106,6 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- Vulkan SDK 1.3 or newer
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 

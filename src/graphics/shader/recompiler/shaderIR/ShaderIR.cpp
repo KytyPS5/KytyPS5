@@ -1,8 +1,8 @@
 #include "graphics/shader/recompiler/ShaderIR.h"
 
-#include "graphics/shader/recompiler/shaderIR/ShaderIRInternal.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/shaderIR/ShaderIRInternal.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -402,7 +402,6 @@ Decoder::Operand M0Operand() {
 	operand.kind = Decoder::OperandKind::M0;
 	return operand;
 }
-
 
 namespace {
 
@@ -1144,7 +1143,6 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock* block
 	}
 	return LowerImplemented(inst, block, error);
 }
-
 
 bool LowerImplemented(const Decoder::Instruction& decoded, BasicBlock* block, std::string* error) {
 	Instruction inst;

@@ -2,11 +2,13 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/image.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <vector>
 
@@ -25,7 +27,7 @@ static void UploadPromotedD16Depth(GraphicContext* ctx, DepthStencilVulkanImage*
 		     " host_slice=0x%016" PRIx64 " layers=%u\n",
 		     slice_size, host_slice_size, info.layers);
 	}
-	UtilScratchBuffer            host_linear(host_upload_size);
+	Transfer::ScratchBuffer      host_linear(host_upload_size);
 	std::vector<uint16_t>        guest_linear(slice_size / sizeof(uint16_t));
 	std::vector<BufferImageCopy> regions;
 	regions.reserve(info.layers);
@@ -44,17 +46,17 @@ static void UploadPromotedD16Depth(GraphicContext* ctx, DepthStencilVulkanImage*
 		region.width     = info.width;
 		region.height    = info.height;
 		region.dst_layer = base_layer + layer;
-		region.aspect    = VK_IMAGE_ASPECT_DEPTH_BIT;
+		region.aspect    = vk::ImageAspectFlagBits::eDepth;
 		regions.push_back(region);
 	}
-	UtilFillImage(ctx, image, host_linear.Data(), host_upload_size, regions,
-	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	Transfer::UploadImage(ctx, image, host_linear.Data(), host_upload_size, regions,
+	                      vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image, const ImageInfo& info,
                         const BufferImageCopySource& source, bool refresh, bool storage) const {
 	if (refresh) {
-		VulkanDeviceWaitIdle(ctx);
+		Transfer::WaitForGraphicsIdle(ctx);
 	}
 	const bool array_texture  = TextureIsLayeredTexture(info.type);
 	const bool volume_texture = TextureIs3DTexture(info.type);
@@ -69,22 +71,21 @@ void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image, const
 	    ctx, image, reinterpret_cast<const void*>(source.address), info.size, regions, layout,
 	    info.format, info.width, info.height, info.depth, info.levels, slice_layout,
 	    storage ? "StorageTextureCache" : "TextureCache",
-	    static_cast<uint64_t>(storage ? VK_IMAGE_LAYOUT_GENERAL
-	                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+	    storage ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal);
 }
 
 void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
                         const DepthTargetInfo& info, const BufferImageCopySource& source,
                         bool refresh, uint32_t base_layer) const {
 	if (refresh) {
-		VulkanDeviceWaitIdle(ctx);
+		Transfer::WaitForGraphicsIdle(ctx);
 	}
 	if (DepthAspectTransferBytes(info.format) != info.bytes_per_element) {
 		switch (info.format) {
-			case VK_FORMAT_D24_UNORM_S8_UINT:
+			case vk::Format::eD24UnormS8Uint:
 				UploadPromotedD16Depth<EncodeD16AsD24>(ctx, image, info, source, base_layer);
 				return;
-			case VK_FORMAT_D32_SFLOAT_S8_UINT:
+			case vk::Format::eD32SfloatS8Uint:
 				UploadPromotedD16Depth<EncodeD16AsD32>(ctx, image, info, source, base_layer);
 				return;
 			default:
@@ -93,7 +94,7 @@ void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 		}
 	}
 	const auto                   slice_size = info.size / info.layers;
-	UtilScratchBuffer            linear(info.size);
+	Transfer::ScratchBuffer      linear(info.size);
 	std::vector<BufferImageCopy> regions;
 	regions.reserve(info.layers);
 	for (uint32_t layer = 0; layer < info.layers; layer++) {
@@ -107,11 +108,11 @@ void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 		region.width     = info.width;
 		region.height    = info.height;
 		region.dst_layer = base_layer + layer;
-		region.aspect    = VK_IMAGE_ASPECT_DEPTH_BIT;
+		region.aspect    = vk::ImageAspectFlagBits::eDepth;
 		regions.push_back(region);
 	}
-	UtilFillImage(ctx, image, linear.Data(), info.size, regions,
-	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	Transfer::UploadImage(ctx, image, linear.Data(), info.size, regions,
+	                      vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
@@ -121,10 +122,10 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	const auto stencil_pitch  = TileGetTexturePitch(
 	    stencil_format, info.width, 1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	if (refresh) {
-		VulkanDeviceWaitIdle(ctx);
+		Transfer::WaitForGraphicsIdle(ctx);
 	}
 	const auto                   slice_size = info.stencil_size / info.layers;
-	UtilScratchBuffer            linear(info.stencil_size);
+	Transfer::ScratchBuffer      linear(info.stencil_size);
 	std::vector<BufferImageCopy> regions;
 	regions.reserve(info.layers);
 	for (uint32_t layer = 0; layer < info.layers; layer++) {
@@ -138,11 +139,11 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 		region.width     = info.width;
 		region.height    = info.height;
 		region.dst_layer = base_layer + layer;
-		region.aspect    = VK_IMAGE_ASPECT_STENCIL_BIT;
+		region.aspect    = vk::ImageAspectFlagBits::eStencil;
 		regions.push_back(region);
 	}
-	UtilFillImage(ctx, image, linear.Data(), info.stencil_size, regions,
-	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	Transfer::UploadImage(ctx, image, linear.Data(), info.stencil_size, regions,
+	                      vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) const {
@@ -162,11 +163,42 @@ void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) 
 		auto* linear_slice = static_cast<const uint8_t*>(src) + slice_size * layer;
 		if (standard64) {
 			TileConvertLinearToTiledStandard64KB32(guest_slice, linear_slice, info.width,
-			                                        info.height, info.pitch, slice_size);
+			                                       info.height, info.pitch, slice_size);
 		} else {
 			TileConvertLinearToTiledRenderTarget(guest_slice, linear_slice, info.width, info.height,
 			                                     info.pitch, info.bytes_per_element, slice_size);
 		}
+	}
+}
+
+void Tiler::TileImage(void* dst, const void* src, const ImageInfo& info) const {
+	const bool image_2d =
+	    info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && info.depth == 1;
+	const auto bytes_per_element = Prospero::RenderTargetBytesPerElement(info.format);
+	if (!image_2d || info.levels == 0 || info.levels > 16 ||
+	    info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	    bytes_per_element == 0) {
+		EXIT("Tiler: unsupported storage-texture tile, addr=0x%016" PRIx64 "+0x%016" PRIx64
+		     " extent=%ux%ux%u levels=%u tile=%u format=%u\n",
+		     info.address, info.size, info.width, info.height, info.depth, info.levels, info.tile,
+		     info.format);
+	}
+	auto layout = TextureCalcUploadLayout(info.format, info.width, info.height, info.levels,
+	                                      info.depth, info.pitch, info.tile, info.size, true, false,
+	                                      false, "StorageTextureReadback");
+	auto regions = TextureBuildUploadRegions(
+	    layout, VulkanFormat(info.format), info.width, info.height, info.depth, info.levels, false,
+	    false, TextureUploadDestination::MipLevels, TextureUploadSliceLayout::MipChainPerSlice);
+	std::memset(dst, 0, info.size);
+	for (uint32_t level = 0; level < info.levels; level++) {
+		const auto& level_size = layout.level_sizes[level];
+		const auto  guest_offset =
+		    level_size.src_size != 0 ? level_size.src_offset : level_size.offset;
+		auto*       guest  = static_cast<uint8_t*>(dst) + guest_offset;
+		const auto* linear = static_cast<const uint8_t*>(src) + regions[level].offset;
+		TileConvertLinearToTiledRenderTarget(
+		    guest, linear, regions[level].width, regions[level].height, regions[level].pitch,
+		    bytes_per_element, level_size.size, level_size.src_size, level_size.x, level_size.y);
 	}
 }
 

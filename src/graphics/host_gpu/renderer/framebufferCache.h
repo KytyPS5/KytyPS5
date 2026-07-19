@@ -7,28 +7,28 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
 struct RenderColorInfo;
 struct RenderDepthInfo;
 
-static constexpr VkImageLayout RENDER_COLOR_IMAGE_LAYOUT = VK_IMAGE_LAYOUT_GENERAL;
+static constexpr vk::ImageLayout RENDER_COLOR_IMAGE_LAYOUT = vk::ImageLayout::eGeneral;
 
 struct VulkanFramebuffer {
-	VkRenderPass  render_pass                                = nullptr;
-	uint64_t      render_pass_id                             = 0;
-	VkFramebuffer framebuffer                                = nullptr;
-	VkImageLayout color_layout[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	VkImageLayout depth_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	vk::RenderPass  render_pass                                = nullptr;
+	uint64_t        render_pass_id                             = 0;
+	vk::Framebuffer framebuffer                                = nullptr;
+	vk::ImageLayout color_layout[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	vk::ImageLayout depth_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
 };
 
-inline uint64_t render_pass_compat_id(uint32_t color_count, const VkFormat* color_formats,
-                                      bool with_depth, VkFormat depth_format,
-                                      VkImageLayout depth_layout) {
+inline uint64_t render_pass_compat_id(uint32_t color_count, const vk::Format* color_formats,
+                                      bool with_depth, vk::Format depth_format,
+                                      vk::ImageLayout depth_layout) {
 	uint64_t id  = 0xcbf29ce484222325ull;
 	auto     mix = [&id](uint64_t v) {
 		id ^= v;
@@ -42,7 +42,7 @@ inline uint64_t render_pass_compat_id(uint32_t color_count, const VkFormat* colo
 	mix(with_depth ? 1u : 0u);
 	mix(static_cast<uint32_t>(depth_format));
 	mix(static_cast<uint32_t>(depth_layout));
-	mix(VK_SAMPLE_COUNT_1_BIT);
+	mix(static_cast<uint32_t>(vk::SampleCountFlagBits::e1));
 
 	return id;
 }
@@ -50,7 +50,7 @@ inline uint64_t render_pass_compat_id(uint32_t color_count, const VkFormat* colo
 class FramebufferCache {
 public:
 	FramebufferCache() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~FramebufferCache() { KYTY_NOT_IMPLEMENTED; }
+	~FramebufferCache() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(FramebufferCache);
 
 	VulkanFramebuffer* CreateFramebuffer(RenderColorInfo* colors, uint32_t color_count,
@@ -59,24 +59,21 @@ public:
 	void               FreeFramebufferByDepth(DepthStencilVulkanImage* image);
 
 private:
-	VideoOutVulkanImage* CreateDummyBuffer(VkFormat format, uint32_t width, uint32_t height);
-
 	struct Framebuffer {
 		VulkanFramebuffer* framebuffer                                      = nullptr;
 		uint64_t           image_id[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-		VkImageView        color_view[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+		vk::ImageView      color_view[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 		uint64_t           depth_id                                         = 0;
-		VkImageView        depth_view                                       = nullptr;
+		vk::ImageView      depth_view                                       = nullptr;
 		bool               color_clear_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-		VkImageLayout      color_layout[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+		vk::ImageLayout    color_layout[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
 		bool               depth_clear_enable                               = false;
 		bool               stencil_clear_enable                             = false;
 		bool               depth_read_only                                  = false;
 	};
 
-	Common::Mutex                     m_mutex;
-	std::vector<Framebuffer>          m_framebuffers;
-	std::vector<VideoOutVulkanImage*> m_dummy_buffers;
+	Common::Mutex            m_mutex;
+	std::vector<Framebuffer> m_framebuffers;
 };
 
 } // namespace Libs::Graphics

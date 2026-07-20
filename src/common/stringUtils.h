@@ -317,9 +317,17 @@ inline std::string SafeCsv(std::string_view text) {
 }
 
 inline std::string Utf16ToUtf8(const char16_t* utf16) {
+#if defined(_MSC_VER) && _MSC_VER >= 1910
+#pragma warning(push)
+#pragma warning(disable : 4996) // C4996: codecvt_utf8_utf16 deprecated in C++17
+#endif
 	std::u16string                                                    input(utf16);
 	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-	return convert.to_bytes(input);
+	std::string result = convert.to_bytes(input);
+#if defined(_MSC_VER) && _MSC_VER >= 1910
+#pragma warning(pop)
+#endif
+	return result;
 }
 
 inline ByteBuffer HexToBin(std::string_view text) {

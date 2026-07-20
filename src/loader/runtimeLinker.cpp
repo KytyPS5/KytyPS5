@@ -28,6 +28,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1011,6 +1012,85 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
 			dump_guest_qwords("vorbis obj", local[0]);
 			dump_guest_qwords("vorbis len", info->rcx);
+		}
+
+		// M1W2 v1.2 (narrow): if the AV target is a small low address
+		// (the binary's PLT0 placeholder, typically 0x1), patch the
+		// 128-byte region around the FAULTING INSTRUCTION (not the
+		// access_violation_vaddr which is the operand) with NOPs. Then
+		// set the guest RIP forward by 16 bytes (past the bad call/jmp)
+		// and return true to keep the emulator running.
+		// g_invalid_memory = 0x84000000 (PS5 system-reserved + invalid
+		// offset). The 0x1 in the binary's PLT0 is a different sentinel.
+		// On Windows, exception_record->ExceptionAddress is often 0 for
+		// these faults; use CONTEXT.Rip from native_context instead.
+		if (info->access_violation_type == Common::HostException::AccessViolationType::Execute &&
+		    info->access_violation_vaddr != 0 &&
+		    info->access_violation_vaddr != g_invalid_memory &&
+		    (info->access_violation_vaddr & 0xFFFFFFFFFF000000ULL) == 0 &&
+		    info->access_violation_vaddr < 0x100000ULL) {
+			// Determine the actual faulting IP. Prefer CONTEXT.Rip on
+			// Windows (more reliable than ExceptionAddress for these
+			// PS5 binary faults), fall back to info->exception_address.
+			// If CONTEXT.Rip is unavailable/garbage, walk the call stack
+			// (SysStackWalkX86) to get the call site as a best-effort.
+			uint64_t fault_ip = info->exception_address;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			auto* ctx = reinterpret_cast<PCONTEXT>(const_cast<void*>(info->native_context));
+			if (ctx != nullptr && ctx->Rip >= 0x10000 && ctx->Rip < 0x7FFFFFFFFFFFULL) {
+				fault_ip = ctx->Rip;
+			}
+#endif
+			if (fault_ip < 0x10000ULL && info->rsp != 0 && info->rbp != 0) {
+				// CONTEXT.Rip was 0 or tiny — fall back to walking the
+				// x86 stack frame to find the return address of the
+				// faulting call. SysStackWalkX86 already runs at line
+				// 955 and prints the Stack trace; here we use it for
+				// the patch base.
+				void* stack[20] = {};
+				int   depth     = 20;
+				SysStackWalkX86(info->rbp, info->rsp, stack, &depth);
+				if (depth > 0 && stack[0] != nullptr) {
+					fault_ip = reinterpret_cast<uint64_t>(stack[0]) - 2;
+				}
+			}
+			LOGF("[M1W2 v1.2] fault_ip=%016" PRIx64 " ctx_rip=%016" PRIx64 " exc_addr=%016" PRIx64 "\n",
+			     fault_ip,
+			     reinterpret_cast<PCONTEXT>(const_cast<void*>(info->native_context)) == nullptr
+			         ? 0ULL
+			         : reinterpret_cast<PCONTEXT>(const_cast<void*>(info->native_context))->Rip,
+			     info->exception_address);
+			if (fault_ip != 0) {
+				// Patch a 32-byte region (one cache line) at the call site
+				// with NOPs. A single call/jmp is at most 7 bytes on x64,
+				// so 32 bytes is plenty. Anything larger overwrites valid
+				// code after the bad call and causes an IllegalInstruction
+				// when execution resumes.
+				const auto patch_addr = fault_ip & ~0x1F;
+				static std::unordered_set<uint64_t> patched_bases;
+				if (patched_bases.insert(patch_addr).second) {
+					LOGF("[M1W2 v1.2] patching AV site at [%016" PRIx64 "] (av=%016" PRIx64
+					     ") with 32 NOPs\n", patch_addr, info->access_violation_vaddr);
+					Common::VirtualMemory::Mode old_mode {};
+					Common::VirtualMemory::Protect(patch_addr, 32, Common::VirtualMemory::Mode::Write, &old_mode);
+					for (uint32_t i = 0; i < 32; i++) {
+						*reinterpret_cast<uint8_t*>(patch_addr + i) = 0x90;
+					}
+					Common::VirtualMemory::Protect(patch_addr, 32, old_mode);
+					Common::VirtualMemory::FlushInstructionCache(patch_addr, 32);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					if (ctx != nullptr) {
+						// Skip past the bad call/jmp. On x64 a call/jmp is at
+						// most 7 bytes, so +16 is safe.
+						ctx->Rip = fault_ip + 16;
+					}
+#else
+					// Linux-side: hostException.cpp sets the new RIP via
+					// ucontext_t->uc_mcontext.gregs[REG_RIP].
+#endif
+					return true;
+				}
+			}
 		}
 
 		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",

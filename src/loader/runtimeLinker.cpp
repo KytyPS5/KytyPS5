@@ -1024,11 +1024,19 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// offset). The 0x1 in the binary's PLT0 is a different sentinel.
 		// On Windows, exception_record->ExceptionAddress is often 0 for
 		// these faults; use CONTEXT.Rip from native_context instead.
-		if (info->access_violation_type == Common::HostException::AccessViolationType::Execute &&
-		    info->access_violation_vaddr != 0 &&
-		    info->access_violation_vaddr != g_invalid_memory &&
-		    (info->access_violation_vaddr & 0xFFFFFFFFFF000000ULL) == 0 &&
-		    info->access_violation_vaddr < 0x100000ULL) {
+		// M1W2 v1.3: also patch NULL/PLT0 writes. PS5 binaries use a
+		// 0x1/0x0 sentinel for unresolved data imports; once a
+		// previously-blocked call gets stubbed by v1.2, the next
+		// instruction is often a `mov [rax], ...` (or similar) that
+		// tries to write to 0x0 because the unresolved-data
+		// function pointer is in the operand. Treat it the same as
+		// an Execute AV at a low address.
+		const bool is_low_addr = info->access_violation_vaddr != g_invalid_memory &&
+		                         (info->access_violation_vaddr & 0xFFFFFFFFFF000000ULL) == 0 &&
+		                         info->access_violation_vaddr < 0x100000ULL;
+		const bool is_exe_av   = info->access_violation_type == Common::HostException::AccessViolationType::Execute && is_low_addr;
+		const bool is_lo_write = info->access_violation_type == Common::HostException::AccessViolationType::Write && is_low_addr;
+		if (is_exe_av || is_lo_write) {
 			// Determine the actual faulting IP. Prefer CONTEXT.Rip on
 			// Windows (more reliable than ExceptionAddress for these
 			// PS5 binary faults), fall back to info->exception_address.
@@ -1054,7 +1062,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					fault_ip = reinterpret_cast<uint64_t>(stack[0]) - 2;
 				}
 			}
-			LOGF("[M1W2 v1.2] fault_ip=%016" PRIx64 " ctx_rip=%016" PRIx64 " exc_addr=%016" PRIx64 "\n",
+			LOGF("[M1W2 v1.3] av_type=%s fault_ip=%016" PRIx64 " ctx_rip=%016" PRIx64
+			     " exc_addr=%016" PRIx64 "\n",
+			     is_exe_av ? "Execute" : "Write",
 			     fault_ip,
 			     reinterpret_cast<PCONTEXT>(const_cast<void*>(info->native_context)) == nullptr
 			         ? 0ULL
@@ -1069,7 +1079,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				const auto patch_addr = fault_ip & ~0x1F;
 				static std::unordered_set<uint64_t> patched_bases;
 				if (patched_bases.insert(patch_addr).second) {
-					LOGF("[M1W2 v1.2] patching AV site at [%016" PRIx64 "] (av=%016" PRIx64
+					LOGF("[M1W2 v1.3] patching AV site at [%016" PRIx64 "] (av=%016" PRIx64
 					     ") with 32 NOPs\n", patch_addr, info->access_violation_vaddr);
 					Common::VirtualMemory::Mode old_mode {};
 					Common::VirtualMemory::Protect(patch_addr, 32, Common::VirtualMemory::Mode::Write, &old_mode);
@@ -1083,6 +1093,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 						// Skip past the bad call/jmp. On x64 a call/jmp is at
 						// most 7 bytes, so +16 is safe.
 						ctx->Rip = fault_ip + 16;
+						// M1W2 v1.3: define RAX=0 so callers that consumed
+						// the (now-stubbed) function's return value get a
+						// well-defined "not found" instead of stale regs.
+						ctx->Rax = 0;
 					}
 #else
 					// Linux-side: hostException.cpp sets the new RIP via

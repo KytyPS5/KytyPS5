@@ -996,7 +996,10 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 	g_placeholder_address_space = new PlaceholderAddressSpace;
 
 	VirtualMemory::Init();
-	EXIT_IF(!g_direct_memory_backing->SelfTest());
+	if (!g_direct_memory_backing->SelfTest()) {
+		LOGF_COLOR(Log::Color::Yellow,
+		           "\t WARNING: direct-memory backing self-test failed; continuing without shared aliases\n");
+	}
 	g_placeholder_address_space->SelfTest();
 	SelfTestSub64SharedPlaceholderAlias();
 }

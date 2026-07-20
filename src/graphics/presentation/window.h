@@ -25,6 +25,12 @@ PreparedFrame* WindowPrepareBlankFrame(CommandBuffer* buffer, uint32_t width, ui
                                        bool opaque);
 void           WindowPresentFrame(PreparedFrame* frame);
 
+// M1W3: when enabled, the window thread prints a once-per-second
+// FPS summary to stdout. Independent of the in-window title-bar FPS
+// (which is always shown). Useful for headless measurement runs.
+void           SetFpsStdoutEnabled(bool enabled);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_WINDOW_H_ */
+

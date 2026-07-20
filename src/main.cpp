@@ -56,12 +56,12 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
-	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
-	::printf("  --pipeline-dump <true|false>         Enable pipeline dumps.\n");
-	::printf("  --pipeline-dump-folder <path>        Pipeline dump folder.\n");
-	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
-	         "4-vertex path.\n");
-	::printf("  --rd                                 Enable RenderDoc capture.\n");
+		::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
+		::printf("  --pipeline-dump <true|false>         Enable pipeline dumps.\n");
+		::printf("  --pipeline-dump-folder <path>        Pipeline dump folder.\n");
+		::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG 4-vertex path.\n");
+		::printf("  --rd                                 Enable RenderDoc capture.\n");
+		::printf("  --show-fps <true|false>              Print once-per-second FPS summary to stdout.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -216,6 +216,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.pipeline_dump_folder = value;
 		} else if (arg == "--ngg-rectlist-draw") {
 			if (!ParseBool(value, options.config.ngg_rectlist_draw_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--show-fps") {
+			if (!ParseBool(value, options.show_fps)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

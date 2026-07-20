@@ -189,6 +189,10 @@ void Run(const RunOptions& options) {
 		EXIT("ELF is required\n");
 	}
 
+	// M1W3: enable the headless FPS stdout summary if --show-fps was
+	// set. Must happen before WindowRun() spawns the rendering thread.
+	Libs::Graphics::SetFpsStdoutEnabled(options.show_fps);
+
 	Init(options.config);
 
 	ClearDebugTextureFolder();

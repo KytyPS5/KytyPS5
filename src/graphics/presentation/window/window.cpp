@@ -1,5 +1,7 @@
 #include "graphics/presentation/window.h"
 
+#include <atomic>
+
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -63,6 +65,13 @@ namespace Libs::Graphics {
 
 constexpr float FPS_UPDATE_TIME        = 1.0f;
 constexpr int   KEYBOARD_CONTROLLER_ID = -1000;
+
+// M1W3: when set, the window thread also prints a once-per-second FPS
+// summary to stdout. Independent of the in-window title-bar FPS
+// (which is always shown when the window is focused). Useful for
+// headless measurement runs and CI logs.
+static std::atomic<bool> g_print_fps_to_stdout {false};
+void SetFpsStdoutEnabled(bool enabled) { g_print_fps_to_stdout.store(enabled); }
 
 struct EventKeyboard {
 	bool     down;
@@ -1150,6 +1159,27 @@ void WindowUpdateTitle() {
 	                       g_window_ctx->game->m_current_fps);
 
 	SDL_SetWindowTitle(g_window_ctx->window, fps.c_str());
+
+	// M1W3: optional stdout FPS summary for headless measurement runs.
+	// Prints once per FPS_UPDATE_TIME window to avoid log spam.
+	if (g_print_fps_to_stdout.load()) {
+		static double last_print = 0.0;
+		static double t_start   = 0.0;
+		static uint32_t n_frames = 0;
+		const double t_now = g_window_ctx->game->m_current_time_seconds;
+		if (t_start == 0.0) {
+			t_start = t_now;
+		}
+		n_frames++;
+		if (t_now - last_print >= FPS_UPDATE_TIME) {
+			::printf("[FPS] %.2f frames/sec (frame=%u, t=%.2fs)\n",
+			         g_window_ctx->game->m_current_fps,
+			         g_window_ctx->game->m_frame_num,
+			         t_now - t_start);
+			last_print = t_now;
+			n_frames = 0;
+		}
+	}
 }
 
 } // namespace Libs::Graphics

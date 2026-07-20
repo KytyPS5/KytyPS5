@@ -12,6 +12,11 @@ struct RunOptions {
 	Config::ConfigOptions config;
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
+	// M1W3: when true, the rendering thread prints a once-per-second
+	// FPS summary to stdout (e.g. "[FPS] 23.4 frames/sec (t=15.0s)").
+	// Independent of any in-window text overlay; intended for headless
+	// measurement sessions.
+	bool show_fps = false;
 };
 
 void Run(const RunOptions& options);

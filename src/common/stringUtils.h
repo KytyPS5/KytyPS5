@@ -317,8 +317,16 @@ inline std::string SafeCsv(std::string_view text) {
 }
 
 inline std::string Utf16ToUtf8(const char16_t* utf16) {
-	std::u16string                                                    input(utf16);
+	std::u16string input(utf16);
+	// std::wstring_convert / std::codecvt_utf8_utf16 are deprecated in C++17.
+	// kyty's Windows port uses WideCharToMultiByte in the Windows-only paths;
+	// this common/ header stays portable. Suppress MSVC's C4996 at the use site
+	// (defining _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING at the top of
+	// this header doesn't work because the stdlib checks it before our include).
+#pragma warning(push)
+#pragma warning(disable : 4996)
 	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
+#pragma warning(pop)
 	return convert.to_bytes(input);
 }
 

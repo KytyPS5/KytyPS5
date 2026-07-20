@@ -1165,19 +1165,16 @@ void WindowUpdateTitle() {
 	if (g_print_fps_to_stdout.load()) {
 		static double last_print = 0.0;
 		static double t_start   = 0.0;
-		static uint32_t n_frames = 0;
 		const double t_now = g_window_ctx->game->m_current_time_seconds;
 		if (t_start == 0.0) {
 			t_start = t_now;
 		}
-		n_frames++;
 		if (t_now - last_print >= FPS_UPDATE_TIME) {
 			::printf("[FPS] %.2f frames/sec (frame=%u, t=%.2fs)\n",
 			         g_window_ctx->game->m_current_fps,
 			         g_window_ctx->game->m_frame_num,
 			         t_now - t_start);
 			last_print = t_now;
-			n_frames = 0;
 		}
 	}
 }

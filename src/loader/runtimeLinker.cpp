@@ -157,6 +157,112 @@ static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 
+// =============================================================================
+//  M1W2: NID stub function.
+//
+//  When the runtime linker can't resolve a Sony PS5 SDK NID (e.g. scePadInit)
+//  through any loaded program's export table, it falls through to the
+//  "NULL stub" code path -- the GOT is patched with 0x1 and the guest
+//  jmps there, triggering an Execute AV. To break this gate WITHOUT
+//  having a fully-decrypted libkernel.elf/libc.elf, we seed the global
+//  SymbolDatabase with the top-30 unresolved NIDs from the V5 cross-ELF
+//  sweep, each pointing to a tiny return-0 stub. The guest then runs
+//  the stub (which returns 0 for any unknown NID), the next call site
+//  in the guest code moves on, and the emulator accumulates evidence
+//  about WHICH NIDs matter most for next-stage NID-DB curation.
+//
+//  Real PS5 SDK addresses would replace these stubs. The 5 most-frequent
+//  Sony NIDs from the V5 sweep:
+//    scePadInit, sceHttpInit, sceHttpCreateTemplate,
+//    sceNetPoolCreate, sceUserServiceInitialize
+//  are real Sony libkernel.elf/libSceUserService.elf entry points.
+// =============================================================================
+static KYTY_SYSV_ABI uint64_t KytyStubReturn0(void) {
+	// SysV-ABI caller expects return value in RAX; PS5 also uses RAX.
+	// xor eax, eax   (31 c0)
+	// ret            (c3)
+	static const uint8_t code[] = { 0x31, 0xc0, 0xc3 };
+	// Self-modifying: copy to a permanent RX page on first call.
+	static uint64_t vaddr = 0;
+	if (vaddr == 0) {
+		auto page = Common::VirtualMemory::Alloc(0, sizeof(code),
+		                                         Common::VirtualMemory::Mode::ExecuteReadWrite);
+		EXIT_NOT_IMPLEMENTED(page == 0);
+		std::memcpy(reinterpret_cast<void*>(page), code, sizeof(code));
+		Common::VirtualMemory::Protect(page, sizeof(code),
+		                                Common::VirtualMemory::Mode::ExecuteRead);
+		vaddr = page;
+	}
+	return vaddr;
+}
+
+static void SeedKernelNidTable(SymbolDatabase* db) {
+	EXIT_NOT_IMPLEMENTED(db == nullptr);
+
+	// Real PS5 libkernel/libSceUserService export names, mapped to the
+	// return-0 stub. The full NID is name[lib_v0][mod_v0.0][Func] -- the
+	// library/module/version fields are mostly cosmetic for NID lookup.
+	static const char* const nids[] = {
+		// Sony SDK user-service / system-service
+		"sceUserServiceInitialize",
+		"sceUserServiceTerminate",
+		"sceUserServiceGetLoginUserIdList",
+		"scePadInit",
+		"scePadOpen",
+		"scePadRead",
+		"scePadClose",
+		"scePadEnd",
+		"sceHttpInit",
+		"sceHttpTerminate",
+		"sceHttpCreateTemplate",
+		"sceHttpCreateConnection",
+		"sceHttpCreateRequest",
+		"sceHttpSendRequest",
+		"sceHttpAbortRequest",
+		"sceHttpDestroyRequest",
+		"sceHttpDestroyConnection",
+		"sceHttpDestroyTemplate",
+		"sceNetInit",
+		"sceNetTerminate",
+		"sceNetPoolCreate",
+		"sceNetPoolDestroy",
+		"sceNetSocket",
+		"sceNetConnect",
+		"sceNetBind",
+		"sceNetListen",
+		"sceNetAccept",
+		"sceNetSend",
+		"sceNetRecv",
+		"sceNetClose",
+		"sceKernelAllocateDirectMemory",
+		"sceKernelReleaseDirectMemory",
+		"sceKernelMapDirectMemory",
+		"sceKernelUnmapDirectMemory",
+		"sceKernelLoadModule",
+		"sceKernelStartModule",
+		"sceKernelStopModule",
+		"sceKernelUnloadModule",
+		"sceKernelGetModuleInfo",
+		"sceKernelDlsym",
+		"sceFiosFHOpen",
+		"sceFiosFHRead",
+		"sceFiosFHClose",
+	};
+
+	const uint64_t stub = KytyStubReturn0();
+	for (const char* nid : nids) {
+		SymbolResolve sr {};
+		sr.name                 = nid;
+		sr.library              = "libSceKernel";
+		sr.library_version      = 0;
+		sr.module               = "libSceKernel";
+		sr.module_version_major = 0;
+		sr.module_version_minor = 0;
+		sr.type                 = SymbolType::Func;
+		db->Add(sr, stub, std::string("stub0:") + nid);
+	}
+}
+
 static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
@@ -1281,6 +1387,7 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	SeedKernelNidTable(m_symbols.get());
 }
 
 RuntimeLinker::~RuntimeLinker() {
@@ -2250,7 +2357,14 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_entry_size != sizeof(Elf64_Rela));
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table == nullptr);
-	EXIT_NOT_IMPLEMENTED(program->dynamic_info->pltgot_vaddr == 0);
+	// jmprela_table is null for ELFs with no .plt (e.g. PS5 SDK elfldr);
+	// those don't have a PLT GOT either, so the pltgot_vaddr must be
+	// allowed to be 0. (Surfaced 2026-07-20 by running devilutionx.elf
+	// after the M1W2 NID-resolver seed; the old gate rejected the ELF
+	// even though no PLT relocations needed a GOT.)
+	if (program->dynamic_info->jmprela_table != nullptr) {
+		EXIT_NOT_IMPLEMENTED(program->dynamic_info->pltgot_vaddr == 0);
+	}
 
 	InstallRelocateHandler(program);
 

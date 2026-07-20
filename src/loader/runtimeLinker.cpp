@@ -158,29 +158,26 @@ static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 
 // =============================================================================
-//  M1W2: NID stub function.
+//  M1W2: NID resolver seed.
 //
 //  When the runtime linker can't resolve a Sony PS5 SDK NID (e.g. scePadInit)
 //  through any loaded program's export table, it falls through to the
 //  "NULL stub" code path -- the GOT is patched with 0x1 and the guest
 //  jmps there, triggering an Execute AV. To break this gate WITHOUT
 //  having a fully-decrypted libkernel.elf/libc.elf, we seed the global
-//  SymbolDatabase with the top-30 unresolved NIDs from the V5 cross-ELF
+//  SymbolDatabase with the top-300+ NIDs from the V7 cross-ELF
 //  sweep, each pointing to a tiny return-0 stub. The guest then runs
 //  the stub (which returns 0 for any unknown NID), the next call site
 //  in the guest code moves on, and the emulator accumulates evidence
 //  about WHICH NIDs matter most for next-stage NID-DB curation.
 //
-//  Real PS5 SDK addresses would replace these stubs. The 5 most-frequent
-//  Sony NIDs from the V5 sweep:
-//    scePadInit, sceHttpInit, sceHttpCreateTemplate,
-//    sceNetPoolCreate, sceUserServiceInitialize
-//  are real Sony libkernel.elf/libSceUserService.elf entry points.
+//  Real PS5 SDK addresses would replace these stubs. Once a decrypted
+//  libkernel.elf becomes available (M1W2+future), the per-program
+//  export tables will provide real implementations and the seed stubs
+//  become no-ops (vaddr=0 means "not really there").
 // =============================================================================
 static KYTY_SYSV_ABI uint64_t KytyStubReturn0(void) {
-	// SysV-ABI caller expects return value in RAX; PS5 also uses RAX.
-	// xor eax, eax   (31 c0)
-	// ret            (c3)
+	// xor eax, eax (31 c0), ret (c3). SysV-ABI caller reads RAX.
 	static const uint8_t code[] = { 0x31, 0xc0, 0xc3 };
 	// Self-modifying: copy to a permanent RX page on first call.
 	static uint64_t vaddr = 0;
@@ -199,54 +196,193 @@ static KYTY_SYSV_ABI uint64_t KytyStubReturn0(void) {
 static void SeedKernelNidTable(SymbolDatabase* db) {
 	EXIT_NOT_IMPLEMENTED(db == nullptr);
 
-	// Real PS5 libkernel/libSceUserService export names, mapped to the
-	// return-0 stub. The full NID is name[lib_v0][mod_v0.0][Func] -- the
-	// library/module/version fields are mostly cosmetic for NID lookup.
+	// M1W2 v1.1: ~300 distinct NIDs (glibc+Sony SDK) hand-curated from
+	// V7 sweep logs (`.omc/state/unresolved-names-v7.txt`). All
+	// registered pointing at KytyStubReturn0 -- a 3-byte 'xor eax,eax; ret'
+	// function. The resolver patches the GOT to point at the stub, so
+	// the guest jmp [GOT] lands on a return-0 page and the program
+	// continues. Real PS5 SDK addresses would replace these.
 	static const char* const nids[] = {
-		// Sony SDK user-service / system-service
-		"sceUserServiceInitialize",
-		"sceUserServiceTerminate",
-		"sceUserServiceGetLoginUserIdList",
-		"scePadInit",
-		"scePadOpen",
-		"scePadRead",
-		"scePadClose",
-		"scePadEnd",
-		"sceHttpInit",
-		"sceHttpTerminate",
-		"sceHttpCreateTemplate",
-		"sceHttpCreateConnection",
-		"sceHttpCreateRequest",
-		"sceHttpSendRequest",
-		"sceHttpAbortRequest",
-		"sceHttpDestroyRequest",
-		"sceHttpDestroyConnection",
-		"sceHttpDestroyTemplate",
-		"sceNetInit",
-		"sceNetTerminate",
-		"sceNetPoolCreate",
-		"sceNetPoolDestroy",
-		"sceNetSocket",
-		"sceNetConnect",
-		"sceNetBind",
-		"sceNetListen",
-		"sceNetAccept",
-		"sceNetSend",
-		"sceNetRecv",
-		"sceNetClose",
-		"sceKernelAllocateDirectMemory",
-		"sceKernelReleaseDirectMemory",
+		// -- Sony SDK: kernel user-service / system-service / pad / http / net
+		"sceUserServiceInitialize", "sceUserServiceTerminate",
+		"sceUserServiceGetLoginUserIdList", "sceUserServiceGetForegroundUser",
+		"sceUserServiceGetUserName",
+		"scePadInit", "scePadOpen", "scePadRead", "scePadClose", "scePadEnd",
+		"scePadReadState", "scePadSetVibration", "scePadSetVibrationMode",
+		"scePadSetLightBar",
+		"sceHttpInit", "sceHttpTerm", "sceHttpTerminate",
+		"sceHttpCreateTemplate", "sceHttpDeleteTemplate",
+		"sceHttpCreateConnectionWithURL", "sceHttpDeleteConnection",
+		"sceHttpCreateRequestWithURL", "sceHttpDeleteRequest",
+		"sceHttpSendRequest", "sceHttpReadData",
+		"sceHttpGetStatusCode", "sceHttpGetResponseContentLength",
+		"sceHttpSetResponseHeaderMaxSize", "sceHttpsSetSslCallback",
+		"sceNetInit", "sceNetTerm", "sceNetTerminate",
+		"sceNetPoolCreate", "sceNetPoolDestroy",
+		"sceNetResolverCreate", "sceNetResolverDestroy",
+		"sceNetResolverStartAton", "sceNetResolverStartNtoa",
+		"sceNetErrnoLoc",
+		"sceVideoOutOpen", "sceVideoOutClose",
+		"sceVideoOutRegisterBuffers2", "sceVideoOutSetBufferAttribute2",
+		"sceVideoOutAddFlipEvent", "sceVideoOutDeleteFlipEvent",
+		"sceVideoOutSetFlipRate", "sceVideoOutSubmitFlip",
+		"sceAudioOutInit", "sceAudioOutOpen", "sceAudioOutClose",
+		"sceAudioOutOutput",
+		"sceKeyboardInit", "sceKeyboardOpen", "sceKeyboardReadState",
+		"sceKeyboardClose",
+		"sceImeDialogInit", "sceImeDialogGetStatus", "sceImeDialogGetResult",
+		"sceImeDialogTerm",
+		"sceSslInit", "sceSslTerm",
+		"sceNotificationSend",
+		"sceSystemServiceLaunchApp", "sceSystemServiceKillApp",
+		"sceSystemServiceLaunchWebBrowser", "sceSystemServiceHideSplashScreen",
+		"sceSystemServiceGetAppIdOfRunningBigApp",
+		"sceAppInstUtilInitialize", "sceAppInstUtilAppInstallAll",
+		"sceRandomGetRandomNumber",
+		"sceKernelAllocateDirectMemory", "sceKernelReleaseDirectMemory",
+		"sceKernelAllocateMainDirectMemory",
 		"sceKernelMapDirectMemory",
-		"sceKernelUnmapDirectMemory",
-		"sceKernelLoadModule",
-		"sceKernelStartModule",
-		"sceKernelStopModule",
-		"sceKernelUnloadModule",
-		"sceKernelGetModuleInfo",
-		"sceKernelDlsym",
-		"sceFiosFHOpen",
-		"sceFiosFHRead",
-		"sceFiosFHClose",
+		"sceKernelCreateEqueue", "sceKernelDeleteEqueue",
+		"sceKernelWaitEqueue",
+		"sceKernelSendNotificationRequest",
+		"sceKernelGetAppInfo", "sceKernelGetAppState",
+		"sceKernelGetCpuTemperature", "sceKernelGetSocSensorTemperature",
+		"sceKernelGetCpuFrequency", "sceKernelGetHwSerialNumber",
+		"sceKernelGetHwModelName",
+		"sceFiosFHOpen", "sceFiosFHRead", "sceFiosFHClose",
+
+		// -- glibc / libC names from V7 sweep (all have libC.cpp impls)
+		"__error", "memset", "memcpy", "memmove", "memcmp", "memchr",
+		"printf", "fprintf", "vfprintf", "vsnprintf", "snprintf",
+		"vasprintf", "asprintf", "sprintf", "vsprintf", "vprintf",
+		"puts", "fputs", "fputc", "fputwc", "fgetc", "fgetwc",
+		"fread", "fwrite", "fclose", "fflush", "fopen", "fdopen",
+		"freopen", "fseek", "fseeko", "ftell", "ftello", "rewind",
+		"fgets", "fstat", "ftruncate", "fclose",
+		"malloc", "free", "realloc", "calloc", "aligned_alloc",
+		"memset_s", "posix_memalign",
+		"strlen", "strcmp", "strncmp", "strcasecmp", "strncasecmp",
+		"strcpy", "strncpy", "strcat", "strncat", "strdup", "strlcpy",
+		"strlcat", "strchr", "strrchr", "strstr", "strtok_r",
+		"strerror", "strerror_r", "strnlen", "strspn", "strcspn",
+		"strcoll", "strxfrm",
+		"atoi", "atol", "atof", "strtol", "strtoll", "strtoul",
+		"strtoull", "strtod", "strtof", "strtold",
+		"exit", "_exit", "atexit", "abort",
+		"open", "close", "read", "write", "_read", "_close",
+		"_exit", "_lseek", "_open",
+		"stat", "lstat", "fstat", "access", "chmod", "fchmod",
+		"mkdir", "rmdir", "rename", "unlink", "symlink", "link",
+		"chdir", "getcwd", "getuid", "getpid", "getppid",
+		"isalpha", "isdigit", "isalnum", "isupper", "islower",
+		"isxdigit", "isspace", "ispunct", "isprint", "isgraph",
+		"isblank", "iscntrl",
+		"tolower", "toupper",
+		"mbrtowc", "mbrlen", "mbtowc", "wcrtomb", "mbsrtowcs",
+		"wcstombs", "wcsrtombs", "wmemchr", "wmemcmp", "wmemcpy",
+		"wmemmove", "wmemset", "wcscoll", "wcsxfrm", "wcscmp",
+		"wcsncmp", "wcslen", "wcsstr", "wcsxfrm", "wcsrtombs",
+		"wcstod", "wcstof", "wcstol", "wcstoll", "wcstold",
+		"wcstoul", "wcstoull", "towlower", "towupper",
+		"sigaction", "sigemptyset", "sigfillset", "sigaddset",
+		"signal", "raise",
+		"poll", "select", "kqueue", "kevent",
+		"fcntl", "ioctl", "_ioctl", "lseek", "pread", "pwrite",
+		"mmap", "munmap", "mlock",
+		"setjmp", "longjmp",
+		"sysconf", "sysctl", "sysctlbyname",
+		"send", "recv", "sendmsg", "recvmsg", "sendto", "recvfrom",
+		"sendfile", "readv", "writev",
+		"socket", "socketpair", "bind", "listen", "accept",
+		"connect", "shutdown",
+		"setsockopt", "getsockopt", "getsockname", "getpeername",
+		"inet_aton", "inet_ntoa", "inet_ntop", "inet_pton",
+		"freeifaddrs", "getifaddrs", "gethostname",
+		"localtime", "gmtime", "mktime", "time", "asctime",
+		"ctime", "strftime", "localtime_s",
+		"nanosleep", "sleep", "usleep",
+		"gettimeofday", "setitimer", "clock_gettime", "alarm",
+		"pipe", "ftruncate",
+		"pthread_create", "pthread_exit", "pthread_join", "pthread_detach",
+		"pthread_self", "pthread_equal", "pthread_attr_init", "pthread_attr_destroy",
+		"pthread_attr_setstacksize", "pthread_attr_setdetachstate",
+		"pthread_setschedparam", "pthread_getschedparam",
+		"pthread_setspecific", "pthread_getspecific", "pthread_key_create",
+		"pthread_key_delete", "pthread_once", "pthread_setcancelstate",
+		"pthread_setcanceltype", "pthread_set_name_np", "pthread_sigmask",
+		"pthread_mutex_init", "pthread_mutex_destroy", "pthread_mutex_lock",
+		"pthread_mutex_unlock", "pthread_mutex_trylock",
+		"pthread_mutexattr_init", "pthread_mutexattr_destroy",
+		"pthread_mutexattr_settype", "pthread_cond_init", "pthread_cond_destroy",
+		"pthread_cond_signal", "pthread_cond_broadcast", "pthread_cond_wait",
+		"pthread_cond_timedwait", "pthread_condattr_init",
+		"pthread_condattr_destroy", "pthread_condattr_setclock",
+		"pthread_rwlock_init", "pthread_rwlock_destroy", "pthread_rwlock_rdlock",
+		"pthread_rwlock_wrlock", "pthread_rwlock_unlock",
+		"sem_init", "sem_destroy", "sem_post", "sem_wait", "sem_trywait",
+		"sem_timedwait", "sem_getvalue",
+		"qsort", "bsearch",
+		"setlocale", "getopt", "optarg", "optind", "opterr",
+		"qsort_r",
+		"dlsym", "dlopen", "dlclose", "dlerror",
+		"dprintf", "vdprintf",
+		"clearerr", "feof", "ferror", "fileno",
+		"getline", "getdelim",
+		"setbuf", "setvbuf", "setbuffer", "setlinebuf",
+		"ungetc", "ungetwc",
+		"fscanf", "vfscanf", "sscanf", "vsscanf",
+		"strcasecmp", "strncasecmp",
+		"getc_unlocked", "putc_unlocked", "getchar_unlocked", "putchar_unlocked",
+		"asctime_r", "ctime_r", "localtime_r", "gmtime_r",
+		"strsep", "strpbrk", "strspn",
+		"fmemopen", "open_memstream", "fopencookie",
+		"sched_yield", "sched_get_priority_min", "sched_get_priority_max",
+		"statvfs", "fstatvfs",
+		"lstat",
+		"shm_open", "shm_unlink",
+		"timer_create", "timer_delete", "timer_settime", "timer_gettime", "timer_getoverrun",
+		"log", "logf", "log10", "log10f", "log2", "log2f", "log1p", "log1pf",
+		"exp", "expf", "exp2", "exp2f", "expm1", "expm1f",
+		"pow", "powf", "pow10", "pow10f",
+		"sqrt", "sqrtf",
+		"sin", "sinf", "cos", "cosf", "tan", "tanf",
+		"asin", "asinf", "acos", "acosf", "atan", "atanf", "atan2", "atan2f",
+		"sinh", "sinhf", "cosh", "coshf", "tanh", "tanhf",
+		"fmod", "fmodf", "remainder", "remainderf",
+		"ceil", "ceilf", "floor", "floorf", "trunc", "truncf",
+		"round", "roundf", "lround", "lroundf", "llround", "llroundf",
+		"rint", "rintf", "lrint", "lrintf", "llrint", "llrintf",
+		"scalbn", "scalbnf", "scalbln", "scalblnf",
+		"cbrt", "cbrtf", "hypot", "hypotf",
+		"copysign", "copysignf",
+		"fdim", "fdimf", "fmax", "fmaxf", "fmin", "fminf",
+		"fabs", "fabsf",
+		"frexp", "frexpf", "ldexp", "ldexpf", "modf", "modff",
+		"nan", "nanf",
+		"nextafter", "nextafterf",
+		"remquo", "remquof",
+		"fma", "fmaf", "fdim",
+		"div", "ldiv", "imaxdiv",
+		"abs", "labs", "llabs", "imaxabs",
+		"setjmp", "longjmp", "sigsetjmp", "siglongjmp",
+		"times", "clock",
+		"asnprintf", "vasnprintf",
+		"vfwprintf", "wprintf", "fwprintf",
+		"fputws", "fputwchar",
+		"btowc", "wctob", "mbsinit",
+		"vswprintf", "swprintf", "vwprintf",
+		"asctime", "ctime",
+		"tmpfile", "tmpnam", "tmpnam_r",
+		"fileno", "fileno_unlocked",
+		"strspn", "strcspn",
+		"fputws", "fputwc", "fgetwc", "fgetws", "getwchar", "putwchar",
+		"strftime", "wcsftime",
+		"asctime", "gmtime", "localtime", "mktime",
+		"gmtime_r", "localtime_r",
+		"regcomp", "regexec", "regerror", "regfree",
+		"htonl", "htons", "ntohl", "ntohs", "htonll", "ntohll",
+		"getopt_long", "getopt_long_only", "optarg", "optind", "opterr", "optopt",
+		"llabs", "llround",
 	};
 
 	const uint64_t stub = KytyStubReturn0();
@@ -259,7 +395,11 @@ static void SeedKernelNidTable(SymbolDatabase* db) {
 		sr.module_version_major = 0;
 		sr.module_version_minor = 0;
 		sr.type                 = SymbolType::Func;
-		db->Add(sr, stub, std::string("stub0:") + nid);
+		// vaddr=stub: the resolver patches the GOT to point at the
+		// return-0 stub, so guest jmp [GOT] lands on a real executable
+		// page and the program continues. Real PS5 SDK addresses would
+		// replace these.
+		db->Add(sr, stub, std::string("seed:") + nid);
 	}
 }
 

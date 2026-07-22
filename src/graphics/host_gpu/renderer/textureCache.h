@@ -30,6 +30,7 @@ class BufferCache;
 class CommandBuffer;
 class DummyTextureCache;
 class GpuResourceManager;
+class ImageAliasPlan;
 class ResourceMutex;
 
 [[nodiscard]] bool IsExactRenderTargetMipStorage(const ImageInfo& sampled, const ImageInfo& storage,
@@ -120,7 +121,7 @@ public:
 private:
 	friend class GpuResourceManager;
 	using CachedImage = CachedImageRecord;
-	struct AliasRetirementPlan;
+	using AliasRetirementPlan = ImageAliasPlan;
 	struct UnmapPlan;
 	struct ReadbackWorker;
 	struct MetaDataInfo {

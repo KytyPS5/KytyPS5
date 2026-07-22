@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/cachedImageRecord.h"
 #include "graphics/host_gpu/renderer/dummyTextureCache.h"
 #include "graphics/host_gpu/renderer/image.h"
+#include "graphics/host_gpu/renderer/imageAliasPlan.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -190,73 +191,6 @@ bool IsExactRenderTargetMipStorage(const ImageInfo& sampled, const ImageInfo& st
 	}
 	return false;
 }
-
-struct TextureCache::AliasRetirementPlan {
-	enum class Action : uint8_t {
-		RetireGuestCurrent,
-		MaterializeGuest,
-		PreserveNative,
-		ReleaseGpuOwnership
-	};
-	enum class PageIsolation : uint8_t { Required, SharedPagesAllowed };
-	struct Entry {
-		std::shared_ptr<CachedImage> image;
-		Action                       action;
-	};
-
-	AliasRetirementPlan(const char* operation, GuestRange request, PageIsolation isolation)
-	    : operation(operation), request(request), isolation(isolation) {}
-
-	void Add(const std::shared_ptr<CachedImage>& image, Action action) {
-		if (image == nullptr) {
-			EXIT("TextureCache: alias plan has an empty image owner\n");
-		}
-		if (std::any_of(entries.begin(), entries.end(), [&](const auto& entry) {
-			    return entry.image.get() == image.get();
-		    })) {
-			EXIT("TextureCache: alias plan contains a duplicate retirement\n");
-		}
-		if (action == Action::PreserveNative && NativeSource() != nullptr) {
-			EXIT("TextureCache: alias plan contains multiple native sources\n");
-		}
-		entries.push_back({image, action});
-	}
-
-	void PreserveMetadata(uint64_t address) {
-		if (address != 0 && preserve_metadata_address != 0 &&
-		    preserve_metadata_address != address) {
-			EXIT("TextureCache: alias plan preserves multiple metadata allocations\n");
-		}
-		preserve_metadata_address = address;
-	}
-
-	[[nodiscard]] bool Empty() const { return entries.empty(); }
-	[[nodiscard]] size_t RetirementCount() const { return entries.size(); }
-	[[nodiscard]] bool Contains(const CachedImage& image) const {
-		return std::any_of(entries.begin(), entries.end(),
-		                   [&](const auto& entry) { return entry.image.get() == &image; });
-	}
-	[[nodiscard]] bool HasAction(Action action) const {
-		return std::any_of(entries.begin(), entries.end(),
-		                   [action](const auto& entry) { return entry.action == action; });
-	}
-	[[nodiscard]] std::shared_ptr<CachedImage> NativeOwner() const {
-		const auto entry = std::find_if(entries.begin(), entries.end(), [](const auto& item) {
-			return item.action == Action::PreserveNative;
-		});
-		return entry != entries.end() ? entry->image : nullptr;
-	}
-	[[nodiscard]] CachedImage* NativeSource() const { return NativeOwner().get(); }
-	[[nodiscard]] const std::vector<Entry>& Entries() const { return entries; }
-
-private:
-	friend class TextureCache;
-	const char* const        operation;
-	const GuestRange         request;
-	const PageIsolation isolation;
-	uint64_t                 preserve_metadata_address = 0;
-	std::vector<Entry>       entries;
-};
 
 void TextureCache::RemoveImageLocked(CachedImage& image, bool release_tracking) {
 	auto removal = m_image_registry.Remove(image);
@@ -1092,16 +1026,18 @@ void TextureCache::MaterializeImagesToGuestLocked(
 }
 
 void TextureCache::ExecuteAliasRetirementLocked(const AliasRetirementPlan& plan) {
-	if (plan.operation == nullptr || !plan.request.IsValid() ||
-	    (plan.isolation != AliasRetirementPlan::PageIsolation::Required &&
-	     plan.isolation != AliasRetirementPlan::PageIsolation::SharedPagesAllowed)) {
+	const auto request   = plan.Request();
+	const auto isolation = plan.Isolation();
+	if (plan.Operation() == nullptr || !request.IsValid() ||
+	    (isolation != AliasRetirementPlan::PageIsolation::Required &&
+	     isolation != AliasRetirementPlan::PageIsolation::SharedPagesAllowed)) {
 		EXIT("TextureCache: invalid alias retirement plan\n");
 	}
 	std::vector<CachedImage*>                 retirements;
 	std::vector<std::shared_ptr<CachedImage>> materializations;
 	std::vector<std::shared_ptr<CachedImage>> discarded_owners;
-	retirements.reserve(plan.entries.size());
-	for (const auto& entry: plan.entries) {
+	retirements.reserve(plan.RetirementCount());
+	for (const auto& entry: plan.Entries()) {
 		if (entry.image == nullptr || !entry.image->registered ||
 		    FindImageOwnerLocked(*entry.image).get() != entry.image.get()) {
 			EXIT("TextureCache: alias plan references an unregistered image\n");
@@ -1170,9 +1106,8 @@ void TextureCache::ExecuteAliasRetirementLocked(const AliasRetirementPlan& plan)
 	if (plan.Empty()) {
 		return;
 	}
-	if (plan.isolation == AliasRetirementPlan::PageIsolation::Required) {
-		RequireRetirementIsolation(retirements, plan.operation, plan.request.address,
-		                           plan.request.size);
+	if (isolation == AliasRetirementPlan::PageIsolation::Required) {
+		RequireRetirementIsolation(retirements, plan.Operation(), request.address, request.size);
 	}
 	MaterializeImagesToGuestLocked(materializations);
 	for (const auto& image: discarded_owners) {
@@ -1184,7 +1119,7 @@ void TextureCache::ExecuteAliasRetirementLocked(const AliasRetirementPlan& plan)
 		}
 		image->gpu_modified = false;
 	}
-	RetireDepthMetadataLocked(retirements, plan.preserve_metadata_address);
+	RetireDepthMetadataLocked(retirements, plan.PreservedMetadataAddress());
 	RetireImages(retirements, plan.NativeSource());
 }
 

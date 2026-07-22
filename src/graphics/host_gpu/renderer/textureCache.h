@@ -21,7 +21,6 @@ namespace Libs::Graphics {
 
 struct DepthStencilVulkanImage;
 struct GpuTextureVulkanImage;
-struct GraphicContext;
 struct ImageViewInfo;
 struct RenderTextureVulkanImage;
 struct StorageTextureVulkanImage;
@@ -29,6 +28,7 @@ struct VideoOutVulkanImage;
 struct VulkanImage;
 struct VulkanMemory;
 class BufferCache;
+class CachedImageRecord;
 class CommandBuffer;
 class DummyTextureCache;
 class GpuResourceManager;
@@ -56,8 +56,7 @@ public:
 		bool     full             = false;
 	};
 
-	TextureCache(GraphicContext& graphics, PageManager& page_manager, BufferCache& buffer_cache,
-	             ResourceMutex& resource_mutex);
+	TextureCache(PageManager& page_manager, BufferCache& buffer_cache, ResourceMutex& resource_mutex);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
@@ -122,7 +121,7 @@ public:
 
 private:
 	friend class GpuResourceManager;
-	struct CachedImage;
+	using CachedImage = CachedImageRecord;
 	struct AliasRetirementPlan;
 	struct UnmapPlan;
 	using ImageOwnerIndex = MultiRangePageOwnerIndex<CachedImage*>;
@@ -169,7 +168,6 @@ private:
 	void                    ValidateUnmapMemory(uint64_t vaddr, uint64_t size);
 	void                    CommitUnmapMemory(uint64_t vaddr, uint64_t size);
 
-	GraphicContext&                                             m_graphics;
 	std::unique_ptr<DummyTextureCache>                          m_dummy_textures;
 	TrackingSpinLock                                            m_lock;
 	std::mutex                                                  m_fault_mutex;

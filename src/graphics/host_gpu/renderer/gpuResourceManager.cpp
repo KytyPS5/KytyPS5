@@ -13,7 +13,7 @@ namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics)
     : m_page_manager(FaultThunk, this), m_buffer_cache(graphics, m_page_manager, m_resource_mutex),
-      m_texture_cache(graphics, m_page_manager, m_buffer_cache, m_resource_mutex) {
+      m_texture_cache(m_page_manager, m_buffer_cache, m_resource_mutex) {
 	m_buffer_cache.SetTextureCache(m_texture_cache);
 }
 

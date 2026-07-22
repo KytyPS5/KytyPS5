@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/cachedImageRecord.h"
 #include "graphics/host_gpu/renderer/dummyTextureCache.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
@@ -188,164 +189,6 @@ bool IsExactRenderTargetMipStorage(const ImageInfo& sampled, const ImageInfo& st
 	}
 	return false;
 }
-
-struct TextureCache::CachedImage {
-	enum class Kind {
-		Texture,
-		StorageTexture,
-		RenderTarget,
-		DepthTarget,
-		VideoOut
-	};
-
-	CachedImage(GraphicContext& graphics, Kind kind, const ImageInfo& info)
-	    : kind(kind), descriptor(MakeImage(info)), graphics(graphics) {
-		if (kind != Kind::Texture && kind != Kind::StorageTexture) {
-			EXIT("TextureCache: image descriptor has incompatible kind %u\n",
-			     static_cast<uint32_t>(kind));
-		}
-	}
-	CachedImage(GraphicContext& graphics, const RenderTargetInfo& info)
-	    : kind(Kind::RenderTarget), descriptor(info), graphics(graphics) {}
-	CachedImage(GraphicContext& graphics, const DepthTargetInfo& info)
-	    : kind(Kind::DepthTarget), descriptor(info), graphics(graphics) {}
-	CachedImage(GraphicContext& graphics, const VideoOutInfo& info)
-	    : kind(Kind::VideoOut), descriptor(info), graphics(graphics) {}
-
-	[[nodiscard]] Image& ImageDesc() { return std::get<Image>(descriptor); }
-	[[nodiscard]] const Image& ImageDesc() const { return std::get<Image>(descriptor); }
-	[[nodiscard]] RenderTargetInfo& RenderTargetDesc() {
-		return std::get<RenderTargetInfo>(descriptor);
-	}
-	[[nodiscard]] const RenderTargetInfo& RenderTargetDesc() const {
-		return std::get<RenderTargetInfo>(descriptor);
-	}
-	[[nodiscard]] DepthTargetInfo& DepthTargetDesc() {
-		return std::get<DepthTargetInfo>(descriptor);
-	}
-	[[nodiscard]] const DepthTargetInfo& DepthTargetDesc() const {
-		return std::get<DepthTargetInfo>(descriptor);
-	}
-	[[nodiscard]] VideoOutInfo& VideoOutDesc() { return std::get<VideoOutInfo>(descriptor); }
-	[[nodiscard]] const VideoOutInfo& VideoOutDesc() const {
-		return std::get<VideoOutInfo>(descriptor);
-	}
-
-	const Kind kind;
-
-private:
-	std::variant<Image, RenderTargetInfo, DepthTargetInfo, VideoOutInfo> descriptor;
-
-public:
-	GraphicContext&                                                     graphics;
-	VulkanImage*     image               = nullptr;
-	bool             gpu_modified        = false;
-	bool             buffer_modified     = false;
-	bool             stencil_initialized = false;
-	bool             registered          = false;
-
-	~CachedImage() {
-		if (image == nullptr || registered || !DescriptorMatchesKind()) {
-			EXIT("TextureCache: cached image destroyed with invalid resources, image=%p "
-			     "kind=%u registered=%d\n",
-			     static_cast<const void*>(image), static_cast<uint32_t>(kind), registered);
-		}
-		ImageOps::Destroy(*image);
-		image = nullptr;
-	}
-
-	[[nodiscard]] uint32_t RangeCount() const {
-		return kind == Kind::DepthTarget && DepthTargetDesc().stencil_address != 0 ? 2u : 1u;
-	}
-	[[nodiscard]] BufferImageBinding BufferBinding() const {
-		switch (kind) {
-			case Kind::Texture: return BufferImageBinding::Texture;
-			case Kind::RenderTarget: return BufferImageBinding::RenderTarget;
-			case Kind::VideoOut: return BufferImageBinding::VideoOut;
-			case Kind::StorageTexture: return BufferImageBinding::StorageTexture;
-			case Kind::DepthTarget: return BufferImageBinding::DepthTarget;
-		}
-		return BufferImageBinding::Unsupported;
-	}
-	[[nodiscard]] uint64_t Address(uint32_t index = 0) const {
-		if (index >= RangeCount()) {
-			EXIT("TextureCache: image address range index out of bounds, index=%u count=%u\n",
-			     index, RangeCount());
-		}
-		if (index == 1) {
-			return DepthTargetDesc().stencil_address;
-		}
-		switch (kind) {
-			case Kind::Texture:
-			case Kind::StorageTexture: return ImageDesc().address;
-			case Kind::RenderTarget: return RenderTargetDesc().address;
-			case Kind::DepthTarget: return DepthTargetDesc().address;
-			case Kind::VideoOut: return VideoOutDesc().address;
-		}
-		EXIT("TextureCache: unsupported cached image kind %u for address\n",
-		     static_cast<uint32_t>(kind));
-	}
-	[[nodiscard]] uint64_t Size(uint32_t index = 0) const {
-		if (index >= RangeCount()) {
-			EXIT("TextureCache: image size range index out of bounds, index=%u count=%u\n", index,
-			     RangeCount());
-		}
-		if (index == 1) {
-			return DepthTargetDesc().stencil_size;
-		}
-		switch (kind) {
-			case Kind::Texture:
-			case Kind::StorageTexture: return ImageDesc().size;
-			case Kind::RenderTarget: return RenderTargetDesc().size;
-			case Kind::DepthTarget: return DepthTargetDesc().size;
-			case Kind::VideoOut: return VideoOutDesc().size;
-		}
-		EXIT("TextureCache: unsupported cached image kind %u for size\n",
-		     static_cast<uint32_t>(kind));
-	}
-	[[nodiscard]] bool OverlapsRange(uint64_t address, uint64_t size, bool page) const {
-		for (uint32_t i = 0; i < RangeCount(); i++) {
-			if (page ? ImagePageRangesOverlap(address, size, Address(i), Size(i))
-			         : ImageRangeOverlaps(address, size, Address(i), Size(i))) {
-				return true;
-			}
-		}
-		return false;
-	}
-	// A page-expanded region lookup identifies candidates before exact byte classification. Kyty's
-	// tracker retains GPU ownership per 4 KiB page, so an edge-page
-	// candidate must remain coherent even when the triggering byte lies just outside the image.
-	[[nodiscard]] bool IsGpuReadbackPageCandidate(uint64_t address, uint64_t size) const {
-		return gpu_modified && OverlapsRange(address, size, true);
-	}
-	[[nodiscard]] bool HasExactRange(uint64_t address, uint64_t size) const {
-		for (uint32_t i = 0; i < RangeCount(); i++) {
-			if (address == Address(i) && size == Size(i)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-private:
-	[[nodiscard]] static Image MakeImage(const ImageInfo& info) {
-		Image image;
-		image = info;
-		return image;
-	}
-
-	[[nodiscard]] bool DescriptorMatchesKind() const {
-		switch (kind) {
-			case Kind::Texture:
-			case Kind::StorageTexture: return std::holds_alternative<Image>(descriptor);
-			case Kind::RenderTarget:
-				return std::holds_alternative<RenderTargetInfo>(descriptor);
-			case Kind::DepthTarget: return std::holds_alternative<DepthTargetInfo>(descriptor);
-			case Kind::VideoOut: return std::holds_alternative<VideoOutInfo>(descriptor);
-		}
-		return false;
-	}
-};
 
 struct TextureCache::AliasRetirementPlan {
 	enum class Action : uint8_t {
@@ -1462,11 +1305,10 @@ void AppendLayerCopies(std::vector<ImageImageCopy>& regions, VulkanImage& source
 
 } // namespace
 
-TextureCache::TextureCache(GraphicContext& graphics, PageManager& page_manager,
-                           BufferCache& buffer_cache, ResourceMutex& resource_mutex)
-    : m_graphics(graphics), m_memory_tracker(page_manager),
-      m_metadata_tracker(page_manager, PageWatchMode::Write), m_buffer_cache(buffer_cache),
-      m_resource_mutex(resource_mutex) {
+TextureCache::TextureCache(PageManager& page_manager, BufferCache& buffer_cache,
+                           ResourceMutex& resource_mutex)
+    : m_memory_tracker(page_manager), m_metadata_tracker(page_manager, PageWatchMode::Write),
+      m_buffer_cache(buffer_cache), m_resource_mutex(resource_mutex) {
 	if (!Common::Thread::IsMainThread()) {
 		EXIT("TextureCache: construction is restricted to the main thread\n");
 	}
@@ -1878,7 +1720,7 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 		}
 	}
 	m_images.reserve(m_images.size() + 1);
-	auto cached = std::make_shared<CachedImage>(m_graphics, CachedImage::Kind::Texture, info);
+	auto cached = std::make_shared<CachedImage>(CachedImage::Kind::Texture, info);
 	vk::ComponentMapping components {};
 	cached->image = ImageOps::CreateTexture(info, false, components);
 	m_memory_tracker.ForEachUploadRange(
@@ -2007,8 +1849,7 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 
 	ResolveStorageImageOverlaps(info);
 	m_images.reserve(m_images.size() + 1);
-	auto cached =
-	    std::make_shared<CachedImage>(m_graphics, CachedImage::Kind::StorageTexture, info);
+	auto cached = std::make_shared<CachedImage>(CachedImage::Kind::StorageTexture, info);
 	vk::ComponentMapping components {};
 	cached->image = ImageOps::CreateTexture(info, true, components);
 	m_memory_tracker.ForEachUploadRange(
@@ -2244,7 +2085,7 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	auto native_image_source = alias_plan.NativeOwner();
 	ExecuteAliasRetirementLocked(alias_plan);
 	ResolveImageMetadataOverlapsLocked(info.address, info.size);
-	auto cached                = std::make_shared<CachedImage>(m_graphics, info);
+	auto cached                = std::make_shared<CachedImage>(info);
 	cached->image              = ImageOps::CreateRenderTarget(info);
 	const bool preserve_native = native_image_source != nullptr;
 	if (preserve_native) {
@@ -2654,7 +2495,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " samples=%u\n",
 		     info.stencil_address, info.stencil_size, info.samples);
 	}
-	auto cached                 = std::make_shared<CachedImage>(m_graphics, info);
+	auto cached                 = std::make_shared<CachedImage>(info);
 	cached->stencil_initialized = !has_stencil || info.stencil_load_clear || initial_stencil_clear;
 	cached->image               = ImageOps::CreateDepthTarget(info);
 	auto* depth_image           = static_cast<DepthStencilVulkanImage*>(cached->image);
@@ -2814,7 +2655,7 @@ TextureCache::RegisterVideoOutSurfaces(const std::vector<VideoOutInfo>& infos) {
 	std::vector<VideoOutVulkanImage*> result;
 	result.reserve(infos.size());
 	for (const auto& info: infos) {
-		auto cached = std::make_shared<CachedImage>(m_graphics, info);
+		auto cached = std::make_shared<CachedImage>(info);
 		cached->image     = ImageOps::CreateVideoOut(info);
 		if (info.compression == VideoOutCompression::Uncompressed) {
 			m_memory_tracker.ForEachUploadRange(

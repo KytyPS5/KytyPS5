@@ -1073,8 +1073,7 @@ public:
     ResourceMutex resource_mutex;
     PageManager page_manager(RejectUnexpectedPageFault, nullptr);
     BufferCache buffer_cache(m_runtime_context, page_manager, resource_mutex);
-    TextureCache texture_cache(m_runtime_context, page_manager, buffer_cache,
-                               resource_mutex);
+    TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
     buffer_cache.SetTextureCache(texture_cache);
     RenderTextureVulkanImage image;
     image.image = image_handle;
@@ -1185,8 +1184,7 @@ public:
     ResourceMutex resource_mutex;
     PageManager page_manager(RejectUnexpectedPageFault, nullptr);
     BufferCache buffer_cache(m_runtime_context, page_manager, resource_mutex);
-    TextureCache texture_cache(m_runtime_context, page_manager, buffer_cache,
-                               resource_mutex);
+    TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
     buffer_cache.SetTextureCache(texture_cache);
     DepthStencilVulkanImage image;
     image.image = image_handle;
@@ -1254,8 +1252,7 @@ public:
     ResourceMutex resource_mutex;
     PageManager page_manager(RejectUnexpectedPageFault, nullptr);
     BufferCache buffer_cache(m_runtime_context, page_manager, resource_mutex);
-    TextureCache texture_cache(m_runtime_context, page_manager, buffer_cache,
-                               resource_mutex);
+    TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
     buffer_cache.SetTextureCache(texture_cache);
     VideoOutVulkanImage image;
     image.image = backing.image;
@@ -11699,8 +11696,7 @@ void CheckStorageTextureAccessPermissions() {
   ResourceMutex resource_mutex;
   PageManager page_manager(CacheFault, nullptr);
   BufferCache buffer_cache(context, page_manager, resource_mutex);
-  TextureCache texture_cache(context, page_manager, buffer_cache,
-                             resource_mutex);
+  TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
   buffer_cache.SetTextureCache(texture_cache);
   page_manager.OnGpuMap(address, allocation_size);
   texture_cache.RegisterMeta(address, 0x8000);

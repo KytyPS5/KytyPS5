@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utime.h>
@@ -536,8 +537,26 @@ void SysFileFindFiles(const std::filesystem::path& /*path*/,
 	EXIT("not implemented\n");
 }
 
-void SysFileGetDents(const std::filesystem::path& /*path*/, std::vector<sys_dir_entry_t>& /*out*/) {
-	EXIT("not implemented\n");
+void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
+	DIR* dir = opendir(path.c_str());
+	if (dir == nullptr) {
+		return;
+	}
+	for (dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+		sys_dir_entry_t r {};
+		r.name = entry->d_name;
+		if (entry->d_type == DT_REG) {
+			r.is_file = true;
+		} else if (entry->d_type == DT_DIR) {
+			r.is_file = false;
+		} else {
+			// DT_UNKNOWN / symlink: resolve with stat.
+			struct stat st {};
+			r.is_file = (stat((path / entry->d_name).c_str(), &st) == 0) ? S_ISREG(st.st_mode) : true;
+		}
+		out.push_back(std::move(r));
+	}
+	closedir(dir);
 }
 
 bool SysFileCopyFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {

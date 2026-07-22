@@ -12,6 +12,11 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
 // IWYU pragma: no_include <asm/mman-common.h>
 // IWYU pragma: no_include <asm/mman.h>
 // IWYU pragma: no_include <bits/pthread_types.h>
@@ -129,6 +134,32 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 		                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
+#if defined(__APPLE__)
+			// Carve the aligned subrange out of the live mapping with MAP_FIXED (in-place
+			// replacement) and trim the slack; never munmap the whole range first, or a
+			// concurrent host mapping (dyld, Rosetta, Metal) could claim the hole and be
+			// destroyed by the MAP_FIXED. Other platforms keep the original path below.
+			auto aligned_addr = align_up(ret_addr, alignment);
+			// NOLINTNEXTLINE
+			void* fixed = mmap(reinterpret_cast<void*>(aligned_addr), size, protect,
+			                   MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+			if (fixed == MAP_FAILED) {
+				munmap(ptr, size + alignment);
+				ret_addr = 0;
+				ptr      = MAP_FAILED;
+			} else {
+				if (aligned_addr > ret_addr) {
+					munmap(reinterpret_cast<void*>(ret_addr), aligned_addr - ret_addr);
+				}
+				const uintptr_t tail_start = aligned_addr + size;
+				const uintptr_t resv_end   = ret_addr + size + alignment;
+				if (resv_end > tail_start) {
+					munmap(reinterpret_cast<void*>(tail_start), resv_end - tail_start);
+				}
+				ptr      = fixed;
+				ret_addr = aligned_addr;
+			}
+#else
 			munmap(ptr, size + alignment);
 			auto aligned_addr = align_up(ret_addr, alignment);
 #ifdef KYTY_FIXED_NOREPLACE
@@ -146,6 +177,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 				ret_addr = 0;
 				ptr      = MAP_FAILED;
 			}
+#endif
 		}
 	}
 
@@ -165,6 +197,27 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	return ret_addr;
 }
 
+#if defined(__APPLE__)
+// macOS has no /proc/self/maps; query the Mach VM map directly. mach_vm_region returns
+// the first mapped region at or above `region_addr`; if it begins before the end of the
+// requested range, the range overlaps an existing mapping.
+static bool is_mapped(void* ptr, size_t length) {
+	auto              query_addr  = reinterpret_cast<mach_vm_address_t>(ptr);
+	mach_vm_address_t region_addr = query_addr;
+	mach_vm_size_t    region_size = 0;
+	vm_region_basic_info_data_64_t info {};
+	mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t                    object_name = MACH_PORT_NULL;
+
+	kern_return_t kr =
+	    mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+	                   reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+	if (kr != KERN_SUCCESS) {
+		return false; // no region at or above the address → unmapped
+	}
+	return region_addr < (query_addr + length);
+}
+#else
 static bool is_mapped(void* ptr, size_t length) {
 	FILE* file = fopen("/proc/self/maps", "r");
 	char  line[1024];
@@ -189,6 +242,7 @@ static bool is_mapped(void* ptr, size_t length) {
 	fclose(file);
 	return ret;
 }
+#endif
 
 bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
@@ -261,6 +315,33 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 		                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
+#if defined(__APPLE__)
+			// Carve the aligned subrange out of the live reservation with MAP_FIXED (an
+			// in-place replacement), then trim the slack. The range must never be
+			// returned to the OS in between: another thread (dyld, Rosetta, Metal,
+			// malloc) could claim the hole, and the subsequent MAP_FIXED would silently
+			// destroy its mapping. Other platforms keep the original path below.
+			auto aligned_addr = align_up(ret_addr, alignment);
+			// NOLINTNEXTLINE
+			void* fixed = mmap(reinterpret_cast<void*>(aligned_addr), size, PROT_NONE,
+			                   MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+			if (fixed == MAP_FAILED) {
+				munmap(ptr, size + alignment);
+				ret_addr = 0;
+				ptr      = MAP_FAILED;
+			} else {
+				if (aligned_addr > ret_addr) {
+					munmap(reinterpret_cast<void*>(ret_addr), aligned_addr - ret_addr);
+				}
+				const uintptr_t tail_start = aligned_addr + size;
+				const uintptr_t resv_end   = ret_addr + size + alignment;
+				if (resv_end > tail_start) {
+					munmap(reinterpret_cast<void*>(tail_start), resv_end - tail_start);
+				}
+				ptr      = fixed;
+				ret_addr = aligned_addr;
+			}
+#else
 			munmap(ptr, size + alignment);
 			auto aligned_addr = align_up(ret_addr, alignment);
 #ifdef KYTY_FIXED_NOREPLACE
@@ -278,6 +359,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 				ret_addr = 0;
 				ptr      = MAP_FAILED;
 			}
+#endif
 		}
 	}
 

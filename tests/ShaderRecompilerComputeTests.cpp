@@ -11285,7 +11285,7 @@ void CheckStorageTextureGpuOwnedRebindState() {
   Require("StorageTextureGpuOwnedRebind", "allocation",
           memory == reinterpret_cast<void *>(base),
           "fixed VirtualAlloc failed");
-  PageManager page_manager(CacheFault, nullptr);
+  PageManager page_manager(RejectUnexpectedPageFault, nullptr);
   MemoryTracker tracker(page_manager);
   page_manager.OnGpuMap(base, size);
   tracker.ForEachUploadRange(
@@ -11622,7 +11622,7 @@ void CheckStorageTextureDepthAlias() {
     EXIT("storage access child could not reserve its fixed test address\n");
   }
   ResourceMutex resource_mutex;
-  PageManager page_manager(CacheFault, nullptr);
+  PageManager page_manager(RejectUnexpectedPageFault, nullptr);
   BufferCache buffer_cache(context, page_manager, resource_mutex);
   if (std::strcmp(kind, "read") == 0) {
     page_manager.OnGpuMap(base, size, GpuAccess::Write);
@@ -11646,7 +11646,7 @@ void CheckStorageTextureAccessPermissions() {
           memory == reinterpret_cast<void *>(base),
           "fixed VirtualAlloc failed");
   ResourceMutex resource_mutex;
-  PageManager page_manager(CacheFault, nullptr);
+  PageManager page_manager(RejectUnexpectedPageFault, nullptr);
   BufferCache buffer_cache(context, page_manager, resource_mutex);
   page_manager.OnGpuMap(base, size, GpuAccess::ReadWrite);
   buffer_cache.ValidateGpuAccess(base, size, true, true);
@@ -11694,7 +11694,7 @@ void CheckStorageTextureAccessPermissions() {
     EXIT("metadata-overlap child could not reserve its fixed test address\n");
   }
   ResourceMutex resource_mutex;
-  PageManager page_manager(CacheFault, nullptr);
+  PageManager page_manager(RejectUnexpectedPageFault, nullptr);
   BufferCache buffer_cache(context, page_manager, resource_mutex);
   TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
   buffer_cache.SetTextureCache(texture_cache);

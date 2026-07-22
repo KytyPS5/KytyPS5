@@ -58,6 +58,12 @@ namespace LibKernel {
 
 LIB_NAME("libkernel", "libkernel");
 
+// macOS's <pthread.h>/<limits.h> define PTHREAD_STACK_MIN as a macro; the emulator
+// wants its own guest-side value with the same name, so drop the host macro here.
+#ifdef PTHREAD_STACK_MIN
+#undef PTHREAD_STACK_MIN
+#endif
+
 constexpr int      KEYS_MAX                  = 256;
 constexpr int      DESTRUCTOR_ITERATIONS     = 4;
 constexpr size_t   PTHREAD_STACK_DEFAULT     = 0x100000;
@@ -795,9 +801,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "pushq %%r14\n\t"
 	             "pushq %%r15\n\t"
 	             "movq %%gs:0x08, %%r14\n\t"
@@ -805,7 +811,6 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "xorq %%rcx, %%rcx\n\t"
 	             "movq %%rcx, %%gs:0x08\n\t"
 	             "movq %%rcx, %%gs:0x10\n\t"
-#endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
 	             "movq %[guest_rsp], %%rsp\n\t"
@@ -813,12 +818,10 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "callq *%%rsi\n\t"
 	             "movq %%r13, %%rbp\n\t"
 	             "movq %%r12, %%rsp\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%r14, %%gs:0x08\n\t"
 	             "movq %%r15, %%gs:0x10\n\t"
 	             "popq %%r15\n\t"
 	             "popq %%r14\n\t"
-#endif
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
@@ -826,6 +829,29 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
 	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+	// Pin the stack operands to registers the template never touches (r14/r15 are
+	// SysV callee-saved, so guest code preserves them): plain "r" constraints may
+	// allocate them into r12/r13, which the template overwrites before use.
+	register uintptr_t guest_rsp_reg asm("r14") = guest_rsp;
+	register uintptr_t guest_rbp_reg asm("r15") = guest_rbp;
+	asm volatile("pushq %%r12\n\t"
+	             "pushq %%r13\n\t"
+	             "movq %%rsp, %%r12\n\t"
+	             "movq %%rbp, %%r13\n\t"
+	             "movq %[guest_rsp], %%rsp\n\t"
+	             "movq %[guest_rbp], %%rbp\n\t"
+	             "callq *%%rsi\n\t"
+	             "movq %%r13, %%rbp\n\t"
+	             "movq %%r12, %%rsp\n\t"
+	             "popq %%r13\n\t"
+	             "popq %%r12\n\t"
+	             : "=a"(ret), "+D"(arg), "+S"(func)
+	             : [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
+	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
+	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+	               "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 
 	g_guest_entry_return_rsp = 0;
 	if (g_pthread_self != nullptr) {

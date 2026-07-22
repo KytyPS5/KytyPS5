@@ -14,6 +14,13 @@
 #endif
 #else
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// POSIX uses plain int file descriptors for sockets; provide the Winsock spellings
+// the shared (non-guarded) code paths reference.
+using SOCKET                   = int;
+static constexpr SOCKET INVALID_SOCKET = -1;
 #endif
 
 #include "common/assert.h"

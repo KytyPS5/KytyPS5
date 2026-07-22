@@ -191,9 +191,15 @@ public:
 			SetFailure(failure_reason, FailureReason::ReserveAlignedFailed);
 			return 0;
 		}
+#if !defined(__APPLE__)
+		// On macOS the PROT_NONE reservation is left in place: MapView's MAP_FIXED
+		// replaces it atomically, so the range never becomes a hole that dyld,
+		// Rosetta, or Metal background threads could claim (which the subsequent
+		// MAP_FIXED would then silently destroy).
 		if (!ReleaseReservedProbe(reserved, failure_reason)) {
 			return 0;
 		}
+#endif
 		if (MapFixed(reserved, size, backing_offset, mode, failure_reason)) {
 			return reserved;
 		}
@@ -1061,7 +1067,17 @@ private:
 		return ptr;
 	}
 
-	static bool UnmapView(void* vaddr, uint64_t size) { return munmap(vaddr, size) == 0; }
+	static bool UnmapView(void* vaddr, uint64_t size) {
+#if defined(__APPLE__)
+		// Re-reserve instead of freeing: the guest may MAP_FIXED-remap this range
+		// later, and that must never destroy a host mapping (dyld, Rosetta, Metal)
+		// that moved into the hole in the meantime.
+		return mmap(vaddr, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE,
+		            -1, 0) != MAP_FAILED;
+#else
+		return munmap(vaddr, size) == 0;
+#endif
+	}
 
 	static bool UnmapViewPreservePlaceholder(void* /*vaddr*/, uint64_t /*size*/) { return false; }
 

@@ -1919,7 +1919,7 @@ int KYTY_SYSV_ABI Ngs2SystemCreateWithAllocator(const Ngs2SystemOption*    optio
 	     option->sample_rate, option->max_voice_channels,
 	     reinterpret_cast<uint64_t>(allocator->alloc_handler),
 	     reinterpret_cast<uint64_t>(allocator->free_handler),
-	     reinterpret_cast<uint64_t>(allocator->user_data));
+	     static_cast<uint64_t>(allocator->user_data));
 
 	Ngs2ContextBufferInfo buf {};
 	buf.host_buffer      = nullptr;
@@ -2002,7 +2002,7 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 	     option->max_input_delay_blocks, option->max_matrices, option->max_ports,
 	     option->max_voice_channels, option->max_output_channels,
 	     reinterpret_cast<uint64_t>(buffer_info->host_buffer),
-	     reinterpret_cast<uint64_t>(buffer_info->host_buffer_size));
+	     static_cast<uint64_t>(buffer_info->host_buffer_size));
 
 	auto* ngs    = reinterpret_cast<Ngs2Internal*>(system_handle);
 	auto* rack   = static_cast<Ngs2RackInternal*>(buffer_info->host_buffer);
@@ -2106,7 +2106,7 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 	     option->max_voice_channels, option->max_output_channels,
 	     reinterpret_cast<uint64_t>(allocator->alloc_handler),
 	     reinterpret_cast<uint64_t>(allocator->free_handler),
-	     reinterpret_cast<uint64_t>(allocator->user_data));
+	     static_cast<uint64_t>(allocator->user_data));
 
 	Ngs2ContextBufferInfo buf {};
 	buf.host_buffer      = nullptr;

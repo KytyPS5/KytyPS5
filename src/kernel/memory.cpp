@@ -40,6 +40,7 @@
 #endif
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <cerrno>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>

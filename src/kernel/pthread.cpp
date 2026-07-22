@@ -1056,7 +1056,7 @@ static void PthreadAttrDbgPrint(const PthreadAttr* src) {
 	     "\tstack_addr     = 0x%016" PRIx64 "\n"
 	     "\tstack_size    = %" PRIu64 "\n",
 	     mask, state, guard_size, inherit_sched, param.sched_priority, policy, solosched,
-	     reinterpret_cast<uint64_t>(stack_addr), reinterpret_cast<uint64_t>(stack_size));
+	     reinterpret_cast<uint64_t>(stack_addr), static_cast<uint64_t>(stack_size));
 }
 
 static constexpr int32_t DST_NONE = 0;
@@ -2640,7 +2640,12 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result        = pthread_condattr_setclock(&(*attr)->p, pclock_id);
+#if defined(__APPLE__)
+	(void)pclock_id;
+	int result = 0;
+#else
+	int result = pthread_condattr_setclock(&(*attr)->p, pclock_id);
+#endif
 	(*attr)->clock_id = clock_id;
 
 	LOGF("\tcondattr setclock: clock_id = %d, native = %d, result = %d\n", clock_id,

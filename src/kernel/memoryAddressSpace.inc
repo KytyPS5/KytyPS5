@@ -1119,21 +1119,35 @@ public:
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
+		if (UINT64_MAX - vaddr < size) {
+			return false;
+		}
 		{
 			std::lock_guard lock(m_mutex);
 			if (FindContaining(vaddr, size) != m_free.end()) {
 				return true;
 			}
 		}
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
+
+		// VirtualAlloc2 requires a fixed base address to use the host allocation
+		// granularity. Reserve and retain the enclosing container as placeholders;
+		// Consume() will isolate the exact PS5-page range for MapViewOfFile3.
+		const auto container_start = vaddr & ~(m_granularity - 1u);
+		if (UINT64_MAX - (m_granularity - 1u) < vaddr + size) {
+			return false;
+		}
+		const auto container_end  = AlignUp(vaddr + size, m_granularity);
+		const auto container_size = container_end - container_start;
+		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(container_start),
+		                          container_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+		                          PAGE_NOACCESS, nullptr, 0);
+		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != container_start) {
 			if (ptr != nullptr) {
 				VirtualFree(ptr, 0, MEM_RELEASE);
 			}
 			return false;
 		}
-		AddFree(vaddr, size);
+		AddFree(container_start, container_size);
 		return true;
 #else
 		return VirtualMemory::ReserveFixed(vaddr, size);

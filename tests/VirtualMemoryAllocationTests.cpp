@@ -730,6 +730,102 @@ void TestDirectMapUnmapReusesHostAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFixedSub64KDirectMapUsesExactAddress() {
+	const char*        test           = "FixedSub64KDirectMapUsesExactAddress";
+	constexpr uint64_t container_size = SceKernelPageSize * 4;
+	constexpr uint64_t target_offset  = SceKernelPageSize;
+
+	void* container = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &container, container_size, 0, SceKernelPageSize),
+	        "KernelReserveVirtualRange(container)");
+	const auto container_base = reinterpret_cast<uint64_t>(container);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, (container_base & (container_size - 1u)) == 0,
+	      "placeholder container is not 64-KiB aligned");
+#endif
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(container_base, container_size),
+	        "KernelMunmap(container)");
+
+	const auto target = container_base + target_offset;
+	void*      reserve = reinterpret_cast<void*>(target);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &reserve, SceKernelPageSize, SceKernelMapFixed, SceKernelPageSize),
+	        "KernelReserveVirtualRange(sub-64K fixed)");
+	Check(test, reserve == reinterpret_cast<void*>(target), "fixed reservation moved");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(target, SceKernelPageSize),
+	      "fixed reservation did not create an exact free placeholder");
+#endif
+
+	const auto adjacent_target = target + SceKernelPageSize;
+	void*      adjacent_reserve = reinterpret_cast<void*>(adjacent_target);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &adjacent_reserve, SceKernelPageSize, SceKernelMapFixed, SceKernelPageSize),
+	        "KernelReserveVirtualRange(adjacent sub-64K fixed)");
+	Check(test, adjacent_reserve == reinterpret_cast<void*>(adjacent_target),
+	      "adjacent fixed reservation moved");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test,
+	      Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(adjacent_target, SceKernelPageSize),
+	      "adjacent fixed reservation did not retain a free placeholder");
+#endif
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* alias = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &alias, SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
+	            "sub64k_alias"),
+	        "KernelMapNamedDirectMemory(alias)");
+
+	void* mapped = reserve;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &mapped, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, phys_addr,
+	            SceKernelPageSize, "sub64k_fixed"),
+	        "KernelMapNamedDirectMemory(fixed)");
+	Check(test, mapped == reserve, "fixed direct mapping moved");
+	ExpectRange(test, Query(test, target), target, target + SceKernelPageSize, SceKernelProtCpuRw,
+	            0, 1, 0, 1, "sub64k_fixed");
+
+	*reinterpret_cast<uint64_t*>(mapped) = 0x4b59545953554236ull; // "KYTYSUB6"
+	Check(test, *reinterpret_cast<uint64_t*>(alias) == 0x4b59545953554236ull,
+	      "fixed mapping did not alias direct-memory backing");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(target, SceKernelPageSize),
+	        "KernelMunmap(fixed direct)");
+	ExpectRange(test, Query(test, target), target, target + SceKernelPageSize, 0, 0, 0, 0, 0,
+	            "sub64k_fixed");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(target, SceKernelPageSize),
+	      "fixed direct unmap did not restore its placeholder");
+#endif
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(target, SceKernelPageSize),
+	        "KernelMunmap(fixed reserve)");
+	ExpectUnmapped(test, target);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(adjacent_target, SceKernelPageSize),
+	        "KernelMunmap(adjacent fixed reserve)");
+	ExpectUnmapped(test, adjacent_target);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(alias),
+	                                                    SceKernelPageSize),
+	        "KernelMunmap(alias)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReserveReplacesPartialDirectMapping() {
 	const char*        test         = "FixedReserveReplacesPartialDirectMapping";
 	constexpr uint64_t page_count   = 13;
@@ -1473,6 +1569,7 @@ int main() {
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+	RunTest(TestFixedSub64KDirectMapUsesExactAddress);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);

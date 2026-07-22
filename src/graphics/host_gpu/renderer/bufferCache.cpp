@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/resourceRange.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
 #include "graphics/host_gpu/transfer.h"
@@ -140,11 +141,12 @@ uint64_t AlignUp(uint64_t value) {
 }
 
 bool PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right, uint64_t right_size) {
-	const auto left_begin  = left & ~(TRACKER_PAGE_SIZE - 1);
-	const auto left_end    = (left + left_size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	const auto right_begin = right & ~(TRACKER_PAGE_SIZE - 1);
-	const auto right_end = (right + right_size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	return left_begin < right_end && right_begin < left_end;
+	const auto relation =
+	    ClassifyRangeRelation({left, left_size}, {right, right_size}, TRACKER_PAGE_SIZE);
+	if (!relation.has_value()) {
+		EXIT("BufferCache: invalid page-overlap range\n");
+	}
+	return HasPageOverlap(*relation);
 }
 } // namespace
 

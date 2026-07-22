@@ -323,6 +323,17 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(resource_range_tests EXCLUDE_FROM_ALL
+	../tests/ResourceRangeTests.cpp
+)
+target_include_directories(resource_range_tests PRIVATE ${inc_headers})
+
+add_custom_target(host_gpu_aliasing_tests
+	COMMAND $<TARGET_FILE:resource_range_tests>
+	COMMAND $<TARGET_FILE:image_page_table_tests>
+	DEPENDS resource_range_tests image_page_table_tests
+)
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)

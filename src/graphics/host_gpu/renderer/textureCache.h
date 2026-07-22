@@ -13,6 +13,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -121,6 +123,7 @@ public:
 
 private:
 	struct CachedImage;
+	struct AliasRetirementPlan;
 	using ImageOwnerIndex = MultiRangePageOwnerIndex<CachedImage*>;
 	struct ReadbackWorker;
 	struct MetaDataInfo {
@@ -138,38 +141,45 @@ private:
 	void                        RetireSampledTargetAliases(const ImageInfo& requested);
 	void                        ResolveStorageImageOverlaps(const ImageInfo& requested);
 	void                        RetireStorageDepthAliasLocked(const ImageInfo& requested);
-	void                        RegisterImageLocked(CachedImage& image);
+	void                        RegisterImageLocked(const std::shared_ptr<CachedImage>& image);
 	void                        UnregisterImageLocked(CachedImage& image, bool release_tracking);
+	[[nodiscard]] std::shared_ptr<CachedImage>
+	FindImageOwnerLocked(const CachedImage& image) const;
+	[[nodiscard]] std::shared_ptr<CachedImage> FindImageOwnerLocked(VulkanImage& image) const;
 	[[nodiscard]] VulkanImage&  PublishImage(CommandBuffer&               command,
 	                                         std::shared_ptr<CachedImage> image);
 	[[nodiscard]] std::vector<CachedImage*> FindImagesInRegionLocked(uint64_t vaddr, uint64_t size,
 	                                                                 bool page_overlap);
+	[[nodiscard]] std::vector<CachedImage*>
+	FindImagesInRegionsLocked(std::span<const GuestRange> ranges, bool page_overlap);
 	void RequireRetirementIsolation(const std::vector<CachedImage*>& retire, const char* operation,
 	                                uint64_t address, uint64_t size) const;
 	void RetireImages(const std::vector<CachedImage*>& retire,
 	                  const CachedImage*               native_image_source = nullptr);
 	void RetireDepthMetadataLocked(const std::vector<CachedImage*>& retire,
 	                               uint64_t                         preserve_address = 0);
+	void ExecuteAliasRetirementLocked(const AliasRetirementPlan& plan);
 	void MaterializeImagesToGuestLocked(const std::vector<std::shared_ptr<CachedImage>>& images);
 	void SynchronizeColorImageToBufferLocked(CachedImage& cached, uint64_t write_address,
 	                                         uint64_t write_size);
 	void SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
 	                                         uint64_t write_size);
 
-	GraphicContext&                           m_graphics;
-	std::unique_ptr<DummyTextureCache>        m_dummy_textures;
-	TrackingSpinLock                          m_lock;
-	std::mutex                                m_fault_mutex;
-	MemoryTracker                             m_memory_tracker;
-	MemoryTracker                             m_metadata_tracker;
-	Tiler                                     m_tiler;
-	BufferCache&                              m_buffer_cache;
-	ResourceMutex&                            m_resource_mutex;
-	std::vector<std::shared_ptr<CachedImage>> m_images;
-	ImageOwnerIndex                           m_image_owner_index;
-	std::map<uint64_t, MetaDataInfo>          m_surface_metas;
-	std::unique_ptr<ReadbackWorker>           m_readback;
-	std::vector<uint8_t>                      m_buffer_transition_guest;
+	GraphicContext&                                             m_graphics;
+	std::unique_ptr<DummyTextureCache>                          m_dummy_textures;
+	TrackingSpinLock                                            m_lock;
+	std::mutex                                                  m_fault_mutex;
+	MemoryTracker                                               m_memory_tracker;
+	MemoryTracker                                               m_metadata_tracker;
+	Tiler                                                       m_tiler;
+	BufferCache&                                                m_buffer_cache;
+	ResourceMutex&                                              m_resource_mutex;
+	std::vector<std::shared_ptr<CachedImage>>                   m_images;
+	ImageOwnerIndex                                             m_image_owner_index;
+	std::unordered_map<VulkanImage*, std::weak_ptr<CachedImage>> m_records_by_image;
+	std::map<uint64_t, MetaDataInfo>                            m_surface_metas;
+	std::unique_ptr<ReadbackWorker>                             m_readback;
+	std::vector<uint8_t>                                        m_buffer_transition_guest;
 };
 
 } // namespace Libs::Graphics

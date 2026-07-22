@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/resourceRange.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -610,24 +611,21 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 
 [[nodiscard]] inline bool ImageRangeOverlaps(uint64_t left, uint64_t left_size, uint64_t right,
                                              uint64_t right_size) {
-	if (left_size == 0 || right_size == 0 || left > UINT64_MAX - left_size ||
-	    right > UINT64_MAX - right_size) {
+	const auto relation = ClassifyRangeRelation({left, left_size}, {right, right_size}, 1);
+	if (!relation.has_value()) {
 		EXIT("invalid image overlap range\n");
 	}
-	return left < right + right_size && right < left + left_size;
+	return HasByteOverlap(*relation);
 }
 
 [[nodiscard]] inline bool ImagePageRangesOverlap(uint64_t left, uint64_t left_size, uint64_t right,
                                                  uint64_t right_size) {
-	if (left_size == 0 || right_size == 0 || left > UINT64_MAX - left_size ||
-	    right > UINT64_MAX - right_size) {
+	const auto relation =
+	    ClassifyRangeRelation({left, left_size}, {right, right_size}, TRACKER_PAGE_SIZE);
+	if (!relation.has_value()) {
 		EXIT("invalid image page-overlap range\n");
 	}
-	const auto left_first  = left / TRACKER_PAGE_SIZE;
-	const auto left_last   = (left + left_size - 1) / TRACKER_PAGE_SIZE;
-	const auto right_first = right / TRACKER_PAGE_SIZE;
-	const auto right_last  = (right + right_size - 1) / TRACKER_PAGE_SIZE;
-	return left_first <= right_last && right_first <= left_last;
+	return HasPageOverlap(*relation);
 }
 
 [[nodiscard]] inline SampledOverlap ClassifySampledOverlap(const ImageInfo& requested,

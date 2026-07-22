@@ -123,6 +123,34 @@ void TestStrictByteFilteringAndPredicate() {
 	Check(predicate_filtered.size() == 1 && predicate_filtered.front() == 32, "supplied predicate filters query owners");
 }
 
+void TestDisjointMultiRangeLifecycle() {
+	OwnerIndex index;
+	const std::vector<OwnerIndex::ByteRange> planes {{0x401100, 0x100},
+	                                                  {0x403100, 0x100}};
+	Check(index.Register(41, planes), "disjoint image planes register as one owner");
+	for (const auto& plane: planes) {
+		const auto owners = index.Query(plane.address, plane.size);
+		Check(owners.size() == 1 && owners.front() == 41,
+		      "either image plane finds the shared owner");
+	}
+	Check(index.Query(0x401800, 0x20).empty(),
+	      "strict lookup excludes a byte-disjoint plane neighbor");
+	const auto page_candidates = index.QueryCandidates(0x401800, 0x20);
+	Check(page_candidates.size() == 1 && page_candidates.front() == 41,
+	      "page lookup retains a byte-disjoint plane neighbor");
+	const auto union_query = index.Query(planes.front().address, 0x2100);
+	Check(union_query.size() == 1 && union_query.front() == 41,
+	      "a query spanning both planes deduplicates their owner");
+
+	std::vector<OwnerIndex::ByteRange> releases;
+	Check(index.Unregister(41, releases), "disjoint-plane owner unregisters");
+	Check(releases.size() == 2 && releases[0].address == 0x401000 &&
+	          releases[0].size == 0x1000 && releases[1].address == 0x403000 &&
+	          releases[1].size == 0x1000,
+	      "unregister releases both disjoint tracking pages");
+	Check(index.Register(41, planes), "an unregistered multi-range owner can register again");
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +161,7 @@ int main() {
 	TestMultiRangeRegistrationDeduplicatesPages();
 	TestSharedPageUnregisterLifecycle();
 	TestStrictByteFilteringAndPredicate();
+	TestDisjointMultiRangeLifecycle();
 	std::printf("ImagePageTableTests: all cases passed\n");
 	return 0;
 }

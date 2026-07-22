@@ -36,6 +36,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/regression/frameRegressionVulkan.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -243,6 +244,7 @@ struct WindowGamePrivate {
 
 WindowContext* g_window_ctx = nullptr;
 static WindowGame g_window_game;
+static int        g_window_exit_code = 0;
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 constexpr uint32_t    KYTY_SDL_WINDOW_FLAGS =
@@ -961,6 +963,14 @@ void WindowInit(uint32_t width, uint32_t height) {
 	WindowCreate(*g_window_ctx);
 	VulkanCreate(*g_window_ctx);
 	GraphicsRenderInit(g_window_ctx->graphic_ctx);
+	if (!Regression::InitializeFrameRegression()) {
+		WindowRequestExit(2);
+	}
+}
+
+void WindowRequestExit(int exit_code) {
+	g_window_exit_code             = std::max(g_window_exit_code, exit_code);
+	g_window_game.m_game_need_exit = true;
 }
 
 void WindowRun() {
@@ -970,8 +980,9 @@ void WindowRun() {
 
 	// TODO: replace std::_Exit shutdown with full Vulkan teardown, then destroy
 	// the VMA allocator immediately before vkDestroyDevice.
+	const auto regression_exit_code = Regression::FinalizeFrameRegression();
 	Common::SubsystemsListSingleton::Instance()->ShutdownAll();
-	std::_Exit(0);
+	std::_Exit(std::max(g_window_exit_code, regression_exit_code));
 }
 
 static int WindowIconRead(void* user, char* data, int size) {

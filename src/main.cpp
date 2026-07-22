@@ -10,8 +10,11 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
+#include <string_view>
+#include <vector>
 
 using namespace Common;
 using namespace Emulator;
@@ -60,6 +63,13 @@ static void PrintUsage() {
 	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
 	         "4-vertex path.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --gpu-capture <path>                 Record a commands-only GPU trace.\n");
+	::printf("  --regression-record <path>           Record selected presented frames.\n");
+	::printf("  --regression-compare <path>          Compare against a frame baseline.\n");
+	::printf("  --regression-report <path>           Comparison report path.\n");
+	::printf("  --regression-frames <n[,n...]>       Zero-based presentation ordinals.\n");
+	::printf("  --regression-save-raw <true|false>   Save raw frames and previews.\n");
+	::printf("  --regression-exit-on-complete <true|false> Exit after selected frames.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -86,6 +96,29 @@ static bool ParseBool(const std::string& value, bool& out) {
 	}
 
 	return false;
+}
+
+static bool ParseFrameOrdinals(std::string_view value, std::vector<uint64_t>& out) {
+	out.clear();
+	while (!value.empty()) {
+		const auto comma = value.find(',');
+		const auto token = value.substr(0, comma);
+		uint64_t   ordinal = 0;
+		const auto result = std::from_chars(token.data(), token.data() + token.size(), ordinal);
+		if (token.empty() || result.ec != std::errc {} ||
+		    result.ptr != token.data() + token.size()) {
+			return false;
+		}
+		out.push_back(ordinal);
+		if (comma == std::string_view::npos) {
+			break;
+		}
+		if (comma + 1 == value.size()) {
+			return false;
+		}
+		value.remove_prefix(comma + 1);
+	}
+	return !out.empty();
 }
 
 template <typename E>
@@ -210,10 +243,44 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-capture") {
+			options.config.gpu_capture_file = value;
+		} else if (arg == "--regression-record" || arg == "--regression-compare") {
+			if (options.config.frame_regression_mode != Config::FrameRegressionMode::None) {
+				::printf("regression mode can only be specified once\n");
+				return false;
+			}
+			options.config.frame_regression_mode =
+			    arg == "--regression-record" ? Config::FrameRegressionMode::Record
+			                                 : Config::FrameRegressionMode::Compare;
+			options.config.frame_regression_baseline = value;
+		} else if (arg == "--regression-report") {
+			options.config.frame_regression_report = value;
+		} else if (arg == "--regression-frames") {
+			if (!ParseFrameOrdinals(value, options.config.frame_regression_frames)) {
+				::printf("invalid frame ordinal list: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--regression-save-raw") {
+			if (!ParseBool(value, options.config.frame_regression_save_raw)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--regression-exit-on-complete") {
+			if (!ParseBool(value, options.config.frame_regression_exit_on_complete)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
 		}
+	}
+
+	if (options.config.frame_regression_mode != Config::FrameRegressionMode::None &&
+	    options.config.frame_regression_frames.empty()) {
+		::printf("--regression-frames is required with a regression mode\n");
+		return false;
 	}
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());

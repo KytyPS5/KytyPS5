@@ -5,6 +5,7 @@
 #include "common/subsystems.h"
 
 #include <filesystem>
+#include <vector>
 
 namespace Config {
 
@@ -17,6 +18,8 @@ enum class ShaderLogDirection { Silent, Console, File };
 enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
+
+enum class FrameRegressionMode { None, Record, Compare };
 
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
@@ -36,6 +39,13 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   ngg_rectlist_draw_enabled   = true;
+	std::filesystem::path  gpu_capture_file;
+	FrameRegressionMode    frame_regression_mode = FrameRegressionMode::None;
+	std::filesystem::path  frame_regression_baseline;
+	std::filesystem::path  frame_regression_report = "_Regression/report.json";
+	std::vector<uint64_t>  frame_regression_frames;
+	bool                   frame_regression_save_raw         = true;
+	bool                   frame_regression_exit_on_complete = true;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -64,6 +74,14 @@ bool SpirvDebugPrintfEnabled();
 
 bool RenderDocEnabled();
 bool NggRectlistDrawEnabled();
+
+std::filesystem::path       GetGpuCaptureFile();
+FrameRegressionMode         GetFrameRegressionMode();
+std::filesystem::path       GetFrameRegressionBaseline();
+std::filesystem::path       GetFrameRegressionReport();
+const std::vector<uint64_t>& GetFrameRegressionFrames();
+bool                        FrameRegressionSaveRaw();
+bool                        FrameRegressionExitOnComplete();
 
 } // namespace Config
 

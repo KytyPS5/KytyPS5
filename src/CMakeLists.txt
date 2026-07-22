@@ -142,6 +142,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	libs/*.h
 	graphics/*.cpp
 	graphics/*.h
+	graphics/capture/*.cpp
+	graphics/capture/*.h
 	graphics/guest_gpu/*.cpp
 	graphics/guest_gpu/*.h
 	graphics/guest_gpu/command_processor/*.cpp
@@ -164,6 +166,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	graphics/presentation/*.h
 	graphics/presentation/window/*.cpp
 	graphics/presentation/window/*.h
+	graphics/regression/*.cpp
+	graphics/regression/*.h
 	kernel/*.cpp
 	kernel/*.h
 	loader/*.cpp
@@ -322,6 +326,20 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	../tests/ImagePageTableTests.cpp
 )
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
+
+add_executable(gpu_trace_tests EXCLUDE_FROM_ALL
+	../tests/GpuTraceTests.cpp
+	graphics/capture/gpuTrace.cpp
+)
+target_link_libraries(gpu_trace_tests common xxhash)
+target_include_directories(gpu_trace_tests PRIVATE ${inc_headers})
+
+add_executable(frame_regression_tests EXCLUDE_FROM_ALL
+	../tests/FrameRegressionTests.cpp
+	graphics/regression/frameRegression.cpp
+)
+target_link_libraries(frame_regression_tests common xxhash nlohmann_json::nlohmann_json)
+target_include_directories(frame_regression_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 

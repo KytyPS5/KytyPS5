@@ -93,4 +93,32 @@ bool NggRectlistDrawEnabled() {
 	return g_config->ngg_rectlist_draw_enabled;
 }
 
+std::filesystem::path GetGpuCaptureFile() {
+	return g_config->gpu_capture_file;
+}
+
+FrameRegressionMode GetFrameRegressionMode() {
+	return g_config->frame_regression_mode;
+}
+
+std::filesystem::path GetFrameRegressionBaseline() {
+	return g_config->frame_regression_baseline;
+}
+
+std::filesystem::path GetFrameRegressionReport() {
+	return g_config->frame_regression_report;
+}
+
+const std::vector<uint64_t>& GetFrameRegressionFrames() {
+	return g_config->frame_regression_frames;
+}
+
+bool FrameRegressionSaveRaw() {
+	return g_config->frame_regression_save_raw;
+}
+
+bool FrameRegressionExitOnComplete() {
+	return g_config->frame_regression_exit_on_complete;
+}
+
 } // namespace Config

@@ -36,6 +36,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/regression/frameRegressionVulkan.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -428,6 +429,10 @@ void WindowPresentFrame(PreparedFrame& frame) {
 		~ReleaseScope() { GetPreparedFramePool()->Release(frame); }
 	};
 	ReleaseScope release {&frame};
+	if (Regression::ObservePresentedFrame(frame.image)) {
+		WindowRequestExit(Regression::FinalizeFrameRegression());
+		return;
+	}
 
 	if (g_window_ctx->window_hidden) {
 		WindowUpdateIcon();

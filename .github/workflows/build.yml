@@ -62,7 +62,22 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher --parallel
+          cmake --build _Build/windows --target kyty_emulator launcher gpu_trace_tests frame_regression_tests --parallel
+
+      - name: Run GPU trace tests
+        shell: cmd
+        run: |
+          _Build\windows\gpu_trace_tests.exe
+
+      - name: Run frame regression tests
+        shell: cmd
+        run: |
+          _Build\windows\frame_regression_tests.exe
+
+      - name: Validate game regression runner
+        shell: cmd
+        run: |
+          python tools\run_graphics_regression.py --help
 
       - name: Install
         shell: cmd

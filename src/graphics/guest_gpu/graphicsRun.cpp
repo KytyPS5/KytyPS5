@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/asyncJob.h"
+#include "graphics/capture/gpuTrace.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -29,6 +30,8 @@
 #include <atomic>
 #include <cstdio>
 #include <list>
+#include <memory>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -227,6 +230,10 @@ public:
 private:
 	void Init();
 	void WaitLocked();
+	void CaptureGraphics(const OwnedCmdBuffer& draw, const OwnedCmdBuffer& constants,
+	                     bool trigger_interrupt);
+	void CaptureCompute(uint32_t queue, const OwnedCmdBuffer& commands, bool trigger_interrupt);
+	void CaptureMarker(Capture::TraceEventType type);
 
 	ComputeRing* GetRing(uint32_t ring_id);
 
@@ -237,6 +244,7 @@ private:
 
 	CommandProcessor* m_compute_cp[8]    = {};
 	ComputeRing*      m_compute_ring[64] = {};
+	std::unique_ptr<Capture::TraceWriter> m_capture;
 
 	std::atomic_int m_done_num = 0;
 };
@@ -263,6 +271,7 @@ void Gpu::Submit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t* cmd_
 	OwnedCmdBuffer draw_buffer(cmd_draw_buffer, num_draw_dw);
 	OwnedCmdBuffer const_buffer(cmd_const_buffer, num_const_dw);
 	GpuMutexLock   lock(m_mutex);
+	CaptureGraphics(draw_buffer, const_buffer, trigger_agc_interrupt_on_done);
 
 	m_gfx_ring->Submit(std::move(draw_buffer), std::move(const_buffer), 0, 0, 0, 0,
 	                   trigger_agc_interrupt_on_done);
@@ -288,11 +297,13 @@ void Gpu::SubmitCompute(uint32_t queue, uint32_t* cmd_buffer, uint32_t num_dw,
 
 	auto* ring = GetRing(ring_id);
 
+	CaptureCompute(queue, buffer, trigger_agc_interrupt_on_done);
 	ring->Submit(std::move(buffer), trigger_agc_interrupt_on_done);
 }
 
 void Gpu::SubmitFlipPreparation() {
 	GpuMutexLock lock(m_mutex);
+	CaptureMarker(Capture::TraceEventType::FlipPreparation);
 	m_gfx_ring->SubmitFlipPreparation();
 }
 
@@ -304,6 +315,7 @@ void Gpu::Done() {
 
 	{
 		GpuMutexLock lock(m_mutex);
+		CaptureMarker(Capture::TraceEventType::SuspendRequest);
 
 		gfx_ring = m_gfx_ring;
 		gfx_cp   = m_gfx_cp;
@@ -383,8 +395,50 @@ void Gpu::Init() {
 	m_gfx_ring = new GraphicsRing;
 	m_gfx_cp->SetQueue(GraphicContext::QUEUE_GFX);
 	m_gfx_ring->SetCp(*m_gfx_cp);
+	if (const auto path = Config::GetGpuCaptureFile(); !path.empty()) {
+		std::string error;
+		m_capture = Capture::TraceWriter::Create(path, error);
+		if (m_capture == nullptr) {
+			EXIT("GPU command capture initialization failed: %s\n", error.c_str());
+		}
+		LOGF("Recording commands-only GPU trace to %s\n", path.string().c_str());
+	}
 
 	EXIT_IF(GraphicContext::QUEUE_COMPUTE_NUM < 8);
+}
+
+void Gpu::CaptureGraphics(const OwnedCmdBuffer& draw, const OwnedCmdBuffer& constants,
+	                      bool trigger_interrupt) {
+	if (m_capture == nullptr) {
+		return;
+	}
+	std::string error;
+	if (!m_capture->RecordGraphics({draw.data, draw.num_dw}, {constants.data, constants.num_dw},
+	                               trigger_interrupt, error)) {
+		EXIT("GPU command capture failed: %s\n", error.c_str());
+	}
+}
+
+void Gpu::CaptureCompute(uint32_t queue, const OwnedCmdBuffer& commands,
+	                     bool trigger_interrupt) {
+	if (m_capture == nullptr) {
+		return;
+	}
+	std::string error;
+	if (!m_capture->RecordCompute(queue, {commands.data, commands.num_dw}, trigger_interrupt,
+	                              error)) {
+		EXIT("GPU command capture failed: %s\n", error.c_str());
+	}
+}
+
+void Gpu::CaptureMarker(Capture::TraceEventType type) {
+	if (m_capture == nullptr) {
+		return;
+	}
+	std::string error;
+	if (!m_capture->RecordMarker(type, error)) {
+		EXIT("GPU command capture failed: %s\n", error.c_str());
+	}
 }
 
 ComputeRing* Gpu::GetRing(uint32_t ring_id) {

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 
 namespace Libs::Graphics {
 
@@ -29,6 +30,8 @@ enum class RangeRelation : uint8_t {
 	ContainedBy,
 	PartialOverlap
 };
+
+enum class RangeSetCoverage : uint8_t { Disjoint, ContainsAll, Partial };
 
 [[nodiscard]] constexpr bool IsPowerOfTwo(uint64_t value) noexcept {
 	return value != 0 && (value & (value - 1)) == 0;
@@ -77,6 +80,30 @@ ClassifyRangeRelation(GuestRange left, GuestRange right, uint64_t page_size) noe
 
 [[nodiscard]] constexpr bool HasPageOverlap(RangeRelation relation) noexcept {
 	return relation == RangeRelation::SharedPageOnly || HasByteOverlap(relation);
+}
+
+// Classifies one range against an atomic set of owner ranges. A byte hit may retire the owner only
+// when every range is contained; page-only neighbors remain disjoint at this layer.
+[[nodiscard]] constexpr std::optional<RangeSetCoverage>
+ClassifyRangeSetCoverage(GuestRange range, std::span<const GuestRange> owner_ranges) noexcept {
+	if (!range.IsValid() || owner_ranges.empty()) {
+		return std::nullopt;
+	}
+	bool overlaps = false;
+	bool contains_all = true;
+	for (const auto owner_range: owner_ranges) {
+		const auto relation = ClassifyRangeRelation(range, owner_range, 1);
+		if (!relation.has_value()) {
+			return std::nullopt;
+		}
+		overlaps |= HasByteOverlap(*relation);
+		contains_all &=
+		    *relation == RangeRelation::Exact || *relation == RangeRelation::Contains;
+	}
+	if (!overlaps) {
+		return RangeSetCoverage::Disjoint;
+	}
+	return contains_all ? RangeSetCoverage::ContainsAll : RangeSetCoverage::Partial;
 }
 
 } // namespace Libs::Graphics

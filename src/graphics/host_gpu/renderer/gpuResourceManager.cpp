@@ -7,6 +7,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <optional>
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics)
@@ -56,7 +58,10 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// Stop command-processor jobs before taking the shared cache transaction. External readback
 	// workers inherit this paused state and therefore never form resource -> submission lock
 	// inversion.
-	GraphicsRunSubmissionLock submissions;
+	std::optional<GraphicsRunSubmissionLock> submissions;
+	if (GraphicsRunIsInitialized()) {
+		submissions.emplace();
+	}
 	ResourceMutex::FaultScope fault(m_resource_mutex);
 	return m_page_manager.HandleFault(access, fault_vaddr);
 }
@@ -90,7 +95,10 @@ void GpuResourceManager::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	GraphicsRunSubmissionLock submissions;
+	std::optional<GraphicsRunSubmissionLock> submissions;
+	if (GraphicsRunIsInitialized()) {
+		submissions.emplace();
+	}
 	ResourceMutex::FaultScope fault(m_resource_mutex);
 	handle_range();
 }
@@ -107,8 +115,18 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, GpuAccess ac
 	if (!IsMapped(vaddr, size)) {
 		EXIT("cannot unmap an unmapped GPU resource range\n");
 	}
-	m_texture_cache.UnmapMemory(vaddr, size);
-	m_buffer_cache.UnmapMemory(vaddr, size);
+	if (m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("cannot unmap from a pre-owned resource transaction\n");
+	}
+	std::optional<GraphicsRunSubmissionLock> submissions;
+	if (GraphicsRunIsInitialized()) {
+		submissions.emplace();
+	}
+	std::lock_guard          transaction(m_resource_mutex);
+	m_texture_cache.ValidateUnmapMemory(vaddr, size);
+	m_buffer_cache.ValidateUnmapMemory(vaddr, size);
+	m_texture_cache.CommitUnmapMemory(vaddr, size);
+	m_buffer_cache.CommitUnmapMemory(vaddr, size);
 	m_page_manager.OnGpuUnmap(vaddr, size, access);
 }
 

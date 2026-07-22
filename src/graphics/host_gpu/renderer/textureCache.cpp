@@ -516,6 +516,7 @@ std::vector<TextureCache::CachedImage*> TextureCache::FindImagesInRegionsLocked(
 }
 
 struct TextureCache::ReadbackWorker {
+	enum class Purpose : uint8_t { Fault, AliasTransition, Unmap };
 	enum class State : uint32_t {
 		Idle,
 		Claimed,
@@ -544,6 +545,21 @@ struct TextureCache::ReadbackWorker {
 			return {ranges.data(), count};
 		}
 	};
+	struct PreparedDepthReadback {
+		CachedImage*                 image = nullptr;
+		std::vector<ImageBufferCopy> regions;
+		std::vector<GpuTileInfo>     gpu_infos;
+		uint64_t                     transfer_size = 0;
+		bool                         has_stencil   = false;
+	};
+	struct PreparedColorReadback {
+		CachedImage*                 image = nullptr;
+		ColorImageTransferInfo       info;
+		std::vector<ImageBufferCopy> regions;
+		std::vector<GpuTileInfo>     gpu_infos;
+		bool                         tiled = false;
+	};
+	using PreparedReadback = std::variant<PreparedDepthReadback, PreparedColorReadback>;
 	static_assert(std::atomic<State>::is_always_lock_free);
 
 	explicit ReadbackWorker(TextureCache& owner): cache(owner), thread([this] { Run(); }) {}
@@ -653,9 +669,11 @@ struct TextureCache::ReadbackWorker {
 		}
 	}
 
-	[[nodiscard]] ReadbackTransfer DownloadDepthTarget(CachedImage& cached,
-	                                                   bool         require_fault_range = true) {
+	[[nodiscard]] PreparedDepthReadback PrepareDepthTarget(CachedImage& cached,
+	                                                       Purpose purpose = Purpose::Fault) {
 		const auto& info = cached.DepthTargetDesc();
+		const bool require_fault_range = purpose == Purpose::Fault;
+		const bool allow_buffer_overlap = purpose == Purpose::Unmap;
 		if (info.samples != 1 || cached.image->samples != 1) {
 			EXIT("TextureCache: multisampled depth-image readback is unsupported, samples=%u/%u\n",
 			     info.samples, cached.image->samples);
@@ -741,9 +759,11 @@ struct TextureCache::ReadbackWorker {
 		const bool meta_overlap =
 		    cache.HasMetaOverlapLocked(info.address, info.size) ||
 		    (has_stencil && cache.HasMetaOverlapLocked(info.stencil_address, info.stencil_size));
-		const bool buffer_overlap = cache.m_buffer_cache.HasPageOverlap(info.address, info.size) ||
-		                            (has_stencil && cache.m_buffer_cache.HasPageOverlap(
-		                                                info.stencil_address, info.stencil_size));
+		const bool buffer_overlap =
+		    !allow_buffer_overlap &&
+		    (cache.m_buffer_cache.HasPageOverlap(info.address, info.size) ||
+		     (has_stencil && cache.m_buffer_cache.HasPageOverlap(info.stencil_address,
+		                                                         info.stencil_size)));
 		const auto transfer_size  = info.size + info.stencil_size;
 		if (depth_linear_size > depth_slice_size ||
 		    (has_stencil && stencil_linear_elements > stencil_slice_size) ||
@@ -811,13 +831,20 @@ struct TextureCache::ReadbackWorker {
 				gpu_infos.push_back(tile);
 			}
 		}
-		guest.resize(transfer_size);
-		Transfer::DownloadTiledImage(guest.data(), transfer_size, transfer_size, gpu_infos, regions,
-		                             *cached.image, cached.image->layout);
+		return {&cached, std::move(regions), std::move(gpu_infos), transfer_size, has_stencil};
+	}
+
+	[[nodiscard]] ReadbackTransfer Execute(PreparedDepthReadback& prepared) {
+		auto&       cached = *prepared.image;
+		const auto& info   = cached.DepthTargetDesc();
+		guest.resize(prepared.transfer_size);
+		Transfer::DownloadTiledImage(guest.data(), prepared.transfer_size, prepared.transfer_size,
+		                             prepared.gpu_infos, prepared.regions, *cached.image,
+		                             cached.image->layout);
 		Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		ReadbackTransfer transfer;
 		transfer.Add(info.address, info.size);
-		if (has_stencil) {
+		if (prepared.has_stencil) {
 			Libs::LibKernel::Memory::WriteBacking(info.stencil_address, guest.data() + info.size,
 			                                      info.stencil_size);
 			transfer.Add(info.stencil_address, info.stencil_size);
@@ -825,7 +852,8 @@ struct TextureCache::ReadbackWorker {
 		return transfer;
 	}
 
-	[[nodiscard]] ReadbackTransfer DownloadColorImage(CachedImage& cached) {
+	[[nodiscard]] PreparedColorReadback PrepareColorImage(CachedImage& cached,
+	                                                     Purpose purpose = Purpose::Fault) {
 		const bool storage = cached.kind == CachedImage::Kind::StorageTexture;
 		const bool target  = cached.kind == CachedImage::Kind::RenderTarget;
 		const auto info =
@@ -873,7 +901,8 @@ struct TextureCache::ReadbackWorker {
 		}
 		const auto slice_size     = info.size / layers;
 		const bool meta_overlap   = cache.HasMetaOverlapLocked(info.address, info.size);
-		const bool buffer_overlap = cache.m_buffer_cache.HasPageOverlap(info.address, info.size);
+		const bool buffer_overlap = purpose != Purpose::Unmap &&
+		                            cache.m_buffer_cache.HasPageOverlap(info.address, info.size);
 		if (meta_overlap || buffer_overlap) {
 			EXIT("TextureCache: color-image readback storage is unsupported, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " meta=%d buffer=%d kind=%u\n",
@@ -906,27 +935,49 @@ struct TextureCache::ReadbackWorker {
 			regions = Transfer::MakeLayeredImageBufferCopies(layers, slice_size, info.pitch,
 			                                                 info.width, info.height);
 		}
+		std::vector<GpuTileInfo> gpu_infos;
 		if (gpu_tiled) {
-			std::vector<GpuTileInfo> infos;
 			const auto format = storage
 			                        ? cached.ImageDesc().format
 			                        : ImageOps::RenderTargetTransferFormat(info.bytes_per_element);
-			guest.resize(info.size);
 			EXIT_NOT_IMPLEMENTED(!TextureBuildGpuTileInfos(info.size, tiled_regions, tiled_layout,
-			                                               format, layers, info.levels, infos));
-			Transfer::DownloadTiledImage(guest.data(), info.size, info.size, infos, regions,
-			                             *cached.image, cached.image->layout);
+			                                               format, layers, info.levels, gpu_infos));
+		}
+		return {&cached, info, std::move(regions), std::move(gpu_infos), gpu_tiled};
+	}
+
+	[[nodiscard]] ReadbackTransfer Execute(PreparedColorReadback& prepared) {
+		auto&       cached = *prepared.image;
+		const auto& info   = prepared.info;
+		if (prepared.tiled) {
+			guest.resize(info.size);
+			Transfer::DownloadTiledImage(guest.data(), info.size, info.size, prepared.gpu_infos,
+			                             prepared.regions, *cached.image, cached.image->layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		} else {
 			download.resize(info.size);
 			std::fill(download.begin(), download.end(), 0);
-			Transfer::DownloadImage(download.data(), info.size, regions, *cached.image,
+			Transfer::DownloadImage(download.data(), info.size, prepared.regions, *cached.image,
 			                        cached.image->layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
 		}
 		ReadbackTransfer transfer;
 		transfer.Add(info.address, info.size);
 		return transfer;
+	}
+
+	[[nodiscard]] PreparedReadback Prepare(CachedImage& cached, Purpose purpose) {
+		return cached.kind == CachedImage::Kind::DepthTarget
+		           ? PreparedReadback {PrepareDepthTarget(cached, purpose)}
+		           : PreparedReadback {PrepareColorImage(cached, purpose)};
+	}
+
+	[[nodiscard]] ReadbackTransfer Execute(PreparedReadback& prepared) {
+		return std::visit([this](auto& item) { return Execute(item); }, prepared);
+	}
+
+	[[nodiscard]] static CachedImage& Owner(PreparedReadback& prepared) {
+		return *std::visit([](auto& item) { return item.image; }, prepared);
 	}
 
 	void Run() noexcept {
@@ -970,8 +1021,8 @@ struct TextureCache::ReadbackWorker {
 				     selected != nullptr ? static_cast<const void*>(selected->image) : nullptr);
 			}
 
-			const auto transfer =
-			    depth_target ? DownloadDepthTarget(*selected) : DownloadColorImage(*selected);
+			auto       prepared = Prepare(*selected, Purpose::Fault);
+			const auto transfer = Execute(prepared);
 
 			if (!cache.m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 				EXIT("TextureCache: readback fault page is not GPU-modified, addr=0x%016" PRIx64
@@ -1030,6 +1081,13 @@ struct TextureCache::ReadbackWorker {
 	std::vector<uint8_t> download;
 	std::vector<uint8_t> guest;
 	std::thread          thread;
+};
+
+struct TextureCache::UnmapPlan {
+	GuestRange                                range;
+	std::vector<std::shared_ptr<CachedImage>> images;
+	std::vector<ReadbackWorker::PreparedReadback> materializations;
+	std::vector<uint64_t>                     metadata_addresses;
 };
 
 void TextureCache::RequireRetirementIsolation(const std::vector<CachedImage*>& retire,
@@ -1175,10 +1233,8 @@ void TextureCache::RetireDepthMetadataLocked(const std::vector<CachedImage*>& re
 
 void TextureCache::MaterializeImagesToGuestLocked(
     const std::vector<std::shared_ptr<CachedImage>>& images) {
-	if (std::any_of(images.begin(), images.end(),
-	                [](const auto& cached) { return cached->gpu_modified; })) {
-		Transfer::WaitForGraphicsIdle();
-	}
+	std::vector<ReadbackWorker::PreparedReadback> materializations;
+	materializations.reserve(images.size());
 	for (const auto& cached: images) {
 		if (!cached->gpu_modified) {
 			continue;
@@ -1194,14 +1250,20 @@ void TextureCache::MaterializeImagesToGuestLocked(
 			EXIT("TextureCache: unsupported image recreation source kind %u\n",
 			     static_cast<uint32_t>(cached->kind));
 		}
-		const auto transfer = cached->kind == CachedImage::Kind::DepthTarget
-		                          ? m_readback->DownloadDepthTarget(*cached, false)
-		                          : m_readback->DownloadColorImage(*cached);
+		materializations.push_back(
+		    m_readback->Prepare(*cached, ReadbackWorker::Purpose::AliasTransition));
+	}
+	if (!materializations.empty()) {
+		Transfer::WaitForGraphicsIdle();
+	}
+	for (auto& prepared: materializations) {
+		auto&      cached   = ReadbackWorker::Owner(prepared);
+		const auto transfer = m_readback->Execute(prepared);
 		for (const auto& range: transfer.Ranges()) {
 			m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
 			                                            [](uint64_t, uint64_t) noexcept {});
 		}
-		cached->gpu_modified = false;
+		cached.gpu_modified = false;
 	}
 }
 
@@ -3913,92 +3975,124 @@ bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint
 	return true;
 }
 
-void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
+TextureCache::UnmapPlan TextureCache::BuildUnmapPlanLocked(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("TextureCache: invalid unmap range, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	std::lock_guard      transaction(m_resource_mutex);
-	FaultSafeTextureLock lock(this, m_lock);
-	const auto           end = vaddr + size;
-	const auto           image_candidates = FindImagesInRegionLocked(vaddr, size, true);
-	std::vector<std::shared_ptr<CachedImage>> unmapped_images;
+	UnmapPlan plan {{vaddr, size}};
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (ImagePageRangesOverlap(vaddr, size, address, meta.size) &&
-		    (vaddr > address || end < address + meta.size)) {
+		const auto relation = ClassifyRangeRelation(plan.range, {address, meta.size}, 1);
+		if (!relation.has_value()) {
+			EXIT("TextureCache: invalid metadata range during unmap\n");
+		}
+		if (HasByteOverlap(*relation) && *relation != RangeRelation::Exact &&
+		    *relation != RangeRelation::Contains) {
 			EXIT("TextureCache: partial metadata unmap is unsupported, unmap=0x%016" PRIx64
 			     "+0x%016" PRIx64 " metadata=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
 			     vaddr, size, address, meta.size);
 		}
-	}
-	for (auto* cached: image_candidates) {
-		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-			if (ImagePageRangesOverlap(vaddr, size, cached->Address(i), cached->Size(i)) &&
-			    (vaddr > cached->Address(i) || end < cached->Address(i) + cached->Size(i))) {
-				EXIT("TextureCache: partial image unmap is unsupported, unmap=0x%016" PRIx64
-				     "+0x%016" PRIx64 " image=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
-				     vaddr, size, cached->Address(i), cached->Size(i));
-			}
+		if (*relation == RangeRelation::Exact || *relation == RangeRelation::Contains) {
+			plan.metadata_addresses.push_back(address);
 		}
-		if (cached->OverlapsRange(vaddr, size, false) &&
-		    cached->kind == CachedImage::Kind::VideoOut) {
+	}
+	for (auto* cached: FindImagesInRegionLocked(vaddr, size, true)) {
+		std::array<GuestRange, 2> ranges {};
+		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
+			ranges[i] = {cached->Address(i), cached->Size(i)};
+		}
+		const auto coverage = ClassifyRangeSetCoverage(
+		    plan.range, std::span<const GuestRange> {ranges.data(), cached->RangeCount()});
+		if (!coverage.has_value()) {
+			EXIT("TextureCache: invalid image range set during unmap\n");
+		}
+		if (*coverage == RangeSetCoverage::Disjoint) {
+			continue;
+		}
+		if (*coverage == RangeSetCoverage::Partial) {
+			EXIT("TextureCache: partial image unmap is unsupported, unmap=0x%016" PRIx64
+			     "+0x%016" PRIx64 " image=0x%016" PRIx64 "+0x%016" PRIx64
+			     " ranges=%u\n",
+			     vaddr, size, cached->Address(), cached->Size(), cached->RangeCount());
+		}
+		if (cached->kind == CachedImage::Kind::VideoOut) {
 			EXIT("TextureCache: registered video-out surface must be unregistered before unmap, "
 			     "unmap=0x%016" PRIx64 "+0x%016" PRIx64 " image=0x%016" PRIx64 "+0x%016" PRIx64
 			     " buffer_modified=%d\n",
 			     vaddr, size, cached->Address(), cached->Size(), cached->buffer_modified);
 		}
-		if (cached->OverlapsRange(vaddr, size, false)) {
-			unmapped_images.push_back(FindImageOwnerLocked(*cached));
-		}
-	}
-	for (const auto& cached: unmapped_images) {
-		if (std::find(m_images.begin(), m_images.end(), cached) == m_images.end()) {
+		auto owner = FindImageOwnerLocked(*cached);
+		if (std::find(m_images.begin(), m_images.end(), owner) == m_images.end()) {
 			EXIT("TextureCache: indexed unmap owner is missing from the image cache\n");
 		}
+		if (cached->gpu_modified) {
+			const bool materializable = cached->kind == CachedImage::Kind::StorageTexture ||
+			                            cached->kind == CachedImage::Kind::RenderTarget ||
+			                            cached->kind == CachedImage::Kind::DepthTarget;
+			const bool cpu_dirty = cached->kind == CachedImage::Kind::StorageTexture &&
+			                       cached->ImageDesc().IsCpuDirty();
+			if (!materializable || cached->buffer_modified || cpu_dirty) {
+				EXIT("TextureCache: GPU-owned image cannot be materialized for unmap, kind=%u "
+				     "buffer_modified=%d cpu_dirty=%d\n",
+				     static_cast<uint32_t>(cached->kind), cached->buffer_modified, cpu_dirty);
+			}
+			for (uint32_t i = 0; i < cached->RangeCount(); i++) {
+				if (!m_memory_tracker.IsRegionGpuModified(cached->Address(i), cached->Size(i))) {
+					EXIT("TextureCache: GPU-owned unmap image lacks tracker ownership, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     cached->Address(i), cached->Size(i));
+				}
+				if (m_buffer_cache.IsRegionGpuModified(cached->Address(i), cached->Size(i))) {
+					EXIT("TextureCache: unmap has competing GPU image and buffer ownership, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     cached->Address(i), cached->Size(i));
+				}
+			}
+		}
+		plan.images.push_back(std::move(owner));
 	}
-	std::vector<uint64_t> retire_depth_metadata;
-	for (const auto& cached: unmapped_images) {
+	for (const auto& cached: plan.images) {
 		if (cached->kind != CachedImage::Kind::DepthTarget ||
 		    cached->DepthTargetDesc().htile_address == 0) {
 			continue;
 		}
 		const bool retained_owner =
 		    std::any_of(m_images.begin(), m_images.end(), [&](const auto& other) {
-			    return other.get() != cached.get() &&
+			    return std::find(plan.images.begin(), plan.images.end(), other) == plan.images.end() &&
 			           other->kind == CachedImage::Kind::DepthTarget &&
-			           !other->OverlapsRange(vaddr, size, false) &&
 			           other->DepthTargetDesc().htile_address == cached->DepthTargetDesc().htile_address &&
 			           other->DepthTargetDesc().htile_size == cached->DepthTargetDesc().htile_size;
 		    });
 		if (!retained_owner &&
-		    std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(),
-		              cached->DepthTargetDesc().htile_address) == retire_depth_metadata.end()) {
-			retire_depth_metadata.push_back(cached->DepthTargetDesc().htile_address);
+		    std::find(plan.metadata_addresses.begin(), plan.metadata_addresses.end(),
+		              cached->DepthTargetDesc().htile_address) == plan.metadata_addresses.end()) {
+			plan.metadata_addresses.push_back(cached->DepthTargetDesc().htile_address);
 		}
 	}
-	for (const auto address: retire_depth_metadata) {
+	for (const auto address: plan.metadata_addresses) {
 		const auto meta  = m_surface_metas.find(address);
-		const auto owner = std::find_if(unmapped_images.begin(), unmapped_images.end(),
+		const auto owner = std::find_if(plan.images.begin(), plan.images.end(),
 		                                [&](const auto& cached) {
 			return cached->kind == CachedImage::Kind::DepthTarget &&
 			       cached->DepthTargetDesc().htile_address == address;
 		});
-		if (meta == m_surface_metas.end() || owner == unmapped_images.end() ||
-		    meta->second.size != (*owner)->DepthTargetDesc().htile_size) {
+		const bool depth_metadata = owner != plan.images.end();
+		if (meta == m_surface_metas.end() ||
+		    (depth_metadata && meta->second.size != (*owner)->DepthTargetDesc().htile_size)) {
 			EXIT("TextureCache: retiring depth image has invalid HTile registration, "
 			     "unmap=0x%016" PRIx64 "+0x%016" PRIx64 " metadata=0x%016" PRIx64
 			     " registered=0x%016" PRIx64 " expected=0x%016" PRIx64 "\n",
 			     vaddr, size, address, meta != m_surface_metas.end() ? meta->second.size : 0,
-			     owner != unmapped_images.end() ? (*owner)->DepthTargetDesc().htile_size : 0);
+			     depth_metadata ? (*owner)->DepthTargetDesc().htile_size : 0);
 		}
 	}
 	std::vector<ImageRetirementRange> metadata_ranges;
 	metadata_ranges.reserve(m_surface_metas.size());
 	for (const auto& [address, meta]: m_surface_metas) {
-		const bool retiring = ImageRangeOverlaps(vaddr, size, address, meta.size) ||
-		                      std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(),
-		                                address) != retire_depth_metadata.end();
+		const bool retiring = std::find(plan.metadata_addresses.begin(),
+		                                plan.metadata_addresses.end(), address) !=
+		                      plan.metadata_addresses.end();
 		metadata_ranges.push_back({address, meta.size, retiring});
 	}
 	const auto metadata_conflict = FindImageRetirementConflict(metadata_ranges);
@@ -4010,28 +4104,53 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     " retained=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
 		     vaddr, size, retired.address, retired.size, retained.address, retained.size);
 	}
-	if (!unmapped_images.empty()) {
+	plan.materializations.reserve(plan.images.size());
+	for (const auto& cached: plan.images) {
+		if (cached->gpu_modified) {
+			plan.materializations.push_back(
+			    m_readback->Prepare(*cached, ReadbackWorker::Purpose::Unmap));
+		}
+	}
+	return plan;
+}
+
+void TextureCache::ValidateUnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (!m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("TextureCache: unmap validation requires the shared resource transaction\n");
+	}
+	FaultSafeTextureLock lock(this, m_lock);
+	(void)BuildUnmapPlanLocked(vaddr, size);
+}
+
+void TextureCache::CommitUnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (!m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("TextureCache: unmap commit requires the shared resource transaction\n");
+	}
+	FaultSafeTextureLock lock(this, m_lock);
+	auto                 plan = BuildUnmapPlanLocked(vaddr, size);
+	if (!plan.materializations.empty()) {
 		Transfer::WaitForGraphicsIdle();
 	}
-	for (const auto& cached: unmapped_images) {
-		if (!cached->gpu_modified) {
-			continue;
+	for (auto& prepared: plan.materializations) {
+		auto&      cached   = ReadbackWorker::Owner(prepared);
+		const auto transfer = m_readback->Execute(prepared);
+		for (const auto& range: transfer.Ranges()) {
+			m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
+			                                            [](uint64_t, uint64_t) noexcept {});
 		}
-		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
-		}
-		cached->gpu_modified = false;
+		cached.gpu_modified = false;
 	}
 	for (auto it = m_surface_metas.begin(); it != m_surface_metas.end();) {
-		const bool allocation_unmapped =
-		    ImageRangeOverlaps(vaddr, size, it->first, it->second.size);
-		const bool depth_owner_retired =
-		    std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(), it->first) !=
-		    retire_depth_metadata.end();
-		if (!allocation_unmapped && !depth_owner_retired) {
+		if (std::find(plan.metadata_addresses.begin(), plan.metadata_addresses.end(), it->first) ==
+		    plan.metadata_addresses.end()) {
 			++it;
 			continue;
 		}
+		const bool depth_owner_retired =
+		    std::any_of(plan.images.begin(), plan.images.end(), [&](const auto& cached) {
+			    return cached->kind == CachedImage::Kind::DepthTarget &&
+			           cached->DepthTargetDesc().htile_address == it->first;
+		    });
 		if (depth_owner_retired) {
 			LOGF("TextureCache: retiring HTile metadata with depth image, "
 			     "unmap=0x%016" PRIx64 "+0x%016" PRIx64 " metadata=0x%016" PRIx64 "+0x%016" PRIx64
@@ -4045,13 +4164,12 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_metadata_tracker.UntrackMemory(it->first, it->second.size);
 		it = m_surface_metas.erase(it);
 	}
-	m_memory_tracker.UntrackMemory(vaddr, size);
-	for (const auto& cached: unmapped_images) {
+	for (const auto& cached: plan.images) {
 		const auto owner = std::find(m_images.begin(), m_images.end(), cached);
 		if (owner == m_images.end()) {
 			EXIT("TextureCache: unmapped image owner disappeared\n");
 		}
-		UnregisterImageLocked(*cached, false);
+		UnregisterImageLocked(*cached, true);
 		m_images.erase(owner);
 	}
 }

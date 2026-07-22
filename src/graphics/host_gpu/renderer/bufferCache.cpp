@@ -584,9 +584,12 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 	return true;
 }
 
-void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
-	GraphicsRunSubmissionLock submissions;
-	FaultSafeCacheLock        lock(this, m_mutex);
+void BufferCache::ValidateUnmapMemoryLocked(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid unmap range, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
 	for (const auto& [begin, cached]: m_buffers) {
 		if (vaddr < begin + cached->size && begin < vaddr + size &&
 		    (vaddr > begin || size < cached->size || vaddr + size < begin + cached->size)) {
@@ -595,6 +598,34 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			     vaddr, size, begin, cached->size);
 		}
 	}
+	for (const auto& [begin, cached]: m_buffers) {
+		const auto offset = begin >= vaddr ? begin - vaddr : UINT64_MAX;
+		if (offset > size || cached->size > size - offset ||
+		    !m_memory_tracker.IsRegionGpuModified(begin, cached->size)) {
+			continue;
+		}
+		if (m_gpu_modified_ranges.Intersections(begin, cached->size).empty()) {
+			EXIT("BufferCache: GPU-modified buffer has no dirty ranges, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     begin, cached->size);
+		}
+	}
+}
+
+void BufferCache::ValidateUnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (!m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("BufferCache: unmap validation requires the shared resource transaction\n");
+	}
+	FaultSafeCacheLock lock(this, m_mutex);
+	ValidateUnmapMemoryLocked(vaddr, size);
+}
+
+void BufferCache::CommitUnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (!m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("BufferCache: unmap commit requires the shared resource transaction\n");
+	}
+	FaultSafeCacheLock lock(this, m_mutex);
+	ValidateUnmapMemoryLocked(vaddr, size);
 	for (const auto& [begin, cached]: m_buffers) {
 		const auto offset = begin >= vaddr ? begin - vaddr : UINT64_MAX;
 		if (offset > size || cached->size > size - offset ||

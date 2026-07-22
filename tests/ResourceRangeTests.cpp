@@ -6,10 +6,12 @@
 namespace {
 
 using Libs::Graphics::ClassifyRangeRelation;
+using Libs::Graphics::ClassifyRangeSetCoverage;
 using Libs::Graphics::GuestRange;
 using Libs::Graphics::HasByteOverlap;
 using Libs::Graphics::HasPageOverlap;
 using Libs::Graphics::RangeRelation;
+using Libs::Graphics::RangeSetCoverage;
 
 void Check(bool condition, const char* message) {
 	if (!condition) {
@@ -74,6 +76,26 @@ void CheckPredicates() {
 	      "page neighbors overlap pages but not bytes");
 }
 
+void CheckRangeSetCoverage() {
+	constexpr GuestRange depth_stencil[] {{0x10000, 0x1000}, {0x14000, 0x1000}};
+	Check(ClassifyRangeSetCoverage({0x10000, 0x5000}, depth_stencil) ==
+	          RangeSetCoverage::ContainsAll,
+	      "one unmap containing both planes covers the owner");
+	Check(ClassifyRangeSetCoverage({0x10000, 0x1000}, depth_stencil) ==
+	          RangeSetCoverage::Partial,
+	      "an unmap containing only depth cannot retire depth and stencil");
+	Check(ClassifyRangeSetCoverage({0x10800, 0x4000}, depth_stencil) ==
+	          RangeSetCoverage::Partial,
+	      "partial intersections cannot retire a multi-range owner");
+	Check(ClassifyRangeSetCoverage({0x0ff00, 0x80}, depth_stencil) ==
+	          RangeSetCoverage::Disjoint,
+	      "a page-only neighbor is byte-disjoint from the owner");
+	Check(!ClassifyRangeSetCoverage({0x10000, 0}, depth_stencil).has_value(),
+	      "an empty unmap range is invalid");
+	Check(!ClassifyRangeSetCoverage({0x10000, 0x1000}, {}).has_value(),
+	      "an owner without ranges is invalid");
+}
+
 [[nodiscard]] constexpr RangeRelation Reverse(RangeRelation relation) {
 	switch (relation) {
 		case RangeRelation::Contains: return RangeRelation::ContainedBy;
@@ -121,6 +143,7 @@ int main() {
 	CheckRelations();
 	CheckBoundaries();
 	CheckPredicates();
+	CheckRangeSetCoverage();
 	CheckAlgebra();
 	std::puts("ResourceRangeTests: all cases passed");
 	return 0;

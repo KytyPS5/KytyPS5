@@ -26,6 +26,7 @@ void GraphicsRunWait();
 void GraphicsRunDone();
 int  GraphicsRunGetFrameNum();
 [[nodiscard]] bool              GraphicsRunIsCommandProcessorThread() noexcept;
+[[nodiscard]] bool              GraphicsRunIsInitialized() noexcept;
 [[nodiscard]] CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept;
 void                            GraphicsRunFinishCommandProcessors();
 [[nodiscard]] bool              GraphicsRunSubmissionLockHeld() noexcept;

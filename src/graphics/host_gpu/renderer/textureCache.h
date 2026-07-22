@@ -31,6 +31,7 @@ struct VulkanMemory;
 class BufferCache;
 class CommandBuffer;
 class DummyTextureCache;
+class GpuResourceManager;
 class ResourceMutex;
 
 [[nodiscard]] bool IsExactRenderTargetMipStorage(const ImageInfo& sampled, const ImageInfo& storage,
@@ -116,14 +117,14 @@ public:
 	[[nodiscard]] bool       TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear);
 	[[nodiscard]] bool       InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                          PageFaultPhase phase) noexcept;
-	void                     UnmapMemory(uint64_t vaddr, uint64_t size);
-
 	VulkanImage& GetDummySampledTexture(bool uint_format, bool image_3d);
 	VulkanImage& GetDummyStorageTexture(bool uint_format, bool image_3d);
 
 private:
+	friend class GpuResourceManager;
 	struct CachedImage;
 	struct AliasRetirementPlan;
+	struct UnmapPlan;
 	using ImageOwnerIndex = MultiRangePageOwnerIndex<CachedImage*>;
 	struct ReadbackWorker;
 	struct MetaDataInfo {
@@ -164,6 +165,9 @@ private:
 	                                         uint64_t write_size);
 	void SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
 	                                         uint64_t write_size);
+	[[nodiscard]] UnmapPlan BuildUnmapPlanLocked(uint64_t vaddr, uint64_t size);
+	void                    ValidateUnmapMemory(uint64_t vaddr, uint64_t size);
+	void                    CommitUnmapMemory(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                             m_graphics;
 	std::unique_ptr<DummyTextureCache>                          m_dummy_textures;

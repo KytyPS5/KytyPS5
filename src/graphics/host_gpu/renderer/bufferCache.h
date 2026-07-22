@@ -16,6 +16,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct VulkanBuffer;
 class CommandBuffer;
+class GpuResourceManager;
 class TextureCache;
 class ResourceMutex;
 
@@ -57,7 +58,6 @@ public:
 
 	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,
 	                                         bool is_formatted = false);
@@ -80,6 +80,10 @@ public:
 	void ResetNullBuffer();
 
 private:
+	friend class GpuResourceManager;
+	void ValidateUnmapMemory(uint64_t vaddr, uint64_t size);
+	void CommitUnmapMemory(uint64_t vaddr, uint64_t size);
+	void ValidateUnmapMemoryLocked(uint64_t vaddr, uint64_t size);
 	struct CachedBuffer;
 	struct ReadbackWorker;
 

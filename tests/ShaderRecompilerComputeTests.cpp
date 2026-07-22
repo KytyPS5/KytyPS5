@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptors.h"
+#include "graphics/host_gpu/renderer/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1308,13 +1309,9 @@ public:
     std::memset(memory, 0, allocation_size);
 
     EnsureRuntimeContext();
-    ResourceMutex resource_mutex;
-    PageManager page_manager(RejectUnexpectedPageFault, nullptr);
-    BufferCache buffer_cache(m_runtime_context, page_manager, resource_mutex);
-    TextureCache texture_cache(m_runtime_context, page_manager, buffer_cache,
-                               resource_mutex);
-    buffer_cache.SetTextureCache(texture_cache);
-    page_manager.OnGpuMap(base, allocation_size);
+    GpuResourceManager resources(m_runtime_context);
+    auto& texture_cache = resources.GetTextureCache();
+    resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
 
     constexpr auto format =
         Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
@@ -1390,8 +1387,7 @@ public:
                   !gpu_page.gpu_image_bytes && gpu_page.non_sampled_pages,
               "GPU ownership escaped the target's exact byte range");
 
-      texture_cache.UnmapMemory(base, allocation_size);
-      page_manager.OnGpuUnmap(base, allocation_size);
+      resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
     }
     Require(name, "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
             "VirtualFree failed");
@@ -9812,17 +9808,6 @@ void CheckEmbeddedFetchVertexOffset() {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-struct CacheFaultContext {
-  TextureCache *texture = nullptr;
-};
-
-bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
-                uint64_t size, PageFaultPhase phase) noexcept {
-  auto *context = static_cast<CacheFaultContext *>(opaque);
-  return context != nullptr && context->texture != nullptr &&
-         context->texture->InvalidateMemory(access, vaddr, size, phase);
-}
-
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
   (void)TextureGetRenderTargetFormat(12u, 7u, 3u);
   std::_Exit(0x7f);
@@ -11861,15 +11846,9 @@ void CheckOverlappingMetadataViews() {
           memory == reinterpret_cast<void *>(base),
           "fixed VirtualAlloc failed");
 
-  ResourceMutex resource_mutex;
-  CacheFaultContext fault_context;
-  PageManager page_manager(CacheFault, &fault_context);
-  BufferCache buffer_cache(context, page_manager, resource_mutex);
-  TextureCache texture_cache(context, page_manager, buffer_cache,
-                             resource_mutex);
-  fault_context.texture = &texture_cache;
-  buffer_cache.SetTextureCache(texture_cache);
-  page_manager.OnGpuMap(base, allocation_size);
+  GpuResourceManager resources(context);
+  auto& texture_cache = resources.GetTextureCache();
+  resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
 
   texture_cache.RegisterMeta(base, metadata_size);
   texture_cache.RegisterMeta(second, metadata_size);
@@ -11886,14 +11865,13 @@ void CheckOverlappingMetadataViews() {
               texture_cache.IsMetaCleared(second, 0),
           "overlapping metadata clears were not retained independently");
   Require("OverlappingMetadataViews", "fault",
-          page_manager.HandleFault(PageFaultAccess::Write, second),
+          resources.HandleFault(PageFaultAccess::Write, second),
           "shared metadata page did not transfer to CPU ownership");
   Require("OverlappingMetadataViews", "ownership",
           !texture_cache.QueryRegion(second, 0x1000).gpu_metadata_bytes,
           "shared metadata page retained GPU ownership after a CPU fault");
 
-  texture_cache.UnmapMemory(base, allocation_size);
-  page_manager.OnGpuUnmap(base, allocation_size);
+  resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
   Require("OverlappingMetadataViews", "free",
           VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "OverlappingMetadataViews");
@@ -11911,15 +11889,9 @@ void CheckQueryRegionAggregation() {
           memory == reinterpret_cast<void *>(base),
           "fixed VirtualAlloc failed");
 
-  ResourceMutex resource_mutex;
-  CacheFaultContext fault_context;
-  PageManager page_manager(CacheFault, &fault_context);
-  BufferCache buffer_cache(context, page_manager, resource_mutex);
-  TextureCache texture_cache(context, page_manager, buffer_cache,
-                             resource_mutex);
-  fault_context.texture = &texture_cache;
-  buffer_cache.SetTextureCache(texture_cache);
-  page_manager.OnGpuMap(base, allocation_size);
+  GpuResourceManager resources(context);
+  auto& texture_cache = resources.GetTextureCache();
+  resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
 
   const auto empty = texture_cache.QueryRegion(base + 0x20, 0x40);
   Require("QueryRegionAggregation", "empty",
@@ -11953,8 +11925,7 @@ void CheckQueryRegionAggregation() {
               !gpu_page_only.gpu_metadata_bytes,
           "GPU metadata ownership escaped its exact registered byte range");
 
-  texture_cache.UnmapMemory(base, allocation_size);
-  page_manager.OnGpuUnmap(base, allocation_size);
+  resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
   Require("QueryRegionAggregation", "free",
           VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "QueryRegionAggregation");
@@ -11973,15 +11944,9 @@ void CheckGpuMetadataReuse() {
           memory == reinterpret_cast<void *>(base),
           "fixed VirtualAlloc failed");
 
-  ResourceMutex resource_mutex;
-  CacheFaultContext fault_context;
-  PageManager page_manager(CacheFault, &fault_context);
-  BufferCache buffer_cache(context, page_manager, resource_mutex);
-  TextureCache texture_cache(context, page_manager, buffer_cache,
-                             resource_mutex);
-  fault_context.texture = &texture_cache;
-  buffer_cache.SetTextureCache(texture_cache);
-  page_manager.OnGpuMap(base, allocation_size);
+  GpuResourceManager resources(context);
+  auto& texture_cache = resources.GetTextureCache();
+  resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
 
   texture_cache.RegisterMeta(base, metadata_size, layers);
   TextureCache::MetaRangeInfo full_meta{};
@@ -12033,8 +11998,7 @@ void CheckGpuMetadataReuse() {
           "partial metadata overwrite retained identity or claimed an image "
           "transition");
 
-  texture_cache.UnmapMemory(base, allocation_size);
-  page_manager.OnGpuUnmap(base, allocation_size);
+  resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
   Require("GpuMetadataReuse", "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
           "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "GpuMetadataReuse");
@@ -13942,15 +13906,10 @@ void CheckHostDmaMetadataReuse() {
           "fixed VirtualAlloc failed");
   std::memset(memory + metadata_size, 0x5a, 0x1000);
 
-  ResourceMutex resource_mutex;
-  CacheFaultContext fault_context;
-  PageManager page_manager(CacheFault, &fault_context);
-  BufferCache buffer_cache(context, page_manager, resource_mutex);
-  TextureCache texture_cache(context, page_manager, buffer_cache,
-                             resource_mutex);
-  fault_context.texture = &texture_cache;
-  buffer_cache.SetTextureCache(texture_cache);
-  page_manager.OnGpuMap(base, allocation_size);
+  GpuResourceManager resources(context);
+  auto& buffer_cache = resources.GetBufferCache();
+  auto& texture_cache = resources.GetTextureCache();
+  resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
   texture_cache.RegisterMeta(base, metadata_size);
 
   Require("HostDmaMetadataReuse", "clear", texture_cache.ClearMeta(base),
@@ -13961,14 +13920,14 @@ void CheckHostDmaMetadataReuse() {
               protection.Protect == PAGE_READONLY,
           "virtual metadata was not write-watched");
   Require("HostDmaMetadataReuse", "copy fault",
-          page_manager.HandleFault(PageFaultAccess::Write, base),
+          resources.HandleFault(PageFaultAccess::Write, base),
           "copy destination did not transfer to CPU ownership");
   buffer_cache.CopyBuffer(nullptr, base, base + metadata_size, 0x1000);
   Require("HostDmaMetadataReuse", "copy",
           std::memcmp(memory, memory + metadata_size, 0x1000) == 0,
           "post-clear CPU DMA copy did not publish backing");
   Require("HostDmaMetadataReuse", "fill fault",
-          page_manager.HandleFault(PageFaultAccess::Write, base + 0x1000),
+          resources.HandleFault(PageFaultAccess::Write, base + 0x1000),
           "fill destination did not transfer to CPU ownership");
   buffer_cache.FillBuffer(nullptr, base + 0x1000, 0x1000, 0x11223344);
   Require("HostDmaMetadataReuse", "fill",
@@ -13982,8 +13941,7 @@ void CheckHostDmaMetadataReuse() {
               protection.Protect == PAGE_READWRITE,
           "CPU writes erased metadata identity or retained virtual ownership");
 
-  texture_cache.UnmapMemory(base, allocation_size);
-  page_manager.OnGpuUnmap(base, allocation_size);
+  resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
   Require("HostDmaMetadataReuse", "free",
           VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "HostDmaMetadataReuse");

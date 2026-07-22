@@ -1909,6 +1909,10 @@ bool GraphicsRunIsCommandProcessorThread() noexcept {
 	return g_current_run_cp != nullptr;
 }
 
+bool GraphicsRunIsInitialized() noexcept {
+	return g_gpu != nullptr;
+}
+
 CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept {
 	return g_current_run_cp;
 }

@@ -345,6 +345,14 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
+		// The template clobbers r12/r13 before consuming its inputs, so the inputs must
+		// be pinned to registers the template never touches (and which the SysV callee
+		// preserves): plain "r" constraints let the allocator place them in r12/r13,
+		// turning `callq *%[func]` into a jump through the saved host rsp.
+		register entry_func_t func_reg asm("rbx")      = func;
+		register uintptr_t    guest_rsp_reg asm("r14") = guest_rsp;
+		register uintptr_t    guest_rbp_reg asm("r15") = guest_rbp;
+
 		asm volatile("pushq %%r12\n\t"
 		             "pushq %%r13\n\t"
 		             "movq %%rsp, %%r12\n\t"
@@ -357,8 +365,8 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "popq %%r13\n\t"
 		             "popq %%r12\n\t"
 		             :
-		             : [func] "r"(func), "D"(params),
-		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func),
+		               [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
 		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
 		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
 		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
@@ -366,6 +374,9 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	}
 
 	uintptr_t guest_root_frame[2] = {};
+
+	register entry_func_t func_reg asm("rbx")      = func;
+	register uintptr_t    guest_rbp_reg asm("r14") = reinterpret_cast<uintptr_t>(guest_root_frame);
 
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
@@ -376,8 +387,8 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             :
-	             : [func] "r"(func), "D"(params),
-	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
+	             : [func] "r"(func_reg), "D"(params),
+	               "S"(atexit_func), [guest_rbp] "r"(guest_rbp_reg)
 	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
 	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");

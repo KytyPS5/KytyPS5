@@ -1,6 +1,7 @@
 #include "graphics/capture/gpuTrace.h"
 
 #include "common/file.h"
+#include "common/outputReservation.h"
 
 #include <algorithm>
 #include <array>
@@ -9,12 +10,19 @@
 #include <mutex>
 #include <xxhash.h>
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace Libs::Graphics::Capture {
 namespace {
 
 constexpr std::array<uint8_t, 8> Magic {'K', 'Y', 'C', 'A', 'P', '\r', '\n', 0x1a};
+constexpr std::array<uint8_t, 8> FooterMagic {'K', 'Y', 'C', 'E', 'N', 'D', '\r', '\n'};
 constexpr uint32_t HeaderSize       = 24;
 constexpr uint32_t RecordHeaderSize = 40;
+constexpr uint32_t FooterSize       = 32;
 constexpr uint32_t InterruptFlag    = 1u << 0u;
 constexpr uint32_t NoQueue          = UINT32_MAX;
 
@@ -121,6 +129,23 @@ bool IsKnownType(TraceEventType type) {
 	return false;
 }
 
+bool SyncParentDirectory(const std::filesystem::path& path) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	(void)path;
+	return true;
+#else
+	const auto parent = path.parent_path().empty() ? std::filesystem::path(".")
+	                                               : path.parent_path();
+	const int directory = open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+	if (directory < 0) {
+		return false;
+	}
+	const bool synced = fsync(directory) == 0;
+	close(directory);
+	return synced;
+#endif
+}
+
 bool ValidateEventShape(TraceEventType type, uint32_t queue, bool trigger_interrupt,
 	                    size_t primary_size, size_t secondary_size, std::string& error) {
 	switch (type) {
@@ -152,16 +177,22 @@ bool ValidateEventShape(TraceEventType type, uint32_t queue, bool trigger_interr
 
 struct TraceWriter::Private {
 	Common::File file;
+	std::unique_ptr<Common::OutputReservation> reservation;
 	std::mutex   mutex;
 	uint64_t     sequence = 0;
+	uint64_t     command_dwords = 0;
 	bool         open     = false;
+	bool         finalized = false;
 };
 
 TraceWriter::TraceWriter(std::filesystem::path path)
     : m_path(std::move(path)), m_private(std::make_unique<Private>()) {}
 
 TraceWriter::~TraceWriter() {
-	Close();
+	std::string ignored;
+	if (!Finalize(ignored)) {
+		CloseFile();
+	}
 }
 
 std::unique_ptr<TraceWriter> TraceWriter::Create(const std::filesystem::path& path,
@@ -182,6 +213,14 @@ bool TraceWriter::Open(std::string& error) {
 	if (!m_path.parent_path().empty() &&
 	    !Common::File::CreateDirectories(m_path.parent_path())) {
 		error = "cannot create capture directory";
+		return false;
+	}
+	m_private->reservation = Common::OutputReservation::Acquire(m_path, error);
+	if (m_private->reservation == nullptr) {
+		return false;
+	}
+	if (Common::File::IsFileExisting(m_path)) {
+		error = "refusing to overwrite an existing capture file";
 		return false;
 	}
 	if (!m_private->file.Create(m_path)) {
@@ -264,16 +303,53 @@ bool TraceWriter::Record(TraceEventType type, uint32_t queue, uint32_t flags,
 		error = "cannot append capture event";
 		return false;
 	}
+	m_private->command_dwords += primary.size() + secondary.size();
 	return true;
 }
 
-void TraceWriter::Close() {
+bool TraceWriter::Finalize(std::string& error) {
+	error.clear();
+	if (m_private == nullptr) {
+		error = "capture writer is unavailable";
+		return false;
+	}
+	std::lock_guard lock(m_private->mutex);
+	if (m_private->finalized) {
+		return true;
+	}
+	if (!m_private->open) {
+		error = "capture file is closed";
+		return false;
+	}
+	std::array<uint8_t, FooterSize> footer {};
+	std::copy(FooterMagic.begin(), FooterMagic.end(), footer.begin());
+	Put64(footer, 8, m_private->sequence);
+	Put64(footer, 16, m_private->command_dwords);
+	Put64(footer, 24, XXH3_64bits(footer.data(), footer.size()));
+	if (!WriteExact(m_private->file, footer.data(), footer.size()) || !m_private->file.Flush()) {
+		error = "cannot finalize capture file";
+		m_private->file.Close();
+		m_private->open = false;
+		m_private->reservation.reset();
+		return false;
+	}
+	m_private->file.Close();
+	m_private->open = false;
+	m_private->reservation.reset();
+	if (!SyncParentDirectory(m_path)) {
+		error = "cannot durably finalize capture directory";
+		return false;
+	}
+	m_private->finalized = true;
+	return true;
+}
+
+void TraceWriter::CloseFile() {
 	if (m_private == nullptr) {
 		return;
 	}
 	std::lock_guard lock(m_private->mutex);
 	if (m_private->open) {
-		m_private->file.Flush();
 		m_private->file.Close();
 		m_private->open = false;
 	}
@@ -306,7 +382,32 @@ bool LoadTrace(const std::filesystem::path& path, Trace& trace, std::string& err
 	trace.capability = TraceCapability::CommandsOnly;
 	uint64_t command_dwords = 0;
 	uint64_t last_sequence  = 0;
-	while (file.Tell() < file.Size()) {
+	while (true) {
+		const auto remaining = file.Size() - file.Tell();
+		if (remaining == FooterSize) {
+			std::array<uint8_t, FooterSize> footer {};
+			if (!ReadExact(file, footer.data(), footer.size())) {
+				close();
+				error = "truncated capture footer";
+				return false;
+			}
+			const auto expected_hash = Get64(footer, 24);
+			Put64(footer, 24, 0);
+			if (!std::equal(FooterMagic.begin(), FooterMagic.end(), footer.begin()) ||
+			    Get64(footer, 8) != trace.events.size() || Get64(footer, 16) != command_dwords ||
+			    XXH3_64bits(footer.data(), footer.size()) != expected_hash) {
+				close();
+				error = "invalid capture footer";
+				return false;
+			}
+			close();
+			return true;
+		}
+		if (remaining == 0) {
+			close();
+			error = "capture is not finalized";
+			return false;
+		}
 		if (file.Size() - file.Tell() < RecordHeaderSize) {
 			close();
 			error = "truncated capture event header";
@@ -384,8 +485,6 @@ bool LoadTrace(const std::filesystem::path& path, Trace& trace, std::string& err
 		command_dwords += dwords;
 		trace.events.push_back(std::move(event));
 	}
-	close();
-	return true;
 }
 
 } // namespace Libs::Graphics::Capture

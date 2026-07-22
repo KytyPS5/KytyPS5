@@ -11,6 +11,8 @@
 
 namespace Libs::Graphics::Regression {
 
+inline constexpr uint64_t MaxFrameBytes = 512ull * 1024ull * 1024ull;
+
 enum class Mode { Record, Compare };
 
 enum class PixelFormat : uint32_t {
@@ -23,12 +25,28 @@ enum class PixelFormat : uint32_t {
 	Rgba16Float,
 };
 
+struct Provenance {
+	std::string test_id;
+	std::string build_id;
+	std::string gpu_name;
+	std::string configuration;
+	uint32_t    gpu_vendor_id    = 0;
+	uint32_t    gpu_device_id    = 0;
+	uint32_t    gpu_driver       = 0;
+	uint32_t    vulkan_api       = 0;
+
+	[[nodiscard]] bool CompatibleWith(const Provenance& other) const;
+};
+
 struct Options {
 	Mode                  mode = Mode::Compare;
 	std::filesystem::path baseline;
 	std::filesystem::path report;
+	std::filesystem::path capture;
 	std::vector<uint64_t> frame_ordinals;
+	Provenance            provenance;
 	bool                  save_raw_frames = true;
+	bool                  allow_environment_mismatch = false;
 };
 
 struct FrameView {

@@ -3,11 +3,14 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/transfer.h"
 #include "graphics/regression/frameRegression.h"
+#include "kytyGitVersion.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -28,13 +31,33 @@ public:
 		}
 		enabled            = true;
 		exit_on_complete   = Config::FrameRegressionExitOnComplete();
+		const auto& properties = GetRenderContext().GetGraphics().GetPhysicalDeviceProperties();
 		Options options {
 		    .mode = configured_mode == Config::FrameRegressionMode::Record ? Mode::Record
 		                                                                 : Mode::Compare,
 		    .baseline = Config::GetFrameRegressionBaseline(),
 		    .report = Config::GetFrameRegressionReport(),
+		    .capture = Config::GetGpuCaptureFile(),
 		    .frame_ordinals = Config::GetFrameRegressionFrames(),
+		    .provenance = {
+		        .test_id = Config::GetFrameRegressionTestId(),
+		        .build_id = KYTY_GIT_VERSION,
+		        .gpu_name = properties.deviceName.data(),
+		        .configuration = fmt::format(
+		            "screen={}x{};vblank={};vulkan_validation={};shader_validation={};"
+		            "shader_optimization={};spirv_debug_printf={};ngg_rectlist={}",
+		            Config::GetScreenWidth(), Config::GetScreenHeight(), Config::GetVblankFrequency(),
+		            Config::VulkanValidationEnabled(), Config::ShaderValidationEnabled(),
+		            static_cast<uint32_t>(Config::GetShaderOptimizationType()),
+		            Config::SpirvDebugPrintfEnabled(), Config::NggRectlistDrawEnabled()),
+		        .gpu_vendor_id = properties.vendorID,
+		        .gpu_device_id = properties.deviceID,
+		        .gpu_driver = properties.driverVersion,
+		        .vulkan_api = properties.apiVersion,
+		    },
 		    .save_raw_frames = Config::FrameRegressionSaveRaw(),
+		    .allow_environment_mismatch =
+		        Config::FrameRegressionAllowEnvironmentMismatch(),
 		};
 		session = Session::Create(std::move(options), error);
 		if (session == nullptr) {
@@ -65,7 +88,7 @@ public:
 		}
 		const auto row_pitch = image.extent.width * bytes_per_pixel;
 		const auto byte_size = static_cast<uint64_t>(row_pitch) * image.extent.height;
-		if (byte_size > std::numeric_limits<size_t>::max()) {
+		if (byte_size > std::numeric_limits<size_t>::max() || byte_size > MaxFrameBytes) {
 			Fail("readback", "presented frame is too large for host memory");
 			return true;
 		}

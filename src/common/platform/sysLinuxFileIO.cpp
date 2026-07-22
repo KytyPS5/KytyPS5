@@ -363,7 +363,7 @@ bool SysFileDeleteFile(const std::filesystem::path& name) {
 
 bool SysFileFlush(sys_file_t& f) {
 	if (f.type == SYS_FILE_FILE && f.f != nullptr) {
-		return (fflush(f.f) == 0);
+		return fflush(f.f) == 0 && fsync(fileno(f.f)) == 0;
 	}
 
 	return false;

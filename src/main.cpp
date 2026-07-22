@@ -68,8 +68,10 @@ static void PrintUsage() {
 	::printf("  --regression-compare <path>          Compare against a frame baseline.\n");
 	::printf("  --regression-report <path>           Comparison report path.\n");
 	::printf("  --regression-frames <n[,n...]>       Zero-based presentation ordinals.\n");
+	::printf("  --regression-test-id <id>            Stable game/revision/checkpoint identity.\n");
 	::printf("  --regression-save-raw <true|false>   Save raw frames and previews.\n");
 	::printf("  --regression-exit-on-complete <true|false> Exit after selected frames.\n");
+	::printf("  --regression-allow-environment-mismatch <true|false> Override provenance checks.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -261,6 +263,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid frame ordinal list: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--regression-test-id") {
+			options.config.frame_regression_test_id = value;
 		} else if (arg == "--regression-save-raw") {
 			if (!ParseBool(value, options.config.frame_regression_save_raw)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -268,6 +272,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--regression-exit-on-complete") {
 			if (!ParseBool(value, options.config.frame_regression_exit_on_complete)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--regression-allow-environment-mismatch") {
+			if (!ParseBool(value, options.config.frame_regression_allow_environment_mismatch)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
@@ -280,6 +289,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	if (options.config.frame_regression_mode != Config::FrameRegressionMode::None &&
 	    options.config.frame_regression_frames.empty()) {
 		::printf("--regression-frames is required with a regression mode\n");
+		return false;
+	}
+	if (options.config.frame_regression_mode != Config::FrameRegressionMode::None &&
+	    options.config.frame_regression_test_id.empty()) {
+		::printf("--regression-test-id is required with a regression mode\n");
+		return false;
+	}
+	std::string path_error;
+	if (!Config::ValidateFrameRegressionPaths(options.config, path_error)) {
+		::printf("%s\n", path_error.c_str());
 		return false;
 	}
 

@@ -46,8 +46,18 @@ int main() {
 	const auto capture = root / "commands.kycap";
 
 	std::string error;
+	Check(TraceWriter::Create(root / "reserved.kyty-lock", error) == nullptr &&
+	          error.find("reserved") != std::string::npos,
+	      "reservation suffix protection");
 	auto        writer = TraceWriter::Create(capture, error);
 	Check(writer != nullptr, error.c_str());
+	std::filesystem::remove(capture);
+	Check(TraceWriter::Create(capture, error) == nullptr && error.find("use") != std::string::npos,
+	      "concurrent capture writer protection");
+	writer.reset();
+	writer = TraceWriter::Create(capture, error);
+	Check(writer != nullptr, error.c_str());
+	error.clear();
 	const std::array<uint32_t, 3> draw {0xc0011000, 0x11223344, 0x55667788};
 	const std::array<uint32_t, 2> constants {0xc0007600, 0xaabbccdd};
 	const std::array<uint32_t, 2> compute {0xc0001500, 0x12345678};
@@ -55,7 +65,8 @@ int main() {
 	Check(writer->RecordCompute(0x27, compute, false, error), error.c_str());
 	Check(writer->RecordMarker(TraceEventType::FlipPreparation, error), error.c_str());
 	Check(writer->RecordMarker(TraceEventType::SuspendRequest, error), error.c_str());
-	writer->Close();
+	Check(writer->Finalize(error), error.c_str());
+	Check(writer->Finalize(error), "capture finalization must be idempotent");
 
 	Trace trace;
 	Check(LoadTrace(capture, trace, error), error.c_str());
@@ -75,7 +86,7 @@ int main() {
 
 	auto corrupted = ReadBytes(capture);
 	Check(corrupted.size() > 64, "capture size");
-	corrupted.back() ^= 0x80;
+	corrupted[corrupted.size() - 32 - 1] ^= 0x80;
 	const auto corrupt_path = root / "corrupt.kycap";
 	WriteBytes(corrupt_path, corrupted);
 	error.clear();
@@ -98,6 +109,32 @@ int main() {
 	WriteBytes(truncated_path, truncated);
 	error.clear();
 	Check(!LoadTrace(truncated_path, trace, error), "truncation validation");
+
+	auto missing_footer = ReadBytes(capture);
+	missing_footer.resize(missing_footer.size() - 32);
+	const auto missing_footer_path = root / "missing_footer.kycap";
+	WriteBytes(missing_footer_path, missing_footer);
+	error.clear();
+	Check(!LoadTrace(missing_footer_path, trace, error) &&
+	          error.find("finalized") != std::string::npos,
+	      "whole-footer truncation validation");
+
+	auto missing_record = ReadBytes(capture);
+	constexpr size_t last_marker_size = 40;
+	missing_record.erase(missing_record.end() - 32 - last_marker_size,
+	                     missing_record.end() - 32);
+	const auto missing_record_path = root / "missing_record.kycap";
+	WriteBytes(missing_record_path, missing_record);
+	error.clear();
+	Check(!LoadTrace(missing_record_path, trace, error) && error.find("footer") != std::string::npos,
+	      "whole-record truncation validation");
+
+	const auto header_only_path = root / "header_only.kycap";
+	auto header_only = ReadBytes(capture);
+	header_only.resize(24);
+	WriteBytes(header_only_path, header_only);
+	error.clear();
+	Check(!LoadTrace(header_only_path, trace, error), "header-only capture validation");
 
 	error.clear();
 	Check(!LoadTrace(capture, trace, error,

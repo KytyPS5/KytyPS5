@@ -5,6 +5,7 @@
 #include "common/subsystems.h"
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace Config {
@@ -44,11 +45,14 @@ struct ConfigOptions {
 	std::filesystem::path  frame_regression_baseline;
 	std::filesystem::path  frame_regression_report = "_Regression/report.json";
 	std::vector<uint64_t>  frame_regression_frames;
+	std::string            frame_regression_test_id;
 	bool                   frame_regression_save_raw         = true;
 	bool                   frame_regression_exit_on_complete = true;
+	bool                   frame_regression_allow_environment_mismatch = false;
 };
 
 void Load(const ConfigOptions& cfg);
+[[nodiscard]] bool ValidateFrameRegressionPaths(const ConfigOptions& cfg, std::string& error);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
@@ -80,8 +84,10 @@ FrameRegressionMode         GetFrameRegressionMode();
 std::filesystem::path       GetFrameRegressionBaseline();
 std::filesystem::path       GetFrameRegressionReport();
 const std::vector<uint64_t>& GetFrameRegressionFrames();
+const std::string&           GetFrameRegressionTestId();
 bool                        FrameRegressionSaveRaw();
 bool                        FrameRegressionExitOnComplete();
+bool                        FrameRegressionAllowEnvironmentMismatch();
 
 } // namespace Config
 

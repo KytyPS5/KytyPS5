@@ -226,6 +226,7 @@ public:
 	void PauseSubmissions();
 	void ResumeSubmissions();
 	int  GetFrameNum();
+	[[nodiscard]] bool FinalizeCapture(std::string& error);
 
 private:
 	void Init();
@@ -439,6 +440,15 @@ void Gpu::CaptureMarker(Capture::TraceEventType type) {
 	if (!m_capture->RecordMarker(type, error)) {
 		EXIT("GPU command capture failed: %s\n", error.c_str());
 	}
+}
+
+bool Gpu::FinalizeCapture(std::string& error) {
+	std::unique_ptr<Capture::TraceWriter> capture;
+	{
+		GpuMutexLock lock(m_mutex);
+		capture = std::move(m_capture);
+	}
+	return capture == nullptr || capture->Finalize(error);
 }
 
 ComputeRing* Gpu::GetRing(uint32_t ring_id) {
@@ -1951,6 +1961,19 @@ void GraphicsRunDone() {
 	EXIT_IF(g_gpu == nullptr);
 
 	g_gpu->Done();
+}
+
+int GraphicsRunFinalizeCapture() {
+	if (g_gpu == nullptr) {
+		return 0;
+	}
+	std::string error;
+	if (!g_gpu->FinalizeCapture(error)) {
+		::printf("GPU command capture finalization failed: %s\n", error.c_str());
+		LOGF("GPU command capture finalization failed: %s\n", error.c_str());
+		return 2;
+	}
+	return 0;
 }
 
 int GraphicsRunGetFrameNum() {

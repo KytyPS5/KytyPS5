@@ -11,7 +11,7 @@
 
 namespace Libs::Graphics::Capture {
 
-constexpr uint16_t TraceMajorVersion = 1;
+constexpr uint16_t TraceMajorVersion = 2;
 constexpr uint16_t TraceMinorVersion = 0;
 
 enum class TraceCapability : uint32_t {
@@ -60,7 +60,7 @@ public:
 	[[nodiscard]] bool RecordCompute(uint32_t queue, std::span<const uint32_t> commands,
 	                                 bool trigger_interrupt_on_done, std::string& error);
 	[[nodiscard]] bool RecordMarker(TraceEventType type, std::string& error);
-	void               Close();
+	[[nodiscard]] bool Finalize(std::string& error);
 
 private:
 	explicit TraceWriter(std::filesystem::path path);
@@ -68,6 +68,7 @@ private:
 	[[nodiscard]] bool Record(TraceEventType type, uint32_t queue, uint32_t flags,
 	                          std::span<const uint32_t> primary,
 	                          std::span<const uint32_t> secondary, std::string& error);
+	void CloseFile();
 
 	struct Private;
 	std::filesystem::path m_path;

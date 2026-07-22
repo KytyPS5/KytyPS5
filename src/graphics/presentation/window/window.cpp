@@ -37,6 +37,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/regression/frameRegressionVulkan.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -981,8 +982,9 @@ void WindowRun() {
 	// TODO: replace std::_Exit shutdown with full Vulkan teardown, then destroy
 	// the VMA allocator immediately before vkDestroyDevice.
 	const auto regression_exit_code = Regression::FinalizeFrameRegression();
+	const auto capture_exit_code    = GraphicsRunFinalizeCapture();
 	Common::SubsystemsListSingleton::Instance()->ShutdownAll();
-	std::_Exit(std::max(g_window_exit_code, regression_exit_code));
+	std::_Exit(std::max({g_window_exit_code, regression_exit_code, capture_exit_code}));
 }
 
 static int WindowIconRead(void* user, char* data, int size) {

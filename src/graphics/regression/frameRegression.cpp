@@ -1,11 +1,14 @@
 #include "graphics/regression/frameRegression.h"
 
 #include "common/file.h"
+#include "common/outputReservation.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -16,14 +19,28 @@
 #include <vector>
 #include <xxhash.h>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // IWYU pragma: keep
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace Libs::Graphics::Regression {
 namespace {
 
-constexpr uint32_t SchemaVersion = 1;
+constexpr uint32_t SchemaVersion = 2;
 constexpr int      FailureExitCode = 2;
 constexpr uint64_t MaxManifestBytes = 4ull * 1024ull * 1024ull;
 constexpr size_t   MaxManifestFrames = 4096;
 constexpr size_t   MaxArtifactPathLength = 1024;
+constexpr size_t   MaxProvenanceTextLength = 4096;
 
 struct Digest {
 	uint64_t low  = 0;
@@ -41,6 +58,7 @@ struct FrameRecord {
 	Digest      digest;
 	std::string raw_file;
 	std::string image_file;
+	std::string diff_file;
 	std::string status;
 	Digest      expected;
 	bool        has_expected = false;
@@ -116,12 +134,41 @@ bool ReadText(const std::filesystem::path& path, std::string& text) {
 	return read == text.size();
 }
 
+bool ReplaceFile(const std::filesystem::path& temporary, const std::filesystem::path& path) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return MoveFileExW(temporary.wstring().c_str(), path.wstring().c_str(),
+	                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+	std::error_code error;
+	std::filesystem::rename(temporary, path, error);
+	if (error) {
+		return false;
+	}
+	const auto directory_path = path.parent_path().empty() ? std::filesystem::path(".")
+	                                                      : path.parent_path();
+	const int directory = open(directory_path.c_str(), O_RDONLY | O_DIRECTORY);
+	if (directory < 0) {
+		return false;
+	}
+	const bool synced = fsync(directory) == 0;
+	close(directory);
+	return synced;
+#endif
+}
+
 bool WriteBytes(const std::filesystem::path& path, const void* data, uint64_t size) {
 	if (!path.parent_path().empty() && !Common::File::CreateDirectories(path.parent_path())) {
 		return false;
 	}
+	static std::atomic<uint64_t> temporary_sequence = 0;
+	auto temporary = path;
+	temporary += ".tmp." +
+	             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "." +
+	             std::to_string(temporary_sequence.fetch_add(1, std::memory_order_relaxed));
+	std::error_code remove_error;
+	std::filesystem::remove(temporary, remove_error);
 	Common::File file;
-	if (!file.Create(path)) {
+	if (!file.Create(temporary)) {
 		return false;
 	}
 	const auto* bytes = static_cast<const uint8_t*>(data);
@@ -132,6 +179,7 @@ bool WriteBytes(const std::filesystem::path& path, const void* data, uint64_t si
 		file.Write(bytes, chunk, &written);
 		if (written != chunk) {
 			file.Close();
+			std::filesystem::remove(temporary, remove_error);
 			return false;
 		}
 		bytes += chunk;
@@ -139,7 +187,11 @@ bool WriteBytes(const std::filesystem::path& path, const void* data, uint64_t si
 	}
 	const bool flushed = file.Flush();
 	file.Close();
-	return flushed;
+	if (!flushed || !ReplaceFile(temporary, path)) {
+		std::filesystem::remove(temporary, remove_error);
+		return false;
+	}
+	return true;
 }
 
 bool WriteText(const std::filesystem::path& path, const std::string& text) {
@@ -147,14 +199,17 @@ bool WriteText(const std::filesystem::path& path, const std::string& text) {
 }
 
 std::filesystem::path FrameDirectory(const std::filesystem::path& manifest) {
-	return manifest.parent_path() / (manifest.stem().string() + "_frames");
+	return manifest.parent_path() / (manifest.filename().string() + "_frames");
 }
 
 std::string ComparablePath(const std::filesystem::path& path) {
 	std::error_code error;
-	auto normalized = std::filesystem::absolute(path, error);
+	auto normalized = std::filesystem::weakly_canonical(path, error);
 	if (error) {
-		normalized = path;
+		normalized = std::filesystem::absolute(path, error);
+		if (error) {
+			normalized = path;
+		}
 	}
 	auto text = normalized.lexically_normal().generic_string();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -198,11 +253,17 @@ bool SavePpm(const std::filesystem::path& path, const FrameView& frame,
 		const auto row = static_cast<size_t>(y) * frame.row_pitch;
 		for (uint32_t x = 0; x < frame.width; x++) {
 			const auto offset = row + static_cast<size_t>(x) * 4u;
+			const auto alpha_delta = expected.empty()
+			                             ? 0
+			                             : std::abs(static_cast<int>(frame.bytes[offset + 3]) -
+			                                        expected[offset + 3]);
 			const auto channel = [&](uint32_t index) {
 				const auto actual = frame.bytes[offset + index];
-				return expected.empty() ? actual
-				                        : static_cast<uint8_t>(std::abs(
-				                              static_cast<int>(actual) - expected[offset + index]));
+				return expected.empty()
+				           ? actual
+				           : static_cast<uint8_t>(std::max(
+				                 alpha_delta,
+				                 std::abs(static_cast<int>(actual) - expected[offset + index])));
 			};
 			if (rgba) {
 				rgb.push_back(channel(0));
@@ -225,6 +286,11 @@ bool SavePpm(const std::filesystem::path& path, const FrameView& frame,
 	std::copy_n(reinterpret_cast<const uint8_t*>(header), header_size, ppm.begin());
 	std::copy(rgb.begin(), rgb.end(), ppm.begin() + header_size);
 	return WriteBytes(path, ppm.data(), ppm.size());
+}
+
+bool SupportsPpm(PixelFormat format) {
+	return format == PixelFormat::Rgba8Unorm || format == PixelFormat::Rgba8Srgb ||
+	       format == PixelFormat::Bgra8Unorm || format == PixelFormat::Bgra8Srgb;
 }
 
 bool SameLayout(const FrameRecord& expected, const FrameRecord& actual) {
@@ -265,7 +331,7 @@ FrameRecord ParseRecord(const nlohmann::json& json, std::string& error) {
 		error = "invalid frame format or digest";
 		return {};
 	}
-	for (const auto* name: {"raw_file", "image_file"}) {
+	for (const auto* name: {"raw_file", "image_file", "diff_file", "status"}) {
 		if (json.contains(name) && !json[name].is_string()) {
 			error = "invalid frame artifact path";
 			return {};
@@ -274,14 +340,21 @@ FrameRecord ParseRecord(const nlohmann::json& json, std::string& error) {
 	if ((json.contains("raw_file") &&
 	     json["raw_file"].get_ref<const std::string&>().size() > MaxArtifactPathLength) ||
 	    (json.contains("image_file") &&
-	     json["image_file"].get_ref<const std::string&>().size() > MaxArtifactPathLength)) {
+	     json["image_file"].get_ref<const std::string&>().size() > MaxArtifactPathLength) ||
+	    (json.contains("diff_file") &&
+	     json["diff_file"].get_ref<const std::string&>().size() > MaxArtifactPathLength) ||
+	    (json.contains("status") &&
+	     json["status"].get_ref<const std::string&>().size() > 64)) {
 		error = "frame artifact path is too long";
 		return {};
 	}
 	record.raw_file   = json.contains("raw_file") ? json["raw_file"].get<std::string>() : "";
 	record.image_file = json.contains("image_file") ? json["image_file"].get<std::string>() : "";
+	record.diff_file  = json.contains("diff_file") ? json["diff_file"].get<std::string>() : "";
+	record.status     = json.contains("status") ? json["status"].get<std::string>() : "";
 	if ((!record.raw_file.empty() && !IsSafeArtifactPath(record.raw_file)) ||
-	    (!record.image_file.empty() && !IsSafeArtifactPath(record.image_file))) {
+	    (!record.image_file.empty() && !IsSafeArtifactPath(record.image_file)) ||
+	    (!record.diff_file.empty() && !IsSafeArtifactPath(record.diff_file))) {
 		error = "unsafe frame artifact path";
 		return {};
 	}
@@ -289,7 +362,8 @@ FrameRecord ParseRecord(const nlohmann::json& json, std::string& error) {
 	if (record.width == 0 || record.height == 0 || bytes_per_pixel == 0 ||
 	    record.width > UINT32_MAX / bytes_per_pixel ||
 	    record.row_pitch != record.width * bytes_per_pixel ||
-	    record.byte_size != static_cast<uint64_t>(record.row_pitch) * record.height) {
+	    record.byte_size != static_cast<uint64_t>(record.row_pitch) * record.height ||
+	    record.byte_size > MaxFrameBytes) {
 		error = "invalid frame dimensions";
 		return {};
 	}
@@ -316,6 +390,9 @@ nlohmann::ordered_json RecordJson(const FrameRecord& record) {
 	if (!record.image_file.empty()) {
 		json["image_file"] = record.image_file;
 	}
+	if (!record.diff_file.empty()) {
+		json["diff_file"] = record.diff_file;
+	}
 	if (!record.status.empty()) {
 		json["status"] = record.status;
 	}
@@ -324,6 +401,43 @@ nlohmann::ordered_json RecordJson(const FrameRecord& record) {
 		json["expected_hash_high"] = Hex(record.expected.high);
 	}
 	return json;
+}
+
+nlohmann::ordered_json ProvenanceJson(const Provenance& provenance) {
+	return {{"test_id", provenance.test_id},
+	        {"build_id", provenance.build_id},
+	        {"gpu_name", provenance.gpu_name},
+	        {"gpu_vendor_id", provenance.gpu_vendor_id},
+	        {"gpu_device_id", provenance.gpu_device_id},
+	        {"gpu_driver", provenance.gpu_driver},
+	        {"vulkan_api", provenance.vulkan_api},
+	        {"configuration", provenance.configuration}};
+}
+
+bool ParseProvenance(const nlohmann::json& json, Provenance& provenance) {
+	const auto text = [&json](const char* name, std::string& value) {
+		if (!json.contains(name) || !json[name].is_string() ||
+		    json[name].get_ref<const std::string&>().empty() ||
+		    json[name].get_ref<const std::string&>().size() > MaxProvenanceTextLength) {
+			return false;
+		}
+		value = json[name].get<std::string>();
+		return true;
+	};
+	const auto number = [&json](const char* name, uint32_t& value) {
+		if (!json.contains(name) || !json[name].is_number_unsigned() ||
+		    json[name].get<uint64_t>() > UINT32_MAX) {
+			return false;
+		}
+		value = json[name].get<uint32_t>();
+		return true;
+	};
+	return json.is_object() && text("test_id", provenance.test_id) &&
+	       text("build_id", provenance.build_id) && text("gpu_name", provenance.gpu_name) &&
+	       text("configuration", provenance.configuration) &&
+	       number("gpu_vendor_id", provenance.gpu_vendor_id) &&
+	       number("gpu_device_id", provenance.gpu_device_id) &&
+	       number("gpu_driver", provenance.gpu_driver) && number("vulkan_api", provenance.vulkan_api);
 }
 
 } // namespace
@@ -341,9 +455,19 @@ uint32_t BytesPerPixel(PixelFormat format) {
 	return 0;
 }
 
+bool Provenance::CompatibleWith(const Provenance& other) const {
+	return test_id == other.test_id && gpu_name == other.gpu_name &&
+	       configuration == other.configuration && gpu_vendor_id == other.gpu_vendor_id &&
+	       gpu_device_id == other.gpu_device_id && gpu_driver == other.gpu_driver &&
+	       vulkan_api == other.vulkan_api;
+}
+
 struct Session::Private {
 	std::map<uint64_t, FrameRecord> expected;
 	std::map<uint64_t, FrameRecord> actual;
+	Provenance                     baseline_provenance;
+	std::vector<std::unique_ptr<Common::OutputReservation>> reservations;
+	bool                           environment_compatible = true;
 	bool                            failed    = false;
 	bool                            finalized = false;
 };
@@ -368,6 +492,24 @@ bool Session::Initialize(std::string& error) {
 		error = "regression baseline, report, and frame ordinals are required";
 		return false;
 	}
+	if (Common::OutputReservation::IsReservedPath(m_options.baseline) ||
+	    (m_options.mode == Mode::Compare &&
+	     Common::OutputReservation::IsReservedPath(m_options.report)) ||
+	    (!m_options.capture.empty() &&
+	     Common::OutputReservation::IsReservedPath(m_options.capture))) {
+		error = "regression output uses the reserved .kyty-lock suffix";
+		return false;
+	}
+	const auto valid_provenance_text = [](const std::string& value) {
+		return !value.empty() && value.size() <= MaxProvenanceTextLength;
+	};
+	if (!valid_provenance_text(m_options.provenance.test_id) ||
+	    !valid_provenance_text(m_options.provenance.build_id) ||
+	    !valid_provenance_text(m_options.provenance.gpu_name) ||
+	    !valid_provenance_text(m_options.provenance.configuration)) {
+		error = "regression provenance is incomplete";
+		return false;
+	}
 	if (m_options.frame_ordinals.size() > MaxManifestFrames) {
 		error = "too many regression frame ordinals";
 		return false;
@@ -378,21 +520,76 @@ bool Session::Initialize(std::string& error) {
 		error = "regression frame ordinals must be unique";
 		return false;
 	}
+	const auto reserve_outputs = [this, &error](const std::filesystem::path& manifest) {
+		std::array paths {manifest, FrameDirectory(manifest)};
+		std::sort(paths.begin(), paths.end(), [](const auto& first, const auto& second) {
+			return ComparablePath(first) < ComparablePath(second);
+		});
+		for (const auto& path: paths) {
+			auto reservation = Common::OutputReservation::Acquire(path, error);
+			if (reservation == nullptr) {
+				m_private->reservations.clear();
+				return false;
+			}
+			m_private->reservations.push_back(std::move(reservation));
+		}
+		return true;
+	};
 	if (m_options.mode == Mode::Record) {
-		if (Common::File::IsFileExisting(m_options.baseline)) {
+		const auto baseline_lock = Common::OutputReservation::LockPath(m_options.baseline);
+		if (!m_options.capture.empty() &&
+		    (ComparablePath(m_options.capture) == ComparablePath(m_options.baseline) ||
+		     ComparablePath(m_options.capture) == ComparablePath(baseline_lock) ||
+		     ComparablePath(Common::OutputReservation::LockPath(m_options.capture)) ==
+		         ComparablePath(m_options.baseline) ||
+		     SameOrWithin(m_options.capture, FrameDirectory(m_options.baseline)) ||
+		     SameOrWithin(Common::OutputReservation::LockPath(m_options.capture),
+		                  FrameDirectory(m_options.baseline)))) {
+			error = "GPU capture and regression baseline outputs collide";
+			return false;
+		}
+		if (!reserve_outputs(m_options.baseline)) {
+			return false;
+		}
+		if (Common::File::IsFileExisting(m_options.baseline) ||
+		    Common::File::IsDirectoryExisting(m_options.baseline) ||
+		    Common::File::IsDirectoryExisting(FrameDirectory(m_options.baseline))) {
 			error = "refusing to overwrite an existing regression baseline";
 			return false;
 		}
 		return true;
 	}
 	if (ComparablePath(m_options.baseline) == ComparablePath(m_options.report) ||
+	    ComparablePath(m_options.baseline) ==
+	        ComparablePath(Common::OutputReservation::LockPath(m_options.report)) ||
 	    ComparablePath(FrameDirectory(m_options.baseline)) ==
 	        ComparablePath(FrameDirectory(m_options.report)) ||
-	    SameOrWithin(m_options.report, FrameDirectory(m_options.baseline))) {
+	    SameOrWithin(m_options.report, FrameDirectory(m_options.baseline)) ||
+	    SameOrWithin(Common::OutputReservation::LockPath(m_options.report),
+	                 FrameDirectory(m_options.baseline))) {
 		error = "regression baseline and report outputs collide";
 		return false;
 	}
-
+	if (Common::File::IsDirectoryExisting(m_options.report)) {
+		error = "regression report path is an existing directory";
+		return false;
+	}
+	if (!m_options.capture.empty() &&
+	    (ComparablePath(m_options.capture) == ComparablePath(m_options.baseline) ||
+	     ComparablePath(m_options.capture) == ComparablePath(m_options.report) ||
+	     ComparablePath(m_options.capture) ==
+	         ComparablePath(Common::OutputReservation::LockPath(m_options.report)) ||
+	     ComparablePath(Common::OutputReservation::LockPath(m_options.capture)) ==
+	         ComparablePath(m_options.report) ||
+	     SameOrWithin(m_options.capture, FrameDirectory(m_options.baseline)) ||
+	     SameOrWithin(m_options.capture, FrameDirectory(m_options.report)) ||
+	     SameOrWithin(Common::OutputReservation::LockPath(m_options.capture),
+	                  FrameDirectory(m_options.baseline)) ||
+	     SameOrWithin(Common::OutputReservation::LockPath(m_options.capture),
+	                  FrameDirectory(m_options.report)))) {
+		error = "GPU capture and regression outputs collide";
+		return false;
+	}
 	std::string source;
 	if (!ReadText(m_options.baseline, source)) {
 		error = "cannot read regression baseline";
@@ -405,6 +602,10 @@ bool Session::Initialize(std::string& error) {
 	    !json["algorithm"].is_string() ||
 	    json["algorithm"].get<std::string>() != "xxh3_128" || !json.contains("complete") ||
 	    !json["complete"].is_boolean() || !json["complete"].get<bool>() ||
+	    !json.contains("mode") || json["mode"] != "record" || !json.contains("passed") ||
+	    !json["passed"].is_boolean() || !json["passed"].get<bool>() ||
+	    !json.contains("provenance") ||
+	    !ParseProvenance(json["provenance"], m_private->baseline_provenance) ||
 	    !json.contains("frames") || !json["frames"].is_array() ||
 	    json["frames"].size() > MaxManifestFrames) {
 		error = "invalid or incomplete regression baseline";
@@ -413,6 +614,10 @@ bool Session::Initialize(std::string& error) {
 	for (const auto& entry: json["frames"]) {
 		auto record = ParseRecord(entry, error);
 		if (!error.empty()) {
+			return false;
+		}
+		if (record.status != "recorded") {
+			error = "regression baseline contains a non-record frame";
 			return false;
 		}
 		if (!m_private->expected.emplace(record.ordinal, std::move(record)).second) {
@@ -426,7 +631,14 @@ bool Session::Initialize(std::string& error) {
 			return false;
 		}
 	}
+	m_private->environment_compatible =
+	    m_private->baseline_provenance.CompatibleWith(m_options.provenance);
+	if (!m_private->environment_compatible && !m_options.allow_environment_mismatch) {
+		error = "regression environment does not match baseline provenance";
+		return false;
+	}
 	std::unordered_set<std::string> protected_artifacts;
+	protected_artifacts.insert(ComparablePath(m_options.baseline));
 	for (const auto& [ordinal, record]: m_private->expected) {
 		(void)ordinal;
 		if (!record.raw_file.empty()) {
@@ -438,8 +650,17 @@ bool Session::Initialize(std::string& error) {
 			    ComparablePath(m_options.baseline.parent_path() / record.image_file));
 		}
 	}
-	if (protected_artifacts.contains(ComparablePath(m_options.report))) {
+	if (protected_artifacts.contains(ComparablePath(m_options.report)) ||
+	    protected_artifacts.contains(
+	        ComparablePath(Common::OutputReservation::LockPath(m_options.report)))) {
 		error = "regression report would overwrite a baseline artifact";
+		return false;
+	}
+	if (!m_options.capture.empty() &&
+	    (protected_artifacts.contains(ComparablePath(m_options.capture)) ||
+	     protected_artifacts.contains(
+	         ComparablePath(Common::OutputReservation::LockPath(m_options.capture))))) {
+		error = "GPU capture would overwrite a baseline artifact";
 		return false;
 	}
 	if (m_options.save_raw_frames) {
@@ -454,11 +675,15 @@ bool Session::Initialize(std::string& error) {
 			}
 		}
 	}
+	if (!reserve_outputs(m_options.report)) {
+		return false;
+	}
 	return true;
 }
 
 bool Session::WantsFrame(uint64_t ordinal) const {
-	return std::binary_search(m_options.frame_ordinals.begin(), m_options.frame_ordinals.end(),
+	return !m_private->finalized &&
+	       std::binary_search(m_options.frame_ordinals.begin(), m_options.frame_ordinals.end(),
 	                          ordinal) &&
 	       !m_private->actual.contains(ordinal);
 }
@@ -473,7 +698,8 @@ bool Session::Observe(const FrameView& frame, std::string& error) {
 	if (frame.width == 0 || frame.height == 0 || bytes_per_pixel == 0 ||
 	    frame.width > UINT32_MAX / bytes_per_pixel ||
 	    frame.row_pitch != frame.width * bytes_per_pixel ||
-	    frame.bytes.size() != static_cast<uint64_t>(frame.row_pitch) * frame.height) {
+	    frame.bytes.size() != static_cast<uint64_t>(frame.row_pitch) * frame.height ||
+	    frame.bytes.size() > MaxFrameBytes) {
 		error = "invalid regression frame layout";
 		return false;
 	}
@@ -496,8 +722,7 @@ bool Session::Observe(const FrameView& frame, std::string& error) {
 			error = "cannot write regression raw frame";
 			return false;
 		}
-		if (frame.format == PixelFormat::Rgba8Unorm || frame.format == PixelFormat::Rgba8Srgb ||
-		    frame.format == PixelFormat::Bgra8Unorm || frame.format == PixelFormat::Bgra8Srgb) {
+		if (SupportsPpm(frame.format)) {
 			record.image_file =
 			    (directory.filename() / FrameName(frame.ordinal, "ppm")).generic_string();
 			if (!SavePpm(manifest.parent_path() / record.image_file, frame)) {
@@ -518,7 +743,7 @@ bool Session::Observe(const FrameView& frame, std::string& error) {
 		record.status       = match ? "match" : "mismatch";
 		m_private->failed   = m_private->failed || !match;
 		if (!match && m_options.save_raw_frames && !expected.raw_file.empty() &&
-		    SameLayout(expected, record)) {
+		    SameLayout(expected, record) && SupportsPpm(frame.format)) {
 			Common::File expected_file;
 			const auto expected_path = m_options.baseline.parent_path() / expected.raw_file;
 			if (expected_file.Open(expected_path, Common::File::Mode::Read) &&
@@ -528,16 +753,28 @@ bool Session::Observe(const FrameView& frame, std::string& error) {
 				expected_file.Read(expected_bytes.data(), static_cast<uint32_t>(expected_bytes.size()),
 				                   &read);
 				expected_file.Close();
-				if (read == expected_bytes.size()) {
+				const auto expected_hash = XXH3_128bits(expected_bytes.data(), expected_bytes.size());
+				if (read == expected_bytes.size() && expected_hash.low64 == expected.digest.low &&
+				    expected_hash.high64 == expected.digest.high) {
 					const auto diff = FrameDirectory(m_options.report) /
 					                  ("diff_" + FrameName(frame.ordinal, "ppm"));
 					if (!SavePpm(diff, frame, expected_bytes)) {
 						record.status     = "mismatch_diff_write_failed";
 						diff_write_failed = true;
+					} else {
+						record.diff_file =
+						    (FrameDirectory(m_options.report).filename() /
+						     ("diff_" + FrameName(frame.ordinal, "ppm")))
+						        .generic_string();
 					}
+				} else {
+					record.status = "mismatch_reference_unavailable";
 				}
 			} else if (!expected_file.IsInvalid()) {
 				expected_file.Close();
+				record.status = "mismatch_reference_unavailable";
+			} else {
+				record.status = "mismatch_reference_unavailable";
 			}
 		}
 	}
@@ -563,6 +800,13 @@ bool Session::WriteManifest(bool complete, std::string& error) const {
 	json["mode"]           = m_options.mode == Mode::Record ? "record" : "compare";
 	json["complete"]       = complete;
 	json["passed"]         = complete && !m_private->failed;
+	if (m_options.mode == Mode::Record) {
+		json["provenance"] = ProvenanceJson(m_options.provenance);
+	} else {
+		json["baseline_provenance"] = ProvenanceJson(m_private->baseline_provenance);
+		json["run_provenance"]      = ProvenanceJson(m_options.provenance);
+		json["environment_match"]   = m_private->environment_compatible;
+	}
 	json["frames"]         = nlohmann::ordered_json::array();
 	for (const auto ordinal: m_options.frame_ordinals) {
 		if (const auto it = m_private->actual.find(ordinal); it != m_private->actual.end()) {
@@ -593,9 +837,12 @@ int Session::Finalize(std::string& error) {
 	}
 	if (!WriteManifest(Complete(), error)) {
 		m_private->failed = true;
+		m_private->reservations.clear();
 		return FailureExitCode;
 	}
-	return ExitCode();
+	const auto exit_code = ExitCode();
+	m_private->reservations.clear();
+	return exit_code;
 }
 
 int Session::ExitCode() const {

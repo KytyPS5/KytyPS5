@@ -24,6 +24,7 @@ void GraphicsRunSubmitCompute(uint32_t queue, uint32_t* cmd_buffer, uint32_t num
 void GraphicsRunSubmitFlipPreparation();
 void GraphicsRunWait();
 void GraphicsRunDone();
+[[nodiscard]] int GraphicsRunFinalizeCapture();
 int  GraphicsRunGetFrameNum();
 [[nodiscard]] bool              GraphicsRunIsCommandProcessorThread() noexcept;
 [[nodiscard]] CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept;

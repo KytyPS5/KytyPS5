@@ -1,0 +1,87 @@
+name: Graphics Regression Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite_path:
+        description: Absolute path to the private suite file on the runner
+        required: true
+        type: string
+      emulator_path:
+        description: Absolute path to kyty_emulator.exe on the runner
+        required: true
+        type: string
+      artifact_name:
+        description: Uploaded result artifact name
+        required: true
+        default: graphics-regression-results
+        type: string
+      allow_environment_mismatch:
+        description: Deliberately override baseline environment checks
+        required: true
+        default: false
+        type: boolean
+      upload_frame_evidence:
+        description: Upload raw, preview, and difference frames (may contain game imagery)
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  regression:
+    runs-on: [self-hosted, Windows, X64, gpu]
+    environment: graphics-regression
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Run serialized suite
+        shell: pwsh
+        env:
+          KYTY_SUITE: ${{ inputs.suite_path }}
+          KYTY_EMULATOR: ${{ inputs.emulator_path }}
+          KYTY_OUTPUT: ${{ runner.temp }}\kyty-graphics-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          KYTY_ALLOW_ENVIRONMENT_MISMATCH: ${{ inputs.allow_environment_mismatch }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:KYTY_OUTPUT | Out-Null
+          $arguments = @(
+            "tools\run_graphics_regression_suite.py",
+            "--suite", $env:KYTY_SUITE,
+            "--emulator", $env:KYTY_EMULATOR,
+            "--output", $env:KYTY_OUTPUT
+          )
+          if ($env:KYTY_ALLOW_ENVIRONMENT_MISMATCH -eq "true") {
+            $arguments += "--allow-environment-mismatch"
+          }
+          python @arguments
+          exit $LASTEXITCODE
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}\kyty-graphics-regression-${{ github.run_id }}-${{ github.run_attempt }}\summary.json
+            ${{ runner.temp }}\kyty-graphics-regression-${{ github.run_id }}-${{ github.run_attempt }}\*\report.json
+            ${{ runner.temp }}\kyty-graphics-regression-${{ github.run_id }}-${{ github.run_attempt }}\*\report.log
+            ${{ runner.temp }}\kyty-graphics-regression-${{ github.run_id }}-${{ github.run_attempt }}\*\report.runner.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
+
+      - name: Upload frame evidence
+        if: always() && inputs.upload_frame_evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact_name }}-frame-evidence
+          path: ${{ runner.temp }}\kyty-graphics-regression-${{ github.run_id }}-${{ github.run_attempt }}\*\report.json_frames\**
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6

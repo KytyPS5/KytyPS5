@@ -74,10 +74,12 @@ jobs:
         run: |
           _Build\windows\frame_regression_tests.exe
 
-      - name: Validate game regression runner
+      - name: Test game regression runner
         shell: cmd
         run: |
+          python tests\GraphicsRegressionRunnerTests.py
           python tools\run_graphics_regression.py --help
+          python tools\run_graphics_regression_suite.py --help
 
       - name: Install
         shell: cmd

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "sample-title-revision-checkpoint",
+      "game": "D:/Games/SampleTitle",
+      "baseline": "D:/KytyBaselines/sample-title.json",
+      "frames": [60, 120, 300],
+      "timeout_seconds": 300,
+      "save_raw": false,
+      "reuse_work_dir": false,
+      "emulator_args": []
+    }
+  ]
+}

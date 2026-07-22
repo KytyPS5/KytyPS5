@@ -44,6 +44,16 @@ Provenance TestProvenance() {
 	        .vulkan_api = 4};
 }
 
+std::vector<uint8_t> ReadBytes(const std::filesystem::path& path) {
+	std::ifstream stream(path, std::ios::binary);
+	return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+std::string ReadText(const std::filesystem::path& path) {
+	std::ifstream stream(path);
+	return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
 std::unique_ptr<Session> Create(Mode mode, const std::filesystem::path& baseline,
 	                            const std::filesystem::path& report, std::string& error) {
 	return Session::Create(Options {.mode = mode,
@@ -188,10 +198,10 @@ int main() {
 	Check(alpha_mismatch->Observe(View(3, second), error), error.c_str());
 	Check(alpha_mismatch->Finalize(error) == 2, "alpha mismatch exit code");
 	const auto alpha_diff = root / "alpha.json_frames/diff_frame_00000001.ppm";
-	std::ifstream alpha_stream(alpha_diff, std::ios::binary);
-	const std::vector<uint8_t> alpha_bytes {std::istreambuf_iterator<char>(alpha_stream), {}};
+	const auto alpha_bytes = ReadBytes(alpha_diff);
 	Check(alpha_bytes.size() >= 12 &&
-	          std::any_of(alpha_bytes.end() - 12, alpha_bytes.end(), [](uint8_t byte) { return byte != 0; }),
+	          std::any_of(alpha_bytes.end() - 12, alpha_bytes.end(),
+	                      [](uint8_t byte) { return byte != 0; }),
 	      "alpha mismatch must be visible in difference image");
 
 	{
@@ -205,8 +215,7 @@ int main() {
 	Check(corrupt_raw->Observe(View(1, first), error), error.c_str());
 	Check(corrupt_raw->Observe(View(3, changed), error), error.c_str());
 	Check(corrupt_raw->Finalize(error) == 2, "corrupt reference raw exit code");
-	std::ifstream corrupt_report_stream(corrupt_raw_report);
-	const std::string corrupt_report {std::istreambuf_iterator<char>(corrupt_report_stream), {}};
+	const auto corrupt_report = ReadText(corrupt_raw_report);
 	Check(corrupt_report.find("mismatch_reference_unavailable") != std::string::npos,
 	      "corrupt reference raw diagnostic");
 
@@ -227,6 +236,8 @@ int main() {
 	          error.find("overwrite") != std::string::npos,
 	      "report artifact cannot overwrite baseline manifest");
 
-	std::filesystem::remove_all(root);
+	std::error_code cleanup_error;
+	std::filesystem::remove_all(root, cleanup_error);
+	Check(!cleanup_error, "temporary output cleanup");
 	return 0;
 }

@@ -1,5 +1,7 @@
 #include "graphics/presentation/window.h"
 
+#include <cstdlib>
+
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -747,9 +749,18 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
+	uint32_t window_flags = KYTY_SDL_WINDOW_FLAGS;
+#if defined(__APPLE__)
+	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
+	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
+	// borderless window skips that machinery entirely.
+	if (std::getenv("KYTY_BORDERLESS") != nullptr) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
+	}
+#endif
 	context.window =
 	    SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
-	                     KYTY_SDL_WINDOWPOS_CENTERED, width, height, KYTY_SDL_WINDOW_FLAGS);
+	                     KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
 	context.window_hidden = true;
 

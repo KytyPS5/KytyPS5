@@ -19,6 +19,12 @@
 #include <windows.h>
 #undef min
 #undef max
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace Libs::Graphics {
@@ -28,16 +34,55 @@ constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
 constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// The tracker reuses Win32 memory-protection tags as internal page-state values (on
+// Windows they come from <windows.h> and are what VirtualQuery returns). Mirror the
+// canonical Win32 numeric values so the shared state-machine logic is identical.
+constexpr uint32_t PAGE_NOACCESS  = 0x01;
+constexpr uint32_t PAGE_READONLY  = 0x02;
+constexpr uint32_t PAGE_READWRITE = 0x04;
+#endif
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-constexpr uint32_t NO_ACCESS_PROTECTION = PAGE_NOACCESS;
-constexpr uint32_t READ_ONLY_PROTECTION = PAGE_READONLY;
+constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
+constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
 constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
-#else
-constexpr uint32_t NO_ACCESS_PROTECTION = 0;
-constexpr uint32_t READ_ONLY_PROTECTION = 1;
-constexpr uint32_t READ_WRITE_PROTECTION = 2;
+
+#if defined(__APPLE__)
+// Map the tracker's Win32-style protection tags to POSIX mprotect flags.
+static int PageProtToPosix(uint32_t protection) {
+	switch (protection) {
+		case PAGE_NOACCESS: return PROT_NONE;
+		case PAGE_READONLY: return PROT_READ;
+		case PAGE_READWRITE: return PROT_READ | PROT_WRITE;
+		default: return PROT_NONE;
+	}
+}
+
+// Query the current protection of the page containing vaddr via the Mach VM map and
+// collapse it to the tracker's read/write tags (execute is irrelevant to write tracking).
+static uint32_t MachQueryPageProt(uint64_t vaddr) {
+	auto              region_addr = static_cast<mach_vm_address_t>(vaddr);
+	mach_vm_size_t    region_size = 0;
+	vm_region_basic_info_data_64_t info {};
+	mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t                    object_name = MACH_PORT_NULL;
+
+	kern_return_t kr =
+	    mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+	                   reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+	if (kr != KERN_SUCCESS || region_addr > vaddr) {
+		return PAGE_NOACCESS; // no region covering vaddr
+	}
+	if ((info.protection & VM_PROT_WRITE) != 0) {
+		return PAGE_READWRITE;
+	}
+	if ((info.protection & VM_PROT_READ) != 0) {
+		return PAGE_READONLY;
+	}
+	return PAGE_NOACCESS;
+}
 #endif
 
 thread_local bool g_in_fault_resolution = false;
@@ -78,6 +123,8 @@ thread_local bool g_in_fault_resolution = false;
 uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return GetCurrentThreadId();
+#elif defined(__APPLE__)
+	return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
 #else
 	FailFast();
 #endif
@@ -144,6 +191,12 @@ struct PageManager::Impl {
 		if (info.dwPageSize != PAGE_SIZE) {
 			Fatal("unsupported host page size 0x%08" PRIx32,
 			      static_cast<uint32_t>(info.dwPageSize));
+		}
+#elif defined(__APPLE__)
+		// Under Rosetta the host page size is 4 KB, matching TRACKER_PAGE_SIZE.
+		if (static_cast<uint64_t>(getpagesize()) != PAGE_SIZE) {
+			Fatal("unsupported host page size 0x%08" PRIx32,
+			      static_cast<uint32_t>(getpagesize()));
 		}
 #else
 		Fatal("page-fault invalidation is not implemented on this platform");
@@ -225,6 +278,14 @@ struct PageManager::Impl {
 			      vaddr, static_cast<uint32_t>(info.State), static_cast<uint32_t>(info.Protect));
 		}
 		return info.Protect;
+#elif defined(__APPLE__)
+		const uint32_t protection = MachQueryPageProt(vaddr);
+		if (protection != PAGE_READWRITE) {
+			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (protection=0x%08" PRIx32
+			      ")",
+			      vaddr, protection);
+		}
+		return protection;
 #else
 		(void)vaddr;
 		Fatal("page query is unsupported on this platform");
@@ -243,6 +304,14 @@ struct PageManager::Impl {
 			case PageFaultAccess::Read:
 				return info.Protect == PAGE_READONLY || info.Protect == PAGE_READWRITE;
 			case PageFaultAccess::Write: return info.Protect == PAGE_READWRITE;
+			default: return false;
+		}
+#elif defined(__APPLE__)
+		const uint32_t protection = MachQueryPageProt(vaddr);
+		switch (access) {
+			case PageFaultAccess::Read:
+				return protection == PAGE_READONLY || protection == PAGE_READWRITE;
+			case PageFaultAccess::Write: return protection == PAGE_READWRITE;
 			default: return false;
 		}
 #else
@@ -264,6 +333,18 @@ struct PageManager::Impl {
 			Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
 			      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
 			      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
+		}
+#elif defined(__APPLE__)
+		// mprotect cannot report the previous protection, so the expected_old comparison
+		// is dropped; the tracker is the sole mutator of these pages and drives the
+		// transition from its own shadow state.
+		(void)expected_old;
+		if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
+		             PageProtToPosix(protection)) != 0) {
+			if (fault_path) {
+				FailFast("mprotect fault transition failed");
+			}
+			Fatal("mprotect failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr, protection);
 		}
 #else
 		(void)vaddr;

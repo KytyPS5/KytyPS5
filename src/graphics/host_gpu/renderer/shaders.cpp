@@ -729,7 +729,13 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 
 	vk::PipelineRasterizationStateCreateInfo rasterizer {};
 	rasterizer.sType                   = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
+	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
+#if defined(__APPLE__)
+	rasterizer.pNext                   = nullptr;
+#else
 	rasterizer.pNext                   = &clip_ext;
+#endif
 	rasterizer.flags                   = {};
 	rasterizer.depthClampEnable        = VK_FALSE;
 	rasterizer.rasterizerDiscardEnable = VK_FALSE;
@@ -807,7 +813,13 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
 	color_blending.sType             = vk::StructureType::ePipelineColorBlendStateCreateInfo;
+	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
+	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
+#if defined(__APPLE__)
+	color_blending.pNext             = nullptr;
+#else
 	color_blending.pNext             = &color_write;
+#endif
 	color_blending.flags             = {};
 	color_blending.logicOpEnable     = VK_FALSE;
 	color_blending.logicOp           = vk::LogicOp::eCopy;
@@ -873,7 +885,11 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	depth_stencil_info.depthWriteEnable = (static_params.depth_write_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.depthCompareOp   = static_params.depth_compare_op;
 	depth_stencil_info.depthBoundsTestEnable =
+#if defined(__APPLE__)
+	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
+#else
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
+#endif
 	depth_stencil_info.stencilTestEnable = (static_params.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.front.failOp      = static_params.stencil_front.failOp;
 	depth_stencil_info.front.passOp      = static_params.stencil_front.passOp;
@@ -893,7 +909,9 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,
-	    vk::DynamicState::eColorWriteEnableEXT,
+#if !defined(__APPLE__)
+	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
+#endif
 	};
 	const auto dynamic_states_count =
 	    static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(dynamic_states[0]));

@@ -217,7 +217,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		if (color_write_ext.colorWriteEnable != VK_TRUE) {
 			LOGF("colorWriteEnable is not supported\n");
+#if !defined(__APPLE__)
 			skip_device = true;
+#endif
 		}
 
 		if (depth_clip_control.depthClipControl != VK_TRUE) {
@@ -226,7 +228,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 		if (depth_clip_enable.depthClipEnable != VK_TRUE) {
 			LOGF("depthClipEnable is not supported\n");
+#if !defined(__APPLE__)
 			skip_device = true;
+#endif
 		}
 
 		if (features12.samplerMirrorClampToEdge != VK_TRUE) {
@@ -271,7 +275,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 		if (device_features2.features.depthBounds != VK_TRUE) {
 			LOGF("depthBounds is not supported\n");
+#if !defined(__APPLE__)
 			skip_device = true;
+#endif
 		}
 		if (device_features2.features.shaderStorageImageWriteWithoutFormat != VK_TRUE) {
 			LOGF("shaderStorageImageWriteWithoutFormat is not supported\n");
@@ -494,7 +500,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	depth_clip_control.sType = vk::StructureType::ePhysicalDeviceDepthClipControlFeaturesEXT;
+	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
+	// feature structs from the chain on macOS (the renderer falls back to default depth
+	// clipping and static color-write masks).
+#if defined(__APPLE__)
+	depth_clip_control.pNext = nullptr;
+#else
 	depth_clip_control.pNext = &depth_clip_enable;
+#endif
 	depth_clip_control.depthClipControl = VK_TRUE;
 
 	vk::PhysicalDeviceVulkan12Features features12 {};
@@ -541,7 +554,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.fragmentStoresAndAtomics             = VK_TRUE;
 	device_features.samplerAnisotropy                    = VK_TRUE;
 	device_features.robustBufferAccess                   = VK_TRUE;
-	device_features.depthBounds                          = VK_TRUE;
+#if !defined(__APPLE__)
+	device_features.depthBounds                          = VK_TRUE; // unsupported by MoltenVK
+#endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
@@ -894,10 +909,20 @@ void WindowContext::CreateVulkan() {
 	}
 	surface = native_surface;
 
-	std::vector<const char*> device_extensions = {
-	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
-	    VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
-	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
+	std::vector<const char*> device_extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+	                                              VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+	                                              VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+	                                              "VK_KHR_maintenance1"};
+
+#if defined(__APPLE__)
+	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
+	// falls back to default depth clipping and static color-write masks on macOS. It also
+	// requires VK_KHR_portability_subset per the Vulkan portability spec.
+	device_extensions.push_back("VK_KHR_portability_subset");
+#else
+	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+#endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {

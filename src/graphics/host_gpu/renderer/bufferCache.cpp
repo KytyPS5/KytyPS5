@@ -554,7 +554,7 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 		return action == CpuFaultAction::Continue;
 	}
 	if (GraphicsRunIsCommandProcessorThread()) {
-		GraphicsRunFinishCommandProcessors();
+		GraphicsRunFinishScheduler();
 	}
 	m_readback->Request(access, vaddr, size);
 	return true;

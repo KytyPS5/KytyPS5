@@ -27,7 +27,7 @@ void GraphicsRunDone();
 int  GraphicsRunGetFrameNum();
 [[nodiscard]] bool              GraphicsRunIsCommandProcessorThread() noexcept;
 [[nodiscard]] CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept;
-void                            GraphicsRunFinishCommandProcessors();
+void                            GraphicsRunFinishScheduler();
 [[nodiscard]] bool              GraphicsRunSubmissionLockHeld() noexcept;
 [[nodiscard]] bool              GraphicsRunGpuLockHeld() noexcept;
 } // namespace Libs::Graphics

@@ -3653,7 +3653,7 @@ bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint
 
 		if (needs_readback) {
 			if (GraphicsRunIsCommandProcessorThread()) {
-				GraphicsRunFinishCommandProcessors();
+				GraphicsRunFinishScheduler();
 			}
 			m_readback->Request(access, vaddr, size);
 			action = m_memory_tracker.BeginCpuFault(vaddr, size, access);

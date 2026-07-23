@@ -1984,7 +1984,6 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	}
 
 	if (stall_mode == 0) {
-		cp.BufferFlush();
 		cp.BufferWait();
 	}
 
@@ -2166,10 +2165,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.Run(then_buffer, then_num_dw);
+		cp.ProcessIndirectBuffer(then_buffer, then_num_dw);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.Run(else_buffer, else_num_dw);
+		cp.ProcessIndirectBuffer(else_buffer, else_num_dw);
 	}
 
 	return payload_dw;
@@ -2496,7 +2495,7 @@ KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008400);
 	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
 
-	cp.IncremenetCe();
+	cp.IncrementCe();
 
 	return 1;
 }
@@ -2507,7 +2506,7 @@ KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008500);
 	EXIT_NOT_IMPLEMENTED(buffer[0] != 0);
 
-	cp.IncremenetDe();
+	cp.IncrementDe();
 
 	return 1;
 }
@@ -2607,7 +2606,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.Run(indirect_buffer, indirect_num_dw);
+	cp.ProcessIndirectBuffer(indirect_buffer, indirect_num_dw);
 
 	return 3;
 }

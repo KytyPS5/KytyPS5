@@ -27,7 +27,6 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t GROUP_SIZE              = 64;
 constexpr uint32_t FAMILY_COUNT            = static_cast<uint32_t>(TileBlockFamily::Count);
 constexpr uint32_t BYTES_PER_ELEMENT_COUNT = 5;
 constexpr uint32_t DIRECTION_COUNT         = 2;
@@ -48,10 +47,8 @@ struct Push {
 	uint32_t tail_x;
 	uint32_t tail_y;
 	uint32_t tail;
-	uint32_t first;
-	uint32_t count;
 };
-static_assert(sizeof(Push) == 60);
+static_assert(sizeof(Push) == 52);
 
 struct Shader {
 	const uint32_t* code;
@@ -73,7 +70,6 @@ constexpr std::array<Shader, FAMILY_COUNT> SHADERS {{
 struct Dispatch {
 	Push     push {};
 	uint32_t pipeline_slot = 0;
-	uint32_t elements      = 0;
 };
 
 struct Resources {
@@ -173,19 +169,22 @@ void TileCompute::Prepare(bool to_tiled, uint64_t tiled_capacity, uint64_t linea
 		TileBlockLayout block {};
 		const uint32_t  tiled_width  = info.tiled_width != 0 ? info.tiled_width : info.pitch;
 		const uint32_t  tiled_height = info.tiled_height != 0 ? info.tiled_height : info.height;
+		const uint64_t  groups_x     = (static_cast<uint64_t>(info.width) + 7u) / 8u;
+		const uint64_t  groups_y     = (static_cast<uint64_t>(info.height) + 7u) / 8u;
 		EXIT_NOT_IMPLEMENTED(
 		    !TileGetBlockLayout(info.family, info.bytes_per_element, block) || info.width == 0 ||
 		    info.height == 0 || info.depth == 0 || info.pitch < info.width ||
+		    groups_x > limits.maxComputeWorkGroupCount[0] ||
+		    groups_y > limits.maxComputeWorkGroupCount[1] ||
+		    info.depth > limits.maxComputeWorkGroupCount[2] ||
 		    (!info.tail && (tiled_width < info.width || tiled_height < info.height)) ||
 		    !IsRangeValid(info.linear_offset, info.linear_size, linear_capacity) ||
 		    !IsRangeValid(info.tiled_offset, info.tiled_size, tiled_capacity) ||
 		    (block.block_depth == 1 && info.depth != 1));
 
-		uint64_t elements = 0, pitch_bytes = 0;
-		EXIT_NOT_IMPLEMENTED(!CheckedMultiply(info.width, info.height, elements) ||
-		                     !CheckedMultiply(elements, info.depth, elements) ||
-		                     !CheckedMultiply(info.pitch, info.bytes_per_element, pitch_bytes) ||
-		                     elements > UINT32_MAX || pitch_bytes > UINT32_MAX);
+		uint64_t pitch_bytes = 0;
+		EXIT_NOT_IMPLEMENTED(!CheckedMultiply(info.pitch, info.bytes_per_element, pitch_bytes) ||
+		                     pitch_bytes > UINT32_MAX);
 		uint64_t slice_bytes = info.linear_slice_stride;
 		EXIT_NOT_IMPLEMENTED(slice_bytes == 0 &&
 		                     !CheckedMultiply(pitch_bytes, info.height, slice_bytes));
@@ -225,7 +224,6 @@ void TileCompute::Prepare(bool to_tiled, uint64_t tiled_capacity, uint64_t linea
 		                      (alignment - 1u)) != 0);
 
 		Dispatch dispatch {};
-		dispatch.elements      = static_cast<uint32_t>(elements);
 		dispatch.pipeline_slot = GetPipelineSlot(to_tiled, info.family, info.bytes_per_element);
 		dispatch.push.src_base =
 		    static_cast<uint32_t>(to_tiled ? info.linear_offset : info.tiled_offset);
@@ -457,23 +455,13 @@ void TileCompute::Execute(bool to_tiled, const void* input, void* output, uint64
 	        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, resources.pipeline_layout, 0, 1,
 	                              &resources.descriptor_set, 0, nullptr);
-	const uint64_t limit =
-	    static_cast<uint64_t>(
-	        graphics.GetPhysicalDeviceProperties().limits.maxComputeWorkGroupCount[0]) *
-	    GROUP_SIZE;
 	for (const auto& dispatch: dispatches) {
 		vk_command.bindPipeline(vk::PipelineBindPoint::eCompute,
 		                        resources.pipelines[dispatch.pipeline_slot]);
-		for (uint32_t first = 0; first < dispatch.elements;) {
-			auto push  = dispatch.push;
-			push.first = first;
-			push.count =
-			    static_cast<uint32_t>(std::min<uint64_t>(dispatch.elements - first, limit));
-			vk_command.pushConstants(resources.pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-			                         0, sizeof(push), &push);
-			vk_command.dispatch((push.count - 1u) / GROUP_SIZE + 1u, 1, 1);
-			first += push.count;
-		}
+		vk_command.pushConstants(resources.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                         sizeof(dispatch.push), &dispatch.push);
+		vk_command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+		                    dispatch.push.depth);
 	}
 	Barrier(vk_command, output_buffer, vk::AccessFlagBits::eShaderWrite,
 	        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eHostRead,

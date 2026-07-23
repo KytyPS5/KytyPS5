@@ -3,9 +3,12 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/gpuTiler.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -14083,6 +14086,102 @@ void CheckClipControlDepthClipState() {
   std::printf("[host]    %-32s ok\n", "ClipControlDepthClipState");
 }
 
+void CheckPm4WaitResume() {
+  GraphicsInitJmpTables();
+  CommandProcessor processor;
+
+  uint32_t label = 0;
+  uint32_t prefix = 0;
+  uint32_t child_observation = UINT32_MAX;
+  uint32_t suffix = 0;
+  const auto address = [](const void *value) {
+    return reinterpret_cast<uint64_t>(value);
+  };
+
+  std::array<uint32_t, 12> child{};
+  child[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  child[1] = 0;
+  child[2] = static_cast<uint32_t>(address(&child_observation));
+  child[3] = static_cast<uint32_t>(address(&child_observation) >> 32u);
+  child[4] = 0;
+  child[5] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_MEM_32);
+  child[6] = static_cast<uint32_t>(address(&label));
+  child[7] = static_cast<uint32_t>(address(&label) >> 32u);
+  child[8] = UINT32_MAX;
+  child[9] = 1;
+  child[10] = 0x10u | 3u;
+
+  std::array<uint32_t, 4> nested{};
+  nested[0] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+  nested[1] = static_cast<uint32_t>(address(child.data()));
+  nested[2] = static_cast<uint32_t>(address(child.data()) >> 32u);
+  nested[3] = 0x0f200000u | static_cast<uint32_t>(child.size());
+
+  std::array<uint32_t, 14> commands{};
+  commands[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[1] = 0;
+  commands[2] = static_cast<uint32_t>(address(&prefix));
+  commands[3] = static_cast<uint32_t>(address(&prefix) >> 32u);
+  commands[4] = 11;
+  commands[5] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+  commands[6] = static_cast<uint32_t>(address(nested.data()));
+  commands[7] = static_cast<uint32_t>(address(nested.data()) >> 32u);
+  commands[8] = 0x0f200000u | static_cast<uint32_t>(nested.size());
+  commands[9] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[10] = 0;
+  commands[11] = static_cast<uint32_t>(address(&suffix));
+  commands[12] = static_cast<uint32_t>(address(&suffix) >> 32u);
+  commands[13] = 22;
+
+  Pm4Execution execution;
+  Require("Pm4WaitResume", "suspend",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Blocked &&
+              prefix == 11 && child_observation == 0 && suffix == 0,
+          "blocked indirect wait did not preserve its command position");
+
+  label = 1;
+  child[4] = 1;
+  Require("Pm4WaitResume", "resume",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Complete &&
+              prefix == 11 && child_observation == 0 && suffix == 22,
+          "resumed indirect wait replayed a child or did not finish its parent");
+  std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
+}
+
+void CheckPm4CeCompletion() {
+  GraphicsInitJmpTables();
+  CommandProcessor processor;
+  uint32_t suffix = 0;
+  const auto address = reinterpret_cast<uint64_t>(&suffix);
+
+  std::array<uint32_t, 7> commands{};
+  commands[0] = 0xc0008600u;
+  commands[1] = 1;
+  commands[2] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[3] = 0;
+  commands[4] = static_cast<uint32_t>(address);
+  commands[5] = static_cast<uint32_t>(address >> 32u);
+  commands[6] = 33;
+
+  processor.ResetDeCe();
+  Pm4Execution execution;
+  Require("Pm4CeCompletion", "wait",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Blocked &&
+              suffix == 0,
+          "DE did not wait for an active CE stream");
+
+  processor.SetCeComplete(true);
+  Require("Pm4CeCompletion", "complete",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Complete &&
+              suffix == 33,
+          "DE remained blocked after the CE stream completed");
+  std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14229,6 +14328,8 @@ int main(int argc, char **argv) {
 #endif
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
+  CheckPm4WaitResume();
+  CheckPm4CeCompletion();
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckPs5GameExampleImageClearRuntimeShape();

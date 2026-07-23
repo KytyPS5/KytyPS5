@@ -1,4 +1,4 @@
-layout(local_size_x = 64) in;
+layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
@@ -17,8 +17,6 @@ layout(push_constant) uniform Push {
 	uint tail_x;
 	uint tail_y;
 	uint tail;
-	uint first;
-	uint count;
 } params;
 
 void copy_element(uint src, uint dst) {
@@ -34,18 +32,10 @@ void copy_element(uint src, uint dst) {
 }
 
 void main() {
-	uint index = gl_GlobalInvocationID.x;
-	if (index >= params.count) {
+	uvec3 p = gl_GlobalInvocationID;
+	if (p.x >= params.width || p.y >= params.height || p.z >= params.depth) {
 		return;
 	}
-
-	uint element = params.first + index;
-	uint plane = params.width * params.height;
-	uvec3 p;
-	p.z = element / plane;
-	element -= p.z * plane;
-	p.y = element / params.width;
-	p.x = element - p.y * params.width;
 
 	uvec3 extent = block_extent();
 	uvec3 swizzle = p;

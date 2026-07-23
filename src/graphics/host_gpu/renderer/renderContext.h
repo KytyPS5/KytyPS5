@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/gdsBuffer.h"
@@ -30,6 +31,7 @@ public:
 	[[nodiscard]] GraphicContext& GetGraphics() const noexcept { return m_graphics; }
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
+	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorCache&    GetDescriptorCache() { return m_descriptor_cache; }
 	FramebufferCache&   GetFramebufferCache() { return m_framebuffer_cache; }
@@ -52,6 +54,7 @@ private:
 
 	GraphicContext&    m_graphics;
 	Common::Mutex      m_mutex;
+	CommandScheduler   m_command_scheduler;
 	PipelineCache      m_pipeline_cache;
 	DescriptorCache    m_descriptor_cache;
 	FramebufferCache   m_framebuffer_cache;

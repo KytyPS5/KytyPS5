@@ -129,17 +129,22 @@ private:
 
 class RenderCommandBuffer final: public CommandBuffer {
 public:
-	RenderCommandBuffer(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders)
-	    : m_registers(registers), m_user_config(user_config), m_shaders(shaders) {}
+	RenderCommandBuffer() = default;
 
-	[[nodiscard]] HW::Context&    GetRegisters() const noexcept { return m_registers; }
-	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept { return m_user_config; }
-	[[nodiscard]] HW::Shader&     GetShaders() const noexcept { return m_shaders; }
+	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
+		m_registers   = &registers;
+		m_user_config = &user_config;
+		m_shaders     = &shaders;
+	}
+
+	[[nodiscard]] HW::Context&    GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
 private:
-	HW::Context&    m_registers;
-	HW::UserConfig& m_user_config;
-	HW::Shader&     m_shaders;
+	HW::Context*    m_registers   = nullptr;
+	HW::UserConfig* m_user_config = nullptr;
+	HW::Shader*     m_shaders     = nullptr;
 };
 
 void RenderDrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t index_type_and_size,

@@ -734,6 +734,23 @@ bool LowerVectorSubBorrowRev(const Decoder::Instruction& decoded, BasicBlock& bl
 	return true;
 }
 
+// STUB: see Decoder::Opcode::ImageBvhIntersectRay / IR::Opcode::ImageBvhIntersectRayStub. Emits an
+// instruction with no source operands (the decoded address/resource fields are intentionally
+// dropped); EmitImageBvhIntersectRayStub always writes "no intersection" to the 4 destination
+// registers instead of performing a real BVH-node ray test.
+bool LowerImageBvhIntersectRayStub(const Decoder::Instruction& decoded, BasicBlock& block,
+                                   std::string* error) {
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = Opcode::ImageBvhIntersectRayStub;
+	inst.src_count = 0;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 bool LowerVectorCarryOut(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
 	Instruction inst;
@@ -1106,6 +1123,8 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
 		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);
 		case Decoder::Opcode::VSubbrevU32: return LowerVectorSubBorrowRev(inst, block, error);
+		case Decoder::Opcode::ImageBvhIntersectRay:
+			return LowerImageBvhIntersectRayStub(inst, block, error);
 		case Decoder::Opcode::VMadU64U32: return LowerVectorMadU64U32(inst, block, error);
 		case Decoder::Opcode::VMacF32: return LowerVectorMacF32(inst, block, error);
 		case Decoder::Opcode::VPkFmacF16: return LowerVectorPkFmacF16(inst, block, error);

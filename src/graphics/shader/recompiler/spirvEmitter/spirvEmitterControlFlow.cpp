@@ -841,6 +841,9 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 			break;
 		case IR::Opcode::ImageGetResinfo: EmitImageGetResinfo(state, inst); break;
 		case IR::Opcode::ImageGetLod: EmitImageGetLod(state, inst); break;
+		case IR::Opcode::ImageBvhIntersectRayStub:
+			EmitImageBvhIntersectRayStub(state, inst);
+			break;
 		case IR::Opcode::ImageLoad: EmitImageLoad(state, inst); break;
 		case IR::Opcode::ImageStore:
 			EmitGuardedByExec(state, [&]() { EmitImageStore(state, inst); });

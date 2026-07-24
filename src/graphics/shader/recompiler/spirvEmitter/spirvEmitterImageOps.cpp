@@ -95,6 +95,21 @@ uint32_t EmitImageGetResinfoComponent(EmitterState& state, uint32_t image, uint3
 	}
 }
 
+// STUB: see Decoder::Opcode::ImageBvhIntersectRay / IR::Opcode::ImageBvhIntersectRayStub for what a
+// real implementation needs. No BVH acceleration-structure traversal is performed here -- this
+// just reports "no intersection" unconditionally, so ray-traced effects using this instruction
+// (e.g. ray-traced shadows) will always see a miss. To implement the real thing: read the RSRC
+// (bound via inst.memory, currently unused) as the BVH root/node descriptor, walk it using the 11
+// address dwords in inst.src (currently not even decoded -- see LowerImageBvhIntersectRayStub) and
+// write either 4 sorted child-box pointers or {hit_time, triangle_id, ...} to inst.dst..dst+3
+// depending on the fetched node's type, per RDNA2 ISA reference section 12.16.
+void EmitImageBvhIntersectRayStub(EmitterState& state, const IR::Instruction& inst) {
+	const auto miss = ConstantU32(state, 0xffffffffu);
+	for (uint32_t i = 0; i < 4u; i++) {
+		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), miss);
+	}
+}
+
 void EmitImageGetResinfo(EmitterState& state, const IR::Instruction& inst) {
 	const auto view      = SampledImageViewKind(state, inst.memory, inst.pc);
 	const auto image     = LoadSampledImageDescriptor(state, inst.memory, inst.pc, view);

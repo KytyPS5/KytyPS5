@@ -497,6 +497,13 @@ enum class Opcode {
 	DsReadAddtidB32,
 	ImageGetResinfo,
 	ImageGetLod,
+	// STUB: real GPU ray tracing (BVH acceleration-structure traversal) is not implemented. This
+	// decodes MIMG opcode 0xe6 (IMAGE_BVH_INTERSECT_RAY, RDNA2 ISA reference section 12.16) but the
+	// IR/emission side (see IR::Opcode::ImageBvhIntersectRayStub) always reports "no intersection"
+	// instead of doing a real ray/BVH-node test. See that opcode's definition for what a real
+	// implementation needs (11 address VGPRs: node pointer, ray extent/origin/dir/inv-dir; 4 result
+	// VGPRs: either 4 sorted child box pointers or a hit time + triangle ID, depending on node type).
+	ImageBvhIntersectRay,
 	ImageLoad,
 	ImageLoadMip,
 	ImageStore,

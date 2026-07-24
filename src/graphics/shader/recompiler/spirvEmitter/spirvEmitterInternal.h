@@ -1012,6 +1012,7 @@ void EmitDsSwizzleB32(EmitterState& state, const IR::Instruction& inst);
 uint32_t EmitImageGetResinfoComponent(EmitterState& state, uint32_t image, uint32_t size,
                                       uint32_t component_index);
 
+void EmitImageBvhIntersectRayStub(EmitterState& state, const IR::Instruction& inst);
 void EmitImageGetResinfo(EmitterState& state, const IR::Instruction& inst);
 
 void EmitImageGetLod(EmitterState& state, const IR::Instruction& inst);

@@ -500,6 +500,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DsReadAddtidB32: text += "DsReadAddtidB32"; break;
 		case Opcode::ImageGetResinfo: text += "ImageGetResinfo"; break;
 		case Opcode::ImageGetLod: text += "ImageGetLod"; break;
+		case Opcode::ImageBvhIntersectRayStub: text += "ImageBvhIntersectRayStub"; break;
 		case Opcode::ImageLoad: text += "ImageLoad"; break;
 		case Opcode::ImageStore: text += "ImageStore"; break;
 		case Opcode::ImageSample: text += "ImageSample"; break;

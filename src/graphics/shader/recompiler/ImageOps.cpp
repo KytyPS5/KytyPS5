@@ -271,9 +271,10 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                            : opcode == 0x09u   ? Opcode::ImageStoreMip
 	                            : opcode == 0x0eu   ? Opcode::ImageGetResinfo
 	                            : opcode == 0x60u   ? Opcode::ImageGetLod
+	                            : opcode == 0xe6u   ? Opcode::ImageBvhIntersectRay
 	                                                : Opcode::Unsupported);
 	inst.dmask              = (word0 >> 8u) & 0xfu;
-	inst.data_dwords        = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
+	inst.data_dwords = gather != nullptr || opcode == 0xe6u ? 4u : CountDmaskComponents(inst.dmask);
 	inst.glc                = ((word0 >> 13u) & 1u) != 0;
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
 	inst.image_sample_flags = (sample != nullptr   ? sample->flags
@@ -292,6 +293,7 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    : opcode == 0x60u   ? ImageCoordComponents(dimension)
 	    : opcode == 0x01u   ? ImageCoordComponents(dimension) + 1u
 	    : opcode == 0x00u   ? ImageCoordComponents(dimension)
+	    : opcode == 0xe6u   ? (a16 ? 8u : 11u) // node ptr, ray extent/origin/dir/inv-dir; see decl.
 	                        : (opcode == 0x09u   ? ImageCoordComponents(dimension) + 1u
 	                           : opcode == 0x08u ? ImageCoordComponents(dimension)
 	                                             : 0u);

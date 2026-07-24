@@ -396,9 +396,19 @@ static void CreateLayout(std::span<vk::DescriptorSetLayout> set_layouts, uint32_
 	if (bindings.push_constant_size != 0) {
 		auto index = push_constant_info_num;
 
+		// The SPIR-V push-constant block (spirvEmitterModule.cpp) is declared as whole 16-byte rows,
+		// rounding push_constant_size up to the next multiple of 16. The VkPushConstantRange must
+		// fully contain that declared block or driver validation rejects pipeline creation, so round
+		// the range's size up the same way here. vkCmdPushConstants (descriptors.cpp) still uses the
+		// exact, unrounded bindings.push_constant_size for the actual data upload, which is fine --
+		// the extra rounded-up bytes are unused padding inside the declared block.
+		constexpr uint32_t push_constant_row_bytes = 16u;
+		const uint32_t     rounded_size =
+		    (bindings.push_constant_size + push_constant_row_bytes - 1u) & ~(push_constant_row_bytes - 1u);
+
 		push_constant_info[index].stageFlags = vk_stage;
 		push_constant_info[index].offset     = bindings.push_constant_offset;
-		push_constant_info[index].size       = bindings.push_constant_size;
+		push_constant_info[index].size       = rounded_size;
 		push_constant_info_num++;
 	}
 

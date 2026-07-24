@@ -2175,22 +2175,37 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 #if defined(__x86_64__) || defined(_M_X64)
 __attribute__((noinline, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
 	int ret = 0;
+	// Reading the return address and "resume" rsp off (%rsp)/8(%rsp) only works if this asm is the
+	// very first thing to execute after entry, with zero prologue overhead. That assumption breaks
+	// silently whenever the compiler keeps a frame pointer (push %rbp; mov %rsp,%rbp before this
+	// block runs, e.g. under -fno-omit-frame-pointer for profiler/backtrace support): every raw
+	// (%rsp)-relative read below ends up one push (8 bytes) short, capturing the wrong caller rbp,
+	// return address, and resume rsp, which corrupts fiber state (a later jmp through the bogus
+	// captured rip crashes). __builtin_frame_address(0) gives the correct frame-pointer-chain
+	// address regardless of the actual prologue GCC/Clang emits, so derive everything from that
+	// instead of hardcoded (%rsp) offsets.
+	auto* frame       = static_cast<void**>(__builtin_frame_address(0));
+	void* caller_rbp   = frame[0];
+	void* return_addr  = frame[1];
+	auto  resume_rsp   = reinterpret_cast<uintptr_t>(frame) + 2u * sizeof(void*);
 	asm volatile("movq %[ctx], %%r10\n\t"
 	             "movq %%rbx, 0(%%r10)\n\t"
-	             "movq %%rbp, 8(%%r10)\n\t"
+	             "movq %[caller_rbp], %%r11\n\t"
+	             "movq %%r11, 8(%%r10)\n\t"
 	             "movq %%rdi, 16(%%r10)\n\t"
 	             "movq %%rsi, 24(%%r10)\n\t"
 	             "movq %%r12, 32(%%r10)\n\t"
 	             "movq %%r13, 40(%%r10)\n\t"
 	             "movq %%r14, 48(%%r10)\n\t"
 	             "movq %%r15, 56(%%r10)\n\t"
-	             "leaq 8(%%rsp), %%r11\n\t"
+	             "movq %[resume_rsp], %%r11\n\t"
 	             "movq %%r11, 64(%%r10)\n\t"
-	             "movq (%%rsp), %%r11\n\t"
+	             "movq %[return_addr], %%r11\n\t"
 	             "movq %%r11, 72(%%r10)\n\t"
 	             "xorl %%eax, %%eax\n\t"
 	             : "=a"(ret)
-	             : [ctx] "r"(ctx)
+	             : [ctx] "r"(ctx), [caller_rbp] "r"(caller_rbp), [resume_rsp] "r"(resume_rsp),
+	               [return_addr] "r"(return_addr)
 	             : "memory", "r10", "r11");
 	return ret;
 }
@@ -2212,7 +2227,8 @@ __attribute__((noreturn, noinline)) static void FiberRestoreContext(FiberCpuCont
 	             "jmp *%%r11\n\t"
 	             :
 	             : [ctx] "r"(ctx), [ret] "r"(ret)
-	             : "memory", "rax", "r10", "r11");
+	             : "memory", "rax", "rbx", "rbp", "rdi", "rsi", "r10", "r11", "r12", "r13", "r14",
+	               "r15");
 	__builtin_unreachable();
 }
 #else

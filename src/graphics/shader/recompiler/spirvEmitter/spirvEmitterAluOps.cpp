@@ -1492,6 +1492,26 @@ void EmitCompareNeU64(EmitterState& state, const IR::Instruction& inst) {
 	EmitCompareResult(state, inst.dst, cond);
 }
 
+void EmitCompareGtU64(EmitterState& state, const IR::Instruction& inst) {
+	const auto lhs_low  = EmitSequentialValueLoad(state, inst.src[0], 0);
+	const auto lhs_high = EmitSequentialValueLoad(state, inst.src[0], 1);
+	const auto rhs_low  = EmitSequentialValueLoad(state, inst.src[1], 0);
+	const auto rhs_high = EmitSequentialValueLoad(state, inst.src[1], 1);
+	const auto high_gt  = state.builder.AllocateId();
+	const auto high_eq  = state.builder.AllocateId();
+	const auto low_gt   = state.builder.AllocateId();
+	const auto low_case = state.builder.AllocateId();
+	const auto cond     = state.builder.AllocateId();
+	// Standard multi-word unsigned comparison: the high words decide unless they're equal, in
+	// which case the low words decide.
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, high_gt, lhs_high, rhs_high});
+	state.builder.AddFunction({OpIEqual, state.bool_type, high_eq, lhs_high, rhs_high});
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, low_gt, lhs_low, rhs_low});
+	state.builder.AddFunction({OpLogicalAnd, state.bool_type, low_case, high_eq, low_gt});
+	state.builder.AddFunction({OpLogicalOr, state.bool_type, cond, high_gt, low_case});
+	EmitCompareResult(state, inst.dst, cond);
+}
+
 void EmitCompareConstant(EmitterState& state, const IR::Instruction& inst, bool value) {
 	const auto cond = state.builder.AllocateId();
 	state.builder.AddFunction({value ? OpIEqual : OpINotEqual, state.bool_type, cond,

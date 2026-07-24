@@ -289,6 +289,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::CompareLtU32: text += "CompareLtU32"; break;
 		case Opcode::CompareLeU32: text += "CompareLeU32"; break;
 		case Opcode::CompareNeU64: text += "CompareNeU64"; break;
+		case Opcode::CompareGtU64: text += "CompareGtU64"; break;
 		case Opcode::CompareMaskEqU32: text += "CompareMaskEqU32"; break;
 		case Opcode::CompareMaskNeU32: text += "CompareMaskNeU32"; break;
 		case Opcode::CompareMaskGtU32: text += "CompareMaskGtU32"; break;

@@ -326,6 +326,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VCmpGeU32, Opcode::CompareGeU32},
     {Decoder::Opcode::VCmpTU32, Opcode::CompareTrue},
     {Decoder::Opcode::VCmpNeU64, Opcode::CompareNeU64},
+    {Decoder::Opcode::VCmpGtU64, Opcode::CompareGtU64},
     {Decoder::Opcode::VCmpxLtU32, Opcode::CompareMaskLtU32},
     {Decoder::Opcode::VCmpxEqU32, Opcode::CompareMaskEqU32},
     {Decoder::Opcode::VCmpxLeU32, Opcode::CompareMaskLeU32},

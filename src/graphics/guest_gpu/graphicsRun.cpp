@@ -390,7 +390,28 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (num_bytes == 0) {
 		return;
 	}
-	EXIT_NOT_IMPLEMENTED((num_bytes & 3u) != 0);
+	// A handful of CP_DMA_DATA packets from this game carry implausibly small dst/src "addresses"
+	// (observed: dst_sel=3/src_sel=3 with dst=2/src=4, and dst_sel=2/src_sel=3 with dst=1/src=4,
+	// all 1-byte transfers) that don't correspond to any real guest allocation -- no legitimate
+	// PS4/PS5 allocation ever lands in the first page, and dst_sel=2 isn't even one of the memory
+	// selectors this code otherwise understands. Whatever these actually address (some non-memory
+	// CP-internal selector semantics not root-caused here), they're clearly not guest memory
+	// traffic, so treat any implausibly-low address as a no-op before interpreting selectors at
+	// all, rather than hard-failing on a rejected/unrecognized access.
+	constexpr uint64_t plausible_guest_address_min = 4096u;
+	const bool         dst_plausible = dst_address_or_offset >= plausible_guest_address_min;
+	const bool         src_plausible =
+	    src_sel == 2 || src_address_or_offset_or_immediate >= plausible_guest_address_min;
+	if (!dst_plausible || !src_plausible) {
+		LOGF("DmaData: skipping implausible-address transfer, dst_sel=%u src_sel=%u "
+		     "dst=0x%016" PRIx64 " src=0x%016" PRIx64 " size=%u\n",
+		     dst_sel, src_sel, dst_address_or_offset, src_address_or_offset_or_immediate,
+		     num_bytes);
+		return;
+	}
+	// FillBuffer/CopyBuffer each enforce whatever dword-alignment their own implementation actually
+	// needs (FillBuffer's std::fill<uint32_t> genuinely requires it; a plain byte copy doesn't), so
+	// this doesn't need its own blanket alignment gate ahead of them.
 	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);

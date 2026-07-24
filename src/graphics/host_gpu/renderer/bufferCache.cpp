@@ -1065,8 +1065,10 @@ void BufferCache::FillBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t si
 
 void BufferCache::CopyBuffer(CommandBuffer* command, uint64_t dst_vaddr, uint64_t src_vaddr,
                              uint64_t size) {
-	if (dst_vaddr == 0 || src_vaddr == 0 || size == 0 ||
-	    ((dst_vaddr | src_vaddr | size) & 3u) != 0 || size > UINT64_MAX - dst_vaddr ||
+	// Byte-granular copies are legitimate PM4 CP_DMA_DATA traffic (unlike FillBuffer's dword-wise
+	// std::fill, the memcpy fast path below and the Vulkan vkCmdCopyBuffer fallback both work at
+	// arbitrary byte granularity), so this doesn't require dword-aligned addresses/size.
+	if (dst_vaddr == 0 || src_vaddr == 0 || size == 0 || size > UINT64_MAX - dst_vaddr ||
 	    size > UINT64_MAX - src_vaddr ||
 	    (src_vaddr < dst_vaddr + size && dst_vaddr < src_vaddr + size)) {
 		EXIT("BufferCache: invalid or overlapping copy range, src=0x%016" PRIx64

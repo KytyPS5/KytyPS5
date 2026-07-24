@@ -938,6 +938,16 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	if (construct_predecessors.empty() || (!force_split && external_predecessors.empty())) {
 		return false;
 	}
+	// Skip predecessors that are already trivial single-successor forwarders into merge -- retargeting
+	// them again would just add a redundant layer of indirection when the split isn't otherwise
+	// needed. But when a split is required (force_split, e.g. an inner construct's merge illegally
+	// coincides with an enclosing loop's continue block) and *every* construct predecessor happens to
+	// already be such a forwarder, skipping all of them here means nothing gets split at all, leaving
+	// the structural violation this call exists to fix unresolved -- observed as spirv-val rejecting
+	// the module ("header block is contained in the loop construct ..., but its merge block is not")
+	// for a shader where an if/else's merge landed on its enclosing loop's continue block. In that
+	// case, fall back to splitting the forwarders anyway; an extra harmless indirection layer is far
+	// better than leaving an invalid module.
 	std::vector<uint32_t> predecessors_to_split;
 	for (auto pred: construct_predecessors) {
 		if (!IsSyntheticMergeForwarder(graph, pred, merge)) {
@@ -945,7 +955,10 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 		}
 	}
 	if (predecessors_to_split.empty()) {
-		return false;
+		if (!force_split) {
+			return false;
+		}
+		predecessors_to_split = construct_predecessors;
 	}
 
 	const auto synthetic_merge = AppendSyntheticMergeBlock(graph, merge);

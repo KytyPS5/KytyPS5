@@ -419,6 +419,21 @@ IsDepthUintTextureReinterpretation(vk::Format image_format, uint32_t guest_forma
 	}
 }
 
+// Same idea as IsDepthUintTextureReinterpretation, but for a guest access that reads/writes the
+// depth buffer's values directly as float (its natural representation) rather than reinterpreting
+// the raw bits as uint32 -- e.g. a compute pass binding a depth-tiled 2D storage image with
+// BufferFormat::k32Float over a D32_SFLOAT depth target.
+[[nodiscard]] inline constexpr bool
+IsDepthFloatTextureDirectView(vk::Format image_format, uint32_t guest_format,
+                              vk::Format view_format) noexcept {
+	switch (image_format) {
+		case vk::Format::eD32Sfloat:
+			return guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
+			       view_format == vk::Format::eR32Sfloat;
+		default: return false;
+	}
+}
+
 [[nodiscard]] inline constexpr bool NeedsStaticSampledArrayView(bool shader_array,
                                                                 bool dynamic_view_selected) {
 	return shader_array && !dynamic_view_selected;

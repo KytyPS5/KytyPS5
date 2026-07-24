@@ -348,9 +348,14 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    descriptor.BaseArray5() <= descriptor.Depth();
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
+	// A depth-tiled storage access can read the depth buffer's raw bits via a uint binding
+	// (StorageImageUint) or its values directly via a float binding (StorageImage); ValidateStorageTexture
+	// has already checked the resource kind and guest format agree (both uint or both float) before
+	// this is reached, so accepting either kind here is safe.
 	const bool supported_depth_tile =
 	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) && !resource.read &&
-	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
+	    (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint ||
+	     resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImage) &&
 	    IsSupportedStorageDepthTile(descriptor.Format(), descriptor.Type(), width, height, depth);
 	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
 	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
@@ -560,7 +565,12 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 				    IsSupportedStorageTextureEncoding(descriptor) &&
 				    IsDepthUintTextureReinterpretation(image->format, descriptor.Format(),
 				                                       view_format);
-				if (uint_reinterpret || uint_storage_reinterpret) {
+				const bool float_storage_direct =
+				    storage && IsSupportedStorageImageResource(resource) &&
+				    IsSupportedStorageTextureDescriptor(resource, descriptor) &&
+				    IsSupportedStorageTextureEncoding(descriptor) &&
+				    IsDepthFloatTextureDirectView(image->format, descriptor.Format(), view_format);
+				if (uint_reinterpret || uint_storage_reinterpret || float_storage_direct) {
 					image = nullptr;
 				} else {
 					const auto depth_view = ResolveTargetTextureView(

@@ -43,6 +43,10 @@
 
 #include <pthread.h>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <sched.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <fmt/format.h>
 #include <pthread_time.h>
@@ -50,6 +54,12 @@
 
 #ifdef pthread_attr_getguardsize
 #undef pthread_attr_getguardsize
+#endif
+
+// glibc defines this as a macro (historically a literal, now sometimes a sysconf() call); this
+// file declares its own constexpr constant of the same name below.
+#ifdef PTHREAD_STACK_MIN
+#undef PTHREAD_STACK_MIN
 #endif
 
 namespace Libs {
@@ -290,16 +300,31 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 	}
 }
 #else
-static bool kernel_clock_gettime_special(KernelClockid clock_id, KernelTimespec* tp, int* error) {
+static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp, int* error) {
 	EXIT_IF(tp == nullptr);
 	EXIT_IF(error == nullptr);
 
 	if (clock_id == KERNEL_CLOCK_PROCTIME) {
-		kernel_us_to_timespec(kernel_get_process_time_us_native(), tp);
+		KernelUsToTimespec(KernelGetProcessTimeUsNative(), tp);
 		return true;
 	}
 
-	return false;
+	clockid_t native_clock_id {};
+	switch (clock_id) {
+		case KERNEL_CLOCK_THREAD_CPUTIME_ID: native_clock_id = CLOCK_THREAD_CPUTIME_ID; break;
+		case KERNEL_CLOCK_VIRTUAL:
+		case KERNEL_CLOCK_PROF: native_clock_id = CLOCK_PROCESS_CPUTIME_ID; break;
+		default: return false;
+	}
+
+	timespec native_time {};
+	if (::clock_gettime(native_clock_id, &native_time) != 0) {
+		*error = KERNEL_ERROR_EFAULT;
+		return true;
+	}
+	tp->tv_sec  = native_time.tv_sec;
+	tp->tv_nsec = native_time.tv_nsec;
+	return true;
 }
 #endif
 
@@ -823,9 +848,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
+	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "xmm0",
+	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+	               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 
 	g_guest_entry_return_rsp = 0;
 	if (g_pthread_self != nullptr) {
@@ -2130,6 +2155,20 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 	} else {
 		pparam.sched_priority = 0;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// glibc pthreads enforce POSIX scheduling-policy priority ranges (SCHED_OTHER only allows a
+	// priority of 0), unlike the PS4/PS5 SDK and winpthreads (Windows), which accept this hint
+	// regardless of policy. Clamp into whatever range the attr's current policy actually supports
+	// so the call degrades to a no-op under SCHED_OTHER instead of failing outright.
+	int policy = SCHED_OTHER;
+	pthread_attr_getschedpolicy(&attr_value->p, &policy);
+	const int min_priority = sched_get_priority_min(policy);
+	const int max_priority = sched_get_priority_max(policy);
+	if (min_priority != -1 && max_priority != -1) {
+		pparam.sched_priority = std::clamp(pparam.sched_priority, min_priority, max_priority);
+	}
+#endif
 
 	int result = pthread_attr_setschedparam(&attr_value->p, &pparam);
 

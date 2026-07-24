@@ -9,6 +9,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <unordered_map>
 #include <vector>

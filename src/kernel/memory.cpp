@@ -1899,20 +1899,24 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	constexpr size_t   PAGE_SIZE         = 0x4000;
 	constexpr size_t   MAXIMUM_NAME_SIZE = 32;
 	constexpr uint64_t DEFAULT_PS5_BASE  = 0x200000000;
-	constexpr int      MAP_FIXED         = 0x10;
-	constexpr int      MAP_SHARED        = 0x01;
-	constexpr int      MAP_PRIVATE       = 0x02;
+	// Prefixed to avoid colliding with the MAP_* macros <sys/mman.h> defines on POSIX platforms;
+	// these are the guest (PS4/PS5) ABI's own mmap flag bit values, not the host's.
+	constexpr int      KYTY_MAP_FIXED        = 0x10;
+	constexpr int      KYTY_MAP_SHARED       = 0x01;
+	constexpr int      KYTY_MAP_PRIVATE      = 0x02;
 	constexpr int      MAP_NO_OVERWRITE  = 0x80;
 	constexpr int      MAP_VOID          = 0x100;
-	constexpr int      MAP_STACK         = 0x400;
+	// Prefixed to avoid colliding with <sys/mman.h>'s MAP_STACK macro on POSIX platforms.
+	constexpr int      KYTY_MAP_STACK        = 0x400;
 	constexpr int      MAP_NO_SYNC       = 0x800;
-	constexpr int      MAP_ANON          = 0x1000;
+	constexpr int      KYTY_MAP_ANON         = 0x1000;
 	constexpr int      MAP_UNKNOWN_8000  = 0x8000;
 	constexpr int      MAP_NO_CORE       = 0x20000;
 	constexpr int      MAP_NO_COALESCE   = 0x400000;
-	constexpr int SUPPORTED_MAP_BITS     = MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_NO_OVERWRITE |
-	                                       MAP_VOID | MAP_STACK | MAP_NO_SYNC | MAP_ANON |
-	                                       MAP_UNKNOWN_8000 | MAP_NO_CORE | MAP_NO_COALESCE;
+	constexpr int SUPPORTED_MAP_BITS     = KYTY_MAP_SHARED | KYTY_MAP_PRIVATE | KYTY_MAP_FIXED |
+	                                       MAP_NO_OVERWRITE | MAP_VOID | KYTY_MAP_STACK |
+	                                       MAP_NO_SYNC | KYTY_MAP_ANON | MAP_UNKNOWN_8000 |
+	                                       MAP_NO_CORE | MAP_NO_COALESCE;
 
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -2662,10 +2666,11 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	EXIT_NOT_IMPLEMENTED(addr == nullptr);
-	constexpr int MAP_FIXED        = 0x10;
+	// Prefixed to avoid colliding with <sys/mman.h>'s MAP_FIXED macro on POSIX platforms.
+	constexpr int KYTY_MAP_FIXED   = 0x10;
 	constexpr int MAP_NO_OVERWRITE = 0x80;
 
-	bool fixed        = ((flags & MAP_FIXED) != 0);
+	bool fixed        = ((flags & KYTY_MAP_FIXED) != 0);
 	bool no_overwrite = ((flags & MAP_NO_OVERWRITE) != 0);
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
@@ -3001,6 +3006,16 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 				continue;
 			}
 		}
+#else
+		// Linux has no query-then-act step: mprotect() on an already-mapped page always
+		// succeeds regardless of its current protection (this covers both the "was committed"
+		// and "was already a placeholder reservation" cases Windows distinguishes via
+		// VirtualQuery above), and fails on an address with no mapping at all, in which case
+		// fall through to a fresh reservation below.
+		if (VirtualMemory::Decommit(addr, PAGE_SIZE)) {
+			host_mutated = true;
+			continue;
+		}
 #endif
 		if (!VirtualMemory::ReserveFixed(addr, PAGE_SIZE)) {
 			if (host_mutated) {
@@ -3268,7 +3283,8 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	     in_addr, len, flags, alignment);
 
 	constexpr size_t PAGE_SIZE        = 0x4000;
-	constexpr int    MAP_FIXED        = 0x10;
+	// Prefixed to avoid colliding with <sys/mman.h>'s MAP_FIXED macro on POSIX platforms.
+	constexpr int    KYTY_MAP_FIXED   = 0x10;
 	constexpr int    MAP_NO_OVERWRITE = 0x80;
 
 	if (addr == nullptr || len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
@@ -3281,7 +3297,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	uint64_t out_addr            = 0;
 	bool     range_already_added = false;
 	bool     placeholder_backed  = false;
-	if ((flags & MAP_FIXED) != 0) {
+	if ((flags & KYTY_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0) {
 			return KERNEL_ERROR_EINVAL;
 		}
@@ -3699,8 +3715,9 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out) {
-	constexpr int MAP_FIXED = 0x10;
-	return KernelBatchMap2(entries, num_entries, num_entries_out, MAP_FIXED);
+	// Prefixed to avoid colliding with <sys/mman.h>'s MAP_FIXED macro on POSIX platforms.
+	constexpr int KYTY_MAP_FIXED = 0x10;
+	return KernelBatchMap2(entries, num_entries, num_entries_out, KYTY_MAP_FIXED);
 }
 
 static bool IsAligned(uint64_t value, uint64_t alignment) {

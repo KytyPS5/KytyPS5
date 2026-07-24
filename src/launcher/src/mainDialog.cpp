@@ -18,6 +18,7 @@
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QTextStream>
 #include <QVariant>
@@ -45,6 +46,7 @@ constexpr char EMULATOR_EXE[] = "kyty_emulator.exe";
 constexpr char CMD_EXE[] = "cmd.exe";
 #else
 constexpr char GNOME[]          = "gnome-terminal";
+constexpr char KONSOLE[]        = "konsole";
 constexpr char XTERM[]          = "xterm";
 constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
@@ -282,9 +284,20 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		return;
 	}
 
-	{
+	if (!QStandardPaths::findExecutable(GNOME).isEmpty()) {
 		process->setProgram(GNOME);
 		process->setArguments({"--", "bash", "-c", bash_file_name});
+	} else if (!QStandardPaths::findExecutable(KONSOLE).isEmpty()) {
+		process->setProgram(KONSOLE);
+		process->setArguments({"-e", "bash", "-c", bash_file_name});
+	} else if (!QStandardPaths::findExecutable(XTERM).isEmpty()) {
+		process->setProgram(XTERM);
+		process->setArguments({"-e", "bash", "-c", bash_file_name});
+	} else {
+		QMessageBox::critical(this, tr("Error"),
+		                       tr("Can't find a terminal emulator to launch the game in.\n"
+		                          "Install gnome-terminal, konsole, or xterm."));
+		return;
 	}
 #else
 	{

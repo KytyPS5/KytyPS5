@@ -8,6 +8,9 @@
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -42,6 +45,8 @@ void SysVirtualInit() {
 	g_allocs   = new std::map<uintptr_t, size_t>;
 	g_protects = new std::map<uintptr_t, int>;
 }
+
+static bool is_mapped(void* ptr, size_t length);
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
 	int protect = PROT_NONE;
@@ -83,8 +88,25 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 
 	int protect = get_protection_flag(mode);
 
-	void* ptr =
-	    mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	// A plain mmap() hint address is only advisory on Linux and is routinely ignored in favor of
+	// the kernel's default (high, ASLR'd) mmap region, unlike Windows' VirtualAlloc(). Callers of
+	// this function (guest memory allocation) rely on the hint being honored to keep addresses
+	// inside the guest's low, sub-2^40 address space, so try a fixed placement at the hint first.
+	void* ptr = MAP_FAILED;
+	if (addr != 0) {
+#ifdef KYTY_FIXED_NOREPLACE
+		ptr = mmap(reinterpret_cast<void*>(addr), size, protect,
+		          MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+#else
+		if (!is_mapped(reinterpret_cast<void*>(addr), size)) {
+			ptr = mmap(reinterpret_cast<void*>(addr), size, protect,
+			          MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+		}
+#endif
+	}
+	if (ptr == MAP_FAILED) {
+		ptr = mmap(nullptr, size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	}
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
@@ -117,8 +139,27 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	auto addr    = static_cast<uintptr_t>(address);
 	int  protect = get_protection_flag(mode);
 
-	void* ptr =
-	    mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	// As in SysVirtualAlloc(), an unfixed mmap() hint is routinely ignored by Linux in favor of
+	// the default high mmap region, whereas callers here rely on the hint being honored to keep
+	// guest allocations inside the guest's low, sub-2^40 address space. Try a fixed placement at
+	// the (already alignment-compliant) hint first, then fall back to the original hinted-but-not-
+	// fixed probe/remap dance below.
+	void* ptr = MAP_FAILED;
+	if (addr != 0 && (addr & (alignment - 1)) == 0) {
+#ifdef KYTY_FIXED_NOREPLACE
+		ptr = mmap(reinterpret_cast<void*>(addr), size, protect,
+		          MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+#else
+		if (!is_mapped(reinterpret_cast<void*>(addr), size)) {
+			ptr = mmap(reinterpret_cast<void*>(addr), size, protect,
+			          MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+		}
+#endif
+	}
+	if (ptr == MAP_FAILED) {
+		ptr = mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1,
+		          0); // NOLINT
+	}
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
@@ -249,8 +290,42 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 
 	auto addr = static_cast<uintptr_t>(address);
 
-	void* ptr = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE,
-	                 MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+	// See SysVirtualAllocAligned(): an unfixed mmap() hint is only advisory on Linux, so try a
+	// fixed placement at the (already alignment-compliant) hint first to keep guest reservations
+	// inside the guest's low, sub-2^40 address space. Callers here (guest direct/flexible memory
+	// pools) commonly retry the exact same hint for multiple, differently-sized allocations,
+	// expecting the kernel to slide forward past whatever's already there rather than collide with
+	// it, so on a taken hint keep stepping the candidate address forward (by the just-tried size,
+	// rounded up to alignment) instead of falling back to an unhinted mmap() that would land far
+	// outside the guest's address space. Bounded so a persistently-hostile layout can't hang.
+	constexpr uint64_t LOW_ADDRESS_SEARCH_LIMIT = 1ull << 40u; // matches IsGpuAddressRange()
+	constexpr int      MAX_SEARCH_ATTEMPTS      = 1024;
+	void*              ptr                      = MAP_FAILED;
+	if (addr != 0 && (addr & (alignment - 1)) == 0) {
+		auto candidate = addr;
+		for (int attempt = 0; attempt < MAX_SEARCH_ATTEMPTS && candidate + size <= LOW_ADDRESS_SEARCH_LIMIT;
+		     attempt++) {
+#ifdef KYTY_FIXED_NOREPLACE
+			ptr = mmap(reinterpret_cast<void*>(candidate), size, PROT_NONE,
+			          MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+			if (ptr != MAP_FAILED || errno != EEXIST) {
+				break;
+			}
+#else
+			if (!is_mapped(reinterpret_cast<void*>(candidate), size)) {
+				ptr = mmap(reinterpret_cast<void*>(candidate), size, PROT_NONE,
+				          MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+				break;
+			}
+#endif
+			candidate = align_up(candidate + size, alignment);
+		}
+		addr = candidate;
+	}
+	if (ptr == MAP_FAILED) {
+		ptr = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE,
+		          MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+	}
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 

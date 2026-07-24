@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <cinttypes>
+#include <csetjmp>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,15 +33,23 @@ constexpr uint64_t SceKernelMemoryPoolExpandLen  = 0x400000;
 constexpr uint64_t SceKernelMemoryPoolAlignment  = 0x10000;
 constexpr int      ErrorAccess                   = Libs::LibKernel::KERNEL_ERROR_EACCES;
 
-struct TestFailure {};
-
 int g_failed_tests = 0;
+
+// Exceptions are disabled for this build (-fno-exceptions), so Fail() unwinds out of the current
+// test_func() back to RunTest() via setjmp/longjmp instead of throw/catch. This is safe here
+// because test functions in this file hold no RAII state (locks, etc.) across Check()/Fail()
+// calls, so longjmp skipping destructors between the jump points is a non-issue.
+thread_local std::jmp_buf g_test_failure_jmp;
+thread_local bool         g_test_failure_jmp_valid = false;
 
 [[noreturn]] void Fail(const char* test, const std::string& message) {
 	std::fflush(stdout);
 	std::fprintf(stderr, "VirtualMemoryAllocationTests: %s failed: %s\n", test, message.c_str());
 	g_failed_tests++;
-	throw TestFailure {};
+	if (g_test_failure_jmp_valid) {
+		std::longjmp(g_test_failure_jmp, 1);
+	}
+	std::_Exit(1);
 }
 
 void Check(const char* test, bool value, const std::string& message) {
@@ -104,10 +113,11 @@ void RunTest(void (*test_func)()) {
 	if (g_failed_tests != 0) {
 		return;
 	}
-	try {
+	g_test_failure_jmp_valid = true;
+	if (setjmp(g_test_failure_jmp) == 0) {
 		test_func();
-	} catch (const TestFailure&) {
 	}
+	g_test_failure_jmp_valid = false;
 }
 
 VirtualQueryInfo Query(const char* test, uint64_t addr, int flags = 0) {

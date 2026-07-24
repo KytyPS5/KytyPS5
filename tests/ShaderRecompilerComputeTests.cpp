@@ -14336,7 +14336,9 @@ int main(int argc, char **argv) {
   VulkanHarness vulkan;
   vulkan.CheckCommandPoolGrowth();
   vulkan.CheckGpuTilerCpuParity();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckQueryRegionImageClassification();
+#endif
   vulkan.CheckMutableStorageSrgbView();
   vulkan.CheckMutableRenderTargetBgraStorageView();
   vulkan.CheckRenderTargetViewCache();

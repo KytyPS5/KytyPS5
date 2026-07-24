@@ -113,7 +113,7 @@ void MakeTransparent(QWidget* widget) {
 } // namespace
 
 ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeWidget* parent)
-    : QTreeWidgetItem(parent), m_info(std::move(info)) {
+    : QTreeWidgetItem(parent, Type), m_info(std::move(info)) {
 	setSizeHint(NameColumn, QSize(0, 72));
 
 	m_status_widget = new QWidget(parent);
@@ -187,10 +187,10 @@ void ConfigurationItem::Update() {
 }
 
 bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
-	const auto* other_item = dynamic_cast<const ConfigurationItem*>(&other);
-	if (other_item == nullptr) {
+	if (other.type() != Type) {
 		return QTreeWidgetItem::operator<(other);
 	}
+	const auto* other_item = static_cast<const ConfigurationItem*>(&other);
 
 	const int column = treeWidget() != nullptr ? treeWidget()->sortColumn() : NameColumn;
 	switch (column) {

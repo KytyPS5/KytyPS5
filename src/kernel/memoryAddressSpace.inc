@@ -1051,7 +1051,15 @@ private:
 
 	static bool UnmapView(void* vaddr, uint64_t size) { return munmap(vaddr, size) == 0; }
 
-	static bool UnmapViewPreservePlaceholder(void* /*vaddr*/, uint64_t /*size*/) { return false; }
+	// mmap(MAP_FIXED) always atomically replaces whatever was mapped at 'vaddr' before, so
+	// swapping in a fresh PROT_NONE anonymous mapping over the shared file-backed one gives the
+	// same "still reserved, no longer accessible or file-backed" placeholder state Windows reaches
+	// via UnmapViewOfFile2(..., MEM_PRESERVE_PLACEHOLDER).
+	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
+		void* ptr = mmap(vaddr, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+		                 -1, 0);
+		return ptr != MAP_FAILED;
+	}
 
 	int m_fd = -1;
 #endif
@@ -1062,6 +1070,12 @@ private:
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
+// Windows has no native way to split/rejoin a VA reservation without the MEM_*_PLACEHOLDER
+// ceremony, so this class tracks free (reserved-but-uncommitted) sub-ranges itself and, on
+// Windows, mirrors every split/coalesce into the kernel via VirtualFree. mmap-backed platforms
+// don't have that restriction — any sub-range of a reservation can be committed, decommitted or
+// released independently at any time — so their bookkeeping is the same m_free map without any
+// matching kernel call for the split/coalesce step itself.
 class PlaceholderAddressSpace {
 public:
 	PlaceholderAddressSpace() {
@@ -1109,7 +1123,8 @@ public:
 		AddFree(addr, size);
 		return addr;
 #else
-		auto addr = VirtualMemory::ReserveAligned(search_addr, size, alignment);
+		const auto addr = VirtualMemory::ReserveAligned(search_addr, size, alignment);
+		AddFree(addr, size);
 		return addr;
 #endif
 	}
@@ -1136,12 +1151,24 @@ public:
 		AddFree(vaddr, size);
 		return true;
 #else
-		return VirtualMemory::ReserveFixed(vaddr, size);
+		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
+			return false;
+		}
+		{
+			std::lock_guard lock(m_mutex);
+			if (FindContaining(vaddr, size) != m_free.end()) {
+				return true;
+			}
+		}
+		if (!VirtualMemory::ReserveFixed(vaddr, size)) {
+			return false;
+		}
+		AddFree(vaddr, size);
+		return true;
 #endif
 	}
 
 	bool Consume(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		std::lock_guard lock(m_mutex);
 		auto            it = FindContaining(vaddr, size);
 		if (it == m_free.end()) {
@@ -1156,50 +1183,46 @@ public:
 		}
 		m_free.erase(it);
 		return true;
-#else
-		return false;
-#endif
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		std::lock_guard lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
-#else
-		return false;
-#endif
 	}
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
+		{
+			std::lock_guard lock(m_mutex);
+			auto            it = FindContaining(vaddr, size);
+			if (it == m_free.end() || !SplitUnlocked(it, vaddr, size)) {
+				return false;
+			}
+			it = m_free.find(vaddr);
+			if (it == m_free.end() || it->second != size) {
+				return false;
+			}
+			m_free.erase(it);
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		std::lock_guard lock(m_mutex);
-		auto            it = FindContaining(vaddr, size);
-		if (it == m_free.end() || !SplitUnlocked(it, vaddr, size)) {
-			return false;
-		}
-		it = m_free.find(vaddr);
-		if (it == m_free.end() || it->second != size) {
-			return false;
-		}
-		m_free.erase(it);
 		if (VirtualFree(reinterpret_cast<void*>(vaddr), 0, MEM_RELEASE) != 0) {
 			return true;
 		}
-		AddFreeUnlocked(vaddr, size);
-		return false;
 #else
-		return VirtualMemory::FreeRange(vaddr, size);
+		if (VirtualMemory::FreeRange(vaddr, size)) {
+			return true;
+		}
 #endif
+		AddFree(vaddr, size);
+		return false;
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (!Consume(vaddr, size)) {
 			return false;
 		}
-
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
 		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
 		                          GetProtect(mode), nullptr, 0);
@@ -1212,28 +1235,33 @@ public:
 		}
 		return true;
 #else
-		return false;
+		if (!VirtualMemory::Commit(vaddr, size, mode)) {
+			AddFree(vaddr, size);
+			return false;
+		}
+		return true;
 #endif
 	}
 
 	bool ReleaseCommitted(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (VirtualFree(reinterpret_cast<void*>(vaddr), size,
 		                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
 			return false;
 		}
+#else
+		if (!VirtualMemory::Decommit(vaddr, size)) {
+			return false;
+		}
+#endif
 		AddFree(vaddr, size);
 		return true;
-#else
-		return false;
-#endif
 	}
 
 	bool SelfTest() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const auto addr = ReserveAligned(0, m_granularity, m_granularity);
 		if (addr == 0) {
 			LOGF_COLOR(Log::Color::Yellow,
@@ -1250,7 +1278,11 @@ public:
 		*ptr      = 0x4b59545950484f4cull; // "KYTYPHOL"
 
 		if (!ReleaseCommitted(addr, m_granularity)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			VirtualFree(reinterpret_cast<void*>(addr), 0, MEM_RELEASE);
+#else
+			VirtualMemory::FreeRange(addr, m_granularity);
+#endif
 			LOGF_COLOR(Log::Color::Red,
 			           "\t placeholder address-space self-test: release-committed failed\n");
 			return false;
@@ -1261,21 +1293,14 @@ public:
 		           "\t placeholder address-space self-test: %s\n",
 		           ok ? "ok" : "release-free failed");
 		return ok;
-#else
-		LOGF_COLOR(Log::Color::Yellow, "\t placeholder address-space self-test skipped\n");
-		return false;
-#endif
 	}
 
 	void AddFree(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		std::lock_guard lock(m_mutex);
 		AddFreeUnlocked(vaddr, size);
-#endif
 	}
 
 private:
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static constexpr uint64_t PageSize() { return 0x4000; }
 
 	static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
@@ -1286,6 +1311,7 @@ private:
 		return (value & (PageSize() - 1u)) == 0;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	[[nodiscard]] bool IsGranularityAligned(uint64_t value) const {
 		return (value & (m_granularity - 1u)) == 0;
 	}
@@ -1303,6 +1329,7 @@ private:
 			default: return PAGE_NOACCESS;
 		}
 	}
+#endif
 
 	std::map<uint64_t, uint64_t>::iterator FindContaining(uint64_t vaddr, uint64_t size) {
 		auto next = m_free.upper_bound(vaddr);
@@ -1323,19 +1350,23 @@ private:
 
 		if (base != vaddr) {
 			const auto left_size = vaddr - base;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (VirtualFree(reinterpret_cast<void*>(base), left_size,
 			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
 				return false;
 			}
+#endif
 			it->second = left_size;
 			it         = m_free.emplace(vaddr, end - vaddr).first;
 		}
 
 		if (it->second != size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (VirtualFree(reinterpret_cast<void*>(it->first), size,
 			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
 				return false;
 			}
+#endif
 			const auto right_start = it->first + size;
 			const auto right_size  = it->second - size;
 			it->second             = size;
@@ -1374,16 +1405,20 @@ private:
 		}
 
 		if (base != it->first || end != it->first + it->second) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (VirtualFree(reinterpret_cast<void*>(base), end - base,
 			                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0) {
 				m_free.erase(first, last);
 				m_free.emplace(base, end - base);
 			}
+#else
+			m_free.erase(first, last);
+			m_free.emplace(base, end - base);
+#endif
 		}
 	}
 
 	uint64_t                     m_granularity = 0x10000;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, uint64_t> m_free;
-#endif
 };

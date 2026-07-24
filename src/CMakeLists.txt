@@ -19,8 +19,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(utils.cmake)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPM.cmake")
 
 set(KYTY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty")
+
+CPMAddPackage(
+	NAME magic_enum
+	GIT_REPOSITORY https://github.com/Neargye/magic_enum.git
+	GIT_TAG 1384769c66bd16ec9bb1353f45fe8ec8ccc12dbd
+	DOWNLOAD_ONLY YES
+)
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
@@ -90,11 +98,8 @@ endif()
 
 project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.2.2)
 
-include_directories(	
-	${KYTY_THIRD_PARTY_DIR}/gtest/include
-	${KYTY_THIRD_PARTY_DIR}/gtest
-	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
+include_directories(
+	${magic_enum_SOURCE_DIR}/include/magic_enum
 	${PROJECT_BINARY_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR}
 )
@@ -218,11 +223,11 @@ set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-to
 
 set(inc_headers
 	${CMAKE_CURRENT_SOURCE_DIR}
-	${KYTY_THIRD_PARTY_DIR}/SDL2/include
-	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
-	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
-	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxhash
+	${SDL2_SOURCE_DIR}/include
+	${VulkanMemoryAllocator_SOURCE_DIR}/include
+	${SPIRV-Tools_SOURCE_DIR}/include
+	${fmt_SOURCE_DIR}/include
+	${xxHash_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/stb
 )

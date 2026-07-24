@@ -16,6 +16,8 @@
 #include <windows.h>
 #undef min
 #undef max
+#else
+#include <unistd.h>
 #endif
 
 namespace Libs::Graphics {
@@ -50,7 +52,7 @@ private:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return GetCurrentThreadId();
 #else
-		EXIT("region tracking thread identity is unsupported on this platform\n");
+		return static_cast<uint32_t>(gettid());
 #endif
 	}
 

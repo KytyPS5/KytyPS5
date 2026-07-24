@@ -1,6 +1,6 @@
 # KytyPS5
 
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4.svg)](#system-requirements)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
@@ -21,7 +21,8 @@ KytyPS5 can boot 2D games and a selection of 3D games, including titles built wi
 
 Development is focused on compatibility and boot reliability.
 
-Linux support is planned, but Windows is the only supported platform at this time.
+Windows and Linux are both supported. The Linux port is newer and has seen less compatibility
+testing than Windows.
 
 ## Bugs and Issues
 
@@ -92,13 +93,20 @@ the Vulkan/SPIR-V validation rules.
 
 ## Building
 
-### System requirements
+Third-party dependencies are fetched automatically at configure time via
+[CPM.cmake](https://github.com/cpm-cmake/CPM.cmake) (`src/cmake/CPM.cmake`), pinned to the same
+commits the project used when it vendored them as git submodules. No `git submodule` step is
+needed on either platform; just clone the repository normally.
+
+### Windows
+
+#### System requirements
 
 - Windows 10 version 1803
 - A 64-bit x86 processor
 - A Vulkan 1.3-capable GPU with current drivers
 
-### Build requirements
+#### Build requirements
 
 - Git
 - CMake 3.12 or newer
@@ -110,11 +118,7 @@ the Vulkan/SPIR-V validation rules.
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
 Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or the equivalent Developer
-PowerShell), change to the repository root, and initialize the dependencies:
-
-```powershell
-git submodule update --init --recursive
-```
+PowerShell) and change to the repository root.
 
 Configure the project. Replace the Qt path with the version installed on your system:
 
@@ -131,6 +135,42 @@ cmake --install _Build/windows --prefix _Build/windows/install
 
 The finished application and its runtime dependencies will be placed in
 `_Build/windows/install`.
+
+### Linux
+
+#### System requirements
+
+- A 64-bit x86 Linux distribution with a kernel supporting `MAP_FIXED_NOREPLACE` (5.0+)
+- A Vulkan 1.3-capable GPU with current drivers
+
+#### Build requirements
+
+- Git
+- CMake 3.12 or newer
+- Ninja
+- GCC or Clang with C++20 support
+- `glslangValidator` (usually packaged as `glslang-tools`)
+- Vulkan headers/loader (usually packaged as `libvulkan-dev`)
+- Qt 6, including Concurrent, Network, and Widgets
+
+Install the system packages (Debian/Ubuntu example) and configure:
+
+```bash
+sudo apt-get install ninja-build glslang-tools libvulkan-dev qt6-base-dev
+
+cmake -S src -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+```
+
+If Qt6 isn't found automatically, pass `-DCMAKE_PREFIX_PATH=/path/to/Qt/6.x.x/gcc_64`.
+
+Build the launcher and stage a runnable installation:
+
+```bash
+cmake --build _Build/linux --target launcher --parallel
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The finished application and its runtime dependencies will be placed in `_Build/linux/install`.
 
 ### Visual Studio Code
 
@@ -158,6 +198,10 @@ To use the graphical launcher:
 .\_Build\windows\install\launcher.exe
 ```
 
+```bash
+./_Build/linux/install/launcher
+```
+
 On first launch, add one or more game folders in the global settings. The launcher searches those
 folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
 from the game list.
@@ -168,8 +212,12 @@ The emulator can also be started directly with a legally obtained game directory
 .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
 ```
 
-Run `kyty_emulator.exe --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
+```bash
+./_Build/linux/install/kyty_emulator --game /path/to/ExampleGame
+```
+
+Run `kyty_emulator --help` (or `kyty_emulator.exe --help` on Windows) to see the available
+graphics, logging, validation, profiling, and debugging options.
 
 ### AI Use
 

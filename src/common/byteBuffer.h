@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef> // IWYU pragma: export
+#include <cstring>
 #include <utility>
 #include <vector>
 

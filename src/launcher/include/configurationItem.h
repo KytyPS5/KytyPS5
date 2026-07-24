@@ -16,6 +16,10 @@ class QWidget;
 class Configuration;
 class ConfigurationItem: public QTreeWidgetItem {
 public:
+	// Identifies this class via QTreeWidgetItem::type() instead of dynamic_cast<>, since RTTI is
+	// disabled for this build (-fno-rtti).
+	enum { Type = QTreeWidgetItem::UserType + 1 };
+
 	explicit ConfigurationItem(std::unique_ptr<Configuration> info, QTreeWidget* parent);
 	~ConfigurationItem() override;
 

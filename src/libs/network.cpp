@@ -14,6 +14,52 @@
 #endif
 #else
 #include <arpa/inet.h>
+#include <cerrno>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+using SOCKET                    = int;
+constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int    SOCKET_ERROR   = -1;
+
+inline int closesocket(SOCKET s) { return ::close(s); }
+inline int ioctlsocket(SOCKET s, long cmd, unsigned long* argp) {
+	return ::ioctl(s, static_cast<unsigned long>(cmd), argp);
+}
+inline int WSAGetLastError() { return errno; }
+
+#define WSAEACCES EACCES
+#define WSAEADDRINUSE EADDRINUSE
+#define WSAEADDRNOTAVAIL EADDRNOTAVAIL
+#define WSAEAFNOSUPPORT EAFNOSUPPORT
+#define WSAEFAULT EFAULT
+#define WSAEINTR EINTR
+#define WSAEINVAL EINVAL
+#define WSAEISCONN EISCONN
+#define WSAEMFILE EMFILE
+#define WSAEMSGSIZE EMSGSIZE
+#define WSAENOBUFS ENOBUFS
+#define WSAENETDOWN ENETDOWN
+#define WSAENETRESET ENETRESET
+#define WSAENETUNREACH ENETUNREACH
+#define WSAENOTCONN ENOTCONN
+#define WSAENOTSOCK ENOTSOCK
+#define WSAEOPNOTSUPP EOPNOTSUPP
+#define WSAEPROTONOSUPPORT EPROTONOSUPPORT
+#define WSAESHUTDOWN ESHUTDOWN
+#define WSAETIMEDOUT ETIMEDOUT
+#define WSAEWOULDBLOCK EWOULDBLOCK
+#define WSAECONNABORTED ECONNABORTED
+#define WSAECONNREFUSED ECONNREFUSED
+#define WSAECONNRESET ECONNRESET
+#define WSAEDESTADDRREQ EDESTADDRREQ
+#define WSAEHOSTUNREACH EHOSTUNREACH
+#define WSAEINPROGRESS EINPROGRESS
+#define WSAEALREADY EALREADY
 #endif
 
 #include "common/assert.h"

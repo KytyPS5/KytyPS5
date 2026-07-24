@@ -13,8 +13,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -74,6 +72,58 @@ jobs:
         with:
           name: KytyPS5
           path: _Build/windows/install/**
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools libvulkan-dev
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Verify toolchain
+        run: |
+          git --version
+          cmake --version
+          ninja --version
+          g++ --version
+          glslangValidator --version
+          echo "Qt6_DIR=$Qt6_DIR"
+
+      - name: Configure
+        run: |
+          cmake -S src -B _Build/linux \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+
+      - name: Build
+        run: |
+          cmake --build _Build/linux --target launcher --parallel
+
+      - name: Install
+        run: |
+          cmake --install _Build/linux --prefix _Build/linux/install
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-linux
+          path: _Build/linux/install/**
           if-no-files-found: error
 
   release:

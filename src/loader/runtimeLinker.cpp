@@ -358,9 +358,9 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             :
 		             : [func] "r"(func), "D"(params),
 		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
-		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
-		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12",
+		               "r13", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+		               "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 		return;
 	}
 
@@ -377,9 +377,9 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             :
 	             : [func] "r"(func), "D"(params),
 	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
-	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
-	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
+	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
+	               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+	               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
@@ -492,6 +492,59 @@ void KYTY_SYSV_ABI SysStackWalkX86(uint64_t rbp, void** stack, int* depth) {
 	SysStackWalkX86(rbp, rbp, stack, depth);
 }
 
+static bool IsReadableRange(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0) {
+		return false;
+	}
+	uint64_t end = addr + size;
+	if (end < addr) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t current = addr;
+	while (current < end) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
+		    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			return false;
+		}
+		const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		if (region_end <= current) {
+			return false;
+		}
+		current = std::min(region_end, end);
+	}
+#else
+	FILE* maps = std::fopen("/proc/self/maps", "re");
+	if (maps == nullptr) {
+		return false;
+	}
+	uint64_t cursor = addr;
+	char     line[512];
+	while (cursor < end && std::fgets(line, sizeof(line), maps) != nullptr) {
+		uint64_t region_start = 0;
+		uint64_t region_end   = 0;
+		char     perms[5] {};
+		if (std::sscanf(line, "%" SCNx64 "-%" SCNx64 " %4s", &region_start, &region_end,
+		                static_cast<char*>(perms)) != 3) {
+			continue;
+		}
+		if (region_end <= cursor) {
+			continue;
+		}
+		if (region_start > cursor || perms[0] != 'r') {
+			break;
+		}
+		cursor = region_end;
+	}
+	std::fclose(maps);
+	if (cursor < end) {
+		return false;
+	}
+#endif
+	return true;
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -561,12 +614,19 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF("code-32: unavailable\n");
 		}
 #else
-		LOGF("code-32:");
-		for (uint64_t i = 0; i < 64; i++) {
-			LOGF(" %02" PRIx32, static_cast<uint32_t>(*reinterpret_cast<const uint8_t*>(
-			                        info->exception_address + i - 32)));
+		const auto dump_start = info->exception_address >= 32 ? info->exception_address - 32
+		                                                      : info->exception_address;
+		if (IsReadableRange(dump_start, 64)) {
+			LOGF("code-32:");
+			for (uint64_t i = 0; i < 64; i++) {
+				LOGF(" %02" PRIx32,
+				     static_cast<uint32_t>(
+				         *reinterpret_cast<const uint8_t*>(dump_start + i)));
+			}
+			LOGF("\n");
+		} else {
+			LOGF("code-32: unavailable\n");
 		}
-		LOGF("\n");
 #endif
 	} else {
 		LOGF("code: unavailable\n");
@@ -584,34 +644,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
 	     info->r12, info->r13, info->r14, info->r15);
 
-	auto is_readable_range = [](uint64_t addr, uint64_t size) {
-		if (addr == 0 || size == 0) {
-			return false;
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		uint64_t current = addr;
-		uint64_t end     = addr + size;
-		if (end < addr) {
-			return false;
-		}
-		while (current < end) {
-			MEMORY_BASIC_INFORMATION mbi {};
-			if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
-			    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-				return false;
-			}
-			const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-			if (region_end <= current) {
-				return false;
-			}
-			current = std::min(region_end, end);
-		}
-#else
-		(void)addr;
-		(void)size;
-#endif
-		return true;
-	};
+	auto is_readable_range = [](uint64_t addr, uint64_t size) { return IsReadableRange(addr, size); };
 
 	if (is_readable_range(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
@@ -642,8 +675,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		const auto dump_size =
 		    (dump_start + 32 <= region_end ? 32u : static_cast<uint32_t>(region_end - dump_start));
 #else
-		auto*      dump_ptr  = reinterpret_cast<const uint8_t*>(addr >= 16 ? addr - 16 : addr);
-		const auto dump_size = 32u;
+		auto* dump_ptr = reinterpret_cast<const uint8_t*>(addr >= 16 ? addr - 16 : addr);
+		uint32_t dump_size = 32u;
+		while (dump_size > 0 &&
+		       !IsReadableRange(reinterpret_cast<uint64_t>(dump_ptr), dump_size)) {
+			dump_size /= 2;
+		}
+		if (dump_size == 0) {
+			return;
+		}
 #endif
 
 		LOGF("%s code: addr=%016" PRIx64 ", off=%016" PRIx64 ", module=%s:", name, addr,

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,10 @@
 #include <windows.h>
 #undef min
 #undef max
+#else
+#include <execinfo.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace Libs::Graphics {
@@ -29,6 +34,14 @@ constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
 constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Mirrors the Win32 PAGE_* protection values so the platform-agnostic state machine below
+// (WatcherProtection/PublishDelayedFaults/UpdatePageWatchers/...) needs no per-platform branches.
+constexpr uint32_t PAGE_NOACCESS  = 0x01;
+constexpr uint32_t PAGE_READONLY  = 0x02;
+constexpr uint32_t PAGE_READWRITE = 0x04;
+#endif
 
 thread_local bool g_in_fault_resolution = false;
 
@@ -46,6 +59,10 @@ thread_local bool g_in_fault_resolution = false;
 		std::fprintf(stderr, "  frame[%u]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR "\n", i,
 		             address, address >= image_base ? address - image_base : 0);
 	}
+#else
+	void*     frames[16] {};
+	const int frame_count = backtrace(frames, static_cast<int>(std::size(frames)));
+	backtrace_symbols_fd(frames, frame_count, fileno(stderr));
 #endif
 	std::fflush(stderr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -69,7 +86,7 @@ uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return GetCurrentThreadId();
 #else
-	FailFast();
+	return static_cast<uint32_t>(gettid());
 #endif
 }
 
@@ -136,7 +153,11 @@ struct PageManager::Impl {
 			      static_cast<uint32_t>(info.dwPageSize));
 		}
 #else
-		Fatal("page-fault invalidation is not implemented on this platform");
+		if (const auto page_size = sysconf(_SC_PAGESIZE); page_size < 0 ||
+		    static_cast<uint64_t>(page_size) != PAGE_SIZE) {
+			Fatal("unsupported host page size 0x%08" PRIx64,
+			      page_size < 0 ? uint64_t {0} : static_cast<uint64_t>(page_size));
+		}
 #endif
 		regions = std::make_unique<std::atomic<Region*>[]>(REGION_COUNT);
 		for (uint64_t i = 0; i < REGION_COUNT; i++) {
@@ -203,6 +224,43 @@ struct PageManager::Impl {
 		}
 	}
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// Reads the current PROT_* state of the single page at 'vaddr' out of /proc/self/maps.
+	// Returns false only if 'vaddr' isn't covered by any mapping at all, which never happens for
+	// pages this class tracks (they're always backed by the guest's anonymous RW allocation).
+	static bool LinuxQueryProtection(uint64_t vaddr, uint32_t& out_protection) noexcept {
+		FILE* maps = std::fopen("/proc/self/maps", "re");
+		if (maps == nullptr) {
+			return false;
+		}
+		bool found = false;
+		char line[512];
+		while (std::fgets(line, sizeof(line), maps) != nullptr) {
+			uint64_t start = 0;
+			uint64_t end   = 0;
+			char     perms[5] {};
+			if (std::sscanf(line, "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, static_cast<char*>(perms)) !=
+			    3) {
+				continue;
+			}
+			if (vaddr < start || vaddr >= end) {
+				continue;
+			}
+			if (perms[1] == 'w') {
+				out_protection = PAGE_READWRITE;
+			} else if (perms[0] == 'r') {
+				out_protection = PAGE_READONLY;
+			} else {
+				out_protection = PAGE_NOACCESS;
+			}
+			found = true;
+			break;
+		}
+		std::fclose(maps);
+		return found;
+	}
+#endif
+
 	static uint32_t QueryProtection(uint64_t vaddr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
@@ -215,8 +273,13 @@ struct PageManager::Impl {
 		}
 		return info.Protect;
 #else
-		(void)vaddr;
-		Fatal("page query is unsupported on this platform");
+		uint32_t protection = 0;
+		if (!LinuxQueryProtection(vaddr, protection) || protection != PAGE_READWRITE) {
+			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (protection=0x%08" PRIx32
+			      ")",
+			      vaddr, protection);
+		}
+		return protection;
 #endif
 	}
 
@@ -235,8 +298,15 @@ struct PageManager::Impl {
 			default: return false;
 		}
 #else
-		(void)vaddr;
-		return false;
+		uint32_t protection = 0;
+		if (!LinuxQueryProtection(vaddr, protection)) {
+			return false;
+		}
+		switch (access) {
+			case PageFaultAccess::Read: return protection == PAGE_READONLY || protection == PAGE_READWRITE;
+			case PageFaultAccess::Write: return protection == PAGE_READWRITE;
+			default: return false;
+		}
 #endif
 	}
 
@@ -255,10 +325,29 @@ struct PageManager::Impl {
 			      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
 		}
 #else
-		(void)vaddr;
-		(void)protection;
-		(void)fault_path;
-		FailFast("page protection is unsupported on this platform");
+		uint32_t old_protection = 0;
+		if (!LinuxQueryProtection(vaddr, old_protection) || old_protection != expected_old) {
+			if (fault_path) {
+				FailFast("mprotect fault transition did not match expected protection");
+			}
+			Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
+			      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
+			      vaddr, old_protection, expected_old, protection);
+		}
+		int native_protection = PROT_NONE;
+		switch (protection) {
+			case PAGE_NOACCESS: native_protection = PROT_NONE; break;
+			case PAGE_READONLY: native_protection = PROT_READ; break;
+			case PAGE_READWRITE: native_protection = PROT_READ | PROT_WRITE; break;
+			default: Fatal("unknown protection value 0x%08" PRIx32, protection);
+		}
+		if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
+		             native_protection) != 0) {
+			if (fault_path) {
+				FailFast("mprotect failed on the fault path");
+			}
+			Fatal("mprotect failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr, protection);
+		}
 #endif
 	}
 

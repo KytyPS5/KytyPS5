@@ -10,7 +10,10 @@
 #include "common/stringUtils.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
+#include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utime.h>
@@ -423,9 +426,28 @@ void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysF
 	}
 }
 
-void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& /*f*/, SysFileTimeStruct& /*a*/,
-                                         SysFileTimeStruct& /*w*/) {
-	EXIT("not implemented\n");
+void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
+                                         SysFileTimeStruct& w) {
+	if (f.type == SYS_FILE_FILE) {
+		struct stat s {};
+		if (0 == fstat(fileno(f.f), &s)) {
+			a.is_invalid = false;
+			w.is_invalid = false;
+			a.time       = s.st_atime;
+			w.time       = s.st_mtime;
+		} else {
+			a.is_invalid = true;
+			w.is_invalid = true;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		SysTimeStruct t {};
+		SysGetSystemTimeUtc(t);
+		SysSystemToFileTimeUtc(t, a);
+		SysSystemToFileTimeUtc(t, w);
+	} else {
+		a.is_invalid = true;
+		w.is_invalid = true;
+	}
 }
 
 bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& access) {
@@ -531,27 +553,103 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	//	}
 }
 
-void SysFileFindFiles(const std::filesystem::path& /*path*/,
-                      std::vector<sys_file_find_t>& /*out*/) {
-	EXIT("not implemented\n");
+void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
+	auto real_name = get_internal_name(path);
+
+	DIR* d = opendir(real_name.c_str());
+	if (d == nullptr) {
+		return;
+	}
+
+	for (dirent* e = readdir(d); e != nullptr; e = readdir(d)) {
+		std::string name = e->d_name;
+
+		if (name == "." || name == "..") {
+			continue;
+		}
+
+		auto full_path = real_name / name;
+
+		struct stat s {};
+		if (0 != lstat(full_path.c_str(), &s)) {
+			continue;
+		}
+
+		if (S_ISDIR(s.st_mode)) {
+			SysFileFindFiles(path / name, out);
+		} else {
+			sys_file_find_t r {};
+
+			r.path_with_name              = path / name;
+			r.size                        = static_cast<uint64_t>(s.st_size);
+			r.last_access_time.is_invalid = false;
+			r.last_access_time.time       = s.st_atime;
+			r.last_write_time.is_invalid  = false;
+			r.last_write_time.time        = s.st_mtime;
+
+			out.push_back(r);
+		}
+	}
+
+	closedir(d);
 }
 
-void SysFileGetDents(const std::filesystem::path& /*path*/, std::vector<sys_dir_entry_t>& /*out*/) {
-	EXIT("not implemented\n");
+void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
+	auto real_name = get_internal_name(path);
+
+	DIR* d = opendir(real_name.c_str());
+	if (d == nullptr) {
+		return;
+	}
+
+	for (dirent* e = readdir(d); e != nullptr; e = readdir(d)) {
+		std::string name = e->d_name;
+
+		if (name == "." || name == "..") {
+			continue;
+		}
+
+		struct stat s {};
+		if (0 != lstat((real_name / name).c_str(), &s)) {
+			continue;
+		}
+
+		sys_dir_entry_t r {};
+
+		r.is_file = !S_ISDIR(s.st_mode);
+		r.name    = name;
+
+		out.push_back(r);
+	}
+
+	closedir(d);
 }
 
-bool SysFileCopyFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {
-	EXIT("not implemented\n");
-	return false;
+bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto real_src = get_internal_name(src);
+	auto real_dst = get_internal_name(dst);
+
+	std::error_code ec;
+	return std::filesystem::copy_file(real_src, real_dst,
+	                                  std::filesystem::copy_options::overwrite_existing, ec);
 }
 
-bool SysFileMoveFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {
-	EXIT("not implemented\n");
-	return false;
+bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto real_src = get_internal_name(src);
+	auto real_dst = get_internal_name(dst);
+
+	std::error_code ec;
+	std::filesystem::rename(real_src, real_dst, ec);
+	return !ec;
 }
 
-void SysFileRemoveReadonly(const std::filesystem::path& /*name*/) {
-	EXIT("not implemented\n");
+void SysFileRemoveReadonly(const std::filesystem::path& name) {
+	auto real_name = get_internal_name(name);
+
+	struct stat s {};
+	if (0 == stat(real_name.c_str(), &s)) {
+		chmod(real_name.c_str(), s.st_mode | S_IWUSR);
+	}
 }
 
 #endif

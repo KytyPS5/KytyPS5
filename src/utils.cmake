@@ -20,7 +20,7 @@ function(include_what_you_use_with_mappings target dirs mappings)
 endfunction()
 
 function(clang_tidy_check target config headers dirs)
-  if (CLANG AND ("${target}" IN_LIST KYTY_CLANG_TYDY) AND NOT KYTY_CLANG_CL)
+  if (NOT LINUX AND CLANG AND ("${target}" IN_LIST KYTY_CLANG_TYDY) AND NOT KYTY_CLANG_CL)
     find_program (CLANG_TIDY_EXE NAMES "clang-tidy")
     if (CLANG_TIDY_EXE)
 		set(std_arg "-extra-arg=-std=c++${CMAKE_CXX_STANDARD}")

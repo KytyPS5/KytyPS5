@@ -152,8 +152,7 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	                            inst.dst.kind != IR::OperandKind::Null)) ||
 	    ((inst.op == IR::Opcode::DsAppend || inst.op == IR::Opcode::DsConsume) &&
 	     (!ds_kind || !ds_resource || inst.src_count != 1 ||
-	      inst.dst.kind != IR::OperandKind::Register ||
-	      (kind == IR::ResourceKind::Gds && inst.memory.offset != 0))) ||
+	      inst.dst.kind != IR::OperandKind::Register)) ||
 	    ((inst.op == IR::Opcode::DsMinF32 || inst.op == IR::Opcode::DsMaxF32) &&
 	     (!ds_kind || !ds_resource || inst.src_count != 3 ||
 	      inst.dst.kind != IR::OperandKind::Null)) ||

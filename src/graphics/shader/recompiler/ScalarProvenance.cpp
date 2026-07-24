@@ -231,16 +231,14 @@ public:
 		}
 		Queue(0);
 		// The worklist below is a standard iterate-to-fixed-point dataflow pass and should settle in
-		// a small multiple of the block count for well-behaved (monotone) control flow. Some shaders
-		// with deeply nested/chained loops have been observed to keep re-queueing blocks far longer
-		// than that -- possibly a genuine non-convergence in this analysis, not yet root-caused. Cap
-		// wall-clock time spent here so a pathological shader fails this optimization pass cleanly
-		// (falling back to a less-optimized compile, same as any other BuildScalarProvenance failure)
-		// instead of hanging the whole process indefinitely.
-		constexpr auto   convergence_time_limit = std::chrono::seconds(5);
-		const auto       start_time             = std::chrono::steady_clock::now();
-		uint64_t         iteration              = 0;
-		constexpr uint64_t time_check_interval  = 256;
+		// a small multiple of the block count for well-behaved (monotone) control flow. Cap wall-clock
+		// time spent here as a defensive backstop: if some other non-monotonic step is ever
+		// introduced, a pathological shader fails this optimization pass cleanly (the same handled-
+		// failure path as any other BuildScalarProvenance error) instead of hanging the process.
+		constexpr auto     convergence_time_limit = std::chrono::seconds(5);
+		const auto         start_time             = std::chrono::steady_clock::now();
+		uint64_t           iteration              = 0;
+		constexpr uint64_t time_check_interval    = 256;
 		while (!m_work.empty()) {
 			if (++iteration % time_check_interval == 0 &&
 			    std::chrono::steady_clock::now() - start_time > convergence_time_limit) {
@@ -794,10 +792,21 @@ private:
 					incoming.push_back(value);
 				}
 			}
+			// Once this slot has ever needed a Phi (2+ distinct incoming values seen on some earlier
+			// visit), it must keep returning that same Phi id forever after, even on a later visit
+			// where the predecessors currently happen to agree on a single value. This worklist
+			// re-visits blocks repeatedly while predecessors are still converging, and two
+			// predecessors that are each still independently changing value can transiently coincide
+			// on the same id before diverging again on the next visit. Falling back to a bare
+			// single-value passthrough in that window returns a *different* id each time (since the
+			// coincidental value itself keeps changing across visits), which never stabilizes:
+			// entry_changed stays true forever and the pass never converges. Keeping the Phi id
+			// stable once created (only its phi_args content changes) guarantees the merge result for
+			// this slot settles to one fixed id as soon as its inputs do.
 			if (incoming.empty()) {
-				return ScalarProvenance::Undefined;
+				return *phi != ScalarProvenance::Undefined ? *phi : ScalarProvenance::Undefined;
 			}
-			if (incoming.size() == 1) {
+			if (incoming.size() == 1 && *phi == ScalarProvenance::Undefined) {
 				return incoming[0];
 			}
 			if (*phi == ScalarProvenance::Undefined) {

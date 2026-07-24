@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <compare>
 #include <deque>
 #include <fmt/format.h>
@@ -229,7 +230,25 @@ public:
 			}
 		}
 		Queue(0);
+		// The worklist below is a standard iterate-to-fixed-point dataflow pass and should settle in
+		// a small multiple of the block count for well-behaved (monotone) control flow. Some shaders
+		// with deeply nested/chained loops have been observed to keep re-queueing blocks far longer
+		// than that -- possibly a genuine non-convergence in this analysis, not yet root-caused. Cap
+		// wall-clock time spent here so a pathological shader fails this optimization pass cleanly
+		// (falling back to a less-optimized compile, same as any other BuildScalarProvenance failure)
+		// instead of hanging the whole process indefinitely.
+		constexpr auto   convergence_time_limit = std::chrono::seconds(5);
+		const auto       start_time             = std::chrono::steady_clock::now();
+		uint64_t         iteration              = 0;
+		constexpr uint64_t time_check_interval  = 256;
 		while (!m_work.empty()) {
+			if (++iteration % time_check_interval == 0 &&
+			    std::chrono::steady_clock::now() - start_time > convergence_time_limit) {
+				return Fail(error, fmt::format("scalar provenance did not converge after {} "
+				                               "block visits ({} blocks total)",
+				                               iteration, block_count));
+			}
+
 			const auto block_index = m_work.front();
 			m_work.pop_front();
 			m_queued[block_index] = false;

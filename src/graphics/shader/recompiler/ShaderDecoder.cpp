@@ -657,6 +657,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VAddcU32: return "v_addc_u32";
 		case Opcode::VSubNcU32: return "v_sub_nc_u32";
 		case Opcode::VSubrevNcU32: return "v_subrev_nc_u32";
+		case Opcode::VSubbrevU32: return "v_subbrev_co_u32";
 		case Opcode::VAddNcU16: return "v_add_nc_u16";
 		case Opcode::VSubNcU16: return "v_sub_nc_u16";
 		case Opcode::VMaxU16: return "v_max_u16";
@@ -917,6 +918,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SSendmsg: return "s_sendmsg";
 		case Opcode::SSetregB32: return "s_setreg_b32";
 		case Opcode::SSleep: return "s_sleep";
+		case Opcode::STrap: return "s_trap";
 		case Opcode::STtraceData: return "s_ttracedata";
 		case Opcode::SInstPrefetch: return "s_inst_prefetch";
 		case Opcode::SEndpgm: return "s_endpgm";
@@ -1016,6 +1018,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::SNop:
 		case Opcode::SWaitcnt:
 		case Opcode::SSleep:
+		case Opcode::STrap:
 		case Opcode::SSendmsg:
 		case Opcode::STtraceData:
 		case Opcode::SInstPrefetch:

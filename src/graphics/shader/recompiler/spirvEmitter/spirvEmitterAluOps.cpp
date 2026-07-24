@@ -582,6 +582,31 @@ void EmitISubBorrowU32(EmitterState& state, const IR::Instruction& inst) {
 	EmitLaneMaskPairFromBool(state, inst.dst2, borrow);
 }
 
+// Like EmitISubBorrowU32, but also consumes a borrow-in (VCC) via src[2], for V_SUBBREV_CO_U32
+// (D = S1 - S0 - VCC; VCC' = borrow-out), mirroring how EmitIAddCarryU32 consumes a carry-in.
+void EmitISubBorrowInU32(EmitterState& state, const IR::Instruction& inst) {
+	const auto lhs             = EmitValueLoad(state, inst.src[0]);
+	const auto rhs             = EmitValueLoad(state, inst.src[1]);
+	const auto borrow_in_active = EmitLaneMaskOperandActiveBool(state, inst.src[2]);
+	const auto borrow_in        = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, state.uint_type, borrow_in, borrow_in_active,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+	const auto partial = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction({OpISub, state.uint_type, partial, lhs, rhs});
+	state.builder.AddFunction({OpISub, state.uint_type, result, partial, borrow_in});
+	const auto lt          = state.builder.AllocateId();
+	const auto eq          = state.builder.AllocateId();
+	const auto eq_borrow   = state.builder.AllocateId();
+	const auto borrow_bool = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThan, state.bool_type, lt, lhs, rhs});
+	state.builder.AddFunction({OpIEqual, state.bool_type, eq, lhs, rhs});
+	state.builder.AddFunction({OpLogicalAnd, state.bool_type, eq_borrow, eq, borrow_in_active});
+	state.builder.AddFunction({OpLogicalOr, state.bool_type, borrow_bool, lt, eq_borrow});
+	EmitStoreU32(state, inst.dst, result);
+	EmitLaneMaskPairFromBool(state, inst.dst2, borrow_bool);
+}
+
 void EmitScalarAddCarryU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto lhs      = EmitValueLoad(state, inst.src[0]);
 	const auto rhs      = EmitValueLoad(state, inst.src[1]);

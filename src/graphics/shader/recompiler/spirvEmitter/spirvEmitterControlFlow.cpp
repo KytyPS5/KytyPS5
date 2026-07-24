@@ -390,6 +390,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::IAddU32: EmitBinaryU32(state, inst, OpIAdd); break;
 		case IR::Opcode::IAddCarryU32: EmitIAddCarryU32(state, inst); break;
 		case IR::Opcode::ISubBorrowU32: EmitISubBorrowU32(state, inst); break;
+		case IR::Opcode::ISubBorrowInU32: EmitISubBorrowInU32(state, inst); break;
 		case IR::Opcode::ScalarAddCarryU32: EmitScalarAddCarryU32(state, inst); break;
 		case IR::Opcode::ScalarSubBorrowU32: EmitScalarSubBorrowU32(state, inst); break;
 		case IR::Opcode::ScalarSubBorrowCarryU32: EmitScalarSubBorrowCarryU32(state, inst); break;

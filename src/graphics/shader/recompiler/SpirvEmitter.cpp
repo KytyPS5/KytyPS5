@@ -346,6 +346,7 @@ static bool ProducesLaneMask(const IR::Instruction& inst) {
 	switch (inst.op) {
 		case IR::Opcode::IAddCarryU32:
 		case IR::Opcode::ISubBorrowU32:
+		case IR::Opcode::ISubBorrowInU32:
 		case IR::Opcode::UMadU64U32: return inst.dst2.kind != IR::OperandKind::Null;
 		default: return false;
 	}

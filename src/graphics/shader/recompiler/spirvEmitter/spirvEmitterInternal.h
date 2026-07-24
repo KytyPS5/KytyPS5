@@ -1159,6 +1159,7 @@ void EmitPerInvocationMask(EmitterState& state, const IR::Operand& dst, uint32_t
 void EmitIAddCarryU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitISubBorrowU32(EmitterState& state, const IR::Instruction& inst);
+void EmitISubBorrowInU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitScalarAddCarryU32(EmitterState& state, const IR::Instruction& inst);
 

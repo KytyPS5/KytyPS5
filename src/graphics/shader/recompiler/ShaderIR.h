@@ -36,6 +36,7 @@ enum class Opcode {
 	IAddU32,
 	IAddCarryU32,
 	ISubBorrowU32,
+	ISubBorrowInU32,
 	ScalarAddCarryU32,
 	ScalarSubBorrowU32,
 	ScalarSubBorrowCarryU32,

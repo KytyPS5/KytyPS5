@@ -190,6 +190,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IAddU32: text += "IAddU32"; break;
 		case Opcode::IAddCarryU32: text += "IAddCarryU32"; break;
 		case Opcode::ISubBorrowU32: text += "ISubBorrowU32"; break;
+		case Opcode::ISubBorrowInU32: text += "ISubBorrowInU32"; break;
 		case Opcode::ScalarAddCarryU32: text += "ScalarAddCarryU32"; break;
 		case Opcode::ScalarSubBorrowU32: text += "ScalarSubBorrowU32"; break;
 		case Opcode::ScalarSubBorrowCarryU32: text += "ScalarSubBorrowCarryU32"; break;

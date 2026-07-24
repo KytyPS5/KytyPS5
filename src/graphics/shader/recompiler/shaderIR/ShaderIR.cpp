@@ -716,6 +716,24 @@ bool LowerVectorAddCarry(const Decoder::Instruction& decoded, BasicBlock& block,
 	return true;
 }
 
+bool LowerVectorSubBorrowRev(const Decoder::Instruction& decoded, BasicBlock& block,
+                             std::string* error) {
+	// V_SUBBREV_CO_U32: D = S1 - S0 - VCC; VCC' = borrow-out.
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = Opcode::ISubBorrowInU32;
+	inst.src_count = 3;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerRegisterOperand(decoded.dst2, inst.dst2, error) ||
+	    !LowerSourceOperand(decoded.src1, inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[1], error) ||
+	    !LowerSourceOperand(decoded.src2, inst.src[2], error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 bool LowerVectorCarryOut(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
 	Instruction inst;
@@ -957,6 +975,11 @@ bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& bl
 			return LowerControlMarker(decoded, block, Opcode::Sendmsg, true, error);
 		case Decoder::Opcode::SSetregB32:
 		case Decoder::Opcode::SSleep:
+		// S_TRAP is a debug/assertion trap (e.g. compiler-inserted bounds-check fallback) that, in
+		// correctly-executing shader code, is never actually reached. There's no meaningful SPIR-V
+		// equivalent (no "signal the GPU debugger" mechanism in compute shaders), so translate it as
+		// a no-op like the other non-functional control markers here.
+		case Decoder::Opcode::STrap:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
 		case Decoder::Opcode::STtraceData:
 			return LowerControlMarker(decoded, block, Opcode::TtraceData, true, error);
@@ -1028,6 +1051,7 @@ bool IsControlOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::SSendmsg:
 		case Decoder::Opcode::SSetregB32:
 		case Decoder::Opcode::SSleep:
+		case Decoder::Opcode::STrap:
 		case Decoder::Opcode::STtraceData:
 		case Decoder::Opcode::SInstPrefetch: return true;
 		default: return false;
@@ -1081,6 +1105,7 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 		case Decoder::Opcode::VMovreldB32: return LowerVectorMoveRelDestination(inst, block, error);
 		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
 		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);
+		case Decoder::Opcode::VSubbrevU32: return LowerVectorSubBorrowRev(inst, block, error);
 		case Decoder::Opcode::VMadU64U32: return LowerVectorMadU64U32(inst, block, error);
 		case Decoder::Opcode::VMacF32: return LowerVectorMacF32(inst, block, error);
 		case Decoder::Opcode::VPkFmacF16: return LowerVectorPkFmacF16(inst, block, error);

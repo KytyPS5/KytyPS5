@@ -339,8 +339,12 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const auto width  = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	// The decoder has no separate 1D dimension (ImageDimension only distinguishes 2D/3D/2D-array);
+	// a guest 1D image storage access decodes as Dim2D, so a kColor1D descriptor is a legitimate
+	// match for it here, not just kColor2D.
 	const bool is_2d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
-	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	                   (descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) ||
+	                    descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor1D)) &&
 	                   descriptor.Depth() == 0;
 	const bool is_2d_array =
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&

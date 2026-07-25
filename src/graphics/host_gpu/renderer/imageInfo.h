@@ -960,10 +960,15 @@ ClassifyStorageRenderTargetOverlap(const ImageInfo& storage, vk::Format storage_
 	    !storage_buffer_modified && !storage_cpu_dirty) {
 		return RenderTargetOverlap::PreserveStorage;
 	}
-	return HasGuestCurrentImageOwnership(storage_gpu_modified, storage_buffer_modified,
-	                                     storage_cpu_dirty, tracker_gpu_modified)
-	           ? RenderTargetOverlap::RetireStorage
-	           : RenderTargetOverlap::Unsupported;
+	// Unlike PreserveStorage, retirement here always discards the storage image outright and
+	// creates a fresh render target over the (possibly only partially overlapping) requested
+	// range. A pending GPU write (storage_gpu_modified/tracker_gpu_modified) is not a reason to
+	// refuse that -- it is a reason the caller must synchronize the storage image to guest memory
+	// first so that content is not lost, which it does before adding this entry to the retire set.
+	// storage_buffer_modified is left permissive too since a sync leaves it set. Only genuinely
+	// unresolved CPU-side writes (storage_cpu_dirty) are refused here.
+	return !storage_cpu_dirty ? RenderTargetOverlap::RetireStorage
+	                          : RenderTargetOverlap::Unsupported;
 }
 
 [[nodiscard]] inline bool IsRgba8SrgbViewFormat(vk::Format format) noexcept {

@@ -933,15 +933,17 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire,
 			(*it)->gpu_modified  = false;
 			native_image_retired = true;
 		}
-		// A render/depth target being retired here is always discarded outright and replaced (see
-		// ClassifyRenderTargetOverlap's RetireTarget path in imageInfo.h) -- buffer_modified just
-		// means guest memory has bytes this particular GPU image never picked up, which is
-		// irrelevant to an image nothing will read again. gpu_modified staying a hard blocker for
-		// every kind (checked unconditionally above) is what actually matters: it would mean this
-		// image holds rendered content that hasn't reached guest memory, which retiring it would
-		// silently lose.
+		// A render/depth target or storage image being retired here is always discarded outright
+		// and replaced (see ClassifyRenderTargetOverlap/ClassifyStorageRenderTargetOverlap's
+		// Retire* paths in imageInfo.h) -- buffer_modified just means guest memory has bytes this
+		// particular GPU image never picked up, which is irrelevant to an image nothing will read
+		// again (a storage image with a pending GPU write gets flushed to guest memory,
+		// which sets buffer_modified, before it reaches here). gpu_modified staying a hard blocker
+		// for every kind (checked unconditionally above) is what actually matters: it would mean
+		// this image holds rendered content that hasn't reached guest memory, which retiring it
+		// would silently lose.
 		if ((!sampled && !storage && !target && !native_image) || (*it)->gpu_modified ||
-		    (storage && ((*it)->buffer_modified || (*it)->info.IsCpuDirty()))) {
+		    (storage && (*it)->info.IsCpuDirty())) {
 			EXIT("TextureCache: invalid image retirement, kind=%u gpu_modified=%d "
 			     "buffer_modified=%d\n",
 			     static_cast<uint32_t>((*it)->kind), (*it)->gpu_modified, (*it)->buffer_modified);
@@ -1917,6 +1919,11 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 				break;
 			case RenderTargetOverlap::RetireStorage:
 				supported = cached.kind == CachedImage::Kind::StorageTexture;
+				if (supported && cached.gpu_modified) {
+					// The storage image may hold rendered content only it has -- flush it to
+					// guest memory before it gets discarded and replaced below.
+					SynchronizeColorImageToBufferLocked(cached, cached.Address(), cached.Size());
+				}
 				break;
 			case RenderTargetOverlap::PreserveStorage:
 				supported = cached.kind == CachedImage::Kind::StorageTexture &&

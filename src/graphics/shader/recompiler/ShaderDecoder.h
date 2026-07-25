@@ -43,6 +43,7 @@ enum class Opcode {
 	SBcnt1I32B32,
 	SBcnt1I32B64,
 	SFf1I32B32,
+	SFlbitI32B32,
 	SFlbitI32B64,
 	SBitreplicateB64B32,
 	SGetpcB64,

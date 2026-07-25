@@ -533,6 +533,17 @@ enum class ScalarValueOp {
 	ShiftLeftOr,
 	ReadConst,
 	ReadConstBuffer,
+	MinI32,
+	MaxI32,
+	MinU32,
+	MaxU32,
+	AbsI32,
+	BitFieldExtractU32,
+	SelectU32,
+	ShiftLeftU64Low,
+	ShiftLeftU64High,
+	ShiftRightU64Low,
+	ShiftRightU64High,
 	Phi,
 };
 

@@ -96,6 +96,49 @@ bool ApplyOperation(ScalarValueOp op, const std::array<uint32_t, 3>& args, uint3
 		case ScalarValueOp::AddShiftLeft: result = (args[0] + args[1]) << (args[2] & 31u); break;
 		case ScalarValueOp::XorAdd: result = (args[0] ^ args[1]) + args[2]; break;
 		case ScalarValueOp::ShiftLeftOr: result = (args[0] << shift) | args[2]; break;
+		case ScalarValueOp::MinI32:
+			result = static_cast<uint32_t>(
+			    std::min(static_cast<int32_t>(args[0]), static_cast<int32_t>(args[1])));
+			break;
+		case ScalarValueOp::MaxI32:
+			result = static_cast<uint32_t>(
+			    std::max(static_cast<int32_t>(args[0]), static_cast<int32_t>(args[1])));
+			break;
+		case ScalarValueOp::MinU32: result = std::min(args[0], args[1]); break;
+		case ScalarValueOp::MaxU32: result = std::max(args[0], args[1]); break;
+		case ScalarValueOp::AbsI32:
+			result = (args[0] & 0x80000000u) != 0 ? (~args[0] + 1u) : args[0];
+			break;
+		case ScalarValueOp::BitFieldExtractU32: {
+			const auto offset = args[1] & 0x1fu;
+			const auto count  = (args[1] >> 16u) & 0x7fu;
+			result = count == 0 ? 0u
+			         : count >= 32u
+			             ? (args[0] >> offset)
+			             : ((args[0] >> offset) & ((uint32_t {1} << count) - 1u));
+			break;
+		}
+		case ScalarValueOp::SelectU32: result = args[0] != 0 ? args[1] : args[2]; break;
+		case ScalarValueOp::ShiftLeftU64Low:
+		case ScalarValueOp::ShiftLeftU64High: {
+			const auto     shift_amount = args[2] & 63u;
+			const uint64_t v = (static_cast<uint64_t>(args[1]) << 32u) | args[0];
+			const uint64_t shifted      = v << shift_amount;
+			result                      = static_cast<uint32_t>(op == ScalarValueOp::ShiftLeftU64Low
+			                                                        ? shifted
+			                                                        : shifted >> 32u);
+			break;
+		}
+		case ScalarValueOp::ShiftRightU64Low:
+		case ScalarValueOp::ShiftRightU64High: {
+			const auto     shift_amount = args[2] & 63u;
+			const uint64_t v = (static_cast<uint64_t>(args[1]) << 32u) | args[0];
+			const uint64_t shifted      = v >> shift_amount;
+			result                      = static_cast<uint32_t>(op == ScalarValueOp::ShiftRightU64Low
+			                                                        ? shifted
+			                                                        : shifted >> 32u);
+			break;
+		}
 		default: return false;
 	}
 	return true;

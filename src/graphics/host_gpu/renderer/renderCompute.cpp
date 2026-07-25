@@ -384,8 +384,15 @@ void RenderDispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint3
 	ShaderComputeInputInfo    input_info {};
 	std::span<const uint32_t> cs_shader;
 	if (!ShaderCompileInfoCS(cs_regs, sh_regs, input_info, cs_shader)) {
-		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
-		     cs_regs.cs_regs.data_addr);
+		// The compiler already logged the specific reason (bounded). Drop this dispatch rather
+		// than crashing the process so the rest of the frame can still be produced.
+		static std::atomic<uint32_t> logged_failures {0};
+		if (logged_failures.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: ShaderCompileInfoCS failed for CS shader "
+			     "0x%016" PRIx64 ", dispatch skipped\n",
+			     cs_regs.cs_regs.data_addr);
+		}
+		return;
 	}
 
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;

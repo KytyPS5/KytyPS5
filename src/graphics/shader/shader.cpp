@@ -1496,7 +1496,18 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
-		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
+		// Compute-shader compile failures are usually a specific unsupported pattern (e.g. a
+		// resource index computed from a cross-lane runtime search that static analysis cannot
+		// resolve to a descriptor) rather than a broadly fatal bug. Skip this dispatch instead of
+		// crashing the whole process so the rest of the frame/game can keep running; the caller
+		// (RenderDispatchDirect) treats a false return as "drop this dispatch".
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF_COLOR(Log::Color::BrightRed,
+			           "ShaderRecompiler CS failed hash=0x%016" PRIx64 ": %s (dispatch skipped)\n",
+			           options.shader_hash, error.c_str());
+		}
+		return false;
 	}
 	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler CS", options.shader_hash, result.spirv)) {

@@ -30,6 +30,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -114,6 +115,15 @@ static std::unordered_map<ShaderStageProgramKey,
                           ShaderStageProgramKeyHash>
                   g_shader_program_cache;
 static std::mutex g_shader_program_cache_mutex;
+
+// A compute shader that fails to compile (e.g. a resource index this AOT compiler cannot resolve
+// statically -- see ShaderCompileSpirvCS) is never added to g_shader_program_cache, since that
+// cache only holds successful permutations. Without remembering the failure separately, a shader
+// dispatched many times per frame (a per-tile/per-light compute pass is a common case) reruns the
+// full decode/CFG-build/structurize/lower pipeline from scratch on every single dispatch even
+// though it is guaranteed to fail the same way again, which can turn a single unsupported shader
+// into a many-seconds-per-frame stall instead of one cheap, bounded compile attempt.
+static std::unordered_set<ShaderStageProgramKey, ShaderStageProgramKeyHash> g_failed_cs_shaders;
 
 static constexpr uint32_t ShaderMaxPermutationsPerProgram = 64;
 
@@ -1154,10 +1164,15 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 				}
 			}
 		}
+		if (g_failed_cs_shaders.contains(key)) {
+			return false;
+		}
 	}
 
 	std::vector<uint32_t> compiled_spirv;
 	if (!ShaderCompileSpirvCS(regs, sh, info, compiled_spirv)) {
+		std::scoped_lock lock(g_shader_program_cache_mutex);
+		g_failed_cs_shaders.insert(key);
 		return false;
 	}
 

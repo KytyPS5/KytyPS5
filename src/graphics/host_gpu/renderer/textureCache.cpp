@@ -1939,14 +1939,14 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 		if (!supported) {
 			EXIT("TextureCache: unsupported render-target alias, requested=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64
-			     " gpu_modified=%d"
+			     " overlap=%u gpu_modified=%d buffer_modified=%d"
 			     " sampled_format=%u extent=%ux%ux%u pitch=%u levels=%u base_level=%u"
 			     " tile=%u type=%u base_array=%u\n",
 			     info.address, info.size, static_cast<uint32_t>(cached.kind), cached.Address(),
-			     cached.Size(), cached.gpu_modified, cached.info.format, cached.info.width,
-			     cached.info.height, cached.info.depth, cached.info.pitch, cached.info.levels,
-			     cached.info.base_level, cached.info.tile, cached.info.type,
-			     cached.info.base_array);
+			     cached.Size(), static_cast<uint32_t>(overlap), cached.gpu_modified,
+			     cached.buffer_modified, cached.info.format, cached.info.width, cached.info.height,
+			     cached.info.depth, cached.info.pitch, cached.info.levels, cached.info.base_level,
+			     cached.info.tile, cached.info.type, cached.info.base_array);
 		}
 		retire.push_back(&cached);
 	}

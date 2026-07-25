@@ -1102,9 +1102,13 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 	    cached.layers != requested.layers || cached.samples != requested.samples;
 	const bool new_allocation = cached.address != requested.address ||
 	                            cached.size != requested.size || pool_storage_shape_changed;
-	return page_isolated && new_allocation && guest_source_current &&
-	               HasGuestCurrentImageOwnership(cached_gpu_modified, cached_buffer_modified, false,
-	                                             tracker_gpu_modified)
+	// This path discards the cached image outright and creates a fresh one over the (possibly
+	// only partially overlapping) requested range, so cached_buffer_modified -- "guest memory has
+	// bytes newer than this GPU image" -- does not matter: nobody is going to read the retired
+	// image again. What must hold is that the GPU never holds rendered content that only exists
+	// in this image and hasn't reached guest memory yet, i.e. no pending GPU-side write.
+	return page_isolated && new_allocation && guest_source_current && !cached_gpu_modified &&
+	               !tracker_gpu_modified
 	           ? RenderTargetOverlap::RetireTarget
 	           : RenderTargetOverlap::Unsupported;
 }

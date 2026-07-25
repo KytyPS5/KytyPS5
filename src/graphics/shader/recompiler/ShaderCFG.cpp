@@ -479,6 +479,16 @@ void SortUnique(std::vector<uint32_t>& values) {
 	values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
+// Inserts into an already-sorted, duplicate-free vector while keeping it sorted. Cheaper than
+// AddUnique() followed by SortUnique() on the dominator/post-dominator sets, which are rebuilt
+// once per block per dataflow pass.
+void InsertSorted(std::vector<uint32_t>& values, uint32_t value) {
+	const auto it = std::lower_bound(values.begin(), values.end(), value);
+	if (it == values.end() || *it != value) {
+		values.insert(it, value);
+	}
+}
+
 bool Contains(const std::vector<uint32_t>& values, uint32_t value) {
 	return std::find(values.begin(), values.end(), value) != values.end();
 }
@@ -567,8 +577,7 @@ void ComputeDominators(Graph& graph) {
 				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
 					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
 				}
-				AddUnique(next, block.id);
-				SortUnique(next);
+				InsertSorted(next, block.id);
 			}
 			if (next != block.dominators) {
 				block.dominators = std::move(next);
@@ -589,7 +598,14 @@ void ComputePostDominators(Graph& graph) {
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
+		// Post-dominance flows backwards along the CFG, so visiting blocks in descending id order
+		// (blocks are laid out roughly in program order) propagates a successor's freshly updated
+		// set within the same pass. Sweeping forwards instead advances the fixpoint by a single
+		// edge per pass, which turns this into O(blocks) passes -- SplitSharedMergeBlocks() reruns
+		// the whole analysis once per split, so that cost is what made structurizing large compute
+		// kernels take minutes.
+		for (auto it = graph.blocks.rbegin(); it != graph.blocks.rend(); ++it) {
+			auto&                 block = *it;
 			std::vector<uint32_t> next;
 			if (block.successors.empty()) {
 				next = {block.id};
@@ -598,8 +614,7 @@ void ComputePostDominators(Graph& graph) {
 				for (uint32_t i = 1; i < block.successors.size(); i++) {
 					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
 				}
-				AddUnique(next, block.id);
-				SortUnique(next);
+				InsertSorted(next, block.id);
 			}
 			if (next != block.post_dominators) {
 				block.post_dominators = std::move(next);
@@ -1114,19 +1129,36 @@ uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_
 	}
 
 	const auto common = IntersectSorted(a->post_dominators, b->post_dominators);
-	for (auto candidate: common) {
-		bool nearest = true;
-		for (auto other: common) {
-			if (other != candidate && !PostDominates(other, candidate)) {
-				nearest = false;
-				break;
-			}
+	if (common.empty()) {
+		return UINT32_MAX;
+	}
+
+	// The common post-dominators form a chain, so the nearest one is the candidate whose own
+	// post-dominator set contains every other candidate -- i.e. the one with the largest set.
+	// Trying candidates in descending set size finds it on the first probe in practice, while a
+	// sorted-set inclusion test keeps the exact semantics of the original pairwise scan (which was
+	// O(blocks^3) per call and is invoked once per loop exit and once per conditional block on
+	// every structurization pass).
+	std::vector<uint32_t> ordered = common;
+	std::stable_sort(ordered.begin(), ordered.end(), [this](uint32_t lhs, uint32_t rhs) {
+		const auto* lhs_block = FindBlock(lhs);
+		const auto* rhs_block = FindBlock(rhs);
+		const auto  lhs_size  = lhs_block != nullptr ? lhs_block->post_dominators.size() : 0u;
+		const auto  rhs_size  = rhs_block != nullptr ? rhs_block->post_dominators.size() : 0u;
+		return lhs_size > rhs_size;
+	});
+	for (auto candidate: ordered) {
+		const auto* candidate_block = FindBlock(candidate);
+		if (candidate_block == nullptr) {
+			continue;
 		}
-		if (nearest) {
+		const auto& post_dominators = candidate_block->post_dominators;
+		if (std::includes(post_dominators.begin(), post_dominators.end(), common.begin(),
+		                  common.end())) {
 			return candidate;
 		}
 	}
-	return common.empty() ? UINT32_MAX : common.front();
+	return common.front();
 }
 
 bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* error) {

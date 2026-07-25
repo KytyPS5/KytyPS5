@@ -933,9 +933,15 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire,
 			(*it)->gpu_modified  = false;
 			native_image_retired = true;
 		}
+		// A render/depth target being retired here is always discarded outright and replaced (see
+		// ClassifyRenderTargetOverlap's RetireTarget path in imageInfo.h) -- buffer_modified just
+		// means guest memory has bytes this particular GPU image never picked up, which is
+		// irrelevant to an image nothing will read again. gpu_modified staying a hard blocker for
+		// every kind (checked unconditionally above) is what actually matters: it would mean this
+		// image holds rendered content that hasn't reached guest memory, which retiring it would
+		// silently lose.
 		if ((!sampled && !storage && !target && !native_image) || (*it)->gpu_modified ||
-		    (storage && ((*it)->buffer_modified || (*it)->info.IsCpuDirty())) ||
-		    (target && (*it)->buffer_modified)) {
+		    (storage && ((*it)->buffer_modified || (*it)->info.IsCpuDirty()))) {
 			EXIT("TextureCache: invalid image retirement, kind=%u gpu_modified=%d "
 			     "buffer_modified=%d\n",
 			     static_cast<uint32_t>((*it)->kind), (*it)->gpu_modified, (*it)->buffer_modified);

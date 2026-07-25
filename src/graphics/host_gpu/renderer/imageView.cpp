@@ -351,8 +351,10 @@ vk::ImageView TextureCache::GetStorageTextureSampledView(StorageTextureVulkanIma
                                                          const ImageInfo&           info) {
 	const auto shape = SelectStorageSampledViewShape(info.type, info.depth, image.layers);
 	if (image.image == nullptr || shape == StorageSampledViewShape::Unsupported ||
-	    info.base_array != 0 || info.levels != image.mip_levels || info.base_level >= info.levels ||
-	    info.view_levels == 0 || info.base_level + info.view_levels > info.levels) {
+	    info.base_array != 0 || info.levels > image.mip_levels ||
+	    info.base_level >= info.levels || info.view_levels == 0 ||
+	    info.view_levels > info.levels - info.base_level ||
+	    info.view_levels > image.mip_levels - info.base_level) {
 		EXIT("TextureCache: invalid sampled view of storage texture, image=%p type=%u depth=%u"
 		     " base=%u levels=%u view_levels=%u image_levels=%u base_array=%u\n",
 		     static_cast<const void*>(&image), info.type, info.depth, info.base_level, info.levels,

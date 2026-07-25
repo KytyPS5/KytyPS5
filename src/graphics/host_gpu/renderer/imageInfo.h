@@ -756,7 +756,9 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	const bool same_backing =
 	    requested.address == cached.address && requested.size == cached.size &&
 	    requested.width == cached.width && requested.height == cached.height &&
-	    requested.pitch == cached.pitch && requested.levels == cached.levels &&
+	    requested.pitch == cached.pitch && requested.levels <= cached.levels &&
+	    requested.base_level < cached.levels &&
+	    requested.view_levels <= cached.levels - requested.base_level &&
 	    requested.tile == cached.tile && requested.depth == cached.depth &&
 	    requested.type == cached.type && requested.base_array == cached.base_array;
 	const bool compatible_format =

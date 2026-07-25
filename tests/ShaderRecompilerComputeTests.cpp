@@ -11471,6 +11471,19 @@ void CheckStorageTextureSampledReuse() {
               vk::Format::eR16G16B16A16Sfloat, true,
               false) == StorageSampledOverlap::ExactImage,
           "GPU-owned storage backing rejected a wider sampled mip view");
+  auto narrower_declared_sampled = full_mip_sampled;
+  narrower_declared_sampled.levels = 7;
+  narrower_declared_sampled.view_levels = 7;
+  auto tail_mip_storage = full_mip_sampled;
+  tail_mip_storage.base_level = 7;
+  tail_mip_storage.view_levels = 1;
+  Require("StorageTextureSampledReuse", "sampled subset of storage mip backing",
+          ClassifyStorageSampledOverlap(
+              narrower_declared_sampled, tail_mip_storage,
+              vk::Format::eR16G16B16A16Sfloat,
+              vk::Format::eR16G16B16A16Sfloat, true,
+              false) == StorageSampledOverlap::ExactImage,
+          "GPU-owned full storage backing rejected a sampled mip subset");
   auto incompatible = storage;
   incompatible.format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16UNorm);

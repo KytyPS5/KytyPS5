@@ -385,11 +385,16 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
 	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
+	// fields[6]/[7] carry DCC/CMASK compression metadata (address, block-size limits, etc.) on a
+	// storage descriptor built from a compressed render target -- e.g. a post-process compute
+	// pass writing back into the display buffer. This engine doesn't implement DCC (render
+	// targets are always stored uncompressed; RenderColorTarget already just tolerates the
+	// DCC/CMASK pipe-config flags rather than acting on them), and the ordinary sampled-texture
+	// path never inspects these fields either, so they carry no information this validator needs.
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	       descriptor.fields[3] == expected_field3 && descriptor.fields[4] == descriptor.Depth() &&
-	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected &&
-	       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
+	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,

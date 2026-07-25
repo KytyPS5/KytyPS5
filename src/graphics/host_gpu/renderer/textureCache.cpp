@@ -682,7 +682,7 @@ struct TextureCache::ReadbackWorker {
 		}
 		const bool basic_storage =
 		    !storage ||
-		    (single_layer_storage && cached.info.base_level == 0 &&
+		    (single_layer_storage && cached.info.base_level < cached.info.levels &&
 		     cached.info.view_levels == 1 && cached.info.base_array == 0 &&
 		     (linear || tiled_storage));
 		const auto    layers = target ? cached.target.layers : 1u;
@@ -698,9 +698,10 @@ struct TextureCache::ReadbackWorker {
 		    cached.image->extent.height == info.height && cached.image->layers == 1 &&
 		    cached.image->mip_levels == info.levels && cached.image->samples == 1;
 		// A storage descriptor exposes one mip at a time, but its cached Vulkan image owns the
-		// complete backing mip chain. Retiring that backing must download every level before a
-		// differently-sized view/backing replaces it. TextureCalcUploadLayout and
-		// TextureBuildGpuTileInfos below already describe all levels generically.
+		// complete backing mip chain regardless of which mip its first view selected. Retiring
+		// that backing must download every level before a differently-sized view/backing replaces
+		// it. TextureCalcUploadLayout and TextureBuildGpuTileInfos below already describe all
+		// levels generically.
 		const bool storage_mip_chain =
 		    storage && info.levels > 1 && basic_storage && cached.image != nullptr &&
 		    cached.image->format == info.format && cached.image->extent.width == info.width &&

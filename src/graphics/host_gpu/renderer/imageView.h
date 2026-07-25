@@ -157,7 +157,8 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {
-	if (!IsSupportedSampledDepthFormat(image_format, view_format)) {
+	if (!IsSupportedSampledDepthFormat(image_format, view_format) &&
+	    !IsSupportedSampledStencilFormat(image_format, view_format)) {
 		return false;
 	}
 	switch (swizzle) {

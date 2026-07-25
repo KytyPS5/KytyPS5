@@ -10147,6 +10147,16 @@ void CheckSampledColorViews() {
                                  vk::Format::eR32Sfloat,
                                  DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
           "D32S8 depth target did not select its R001 depth-aspect view");
+  Require("SampledColorViews", "D32S8 R8_UINT stencil target",
+          SelectSampledDepthView(vk::Format::eD32SfloatS8Uint,
+                                 vk::Format::eR8Uint,
+                                 DstSel(4, 4, 4, 4)) == DstSel(4, 4, 4, 4),
+          "D32S8 target did not select its replicated stencil-aspect view");
+  Require("SampledColorViews", "stencil aspect selection",
+          SampledDepthTargetAspect(vk::Format::eD32SfloatS8Uint,
+                                   vk::Format::eR8Uint) ==
+              vk::ImageAspectFlagBits::eStencil,
+          "R8_UINT depth-target view did not select the stencil aspect");
   Require("SampledColorViews", "storage identity",
           SelectStorageColorView(
               vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm,

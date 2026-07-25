@@ -271,8 +271,12 @@ vk::ImageView TextureCache::GetDepthTargetSampledView(DepthStencilVulkanImage& i
 		     static_cast<int>(view_format), swizzle, base_level, level_count, base_layer,
 		     layer_count, static_cast<int>(type), image.mip_levels, image.layers);
 	}
-	return GetImageView(image, {image.format, type, vk::ImageAspectFlagBits::eDepth, base_level,
-	                            level_count, base_layer, layer_count, swizzle});
+	const auto aspect = SampledDepthTargetAspect(image.format, view_format);
+	if (!aspect) {
+		EXIT("TextureCache: sampled depth-target view has no compatible aspect\n");
+	}
+	return GetImageView(image, {image.format, type, aspect, base_level, level_count, base_layer,
+	                            layer_count, swizzle});
 }
 
 vk::ImageView TextureCache::GetSampledColorView(VulkanImage& image, vk::Format view_format,

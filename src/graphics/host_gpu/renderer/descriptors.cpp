@@ -267,6 +267,9 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
 	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto pitch  = TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
 	const auto type   = static_cast<Prospero::ImageType>(descriptor.Type());
+	const bool stencil_view =
+	    descriptor.Format() == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+	    IsStencilAspectFormat(image.format);
 	const bool supported_single_layer =
 	    image.layers == 1 && descriptor.Depth() == 0 && descriptor.BaseArray5() == 0 &&
 	    (type == Prospero::ImageType::kColor2D || type == Prospero::ImageType::kColor2DArray);
@@ -280,7 +283,7 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
 	       descriptor.MinLod() == 0 && descriptor.BaseArray5() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth() && pitch >= width &&
-	       pitch == image.guest_pitch;
+	       (stencil_view || pitch == image.guest_pitch);
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor) {
@@ -302,12 +305,17 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
                                        const ShaderTextureResource&               descriptor,
                                        const VulkanImage* image, vk::Format view_format,
                                        uint64_t size) {
-	const bool resource_ok = IsSupportedSampledDepthResource(resource);
+	const bool stencil =
+	    image != nullptr && IsSupportedSampledStencilFormat(image->format, descriptor.Format(),
+	                                                        view_format);
+	const bool resource_ok = stencil ? IsSupportedSampledDepthUintResource(resource)
+	                                 : IsSupportedSampledDepthResource(resource);
 	const bool descriptor_ok =
 	    image != nullptr && IsSupportedDepthTargetDescriptor(descriptor, *image);
 	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor);
-	const bool format_ok   = image != nullptr && IsSupportedSampledDepthFormat(
-	                                                 image->format, descriptor.Format(), view_format);
+	const bool format_ok =
+	    image != nullptr &&
+	    (IsSupportedSampledDepthFormat(image->format, descriptor.Format(), view_format) || stencil);
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}

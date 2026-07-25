@@ -221,6 +221,40 @@ FindGuestDepthFormatPolicy(uint32_t guest_format) noexcept {
 	return false;
 }
 
+[[nodiscard]] inline constexpr bool IsStencilAspectFormat(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint: return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedSampledStencilFormat(vk::Format image_format,
+                                                                    uint32_t guest_format,
+                                                                    vk::Format view_format) noexcept {
+	return IsStencilAspectFormat(image_format) &&
+	       guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+	       view_format == vk::Format::eR8Uint;
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedSampledStencilFormat(vk::Format image_format,
+                                                                    vk::Format view_format) noexcept {
+	return IsSupportedSampledStencilFormat(
+	    image_format, Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt), view_format);
+}
+
+[[nodiscard]] inline constexpr vk::ImageAspectFlags
+SampledDepthTargetAspect(vk::Format image_format, vk::Format view_format) noexcept {
+	if (IsSupportedSampledDepthFormat(image_format, view_format)) {
+		return vk::ImageAspectFlagBits::eDepth;
+	}
+	if (IsSupportedSampledStencilFormat(image_format, view_format)) {
+		return vk::ImageAspectFlagBits::eStencil;
+	}
+	return {};
+}
+
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const DepthTargetInfo& info) {
 	const bool  has_stencil = info.stencil_address != 0 || info.stencil_size != 0;
 	const auto* policy      = FindGuestDepthFormatPolicy(info.guest_format);

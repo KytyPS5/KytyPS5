@@ -889,19 +889,27 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		     " size=0x%016" PRIx64 " tracker_dirty=%d byte_ranges=%zu\n",
 		     vaddr, size, gpu_modified, dirty_ranges.size());
 	}
-	auto find_owner = [&](uint64_t address, uint64_t bytes) noexcept -> CachedBuffer& {
+	// A dirty byte range can outlive the buffer object it was recorded against: e.g. that buffer
+	// was since replaced by an image over the same memory (a render/depth/video-out target
+	// retiring a storage image, or vice versa -- see this session's other TextureCache retirement
+	// fixes), which erases it from m_buffers without necessarily clearing m_gpu_modified_ranges
+	// for its old range. There is nothing left to download such a range from, and nothing that
+	// still cares about its "GPU modified" status (whatever now owns that memory tracks its own
+	// state), so find_owner reports absence instead of treating it as fatal, and the caller drops
+	// the stale range from tracking rather than downloading it.
+	auto find_owner = [&](uint64_t address, uint64_t bytes) noexcept -> CachedBuffer* {
 		auto owner = m_buffers.upper_bound(address);
 		if (owner == m_buffers.begin()) {
-			EXIT("BufferCache: GPU image-source bytes have no cached owner\n");
+			return nullptr;
 		}
 		--owner;
 		auto&      cached = *owner->second;
 		const auto offset = address - cached.vaddr;
 		if (offset > cached.size || bytes > cached.size - offset || cached.buffer == nullptr ||
 		    cached.buffer->buffer == nullptr) {
-			EXIT("BufferCache: GPU image-source bytes have no containing native buffer\n");
+			return nullptr;
 		}
-		return cached;
+		return &cached;
 	};
 	if (gpu_modified) {
 		if (!GraphicsRunIsCommandProcessorThread() && !GraphicsRunSubmissionLockHeld() &&
@@ -913,8 +921,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 			     GraphicsRunSubmissionLockHeld(), LabelInCallback());
 		}
 		Transfer::WaitForQueueIdle();
-		auto     backing_writes = ReserveBackingWrites(m_page_manager, dirty_ranges);
-		uint64_t downloaded     = 0;
+		auto backing_writes = ReserveBackingWrites(m_page_manager, dirty_ranges);
 		m_memory_tracker.ForEachDownloadRange<true>(
 		    vaddr, size,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -928,19 +935,17 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 				         address, bytes);
 			    }
 			    for (const auto& range: dirty) {
-				    auto&                owner         = find_owner(range.address, range.size);
-				    const auto           buffer_offset = range.address - owner.vaddr;
+				    auto* owner = find_owner(range.address, range.size);
+				    if (owner == nullptr) {
+					    m_gpu_modified_ranges.Subtract(range.address, range.size);
+					    continue;
+				    }
+				    const auto           buffer_offset = range.address - owner->vaddr;
 				    std::vector<uint8_t> data(range.size);
-				    Transfer::DownloadBuffer(*owner.buffer, buffer_offset, data.data(), range.size);
+				    Transfer::DownloadBuffer(*owner->buffer, buffer_offset, data.data(), range.size);
 				    Libs::LibKernel::Memory::WriteBacking(range.address, data.data(), data.size());
-				    downloaded += range.size;
 			    }
 		    });
-		if (downloaded == 0) {
-			EXIT("BufferCache: image source cleared no tracked GPU pages, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     vaddr, size);
-		}
 		m_gpu_modified_ranges.Subtract(vaddr, size);
 	}
 	auto owner = m_buffers.upper_bound(vaddr);

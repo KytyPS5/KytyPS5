@@ -1194,17 +1194,32 @@ void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		const auto offset = vaddr >= it->second->vaddr ? vaddr - it->second->vaddr : UINT64_MAX;
-		if (owner != m_buffers.end() || offset > it->second->size ||
-		    size > it->second->size - offset) {
-			EXIT("BufferCache: image backing aliases a non-containing cached buffer, "
+		if (offset > it->second->size || size > it->second->size - offset) {
+			// A buffer object that only partially overlaps (or is smaller than) the range being
+			// published is stale relative to it -- e.g. a render target's buffer alias left over
+			// from before the same memory was reused at a larger size for a compute pass. It does
+			// not describe this data, so it is not this range's owner; treat it the same as if it
+			// hadn't overlapped at all rather than refusing the publish outright.
+			continue;
+		}
+		if (owner != m_buffers.end()) {
+			EXIT("BufferCache: image backing aliases multiple containing cached buffers, "
 			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " buffer=0x%016" PRIx64 "+0x%016" PRIx64
 			     "\n",
 			     vaddr, size, it->second->vaddr, it->second->size);
 		}
 		owner = it;
 	}
-	if ((owner != m_buffers.end() && m_memory_tracker.IsRegionCpuModified(vaddr, size)) ||
-	    m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
+	// A region already marked CPU-modified here is not a conflict worth refusing: this range's
+	// memory keeps getting reinterpreted between render-target/storage-image/buffer roles in a
+	// single command stream (e.g. a post-process pass followed immediately by another retirement
+	// over the same or overlapping bytes), and each retirement's own sync republishes the range
+	// before anything necessarily consumes the previous mark. The data we're about to (re)mark
+	// dirty here is the freshest available -- WriteBacking just wrote it -- so it simply
+	// supersedes whatever caused the prior mark. An actual pending GPU-side write
+	// (gpu_modified/m_gpu_modified_ranges) is a real hazard, though: that write's content isn't in
+	// guest memory yet at all, so silently overwriting the mark that says so would lose it.
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
 	    !m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
 		EXIT("BufferCache: image backing requires clean buffer ownership, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " cached=%d\n",

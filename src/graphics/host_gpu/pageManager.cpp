@@ -694,9 +694,22 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 			// falls through to the guest exception path.
 			return allowed;
 		}
-		if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
-		    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
+		if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
 			FailFast("fault access is incompatible with active page watchers");
+		}
+		if (access == PageFaultAccess::Read && page.access_watchers == 0) {
+			// A write_watchers-only page is meant to stay readable (WatcherProtection returns
+			// PAGE_READONLY, not PAGE_NOACCESS, whenever access_watchers is 0). A read fault
+			// reaching here means this CPU observed a stale, more restrictive mapping while some
+			// other thread's watcher-count/protection transition was still becoming visible --
+			// the same class of race the write_watchers==0 && access_watchers==0 branch above
+			// already tolerates via late_read_pending. Re-check the actual current protection
+			// instead of treating a merely-stale read fault as fatal; a genuinely inaccessible
+			// page still fails fast.
+			if (!Impl::AllowsAccess(fault_vaddr, access)) {
+				FailFast("fault access is incompatible with active page watchers");
+			}
+			return true;
 		}
 		page.resolving            = true;
 		page.resolving_read_write = page.access_watchers != 0;

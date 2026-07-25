@@ -766,9 +766,13 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 	const bool image_page_aligned = ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	switch (binding) {
 		case BufferImageBinding::Texture:
-			return contained && image_page_aligned && !image_gpu_modified
-			           ? BufferImageWrite::InvalidateTexture
-			           : BufferImageWrite::Unsupported;
+			// Same reasoning as the RenderTarget case below: a GPU cache invalidate/flush range
+			// operates at cache-line granularity over whatever span the guest names and does not
+			// have to be fully contained within (or exactly match) a single sampled texture's
+			// bounds. InvalidateTexture only flags the cached image's GPU-side copy stale (never
+			// destructive), which is correct for a write touching any part of it.
+			return image_page_aligned && !image_gpu_modified ? BufferImageWrite::InvalidateTexture
+			                                                 : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:
 			if (!exact || !buffer_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;

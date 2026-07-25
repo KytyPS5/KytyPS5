@@ -442,6 +442,10 @@ IsDepthFloatTextureDirectView(vk::Format image_format, uint32_t guest_format,
 [[nodiscard]] inline constexpr StorageSampledViewShape
 SelectStorageSampledViewShape(uint32_t type, uint32_t depth, uint32_t backing_layers) noexcept {
 	switch (static_cast<Prospero::ImageType>(type)) {
+		// No separate 1D dimension is tracked through the shader IR (a 1D image decodes the same
+		// as 2D, see IsSupportedStorageTextureDescriptor in descriptors.cpp and FindStorageTexture
+		// in textureCache.cpp), so a kColor1D storage texture gets the same 2D sampled view shape.
+		case Prospero::ImageType::kColor1D:
 		case Prospero::ImageType::kColor2D:
 			return depth == 1 && backing_layers == 1 ? StorageSampledViewShape::Image2D
 			                                         : StorageSampledViewShape::Unsupported;

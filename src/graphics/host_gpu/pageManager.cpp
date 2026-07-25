@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -225,6 +226,39 @@ struct PageManager::Impl {
 	}
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// Shadow of the last protection this class applied to each page. mprotect (unlike
+	// VirtualProtect) does not report the previous protection, and parsing /proc/self/maps to
+	// recover it is far too slow for the per-page loops this class runs from (a single
+	// render-target upload protects thousands of pages, and the guest's address space holds
+	// thousands of mapping lines -- scanning the whole file per page made one upload take
+	// seconds). Tracked pages only ever change protection through Protect(), so once a page has
+	// been touched the shadow is authoritative; /proc/self/maps remains the fallback for a page's
+	// first touch and for self-healing if the guest remapped a range behind our back.
+	static std::mutex& ShadowMutex() noexcept {
+		static std::mutex mutex;
+		return mutex;
+	}
+	static std::unordered_map<uint64_t, uint32_t>& ShadowProtections() noexcept {
+		static std::unordered_map<uint64_t, uint32_t> map;
+		return map;
+	}
+	static bool LookupShadowProtection(uint64_t vaddr, uint32_t& out_protection) noexcept {
+		const auto      page = vaddr & ~static_cast<uint64_t>(PAGE_SIZE - 1);
+		std::lock_guard lock(ShadowMutex());
+		const auto&     map = ShadowProtections();
+		const auto      it  = map.find(page);
+		if (it == map.end()) {
+			return false;
+		}
+		out_protection = it->second;
+		return true;
+	}
+	static void StoreShadowProtection(uint64_t vaddr, uint32_t protection) noexcept {
+		const auto      page = vaddr & ~static_cast<uint64_t>(PAGE_SIZE - 1);
+		std::lock_guard lock(ShadowMutex());
+		ShadowProtections()[page] = protection;
+	}
+
 	// Reads the current PROT_* state of the single page at 'vaddr' out of /proc/self/maps.
 	// Returns false only if 'vaddr' isn't covered by any mapping at all, which never happens for
 	// pages this class tracks (they're always backed by the guest's anonymous RW allocation).
@@ -274,7 +308,11 @@ struct PageManager::Impl {
 		return info.Protect;
 #else
 		uint32_t protection = 0;
-		if (!LinuxQueryProtection(vaddr, protection) || protection != PAGE_READWRITE) {
+		if (!LookupShadowProtection(vaddr, protection) &&
+		    !LinuxQueryProtection(vaddr, protection)) {
+			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (unmapped)", vaddr);
+		}
+		if (protection != PAGE_READWRITE) {
 			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (protection=0x%08" PRIx32
 			      ")",
 			      vaddr, protection);
@@ -298,15 +336,26 @@ struct PageManager::Impl {
 			default: return false;
 		}
 #else
-		uint32_t protection = 0;
-		if (!LinuxQueryProtection(vaddr, protection)) {
+		uint32_t   protection = 0;
+		const bool shadowed   = LookupShadowProtection(vaddr, protection);
+		if (!shadowed && !LinuxQueryProtection(vaddr, protection)) {
 			return false;
 		}
-		switch (access) {
-			case PageFaultAccess::Read: return protection == PAGE_READONLY || protection == PAGE_READWRITE;
-			case PageFaultAccess::Write: return protection == PAGE_READWRITE;
-			default: return false;
+		const auto allows = [access](uint32_t current) noexcept {
+			switch (access) {
+				case PageFaultAccess::Read:
+					return current == PAGE_READONLY || current == PAGE_READWRITE;
+				case PageFaultAccess::Write: return current == PAGE_READWRITE;
+				default: return false;
+			}
+		};
+		if (allows(protection)) {
+			return true;
 		}
+		// A denial decides between resuming and failing fast (or raising a guest exception), so a
+		// stale shadow entry must not produce one. Confirm against the real mapping state before
+		// denying; the deny path is rare enough that the slow query cannot hurt.
+		return shadowed && LinuxQueryProtection(vaddr, protection) && allows(protection);
 #endif
 	}
 
@@ -325,8 +374,20 @@ struct PageManager::Impl {
 			      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
 		}
 #else
-		uint32_t old_protection = 0;
-		if (!LinuxQueryProtection(vaddr, old_protection) || old_protection != expected_old) {
+		uint32_t   old_protection = 0;
+		const bool shadowed       = LookupShadowProtection(vaddr, old_protection);
+		if (!shadowed && !LinuxQueryProtection(vaddr, old_protection)) {
+			if (fault_path) {
+				FailFast("mprotect fault transition targets an unmapped page");
+			}
+			Fatal("protection transition targets an unmapped page at 0x%016" PRIx64, vaddr);
+		}
+		if (old_protection != expected_old &&
+		    // A shadow entry can go stale if the guest remapped this range (a fresh mapping is RW
+		    // again without passing through Protect); before treating the mismatch as fatal,
+		    // re-check reality once.
+		    !(shadowed && LinuxQueryProtection(vaddr, old_protection) &&
+		      old_protection == expected_old)) {
 			if (fault_path) {
 				FailFast("mprotect fault transition did not match expected protection");
 			}
@@ -348,6 +409,7 @@ struct PageManager::Impl {
 			}
 			Fatal("mprotect failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr, protection);
 		}
+		StoreShadowProtection(vaddr, protection);
 #endif
 	}
 

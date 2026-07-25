@@ -772,7 +772,15 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			return image_gpu_modified ? BufferImageWrite::SynchronizeVideoOut
 			                          : BufferImageWrite::InvalidateVideoOut;
 		case BufferImageBinding::RenderTarget:
-			if (!exact || !buffer_page_aligned || !buffer_formatted) {
+			// GPU cache invalidate/flush ranges operate at cache-line granularity over whatever
+			// address span the guest asked for, which does not have to line up exactly with a
+			// single render target's bounds (e.g. a flush that also covers an adjacent
+			// allocation). Requiring an exact address+size match rejected any such partially
+			// overlapping flush outright. Any page-aligned, formatted write that overlaps the
+			// target's bytes at all is safe to treat the same as an exact one: the sync path only
+			// downloads GPU content (never destructive), and the invalidate path just marks the
+			// GPU-side copy stale, which is correct for a write touching any part of it.
+			if (!buffer_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
 			}
 			if (image_gpu_modified && !image_buffer_modified) {

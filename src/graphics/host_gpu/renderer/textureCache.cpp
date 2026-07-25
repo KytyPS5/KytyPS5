@@ -3193,12 +3193,26 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		case BufferImageWrite::InvalidateDepthTarget:
 		case BufferImageWrite::InvalidateRenderTarget: cached.buffer_modified = true; return true;
 		case BufferImageWrite::SynchronizeRenderTarget:
-		case BufferImageWrite::SynchronizeStorageTexture:
-			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
+		case BufferImageWrite::SynchronizeStorageTexture: {
+			// A GPU cache flush range is no longer required to sit exactly inside the image (see
+			// ClassifyBufferImageWrite's RenderTarget case) -- it can extend past either edge.
+			// Synchronize*ImageToBufferLocked only downloads the cached image's own bytes and
+			// asserts its write range is contained within it, so clamp to the intersection here.
+			const auto sync_start = std::max(vaddr, cached.Address());
+			const auto sync_end   = std::min(vaddr + size, cached.Address() + cached.Size());
+			if (sync_end > sync_start) {
+				SynchronizeColorImageToBufferLocked(cached, sync_start, sync_end - sync_start);
+			}
 			return true;
-		case BufferImageWrite::SynchronizeDepthTarget:
-			SynchronizeDepthImageToBufferLocked(cached, vaddr, size);
+		}
+		case BufferImageWrite::SynchronizeDepthTarget: {
+			const auto sync_start = std::max(vaddr, cached.Address());
+			const auto sync_end   = std::min(vaddr + size, cached.Address() + cached.Size());
+			if (sync_end > sync_start) {
+				SynchronizeDepthImageToBufferLocked(cached, sync_start, sync_end - sync_start);
+			}
 			return true;
+		}
 		case BufferImageWrite::SynchronizeVideoOut:
 			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
 			return true;

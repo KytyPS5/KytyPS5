@@ -336,7 +336,7 @@ private:
 		return static_cast<uint32_t>(m_info.images.size() - 1);
 	}
 
-	uint32_t AddAddress(const Instruction& inst) {
+	uint32_t AddAddress(const Instruction& inst, bool dynamic_base = false) {
 		auto immediate = static_cast<int32_t>(inst.memory.offset);
 		if (inst.memory.kind == ResourceKind::ScalarBuffer) {
 			immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
@@ -351,6 +351,9 @@ private:
 				address.read         = address.read || !IsWrite(inst.op) || IsAtomic(inst.op);
 				address.written      = address.written || IsWrite(inst.op);
 				address.atomic       = address.atomic || IsAtomic(inst.op);
+				// One run-time use makes the whole resource run-time: the binding has to be a
+				// window either way.
+				address.dynamic_base = address.dynamic_base || dynamic_base;
 				return i;
 			}
 		}
@@ -359,9 +362,10 @@ private:
 		}
 		AddressResource address {inst.memory.resource_source, inst.pc, inst.memory.kind,
 		                         min_offset};
-		address.read    = !IsWrite(inst.op) || IsAtomic(inst.op);
-		address.written = IsWrite(inst.op);
-		address.atomic  = IsAtomic(inst.op);
+		address.read         = !IsWrite(inst.op) || IsAtomic(inst.op);
+		address.written      = IsWrite(inst.op);
+		address.atomic       = IsAtomic(inst.op);
+		address.dynamic_base = dynamic_base;
 		m_info.addresses.push_back(address);
 		return static_cast<uint32_t>(m_info.addresses.size() - 1);
 	}
@@ -402,16 +406,42 @@ private:
 		return true;
 	}
 
+	// A scalar load whose 64-bit base the shader computes at run time -- a waterfall loop feeding
+	// s_load, for instance. Nothing on the host can name the address, but the shader can, so the
+	// access is served from a bound window instead of a resolved pointer. Descriptor sources for
+	// buffers and images (4 and 8 dwords) are deliberately excluded: those still need the concrete
+	// descriptor contents, not just an address.
+	bool IsDynamicScalarAddress(const Instruction& inst) const {
+		if (inst.memory.kind != ResourceKind::ScalarBuffer ||
+		    inst.memory.resource_source == ScalarProvenance::Unknown) {
+			return false;
+		}
+		const auto* descriptor = GetDescriptorSource(m_program, inst.memory.resource_source);
+		if (descriptor == nullptr || descriptor->dword_count != 2) {
+			return false;
+		}
+		std::vector<uint8_t> visited(m_program.provenance.values.size());
+		for (uint32_t i = 0; i < descriptor->dword_count; i++) {
+			std::vector<uint32_t> path;
+			if (ContainsUnknown(m_program.provenance, descriptor->dwords[i], visited, path)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Collect(Instruction& inst, std::string* error) {
 		if (IsAddress(inst)) {
 			const bool unbased = inst.memory.resource_source == ScalarProvenance::Unknown;
-			if ((!unbased && !ValidateSource(inst.memory.resource_source, 2, inst.pc, error)) ||
+			const bool dynamic = !unbased && IsDynamicScalarAddress(inst);
+			if ((!unbased && !dynamic &&
+			     !ValidateSource(inst.memory.resource_source, 2, inst.pc, error)) ||
 			    (unbased && inst.memory.kind != ResourceKind::Flat &&
 			     inst.memory.kind != ResourceKind::Global &&
 			     inst.memory.kind != ResourceKind::Scratch)) {
 				return unbased ? Fail(inst.pc, error, "scalar memory base is unresolved") : false;
 			}
-			const auto resource = AddAddress(inst);
+			const auto resource = AddAddress(inst, dynamic);
 			if (resource == UINT32_MAX) {
 				return Fail(inst.pc, error, "address resource limit exceeded");
 			}

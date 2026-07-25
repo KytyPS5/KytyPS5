@@ -48,7 +48,11 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 
 uint64_t AddressSpecialization(const AddressResource&           resource,
                                const ResourceSnapshot::Address& snapshot) {
-	return resource.kind == ResourceKind::Flat || resource.source == ScalarProvenance::Unknown
+	// Resources the shader addresses itself get the window base, because the shader subtracts it
+	// from the pointer it computed. Host-resolved ones get the distance from the window start to
+	// the pointer, which the shader adds to its immediate.
+	return resource.kind == ResourceKind::Flat || resource.source == ScalarProvenance::Unknown ||
+	               resource.dynamic_base
 	           ? snapshot.binding_base
 	           : snapshot.guest_base - snapshot.binding_base;
 }
@@ -222,7 +226,9 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		requests.push_back({sampler.source, sampler.first_use_pc});
 	}
 	for (const auto& address: program.info.addresses) {
-		if (address.source != ScalarProvenance::Unknown) {
+		// Run-time bases cannot go through the exact evaluator -- that is what makes them dynamic.
+		// They are resolved below with EvaluateAddressBase() instead.
+		if (address.source != ScalarProvenance::Unknown && !address.dynamic_base) {
 			requests.push_back({address.source, address.first_use_pc});
 		}
 	}
@@ -247,7 +253,21 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();
 	for (const auto& address: program.info.addresses) {
-		if (address.source != ScalarProvenance::Unknown) {
+		if (address.dynamic_base) {
+			AddressBase resolved;
+			if (!EvaluateAddressBase(program, address.source, address.first_use_pc, runtime,
+			                         resolved, error)) {
+				return false;
+			}
+			auto base = resolved.base & ~uint64_t {3};
+			// The shader adds its own displacement on top of this, so the window starts here and
+			// runs to the end of the containing guest mapping -- NativeAddressBuffer() sizes it.
+			// A phi whose arms sit at different addresses contributed its lowest arm, so arms above
+			// it are covered by that same forward extent.
+			const auto before = static_cast<uint64_t>(-static_cast<int64_t>(address.min_offset));
+			const auto binding_base = base >= before ? base - before : 0;
+			next.addresses.push_back({base, binding_base});
+		} else if (address.source != ScalarProvenance::Unknown) {
 			const auto value = *cursor++;
 			auto       base  = (static_cast<uint64_t>(value.dwords[0]) |
 			                    static_cast<uint64_t>(value.dwords[1]) << 32u) &

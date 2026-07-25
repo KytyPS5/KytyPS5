@@ -136,8 +136,11 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	     (kind != IR::ResourceKind::Buffer || inst.src_count != buffer_address_count)) ||
 	    (IsBufferStore(inst.op) &&
 	     (kind != IR::ResourceKind::Buffer || inst.src_count != buffer_address_count + 1u)) ||
+	    // s_load carries its soffset plus, since the pointer may have to be rebuilt in the shader,
+	    // the two SGPRs holding that pointer.
 	    (inst.op == IR::Opcode::SLoadDword &&
-	     (kind != IR::ResourceKind::ScalarBuffer || inst.src_count != 1)) ||
+	     (kind != IR::ResourceKind::ScalarBuffer ||
+	      (inst.src_count != 1 && inst.src_count != 3))) ||
 	    (inst.op == IR::Opcode::SBufferLoadDword &&
 	     (kind != IR::ResourceKind::ScalarBuffer || inst.src_count != 1)) ||
 	    (IsFlatLoad(inst.op) && (!flat_kind || inst.src_count != 2)) ||

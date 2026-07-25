@@ -316,6 +316,9 @@ uint32_t EmitRelativeAddress(EmitterState& state, const IR::Instruction& inst, u
 	return EmitSelectU32Value(state, valid, low, ConstantU32(state, UINT32_MAX));
 }
 
+uint32_t EmitWindowRelativeOffset(EmitterState& state, uint32_t low, uint32_t high,
+                                  const IR::AddressResource& resource);
+
 uint32_t EmitFlatVirtualAddress(EmitterState& state, const IR::Instruction& inst,
                                 uint32_t first_src, uint32_t src_count) {
 	if (inst.memory.resource >= state.resources.addresses.size() ||
@@ -335,7 +338,16 @@ uint32_t EmitFlatVirtualAddress(EmitterState& state, const IR::Instruction& inst
 	    ConstantU32(state, (inst.memory.offset & 0x80000000u) != 0 ? UINT32_MAX : 0u);
 	const auto high = EmitAddU32(state, EmitAddU32(state, high0, immediate_high), carry);
 
-	const auto base         = state.program.info.addresses[inst.memory.resource].specialized_base;
+	return EmitWindowRelativeOffset(state, low, high,
+	                                state.program.info.addresses[inst.memory.resource]);
+}
+
+// Turns a run-time 64-bit guest address into a byte offset inside the storage buffer the host bound
+// for this resource, or UINT32_MAX when it falls outside -- callers already map that to a zero
+// read.
+uint32_t EmitWindowRelativeOffset(EmitterState& state, uint32_t low, uint32_t high,
+                                  const IR::AddressResource& resource) {
+	const auto base         = resource.specialized_base;
 	const auto base_low     = static_cast<uint32_t>(base);
 	const auto base_high    = static_cast<uint32_t>(base >> 32u);
 	const auto relative_low = EmitBinaryU32(state, OpISub, low, ConstantU32(state, base_low));
@@ -350,6 +362,38 @@ uint32_t EmitFlatVirtualAddress(EmitterState& state, const IR::Instruction& inst
 	state.builder.AddFunction(
 	    {OpIEqual, state.bool_type, valid, relative_high, ConstantU32(state, 0)});
 	return EmitSelectU32Value(state, valid, relative_low, ConstantU32(state, UINT32_MAX));
+}
+
+// s_load whose pointer the host could not resolve. The SGPR pair holding it was preserved by
+// LowerScalarBufferLoadDword(), so the address is rebuilt here and indexed against the bound window
+// exactly like a FLAT access.
+uint32_t EmitScalarDynamicAddress(EmitterState& state, const IR::Instruction& inst) {
+	if (inst.src_count < 3 || inst.memory.resource >= state.program.info.addresses.size()) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
+		                             inst.memory.resource,
+		                             "dynamic scalar address is missing its pointer registers");
+	}
+	const auto aligned = ConstantU32(state, ~3u);
+	const auto low0 =
+	    EmitBinaryU32(state, OpBitwiseAnd, EmitValueLoad(state, inst.src[1]), aligned);
+	// Guest pointers are 48-bit; the top half of the high dword carries unrelated bits.
+	const auto high0 = EmitBinaryU32(state, OpBitwiseAnd, EmitValueLoad(state, inst.src[2]),
+	                                 ConstantU32(state, 0xffffu));
+
+	auto displacement =
+	    EmitBinaryU32(state, OpBitwiseAnd, EmitValueLoad(state, inst.src[0]), aligned);
+	displacement =
+	    EmitAddU32(state, displacement, ConstantU32(state, inst.memory.offset & ~uint32_t {3}));
+
+	const auto low        = EmitAddU32(state, low0, displacement);
+	const auto carry_bool = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThan, state.bool_type, carry_bool, low, low0});
+	const auto high = EmitAddU32(
+	    state, high0,
+	    EmitSelectU32Value(state, carry_bool, ConstantU32(state, 1), ConstantU32(state, 0)));
+
+	return EmitWindowRelativeOffset(state, low, high,
+	                                state.program.info.addresses[inst.memory.resource]);
 }
 
 uint32_t EmitMemoryByteAddress(EmitterState& state, const IR::Instruction& inst,
@@ -1171,7 +1215,10 @@ void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst) {
 	}
 	const auto binding = ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory,
 	                                           inst.memory.resource);
-	const auto address = EmitRelativeAddress(state, inst, 0, 1, false, true);
+	const auto dynamic_base = inst.memory.resource < state.program.info.addresses.size() &&
+	                          state.program.info.addresses[inst.memory.resource].dynamic_base;
+	const auto address = dynamic_base ? EmitScalarDynamicAddress(state, inst)
+	                                  : EmitRelativeAddress(state, inst, 0, 1, false, true);
 	const auto index   = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpShiftRightLogical, state.uint_type, index, address, ConstantU32(state, 2)});

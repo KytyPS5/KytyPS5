@@ -26,6 +26,17 @@ bool LowerScalarBufferLoadDword(const Decoder::Instruction& decoded, BasicBlock&
 		    !LowerSourceOperand(decoded.src1, inst.src[0], error)) {
 			return false;
 		}
+		if (op == Opcode::SLoadDword) {
+			// Keep the pointer's SGPR pair reachable from the IR. Resource tracking usually folds
+			// the base into a host binding and the emitter ignores these, but when the base only
+			// exists at run time they are the only way to recover the address. s_buffer_load is
+			// excluded: its src0 is a 4-SGPR descriptor, not a pointer.
+			if (!LowerSourceOperand(decoded.src0, inst.src[1], error) ||
+			    !LowerSourceOperand(OffsetDecodedRegister(decoded.src0, 1), inst.src[2], error)) {
+				return false;
+			}
+			inst.src_count = 3;
+		}
 		block.instructions.push_back(inst);
 	}
 	return true;

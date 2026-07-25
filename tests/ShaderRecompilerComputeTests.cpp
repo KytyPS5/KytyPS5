@@ -6782,6 +6782,38 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
           {O::SMovB32, O::SLoadDword, O::BufferStoreDword, O::SEndpgm}};
 }
 
+// s_load through a pointer the host cannot fold. v_readlane_b32 pulls a lane value into a scalar,
+// which is exactly how a waterfall loop builds a bindless index, and provenance can only report it
+// as unknown. The lane holds zero, so the pointer still lands on the same buffer the resolved form
+// would have used -- if the shader recomputes the address correctly it reads the same dwords.
+TestCase ScalarLoadRuntimeBaseFromReadlane() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(0, InlineU32(0)));  // soffset register
+  code.push_back(EncodeSMovB32(5, InlineU32(0)));
+  AppendVMovU32(&code, 0, 0);
+  // s4 = v0[lane 0] == 0, opaque to the host.
+  AppendVop3(&code, 0x360, 4, Vgpr(0), InlineU32(0));
+  code.push_back(EncodeSop2(0x00, 2, 4, InlineU32(0)));  // s_add_u32  s2, s4, 0
+  code.push_back(EncodeSop2(0x04, 3, 5, InlineU32(0)));  // s_addc_u32 s3, s5, 0
+  code.push_back(EncodeSmem0(0x02, 20, 1));              // s_load_dwordx4 s20, s[2:3]
+  code.push_back(EncodeSmem1(0, 0));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreSgpr(&code, 20 + i, i);
+  }
+  AppendEnd(&code);
+
+  const std::vector<u32> initial = {0x11111111u, 0x22222222u, 0x33333333u,
+                                    0x44444444u};
+  return {"ScalarLoadRuntimeBaseFromReadlane",
+          code,
+          initial,
+          initial,
+          {O::SMovB32, O::VMovB32, O::VReadlaneB32, O::SAddU32, O::SAddcU32,
+           O::SLoadDwordx4, O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase BufferLoadStore() {
   using O = ShaderOpcode;
 
@@ -9512,6 +9544,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BranchVccnzUsesWholeMask);
   AddCase(BranchVccnzUsesCarryProducedWholeMask);
   AddCase(ScalarMemoryLoadVariants);
+  AddCase(ScalarLoadRuntimeBaseFromReadlane);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(BufferLoadStore);

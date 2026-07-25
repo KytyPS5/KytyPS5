@@ -653,6 +653,10 @@ struct AddressResource {
 	bool         read             = false;
 	bool         written          = false;
 	bool         atomic           = false;
+	// The guest pointer is computed by the shader at run time (a waterfall loop feeding a scalar
+	// load, for example), so it cannot be resolved on the host. The shader recomputes the address
+	// itself and indexes relative to specialized_base.
+	bool dynamic_base = false;
 
 	bool operator==(const AddressResource& other) const = default;
 };

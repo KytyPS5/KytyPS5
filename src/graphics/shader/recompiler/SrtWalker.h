@@ -23,6 +23,23 @@ struct DescriptorSourceRequest {
 	uint32_t use_pc = 0;
 };
 
+// The part of a run-time computed guest pointer the host can still pin down. The shader adds the
+// remaining displacement itself, so `base` is a lower bound rather than the address of any one
+// access.
+struct AddressBase {
+	uint64_t base = 0;
+	// The whole pointer resolved after all -- no run-time component was dropped.
+	bool exact = false;
+	// A phi merged arms that live at different guest addresses, so the bound window has to be
+	// widened past `base` to cover all of them.
+	bool spans_multiple_bases = false;
+};
+
+// Evaluates a 2-dword address source that ContainsUnknown() rejects, keeping whatever base
+// survives instead of failing. Fails only when nothing about the pointer can be recovered.
+bool EvaluateAddressBase(const Program& program, uint32_t source, uint32_t use_pc,
+                         const SrtRuntime& runtime, AddressBase& result, std::string* error);
+
 bool FoldScalarConstant(const ScalarProvenance& provenance, uint32_t value, uint32_t& result);
 
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;

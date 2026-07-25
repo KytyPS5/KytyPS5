@@ -2956,9 +2956,15 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 		target.bytes_per_element = info.bytes_per_element;
 		target.tile_mode         = info.tile_mode;
 	}
-	const bool    linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const bool    tiled  = IsTiledRenderTarget(target);
-	const bool    bgra16 = video_out && cached.video_out.bgra16;
+	const bool linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+	// IsTiledRenderTarget only recognizes render-target tiling (kRenderTarget/Standard64), because
+	// the exact/single_slice/exact_tiled math below is the render-target tile-size algorithm. A
+	// storage image can be tiled in ways that never appear on a render target (e.g. kDepth, for a
+	// compute shader bound to depth-shaped data) -- its actual layout is computed independently
+	// via TextureCalcUploadLayout below using cached.info.tile directly, so for storage "tiled"
+	// just needs to mean "not linear" to route into that path rather than the untiled one.
+	const bool tiled  = storage ? !linear : IsTiledRenderTarget(target);
+	const bool bgra16 = video_out && cached.video_out.bgra16;
 	TileSizeAlign exact {};
 	bool          single_slice = false;
 	if (IsSupportedStandard64RenderTarget(target)) {
@@ -2975,13 +2981,17 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 		                                            target.bytes_per_element, target.levels, exact,
 		                                            nullptr, nullptr);
 	}
+	// This exact/single_slice size math is the render-target tiling algorithm and does not apply
+	// to storage's own (already tile-mode-generic) layout path, so exact_tiled is meaningless for
+	// storage; it is not evaluated in the validation below in that case.
 	const bool exact_tiled = tiled && exact.align == 65536 &&
 	                         (storage ? single_slice && exact.size == target.size : layered_size);
 	const bool valid_kind =
 	    render_target || storage ||
 	    (video_out && cached.video_out.compression == VideoOutCompression::Uncompressed);
 	if (!valid_kind || !cached.gpu_modified || cached.buffer_modified ||
-	    (!storage && target.levels != 1) || target.size > UINT32_MAX || (!linear && !exact_tiled) ||
+	    (!storage && target.levels != 1) || target.size > UINT32_MAX ||
+	    (!storage && !linear && !exact_tiled) ||
 	    HasMetaOverlapLocked(target.address, target.size)) {
 		EXIT("TextureCache: unsupported color-image buffer synchronization, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64

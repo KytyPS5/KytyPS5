@@ -1303,7 +1303,8 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 		    m_memory_tracker.IsRegionGpuModified(cached->Address(), cached->Size());
 		switch (ClassifyStorageImageOverlap(
 		    requested.address, requested.size, cached->Address(), cached->Size(),
-		    cached->kind == CachedImage::Kind::Texture, cached->gpu_modified,
+		    cached->kind == CachedImage::Kind::Texture,
+		    cached->kind == CachedImage::Kind::RenderTarget, cached->gpu_modified,
 		    cached->buffer_modified, tracker_gpu)) {
 			case StorageImageOverlap::None: continue;
 			case StorageImageOverlap::RetireSampled: retire.push_back(cached); continue;

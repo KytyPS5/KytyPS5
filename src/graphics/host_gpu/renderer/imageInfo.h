@@ -1014,12 +1014,21 @@ ClassifySampledRenderTargetOverlap(const ImageInfo& sampled, const RenderTargetI
 [[nodiscard]] inline StorageImageOverlap
 ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
                             uint64_t cached_address, uint64_t cached_size, bool sampled,
-                            bool gpu_modified, bool buffer_modified, bool tracker_gpu_modified) {
+                            bool render_target, bool gpu_modified, bool buffer_modified,
+                            bool tracker_gpu_modified) {
 	if (!ImagePageRangesOverlap(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::None;
 	}
 	if (!ImageRangeOverlaps(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::PageNeighbor;
+	}
+	// A render target overlapping a fresh storage-image request (e.g. a post-process compute pass
+	// writing back into a just-rendered color buffer) is always discarded outright and replaced,
+	// same as the render-target retirement paths above -- so a pending GPU write is not a reason
+	// to refuse it, only a reason the caller must download it to guest memory first (which
+	// ResolveStorageImageOverlaps's retire loop already does for any gpu_modified entry).
+	if (render_target) {
+		return StorageImageOverlap::RetireSampled;
 	}
 	return sampled && !gpu_modified && !buffer_modified && !tracker_gpu_modified
 	           ? StorageImageOverlap::RetireSampled

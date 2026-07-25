@@ -266,6 +266,11 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+if (KYTY_CLANG_CL)
+	target_compile_options(scalar_provenance_tests PRIVATE /EHsc)
+elseif (CLANG OR GCC)
+	target_compile_options(scalar_provenance_tests PRIVATE -fexceptions)
+endif()
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp

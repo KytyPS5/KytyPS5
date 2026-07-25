@@ -359,7 +359,13 @@ enum class RenderTargetOverlap : uint8_t {
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
 enum class StorageSampledOverlap : uint8_t { None, ExactImage, RetireStorage, Unsupported };
 enum class StorageSampledViewShape : uint8_t { Image2D, Image2DArray, Image3D, Unsupported };
-enum class StorageImageOverlap : uint8_t { None, RetireSampled, PageNeighbor, Unsupported };
+enum class StorageImageOverlap : uint8_t {
+	None,
+	RetireSampled,
+	RetireStorage,
+	PageNeighbor,
+	Unsupported
+};
 enum class HostWriteOverlap : uint8_t { None, InvalidateImage, Unsupported };
 enum class BufferImageBinding : uint8_t {
 	Texture,
@@ -716,8 +722,7 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	const bool same_backing =
 	    requested.address == cached.address && requested.size == cached.size &&
 	    requested.width == cached.width && requested.height == cached.height &&
-	    requested.pitch == cached.pitch && requested.base_level == cached.base_level &&
-	    requested.levels == cached.levels && requested.view_levels == cached.view_levels &&
+	    requested.pitch == cached.pitch && requested.levels == cached.levels &&
 	    requested.tile == cached.tile && requested.depth == cached.depth &&
 	    requested.type == cached.type && requested.base_array == cached.base_array;
 	const bool compatible_format =
@@ -1022,8 +1027,8 @@ ClassifySampledRenderTargetOverlap(const ImageInfo& sampled, const RenderTargetI
 [[nodiscard]] inline StorageImageOverlap
 ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
                             uint64_t cached_address, uint64_t cached_size, bool sampled,
-                            bool render_target, bool gpu_modified, bool buffer_modified,
-                            bool tracker_gpu_modified) {
+                            bool storage, bool render_target, bool gpu_modified,
+                            bool buffer_modified, bool tracker_gpu_modified) {
 	if (!ImagePageRangesOverlap(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::None;
 	}
@@ -1037,6 +1042,14 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 	// ResolveStorageImageOverlaps's retire loop already does for any gpu_modified entry).
 	if (render_target) {
 		return StorageImageOverlap::RetireSampled;
+	}
+	// A differently shaped storage view may partially overlap the previous one. When ownership is
+	// coherent, retire the old view after downloading its complete contents; the replacement then
+	// uploads from guest backing and preserves the intersection.
+	if (storage) {
+		return gpu_modified == tracker_gpu_modified && !buffer_modified
+		           ? StorageImageOverlap::RetireStorage
+		           : StorageImageOverlap::Unsupported;
 	}
 	return sampled && !gpu_modified && !buffer_modified && !tracker_gpu_modified
 	           ? StorageImageOverlap::RetireSampled

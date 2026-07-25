@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -514,6 +516,91 @@ private:
 	AVIOContext*            ctx    = nullptr;
 };
 
+// Guest threads may use caller-provided stacks as small as 32 KiB. Some host decoders have
+// larger individual stack frames (the FFmpeg H.264 slice parser currently needs about 35 KiB),
+// so running them directly on a guest stack can overflow it before decoding even starts.
+// Real AvPlayer decoding is asynchronous as well; keep the host codec work on a native stack
+// while preserving the synchronous behaviour expected by the emulated API implementation.
+class CodecWorker {
+public:
+	CodecWorker(): thread(&CodecWorker::Run, this) {}
+	~CodecWorker() {
+		{
+			std::lock_guard lock(mutex);
+			stopping = true;
+		}
+		condition.notify_one();
+		thread.join();
+	}
+
+	int Decode(AVCodecContext* context, const AVPacket* packet, AVFrame* frame) {
+		std::unique_lock lock(mutex);
+		condition.wait(lock, [this] { return !pending; });
+
+		codec_context = context;
+		codec_packet  = packet;
+		codec_frame   = frame;
+		complete      = false;
+		pending       = true;
+		condition.notify_one();
+
+		condition.wait(lock, [this] { return complete; });
+		return result;
+	}
+
+	CodecWorker(const CodecWorker&)            = delete;
+	CodecWorker& operator=(const CodecWorker&) = delete;
+
+private:
+	void Run() {
+		std::unique_lock lock(mutex);
+		for (;;) {
+			condition.wait(lock, [this] { return pending || stopping; });
+			if (stopping) {
+				return;
+			}
+
+			auto* context = codec_context;
+			auto* packet  = codec_packet;
+			auto* frame   = codec_frame;
+			lock.unlock();
+
+			int rc = avcodec_send_packet(context, packet);
+			if (rc == AVERROR(EAGAIN)) {
+				// FFmpeg requires callers to drain an already available frame before retrying
+				// the same packet. Dropping the packet here eventually leaves frame-threaded
+				// decoders permanently returning EAGAIN after their first output frame.
+				rc = avcodec_receive_frame(context, frame);
+				if (rc >= 0) {
+					const int retry = avcodec_send_packet(context, packet);
+					if (retry < 0) {
+						rc = retry;
+					}
+				}
+			} else if (rc >= 0) {
+				rc = avcodec_receive_frame(context, frame);
+			}
+
+			lock.lock();
+			result   = rc;
+			pending  = false;
+			complete = true;
+			condition.notify_all();
+		}
+	}
+
+	std::mutex              mutex;
+	std::condition_variable condition;
+	std::thread             thread;
+	AVCodecContext*         codec_context = nullptr;
+	const AVPacket*         codec_packet  = nullptr;
+	AVFrame*                codec_frame   = nullptr;
+	int                     result        = AVERROR_UNKNOWN;
+	bool                    pending       = false;
+	bool                    complete      = false;
+	bool                    stopping      = false;
+};
+
 class Source {
 public:
 	Source(AvPlayerMemAllocator m, AvPlayerFileReplacement f, int32_t video_buffers, bool vdec2)
@@ -845,8 +932,16 @@ private:
 		if (c == nullptr) {
 			return false;
 		}
-		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
-		    avcodec_open2(c, dec, nullptr) < 0) {
+		if (avcodec_parameters_to_context(c, s->codecpar) < 0) {
+			avcodec_free_context(&c);
+			return false;
+		}
+		if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			const auto host_threads = std::max(1u, std::thread::hardware_concurrency());
+			c->thread_count = static_cast<int>(std::min(host_threads, 32u));
+			c->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+		}
+		if (avcodec_open2(c, dec, nullptr) < 0) {
 			avcodec_free_context(&c);
 			return false;
 		}
@@ -919,11 +1014,14 @@ private:
 		return false;
 	}
 	bool DecodeVideo(AVPacket* p) {
-		if (video_ctx == nullptr || avcodec_send_packet(video_ctx, p) < 0) {
+		if (video_ctx == nullptr) {
 			return false;
 		}
-		AVFrame* f  = av_frame_alloc();
-		auto     rc = avcodec_receive_frame(video_ctx, f);
+		AVFrame* f = av_frame_alloc();
+		if (f == nullptr) {
+			return false;
+		}
+		auto rc = codec_worker.Decode(video_ctx, p, f);
 		if (rc < 0) {
 			av_frame_free(&f);
 			return false;
@@ -933,11 +1031,14 @@ private:
 		return true;
 	}
 	bool DecodeAudio(AVPacket* p) {
-		if (audio_ctx == nullptr || avcodec_send_packet(audio_ctx, p) < 0) {
+		if (audio_ctx == nullptr) {
 			return false;
 		}
-		AVFrame* f  = av_frame_alloc();
-		auto     rc = avcodec_receive_frame(audio_ctx, f);
+		AVFrame* f = av_frame_alloc();
+		if (f == nullptr) {
+			return false;
+		}
+		auto rc = codec_worker.Decode(audio_ctx, p, f);
 		if (rc < 0) {
 			av_frame_free(&f);
 			return false;
@@ -1097,6 +1198,23 @@ private:
 		current_video_info.details.video.crop_bottom_offset =
 		    static_cast<uint32_t>(src->crop_bottom + (h - src->height));
 		current_video_info.details.video.pitch = pitch;
+		if (decoded_video_frames < 3) {
+			uint8_t luma_min = 255;
+			uint8_t luma_max = 0;
+			for (int y = 0; y < src->height; y += 8) {
+				for (int x = 0; x < src->width; x += 8) {
+					const auto value = dst[static_cast<size_t>(y) * pitch + x];
+					luma_min         = std::min(luma_min, value);
+					luma_max         = std::max(luma_max, value);
+				}
+			}
+			::printf("AvPlayer video frame %" PRIu64
+			         ": %dx%d format=%d timestamp=%" PRIu64 " luma=%u..%u\n",
+			         decoded_video_frames + 1, src->width, src->height, src->format,
+			         current_video_info.time_stamp, static_cast<unsigned>(luma_min),
+			         static_cast<unsigned>(luma_max));
+		}
+		decoded_video_frames++;
 		if (tmp) {
 			av_frame_free(&tmp);
 		}
@@ -1172,6 +1290,7 @@ private:
 	}
 	AvPlayerMemAllocator                     mem;
 	AvPlayerFileReplacement                  file;
+	CodecWorker                              codec_worker;
 	int                                      max_video_buffers = 2;
 	bool                                     use_vdec2         = false;
 	AvPlayerSourceType                       source_type       = AvPlayerSourceUnknown;
@@ -1205,6 +1324,7 @@ private:
 	uint32_t                                 sync_mode                = 0;
 	uint64_t                                 start_time_ms            = 0;
 	uint64_t                                 last_audio_ts            = 0;
+	uint64_t                                 decoded_video_frames     = 0;
 	std::chrono::steady_clock::time_point    clock_start {};
 	std::chrono::steady_clock::time_point    pause_time {};
 	std::chrono::steady_clock::duration      paused_extra {};

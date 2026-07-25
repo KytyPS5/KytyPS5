@@ -734,17 +734,17 @@ bool LowerVectorSubBorrowRev(const Decoder::Instruction& decoded, BasicBlock& bl
 	return true;
 }
 
-// STUB: see Decoder::Opcode::ImageBvhIntersectRay / IR::Opcode::ImageBvhIntersectRayStub. Emits an
-// instruction with no source operands (the decoded address/resource fields are intentionally
-// dropped); EmitImageBvhIntersectRayStub always writes "no intersection" to the 4 destination
-// registers instead of performing a real BVH-node ray test.
+// STUB: see Decoder::Opcode::ImageBvhIntersectRay / IR::Opcode::ImageBvhIntersectRayStub. Preserve
+// the node pointer so the emitter can distinguish the box-node child-pointer return layout from
+// the triangle-node hit-status return layout while approximating both as misses.
 bool LowerImageBvhIntersectRayStub(const Decoder::Instruction& decoded, BasicBlock& block,
                                    std::string* error) {
 	Instruction inst;
 	inst.pc        = decoded.pc;
 	inst.op        = Opcode::ImageBvhIntersectRayStub;
-	inst.src_count = 0;
-	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
+	inst.src_count = 1;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
 		return false;
 	}
 	block.instructions.push_back(inst);

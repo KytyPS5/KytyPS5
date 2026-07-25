@@ -1039,6 +1039,61 @@ void TestBitFieldMaskDescriptor() {
 	      "maximum bit-field mask count/offset evaluated incorrectly");
 }
 
+void TestLogicalU64ShiftDescriptor() {
+	const auto run = [](Opcode op, uint32_t shift_count) {
+		Program program;
+		program.blocks.resize(1);
+
+		Instruction shift;
+		shift.pc        = 4;
+		shift.op        = op;
+		shift.dst       = Sgpr(16);
+		shift.src[0]    = Sgpr(16);
+		shift.src[1]    = Sgpr(2);
+		shift.src_count = 2;
+		program.blocks[0].instructions = {
+		    Move64(0, 16, 0), shift, MoveImmediate(8, 18, 0), MoveImmediate(12, 19, 0),
+		    BufferUse(16, 16)};
+
+		std::string error;
+		Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error),
+		      error.c_str());
+
+		const auto source = program.blocks[0].instructions.back().memory.resource_source;
+		const auto* descriptor_source = GetDescriptorSource(program, source);
+		Check(descriptor_source != nullptr, "64-bit shift descriptor source was not attached");
+		const auto expected_low_op = op == Opcode::ShiftLeftLogicalU64
+		                                 ? ScalarValueOp::ShiftLeftU64Low
+		                                 : ScalarValueOp::ShiftRightU64Low;
+		const auto expected_high_op = op == Opcode::ShiftLeftLogicalU64
+		                                  ? ScalarValueOp::ShiftLeftU64High
+		                                  : ScalarValueOp::ShiftRightU64High;
+		Check(Value(program, descriptor_source->dwords[0]).op == expected_low_op &&
+		          Value(program, descriptor_source->dwords[1]).op == expected_high_op,
+		      "64-bit shift did not preserve both destination dwords");
+
+		constexpr uint64_t input = 0x89abcdef01234567ull;
+		const std::array<uint32_t, 3> user_data = {
+		    static_cast<uint32_t>(input), static_cast<uint32_t>(input >> 32u), shift_count};
+		DescriptorValue  descriptor;
+		const SrtRuntime runtime {user_data, 0, nullptr, nullptr};
+		Check(EvaluateDescriptorSource(program, source, 16, runtime, descriptor, &error),
+		      error.c_str());
+
+		const auto shift_amount = shift_count & 63u;
+		const auto expected = op == Opcode::ShiftLeftLogicalU64 ? input << shift_amount
+		                                                        : input >> shift_amount;
+		Check(descriptor.dwords[0] == static_cast<uint32_t>(expected) &&
+		          descriptor.dwords[1] == static_cast<uint32_t>(expected >> 32u),
+		      "64-bit logical shift descriptor evaluated incorrectly");
+	};
+
+	for (const auto shift_count: {0u, 1u, 31u, 32u, 63u, 64u}) {
+		run(Opcode::ShiftLeftLogicalU64, shift_count);
+		run(Opcode::ShiftRightLogicalU64, shift_count);
+	}
+}
+
 } // namespace
 
 int main() {
@@ -1072,6 +1127,7 @@ int main() {
 		TestSubBorrowPointerChain();
 		TestCommonScalarPointerOps();
 		TestBitFieldMaskDescriptor();
+		TestLogicalU64ShiftDescriptor();
 		std::cout << "ScalarProvenanceTests: all cases passed\n";
 		return 0;
 	} catch (const std::exception& e) {

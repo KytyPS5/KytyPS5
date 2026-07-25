@@ -258,6 +258,11 @@ struct PageManager::Impl {
 		std::lock_guard lock(ShadowMutex());
 		ShadowProtections()[page] = protection;
 	}
+	static void EraseShadowProtection(uint64_t vaddr) noexcept {
+		const auto      page = vaddr & ~static_cast<uint64_t>(PAGE_SIZE - 1);
+		std::lock_guard lock(ShadowMutex());
+		ShadowProtections().erase(page);
+	}
 
 	// Reads the current PROT_* state of the single page at 'vaddr' out of /proc/self/maps.
 	// Returns false only if 'vaddr' isn't covered by any mapping at all, which never happens for
@@ -600,6 +605,14 @@ void PageManager::OnGpuMap(uint64_t vaddr, uint64_t size, GpuAccess access) {
 		    (gpu_write && page.gpu_write_mappings == std::numeric_limits<uint32_t>::max())) {
 			Fatal("invalid map state at 0x%016" PRIx64, addr);
 		}
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		// A first GPU mapping is only accepted for ordinary writable guest memory. Seed the
+		// protection shadow here so the first texture/buffer watcher does not have to parse
+		// /proc/self/maps independently for every 4 KiB page in a multi-megabyte resource.
+		if (page.mappings == 0) {
+			Impl::StoreShadowProtection(addr, PAGE_READWRITE);
+		}
+#endif
 		page.mappings++;
 		page.gpu_read_mappings += gpu_read ? 1u : 0u;
 		page.gpu_write_mappings += gpu_write ? 1u : 0u;
@@ -637,6 +650,11 @@ void PageManager::OnGpuUnmap(uint64_t vaddr, uint64_t size, GpuAccess access) {
 			}
 			page.late_read_pending  = false;
 			page.late_write_pending = false;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+			// The address can later be remapped with fresh host permissions. Do not retain stale
+			// per-page shadow entries (or let the sparse table grow for dead GPU mappings).
+			Impl::EraseShadowProtection(page_vaddr);
+#endif
 		}
 	}
 }

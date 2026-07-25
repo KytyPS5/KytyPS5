@@ -887,9 +887,10 @@ void GameMainLoop(WindowGame& game) {
 				timer.Pause();
 			}
 
-			GameWaitEvent(game);
-
-			GameProcessEvent(game, timer.GetTimeS());
+			// Guest threads keep running while the window update loop is paused. Continue servicing
+			// vblank and the video-out queue so a command-processor WAIT_FLIP_DONE cannot block the
+			// GPU indefinitely and, in turn, deadlock guest-memory fault handling in WaitForIdle().
+			GameShowWindow(game, timer);
 			need_exit = game.m_game_need_exit;
 			continue;
 		}

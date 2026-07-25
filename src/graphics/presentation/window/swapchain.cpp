@@ -182,6 +182,106 @@ static void ConfigurePreparedFrame(PreparedFrame& frame, vk::Extent2D extent, vk
 	}
 }
 
+static uint32_t GetPresentationTexelSize(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA2B10G10R10UnormPack32: return 4;
+		case vk::Format::eR16G16B16A16Sfloat: return 8;
+		default: return 0;
+	}
+}
+
+static void DiagnosePreparedFrame(PreparedFrame& frame) {
+	static uint32_t presented_frames = 0;
+	presented_frames++;
+	if (presented_frames > 3 && presented_frames != 30 && presented_frames != 60 &&
+	    presented_frames != 120 && presented_frames != 130 && presented_frames != 140 &&
+	    presented_frames != 150 && presented_frames != 180 && presented_frames != 240) {
+		return;
+	}
+
+	const auto texel_size = GetPresentationTexelSize(frame.image.format);
+	if (texel_size == 0) {
+		std::printf("Presentation source frame %u: %ux%u unsupported format=%d\n",
+		            presented_frames, frame.image.extent.width, frame.image.extent.height,
+		            static_cast<int>(frame.image.format));
+		std::fflush(stdout);
+		return;
+	}
+
+	const uint64_t pitch = static_cast<uint64_t>(frame.image.extent.width) * texel_size;
+	const uint64_t size  = pitch * frame.image.extent.height;
+	std::vector<uint8_t> pixels(size);
+	Transfer::DownloadImage(pixels.data(), size, static_cast<uint32_t>(pitch), frame.image,
+	                        frame.image.layout);
+
+	uint8_t  min_value     = 0xff;
+	uint8_t  max_value     = 0;
+	uint64_t nonzero_bytes = 0;
+	uint64_t hash          = 1469598103934665603ull;
+	for (const auto value: pixels) {
+		min_value = std::min(min_value, value);
+		max_value = std::max(max_value, value);
+		nonzero_bytes += value != 0 ? 1u : 0u;
+		hash ^= value;
+		hash *= 1099511628211ull;
+	}
+
+	uint16_t rgb_min[3] = {0x3ff, 0x3ff, 0x3ff};
+	uint16_t rgb_max[3] = {};
+	uint64_t visible_pixels = 0;
+	std::vector<uint8_t> ppm_pixels;
+	if (frame.image.format == vk::Format::eA2R10G10B10UnormPack32) {
+		ppm_pixels.resize(static_cast<size_t>(frame.image.extent.width) *
+		                  frame.image.extent.height * 3);
+		for (uint64_t pixel_index = 0; pixel_index < size / 4; pixel_index++) {
+			uint32_t packed = 0;
+			std::memcpy(&packed, pixels.data() + pixel_index * 4, sizeof(packed));
+			const uint16_t blue  = packed & 0x3ffu;
+			const uint16_t green = (packed >> 10u) & 0x3ffu;
+			const uint16_t red   = (packed >> 20u) & 0x3ffu;
+			const uint16_t rgb[] = {red, green, blue};
+			for (uint32_t channel = 0; channel < 3; channel++) {
+				rgb_min[channel] = std::min(rgb_min[channel], rgb[channel]);
+				rgb_max[channel] = std::max(rgb_max[channel], rgb[channel]);
+			}
+			visible_pixels += (red | green | blue) != 0 ? 1u : 0u;
+			if (!ppm_pixels.empty()) {
+				ppm_pixels[pixel_index * 3 + 0] = static_cast<uint8_t>((red * 255u + 511u) / 1023u);
+				ppm_pixels[pixel_index * 3 + 1] =
+				    static_cast<uint8_t>((green * 255u + 511u) / 1023u);
+				ppm_pixels[pixel_index * 3 + 2] =
+				    static_cast<uint8_t>((blue * 255u + 511u) / 1023u);
+			}
+		}
+	}
+	std::printf(
+	    "Presentation source frame %u: %ux%u format=%d bytes=%u..%u nonzero=%llu/%llu "
+	    "hash=%016llx rgb=%u..%u,%u..%u,%u..%u visible=%llu\n",
+	    presented_frames, frame.image.extent.width, frame.image.extent.height,
+	    static_cast<int>(frame.image.format), static_cast<unsigned>(min_value),
+	    static_cast<unsigned>(max_value), static_cast<unsigned long long>(nonzero_bytes),
+	    static_cast<unsigned long long>(size), static_cast<unsigned long long>(hash), rgb_min[0],
+	    rgb_max[0], rgb_min[1], rgb_max[1], rgb_min[2], rgb_max[2],
+	    static_cast<unsigned long long>(visible_pixels));
+	if (!ppm_pixels.empty()) {
+		const auto dump_path =
+		    fmt::format("/tmp/kyty-presentation-source-{}.ppm", presented_frames);
+		if (auto* dump = std::fopen(dump_path.c_str(), "wb"); dump != nullptr) {
+			std::fprintf(dump, "P6\n%u %u\n255\n", frame.image.extent.width,
+			             frame.image.extent.height);
+			std::fwrite(ppm_pixels.data(), 1, ppm_pixels.size(), dump);
+			std::fclose(dump);
+			std::printf("Presentation source dump: %s\n", dump_path.c_str());
+		}
+	}
+	std::fflush(stdout);
+}
+
 VulkanSwapchain::~VulkanSwapchain() = default;
 
 [[maybe_unused]] static vk::SwapchainKHR VulkanCreateSwapchainInternal(
@@ -420,6 +520,8 @@ void WindowPresentFrame(PreparedFrame& frame) {
 		~ReleaseScope() { GetPreparedFramePool()->Release(frame); }
 	};
 	ReleaseScope release {&frame};
+
+	DiagnosePreparedFrame(frame);
 
 	if (g_window_ctx->window_hidden) {
 		WindowUpdateIcon();

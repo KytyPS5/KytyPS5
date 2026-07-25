@@ -287,14 +287,14 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	constexpr uint32_t field3_common        = 0x01800000u;
-	constexpr uint32_t field5_expected      = 0x00700000u;
+	constexpr uint32_t field5_perf_mod_mask = 0x00700000u;
 	const uint32_t     field3_expected =
 	    (descriptor.Type() << 28u) | field3_common | descriptor.DstSelXYZW();
 	const uint32_t field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	       descriptor.fields[3] == field3_expected && descriptor.fields[4] == field4_expected &&
-	       descriptor.fields[5] == field5_expected && descriptor.fields[6] == 0 &&
+	       (descriptor.fields[5] & ~field5_perf_mod_mask) == 0 && descriptor.fields[6] == 0 &&
 	       descriptor.fields[7] == 0;
 }
 
@@ -368,11 +368,14 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
 	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
 	const bool supported_mip_view = descriptor.BaseLevel() == 0 || is_2d;
+	// MaxMip is not a hard upper bound for the explicitly selected view: tail-only storage
+	// descriptors can select BaseLevel == LastLevel == MaxMip + 1. NativeTexture sizes the
+	// backing from max(LastLevel, MaxMip), so requiring LastLevel <= MaxMip here would reject a
+	// view the decoded allocation can represent.
 	return (is_2d || is_2d_array || is_3d) && supported_tile && supported_mip_view &&
 	       descriptor.BaseLevel() == descriptor.LastLevel() &&
-	       descriptor.LastLevel() <= descriptor.MaxMip() && descriptor.MinLod() == 0 &&
-	       descriptor.BaseArray5() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
-	       !descriptor.MsaaDepth();
+	       descriptor.MinLod() == 0 && descriptor.BaseArray5() == 0 && supported_swizzle &&
+	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
 static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descriptor) {
@@ -511,7 +514,13 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 	const auto height     = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto base_level = descriptor.BaseLevel();
 	const auto last_level = descriptor.LastLevel();
-	const auto levels     = static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
+	// LastLevel selects the end of this view, while MaxMip is an allocation/filtering hint and
+	// can lag behind it on a tail-only descriptor. The backing must cover whichever field names
+	// the highest mip. renderCompute's descriptor diagnostics use the same rule.
+	const auto levels =
+	    std::max(static_cast<uint32_t>(last_level),
+	             static_cast<uint32_t>(descriptor.MaxMip())) +
+	    1u;
 	if (base_level > last_level || last_level >= levels) {
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u\n", base_level, last_level,
 		     levels);

@@ -96,18 +96,27 @@ uint32_t EmitImageGetResinfoComponent(EmitterState& state, uint32_t image, uint3
 }
 
 // STUB: see Decoder::Opcode::ImageBvhIntersectRay / IR::Opcode::ImageBvhIntersectRayStub for what a
-// real implementation needs. No BVH acceleration-structure traversal is performed here -- this
-// just reports "no intersection" unconditionally, so ray-traced effects using this instruction
-// (e.g. ray-traced shadows) will always see a miss. To implement the real thing: read the RSRC
-// (bound via inst.memory, currently unused) as the BVH root/node descriptor, walk it using the 11
-// address dwords in inst.src (currently not even decoded -- see LowerImageBvhIntersectRayStub) and
-// write either 4 sorted child-box pointers or {hit_time, triangle_id, ...} to inst.dst..dst+3
-// depending on the fetched node's type, per RDNA2 ISA reference section 12.16.
+// real implementation needs. No BVH acceleration-structure traversal is performed here. AMD BVH
+// node pointers encode the node type in their low three bits: types 0..3 are triangle nodes and
+// types 4..7 are non-triangle nodes. A box miss returns invalid child pointers in all four dwords,
+// while triangle return mode 0 uses dword 3 as a boolean hit_status. The old all-0xffffffff stub
+// therefore reported every triangle as a hit and turned shadow passes into full occlusion.
 void EmitImageBvhIntersectRayStub(EmitterState& state, const IR::Instruction& inst) {
-	const auto miss = ConstantU32(state, 0xffffffffu);
-	for (uint32_t i = 0; i < 4u; i++) {
-		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), miss);
+	const auto invalid_pointer = ConstantU32(state, 0xffffffffu);
+	for (uint32_t i = 0; i < 3u; i++) {
+		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), invalid_pointer);
 	}
+	const auto node_pointer = EmitValueLoad(state, inst.src[0]);
+	const auto node_type    = state.builder.AllocateId();
+	const auto is_box       = state.builder.AllocateId();
+	const auto fourth       = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, state.uint_type, node_type, node_pointer, ConstantU32(state, 7u)});
+	state.builder.AddFunction(
+	    {OpUGreaterThanEqual, state.bool_type, is_box, node_type, ConstantU32(state, 4u)});
+	state.builder.AddFunction(
+	    {OpSelect, state.uint_type, fourth, is_box, invalid_pointer, ConstantU32(state, 0u)});
+	EmitStoreU32(state, OffsetRegisterOperand(inst.dst, 3), fourth);
 }
 
 void EmitImageGetResinfo(EmitterState& state, const IR::Instruction& inst) {

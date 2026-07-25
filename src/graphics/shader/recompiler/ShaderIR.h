@@ -346,10 +346,10 @@ enum class Opcode {
 	DsReadAddtidB32,
 	ImageGetResinfo,
 	ImageGetLod,
-	// STUB: see Decoder::Opcode::ImageBvhIntersectRay. Always writes "no intersection" (all 4
-	// destination dwords 0xFFFFFFFF) to inst.dst..inst.dst+3 instead of doing a real BVH traversal.
-	// Takes no source operands -- the address/resource inputs are decoded (image_address_components,
-	// inst.src0/src1/src2 if wired up) but intentionally unused by the stub lowering/emission.
+	// STUB: see Decoder::Opcode::ImageBvhIntersectRay. Reports no intersections instead of doing a
+	// real BVH traversal. src[0] is the node pointer; its low three type bits distinguish triangle
+	// results (whose fourth dword is a boolean hit_status and must be zero on a miss) from box
+	// results (which require four invalid child pointers).
 	ImageBvhIntersectRayStub,
 	ImageLoad,
 	ImageStore,

@@ -123,6 +123,8 @@ private:
 	void              WaitLocked();
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	void              PauseProcessing();
+	void              ResumeProcessing();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
@@ -135,6 +137,7 @@ private:
 	uint32_t                                       m_next_queue       = 0;
 	uint32_t                                       m_submission_count = 0;
 	bool                                           m_processing       = false;
+	bool                                           m_paused           = false;
 	bool                                           m_graphics_done    = true;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
@@ -451,6 +454,20 @@ void Gpu::WaitForIdle() {
 	}
 }
 
+void Gpu::PauseProcessing() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_paused = true;
+	while (m_processing) {
+		m_idle.Wait(&m_queue_mutex);
+	}
+}
+
+void Gpu::ResumeProcessing() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_paused = false;
+	m_work_available.Signal();
+}
+
 void Gpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<Gpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -462,7 +479,7 @@ void Gpu::ThreadRun(void* data) {
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			int               selected_queue = -1;
 			while (selected_queue < 0) {
-				while (gpu->m_submission_count == 0) {
+				while (gpu->m_paused || gpu->m_submission_count == 0) {
 					gpu->m_processing = false;
 					gpu->m_idle.Signal();
 					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
@@ -507,9 +524,7 @@ void Gpu::ThreadRun(void* data) {
 			}
 		}
 		gpu->m_processing = false;
-		if (gpu->m_submission_count == 0) {
-			gpu->m_idle.Signal();
-		}
+		gpu->m_idle.Signal();
 	}
 }
 
@@ -601,7 +616,13 @@ void Gpu::PauseSubmissions() {
 	}
 	g_gpu_mutex_owned = true;
 	m_submission_mutex.Lock();
-	WaitLocked();
+	PauseProcessing();
+	m_gfx_cp->BufferWait();
+	for (auto& processor: m_compute_cp) {
+		if (processor != nullptr) {
+			processor->BufferWait();
+		}
+	}
 	LabelDrain();
 }
 
@@ -609,6 +630,7 @@ void Gpu::ResumeSubmissions() {
 	if (!g_gpu_mutex_owned) {
 		EXIT("GPU submissions resumed without an active pause\n");
 	}
+	ResumeProcessing();
 	m_submission_mutex.Unlock();
 	g_gpu_mutex_owned = false;
 }

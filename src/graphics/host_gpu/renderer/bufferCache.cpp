@@ -873,17 +873,25 @@ VulkanBuffer& BufferCache::ObtainNullBuffer(CommandBuffer& command) {
 
 BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr || (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 ||
-	    (size & (TRACKER_PAGE_SIZE - 1)) != 0) {
-		EXIT("BufferCache: invalid image source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " page_aligned=%d\n",
-		     vaddr, size,
-		     (vaddr & (TRACKER_PAGE_SIZE - 1)) == 0 && (size & (TRACKER_PAGE_SIZE - 1)) == 0);
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid image source, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
 	const bool         cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
 	const bool         gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
 	const auto         dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
+	const bool page_aligned = ((vaddr | size) & (TRACKER_PAGE_SIZE - 1)) == 0;
+	// GPU ownership is byte-specific (m_gpu_modified_ranges), while MemoryTracker clears whole
+	// pages. Reconciling a partial page could therefore publish bytes belonging to another image.
+	// CPU-dirty pages are different: guest backing already contains the authoritative bytes. If a
+	// containing cached buffer exists below, upload the complete dirty edge pages into that
+	// page-aligned buffer; otherwise the coherent guest backing is already a valid image source.
+	if (!page_aligned && (gpu_modified || !dirty_ranges.empty())) {
+		EXIT("BufferCache: unaligned GPU-dirty image source is unsupported, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " gpu_modified=%d dirty_ranges=%zu\n",
+		     vaddr, size, gpu_modified, dirty_ranges.size());
+	}
 	if (gpu_modified != !dirty_ranges.empty()) {
 		EXIT("BufferCache: image-source tracker and byte ownership disagree, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " tracker_dirty=%d byte_ranges=%zu\n",
@@ -966,6 +974,13 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		m_memory_tracker.ForEachUploadRange(
 		    vaddr, size, false,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    if (address < cached.vaddr || bytes > cached.size ||
+			        address - cached.vaddr > cached.size - bytes) {
+				    EXIT("BufferCache: CPU-dirty image upload lies outside containing buffer, "
+				         "upload=0x%016" PRIx64 "+0x%016" PRIx64
+				         " buffer=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+				         address, bytes, cached.vaddr, cached.size);
+			    }
 			    uploads.emplace_back(address, bytes);
 		    },
 		    [&]() noexcept {

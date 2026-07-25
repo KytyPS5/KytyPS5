@@ -10157,6 +10157,12 @@ void CheckSampledColorViews() {
               vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm,
               DstSel(4, 5, 6, 1)) == VulkanImage::VIEW_STORAGE,
           "RGBA8 RGB1 storage did not select the identity storage view");
+  Require("SampledColorViews", "storage R11G11B10 RGB1 write mapping",
+          SelectStorageColorView(
+              vk::Format::eB10G11R11UfloatPack32,
+              vk::Format::eB10G11R11UfloatPack32,
+              DstSel(4, 5, 6, 1)) == VulkanImage::VIEW_STORAGE,
+          "R11G11B10 storage did not accept its RGB1 write mapping");
   Require("SampledColorViews", "storage BGRA write mapping",
           SelectStorageColorView(
               vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm,
@@ -10198,6 +10204,11 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 1)) ==
               VulkanImage::VIEW_STORAGE,
           "R32_SFLOAT R001 storage did not select the identity storage view");
+  Require("SampledColorViews", "storage R32 float RRR1 write mapping",
+          SelectStorageColorView(vk::Format::eR32Sfloat, vk::Format::eR32Sfloat,
+                                 DstSel(4, 4, 4, 1)) ==
+              VulkanImage::VIEW_STORAGE,
+          "R32_SFLOAT RRR1 storage did not select the identity storage view");
   Require("SampledColorViews", "storage R8 unorm R001 write mapping",
           SelectStorageColorView(vk::Format::eR8Unorm, vk::Format::eR8Unorm,
                                  DstSel(4, 0, 0, 1)) ==
@@ -10409,6 +10420,11 @@ void CheckSampledDepthDescriptor() {
                                   descriptor.TileMode()) == 1408 &&
               IsSupportedDepthTargetDescriptor(descriptor, image),
           "valid padded-pitch depth texture was rejected");
+  auto default_perf_descriptor = descriptor;
+  default_perf_descriptor.fields[5] = 0;
+  Require("SampledDepthDescriptor", "default texture perf mode",
+          IsSupportedDepthTextureEncoding(default_perf_descriptor),
+          "valid sampled depth descriptor with PerfMod=0 was rejected");
 
   descriptor.fields[3] =
       (descriptor.fields[3] & ~(0xfu << 28u)) |
@@ -10804,6 +10820,16 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA01530 mip-one storage descriptor fixture is malformed");
   ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one,
                          0x20000);
+  auto tail_mip = max_mip;
+  tail_mip.fields[3] =
+      (tail_mip.fields[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
+      (6u << 12u) | (6u << 16u);
+  Require("BasicStorageTexture", "tail mip beyond max-mip hint",
+          tail_mip.BaseLevel() == 6 && tail_mip.LastLevel() == 6 &&
+              tail_mip.MaxMip() == 5,
+          "tail-mip storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), tail_mip,
+                         0x20000);
 
   const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA02527 R16F descriptor",
@@ -10931,6 +10957,16 @@ void CheckBasicStorageTextureDescriptor() {
               Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
               DstSel(4, 4, 4, 4)),
           "single-channel replicated destination selection was rejected");
+  Require("BasicStorageTexture", "R32_FLOAT replicated-one write mapping",
+          IsSupportedStorageSwizzle(
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
+              DstSel(4, 4, 4, 1)),
+          "single-channel RRR1 destination selection was rejected");
+  Require("BasicStorageTexture", "R11G11B10 RGB1 write mapping",
+          IsSupportedStorageSwizzle(
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k11_11_10Float),
+              DstSel(4, 5, 6, 1)),
+          "packed three-channel RGB1 destination selection was rejected");
 
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
@@ -11413,6 +11449,18 @@ void CheckStorageTextureSampledReuse() {
               vk::Format::eR16G16B16A16Sfloat, true,
               false) == StorageSampledOverlap::ExactImage,
           "exact GPU-owned storage image was not reusable for sampling");
+  auto full_mip_sampled = storage;
+  full_mip_sampled.levels = 8;
+  full_mip_sampled.view_levels = 8;
+  auto single_mip_storage = full_mip_sampled;
+  single_mip_storage.view_levels = 1;
+  Require("StorageTextureSampledReuse", "same backing with wider sampled mip view",
+          ClassifyStorageSampledOverlap(
+              full_mip_sampled, single_mip_storage,
+              vk::Format::eR16G16B16A16Sfloat,
+              vk::Format::eR16G16B16A16Sfloat, true,
+              false) == StorageSampledOverlap::ExactImage,
+          "GPU-owned storage backing rejected a wider sampled mip view");
   auto incompatible = storage;
   incompatible.format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16UNorm);
@@ -12623,15 +12671,31 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "storage retires clean sampled backing",
           ClassifyStorageImageOverlap(storage_subrange, storage_subrange_size,
                                       sampled_backing, sampled_backing_size,
-                                      true, false, false, false) ==
+                                      true, false, false, false, false, false) ==
               StorageImageOverlap::RetireSampled,
           "clean sampled subrange was not retired before storage creation");
   Require("ImageOverlapResolution", "storage preserves dirty sampled backing",
           ClassifyStorageImageOverlap(storage_subrange, storage_subrange_size,
                                       sampled_backing, sampled_backing_size,
-                                      true, true, false,
-                                      true) == StorageImageOverlap::Unsupported,
+                                      true, false, false, true, false, true) ==
+              StorageImageOverlap::Unsupported,
           "GPU-owned sampled subrange was admitted as storage backing");
+  constexpr uint64_t overlapping_storage = 0x70000000ull;
+  constexpr uint64_t overlapping_storage_size = 0x3c0000;
+  constexpr uint64_t replacement_storage = overlapping_storage + 0x1c0000;
+  constexpr uint64_t replacement_storage_size = 0x280000;
+  Require("ImageOverlapResolution", "storage retires coherent storage alias",
+          ClassifyStorageImageOverlap(replacement_storage, replacement_storage_size,
+                                      overlapping_storage, overlapping_storage_size,
+                                      false, true, false, true, false, true) ==
+              StorageImageOverlap::RetireStorage,
+          "GPU-owned storage alias was not preserved through retirement");
+  Require("ImageOverlapResolution", "storage rejects stale storage alias",
+          ClassifyStorageImageOverlap(replacement_storage, replacement_storage_size,
+                                      overlapping_storage, overlapping_storage_size,
+                                      false, true, false, true, true, true) ==
+              StorageImageOverlap::Unsupported,
+          "buffer-modified storage alias was admitted for retirement");
   ImageInfo page_left = sampled;
   page_left.size = TRACKER_PAGE_SIZE / 2;
   ImageInfo same_page = page_left;
@@ -13227,11 +13291,11 @@ void CheckImageOverlapResolution() {
               mip_owners.Register(2, {{mip_zero_address, mip_zero_size}}) &&
               ClassifyStorageImageOverlap(mip_one_address, mip_one_size,
                                           mip_chain_address, mip_chain_size,
-                                          true, false, false, false) ==
+                                          true, false, false, false, false, false) ==
                   StorageImageOverlap::RetireSampled &&
               ClassifyStorageImageOverlap(mip_one_address, mip_one_size,
                                           mip_zero_address, mip_zero_size, true,
-                                          false, false,
+                                          false, false, false, false,
                                           false) == StorageImageOverlap::None,
           "captured full-chain and disjoint mip owners were misclassified");
   std::vector<MipOwnerIndex::ByteRange> mip_releases;

@@ -3242,9 +3242,11 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		m_metadata_tracker.UntrackMemory(it->first, it->second.size);
 		it = m_surface_metas.erase(it);
 	}
-	auto                       match  = m_images.end();
-	BufferImageWrite           action = BufferImageWrite::None;
-	std::vector<CachedImage*> invalidation_matches;
+	struct PendingImageWrite {
+		CachedImage*     cached;
+		BufferImageWrite action;
+	};
+	std::vector<PendingImageWrite> pending;
 	const auto is_invalidation = [](BufferImageWrite value) {
 		switch (value) {
 			case BufferImageWrite::InvalidateTexture:
@@ -3263,69 +3265,81 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		const auto next = ClassifyBufferImageWrite(vaddr, size, cached.Address(), cached.Size(),
 		                                           cached.BufferBinding(), cached.gpu_modified,
 		                                           formatted_buffer_write, cached.buffer_modified);
-		const bool ambiguous = match != m_images.end() || !invalidation_matches.empty();
+		bool conflicting_alias = false;
+		for (const auto& previous: pending) {
+			bool images_overlap = false;
+			for (uint32_t current_range = 0; current_range < cached.RangeCount();
+			     current_range++) {
+				for (uint32_t previous_range = 0;
+				     previous_range < previous.cached->RangeCount(); previous_range++) {
+					images_overlap |= ImageRangeOverlaps(
+					    cached.Address(current_range), cached.Size(current_range),
+					    previous.cached->Address(previous_range),
+					    previous.cached->Size(previous_range));
+				}
+			}
+			if (images_overlap &&
+			    (!is_invalidation(next) || !is_invalidation(previous.action))) {
+				conflicting_alias = true;
+				break;
+			}
+		}
 		if (next == BufferImageWrite::None || next == BufferImageWrite::Unsupported ||
-		    (is_invalidation(next) ? match != m_images.end() : ambiguous)) {
+		    conflicting_alias) {
 			EXIT("TextureCache: unsupported GPU invalidation alias, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " cached_kind=%u cached=0x%016" PRIx64 "+0x%016" PRIx64
 			     " gpu_modified=%d buffer_modified=%d formatted=%d ambiguous=%d\n",
 			     vaddr, size, static_cast<uint32_t>(cached.kind), cached.Address(), cached.Size(),
 			     cached.gpu_modified, cached.buffer_modified, formatted_buffer_write,
-			     ambiguous);
+			     conflicting_alias);
 		}
-		if (is_invalidation(next)) {
-			invalidation_matches.push_back(&cached);
-			continue;
-		}
-		match  = it;
-		action = next;
+		pending.push_back({&cached, next});
 	}
-	if (!invalidation_matches.empty()) {
-		for (auto* cached: invalidation_matches) {
-			cached->buffer_modified = true;
-		}
-		return true;
-	}
-	if (match == m_images.end()) {
+	if (pending.empty()) {
 		return false;
 	}
-	auto& cached = **match;
-	switch (action) {
-		case BufferImageWrite::InvalidateTexture:
-		case BufferImageWrite::InvalidateVideoOut:
-		case BufferImageWrite::InvalidateStorageTexture:
-		case BufferImageWrite::InvalidateDepthTarget:
-		case BufferImageWrite::InvalidateRenderTarget: cached.buffer_modified = true; return true;
-		case BufferImageWrite::SynchronizeRenderTarget:
-		case BufferImageWrite::SynchronizeStorageTexture: {
-			// A GPU cache flush range is no longer required to sit exactly inside the image (see
-			// ClassifyBufferImageWrite's RenderTarget case) -- it can extend past either edge.
-			// Synchronize*ImageToBufferLocked only downloads the cached image's own bytes and
-			// asserts its write range is contained within it, so clamp to the intersection here.
-			const auto sync_start = std::max(vaddr, cached.Address());
-			const auto sync_end   = std::min(vaddr + size, cached.Address() + cached.Size());
-			if (sync_end > sync_start) {
-				SynchronizeColorImageToBufferLocked(cached, sync_start, sync_end - sync_start);
+	for (const auto& write: pending) {
+		auto& cached = *write.cached;
+		switch (write.action) {
+			case BufferImageWrite::InvalidateTexture:
+			case BufferImageWrite::InvalidateVideoOut:
+			case BufferImageWrite::InvalidateStorageTexture:
+			case BufferImageWrite::InvalidateDepthTarget:
+			case BufferImageWrite::InvalidateRenderTarget:
+				cached.buffer_modified = true;
+				break;
+			case BufferImageWrite::SynchronizeRenderTarget:
+			case BufferImageWrite::SynchronizeStorageTexture: {
+				// A GPU cache flush range may cover several disjoint images and extend past either
+				// edge of each one. The synchronization path reconstructs a cached image's complete
+				// backing, then publishes only this intersection into BufferCache ownership.
+				const auto sync_start = std::max(vaddr, cached.Address());
+				const auto sync_end   = std::min(vaddr + size, cached.Address() + cached.Size());
+				if (sync_end > sync_start) {
+					SynchronizeColorImageToBufferLocked(cached, sync_start,
+					                                    sync_end - sync_start);
+				}
+				break;
 			}
-			return true;
-		}
-		case BufferImageWrite::SynchronizeDepthTarget: {
-			const auto sync_start = std::max(vaddr, cached.Address());
-			const auto sync_end   = std::min(vaddr + size, cached.Address() + cached.Size());
-			if (sync_end > sync_start) {
-				SynchronizeDepthImageToBufferLocked(cached, sync_start, sync_end - sync_start);
+			case BufferImageWrite::SynchronizeDepthTarget: {
+				const auto sync_start = std::max(vaddr, cached.Address());
+				const auto sync_end   = std::min(vaddr + size, cached.Address() + cached.Size());
+				if (sync_end > sync_start) {
+					SynchronizeDepthImageToBufferLocked(cached, sync_start,
+					                                    sync_end - sync_start);
+				}
+				break;
 			}
-			return true;
+			case BufferImageWrite::SynchronizeVideoOut:
+				SynchronizeColorImageToBufferLocked(cached, vaddr, size);
+				break;
+			case BufferImageWrite::None:
+			case BufferImageWrite::Unsupported:
+				EXIT("TextureCache: invalid GPU invalidation action %u\n",
+				     static_cast<uint32_t>(write.action));
 		}
-		case BufferImageWrite::SynchronizeVideoOut:
-			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
-			return true;
-		case BufferImageWrite::None:
-		case BufferImageWrite::Unsupported:
-			EXIT("TextureCache: invalid GPU invalidation action %u\n",
-			     static_cast<uint32_t>(action));
 	}
-	return false;
+	return true;
 }
 
 DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer& command,

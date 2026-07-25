@@ -793,13 +793,8 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 		return BufferImageWrite::None;
 	}
 	const bool exact = buffer_address == image_address && buffer_size == image_size;
-	const auto offset =
-	    buffer_address >= image_address ? buffer_address - image_address : UINT64_MAX;
-	const bool contained = offset <= image_size && buffer_size <= image_size - offset;
-	const auto image_offset =
-	    image_address >= buffer_address ? image_address - buffer_address : UINT64_MAX;
-	const bool image_contained =
-	    image_offset <= buffer_size && image_size <= buffer_size - image_offset;
+	const bool byte_overlap =
+	    ImageRangeOverlaps(buffer_address, buffer_size, image_address, image_size);
 	const bool buffer_page_aligned =
 	    ((buffer_address | buffer_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	const bool image_page_aligned = ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
@@ -837,13 +832,17 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			           ? BufferImageWrite::InvalidateRenderTarget
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::StorageTexture:
-			if (!buffer_page_aligned || !image_page_aligned || !buffer_formatted) {
+			if (!buffer_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
 			}
-			if (contained && image_gpu_modified && !image_buffer_modified) {
+			// Synchronization reconstructs the complete image backing and publishes only the
+			// intersection with the impending buffer write. Therefore the formatted flush range
+			// may cross either image edge, and the image allocation itself need not end on a
+			// tracker-page boundary.
+			if (byte_overlap && image_gpu_modified && !image_buffer_modified) {
 				return BufferImageWrite::SynchronizeStorageTexture;
 			}
-			return image_contained && !image_gpu_modified && image_buffer_modified
+			return byte_overlap && !image_gpu_modified && image_buffer_modified
 			           ? BufferImageWrite::InvalidateStorageTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::DepthTarget:

@@ -1437,7 +1437,15 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.user_data_count      = regs.ps_regs.rsrc2.user_sgpr;
 	options.user_data            = regs.ps_user_sgpr.value;
 	options.descriptor_set       = input_info.descriptor_set;
-	options.push_constant_offset = 0;
+	// A graphics pipeline's VS and PS share one VkPipelineLayout/push-constant block
+	// (shaders.cpp CreateLayout, called once per stage into the same push_constant_info array).
+	// VS always compiles with offset 0; give PS the other half of the 128-byte portable minimum
+	// (Vulkan's guaranteed maxPushConstantsSize) so the two stages' ranges/vkCmdPushConstants
+	// calls never alias the same bytes with different data -- they used to, which both corrupted
+	// whichever stage got pushed first and tripped VUID-vkCmdPushConstants-offset-01796. PS
+	// shaders whose data no longer fits in 64 bytes gracefully fall back to the UserData
+	// descriptor-buffer path (BindingLayout.cpp).
+	options.push_constant_offset = 64;
 	options.pixel_input_info     = &input_info;
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;

@@ -1599,8 +1599,12 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 
 StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   command,
                                                             const ImageInfo& info) {
+	// No separate 1D dimension is tracked through the shader IR (a 1D image store decodes the same
+	// as a 2D one, see IsSupportedStorageTextureDescriptor in descriptors.cpp), so a kColor1D
+	// descriptor is a legitimate storage-image request here too, not just kColor2D.
 	const bool supported_type =
 	    info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) ||
+	    info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor1D) ||
 	    info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) ||
 	    info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
 	const bool supported_depth_tile =
@@ -1623,6 +1627,7 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 		     info.swizzle);
 	}
 	if ((info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && info.depth != 1) ||
+	    (info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor1D) && info.depth != 1) ||
 	    (info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D) && info.depth == 0) ||
 	    (info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
 	     info.base_array >= info.depth)) {

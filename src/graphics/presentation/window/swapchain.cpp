@@ -216,7 +216,7 @@ static void DiagnosePreparedFrame(PreparedFrame& frame) {
 	const uint64_t pitch = static_cast<uint64_t>(frame.image.extent.width) * texel_size;
 	const uint64_t size  = pitch * frame.image.extent.height;
 	std::vector<uint8_t> pixels(size);
-	Transfer::DownloadImage(pixels.data(), size, static_cast<uint32_t>(pitch), frame.image,
+	Transfer::DownloadImage(pixels.data(), size, frame.image.extent.width, frame.image,
 	                        frame.image.layout);
 
 	uint8_t  min_value     = 0xff;

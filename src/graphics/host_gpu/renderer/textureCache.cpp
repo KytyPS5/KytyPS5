@@ -1951,6 +1951,12 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 				            cached.kind == CachedImage::Kind::DepthTarget;
 				if (supported && cached.kind == CachedImage::Kind::DepthTarget) {
 					recreated_depth_sources.push_back(entry);
+				} else if (supported && cached.gpu_modified) {
+					// A render target (unlike a depth target, whose gpu_modified sources are
+					// handled below via MaterializeImagesToGuestLocked) can carry rendered content
+					// that only exists in this image. Flush it to guest memory before it is
+					// discarded and replaced.
+					SynchronizeColorImageToBufferLocked(cached, cached.Address(), cached.Size());
 				}
 				break;
 			case RenderTargetOverlap::None:

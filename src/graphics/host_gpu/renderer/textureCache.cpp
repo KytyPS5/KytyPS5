@@ -2843,17 +2843,18 @@ void TextureCache::MarkGpuWritten(VulkanImage& image) {
 			     static_cast<const void*>(&image), static_cast<uint32_t>(cached->kind));
 		}
 		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-			if (m_buffer_cache.HasPageOverlap(cached->Address(i), cached->Size(i))) {
-				const bool cpu_modified =
-				    m_buffer_cache.IsRegionCpuModified(cached->Address(i), cached->Size(i));
-				const bool gpu_modified =
-				    m_buffer_cache.IsRegionGpuModified(cached->Address(i), cached->Size(i));
-				if (cpu_modified || gpu_modified) {
-					EXIT(
-					    "TextureCache: GPU-written image aliases a dirty buffer, addr=0x%016" PRIx64
-					    " size=0x%016" PRIx64 " cpu_modified=%d gpu_modified=%d\n",
-					    cached->Address(i), cached->Size(i), cpu_modified, gpu_modified);
-				}
+			// A render/depth/video-out target about to start being GPU-written will overwrite this
+			// memory entirely, but a cached buffer object can still legitimately own it (or the
+			// general tracker can still see it as CPU-dirty) if something upstream -- e.g. this
+			// same image being synchronized to guest memory as part of a pool-reuse retirement --
+			// last touched this range as a buffer. ObtainBufferForImage is this codebase's normal
+			// way to reconcile that: it uploads any pending CPU-side bytes into the buffer object
+			// and clears the tracker, and asserts the range is coherent afterward, so it is safe to
+			// call here for its side effect alone rather than treating the overlap as fatal.
+			if (m_buffer_cache.HasPageOverlap(cached->Address(i), cached->Size(i)) &&
+			    (m_buffer_cache.IsRegionCpuModified(cached->Address(i), cached->Size(i)) ||
+			     m_buffer_cache.IsRegionGpuModified(cached->Address(i), cached->Size(i)))) {
+				m_buffer_cache.ObtainBufferForImage(cached->Address(i), cached->Size(i));
 			}
 			if (m_memory_tracker.IsRegionCpuModified(cached->Address(i), cached->Size(i))) {
 				EXIT("TextureCache: GPU-write begins while image range is CPU-modified, "

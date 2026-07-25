@@ -702,15 +702,19 @@ struct TextureCache::ReadbackWorker {
 			     info.bytes_per_element, info.levels, info.samples, info.tile_mode,
 			     static_cast<uint32_t>(cached.kind));
 		}
-		const auto slice_size     = info.size / layers;
-		const bool meta_overlap   = cache.HasMetaOverlapLocked(info.address, info.size);
-		const bool buffer_overlap = cache.m_buffer_cache.HasPageOverlap(info.address, info.size);
-		if (meta_overlap || buffer_overlap) {
+		const auto slice_size   = info.size / layers;
+		const bool meta_overlap = cache.HasMetaOverlapLocked(info.address, info.size);
+		if (meta_overlap) {
 			EXIT("TextureCache: color-image readback storage is unsupported, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " meta=%d buffer=%d kind=%u\n",
-			     info.address, info.size, meta_overlap, buffer_overlap,
-			     static_cast<uint32_t>(cached.kind));
+			     " size=0x%016" PRIx64 " meta=%d kind=%u\n",
+			     info.address, info.size, meta_overlap, static_cast<uint32_t>(cached.kind));
 		}
+		// A cached buffer-cache entry overlapping this range (e.g. the same memory also bound as a
+		// plain/linear buffer elsewhere) is not a reason to refuse the download -- WriteBacking
+		// below already publishes the fresh bytes to guest memory; PublishImageBacking (the same
+		// call SynchronizeColorImageToBufferLocked/SynchronizeDepthImageToBufferLocked already make
+		// after their own WriteBacking) is what tells the buffer cache to pick that up instead of
+		// serving its own stale cached copy.
 		std::vector<ImageBufferCopy> regions;
 		std::vector<BufferImageCopy> tiled_regions;
 		TextureUploadLayout          tiled_layout {};
@@ -748,12 +752,14 @@ struct TextureCache::ReadbackWorker {
 			Transfer::DownloadTiledImage(guest.data(), info.size, info.size, infos, regions,
 			                             *cached.image, cached.image->layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
+			cache.m_buffer_cache.PublishImageBacking(info.address, info.size);
 		} else {
 			download.resize(info.size);
 			std::fill(download.begin(), download.end(), 0);
 			Transfer::DownloadImage(download.data(), info.size, regions, *cached.image,
 			                        cached.image->layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
+			cache.m_buffer_cache.PublishImageBacking(info.address, info.size);
 		}
 		ReadbackTransfer transfer;
 		transfer.Add(info.address, info.size);

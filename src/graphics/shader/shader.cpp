@@ -800,7 +800,6 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    const ShaderVertexInputInfo&                        vs_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	KYTY_PROFILER_FUNCTION();
@@ -831,10 +830,10 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
 	}
 
-	ps_info.descriptor_set =
-	    vs_info.stage.program != nullptr && !vs_info.stage.program->bindings.descriptors.empty()
-	        ? 1
-	        : 0;
+	// Keep graphics-stage descriptor sets stable so VS and PS can be compiled independently.
+	// Pipeline creation inserts an empty set 0 layout when a descriptor-less VS is paired with a
+	// descriptor-using PS.
+	ps_info.descriptor_set = 1;
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
@@ -1064,31 +1063,71 @@ static std::span<const uint32_t> AddShaderProgramPermutation(const char* stage,
 	return spirv;
 }
 
-bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
-                         std::span<const uint32_t>& spirv) {
+bool ShaderPrepareInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                         ShaderVertexInputInfo& info) {
+	return ShaderGetStaticInputInfoVS(regs, sh, info);
+}
+
+void ShaderPrepareInfoPS(
+    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    ShaderPixelInputInfo& info) {
+	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, info);
+}
+
+bool ShaderTryUsePreparedInfoVS(const HW::VertexShaderInfo& regs,
+                                ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
+                                std::span<const uint32_t>& spirv) {
+	const auto shader_hash = regs.gs_regs.chksum;
+	const auto program_id  = ShaderGetIdVS(regs, info, false);
+	const auto key =
+	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
+	std::scoped_lock lock(g_shader_program_cache_mutex);
+	if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
+		for (const auto& permutation: iter->second) {
+			if (TryUseVertexPermutation(*permutation, regs, info, shader_hash)) {
+				spirv = MakeShaderSpirvView(permutation->spirv);
+				LogShaderProgramCacheHit("VS", shader_hash, static_cast<uint64_t>(spirv.size()));
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool ShaderTryUsePreparedInfoPS(const HW::PixelShaderInfo& regs,
+                                ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo& ps_info,
+                                std::span<const uint32_t>& spirv) {
+	const auto shader_hash =
+	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
+	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
+	const auto key =
+	    MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id, lane_mask_mode);
+	std::scoped_lock lock(g_shader_program_cache_mutex);
+	if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
+		for (const auto& permutation: iter->second) {
+			if (TryUsePixelPermutation(*permutation, regs, ps_info, shader_hash)) {
+				spirv = MakeShaderSpirvView(permutation->spirv);
+				LogShaderProgramCacheHit("PS", shader_hash, static_cast<uint64_t>(spirv.size()));
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool ShaderCompilePreparedInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                                 ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
+                                 std::span<const uint32_t>& spirv) {
 	spirv = {};
 
-	if (!ShaderGetStaticInputInfoVS(regs, sh, info)) {
-		return false;
-	}
 	const auto shader_hash = regs.gs_regs.chksum;
 	const auto program_id  = ShaderGetIdVS(regs, info, false);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
 
-	{
-		std::scoped_lock lock(g_shader_program_cache_mutex);
-		if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
-			for (const auto& permutation: iter->second) {
-				if (TryUseVertexPermutation(*permutation, regs, info, shader_hash)) {
-					spirv = MakeShaderSpirvView(permutation->spirv);
-					LogShaderProgramCacheHit("VS", shader_hash,
-					                         static_cast<uint64_t>(spirv.size()));
-					return true;
-				}
-			}
-		}
+	if (ShaderTryUsePreparedInfoVS(regs, lane_mask_mode, info, spirv)) {
+		return true;
 	}
 
 	std::vector<uint32_t> compiled_spirv;
@@ -1103,31 +1142,20 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 	return true;
 }
 
-bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, const ShaderVertexInputInfo& vs_info,
-                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-                         ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv) {
+bool ShaderCompilePreparedInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                                 ShaderLaneMaskMode lane_mask_mode,
+                                 ShaderPixelInputInfo& ps_info,
+                                 std::span<const uint32_t>& spirv) {
 	spirv = {};
 
-	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, ps_info);
 	const auto shader_hash =
 	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
 	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id, lane_mask_mode);
 
-	{
-		std::scoped_lock lock(g_shader_program_cache_mutex);
-		if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
-			for (const auto& permutation: iter->second) {
-				if (TryUsePixelPermutation(*permutation, regs, ps_info, shader_hash)) {
-					spirv = MakeShaderSpirvView(permutation->spirv);
-					LogShaderProgramCacheHit("PS", shader_hash,
-					                         static_cast<uint64_t>(spirv.size()));
-					return true;
-				}
-			}
-		}
+	if (ShaderTryUsePreparedInfoPS(regs, lane_mask_mode, ps_info, spirv)) {
+		return true;
 	}
 
 	std::vector<uint32_t> compiled_spirv;
@@ -1140,6 +1168,22 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 	permutation.program = ps_info.stage.program;
 	spirv = AddShaderProgramPermutation("PS", shader_hash, key, std::move(permutation));
 	return true;
+}
+
+bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                         ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
+                         std::span<const uint32_t>& spirv) {
+	return ShaderPrepareInfoVS(regs, sh, info) &&
+	       ShaderCompilePreparedInfoVS(regs, sh, lane_mask_mode, info, spirv);
+}
+
+bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                         ShaderLaneMaskMode lane_mask_mode,
+                         const ShaderVertexInputInfo& /*vs_info*/,
+                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                         ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv) {
+	ShaderPrepareInfoPS(regs, sh, target_export_mapping, ps_info);
+	return ShaderCompilePreparedInfoPS(regs, sh, lane_mask_mode, ps_info, spirv);
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,

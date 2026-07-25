@@ -71,6 +71,7 @@ public:
 
 	vk::DescriptorSetLayout GetDescriptorSetLayout(Stage                                stage,
 	                                               const ShaderRecompiler::IR::Program& program);
+	vk::DescriptorSetLayout GetEmptyDescriptorSetLayout();
 	void                    Recycle(VulkanDescriptorSet& set);
 	VulkanDescriptorSet&    GetDescriptor(Stage stage, const ShaderRecompiler::IR::Program& program,
 	                                      const NativeDescriptors& descriptors);
@@ -93,6 +94,7 @@ private:
 	std::unordered_map<vk::DescriptorSetLayout, std::vector<VulkanDescriptorSet*>>
 	                                                         m_free_sets_by_layout;
 	std::map<std::vector<uint32_t>, vk::DescriptorSetLayout> m_descriptor_set_layouts;
+	vk::DescriptorSetLayout                                  m_empty_descriptor_set_layout = nullptr;
 };
 
 void BindDescriptors(uint64_t submit_id, CommandBuffer& buffer,

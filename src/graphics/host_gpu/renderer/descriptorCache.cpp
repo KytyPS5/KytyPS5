@@ -286,4 +286,18 @@ DescriptorCache::GetDescriptorSetLayout(Stage stage, const ShaderRecompiler::IR:
 	return GetDescriptorSetLayoutInternal(stage, program);
 }
 
+vk::DescriptorSetLayout DescriptorCache::GetEmptyDescriptorSetLayout() {
+	Common::LockGuard lock(m_mutex);
+	if (m_empty_descriptor_set_layout != nullptr) {
+		return m_empty_descriptor_set_layout;
+	}
+	vk::DescriptorSetLayoutCreateInfo info {};
+	info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+	const auto result =
+	    m_graphics.device.createDescriptorSetLayout(&info, nullptr, &m_empty_descriptor_set_layout);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess ||
+	                     m_empty_descriptor_set_layout == nullptr);
+	return m_empty_descriptor_set_layout;
+}
+
 } // namespace Libs::Graphics

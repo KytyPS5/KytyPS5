@@ -413,7 +413,12 @@ static void CreateLayout(std::span<vk::DescriptorSetLayout> set_layouts, uint32_
 	}
 
 	if (need_descriptor) {
-		EXIT_IF(bindings.descriptor_set != set_layouts_num);
+		EXIT_IF(bindings.descriptor_set >= set_layouts.size());
+		while (set_layouts_num < bindings.descriptor_set) {
+			set_layouts[set_layouts_num] =
+			    GetRenderContext().GetDescriptorCache().GetEmptyDescriptorSetLayout();
+			set_layouts_num++;
+		}
 
 		set_layouts[set_layouts_num] =
 		    GetRenderContext().GetDescriptorCache().GetDescriptorSetLayout(stage, program);

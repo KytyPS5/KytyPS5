@@ -226,6 +226,28 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInputInfo& input_info,
                        bool include_bind_specialization);
 // Returned SPIR-V spans are read-only views backed by the shader program cache.
+bool ShaderPrepareInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                         ShaderVertexInputInfo& input_info);
+void ShaderPrepareInfoPS(
+    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    ShaderPixelInputInfo& input_info);
+bool ShaderTryUsePreparedInfoVS(const HW::VertexShaderInfo& regs,
+                                ShaderLaneMaskMode lane_mask_mode,
+                                ShaderVertexInputInfo& input_info,
+                                std::span<const uint32_t>& spirv);
+bool ShaderTryUsePreparedInfoPS(const HW::PixelShaderInfo& regs,
+                                ShaderLaneMaskMode lane_mask_mode,
+                                ShaderPixelInputInfo& input_info,
+                                std::span<const uint32_t>& spirv);
+bool ShaderCompilePreparedInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                                 ShaderLaneMaskMode lane_mask_mode,
+                                 ShaderVertexInputInfo& input_info,
+                                 std::span<const uint32_t>& spirv);
+bool ShaderCompilePreparedInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                                 ShaderLaneMaskMode lane_mask_mode,
+                                 ShaderPixelInputInfo& input_info,
+                                 std::span<const uint32_t>& spirv);
 bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                          ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
                          std::span<const uint32_t>& spirv);

@@ -40,6 +40,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -694,22 +695,57 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	}
 	const auto lane_mask_mode = SelectGraphicsLaneMaskMode(64u);
 
+	if (!ShaderPrepareInfoVS(vertex_shader_info, shader_regs, state.vs_input_info)) {
+		EXIT("ShaderPrepareInfoVS failed for draw %s\n", draw.name);
+	}
+	if (state.ps_active) {
+		ShaderPrepareInfoPS(pixel_shader_info, shader_regs, target_export_mapping,
+		                    state.ps_input_info);
+	}
+
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoVS");
 	}
-	if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
-	                         state.vs_shader)) {
-		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
-	}
-
+	const bool vs_cached = ShaderTryUsePreparedInfoVS(
+	    vertex_shader_info, lane_mask_mode, state.vs_input_info, state.vs_shader);
 	if (!state.ps_active) {
+		if (!vs_cached &&
+		    !ShaderCompilePreparedInfoVS(vertex_shader_info, shader_regs, lane_mask_mode,
+		                                 state.vs_input_info, state.vs_shader)) {
+			EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
+		}
 		return;
 	}
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
-	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
-	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
+	const bool ps_cached = ShaderTryUsePreparedInfoPS(
+	    pixel_shader_info, lane_mask_mode, state.ps_input_info, state.ps_shader);
+	if (vs_cached && ps_cached) {
+		return;
+	}
+
+	bool vs_ok = vs_cached;
+	bool ps_ok = ps_cached;
+	if (!vs_cached && !ps_cached) {
+		std::jthread ps_compiler([&] {
+			ps_ok = ShaderCompilePreparedInfoPS(pixel_shader_info, shader_regs, lane_mask_mode,
+			                                   state.ps_input_info, state.ps_shader);
+		});
+		vs_ok = ShaderCompilePreparedInfoVS(vertex_shader_info, shader_regs, lane_mask_mode,
+		                                    state.vs_input_info, state.vs_shader);
+		ps_compiler.join();
+	} else if (!vs_cached) {
+		vs_ok = ShaderCompilePreparedInfoVS(vertex_shader_info, shader_regs, lane_mask_mode,
+		                                    state.vs_input_info, state.vs_shader);
+	} else {
+		ps_ok = ShaderCompilePreparedInfoPS(pixel_shader_info, shader_regs, lane_mask_mode,
+		                                    state.ps_input_info, state.ps_shader);
+	}
+	if (!vs_ok) {
+		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
+	}
+	if (!ps_ok) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}
 }

@@ -190,16 +190,13 @@ void GuestMemoryWindow::RefreshRanges() {
 	m_ranges.clear();
 	m_ranges.reserve(ranges.size());
 	for (const auto& range: ranges) {
-		// The table is searched by shaders, so entries that cannot be expressed in the 32-bit
-		// fields are dropped rather than truncated into a wrong translation.
-		if (range.size > UINT32_MAX || range.backing_offset > UINT32_MAX) {
-			continue;
-		}
 		RangeEntry entry {};
-		entry.vaddr_lo       = static_cast<uint32_t>(range.vaddr);
-		entry.vaddr_hi       = static_cast<uint32_t>(range.vaddr >> 32u);
-		entry.size           = static_cast<uint32_t>(range.size);
-		entry.backing_offset = static_cast<uint32_t>(range.backing_offset);
+		entry.vaddr_lo          = static_cast<uint32_t>(range.vaddr);
+		entry.vaddr_hi          = static_cast<uint32_t>(range.vaddr >> 32u);
+		entry.size_lo           = static_cast<uint32_t>(range.size);
+		entry.size_hi           = static_cast<uint32_t>(range.size >> 32u);
+		entry.backing_offset_lo = static_cast<uint32_t>(range.backing_offset);
+		entry.backing_offset_hi = static_cast<uint32_t>(range.backing_offset >> 32u);
 		m_ranges.push_back(entry);
 	}
 	std::sort(m_ranges.begin(), m_ranges.end(), [](const RangeEntry& a, const RangeEntry& b) {
@@ -226,7 +223,8 @@ bool GuestMemoryWindow::SelfTest() const {
 	// Prove the imported view and the guest view alias the same bytes: write a marker through the
 	// guest-facing path, read it back through the backing pointer the GPU was handed.
 	for (const auto& entry: m_ranges) {
-		if (entry.size < sizeof(uint64_t)) {
+		const auto entry_size = static_cast<uint64_t>(entry.size_hi) << 32u | entry.size_lo;
+		if (entry_size < sizeof(uint64_t)) {
 			continue;
 		}
 		const auto vaddr = static_cast<uint64_t>(entry.vaddr_hi) << 32u | entry.vaddr_lo;
@@ -239,7 +237,9 @@ bool GuestMemoryWindow::SelfTest() const {
 			continue;
 		}
 		uint64_t observed = 0;
-		std::memcpy(&observed, m_backing_base + entry.backing_offset, sizeof(observed));
+		const auto entry_offset =
+		    static_cast<uint64_t>(entry.backing_offset_hi) << 32u | entry.backing_offset_lo;
+		std::memcpy(&observed, m_backing_base + entry_offset, sizeof(observed));
 		LibKernel::Memory::TryWriteBacking(vaddr, &original, sizeof(original));
 		return observed == marker;
 	}

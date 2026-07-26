@@ -28,12 +28,17 @@ public:
 	static constexpr uint64_t ChunkSize = 1ull << 30u; // 1 GiB
 	static constexpr uint32_t MaxChunks = 32;
 
-	// One searchable entry, mirrored by the shader-side struct.
+	// One searchable entry, mirrored by the shader-side struct. Sizes and backing offsets span the
+	// whole multi-gigabyte backing, so both need 64 bits; the shader reads them as dword pairs.
 	struct RangeEntry {
-		uint32_t vaddr_lo       = 0;
-		uint32_t vaddr_hi       = 0;
-		uint32_t size           = 0;
-		uint32_t backing_offset = 0;
+		uint32_t vaddr_lo          = 0;
+		uint32_t vaddr_hi          = 0;
+		uint32_t size_lo           = 0;
+		uint32_t size_hi           = 0;
+		uint32_t backing_offset_lo = 0;
+		uint32_t backing_offset_hi = 0;
+		uint32_t reserved0         = 0;
+		uint32_t reserved1         = 0;
 	};
 
 	GuestMemoryWindow() = default;

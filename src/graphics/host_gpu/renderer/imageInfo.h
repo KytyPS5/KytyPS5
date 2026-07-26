@@ -807,8 +807,15 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			// have to be fully contained within (or exactly match) a single sampled texture's
 			// bounds. InvalidateTexture only flags the cached image's GPU-side copy stale (never
 			// destructive), which is correct for a write touching any part of it.
-			return image_page_aligned && !image_gpu_modified ? BufferImageWrite::InvalidateTexture
-			                                                 : BufferImageWrite::Unsupported;
+			//
+			// The image's own allocation need not be page aligned either. Invalidation is not a
+			// page operation -- it marks this cached image's GPU copy stale so it is re-read from
+			// guest memory -- so a texture that merely starts mid-page (Dead Cells has one at
+			// ...300 inside a 32 MB allocation) is no less safe to invalidate than an aligned one.
+			// Requiring alignment turned that into a hard abort. Over-invalidating costs a
+			// re-upload; under-invalidating would show stale pixels, so err this way.
+			return !image_gpu_modified ? BufferImageWrite::InvalidateTexture
+			                           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:
 			if (!exact || !buffer_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;

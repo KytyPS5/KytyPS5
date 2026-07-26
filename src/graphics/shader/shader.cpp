@@ -1,5 +1,7 @@
 #include "graphics/shader/shader.h"
 
+#include "graphics/host_gpu/guestMemoryWindow.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1445,6 +1447,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.descriptor_set       = 0;
 	options.push_constant_offset = 0;
 	options.vertex_input_info    = &input_info;
+	options.guest_window_chunks  = GetGuestMemoryWindow().ChunkCount();
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler VS";
@@ -1506,6 +1509,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	// descriptor-buffer path (BindingLayout.cpp).
 	options.push_constant_offset = 64;
 	options.pixel_input_info     = &input_info;
+	options.guest_window_chunks  = GetGuestMemoryWindow().ChunkCount();
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler PS";
@@ -1556,6 +1560,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.push_constant_offset = 0;
 	options.compute_input_info   = &input_info;
 	options.wave_size            = input_info.wave_size;
+	options.guest_window_chunks  = GetGuestMemoryWindow().ChunkCount();
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";

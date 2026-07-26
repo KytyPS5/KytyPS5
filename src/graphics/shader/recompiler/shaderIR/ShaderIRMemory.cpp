@@ -26,6 +26,17 @@ bool LowerScalarBufferLoadDword(const Decoder::Instruction& decoded, BasicBlock&
 		    !LowerSourceOperand(decoded.src1, inst.src[0], error)) {
 			return false;
 		}
+		if (op == Opcode::SBufferLoadDword) {
+			// Keep the V#'s base pair reachable. When the host resolves the descriptor these are
+			// ignored; when it cannot, they are the only copy of the address the shader can read.
+			// Only dwords 0-1 are kept: stride, records and format play no part in a plain scalar
+			// fetch, and the IR has four source slots.
+			if (!LowerSourceOperand(decoded.src0, inst.src[1], error) ||
+			    !LowerSourceOperand(OffsetDecodedRegister(decoded.src0, 1), inst.src[2], error)) {
+				return false;
+			}
+			inst.src_count = 3;
+		}
 		if (op == Opcode::SLoadDword) {
 			// Keep the pointer's SGPR pair reachable from the IR. Resource tracking usually folds
 			// the base into a host binding and the emitter ignores these, but when the base only

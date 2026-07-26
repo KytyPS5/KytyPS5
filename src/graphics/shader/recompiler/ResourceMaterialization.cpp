@@ -115,6 +115,10 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		return true;
 	};
 	for (uint32_t i = 0; i < snapshot.addresses.size(); i++) {
+		if (i < program.info.addresses.size() &&
+		    program.info.addresses[i].guest_window_role != GuestWindowRole::None) {
+			continue;
+		}
 		if (snapshot.addresses[i].binding_base > snapshot.addresses[i].guest_base) {
 			if (error != nullptr) {
 				*error = fmt::format("address resource {} binds above its guest base", i);
@@ -217,7 +221,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	requests.reserve(program.info.buffers.size() + program.info.images.size() +
 	                 program.info.samplers.size() + program.info.addresses.size());
 	for (const auto& buffer: program.info.buffers) {
-		requests.push_back({buffer.source, buffer.first_use_pc});
+		requests.push_back({buffer.source, buffer.first_use_pc, buffer.runtime_descriptor});
 	}
 	for (const auto& image: program.info.images) {
 		requests.push_back({image.source, image.first_use_pc});
@@ -228,7 +232,8 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	for (const auto& address: program.info.addresses) {
 		// Run-time bases cannot go through the exact evaluator -- that is what makes them dynamic.
 		// They are resolved below with EvaluateAddressBase() instead.
-		if (address.source != ScalarProvenance::Unknown && !address.dynamic_base) {
+		if (address.guest_window_role == GuestWindowRole::None &&
+		    address.source != ScalarProvenance::Unknown && !address.dynamic_base) {
 			requests.push_back({address.source, address.first_use_pc});
 		}
 	}
@@ -253,7 +258,11 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();
 	for (const auto& address: program.info.addresses) {
-		if (address.dynamic_base) {
+		if (address.guest_window_role != GuestWindowRole::None) {
+			// Bound directly from the imported window, so there is nothing to evaluate; the shader
+			// derives every offset it needs from the range table at run time.
+			next.addresses.push_back({0, 0});
+		} else if (address.dynamic_base) {
 			AddressBase resolved;
 			if (!EvaluateAddressBase(program, address.source, address.first_use_pc, runtime,
 			                         resolved, error)) {

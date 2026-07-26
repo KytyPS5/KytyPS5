@@ -256,6 +256,24 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 	if (UsesGds(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
+	// The imported guest-memory window rides on the address-memory binding: one resource per chunk
+	// plus the range table, appended so a shader's own addresses keep their indices.
+	if (program.uses_guest_window && program.guest_window_chunks > 0) {
+		program.info.guest_window_first = static_cast<uint32_t>(program.info.addresses.size());
+		for (uint32_t i = 0; i < program.guest_window_chunks; i++) {
+			AddressResource chunk {};
+			chunk.kind               = ResourceKind::ScalarBuffer;
+			chunk.read               = true;
+			chunk.guest_window_role  = GuestWindowRole::Chunk;
+			chunk.guest_window_index = i;
+			program.info.addresses.push_back(chunk);
+		}
+		AddressResource table {};
+		table.kind              = ResourceKind::ScalarBuffer;
+		table.read              = true;
+		table.guest_window_role = GuestWindowRole::RangeTable;
+		program.info.addresses.push_back(table);
+	}
 	if (!program.info.addresses.empty()) {
 		std::vector<uint32_t> resources(program.info.addresses.size());
 		for (uint32_t i = 0; i < resources.size(); i++) {

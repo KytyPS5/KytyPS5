@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/descriptors.h"
 
+#include "graphics/host_gpu/guestMemoryWindow.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
@@ -154,11 +156,40 @@ static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer& command
 	return result;
 }
 
+static BufferView NativeUpload(CommandBuffer& command_buffer, std::span<const uint32_t> data);
+
 static BufferView
 NativeAddressBuffer(uint64_t submit_id, CommandBuffer& command_buffer,
                     const ShaderRecompiler::IR::AddressResource&           resource,
                     const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
 	BufferView result;
+	// Guest-window resources are backed by the imported guest pages rather than anything the
+	// buffer cache owns, so they bypass the guest-address lookup entirely.
+	if (resource.guest_window_role == ShaderRecompiler::IR::GuestWindowRole::Chunk) {
+		auto& window = GetGuestMemoryWindow();
+		if (!window.IsAvailable() || resource.guest_window_index >= window.ChunkCount()) {
+			BindNullStorageBuffer(command_buffer, result);
+			return result;
+		}
+		const auto& chunk = window.Chunks()[resource.guest_window_index];
+		result.buffer     = const_cast<VulkanBuffer*>(&chunk);
+		result.offset     = 0;
+		result.range      = chunk.buffer_size;
+		return result;
+	}
+	if (resource.guest_window_role == ShaderRecompiler::IR::GuestWindowRole::RangeTable) {
+		auto&      window = GetGuestMemoryWindow();
+		const auto& ranges = window.Ranges();
+		// A fixed-size table keeps the shader's unrolled search branchless; unused slots are zeroed
+		// and never match because a zero size fails the containment test.
+		std::array<uint32_t, ShaderRecompiler::IR::ShaderInfo::MaxGuestWindowRanges * 8u> table {};
+		const auto count =
+		    std::min<size_t>(ranges.size(), ShaderRecompiler::IR::ShaderInfo::MaxGuestWindowRanges);
+		for (size_t i = 0; i < count; i++) {
+			std::memcpy(table.data() + i * 8u, &ranges[i], sizeof(ranges[i]));
+		}
+		return NativeUpload(command_buffer, table);
+	}
 	if (address.binding_base == 0) {
 		BindNullStorageBuffer(command_buffer, result);
 		return result;

@@ -207,7 +207,10 @@ private:
 		return false;
 	}
 
-	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error) const {
+	// `unresolved`, when supplied, turns "the host cannot recover this descriptor" from a hard
+	// failure into a flag, so the caller can route the access through the guest-memory window.
+	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error,
+	                    bool* unresolved = nullptr) const {
 		const auto* descriptor = GetDescriptorSource(m_program, source);
 		if (descriptor == nullptr || descriptor->dword_count != dwords) {
 			return Fail(pc, error,
@@ -217,6 +220,10 @@ private:
 		for (uint32_t i = 0; i < descriptor->dword_count; i++) {
 			std::vector<uint32_t> path;
 			if (ContainsUnknown(m_program.provenance, descriptor->dwords[i], visited, path)) {
+				if (unresolved != nullptr) {
+					*unresolved = true;
+					return true;
+				}
 				const auto  value = descriptor->dwords[i];
 				std::string chain;
 				for (const auto id: path) {
@@ -265,10 +272,12 @@ private:
 		return true;
 	}
 
-	uint32_t AddBuffer(const Instruction& inst) {
+	uint32_t AddBuffer(const Instruction& inst, bool runtime_descriptor) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == inst.memory.resource_source) {
 				Merge(&m_info.buffers[i], inst);
+				m_info.buffers[i].runtime_descriptor =
+				    m_info.buffers[i].runtime_descriptor || runtime_descriptor;
 				return i;
 			}
 		}
@@ -276,8 +285,9 @@ private:
 			return UINT32_MAX;
 		}
 		BufferResource resource;
-		resource.source       = inst.memory.resource_source;
-		resource.first_use_pc = inst.pc;
+		resource.source             = inst.memory.resource_source;
+		resource.first_use_pc       = inst.pc;
+		resource.runtime_descriptor = runtime_descriptor;
 		Merge(&resource, inst);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
@@ -451,11 +461,21 @@ private:
 		if (!IsBuffer(inst) && !IsImage(inst)) {
 			return true;
 		}
-		if (!ValidateSource(inst.memory.resource_source, IsBuffer(inst) ? 4u : 8u, inst.pc,
-		                    error)) {
+		// A V# the host cannot recover is serviceable only for plain scalar buffer loads, and only
+		// when guest memory was imported: the shader then reads the descriptor from its own SGPRs
+		// and translates the address itself. Everything else still fails.
+		const bool window_capable = m_program.guest_window_chunks > 0 && IsBuffer(inst) &&
+		                            inst.op == Opcode::SBufferLoadDword;
+		bool runtime_descriptor = false;
+		if (!ValidateSource(inst.memory.resource_source, IsBuffer(inst) ? 4u : 8u, inst.pc, error,
+		                    window_capable ? &runtime_descriptor : nullptr)) {
 			return false;
 		}
-		const auto resource = IsBuffer(inst) ? AddBuffer(inst) : AddImage(inst);
+		if (runtime_descriptor) {
+			m_program.uses_guest_window = true;
+		}
+		const auto resource =
+		    IsBuffer(inst) ? AddBuffer(inst, runtime_descriptor) : AddImage(inst);
 		if (resource == UINT32_MAX) {
 			return Fail(inst.pc, error,
 			            IsBuffer(inst) ? "buffer resource limit exceeded"

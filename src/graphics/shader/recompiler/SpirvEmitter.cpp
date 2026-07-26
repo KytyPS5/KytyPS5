@@ -141,8 +141,11 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	    (inst.op == IR::Opcode::SLoadDword &&
 	     (kind != IR::ResourceKind::ScalarBuffer ||
 	      (inst.src_count != 1 && inst.src_count != 3))) ||
+	    // s_buffer_load carries its soffset plus the two SGPRs holding the V#'s base, which the
+	    // shader reads directly when the host could not resolve the descriptor.
 	    (inst.op == IR::Opcode::SBufferLoadDword &&
-	     (kind != IR::ResourceKind::ScalarBuffer || inst.src_count != 1)) ||
+	     (kind != IR::ResourceKind::ScalarBuffer ||
+	      (inst.src_count != 1 && inst.src_count != 3))) ||
 	    (IsFlatLoad(inst.op) && (!flat_kind || inst.src_count != 2)) ||
 	    (IsFlatStore(inst.op) && (!flat_kind || inst.src_count != 3))) {
 		return Fail(error, "memory instruction opcode/kind/operand contract is invalid");

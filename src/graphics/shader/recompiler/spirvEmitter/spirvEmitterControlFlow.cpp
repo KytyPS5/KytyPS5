@@ -724,7 +724,12 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::FMed3F32: EmitMed3F32(state, inst); break;
 		case IR::Opcode::SLoadDword: EmitSLoadDword(state, inst); break;
 		case IR::Opcode::SBufferLoadDword:
-			EmitMemoryLoadU32(state, inst, IR::ResourceKind::ScalarBuffer, 0, 1);
+			if (inst.memory.resource < state.program.info.buffers.size() &&
+			    state.program.info.buffers[inst.memory.resource].runtime_descriptor) {
+				EmitStoreU32(state, inst.dst, EmitGuestWindowBufferLoad(state, inst));
+			} else {
+				EmitMemoryLoadU32(state, inst, IR::ResourceKind::ScalarBuffer, 0, 1);
+			}
 			break;
 		case IR::Opcode::LoadSrtDword: EmitLoadSrtDword(state, inst); break;
 		case IR::Opcode::BufferLoadUbyte: EmitBufferLoadUbyte(state, inst); break;

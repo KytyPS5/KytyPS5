@@ -1207,6 +1207,164 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 	EmitStoreU32(state, inst.dst, old);
 }
 
+
+// Loads one dword from an address-memory resource at a dword index, guarded by the bound range.
+uint32_t EmitAddressResourceLoad(EmitterState& state, uint32_t resource_index, uint32_t index) {
+	const auto binding =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, resource_index);
+	const auto object = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer, object,
+	                            state.address_memory_variable,
+	                            ConstantU32(state, binding.array_index)});
+	const auto length    = state.builder.AllocateId();
+	const auto in_bounds = state.builder.AllocateId();
+	state.builder.AddFunction({OpArrayLength, state.uint_type, length, object, 0});
+	state.builder.AddFunction({OpULessThan, state.bool_type, in_bounds, index, length});
+	return EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
+		const auto pointer = state.builder.AllocateId();
+		const auto loaded  = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpAccessChain, state.ptr_storage_buffer_uint, pointer, state.address_memory_variable,
+		     ConstantU32(state, binding.array_index), ConstantU32(state, 0), index});
+		state.builder.AddFunction({OpLoad, state.uint_type, loaded, pointer});
+		return loaded;
+	});
+}
+
+// Translates a 64-bit guest address into an offset inside the imported guest-memory backing by
+// searching the range table. The table has a fixed slot count so the search unrolls into a
+// branchless select chain -- a running title maps only a handful of ranges, and unused slots have a
+// zero size that never satisfies the containment test.
+//
+// Emits `found` alongside the offset so callers can zero a translation that matched nothing rather
+// than reading an arbitrary location.
+void EmitGuestAddressTranslate(EmitterState& state, uint32_t vaddr_lo, uint32_t vaddr_hi,
+                               uint32_t& offset_lo, uint32_t& offset_hi, uint32_t& found) {
+	const auto table_resource = state.program.info.guest_window_first +
+	                            state.program.guest_window_chunks;
+	const auto zero = ConstantU32(state, 0);
+	offset_lo       = zero;
+	offset_hi       = zero;
+	found           = state.builder.AllocateId();
+	state.builder.AddFunction({OpIEqual, state.bool_type, found, zero, ConstantU32(state, 1)});
+
+	for (uint32_t slot = 0; slot < IR::ShaderInfo::MaxGuestWindowRanges; slot++) {
+		const auto base = slot * 8u;
+		const auto r_lo = EmitAddressResourceLoad(state, table_resource, ConstantU32(state, base));
+		const auto r_hi =
+		    EmitAddressResourceLoad(state, table_resource, ConstantU32(state, base + 1u));
+		const auto s_lo =
+		    EmitAddressResourceLoad(state, table_resource, ConstantU32(state, base + 2u));
+		const auto s_hi =
+		    EmitAddressResourceLoad(state, table_resource, ConstantU32(state, base + 3u));
+		const auto b_lo =
+		    EmitAddressResourceLoad(state, table_resource, ConstantU32(state, base + 4u));
+		const auto b_hi =
+		    EmitAddressResourceLoad(state, table_resource, ConstantU32(state, base + 5u));
+
+		// rel = vaddr - range_base, as a 64-bit subtract with borrow.
+		const auto rel_lo = EmitBinaryU32(state, OpISub, vaddr_lo, r_lo);
+		const auto borrow_bool = state.builder.AllocateId();
+		state.builder.AddFunction({OpULessThan, state.bool_type, borrow_bool, vaddr_lo, r_lo});
+		const auto borrow = EmitSelectU32Value(state, borrow_bool, ConstantU32(state, 1), zero);
+		const auto rel_hi =
+		    EmitBinaryU32(state, OpISub, EmitBinaryU32(state, OpISub, vaddr_hi, r_hi), borrow);
+
+		// vaddr >= base, i.e. the subtraction did not wrap.
+		const auto ge_hi = state.builder.AllocateId();
+		state.builder.AddFunction({OpUGreaterThanEqual, state.bool_type, ge_hi, vaddr_hi, r_hi});
+		const auto hi_eq = state.builder.AllocateId();
+		state.builder.AddFunction({OpIEqual, state.bool_type, hi_eq, vaddr_hi, r_hi});
+		const auto lo_ge = state.builder.AllocateId();
+		state.builder.AddFunction({OpUGreaterThanEqual, state.bool_type, lo_ge, vaddr_lo, r_lo});
+		const auto hi_gt = state.builder.AllocateId();
+		state.builder.AddFunction({OpUGreaterThan, state.bool_type, hi_gt, vaddr_hi, r_hi});
+		const auto at_or_after = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalOr, state.bool_type, at_or_after, hi_gt,
+		                            EmitLogicalAndBool(state, hi_eq, lo_ge)});
+		(void)ge_hi;
+
+		// rel < size, again 64-bit.
+		const auto size_hi_gt = state.builder.AllocateId();
+		state.builder.AddFunction({OpUGreaterThan, state.bool_type, size_hi_gt, s_hi, rel_hi});
+		const auto size_hi_eq = state.builder.AllocateId();
+		state.builder.AddFunction({OpIEqual, state.bool_type, size_hi_eq, s_hi, rel_hi});
+		const auto size_lo_gt = state.builder.AllocateId();
+		state.builder.AddFunction({OpUGreaterThan, state.bool_type, size_lo_gt, s_lo, rel_lo});
+		const auto within = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalOr, state.bool_type, within, size_hi_gt,
+		                            EmitLogicalAndBool(state, size_hi_eq, size_lo_gt)});
+
+		const auto hit = EmitLogicalAndBool(state, at_or_after, within);
+
+		// candidate = backing_offset + rel
+		const auto cand_lo    = EmitAddU32(state, b_lo, rel_lo);
+		const auto carry_bool = state.builder.AllocateId();
+		state.builder.AddFunction({OpULessThan, state.bool_type, carry_bool, cand_lo, b_lo});
+		const auto cand_hi =
+		    EmitAddU32(state, EmitAddU32(state, b_hi, rel_hi),
+		               EmitSelectU32Value(state, carry_bool, ConstantU32(state, 1), zero));
+
+		offset_lo = EmitSelectU32Value(state, hit, cand_lo, offset_lo);
+		offset_hi = EmitSelectU32Value(state, hit, cand_hi, offset_hi);
+		const auto next_found = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalOr, state.bool_type, next_found, found, hit});
+		found = next_found;
+	}
+}
+
+// s_buffer_load whose V# the host could not resolve. The descriptor is read from the SGPR quad the
+// IR preserved, the guest address it points at is translated through the range table, and the dword
+// is fetched from whichever imported chunk holds it.
+uint32_t EmitGuestWindowBufferLoad(EmitterState& state, const IR::Instruction& inst) {
+	const auto zero = ConstantU32(state, 0);
+	// V# dwords 0..1 hold the 48-bit base; the rest is stride/records/format, unused for a plain
+	// scalar fetch.
+	const auto base_lo = EmitValueLoad(state, inst.src[1]);
+	const auto base_hi = EmitBinaryU32(state, OpBitwiseAnd, EmitValueLoad(state, inst.src[2]),
+	                                   ConstantU32(state, 0xffffu));
+
+	auto displacement = EmitBinaryU32(state, OpBitwiseAnd, EmitValueLoad(state, inst.src[0]),
+	                                  ConstantU32(state, ~3u));
+	displacement =
+	    EmitAddU32(state, displacement, ConstantU32(state, inst.memory.offset & ~uint32_t {3}));
+
+	const auto vaddr_lo    = EmitAddU32(state, base_lo, displacement);
+	const auto carry_bool  = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThan, state.bool_type, carry_bool, vaddr_lo, base_lo});
+	const auto vaddr_hi = EmitAddU32(
+	    state, base_hi, EmitSelectU32Value(state, carry_bool, ConstantU32(state, 1), zero));
+
+	uint32_t offset_lo = 0;
+	uint32_t offset_hi = 0;
+	uint32_t found     = 0;
+	EmitGuestAddressTranslate(state, vaddr_lo, vaddr_hi, offset_lo, offset_hi, found);
+
+	// chunk = offset / ChunkSize, index = (offset % ChunkSize) / 4, with ChunkSize a power of two
+	// so both reduce to shifts of the 64-bit offset.
+	constexpr uint32_t ChunkShift = 30u;
+	const auto chunk = EmitBinaryU32(
+	    state, OpBitwiseOr,
+	    EmitBinaryU32(state, OpShiftRightLogical, offset_lo, ConstantU32(state, ChunkShift)),
+	    EmitBinaryU32(state, OpShiftLeftLogical, offset_hi, ConstantU32(state, 32u - ChunkShift)));
+	const auto in_chunk = EmitBinaryU32(state, OpBitwiseAnd, offset_lo,
+	                                    ConstantU32(state, (1u << ChunkShift) - 1u));
+	const auto index = EmitBinaryU32(state, OpShiftRightLogical, in_chunk, ConstantU32(state, 2));
+
+	// The chunk index is dynamic, so every chunk is probed and the matching one selected. The count
+	// is small (a 13.5 GiB backing is fourteen chunks) and this runs on a scalar path.
+	uint32_t value = zero;
+	for (uint32_t i = 0; i < state.program.guest_window_chunks; i++) {
+		const auto loaded =
+		    EmitAddressResourceLoad(state, state.program.info.guest_window_first + i, index);
+		const auto is_chunk = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpIEqual, state.bool_type, is_chunk, chunk, ConstantU32(state, i)});
+		value = EmitSelectU32Value(state, is_chunk, loaded, value);
+	}
+	return EmitSelectU32Value(state, found, value, zero);
+}
+
 void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst) {
 	if (state.address_memory_variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,

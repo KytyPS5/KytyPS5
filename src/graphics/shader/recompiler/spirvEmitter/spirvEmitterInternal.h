@@ -970,6 +970,8 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 
 void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst);
 
+uint32_t EmitGuestWindowBufferLoad(EmitterState& state, const IR::Instruction& inst);
+
 void EmitLoadSrtDword(EmitterState& state, const IR::Instruction& inst);
 
 void EmitBufferLoadUbyte(EmitterState& state, const IR::Instruction& inst);

@@ -606,6 +606,9 @@ struct BufferResource {
 	bool     atomic            = false;
 	bool     formatted         = false;
 	bool     scalar            = false;
+	// The V# itself is fetched through a run-time pointer, so the shader reads it from its SGPR
+	// quad and goes through the imported guest-memory window instead of a host-resolved binding.
+	bool runtime_descriptor = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -745,6 +748,8 @@ struct BindingLayout {
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
 	static constexpr uint32_t MaxAddresses    = 64;
+	// Index of the first guest-window resource in `addresses`; UINT32_MAX when unused.
+	uint32_t guest_window_first = UINT32_MAX;
 	// Slots the shader searches when translating a guest address through the imported window.
 	// Sized well above the handful of ranges a running title actually maps.
 	static constexpr uint32_t MaxGuestWindowRanges = 16;

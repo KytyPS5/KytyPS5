@@ -21,6 +21,10 @@ struct SrtRuntime {
 struct DescriptorSourceRequest {
 	uint32_t source = 0;
 	uint32_t use_pc = 0;
+	// Yield a zeroed descriptor instead of failing when the host cannot evaluate the source. Used
+	// for descriptors the shader reads for itself through the guest-memory window; the zeros keep
+	// the snapshot positionally aligned and are never consulted.
+	bool allow_unresolved = false;
 };
 
 // The part of a run-time computed guest pointer the host can still pin down. The shader adds the

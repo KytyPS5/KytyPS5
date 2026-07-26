@@ -818,6 +818,13 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 		const auto  dynamic =
 		    std::find(program.srt.dynamic_sources.begin(), program.srt.dynamic_sources.end(),
 		              request.source) != program.srt.dynamic_sources.end();
+		if (descriptor != nullptr && request.allow_unresolved &&
+		    (dynamic || !DescriptorSourceResolved(program, request.source))) {
+			auto zeroed = *descriptor;
+			zeroed.dwords.fill(0);
+			evaluated.push_back(zeroed);
+			continue;
+		}
 		if (descriptor == nullptr || dynamic ||
 		    !DescriptorSourceResolved(program, request.source)) {
 			if (error != nullptr) {

@@ -731,6 +731,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, ir, error)) {
 		return false;
 	}
+	ir.guest_window_chunks = options.guest_window_chunks;
 	ir.lane_mask_mode  = options.lane_mask_mode;
 	ir.shader_hash     = options.shader_hash;
 	ir.user_data_base  = options.user_data_base;

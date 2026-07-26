@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/SpirvEmitter.h"
 #include "graphics/shader/recompiler/SrtPatcher.h"
 #include "graphics/shader/recompiler/SrtWalker.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -38,8 +39,21 @@ bool ReadZeroMemory(void*, uint64_t, uint32_t* value) {
 // The SRT walker rebuilds descriptor addresses from guest data and cannot tell a real pointer from
 // an unresolved base plus a field offset, so validating the address belongs here rather than in the
 // walker. TryRead() lets the kernel decide and reports failure instead of faulting.
+//
+// One catch: process_vm_readv() honours page protection without running our SIGSEGV handler, so a
+// descriptor that happens to sit in a page the GPU tracker has write-protected reads as
+// unavailable even though it is perfectly valid. A raw load would have faulted, been resolved and
+// succeeded. Falling back to the direct-memory backing reads the very same physical bytes through
+// a mapping the tracker never protects, which recovers those without ever dereferencing an address
+// we have not checked. Skipping this fallback is not harmless: the descriptors are re-materialized
+// to decide whether a cached shader permutation still applies, so a spurious failure looks like a
+// specialization mismatch and recompiles the shader until it trips the 64-permutation cap.
 bool ReadGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr && Common::VirtualMemory::TryRead(address, value, sizeof(*value));
+	if (value == nullptr) {
+		return false;
+	}
+	return Common::VirtualMemory::TryRead(address, value, sizeof(*value)) ||
+	       LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
 }
 
 const char* GetDumpLabel(const CompileOptions& options) {

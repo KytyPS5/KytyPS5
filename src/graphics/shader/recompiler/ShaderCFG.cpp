@@ -1013,6 +1013,7 @@ struct SplitTally {
 	uint32_t forced_selections = 0;
 	uint32_t last_header       = UINT32_MAX;
 	uint32_t last_merge        = UINT32_MAX;
+	std::map<uint32_t, uint32_t> header_hits;
 };
 
 bool SplitOneLoopMerge(Graph& graph, SplitTally& tally) {
@@ -1046,12 +1047,27 @@ bool SplitOneSelectionMerge(Graph& graph, SplitTally& tally) {
 		const auto merge = graph.FindNearestCommonPostDominator(block->terminator.true_block,
 		                                                        block->terminator.false_block);
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
-		const auto force_split      = SelectionMergeLeavesContainingLoop(graph, block_id, merge);
+		// A selection whose merge sits outside its containing loop is illegal, and the usual fix --
+		// give the merge a private forwarder -- cannot repair it: natural-loop analysis will never
+		// place that forwarder inside the loop, because a block that only branches out can never
+		// reach the back edge. So the forced split leaves the predicate that triggered it still
+		// true, and asking again next pass splits the forwarder we just made. That is an infinite
+		// regress, measured at one block per iteration for as many iterations as the budget allows
+		// (ASTRO BOT's lighting kernels: 160 -> 2720 blocks at a budget of 2560). Refusing to force
+		// a split we already know is futile turns the regress into a fast, honest failure and, more
+		// usefully, stops it from eating the budget that the genuine splits in the same shader need.
+		const auto force_split   = SelectionMergeLeavesContainingLoop(graph, block_id, merge);
+		const auto header        = block_id;
+		const auto merge_before  = merge;
 		if (SplitSharedMergeBlock(graph, merge, construct_blocks, force_split)) {
+			// Recorded from the values captured before the call: SplitSharedMergeBlock() ends in
+			// MoveBlockBefore(), which renumbers every block, so ids read afterwards refer to
+			// whatever now occupies that position rather than to what was split.
 			tally.selection_merges++;
 			tally.forced_selections += force_split ? 1u : 0u;
-			tally.last_header = block_id;
-			tally.last_merge  = merge;
+			tally.header_hits[header]++;
+			tally.last_header = header;
+			tally.last_merge  = merge_before;
 			return true;
 		}
 	}
@@ -1076,7 +1092,16 @@ bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	                       "forced_selections={} last_header={} last_merge={}",
 	                       original_block_count, static_cast<uint64_t>(graph.blocks.size()),
 	                       split_budget, tally.loop_merges, tally.selection_merges,
-	                       tally.forced_selections, tally.last_header, tally.last_merge),
+	                       tally.forced_selections, tally.last_header, tally.last_merge) +
+	               fmt::format(" distinct_headers={} max_header_hits={}",
+	                           tally.header_hits.size(),
+	                           tally.header_hits.empty()
+	                               ? 0u
+	                               : std::max_element(tally.header_hits.begin(),
+	                                                  tally.header_hits.end(),
+	                                                  [](const auto& a, const auto& b) {
+		                                                  return a.second < b.second;
+	                                                  })->second),
 	           error);
 	return false;
 }

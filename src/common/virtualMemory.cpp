@@ -58,6 +58,10 @@ bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	return SysVirtualFlushInstructionCache(address, size);
 }
 
+bool TryRead(uint64_t address, void* destination, uint64_t size) {
+	return SysVirtualTryRead(address, destination, size);
+}
+
 bool PatchReplace(uint64_t vaddr, uint64_t value) {
 	Mode old_mode {};
 	Protect(vaddr, 8, Mode::ReadWrite, &old_mode);

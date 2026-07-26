@@ -353,6 +353,21 @@ bool SysVirtualFlushInstructionCache(uint64_t address, uint64_t size) {
 	return true;
 }
 
+bool SysVirtualTryRead(uint64_t address, void* destination, uint64_t size) {
+	if (address == 0 || destination == nullptr || size == 0 || address + size < address) {
+		return false;
+	}
+	// ReadProcessMemory() on our own handle validates the range in the kernel and fails cleanly on
+	// an unmapped or no-access page, so a bad guest address returns false rather than raising.
+	SIZE_T read = 0;
+	if (ReadProcessMemory(GetCurrentProcess(),
+	                      reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(address)), destination,
+	                      static_cast<SIZE_T>(size), &read) == 0) {
+		return false;
+	}
+	return static_cast<uint64_t>(read) == size;
+}
+
 } // namespace Common
 
 #endif

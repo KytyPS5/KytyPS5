@@ -14,6 +14,8 @@
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 // IWYU pragma: no_include <asm/mman-common.h>
 // IWYU pragma: no_include <asm/mman.h>
@@ -519,6 +521,24 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 
 bool SysVirtualFlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 	return true;
+}
+
+bool SysVirtualTryRead(uint64_t address, void* destination, uint64_t size) {
+	if (address == 0 || destination == nullptr || size == 0 || address + size < address) {
+		return false;
+	}
+	// process_vm_readv() against our own pid resolves the mapping in the kernel and reports a short
+	// read for anything unmapped, so a bad address returns false instead of raising SIGSEGV. The
+	// alternatives are worse: parsing /proc/self/maps costs a file read per probe, and catching the
+	// signal would collide with the page-tracking handler the GPU already installs.
+	struct iovec local {
+		destination, size
+	};
+	struct iovec remote {
+		reinterpret_cast<void*>(static_cast<uintptr_t>(address)), size
+	};
+	const auto got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+	return got >= 0 && static_cast<uint64_t>(got) == size;
 }
 
 } // namespace Common

@@ -39,6 +39,11 @@ bool     Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nu
 bool     FlushInstructionCache(uint64_t address, uint64_t size);
 bool     PatchReplace(uint64_t vaddr, uint64_t value);
 
+// Reads guest memory without trusting the address. Returns false instead of faulting when the
+// range is not fully mapped, so callers can validate a pointer the guest computed. Use this rather
+// than dereferencing directly whenever the address came from guest data or shader analysis.
+bool     TryRead(uint64_t address, void* destination, uint64_t size);
+
 } // namespace VirtualMemory
 
 } // namespace Common

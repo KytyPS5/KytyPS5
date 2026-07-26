@@ -703,9 +703,12 @@ private:
 		// false, which the dispatch path already handles by skipping the dispatch.
 		if (m_runtime.read_memory == nullptr &&
 		    !Common::VirtualMemory::TryRead(address, &result, sizeof(result))) {
-			return Fail(error, fmt::format("ReadConst pc=0x{:08x} cannot read guest memory at "
-			                               "0x{:016x}",
-			                               value.pc, address));
+			return Fail(error,
+			            fmt::format("ReadConst pc=0x{:08x} cannot read guest memory at 0x{:016x} "
+			                        "(base=0x{:016x} lo={} hi={})",
+			                        value.pc, address, base,
+			                        ScalarValueToString(m_program.provenance, value.args[0]),
+			                        ScalarValueToString(m_program.provenance, value.args[1])));
 		}
 		return true;
 	}

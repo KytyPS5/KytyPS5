@@ -2375,10 +2375,20 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			case DepthOverlap::Unsupported: break;
 		}
 		if (!supported) {
+			// Dimensions included deliberately: the question this abort has to answer is whether
+			// the image it collides with is real. An extent that does not agree with
+			// width/height/pitch, or a base too weakly aligned for its tile mode, means the
+			// descriptor was mis-derived and the alias is an artefact rather than something the
+			// cache needs to support.
+			const auto& ci = cached.info;
 			EXIT("TextureCache: unsupported depth-target alias, depth=0x%016" PRIx64
-			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64
+			     " existing_dims=%ux%ux%u pitch=%u levels=%u/%u base_level=%u fmt=0x%08" PRIx32
+			     " tile=%u type=%u base_align=0x%" PRIx64 "\n",
 			     info.address, info.size, static_cast<uint32_t>(cached.kind), cached.Address(),
-			     cached.Size());
+			     cached.Size(), ci.width, ci.height, ci.depth, ci.pitch, ci.levels, ci.view_levels,
+			     ci.base_level, ci.format, ci.tile, ci.type,
+			     cached.Address() & (uint64_t {0x10000} - 1));
 		}
 		retire.push_back(&cached);
 	}

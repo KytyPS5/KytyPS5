@@ -799,7 +799,6 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 	    ImageRangeOverlaps(buffer_address, buffer_size, image_address, image_size);
 	const bool buffer_page_aligned =
 	    ((buffer_address | buffer_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
-	const bool image_page_aligned = ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	switch (binding) {
 		case BufferImageBinding::Texture:
 			// Same reasoning as the RenderTarget case below: a GPU cache invalidate/flush range

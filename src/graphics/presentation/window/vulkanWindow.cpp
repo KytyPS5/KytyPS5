@@ -27,6 +27,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/guestMemoryWindow.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
@@ -898,7 +899,10 @@ void VulkanCreate(WindowContext& window) {
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
 	    VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    "VK_KHR_maintenance1",
+	    // Lets guest memory be handed to the GPU as-is instead of copied. Required by
+	    // GuestMemoryWindow, which shaders use to reach addresses only they can compute.
+	    VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {
@@ -962,6 +966,10 @@ void VulkanCreate(WindowContext& window) {
 	if (!window.graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
+
+	// Optional: shaders fall back to host-resolved descriptors when the import is unavailable. The
+	// alias self-test runs on the first populated range refresh, once the guest has mapped memory.
+	GetGuestMemoryWindow().EnsureImported(window.graphic_ctx);
 
 	window.swapchain = VulkanCreateSwapchain(2);
 	RenderDocSetActiveWindow(window.graphic_ctx.instance, window.window);

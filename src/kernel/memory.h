@@ -6,6 +6,8 @@
 #include "common/subsystems.h"
 #include "common/virtualMemory.h"
 
+#include <vector>
+
 namespace Libs::LibKernel::Memory {
 
 KYTY_SUBSYSTEM_DEFINE(Memory);
@@ -93,6 +95,20 @@ struct KernelMemoryPoolBlockStats {
 
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
+
+// One guest virtual range and where it lives inside the single contiguous direct-memory backing.
+// Lets the GPU reach guest memory at addresses only a shader knows, without copying.
+struct GuestMemoryRange {
+	uint64_t vaddr          = 0;
+	uint64_t size           = 0;
+	uint64_t backing_offset = 0;
+};
+
+// Host pointer and size of the contiguous backing every guest mapping aliases. Null when the
+// backing is unavailable.
+bool QueryDirectMemoryBacking(void** base, uint64_t* size);
+// Currently-accessible guest ranges, ordered by address.
+void QueryDirectMemoryRanges(std::vector<GuestMemoryRange>& out);
 
 void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void SetFlexibleMemorySize(uint64_t size);

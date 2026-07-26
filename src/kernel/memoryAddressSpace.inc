@@ -1068,6 +1068,26 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+
+public:
+	// The whole backing store is one contiguous host mapping of the shared object every guest view
+	// aliases, so the GPU can be given the same pages without copying anything -- see
+	// Graphics::GuestMemoryWindow. Guest virtual addresses are not contiguous in it, hence the
+	// separate range list.
+	[[nodiscard]] uint8_t* BackingBase() const { return m_backing_base; }
+	[[nodiscard]] uint64_t BackingSize() const { return m_size; }
+
+	void CollectRanges(std::vector<GuestMemoryRange>& out) {
+		std::lock_guard lock(m_mutex);
+		out.clear();
+		out.reserve(m_maps.size());
+		for (const auto& [key, entry]: m_maps) {
+			if (entry.mode == VirtualMemory::Mode::NoAccess || entry.size == 0) {
+				continue;
+			}
+			out.push_back({entry.vaddr, entry.size, entry.backing_offset});
+		}
+	}
 };
 
 // Windows has no native way to split/rejoin a VA reservation without the MEM_*_PLACEHOLDER

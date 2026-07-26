@@ -1040,6 +1040,29 @@ static constexpr AlignedPos GetAlignedPos(uint64_t pos, size_t alignment) {
 
 static_assert(!GetAlignedPos(UINT64_MAX - 1, 4).valid);
 
+bool QueryDirectMemoryBacking(void** base, uint64_t* size) {
+	std::lock_guard<std::recursive_mutex> lock(g_memory_operation_mutex);
+	if (g_direct_memory_backing == nullptr || !g_direct_memory_backing->IsAvailable()) {
+		return false;
+	}
+	if (base != nullptr) {
+		*base = g_direct_memory_backing->BackingBase();
+	}
+	if (size != nullptr) {
+		*size = g_direct_memory_backing->BackingSize();
+	}
+	return true;
+}
+
+void QueryDirectMemoryRanges(std::vector<GuestMemoryRange>& out) {
+	std::lock_guard<std::recursive_mutex> lock(g_memory_operation_mutex);
+	out.clear();
+	if (g_direct_memory_backing == nullptr || !g_direct_memory_backing->IsAvailable()) {
+		return;
+	}
+	g_direct_memory_backing->CollectRanges(out);
+}
+
 void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	EXIT_IF(g_alloc_callback != nullptr || g_free_callback != nullptr);
 	EXIT_IF(alloc_func == nullptr || free_func == nullptr);

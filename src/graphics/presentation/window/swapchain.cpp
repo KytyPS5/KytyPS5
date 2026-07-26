@@ -27,6 +27,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/guestMemoryWindow.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/transfer.h"
@@ -487,6 +488,9 @@ PreparedFrame& WindowPrepareFrame(CommandBuffer& buffer, VideoOutVulkanImage& im
 
 	auto*             frame = GetPreparedFramePool()->Acquire();
 	Common::LockGuard render_lock(GetRenderContext().GetMutex());
+	// Guest mappings change as the game streams; refresh once per presented frame so shaders
+	// translating run-time addresses see the current layout.
+	GetGuestMemoryWindow().RefreshRanges();
 	GetRenderContext().GetTextureCache().RefreshVideoOut(image);
 	ConfigurePreparedFrame(*frame, image.extent, image.format);
 	ImageImageCopy copy {image};

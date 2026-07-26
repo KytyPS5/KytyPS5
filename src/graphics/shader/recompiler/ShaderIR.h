@@ -644,6 +644,12 @@ struct SampledResourcePair {
 	bool operator==(const SampledResourcePair& other) const = default;
 };
 
+// Which part of the imported guest-memory window an address resource stands for. Chunk resources
+// are the 1 GiB slices of the backing a shader selects between; the range table translates a guest
+// virtual address into an offset within it. Both are appended by the binding layout, not derived
+// from shader provenance.
+enum class GuestWindowRole : uint8_t { None, Chunk, RangeTable };
+
 struct AddressResource {
 	uint32_t     source           = 0;
 	uint32_t     first_use_pc     = 0;
@@ -657,6 +663,9 @@ struct AddressResource {
 	// load, for example), so it cannot be resolved on the host. The shader recomputes the address
 	// itself and indexes relative to specialized_base.
 	bool dynamic_base = false;
+	// Set on the synthetic resources that expose the imported guest-memory window.
+	GuestWindowRole guest_window_role  = GuestWindowRole::None;
+	uint32_t        guest_window_index = 0;
 
 	bool operator==(const AddressResource& other) const = default;
 };
@@ -735,7 +744,10 @@ struct BindingLayout {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxAddresses    = 32;
+	static constexpr uint32_t MaxAddresses    = 64;
+	// Slots the shader searches when translating a guest address through the imported window.
+	// Sized well above the handful of ranges a running title actually maps.
+	static constexpr uint32_t MaxGuestWindowRanges = 16;
 	static constexpr uint32_t MaxImages       = 32;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -772,6 +784,10 @@ struct Program {
 	bool                    shader_info_complete       = false;
 	BindingLayout           bindings;
 	bool                    binding_layout_complete = false;
+	// Mirrors CompileOptions::guest_window_chunks; the binding layout appends one address resource
+	// per chunk plus the range table when any resource needs run-time translation.
+	uint32_t guest_window_chunks = 0;
+	bool     uses_guest_window   = false;
 };
 
 bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,

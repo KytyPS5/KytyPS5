@@ -21,6 +21,9 @@ struct CompileOptions {
 	uint64_t                      shader_hash     = 0;
 	uint64_t                      shader_base     = 0;
 	std::optional<uint64_t>       flat_memory_base;
+	// Number of 1 GiB chunks of guest memory the host imported. Zero disables the run-time address
+	// translation path, so shaders needing it fail to compile exactly as they did before.
+	uint32_t                      guest_window_chunks = 0;
 	uint32_t                      descriptor_set       = 0;
 	uint32_t                      push_constant_offset = 0;
 	bool                          dump_ir              = true;

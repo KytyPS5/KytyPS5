@@ -85,6 +85,26 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::TryMarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	std::lock_guard access(m_access_mutex);
+	RequireMapped(vaddr, size);
+	bool blocked = false;
+	Iterate<true>(vaddr, size, [&blocked](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		// Checked under the same lock the fault path holds, so the answer cannot go stale between
+		// the test and the change of state.
+		if (manager->HasPendingFault(manager->GetCpuAddr() + offset, bytes)) {
+			blocked = true;
+			return;
+		}
+		const auto changed =
+		    manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		manager->ApplyProtection(changed, false);
+	});
+	return !blocked;
+}
+
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);

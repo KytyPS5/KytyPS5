@@ -25,6 +25,10 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
+	// Same, but declines instead of asserting when any page in the range is mid ownership transfer.
+	// The fault path runs from the signal handler and takes only the per-region lock, so a caller
+	// that checks state and then marks in two steps has no way to exclude it.
+	[[nodiscard]] bool TryMarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);

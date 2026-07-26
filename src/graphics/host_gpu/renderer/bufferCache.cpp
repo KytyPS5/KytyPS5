@@ -1247,7 +1247,27 @@ void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
 	}
 	// A fresh tracker is CPU-dirty by construction when no cached buffer exists. Keep the range
 	// CPU-dirty so subsequently-created buffer uploads the just-published image backing.
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	//
+	// This runs on the readback worker, so a guest thread can be part-way through a page fault on
+	// the same pages. Blocking until that clears deadlocks: a fault on a GPU-dirty page waits for
+	// the download this very worker is performing, so the two wait on each other (measured -- the
+	// range never settles). Marking underneath the fault is not an option either; the tracker's
+	// consistency check rejects it, and rightly, because the faulting thread decides the final
+	// dirty state itself in CompleteCpuFault().
+	//
+	// So defer to it. The image bytes are already in the backing -- WriteBacking() ran before this
+	// -- and the thread taking ownership will settle the page state for the access it faulted on.
+	// What we give up is the guarantee that the range is left CPU-dirty, so a buffer created later
+	// might not re-upload this backing; that is a stale-texture risk, and a far better one than
+	// aborting the process.
+	if (!m_memory_tracker.TryMarkRegionAsCpuModified(vaddr, size)) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("BufferCache: image backing left to an in-flight CPU fault, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     vaddr, size);
+		}
+	}
 }
 
 void BufferCache::ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read,

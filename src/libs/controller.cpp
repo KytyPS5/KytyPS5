@@ -68,6 +68,7 @@ private:
 	};
 
 	void                          CheckActive();
+	[[nodiscard]] bool            AcceptsInputFrom(int id) const;
 	[[nodiscard]] ControllerState GetLastState() const;
 	void                          AddState(const ControllerState& state);
 
@@ -118,6 +119,7 @@ KYTY_SUBSYSTEM_INIT(Controller) {
 
 	g_controller = new GameController;
 	g_controller->Connect(KEYBOARD_CONTROLLER_ID);
+
 }
 
 KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Controller) {}
@@ -206,10 +208,18 @@ void GameController::AddState(const ControllerState& state) {
 	m_states_num++;
 }
 
+// The guest has exactly one pad, so every host input device feeds the same virtual controller.
+// Gating on m_active_id alone silently drops the keyboard the moment any gamepad is present -- and
+// SDL reports a gamepad on this machine at startup, so keys did nothing and games waiting on a
+// button press sat on their splash screen forever. Merge the keyboard in instead of replacing it.
+bool GameController::AcceptsInputFrom(int id) const {
+	return m_active_id == id || id == KEYBOARD_CONTROLLER_ID;
+}
+
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id) {
+	if (AcceptsInputFrom(id)) {
 		auto state = GetLastState();
 
 		state.time = LibKernel::KernelGetProcessTime();
@@ -227,7 +237,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id) {
+	if (AcceptsInputFrom(id)) {
 		auto state = GetLastState();
 
 		state.time = LibKernel::KernelGetProcessTime();

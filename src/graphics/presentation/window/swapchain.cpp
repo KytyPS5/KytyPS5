@@ -199,9 +199,13 @@ static uint32_t GetPresentationTexelSize(vk::Format format) {
 static void DiagnosePreparedFrame(PreparedFrame& frame) {
 	static uint32_t presented_frames = 0;
 	presented_frames++;
+	// Early frames pin down start-up, then keep sampling forever: "is the picture still changing?"
+	// is the cheapest signal there is for whether a game is progressing or wedged, and a game can
+	// sit on a splash for minutes before it moves.
 	if (presented_frames > 3 && presented_frames != 30 && presented_frames != 60 &&
 	    presented_frames != 120 && presented_frames != 130 && presented_frames != 140 &&
-	    presented_frames != 150 && presented_frames != 180 && presented_frames != 240) {
+	    presented_frames != 150 && presented_frames != 180 && presented_frames != 240 &&
+	    (presented_frames % 600) != 0) {
 		return;
 	}
 

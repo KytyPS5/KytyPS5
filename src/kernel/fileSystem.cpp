@@ -153,6 +153,14 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
 
+	// `opened` is only set once KernelOpen() has finished every step, so a descriptor abandoned on
+	// a later failure still owns the handle the Create()/Open() that did succeed produced. Release
+	// it here instead of expecting each failure path to remember -- Common::File's destructor
+	// asserts on a live handle, which turned a recoverable open failure into a fatal error.
+	if (!m_files[index]->f.IsInvalid()) {
+		m_files[index]->f.Close();
+	}
+
 	delete m_files[index];
 	m_files[index] = nullptr;
 }

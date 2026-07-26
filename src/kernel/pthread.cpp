@@ -3729,8 +3729,20 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
 	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
 #else
-	auto dt = Common::DateTime::FromSystemUTC();
-	sec_to_timeval(tp, dt.ToUnix());
+	// Read the clock directly rather than going through DateTime::FromSystemUTC(), which is built
+	// on time() and therefore carries no sub-second information at all -- it reported tv_usec = 0
+	// forever. Windows has always used a microsecond-precision source here; matching it matters
+	// because this is the clock a HashLink runtime asks for the time of day, so a guest computing
+	// its frame delta from it saw zero for a whole second and then a one-second jump. Dead Cells
+	// renders from vblank but drives its logic from this, which is why it sat on a splash screen
+	// that only ever advanced when a button was pressed.
+	timespec now {};
+	if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+		result = -1;
+	} else {
+		tp->tv_sec  = now.tv_sec;
+		tp->tv_usec = now.tv_nsec / 1000;
+	}
 #endif
 
 	if (result == 0) {

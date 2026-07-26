@@ -263,8 +263,28 @@ uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	return size;
 }
 
-bool SysFileTruncate(sys_file_t& /*f*/, uint64_t /*size*/) {
-	return false;
+bool SysFileTruncate(sys_file_t& f, uint64_t size) {
+	// Was an unconditional `return false`, which made every O_TRUNC open on a real file report
+	// failure even though the open itself had worked. KernelOpen() treats that as a failed open and
+	// throws the descriptor away, so a guest opening a file with O_RDWR|O_CREAT|O_TRUNC -- Dead
+	// Cells writing its options file -- could never do so.
+	if (f.type != SYS_FILE_FILE || f.f == nullptr) {
+		return false;
+	}
+	// The stream buffers independently of the descriptor, so flush before resizing and restore the
+	// caller's position afterwards: ftruncate() leaves the offset alone even when it now points
+	// past the end.
+	if (fflush(f.f) != 0) {
+		return false;
+	}
+	const auto position = ftello(f.f);
+	if (ftruncate(fileno(f.f), static_cast<off_t>(size)) != 0) {
+		return false;
+	}
+	if (position >= 0) {
+		fseeko(f.f, position, SEEK_SET);
+	}
+	return true;
 }
 
 bool SysFileUnlink(sys_file_t& /*f*/, const std::filesystem::path& name) {

@@ -65,12 +65,21 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 4ull * 1024ull * 1024ull * 1024ull;
 
+// Where a guest mapping goes when the guest passes no address hint. Guest memory has to stay below
+// IsGpuAddressRange()'s limit or the GPU cannot track it, and an unhinted host mmap() lands
+// wherever the kernel likes - typically ~140 TB up, far outside that window. Both the flexible and
+// direct paths therefore start their search here rather than at 0.
+constexpr uint64_t DEFAULT_PS5_BASE = 0x200000000;
+
 static uint64_t g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 
 static Graphics::GpuResourceManager& GetGpuResources() {
 	return Graphics::GetRenderContext().GetGpuResources();
 }
 
+// The ceiling is not arbitrary: TRACKER_ADDRESS_SIZE sizes the GPU page/region directories, which
+// are flat arrays allocated up front (2 MiB apiece at 1 TB, 512 MiB apiece at 256 TB). Raising it
+// means making those sparse first, so guest allocations are placed to fit the window instead.
 static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t GPU_ADDRESS_LIMIT = 1ull << 40u;
 	return vaddr != 0 && size != 0 && vaddr < GPU_ADDRESS_LIMIT &&
@@ -1921,7 +1930,6 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 
 	constexpr size_t   PAGE_SIZE         = 0x4000;
 	constexpr size_t   MAXIMUM_NAME_SIZE = 32;
-	constexpr uint64_t DEFAULT_PS5_BASE  = 0x200000000;
 	// Prefixed to avoid colliding with the MAP_* macros <sys/mman.h> defines on POSIX platforms;
 	// these are the guest (PS4/PS5) ABI's own mmap flag bit values, not the host's.
 	constexpr int      KYTY_MAP_FIXED        = 0x10;
@@ -2827,8 +2835,13 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 				shared_backing          = true;
 			}
 		} else {
-			out_addr = g_direct_memory_backing->MapAligned(in_addr, len, direct_memory_start, mode,
-			                                               alignment, &shared_failure);
+			// The reservation only searches from a hint it can already honour, so round the guest
+			// base up to the requested alignment; an unaligned hint would be dropped for an
+			// unhinted mmap() far above the GPU-addressable window.
+			const auto default_base = (DEFAULT_PS5_BASE + alignment - 1) & ~(alignment - 1);
+			const auto search_addr  = (in_addr != 0 ? in_addr : default_base);
+			out_addr = g_direct_memory_backing->MapAligned(search_addr, len, direct_memory_start,
+			                                               mode, alignment, &shared_failure);
 			shared_backing = out_addr != 0;
 		}
 	}

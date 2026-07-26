@@ -45,6 +45,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -76,7 +77,59 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
+static uint32_t PadButtonFromName(const std::string& name) {
+	if (name == "L3") return Controller::PAD_BUTTON_L3;
+	if (name == "R3") return Controller::PAD_BUTTON_R3;
+	if (name == "Options") return Controller::PAD_BUTTON_OPTIONS;
+	if (name == "Up") return Controller::PAD_BUTTON_UP;
+	if (name == "Right") return Controller::PAD_BUTTON_RIGHT;
+	if (name == "Down") return Controller::PAD_BUTTON_DOWN;
+	if (name == "Left") return Controller::PAD_BUTTON_LEFT;
+	if (name == "L2") return Controller::PAD_BUTTON_L2;
+	if (name == "R2") return Controller::PAD_BUTTON_R2;
+	if (name == "L1") return Controller::PAD_BUTTON_L1;
+	if (name == "R1") return Controller::PAD_BUTTON_R1;
+	if (name == "Triangle") return Controller::PAD_BUTTON_TRIANGLE;
+	if (name == "Circle") return Controller::PAD_BUTTON_CIRCLE;
+	if (name == "Cross") return Controller::PAD_BUTTON_CROSS;
+	if (name == "Square") return Controller::PAD_BUTTON_SQUARE;
+	if (name == "TouchPad") return Controller::PAD_BUTTON_TOUCH_PAD;
+	return 0;
+}
+
 static uint32_t KeyboardKeyToPadButton(int key_code) {
+	// First, consult the user-supplied keymap if any key was bound to this key.
+	// Build a reverse index (SDL key code -> pad button name) lazily.
+	static std::unordered_map<int, uint32_t> reverse_index;
+	static bool reverse_built = false;
+	const auto& keymap = Config::GetKeymap();
+	if (!reverse_built) {
+		reverse_built = true;
+		for (const auto& kv : keymap) {
+			const std::string& pad_name  = kv.first;
+			const std::string& key_name  = kv.second;
+			if (key_name.rfind("Mouse:", 0) == 0) continue; // mouse bindings resolved elsewhere
+			SDL_Keycode sdl_k = SDL_GetKeyFromName(key_name.c_str());
+			if (sdl_k != SDLK_UNKNOWN) {
+				uint32_t pad = PadButtonFromName(pad_name);
+				if (pad != 0) reverse_index[sdl_k] = pad;
+			}
+		}
+	}
+	auto it = reverse_index.find(key_code);
+	if (it != reverse_index.end() && it->second != 0) {
+		return it->second;
+	}
+
+	// When the user supplied a --keymap, only keys they explicitly bound
+	// should produce pad events. Falling back to the built-in default layout
+	// here would re-arm the old defaults (e.g. S -> Down) alongside a freshly
+	// remapped key (e.g. X -> Down), causing the user's old binds to "stick".
+	if (Config::KeymapIsActive()) {
+		return 0;
+	}
+
+	// Fallback to the built-in default layout when no custom bind exists.
 	switch (key_code) {
 		case SDLK_w: return Controller::PAD_BUTTON_UP;
 		case SDLK_a: return Controller::PAD_BUTTON_LEFT;
@@ -88,6 +141,8 @@ static uint32_t KeyboardKeyToPadButton(int key_code) {
 		case SDLK_l: return Controller::PAD_BUTTON_CIRCLE;
 		case SDLK_q: return Controller::PAD_BUTTON_L1;
 		case SDLK_e: return Controller::PAD_BUTTON_R1;
+		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
+		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
 		case SDLK_RETURN:
 		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
 		case SDLK_BACKSPACE:
@@ -403,6 +458,20 @@ void GameEventKeyboard(WindowGame& game, const EventKeyboard& key) {
 #endif
 }
 
+static uint32_t MouseToPadButton(const std::string& mouse_event) {
+	// mouse_event is e.g. "Left", "Right", "Middle".
+	const auto& keymap = Config::GetKeymap();
+	for (const auto& kv : keymap) {
+		const std::string& pad_name = kv.first;
+		const std::string& binding  = kv.second;
+		if (binding.rfind("Mouse:", 0) != 0) continue;
+		if (binding.substr(6) == mouse_event) {
+			return PadButtonFromName(pad_name);
+		}
+	}
+	return 0;
+}
+
 void GameEventMouse([[maybe_unused]] WindowGame& game, [[maybe_unused]] const EventMouse& mb) {
 #ifdef KYTY_DBG_INPUT
 	if (mb.wheel) {
@@ -420,6 +489,28 @@ void GameEventMouse([[maybe_unused]] WindowGame& game, [[maybe_unused]] const Ev
 		     (mb.x2 ? "x2" : ""), (mb.touch ? "_touch" : ""), (mb.down ? "down" : ""),
 		     (mb.up ? "up" : ""), (mb.pressed ? "pressed" : ""), (mb.released ? "released" : ""),
 		     mb.x, mb.y);
+	}
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// Mouse button -> DualSense pad button mapping (if user bound any bind to
+	// a "Mouse:*" event in the launcher keymap).
+	if ((mb.down || mb.up) && !mb.wheel && !mb.motion) {
+		std::string which;
+		if (mb.left) which = "Left";
+		else if (mb.right) which = "Right";
+		else if (mb.middle) which = "Middle";
+		if (!which.empty()) {
+			uint32_t pad = MouseToPadButton(which);
+			if (pad != 0) {
+				static bool mouse_connected = false;
+				if (!mouse_connected) {
+					Controller::ControllerConnect(KEYBOARD_CONTROLLER_ID);
+					mouse_connected = true;
+				}
+				Controller::ControllerButton(KEYBOARD_CONTROLLER_ID, pad, mb.down);
+			}
+		}
 	}
 #endif
 }

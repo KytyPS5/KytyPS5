@@ -93,4 +93,45 @@ bool NggRectlistDrawEnabled() {
 	return g_config->ngg_rectlist_draw_enabled;
 }
 
+int GetAudioVolume() {
+	return g_config->audio_volume;
+}
+
+bool GetAudioMuted() {
+	return g_config->audio_muted;
+}
+
+std::string GetAudioBackend() {
+	return g_config->audio_backend;
+}
+
+const std::unordered_map<std::string, std::string>& GetKeymap() {
+	static std::unordered_map<std::string, std::string> parsed;
+	// Parse lazily on first access (and reparse if the underlying string
+	// changed). The emulator process is single-threaded for config access.
+	static std::string last_raw;
+	if (parsed.empty() || last_raw != g_config->keymap) {
+		parsed.clear();
+		last_raw = g_config->keymap;
+		size_t i = 0;
+		while (i < last_raw.size()) {
+			size_t semi = last_raw.find(';', i);
+			if (semi == std::string::npos) {
+				semi = last_raw.size();
+			}
+			auto token = last_raw.substr(i, semi - i);
+			auto eq = token.find('=');
+			if (eq != std::string::npos && eq + 1 < token.size()) {
+				parsed[token.substr(0, eq)] = token.substr(eq + 1);
+			}
+			i = semi + 1;
+		}
+	}
+	return parsed;
+}
+
+bool KeymapIsActive() {
+	return g_config != nullptr && !g_config->keymap.empty();
+}
+
 } // namespace Config

@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KytyPS5 — Launcher UI Preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-deep:      #060910;
+  --bg-base:      #0A0D15;
+  --bg-surface:   #0F1219;
+  --bg-card:      rgba(14, 18, 28, 0.72);
+  --bg-card-solid:#101420;
+  --bg-hover:     rgba(25, 32, 48, 0.55);
+  --bg-input:     rgba(12, 15, 22, 0.85);
+  --bg-sidebar:   rgba(8, 11, 18, 0.88);
+
+  --border-subtle:   rgba(38, 45, 62, 0.5);
+  --border-card:     rgba(38, 45, 62, 0.35);
+
+  --accent:       #2DD4BF;          /* Teal-400 */
+  --accent-dim:   rgba(45,212,191,0.12);
+  --accent-glow:  rgba(45,212,191,0.3);
+  --accent-secondary: #A78BFA;
+  --accent-green: #34D399;
+  --accent-amber: #FBBF24;
+  --accent-red:   #F87171;
+  --accent-blue:  #60A5FA;
+
+  --text-primary:   #E8ECF4;
+  --text-secondary: #94A3B8;
+  --text-dim:       #5C6B82;
+  --text-muted:     #3E4A5E;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  --shadow-card: 0 4px 20px rgba(0,0,0,0.35);
+  --shadow-glow: 0 0 18px rgba(45,212,191,0.18);
+
+  --transition-fast: 0.15s ease;
+  --transition-med:  0.25s cubic-bezier(0.4,0,0.2,1);
+  --transition-slow: 0.4s cubic-bezier(0.4,0,0.2,1);
+
+  --sidebar-collapsed: 62px;
+  --sidebar-expanded:  210px;
+  --right-panel-width: 260px;
+}
+
+html, body {
+  height: 100%; overflow: hidden;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  display: flex; flex-direction: column;
+  height: 100vh; width: 100vw;
+  position: relative; overflow: hidden;
+}
+
+/* ═══════════════════ DYNAMIC BLURRED BACKDROP ═══════════════════ */
+.app-backdrop {
+  position: absolute; inset: -20px;
+  z-index: 0;
+  background-size: cover;
+  background-position: center;
+  filter: blur(28px) brightness(0.28) saturate(1.4);
+  transform: scale(1.05);
+  transition: background-image 0.6s ease-in-out, filter 0.6s ease;
+  pointer-events: none;
+}
+.app-backdrop-overlay {
+  position: absolute; inset: 0; z-index: 1;
+  background: radial-gradient(circle at 60% 40%, rgba(45,212,191,0.05) 0%, transparent 60%),
+              linear-gradient(180deg, rgba(6,9,16,0.7) 0%, rgba(6,9,16,0.85) 60%, rgba(6,9,16,0.95) 100%);
+  pointer-events: none;
+}
+
+/* ═══════════════════ TITLE BAR ═══════════════════ */
+.titlebar {
+  display: flex; align-items: center; justify-content: space-between;
+  height: 36px; padding: 0 10px;
+  background: rgba(6,9,16,0.8);
+  border-bottom: 1px solid var(--border-subtle);
+  user-select: none; flex-shrink: 0;
+  z-index: 50; backdrop-filter: blur(12px);
+}
+.titlebar-left { display: flex; align-items: center; gap: 9px; }
+.titlebar-logo {
+  width: 20px; height: 20px;
+  filter: brightness(0.6) sepia(1) hue-rotate(140deg) saturate(3) brightness(0.9);
+}
+.titlebar-name { font-weight: 600; font-size: 12px; color: var(--text-primary); letter-spacing: 0.5px; }
+.titlebar-version {
+  font-size: 9.5px; font-weight: 600;
+  background: var(--accent-dim); color: var(--accent);
+  padding: 1.5px 7px; border-radius: 8px;
+  border: 1px solid rgba(45,212,191,0.2);
+}
+.titlebar-controls { display: flex; gap: 1px; }
+.titlebar-btn {
+  width: 40px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--text-dim); border-radius: 3px;
+  transition: all var(--transition-fast);
+}
+.titlebar-btn:hover { background: rgba(255,255,255,0.06); color: var(--text-secondary); }
+.titlebar-btn.close:hover { background: #C42B1C; color: white; }
+.titlebar-btn svg { width: 13px; height: 13px; }
+
+/* ═══════════════════ BODY LAYOUT ═══════════════════ */
+.body-layout {
+  flex: 1; display: flex; overflow: hidden;
+  position: relative; z-index: 10;
+}
+
+/* ═══════════════════ SIDEBAR ═══════════════════ */
+.sidebar {
+  width: var(--sidebar-collapsed);
+  min-width: var(--sidebar-collapsed);
+  display: flex; flex-direction: column;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-subtle);
+  backdrop-filter: blur(20px);
+  transition: width var(--transition-slow), min-width var(--transition-slow);
+  overflow: hidden; z-index: 40; flex-shrink: 0;
+}
+.sidebar.expanded {
+  width: var(--sidebar-expanded);
+  min-width: var(--sidebar-expanded);
+}
+
+.sidebar-toggle {
+  display: flex; align-items: center; justify-content: center;
+  height: 42px; margin: 6px 0 4px;
+  background: transparent; border: none;
+  cursor: pointer; color: var(--text-dim);
+  transition: color var(--transition-fast); flex-shrink: 0;
+}
+.sidebar-toggle:hover { color: var(--accent); }
+.sidebar-toggle svg { width: 18px; height: 18px; transition: transform var(--transition-slow); }
+.sidebar.expanded .sidebar-toggle svg { transform: rotate(180deg); }
+
+.sidebar-nav {
+  flex: 1; display: flex; flex-direction: column;
+  gap: 2px; padding: 4px 8px;
+  overflow-y: auto; overflow-x: hidden;
+}
+
+.sidebar-item {
+  display: flex; align-items: center; gap: 12px;
+  height: 42px; min-height: 42px; padding: 0 12px;
+  border-radius: var(--radius-md);
+  background: transparent; border: none;
+  cursor: pointer; color: var(--text-dim);
+  font-family: inherit; font-size: 13px; font-weight: 500;
+  transition: all var(--transition-med);
+  white-space: nowrap; overflow: hidden; position: relative;
+}
+.sidebar-item:hover { background: var(--bg-hover); color: var(--text-secondary); }
+.sidebar-item.active { background: var(--accent-dim); color: var(--accent); }
+.sidebar-item.active::before {
+  content: ''; position: absolute; left: 0; top: 8px; bottom: 8px;
+  width: 3px; border-radius: 0 3px 3px 0;
+  background: var(--accent); box-shadow: 0 0 8px var(--accent-glow);
+}
+.sidebar-item svg { width: 20px; height: 20px; flex-shrink: 0; }
+.sidebar-item .sidebar-label {
+  opacity: 0; transform: translateX(-6px);
+  transition: opacity var(--transition-med), transform var(--transition-med);
+  pointer-events: none;
+}
+.sidebar.expanded .sidebar-label { opacity: 1; transform: translateX(0); pointer-events: auto; }
+.sidebar-divider { height: 1px; margin: 8px 12px; background: var(--border-subtle); }
+
+/* ═══════════════════ MAIN CONTENT ═══════════════════ */
+.main-area {
+  flex: 1; display: flex; overflow: hidden; position: relative;
+}
+
+.content-panel {
+  flex: 1; overflow-y: auto; overflow-x: hidden;
+  padding: 24px 28px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(45,212,191,0.18) transparent;
+}
+.content-panel::-webkit-scrollbar { width: 5px; }
+.content-panel::-webkit-scrollbar-thumb { background: rgba(45,212,191,0.18); border-radius: 4px; }
+
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+.page-header { margin-bottom: 22px; }
+.page-title { font-size: 20px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.3px; }
+.page-subtitle { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+
+/* ═══════════════════ RIGHT PANEL ═══════════════════ */
+.right-panel {
+  width: var(--right-panel-width);
+  min-width: var(--right-panel-width);
+  display: flex; flex-direction: column;
+  background: var(--bg-sidebar);
+  border-left: 1px solid var(--border-subtle);
+  backdrop-filter: blur(20px);
+  flex-shrink: 0; z-index: 30; overflow: hidden;
+}
+
+.rp-logo-section {
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px 16px 18px; position: relative;
+}
+.rp-logo {
+  width: 90px; height: 90px; object-fit: contain;
+  filter: brightness(0.45) sepia(1) hue-rotate(140deg) saturate(3) brightness(0.8);
+  opacity: 0.6;
+  animation: logoPulse 6s ease-in-out infinite;
+}
+.rp-logo-glow {
+  position: absolute; width: 130px; height: 130px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(45,212,191,0.08) 0%, transparent 70%);
+  animation: glowPulse 5s ease-in-out infinite;
+}
+@keyframes logoPulse { 0%,100% { opacity:.5; transform:scale(1); } 50% { opacity:.65; transform:scale(1.03); } }
+@keyframes glowPulse { 0%,100% { transform:scale(1); opacity:.5; } 50% { transform:scale(1.15); opacity:.8; } }
+
+.rp-divider { height: 1px; margin: 0 16px; background: linear-gradient(90deg, transparent, var(--border-subtle), transparent); }
+
+.rp-game-section { padding: 16px; flex: 1; display: flex; flex-direction: column; }
+.rp-game-thumb {
+  width: 100%; aspect-ratio: 16/9;
+  background: var(--bg-card);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 12px; overflow: hidden;
+  background-size: cover; background-position: center;
+  transition: all 0.4s ease;
+}
+.rp-game-thumb svg { width: 28px; height: 28px; color: var(--text-muted); }
+.rp-game-title { font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 3px; }
+.rp-game-desc { font-size: 11px; color: var(--text-dim); line-height: 1.4; }
+.rp-status { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; color: var(--text-dim); }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-green); box-shadow: 0 0 6px rgba(52,211,153,0.5); }
+
+.rp-actions { display: flex; flex-direction: column; gap: 6px; padding: 0 16px 12px; }
+.rp-btn {
+  display: flex; align-items: center; justify-content: center; gap: 7px; height: 38px;
+  border-radius: var(--radius-md); font-size: 12px; font-weight: 600;
+  font-family: inherit; cursor: pointer; border: none;
+  transition: all var(--transition-med);
+}
+.rp-btn svg { width: 15px; height: 15px; }
+.rp-btn-launch {
+  background: linear-gradient(135deg, var(--accent), #14B8A6);
+  color: #062019; box-shadow: 0 2px 14px rgba(45,212,191,0.2);
+}
+.rp-btn-launch:hover { box-shadow: var(--shadow-glow); transform: translateY(-1px); filter: brightness(1.1); }
+.rp-btn-stop {
+  background: rgba(255,255,255,0.04); border: 1px solid var(--border-subtle) !important;
+  color: var(--text-secondary);
+}
+.rp-btn-stop:hover { border-color: var(--accent-red) !important; color: var(--accent-red); }
+.rp-btn-console {
+  background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle) !important;
+  color: var(--text-dim);
+}
+.rp-btn-console:hover { border-color: var(--accent) !important; color: var(--accent); }
+.rp-btn-console.active { background: var(--accent-dim); border-color: var(--accent) !important; color: var(--accent); }
+
+.rp-footer { padding: 8px 16px; border-top: 1px solid var(--border-subtle); font-size: 9px; color: var(--text-muted); text-align: center; line-height: 1.4; }
+
+/* ═══════════════════ SECTION CARDS ═══════════════════ */
+.section-card {
+  background: var(--bg-card); border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg); padding: 18px 20px; margin-bottom: 14px;
+  backdrop-filter: blur(16px); box-shadow: var(--shadow-card);
+  transition: border-color var(--transition-med);
+}
+.section-card:hover { border-color: rgba(45,212,191,0.12); }
+.section-title {
+  font-size: 10.5px; font-weight: 700; color: var(--text-dim);
+  letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 8px;
+}
+.section-title svg { width: 14px; height: 14px; color: var(--accent); opacity: 0.7; }
+
+.setting-row {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,0.025);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-info { flex: 1; margin-right: 14px; }
+.setting-label { font-size: 13px; font-weight: 500; color: var(--text-primary); margin-bottom: 1px; display: flex; align-items: center; gap: 8px; }
+.setting-desc { font-size: 11px; color: var(--text-dim); line-height: 1.4; }
+
+/* "Support coming soon" badge */
+.badge-coming-soon {
+  font-size: 9px; font-weight: 600; letter-spacing: 0.4px;
+  padding: 2px 7px; border-radius: 4px;
+  background: rgba(167,139,250,0.12); color: var(--accent-secondary);
+  border: 1px solid rgba(167,139,250,0.25); text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Controls */
+.toggle {
+  position: relative; width: 38px; height: 21px;
+  background: rgba(255,255,255,0.07); border-radius: 11px; cursor: pointer;
+  transition: all var(--transition-med); border: 1px solid rgba(255,255,255,0.05); flex-shrink: 0;
+}
+.toggle.on { background: var(--accent); border-color: rgba(45,212,191,0.5); }
+.toggle.disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+.toggle::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 15px; height: 15px;
+  background: white; border-radius: 50%; transition: all var(--transition-med);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+}
+.toggle.on::after { left: 19px; }
+.toggle-label { font-size: 11px; color: var(--text-dim); margin-left: 8px; min-width: 20px; }
+
+.dropdown select {
+  appearance: none; width: 100%; padding: 6px 28px 6px 11px;
+  background: var(--bg-input); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm); color: var(--text-primary);
+  font-size: 12px; font-family: inherit; cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.dropdown select:hover { border-color: var(--accent); }
+.dropdown select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-dim); }
+.dropdown { position: relative; min-width: 125px; }
+.dropdown::after {
+  content: '▾'; position: absolute; right: 9px; top: 50%; transform: translateY(-50%);
+  color: var(--text-dim); font-size: 10px; pointer-events: none;
+}
+
+.spinner { display: flex; align-items: center; gap: 4px; }
+.spinner input {
+  width: 50px; padding: 5px 7px; background: var(--bg-input);
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);
+  color: var(--text-primary); font-size: 12px; font-family: inherit; text-align: center;
+}
+.spinner-btns { display: flex; flex-direction: column; gap: 1px; }
+.spinner-btn {
+  width: 18px; height: 11px; display: flex; align-items: center; justify-content: center;
+  background: var(--bg-input); border: 1px solid var(--border-subtle);
+  border-radius: 2px; color: var(--text-dim); font-size: 7px; cursor: pointer;
+}
+
+.btn {
+  padding: 6px 13px; background: var(--bg-input);
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);
+  color: var(--text-secondary); font-size: 12px; font-family: inherit; cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); color: var(--text-primary); }
+.btn-outline { background: transparent; border: 1px solid var(--border-subtle); color: var(--text-secondary); }
+.btn-outline:hover { border-color: var(--accent); background: var(--accent-dim); color: var(--accent); }
+.commit-badge { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 4px 10px; background: var(--bg-input); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); color: var(--accent); }
+
+/* ═══════════════════ LIBRARY ═══════════════════ */
+.library-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.library-search { flex: 1; position: relative; }
+.library-search input {
+  width: 100%; padding: 9px 14px 9px 34px; background: var(--bg-card);
+  border: 1px solid var(--border-card); border-radius: var(--radius-md);
+  color: var(--text-primary); font-size: 13px; font-family: inherit;
+}
+.library-search input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+.library-search input::placeholder { color: var(--text-dim); }
+.library-search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--text-dim); }
+
+.library-view-btns { display: flex; gap: 2px; }
+.library-view-btn {
+  width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+  background: var(--bg-card); border: 1px solid var(--border-card);
+  border-radius: var(--radius-sm); color: var(--text-dim); cursor: pointer;
+}
+.library-view-btn:hover, .library-view-btn.active { color: var(--accent); border-color: var(--accent); }
+.library-view-btn svg { width: 15px; height: 15px; }
+
+.library-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+.game-card {
+  background: var(--bg-card); border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg); overflow: hidden; cursor: pointer;
+  transition: all var(--transition-med); position: relative;
+}
+.game-card:hover {
+  border-color: var(--accent); transform: translateY(-3px);
+  box-shadow: 0 8px 28px rgba(0,0,0,0.4), 0 0 16px rgba(45,212,191,0.12);
+}
+.game-card.selected { border-color: var(--accent); box-shadow: 0 0 20px rgba(45,212,191,0.2); }
+.game-cover {
+  width: 100%; aspect-ratio: 3/4;
+  background: linear-gradient(135deg, rgba(45,212,191,0.08), rgba(167,139,250,0.05));
+  display: flex; align-items: center; justify-content: center; position: relative;
+  background-size: cover; background-position: center;
+}
+.game-cover-placeholder { font-size: 32px; opacity: 0.3; }
+.game-compat {
+  position: absolute; top: 7px; right: 7px; font-size: 8.5px; font-weight: 700;
+  padding: 2px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.compat-playable { background: rgba(52,211,153,0.18); color: #34D399; border: 1px solid rgba(52,211,153,0.25); }
+.compat-boots { background: rgba(251,191,36,0.18); color: #FBBF24; border: 1px solid rgba(251,191,36,0.25); }
+.compat-intro { background: rgba(96,165,250,0.18); color: #60A5FA; border: 1px solid rgba(96,165,250,0.25); }
+.compat-nothing { background: rgba(248,113,113,0.18); color: #F87171; border: 1px solid rgba(248,113,113,0.25); }
+.game-info-card { padding: 9px 11px; }
+.game-info-card h5 { font-size: 11.5px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px; }
+.game-info-card span { font-size: 10px; color: var(--text-dim); }
+
+/* ═══════════════════ INPUT MAPPING ═══════════════════ */
+.input-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+.input-mode-tabs { display: flex; gap: 3px; background: var(--bg-input); border-radius: var(--radius-sm); padding: 3px; border: 1px solid var(--border-subtle); }
+.input-mode-tab { padding: 5px 13px; font-size: 11.5px; font-weight: 500; border: none; border-radius: 4px; cursor: pointer; color: var(--text-dim); background: transparent; font-family: inherit; }
+.input-mode-tab.active { background: var(--accent); color: #052e22; font-weight: 600; }
+
+.binding-columns { display: flex; gap: 16px; }
+.binding-col { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.controller-visual { flex: 0 0 280px; display: flex; align-items: center; justify-content: center; position: relative; }
+.controller-img { width: 260px; opacity: 0.82; filter: drop-shadow(0 0 24px rgba(45,212,191,0.12)); animation: controllerFloat 8s ease-in-out infinite; }
+@keyframes controllerFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+.controller-attribution { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); font-size: 8.5px; color: var(--text-muted); white-space: nowrap; }
+.controller-attribution a { color: var(--text-dim); text-decoration: underline; }
+
+.binding-card { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; background: var(--bg-card); border: 1px solid var(--border-card); border-radius: var(--radius-sm); }
+.binding-card:hover { border-color: var(--accent); }
+.binding-name { font-size: 11.5px; font-weight: 500; color: var(--text-primary); }
+.binding-key { font-size: 10.5px; font-weight: 600; color: var(--accent); padding: 2px 7px; background: var(--accent-dim); border-radius: 4px; border: 1px solid rgba(45,212,191,0.18); cursor: pointer; }
+
+.input-bottom-controls { display: flex; align-items: center; gap: 14px; margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.03); flex-wrap: wrap; }
+.input-slider-group { display: flex; align-items: center; gap: 8px; }
+.input-slider-group label { font-size: 11.5px; color: var(--text-secondary); white-space: nowrap; }
+.input-slider { -webkit-appearance: none; appearance: none; width: 110px; height: 4px; background: rgba(255,255,255,0.07); border-radius: 2px; outline: none; }
+.input-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--accent); cursor: pointer; }
+.sep { width: 1px; height: 18px; background: var(--border-subtle); }
+
+/* ═══════════════════ ABOUT ═══════════════════ */
+.about-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,0.025); }
+.about-row:last-child { border-bottom: none; }
+.about-icon { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; background: var(--accent-dim); border-radius: var(--radius-sm); color: var(--accent); flex-shrink: 0; }
+.about-icon svg { width: 15px; height: 15px; }
+.about-info { flex: 1; }
+.about-info h5 { font-size: 13px; font-weight: 500; color: var(--text-primary); margin-bottom: 1px; }
+.about-info p { font-size: 11px; color: var(--text-dim); }
+.about-info a { color: var(--accent); }
+
+/* ═══════════════════ CONSOLE OVERLAY ═══════════════════ */
+.console-overlay {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  height: 0; max-height: 50%;
+  background: rgba(8,11,18,0.96); border-top: 1px solid var(--accent);
+  backdrop-filter: blur(20px); z-index: 25;
+  transition: height var(--transition-slow); overflow: hidden; display: flex; flex-direction: column;
+}
+.console-overlay.open { height: 44%; }
+
+.console-toolbar { display: flex; align-items: center; gap: 6px; padding: 7px 14px; border-bottom: 1px solid rgba(255,255,255,0.04); flex-shrink: 0; }
+.console-search input { width: 100%; padding: 4px 9px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle); border-radius: 4px; color: var(--text-primary); font-size: 11px; font-family: inherit; }
+.console-search { flex: 1; }
+.console-filter-btn { padding: 3px 7px; border-radius: 3px; border: 1px solid var(--border-subtle); background: transparent; font-size: 9.5px; font-weight: 700; font-family: inherit; cursor: pointer; }
+.filter-info  { color: var(--accent); border-color: rgba(45,212,191,0.25); }
+.filter-warn  { color: var(--accent-amber); border-color: rgba(251,191,36,0.25); }
+.filter-error { color: var(--accent-red); border-color: rgba(248,113,113,0.25); }
+.filter-trace { color: var(--accent-secondary); border-color: rgba(167,139,250,0.25); }
+.console-action-btn { width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--text-dim); cursor: pointer; border-radius: 3px; }
+.console-action-btn:hover { background: rgba(255,255,255,0.05); color: var(--text-secondary); }
+.console-action-btn svg { width: 13px; height: 13px; }
+
+.console-log { flex: 1; overflow-y: auto; padding: 6px 14px; font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.65; }
+.log-line { white-space: pre-wrap; word-break: break-all; }
+.log-time { color: var(--text-muted); }
+.log-module { color: var(--text-dim); }
+.log-info { color: var(--accent); }
+.log-warn { color: var(--accent-amber); }
+.log-error { color: var(--accent-red); }
+.log-trace { color: var(--accent-secondary); }
+.log-msg { color: var(--text-secondary); }
+
+.fade-in { animation: fadeIn 0.3s ease forwards; }
+@keyframes fadeIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:translateY(0); } }
+
+.env-label { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--accent); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <!-- DYNAMIC BLURRED BACKDROP -->
+  <div class="app-backdrop" id="app-backdrop" style="background-image: url('../icons/logo.png');"></div>
+  <div class="app-backdrop-overlay"></div>
+
+  <!-- TITLE BAR -->
+  <div class="titlebar">
+    <div class="titlebar-left">
+      <img src="../icons/logo.png" class="titlebar-logo" alt="KytyPS5">
+      <span class="titlebar-name">KytyPS5</span>
+      <span class="titlebar-version">v0.1.0 · UNOFFICIAL</span>
+    </div>
+    <div class="titlebar-controls">
+      <button class="titlebar-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+      <button class="titlebar-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="1"/></svg></button>
+      <button class="titlebar-btn close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg></button>
+    </div>
+  </div>
+
+  <div class="body-layout">
+    <!-- SIDEBAR -->
+    <aside class="sidebar" id="sidebar">
+      <button class="sidebar-toggle" id="sidebar-toggle" title="Expand / Collapse">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 6 15 12 9 18"/></svg>
+      </button>
+
+      <nav class="sidebar-nav">
+        <button class="sidebar-item active" data-tab="library">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 3h1c1.054 0 1.918.816 1.995 1.85L7 5v14a2 2 0 0 1-1.85 1.994L5 21H4a2 2 0 0 1-1.995-1.85L2 19V5c0-1.054.816-1.918 1.85-1.995zh1zm6 0h1c1.054 0 1.918.816 1.995 1.85L13 5v14a2 2 0 0 1-1.85 1.994L11 21h-1a2 2 0 0 1-1.995-1.85L8 19V5c0-1.054.816-1.918 1.85-1.995zh1zm6.974 2c.84 0 1.608.531 1.89 1.346l.047.157l3.015 11.746a2 2 0 0 1-1.296 2.391l-.144.043l-.969.248a2 2 0 0 1-2.387-1.284l-.047-.155l-3.016-11.745a2 2 0 0 1 1.298-2.392l.143-.043l.968-.248q.25-.064.498-.064"/></svg>
+          <span class="sidebar-label">Library</span>
+        </button>
+
+        <div class="sidebar-divider"></div>
+
+        <button class="sidebar-item" data-tab="emulation">
+          <svg viewBox="0 0 512 512"><path fill="currentColor" d="M463.5 113.3h-59c-37.4-40.3-90.4-65.4-149-65.4S143.8 73 106.4 113.3H48.5C21.8 113.3 0 135 0 161.8v189.5c0 26.8 21.8 48.5 48.5 48.5h58.8c37.4 39.6 90 64.4 148.1 64.4s110.8-24.7 148.1-64.4h59.9c26.8 0 48.5-21.8 48.5-48.5V161.8c.1-26.8-21.7-48.5-48.4-48.5m-208-51.4c49.9 0 95.3 19.5 129.4 51.4H126.1c34-31.9 79.5-51.4 129.4-51.4m0 388.2c-49.3 0-94.3-19.1-128.3-50.4h256.6c-34 31.3-79 50.4-128.3 50.4M497 351.2c0 18.5-15 33.5-33.5 33.5h-415c-18.5 0-33.5-15-33.5-33.5V161.8c0-18.5 15-33.5 33.5-33.5h415c18.5 0 33.5 15 33.5 33.5z"/></svg>
+          <span class="sidebar-label">Emulation</span>
+        </button>
+        <button class="sidebar-item" data-tab="graphics">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M19.343 20.672a1.94 1.94 0 0 0 1.94-1.94a1.94 1.94 0 1 0-3.88 0a1.94 1.94 0 0 0 1.94 1.94M9.058 12.796a6.858 6.858 0 1 0-2.324-9.67q-.094.148-.185.3c-.06.103-.11.205-.167.31a6.86 6.86 0 0 0 2.676 9.06m0-.003h-4.23l-2.113 3.663l2.114 3.667h4.229l2.116-3.667zm0 7.33L6.82 23.999h4.48Z"/></svg>
+          <span class="sidebar-label">Graphics</span>
+        </button>
+        <button class="sidebar-item" data-tab="audio">
+          <svg viewBox="0 0 16 16"><g fill="currentColor"><path d="M10 0v5.401a2.999 2.999 0 0 1 0 5.198V16l-5.333-4H0V4h4.667zM8 4L5.333 6H2v4h3.333L8 12z"/><path d="m13.6 3.2l-.799-.6L11.6 4.199l.8.6a4 4 0 0 1 .8.802c.503.668.8 1.497.8 2.399s-.297 1.73-.8 2.4a4 4 0 0 1-.8.8l-.8.601l1.201 1.6l.8-.601a6 6 0 0 0 1.198-1.2A5.98 5.98 0 0 0 16 8c0-1.35-.447-2.598-1.2-3.6a6 6 0 0 0-1.2-1.2"/></g></svg>
+          <span class="sidebar-label">Audio</span>
+        </button>
+        <button class="sidebar-item" data-tab="input">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7.97 16L5 19c-.33.3-.77.5-1.25.5A1.75 1.75 0 0 1 2 17.75v-.25l1-7.38A4.524 4.524 0 0 1 7.5 6h9c2.36 0 4.29 1.81 4.5 4.12l1 7.38v.25a1.75 1.75 0 0 1-1.75 1.75c-.48 0-.92-.2-1.25-.5l-2.97-3zM7 8v2H5v1h2v2h1v-2h2v-1H8V8zm9.5 0a.75.75 0 0 0-.75.75a.75.75 0 0 0 .75.75a.75.75 0 0 0 .75-.75a.75.75 0 0 0-.75-.75m-1.75 1.75a.75.75 0 0 0-.75.75a.75.75 0 0 0 .75.75a.75.75 0 0 0 .75-.75a.75.75 0 0 0-.75-.75m3.5 0a.75.75 0 0 0-.75.75a.75.75 0 0 0 .75.75a.75.75 0 0 0 .75-.75a.75.75 0 0 0-.75-.75M16.5 11.5a.75.75 0 0 0-.75.75a.75.75 0 0 0 .75.75a.75.75 0 0 0 .75-.75a.75.75 0 0 0-.75-.75"/></svg>
+          <span class="sidebar-label">Input</span>
+        </button>
+        <button class="sidebar-item" data-tab="network">
+          <svg viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><path d="M6 9a6 6 0 1 0 12 0A6 6 0 0 0 6 9"/><path d="M12 3q2 .5 2 6c0 5.5-.667 5.667-2 6m0-12q-2 .5-2 6c0 5.5.667 5.667 2 6M6 9h12M3 20h7m4 0h7m-11 0a2 2 0 1 0 4 0a2 2 0 0 0-4 0m2-5v3"/></g></svg>
+          <span class="sidebar-label">Network</span>
+        </button>
+        <button class="sidebar-item" data-tab="logging">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.416 2.624a.75.75 0 1 0-.832-1.248L13.669 3.32A4.5 4.5 0 0 0 12 3c-.59 0-1.153.113-1.669.32L7.416 1.376a.75.75 0 0 0-.832 1.248l2.36 1.573a4.5 4.5 0 0 0-1.368 2.475A5.5 5.5 0 0 1 8.938 6.5h6.125q.707.002 1.361.172a4.5 4.5 0 0 0-1.368-2.475zM1.25 14a.75.75 0 0 1 .75-.75h3v-1.312c0-.836.26-1.611.704-2.248l-2.483-.994a.75.75 0 0 1 .558-1.392l3.136 1.254A3.9 3.9 0 0 1 8.938 8h6.124c.74 0 1.432.204 2.023.558l3.136-1.254a.75.75 0 1 1 .558 1.392l-2.483.994A3.9 3.9 0 0 1 19 11.938v1.312h3a.75.75 0 0 1 0 1.5h-3V15a7 7 0 0 1-.808 3.269l2.587 1.035a.75.75 0 0 1-.558 1.393l-2.892-1.158a7 7 0 0 1-4.579 2.421V15a.75.75 0 1 0-1.5 0v6.96a7 7 0 0 1-4.579-2.42L3.78 20.696a.75.75 0 1 1-.558-1.393l2.588-1.035A7 7 0 0 1 5 15v-.25H2a.75.75 0 0 1-.75-.75"/></svg>
+          <span class="sidebar-label">Logging</span>
+        </button>
+        <button class="sidebar-item" data-tab="environment">
+          <svg viewBox="0 0 32 32"><path fill="currentColor" d="M6 6a1 1 0 1 1 2 0a1 1 0 0 1-2 0m5 1a1 1 0 1 0 0-2a1 1 0 0 0 0 2m19-3v12h-2v-6H4v18h8v2H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h24a2 2 0 0 1 2 2m-2 0H4v4h24zm-2.42 18.41L27 21l4 4l-4 4l-1.41-1.42L28.17 25zm-6.16 5.18L18 29l-4-4l4-4l1.41 1.42L16.83 25zm5.495-7.013L23 20l-2.915 9.423L22 30z"/></svg>
+          <span class="sidebar-label">Environment</span>
+        </button>
+
+        <div class="sidebar-divider"></div>
+
+        <button class="sidebar-item" data-tab="about">
+          <svg viewBox="0 0 512 512"><path fill="currentColor" fill-rule="evenodd" d="M256 42.667C138.18 42.667 42.667 138.179 42.667 256c0 117.82 95.513 213.334 213.333 213.334c117.822 0 213.334-95.513 213.334-213.334S373.822 42.667 256 42.667m0 384c-94.105 0-170.666-76.561-170.666-170.667S161.894 85.334 256 85.334c94.107 0 170.667 76.56 170.667 170.666S350.107 426.667 256 426.667m26.714-256c0 15.468-11.262 26.667-26.497 26.667c-15.851 0-26.837-11.2-26.837-26.963c0-15.15 11.283-26.37 26.837-26.37c15.235 0 26.497 11.22 26.497 26.666m-48 64h42.666v128h-42.666z"/></svg>
+          <span class="sidebar-label">About</span>
+        </button>
+      </nav>
+    </aside>
+
+    <!-- CENTER CONTENT -->
+    <div class="main-area">
+      <div class="content-panel" id="content-panel">
+
+        <!-- LIBRARY -->
+        <div class="tab-content active fade-in" id="tab-library">
+          <div class="page-header">
+            <div class="page-title">Library</div>
+            <div class="page-subtitle">Your game collection · Select a game to view art backdrop</div>
+          </div>
+          <div class="library-toolbar">
+            <div class="library-search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input type="text" placeholder="Search games…">
+            </div>
+            <div class="library-view-btns">
+              <button class="library-view-btn active"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></button>
+              <button class="library-view-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1" fill="currentColor"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/></svg></button>
+            </div>
+            <button class="btn btn-outline" style="display:flex;align-items:center;gap:5px;font-size:11px;">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+              Add Folder
+            </button>
+          </div>
+
+          <div class="library-grid">
+            <!-- Game 1 -->
+            <div class="game-card" data-title="Dreaming Sarah" data-desc="2D Indie Platformer · 1.2 GB" data-bg="https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=1200&auto=format&fit=crop&q=80">
+              <div class="game-cover" style="background-image: url('https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=400&auto=format&fit=crop&q=80');">
+                <span class="game-compat compat-playable">Playable</span>
+              </div>
+              <div class="game-info-card">
+                <h5>Dreaming Sarah</h5>
+                <span>2D Platformer · 1.2 GB</span>
+              </div>
+            </div>
+
+            <!-- Game 2 -->
+            <div class="game-card" data-title="Disgaea 6" data-desc="Tactical RPG · 4.8 GB" data-bg="https://images.unsplash.com/photo-1542751371-adc38448a05e?w=1200&auto=format&fit=crop&q=80">
+              <div class="game-cover" style="background-image: url('https://images.unsplash.com/photo-1542751371-adc38448a05e?w=400&auto=format&fit=crop&q=80');">
+                <span class="game-compat compat-playable">Playable</span>
+              </div>
+              <div class="game-info-card">
+                <h5>Disgaea 6</h5>
+                <span>Tactical RPG · 4.8 GB</span>
+              </div>
+            </div>
+
+            <!-- Game 3 -->
+            <div class="game-card" data-title="Minecraft Legends" data-desc="Action Strategy · 8.3 GB" data-bg="https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=1200&auto=format&fit=crop&q=80">
+              <div class="game-cover" style="background-image: url('https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=400&auto=format&fit=crop&q=80');">
+                <span class="game-compat compat-boots">Boots</span>
+              </div>
+              <div class="game-info-card">
+                <h5>Minecraft Legends</h5>
+                <span>Action Strategy · 8.3 GB</span>
+              </div>
+            </div>
+
+            <!-- Game 4 -->
+            <div class="game-card" data-title="SILENT HILL: TSM" data-desc="Psychological Horror · 12.1 GB" data-bg="https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=1200&auto=format&fit=crop&q=80">
+              <div class="game-cover" style="background-image: url('https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=400&auto=format&fit=crop&q=80');">
+                <span class="game-compat compat-intro">Intro</span>
+              </div>
+              <div class="game-info-card">
+                <h5>SILENT HILL: TSM</h5>
+                <span>Horror · 12.1 GB</span>
+              </div>
+            </div>
+
+            <!-- Game 5 -->
+            <div class="game-card" data-title="Astro Bot" data-desc="Platformer · 6.2 GB" data-bg="https://images.unsplash.com/photo-1612287230202-1ff1d85d1bdf?w=1200&auto=format&fit=crop&q=80">
+              <div class="game-cover" style="background-image: url('https://images.unsplash.com/photo-1612287230202-1ff1d85d1bdf?w=400&auto=format&fit=crop&q=80');">
+                <span class="game-compat compat-nothing">Nothing</span>
+              </div>
+              <div class="game-info-card">
+                <h5>Astro Bot</h5>
+                <span>Platformer · 6.2 GB</span>
+              </div>
+            </div>
+
+            <!-- Game 6 -->
+            <div class="game-card" data-title="Ratchet & Clank" data-desc="Action Platformer · 15.7 GB" data-bg="https://images.unsplash.com/photo-1538481199705-c710c4e965fc?w=1200&auto=format&fit=crop&q=80">
+              <div class="game-cover" style="background-image: url('https://images.unsplash.com/photo-1538481199705-c710c4e965fc?w=400&auto=format&fit=crop&q=80');">
+                <span class="game-compat compat-boots">Boots</span>
+              </div>
+              <div class="game-info-card">
+                <h5>Ratchet & Clank</h5>
+                <span>Action · 15.7 GB</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- EMULATION -->
+        <div class="tab-content" id="tab-emulation">
+          <div class="page-header"><div class="page-title">Emulation</div><div class="page-subtitle">CPU engine and core emulator settings</div></div>
+          <div class="section-card">
+            <div class="section-title">CPU</div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">CPU engine</div>
+                <div class="setting-desc">Execution engine used to run game code.</div>
+              </div>
+              <div class="dropdown"><select><option selected>Native</option><option>Interpreter</option><option disabled>Dynarec (Soon)</option></select></div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">Strict dynlib resolution</div>
+                <div class="setting-desc">Fail the launch when an imported symbol cannot be resolved.</div>
+              </div>
+              <div style="display:flex;align-items:center;"><div class="toggle" onclick="this.classList.toggle('on');this.nextElementSibling.textContent=this.classList.contains('on')?'On':'Off'"></div><span class="toggle-label">Off</span></div>
+            </div>
+          </div>
+
+          <div class="section-card">
+            <div class="section-title">Advanced Emulation</div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">Dynamic Recompiler (JIT) <span class="badge-coming-soon">Support coming soon</span></div>
+                <div class="setting-desc">Fast x86_64 JIT recompilation backend for Prospero kernel instructions.</div>
+              </div>
+              <div style="display:flex;align-items:center;"><div class="toggle disabled"></div><span class="toggle-label">Off</span></div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">Multithreaded CPU Emulation <span class="badge-coming-soon">Support coming soon</span></div>
+                <div class="setting-desc">Dispatch guest threads across isolated worker threads.</div>
+              </div>
+              <div style="display:flex;align-items:center;"><div class="toggle disabled"></div><span class="toggle-label">Off</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- GRAPHICS -->
+        <div class="tab-content" id="tab-graphics">
+          <div class="page-header"><div class="page-title">Graphics</div><div class="page-subtitle">Vulkan renderer and shader settings</div></div>
+          <div class="section-card">
+            <div class="section-title">Renderer</div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">Rendering backend</div><div class="setting-desc">Graphics API used for rendering. Vulkan 1.3 required.</div></div><div class="dropdown"><select><option selected>Vulkan 1.3</option><option disabled>Metal (macOS Soon)</option></select></div></div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">GPU device</div><div class="setting-desc">Select the GPU to use for rendering.</div></div><div class="dropdown" style="min-width:170px;"><select><option selected>Auto (Default)</option></select></div></div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">VSync</div><div class="setting-desc">Synchronize frame presentation with display refresh rate.</div></div><div style="display:flex;align-items:center;"><div class="toggle on" onclick="this.classList.toggle('on');this.nextElementSibling.textContent=this.classList.contains('on')?'On':'Off'"></div><span class="toggle-label">On</span></div></div>
+          </div>
+          <div class="section-card">
+            <div class="section-title">Shaders &amp; Upscaling</div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">FSR 3 Upscaling <span class="badge-coming-soon">Support coming soon</span></div>
+                <div class="setting-desc">FidelityFX Super Resolution for internal rendering upscaling.</div>
+              </div>
+              <div style="display:flex;align-items:center;"><div class="toggle disabled"></div><span class="toggle-label">Off</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AUDIO -->
+        <div class="tab-content" id="tab-audio">
+          <div class="page-header"><div class="page-title">Audio</div><div class="page-subtitle">Sound backend and output configuration</div></div>
+          <div class="section-card">
+            <div class="section-title">Output</div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">Audio backend</div><div class="setting-desc">The audio API to use for sound output.</div></div><div class="dropdown" style="min-width:140px;"><select><option selected>Auto</option><option>WASAPI</option><option>PulseAudio</option></select></div></div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">Spatial 3D Audio <span class="badge-coming-soon">Support coming soon</span></div><div class="setting-desc">Emulate PS5 Tempest 3D AudioTech processing.</div></div><div style="display:flex;align-items:center;"><div class="toggle disabled"></div><span class="toggle-label">Off</span></div></div>
+          </div>
+        </div>
+
+        <!-- INPUT -->
+        <div class="tab-content" id="tab-input">
+          <div class="page-header"><div class="page-title">Input</div><div class="page-subtitle">Controller mapping and input configuration</div></div>
+          <div class="input-toolbar">
+            <div class="dropdown" style="min-width:165px;"><select><option selected>DualSense Default</option><option>Xbox Layout</option><option>Keyboard Preset</option></select></div>
+            <div class="input-mode-tabs">
+              <button class="input-mode-tab active">Gamepad</button>
+              <button class="input-mode-tab">Keyboard</button>
+            </div>
+            <div style="flex:1;"></div>
+            <button class="btn btn-outline" style="display:flex;align-items:center;gap:5px;font-size:11px;">Restore Defaults</button>
+          </div>
+          <div class="binding-columns">
+            <div class="binding-col">
+              <div class="binding-card"><span class="binding-name">L2 (Trigger)</span><span class="binding-key">LT</span></div>
+              <div class="binding-card"><span class="binding-name">L1 (Bumper)</span><span class="binding-key">LB</span></div>
+              <div class="binding-card"><span class="binding-name">D-Pad Up</span><span class="binding-key">↑</span></div>
+              <div class="binding-card"><span class="binding-name">D-Pad Down</span><span class="binding-key">↓</span></div>
+              <div class="binding-card"><span class="binding-name">L3 (Stick)</span><span class="binding-key">LS</span></div>
+            </div>
+            <div class="controller-visual">
+              <img src="../icons/controller.png" class="controller-img" alt="Game Controller">
+              <div class="controller-attribution"><span>Controller icon by <a href="https://www.vecteezy.com/vector-art/7743127-game-controller-icon-vector-illustration" target="_blank" rel="noopener">Vecteezy</a></span></div>
+            </div>
+            <div class="binding-col">
+              <div class="binding-card"><span class="binding-name">R2 (Trigger)</span><span class="binding-key">RT</span></div>
+              <div class="binding-card"><span class="binding-name">R1 (Bumper)</span><span class="binding-key">RB</span></div>
+              <div class="binding-card"><span class="binding-name">△ Triangle</span><span class="binding-key">Y</span></div>
+              <div class="binding-card"><span class="binding-name">○ Circle</span><span class="binding-key">B</span></div>
+              <div class="binding-card"><span class="binding-name">R3 (Stick)</span><span class="binding-key">RS</span></div>
+            </div>
+          </div>
+          <div class="input-bottom-controls">
+            <div class="input-slider-group"><label>Adaptive Triggers <span class="badge-coming-soon">Soon</span></label><input type="range" class="input-slider" min="0" max="100" value="75"></div>
+          </div>
+        </div>
+
+        <!-- NETWORK -->
+        <div class="tab-content" id="tab-network">
+          <div class="page-header"><div class="page-title">Network</div><div class="page-subtitle">PSN stubs and network emulation</div></div>
+          <div class="section-card">
+            <div class="section-title">PlayStation Network</div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">Enable network emulation</div><div class="setting-desc">Stub PSN library calls. Required for titles that check network availability.</div></div><div style="display:flex;align-items:center;"><div class="toggle on" onclick="this.classList.toggle('on');this.nextElementSibling.textContent=this.classList.contains('on')?'On':'Off'"></div><span class="toggle-label">On</span></div></div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">P2P Multiplayer Stubs <span class="badge-coming-soon">Support coming soon</span></div><div class="setting-desc">Emulate local ad-hoc network matchmaking.</div></div><div style="display:flex;align-items:center;"><div class="toggle disabled"></div><span class="toggle-label">Off</span></div></div>
+          </div>
+        </div>
+
+        <!-- LOGGING -->
+        <div class="tab-content" id="tab-logging">
+          <div class="page-header"><div class="page-title">Logging</div><div class="page-subtitle">Console output, file logging, and debug traces</div></div>
+          <div class="section-card">
+            <div class="section-title">Console Output</div>
+            <div class="setting-row"><div class="setting-info"><div class="setting-label">Log level</div><div class="setting-desc">Verbosity of the emulator console output.</div></div><div class="dropdown"><select><option>Trace</option><option>Debug</option><option selected>Info</option><option>Warning</option><option>Error</option></select></div></div>
+          </div>
+        </div>
+
+        <!-- ENVIRONMENT -->
+        <div class="tab-content" id="tab-environment">
+          <div class="page-header"><div class="page-title">Environment</div><div class="page-subtitle">Launch environment variable switches</div></div>
+          <div class="section-card"><div class="setting-row"><div class="setting-info"><div class="setting-label env-label">KYTYPS5_WRITABLE_APP0</div><div class="setting-desc">Allow titles to create and write files inside their install folder.</div></div><div style="display:flex;align-items:center;"><div class="toggle" onclick="this.classList.toggle('on');this.nextElementSibling.textContent=this.classList.contains('on')?'On':'Off'"></div><span class="toggle-label">Off</span></div></div></div>
+        </div>
+
+        <!-- ABOUT -->
+        <div class="tab-content" id="tab-about">
+          <div class="page-header"><div class="page-title">About</div><div class="page-subtitle">Version information, links, and attribution</div></div>
+          <div class="section-card">
+            <div class="section-title">Project</div>
+            <div class="about-row"><div class="about-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><line x1="1.05" y1="12" x2="7" y2="12"/><line x1="17.01" y1="12" x2="22.96" y2="12"/></svg></div><div class="about-info"><h5>Latest Commit</h5><p>Main branch</p></div><span class="commit-badge">a1b2c3d</span></div>
+            <div class="about-row"><div class="about-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg></div><div class="about-info"><h5>GitHub</h5><p>Source code &amp; development</p></div><button class="btn btn-outline">Contribute!</button></div>
+          </div>
+          <div class="section-card">
+            <div class="section-title">Licenses &amp; Attribution</div>
+            <div class="about-row"><div class="about-info"><h5>KytyPS5</h5><p>GPL-2.0 License. Based on Kyty by InoriRus.</p></div></div>
+            <div class="about-row"><div class="about-info"><h5>Controller Icon</h5><p>Game controller icon by <a href="https://www.vecteezy.com/vector-art/7743127-game-controller-icon-vector-illustration" target="_blank" rel="noopener">Vecteezy</a> (Free License).</p></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Console Overlay -->
+      <div class="console-overlay" id="console-overlay">
+        <div class="console-toolbar">
+          <div class="console-search"><input type="text" placeholder="Filter logs…"></div>
+          <button class="console-filter-btn filter-info active">INFO</button>
+          <button class="console-filter-btn filter-warn active">WARN</button>
+          <button class="console-filter-btn filter-error active">ERROR</button>
+          <button class="console-filter-btn filter-trace">TRACE</button>
+          <div style="flex:1;"></div>
+          <button class="console-action-btn" title="Close" onclick="toggleConsole()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+        </div>
+        <div class="console-log">
+          <div class="log-line"><span class="log-time">18:32:01.142</span> <span class="log-info">[INFO]</span> <span class="log-module">[Loader]</span> <span class="log-msg">Mounted /app0/ → D:\Games\CUSA12345</span></div>
+          <div class="log-line"><span class="log-time">18:32:01.145</span> <span class="log-info">[INFO]</span> <span class="log-module">[Kernel]</span> <span class="log-msg">sceKernelLoadStartModule: loading libSceLibcInternal.sprx</span></div>
+          <div class="log-line"><span class="log-time">18:32:01.203</span> <span class="log-trace">[TRACE]</span> <span class="log-module">[GPU]</span> <span class="log-msg">Vulkan device: NVIDIA GeForce RTX 4070</span></div>
+          <div class="log-line"><span class="log-time">18:32:01.342</span> <span class="log-warn">[WARN]</span> <span class="log-module">[Kernel]</span> <span class="log-msg">sceKernelGetModuleInfoByName: module 'libSceNpManager' returning stub</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <aside class="right-panel">
+      <div class="rp-logo-section">
+        <div class="rp-logo-glow"></div>
+        <img src="../icons/logo.png" class="rp-logo" alt="KytyPS5">
+      </div>
+      <div class="rp-divider"></div>
+      <div class="rp-game-section">
+        <div class="rp-game-thumb" id="rp-game-thumb">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" id="rp-game-thumb-svg"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        </div>
+        <div class="rp-game-title" id="rp-game-title">No game selected</div>
+        <div class="rp-game-desc" id="rp-game-desc">Pick a game from the library to view art backdrop.</div>
+        <div class="rp-status">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Idle</span>
+        </div>
+      </div>
+      <div class="rp-actions">
+        <button class="rp-btn rp-btn-launch">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          Launch
+        </button>
+        <button class="rp-btn rp-btn-stop">
+          <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+          Stop
+        </button>
+        <button class="rp-btn rp-btn-console" id="btn-console" onclick="toggleConsole()">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 19V7H4v12h16m0-16a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h16m-7 14v-2h5v2H13m-3.42-4L5.57 9H8.4l3.3 3.3c.39.39.39 1.03 0 1.42L8.42 17H5.59l4-4Z"/></svg>
+          Console
+        </button>
+      </div>
+      <div class="rp-footer">
+        KytyPS5 v0.1.0 · UI Preview<br>
+        Add a game folder to populate library.
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+// Sidebar toggle
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  document.getElementById('sidebar').classList.toggle('expanded');
+});
+
+// Sidebar nav
+document.querySelectorAll('.sidebar-item[data-tab]').forEach(item => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    item.classList.add('active');
+    const target = document.getElementById('tab-' + item.dataset.tab);
+    if (target) {
+      target.classList.add('active');
+      target.classList.remove('fade-in');
+      void target.offsetHeight;
+      target.classList.add('fade-in');
+    }
+  });
+});
+
+// Console toggle
+function toggleConsole() {
+  document.getElementById('console-overlay').classList.toggle('open');
+  document.getElementById('btn-console').classList.toggle('active');
+}
+
+// Dynamic Backdrop & Game Selection
+const defaultLogoBg = '../icons/logo.png';
+const backdrop = document.getElementById('app-backdrop');
+const rpThumb = document.getElementById('rp-game-thumb');
+const rpThumbSvg = document.getElementById('rp-game-thumb-svg');
+
+document.querySelectorAll('.game-card').forEach(card => {
+  card.addEventListener('click', () => {
+    // Selection state
+    document.querySelectorAll('.game-card').forEach(c => c.classList.remove('selected'));
+    card.classList.add('selected');
+
+    const title = card.dataset.title;
+    const desc = card.dataset.desc;
+    const bgUrl = card.dataset.bg;
+
+    // Update Right Panel Info
+    document.getElementById('rp-game-title').textContent = title;
+    document.getElementById('rp-game-desc').textContent = desc;
+
+    // Update Right Panel Thumb
+    if (bgUrl) {
+      rpThumb.style.backgroundImage = `url('${bgUrl}')`;
+      if (rpThumbSvg) rpThumbSvg.style.display = 'none';
+    }
+
+    // Dynamic Backdrop Switch (with smooth blur transition)
+    if (bgUrl) {
+      backdrop.style.backgroundImage = `url('${bgUrl}')`;
+      backdrop.style.filter = 'blur(36px) brightness(0.22) saturate(1.5)';
+    } else {
+      backdrop.style.backgroundImage = `url('${defaultLogoBg}')`;
+      backdrop.style.filter = 'blur(28px) brightness(0.28) saturate(1.4)';
+    }
+  });
+});
+</script>
+</body>
+</html>

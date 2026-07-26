@@ -1,0 +1,19 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/MainAppWindow.qml</file>
+        <file>qml/views/LibraryView.qml</file>
+        <file>qml/views/SettingsView.qml</file>
+        <file>qml/views/InputMappingView.qml</file>
+        <file>qml/views/AboutView.qml</file>
+        <file alias="icons/logo.png">../../assets/icons/logo.png</file>
+        <file alias="icons/controller.png">../../assets/icons/controller.png</file>
+        <file alias="icons/input-controller-white.png">../../assets/icons/input-controller-white.png</file>
+        <file alias="icons/icon-sidebar-white.svg">../../assets/icons/icon-sidebar-white.svg</file>
+        <file alias="icons/icon-library.svg">../../assets/icons/icon-library.svg</file>
+        <file alias="icons/icon-settings.svg">../../assets/icons/icon-general.svg</file>
+        <file alias="icons/icon-input.svg">../../assets/icons/icon-input.svg</file>
+        <file alias="icons/icon-about.svg">../../assets/icons/icon-about.svg</file>
+        <file alias="icons/icon-search.svg">../../assets/icons/icon-search.svg</file>
+        <file alias="icons/icon-folder-open.svg">../../assets/icons/icon-folder-open.svg</file>
+    </qresource>
+</RCC>

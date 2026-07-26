@@ -170,7 +170,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	loader/*.h
 )
 
-find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
+find_program(KYTY_GLSLANG_VALIDATOR glslangValidator HINTS "C:/Tools/glslang/bin" REQUIRED)
+if(KYTY_GLSLANG_VALIDATOR)
 set(gpu_tiler_shader_dir "${CMAKE_CURRENT_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
 set(gpu_tiler_shader_names
@@ -203,6 +204,7 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
+endif()
 
 list(APPEND kyty_emulator_src
 	emulator.h

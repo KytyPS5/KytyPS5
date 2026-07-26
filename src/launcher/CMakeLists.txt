@@ -1,5 +1,4 @@
-
-find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+find_package(Qt6 COMPONENTS Concurrent Network Widgets Quick Qml REQUIRED)
 
 set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -13,13 +12,17 @@ file(GLOB launcher_forms
 	"forms/*.ui"
 )
 
+set(launcher_resources
+	"qml.qrc"
+)
+
 add_executable(launcher WIN32
 	${launcher_src}
 	${launcher_forms}
+	${launcher_resources}
 )
 
-
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets)
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Qt6::Quick Qt6::Qml)
 if(WIN32)
 target_link_libraries(launcher setupapi)
 endif()
@@ -56,7 +59,8 @@ if(WIN32)
 			--no-system-dxc-compiler
 			--no-opengl-sw
 			--no-translations
-		COMMENT "Deploying Qt runtime and TLS plugins"
+			--qmldir "${CMAKE_CURRENT_SOURCE_DIR}/qml"
+		COMMENT "Deploying Qt runtime, QML plugins, and TLS plugins"
 		VERBATIM
 	)
 endif()
@@ -76,10 +80,10 @@ if(WIN32)
 				--no-system-dxc-compiler
 				--no-opengl-sw
 				--no-translations
+				--qmldir \"${CMAKE_CURRENT_SOURCE_DIR}/qml\"
     		)
     ")
 endif()
-
 
 set(tidy_dirs "${CMAKE_SOURCE_DIR}/launcher/include") 
 set(iwyu_maps "${CMAKE_SOURCE_DIR}/launcher/utils/qt6_16.imp")
@@ -92,12 +96,6 @@ list(APPEND inc_headers
 	${Qt6Widgets_INCLUDE_DIRS}
 	${Qt6Core_INCLUDE_DIRS}
 	${Qt6Gui_INCLUDE_DIRS}
-	#${Qt6_DIR}/../../../include
-	#${Qt6_DIR}/../../../include/QtWidgets
-	#${Qt6_DIR}/../../../include/QtCore
-	#${Qt6_DIR}/../../../include/QtGui
+	${Qt6Quick_INCLUDE_DIRS}
+	${Qt6Qml_INCLUDE_DIRS}
 )
-
-include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
-
-clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")

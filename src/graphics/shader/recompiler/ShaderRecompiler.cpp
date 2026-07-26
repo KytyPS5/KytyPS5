@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/virtualMemory.h"
 #include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ResourceTracking.h"
@@ -32,6 +33,13 @@ bool ReadZeroMemory(void*, uint64_t, uint32_t* value) {
 	}
 	*value = 0;
 	return true;
+}
+
+// The SRT walker rebuilds descriptor addresses from guest data and cannot tell a real pointer from
+// an unresolved base plus a field offset, so validating the address belongs here rather than in the
+// walker. TryRead() lets the kernel decide and reports failure instead of faulting.
+bool ReadGuestMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr && Common::VirtualMemory::TryRead(address, value, sizeof(*value));
 }
 
 const char* GetDumpLabel(const CompileOptions& options) {
@@ -807,7 +815,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		                                               : reinterpret_cast<uint64_t>(code.data());
 		runtime.read_memory = options.read_memory != nullptr ? options.read_memory
 		                      : options.user_data == nullptr ? ReadZeroMemory
-		                                                     : nullptr;
+		                                                     : ReadGuestMemory;
 		runtime.userdata    = options.read_memory_data;
 		runtime.flat_memory_base = options.flat_memory_base;
 		if (!IR::MaterializeResources(ir, runtime, resources, error)) {

@@ -1005,17 +1005,30 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	return true;
 }
 
-bool SplitOneLoopMerge(Graph& graph) {
+// Which rule fired for each split, so a run that exhausts the budget can say what it was chasing
+// rather than only that it gave up.
+struct SplitTally {
+	uint32_t loop_merges       = 0;
+	uint32_t selection_merges  = 0;
+	uint32_t forced_selections = 0;
+	uint32_t last_header       = UINT32_MAX;
+	uint32_t last_merge        = UINT32_MAX;
+};
+
+bool SplitOneLoopMerge(Graph& graph, SplitTally& tally) {
 	const auto& loops = graph.natural_loops;
 	for (const auto& loop: loops) {
 		if (SplitSharedMergeBlock(graph, loop.merge, loop.body_blocks)) {
+			tally.loop_merges++;
+			tally.last_header = loop.header;
+			tally.last_merge  = loop.merge;
 			return true;
 		}
 	}
 	return false;
 }
 
-bool SplitOneSelectionMerge(Graph& graph) {
+bool SplitOneSelectionMerge(Graph& graph, SplitTally& tally) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
 	for (const auto& loop: graph.natural_loops) {
@@ -1035,6 +1048,10 @@ bool SplitOneSelectionMerge(Graph& graph) {
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
 		const auto force_split      = SelectionMergeLeavesContainingLoop(graph, block_id, merge);
 		if (SplitSharedMergeBlock(graph, merge, construct_blocks, force_split)) {
+			tally.selection_merges++;
+			tally.forced_selections += force_split ? 1u : 0u;
+			tally.last_header = block_id;
+			tally.last_merge  = merge;
 			return true;
 		}
 	}
@@ -1045,8 +1062,9 @@ bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget =
 	    std::max<uint32_t>(16u, std::min<uint32_t>(128u, original_block_count));
+	SplitTally tally;
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
+		if (!SplitOneLoopMerge(graph, tally) && !SplitOneSelectionMerge(graph, tally)) {
 			return true;
 		}
 		RebuildPredecessors(graph);
@@ -1054,9 +1072,11 @@ bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	}
 	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
 	           fmt::format("CFG shared merge splitting exceeded budget: original_blocks={} "
-	                       "current_blocks={} split_budget={}",
+	                       "current_blocks={} split_budget={} loop_merges={} selection_merges={} "
+	                       "forced_selections={} last_header={} last_merge={}",
 	                       original_block_count, static_cast<uint64_t>(graph.blocks.size()),
-	                       split_budget),
+	                       split_budget, tally.loop_merges, tally.selection_merges,
+	                       tally.forced_selections, tally.last_header, tally.last_merge),
 	           error);
 	return false;
 }

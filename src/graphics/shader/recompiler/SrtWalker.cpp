@@ -1,6 +1,5 @@
 #include "graphics/shader/recompiler/SrtWalker.h"
 
-#include "common/virtualMemory.h"
 #include "graphics/shader/recompiler/ScalarProvenance.h"
 
 #include <algorithm>
@@ -691,18 +690,15 @@ private:
 				                        value.pc, base_aligned, relative));
 			}
 		}
-		if (m_runtime.read_memory != nullptr &&
+		// `address` was reconstructed from shader analysis of guest data, so it is only a guess
+		// until something validates it: an unresolved descriptor base leaves a small constant here
+		// (a null pointer plus its field offset). The walker must never dereference it itself --
+		// doing so took the whole emulator down on ASTRO BOT's lighting kernels. Reading is the
+		// caller's job precisely because the caller knows how to check an address; with no reader
+		// there is no safe way to proceed, so report it. Either way a failure here becomes a
+		// recompile error, which the dispatch path already handles by skipping the dispatch.
+		if (m_runtime.read_memory == nullptr ||
 		    !m_runtime.read_memory(m_runtime.userdata, address, &result)) {
-			return Fail(
-			    error, fmt::format("ReadConst pc=0x{:08x} failed at 0x{:016x}", value.pc, address));
-		}
-		// No reader supplied: read the guest address ourselves, but never by dereferencing it. The
-		// address is derived from shader analysis of guest data, so an unresolved base leaves a
-		// small constant here (a null descriptor pointer plus its field offset) and a raw load
-		// takes the whole emulator down. Reporting the failure instead lets TryRecompile() return
-		// false, which the dispatch path already handles by skipping the dispatch.
-		if (m_runtime.read_memory == nullptr &&
-		    !Common::VirtualMemory::TryRead(address, &result, sizeof(result))) {
 			return Fail(error,
 			            fmt::format("ReadConst pc=0x{:08x} cannot read guest memory at 0x{:016x} "
 			                        "(base=0x{:016x} lo={} hi={})",

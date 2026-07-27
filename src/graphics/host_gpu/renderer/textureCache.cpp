@@ -207,6 +207,9 @@ struct TextureCache::CachedImage {
 	bool             gpu_modified        = false;
 	bool             buffer_modified     = false;
 	bool             stencil_initialized = false;
+	// Frame this image was last handed out for sampling. Distinguishes a guest that is genuinely
+	// using two resources over the same bytes from one whose allocator simply recycled them.
+	int              last_use_frame      = -1;
 	bool             registered          = false;
 
 	~CachedImage() {
@@ -1532,6 +1535,7 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 			     info.address, info.size);
 		}
 		command.RetainResourceUntilFence(storage_match);
+		storage_match->last_use_frame = GraphicsRunGetFrameNum();
 		return *storage_match->image;
 	}
 	if (!storage_retire.empty()) {
@@ -1608,6 +1612,7 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 			match->buffer_modified = false;
 		}
 		command.RetainResourceUntilFence(match);
+		match->last_use_frame = GraphicsRunGetFrameNum();
 		return *match->image;
 	}
 	for (const auto& cached: m_images) {
@@ -2384,11 +2389,12 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			EXIT("TextureCache: unsupported depth-target alias, depth=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64
 			     " existing_dims=%ux%ux%u pitch=%u levels=%u/%u base_level=%u fmt=0x%08" PRIx32
-			     " tile=%u type=%u base_align=0x%" PRIx64 "\n",
+			     " tile=%u type=%u base_align=0x%" PRIx64 " last_use_frame=%d now_frame=%d\n",
 			     info.address, info.size, static_cast<uint32_t>(cached.kind), cached.Address(),
 			     cached.Size(), ci.width, ci.height, ci.depth, ci.pitch, ci.levels, ci.view_levels,
 			     ci.base_level, ci.format, ci.tile, ci.type,
-			     cached.Address() & (uint64_t {0x10000} - 1));
+			     cached.Address() & (uint64_t {0x10000} - 1), cached.last_use_frame,
+			     GraphicsRunGetFrameNum());
 		}
 		retire.push_back(&cached);
 	}

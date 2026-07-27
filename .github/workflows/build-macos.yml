@@ -16,6 +16,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          xcode_path="$(ls -d /Applications/Xcode_26*.app | tail -n 1)"
+          test -n "$xcode_path"
+          sudo xcode-select --switch "$xcode_path/Contents/Developer"
+          xcodebuild -version
+
       - name: Install build dependencies
         shell: bash
         run: brew install glslang ninja

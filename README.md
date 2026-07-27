@@ -2,6 +2,7 @@
 
 [![Windows Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Linux Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml)
+[![macOS Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-macos.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-macos.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)

@@ -61,6 +61,25 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	return m_page_manager.HandleFault(access, fault_vaddr);
 }
 
+bool GpuResourceManager::PrepareHostRead(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
+	    !m_page_manager.IsMapped(vaddr, size)) {
+		return false;
+	}
+	const auto page_size = m_page_manager.GetPageSize();
+	const auto end       = vaddr + size;
+	auto       address   = vaddr;
+	while (address < end) {
+		if (!HandleFault(PageFaultAccess::Read, address)) {
+			return false;
+		}
+		const auto page_offset = address & (page_size - 1);
+		const auto advance     = std::min<uint64_t>(page_size - page_offset, end - address);
+		address += advance;
+	}
+	return true;
+}
+
 void GpuResourceManager::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	if (!m_page_manager.HasAnyMapping(vaddr, size)) {
 		return;

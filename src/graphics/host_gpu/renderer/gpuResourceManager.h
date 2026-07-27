@@ -24,6 +24,7 @@ public:
 	[[nodiscard]] TextureCache& GetTextureCache() { return m_texture_cache; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	[[nodiscard]] bool PrepareHostRead(uint64_t vaddr, uint64_t size);
 	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);

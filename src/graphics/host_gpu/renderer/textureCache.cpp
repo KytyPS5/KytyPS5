@@ -1232,8 +1232,23 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 		if (cached->kind != CachedImage::Kind::RenderTarget) {
 			continue;
 		}
-		switch (ClassifySampledRenderTargetOverlap(requested, cached->target,
-		                                           cached->buffer_modified)) {
+		auto overlap = ClassifySampledRenderTargetOverlap(requested, cached->target,
+		                                                  cached->buffer_modified);
+		if (overlap == RenderTargetOverlap::Unsupported) {
+			const bool tracker_gpu = m_memory_tracker.IsRegionGpuModified(
+			    cached->target.address, cached->target.size);
+			const bool coherent_buffer_source =
+			    m_buffer_cache.HasPageOverlap(requested.address, requested.size);
+			if (CanRetireBufferInvalidatedRenderTargetForSampled(
+			        requested, cached->target, cached->gpu_modified, cached->buffer_modified,
+			        tracker_gpu, coherent_buffer_source)) {
+				// A formatted buffer transition has already made this native target stale. The
+				// sampled binding below will obtain the current bytes from BufferCache after the
+				// stale target is retired.
+				overlap = RenderTargetOverlap::RetireTarget;
+			}
+		}
+		switch (overlap) {
 			case RenderTargetOverlap::None: continue;
 			case RenderTargetOverlap::RetireTarget:
 				wait_idle |= cached->gpu_modified;
@@ -2272,7 +2287,8 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		if (!overlaps) {
 			continue;
 		}
-		DepthOverlap overlap = DepthOverlap::Unsupported;
+		DepthOverlap overlap              = DepthOverlap::Unsupported;
+		bool         guest_source_current = false;
 		switch (cached.kind) {
 			case CachedImage::Kind::Texture: {
 				const auto native_overlap =
@@ -2282,7 +2298,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 				const bool overlaps_stencil =
 				    has_stencil && ImageRangeOverlaps(cached.info.address, cached.info.size,
 				                                      info.stencil_address, info.stencil_size);
-				const bool guest_source_current =
+				guest_source_current =
 				    (!overlaps_depth || info.depth_load_clear ||
 				     IsCoherentGuestImageSource(depth_source, info.address, info.size)) &&
 				    (!overlaps_stencil || info.stencil_load_clear ||
@@ -2389,12 +2405,16 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			EXIT("TextureCache: unsupported depth-target alias, depth=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64
 			     " existing_dims=%ux%ux%u pitch=%u levels=%u/%u base_level=%u fmt=0x%08" PRIx32
-			     " tile=%u type=%u base_align=0x%" PRIx64 " last_use_frame=%d now_frame=%d\n",
+			     " tile=%u type=%u base_align=0x%" PRIx64
+			     " gpu_modified=%d buffer_modified=%d cpu_dirty=%d tracker_gpu=%d"
+			     " source_current=%d last_use_frame=%d now_frame=%d\n",
 			     info.address, info.size, static_cast<uint32_t>(cached.kind), cached.Address(),
 			     cached.Size(), ci.width, ci.height, ci.depth, ci.pitch, ci.levels, ci.view_levels,
 			     ci.base_level, ci.format, ci.tile, ci.type,
-			     cached.Address() & (uint64_t {0x10000} - 1), cached.last_use_frame,
-			     GraphicsRunGetFrameNum());
+			     cached.Address() & (uint64_t {0x10000} - 1), cached.gpu_modified,
+			     cached.buffer_modified, cached.info.IsCpuDirty(),
+			     m_memory_tracker.IsRegionGpuModified(cached.info.address, cached.info.size),
+			     guest_source_current, cached.last_use_frame, GraphicsRunGetFrameNum());
 		}
 		retire.push_back(&cached);
 	}
@@ -3232,6 +3252,87 @@ void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint
 	m_buffer_cache.PublishImageBacking(write_address, write_size);
 	cached.gpu_modified    = false;
 	cached.buffer_modified = true;
+}
+
+bool TextureCache::SynchronizeMemoryToBuffer(uint64_t vaddr, uint64_t size,
+                                             bool formatted_buffer_read) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("TextureCache: invalid image-to-buffer synchronization range, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	FaultSafeTextureLock      lock(this, m_lock);
+	std::vector<CachedImage*> pending;
+	for (auto* cached: FindImagesInRegionLocked(vaddr, size, false)) {
+		if (!cached->OverlapsRange(vaddr, size, false) || !cached->gpu_modified) {
+			continue;
+		}
+		const auto action =
+		    ClassifyBufferImageWrite(vaddr, size, cached->Address(), cached->Size(),
+		                             cached->BufferBinding(), cached->gpu_modified,
+		                             formatted_buffer_read, cached->buffer_modified);
+		switch (action) {
+			case BufferImageWrite::SynchronizeRenderTarget:
+			case BufferImageWrite::SynchronizeStorageTexture:
+			case BufferImageWrite::SynchronizeDepthTarget:
+			case BufferImageWrite::SynchronizeVideoOut: break;
+			default:
+				EXIT("TextureCache: unsupported image-to-buffer read transition, "
+				     "read=0x%016" PRIx64 "+0x%016" PRIx64
+				     " image=0x%016" PRIx64 "+0x%016" PRIx64
+				     " kind=%u binding=%u formatted=%d gpu_modified=%d buffer_modified=%d\n",
+				     vaddr, size, cached->Address(), cached->Size(),
+				     static_cast<uint32_t>(cached->kind),
+				     static_cast<uint32_t>(cached->BufferBinding()), formatted_buffer_read,
+				     cached->gpu_modified, cached->buffer_modified);
+		}
+		for (const auto* previous: pending) {
+			for (uint32_t current_range = 0; current_range < cached->RangeCount();
+			     current_range++) {
+				for (uint32_t previous_range = 0; previous_range < previous->RangeCount();
+				     previous_range++) {
+					if (ImageRangeOverlaps(cached->Address(current_range),
+					                       cached->Size(current_range),
+					                       previous->Address(previous_range),
+					                       previous->Size(previous_range))) {
+						EXIT("TextureCache: ambiguous image-to-buffer read transition, "
+						     "read=0x%016" PRIx64 "+0x%016" PRIx64
+						     " first=0x%016" PRIx64 "+0x%016" PRIx64
+						     " second=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+						     vaddr, size, previous->Address(), previous->Size(), cached->Address(),
+						     cached->Size());
+					}
+				}
+			}
+		}
+		pending.push_back(cached);
+	}
+	for (auto* cached: pending) {
+		const auto action =
+		    ClassifyBufferImageWrite(vaddr, size, cached->Address(), cached->Size(),
+		                             cached->BufferBinding(), cached->gpu_modified,
+		                             formatted_buffer_read, cached->buffer_modified);
+		const auto sync_start = std::max(vaddr, cached->Address());
+		const auto sync_end   = std::min(vaddr + size, cached->Address() + cached->Size());
+		switch (action) {
+			case BufferImageWrite::SynchronizeRenderTarget:
+			case BufferImageWrite::SynchronizeStorageTexture:
+				SynchronizeColorImageToBufferLocked(*cached, sync_start, sync_end - sync_start);
+				break;
+			case BufferImageWrite::SynchronizeDepthTarget:
+				SynchronizeDepthImageToBufferLocked(*cached, sync_start, sync_end - sync_start);
+				break;
+			case BufferImageWrite::SynchronizeVideoOut:
+				SynchronizeColorImageToBufferLocked(*cached, vaddr, size);
+				break;
+			default:
+				EXIT("TextureCache: image-to-buffer read action changed during transition, "
+				     "action=%u\n",
+				     static_cast<uint32_t>(action));
+		}
+	}
+	return !pending.empty();
 }
 
 bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,

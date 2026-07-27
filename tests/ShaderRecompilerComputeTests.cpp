@@ -12285,7 +12285,10 @@ void CheckBufferImageWrites() {
            BufferImageWrite::Unsupported},
       Case{"target CPU-owned", target, target_size, target, target_size,
            BufferImageBinding::RenderTarget, false, true,
-           BufferImageWrite::Unsupported},
+           BufferImageWrite::InvalidateRenderTarget},
+      Case{"Dead Cells target partial overwrite", 0x2dbf80000ull, 0x10000,
+           0x2dbf80000ull, 0x60000, BufferImageBinding::RenderTarget, false,
+           true, BufferImageWrite::InvalidateRenderTarget},
       Case{"target unformatted", target, target_size, target, target_size,
            BufferImageBinding::RenderTarget, true, false,
            BufferImageWrite::Unsupported},
@@ -13021,11 +13024,27 @@ void CheckImageOverlapResolution() {
                                              layered_target, false) ==
               RenderTargetOverlap::RetireTarget,
           "sampled partial target alias was not routed through readback");
-  Require("ImageOverlapResolution", "sampled partial target rejection",
-          ClassifySampledRenderTargetOverlap(partial_target_sample,
-                                             layered_target, true) ==
-              RenderTargetOverlap::Unsupported,
-          "buffer-owned target alias was admitted");
+  Require(
+      "ImageOverlapResolution",
+      "Dead Cells buffer-invalidated target to sampled reuse",
+      ClassifySampledRenderTargetOverlap(partial_target_sample, layered_target,
+                                         true) ==
+              RenderTargetOverlap::Unsupported &&
+          CanRetireBufferInvalidatedRenderTargetForSampled(
+              partial_target_sample, layered_target, false, true, false, true),
+      "buffer-invalidated target was not retired for a coherent sampled source");
+  Require(
+      "ImageOverlapResolution",
+      "buffer-invalidated target to sampled ownership guards",
+      !CanRetireBufferInvalidatedRenderTargetForSampled(
+          partial_target_sample, layered_target, true, true, true, true) &&
+          !CanRetireBufferInvalidatedRenderTargetForSampled(
+              partial_target_sample, layered_target, false, true, false,
+              false) &&
+          !CanRetireBufferInvalidatedRenderTargetForSampled(
+              partial_target_sample, layered_target, false, false, false,
+              true),
+      "GPU-owned, source-less, or still-current target was retired");
 
   ImageInfo storage{};
   storage.address = 0x112cd0000ull;
@@ -13310,18 +13329,24 @@ void CheckImageOverlapResolution() {
               offset_sampled, offset_depth, false, false, false, false, true),
           "offset guest-current sampled allocation was not retired for depth "
           "reuse");
+  Require("ImageOverlapResolution",
+          "Dead Cells buffer-invalidated sampled to depth reuse",
+          CanRetireGuestCurrentSampledForDepth(
+              offset_sampled, offset_depth, false, true, true, false, true),
+          "buffer-invalidated sampled allocation was not retired for coherent "
+          "depth reuse");
   Require(
       "ImageOverlapResolution", "sampled to depth pool ownership guards",
       !CanRetireGuestCurrentSampledForDepth(offset_sampled, offset_depth, true,
                                             false, false, true, true) &&
           !CanRetireGuestCurrentSampledForDepth(
-              offset_sampled, offset_depth, false, true, false, false, true) &&
-          !CanRetireGuestCurrentSampledForDepth(
               offset_sampled, offset_depth, false, false, true, false, true) &&
           !CanRetireGuestCurrentSampledForDepth(
+              offset_sampled, offset_depth, false, true, true, true, true) &&
+          !CanRetireGuestCurrentSampledForDepth(
               offset_sampled, offset_depth, false, false, false, false, false),
-      "dirty or stale sampled allocation was admitted for "
-      "depth reuse");
+      "GPU-owned, CPU-only dirty, or incoherent sampled allocation was "
+      "admitted for depth reuse");
 
   const std::array isolated_retirement{
       ImageRetirementRange{sampled.address, TRACKER_PAGE_SIZE, true},

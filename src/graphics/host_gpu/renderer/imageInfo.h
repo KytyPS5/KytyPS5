@@ -836,9 +836,11 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			if (image_gpu_modified && !image_buffer_modified) {
 				return BufferImageWrite::SynchronizeRenderTarget;
 			}
-			return !image_gpu_modified && image_buffer_modified
-			           ? BufferImageWrite::InvalidateRenderTarget
-			           : BufferImageWrite::Unsupported;
+			// A clean native target is only a cache of guest memory. The first formatted buffer
+			// write makes that cache stale just as surely as a repeated write does; requiring it
+			// to be stale already rejected the ownership transition that should set the flag.
+			return !image_gpu_modified ? BufferImageWrite::InvalidateRenderTarget
+			                           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::StorageTexture:
 			if (!buffer_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
@@ -973,9 +975,16 @@ CanRetireGuestCurrentSampledForDepth(const ImageInfo& sampled, const DepthTarget
 	const bool overlaps_stencil =
 	    depth.stencil_address != 0 && ImageRangeOverlaps(sampled.address, sampled.size,
 	                                                     depth.stencil_address, depth.stencil_size);
-	return (overlaps_depth || overlaps_stencil) && guest_source_current &&
-	       HasGuestCurrentImageOwnership(sampled_gpu_modified, sampled_buffer_modified,
-	                                     sampled_cpu_dirty, tracker_gpu_modified);
+	if ((!overlaps_depth && !overlaps_stencil) || !guest_source_current || sampled_gpu_modified ||
+	    tracker_gpu_modified) {
+		return false;
+	}
+	// A formatted buffer write invalidates a sampled Vulkan copy before the same allocation can be
+	// rebound as depth. At that point buffer_modified means the image is stale, not authoritative;
+	// retiring it is the ownership transition that lets the coherent depth source take over.
+	// CPU-only dirtiness remains conservative because it may describe bytes outside the coherent
+	// depth subrange, but it commonly accompanies the buffer invalidation and is harmless then.
+	return sampled_buffer_modified || !sampled_cpu_dirty;
 }
 
 [[nodiscard]] inline RenderTargetOverlap
@@ -1063,6 +1072,15 @@ ClassifySampledRenderTargetOverlap(const ImageInfo& sampled, const RenderTargetI
 	}
 	return !target_buffer_modified ? RenderTargetOverlap::RetireTarget
 	                               : RenderTargetOverlap::Unsupported;
+}
+
+[[nodiscard]] inline bool CanRetireBufferInvalidatedRenderTargetForSampled(
+    const ImageInfo& sampled, const RenderTargetInfo& target, bool target_gpu_modified,
+    bool target_buffer_modified, bool tracker_gpu_modified,
+    bool coherent_buffer_source) noexcept {
+	return ImageRangeOverlaps(sampled.address, sampled.size, target.address, target.size) &&
+	       !target_gpu_modified && target_buffer_modified && !tracker_gpu_modified &&
+	       coherent_buffer_source;
 }
 
 [[nodiscard]] inline StorageImageOverlap

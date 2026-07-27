@@ -883,6 +883,30 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_direct_memory_backing->TryReadBacking(vaddr, data, size);
 }
 
+static bool TryReadGpuMapped(uint64_t vaddr, void* data, uint64_t size) {
+	if (data == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	// Keep the mapping stable between PageManager validation/fault resolution and the checked host
+	// read. PrepareHostRead only removes read protection; unlike PrepareHostWrite it does not mark
+	// the range CPU-modified or discard GPU ownership.
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	auto& resources = GetGpuResources();
+	if (!resources.IsMapped(vaddr, size)) {
+		return false;
+	}
+	if (!resources.PrepareHostRead(vaddr, size)) {
+		return false;
+	}
+	return VirtualMemory::TryRead(vaddr, data, size);
+}
+
+bool TryReadGuest(uint64_t vaddr, void* data, uint64_t size) {
+	return VirtualMemory::TryRead(vaddr, data, size) ||
+	       g_direct_memory_backing->TryReadBacking(vaddr, data, size) ||
+	       TryReadGpuMapped(vaddr, data, size);
+}
+
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64

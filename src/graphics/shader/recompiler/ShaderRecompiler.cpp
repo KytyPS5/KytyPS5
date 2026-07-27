@@ -42,18 +42,17 @@ bool ReadZeroMemory(void*, uint64_t, uint32_t* value) {
 //
 // One catch: process_vm_readv() honours page protection without running our SIGSEGV handler, so a
 // descriptor that happens to sit in a page the GPU tracker has write-protected reads as
-// unavailable even though it is perfectly valid. A raw load would have faulted, been resolved and
-// succeeded. Falling back to the direct-memory backing reads the very same physical bytes through
-// a mapping the tracker never protects, which recovers those without ever dereferencing an address
-// we have not checked. Skipping this fallback is not harmless: the descriptors are re-materialized
-// to decide whether a cached shader permutation still applies, so a spurious failure looks like a
-// specialization mismatch and recompiles the shader until it trips the 64-permutation cap.
+// unavailable even though it is perfectly valid. Direct memory can use its unprotected physical
+// backing. Flexible memory has no such alias, so the final fallback validates the GPU mapping and
+// proactively resolves read protection through PageManager before retrying the checked read.
+// Skipping these fallbacks is not harmless: descriptors are re-materialized to decide whether a
+// cached shader permutation still applies, so a spurious failure looks like a specialization
+// mismatch and recompiles the shader until it trips the 64-permutation cap.
 bool ReadGuestMemory(void*, uint64_t address, uint32_t* value) {
 	if (value == nullptr) {
 		return false;
 	}
-	return Common::VirtualMemory::TryRead(address, value, sizeof(*value)) ||
-	       LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+	return LibKernel::Memory::TryReadGuest(address, value, sizeof(*value));
 }
 
 const char* GetDumpLabel(const CompileOptions& options) {

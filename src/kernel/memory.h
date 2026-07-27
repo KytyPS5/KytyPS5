@@ -114,6 +114,9 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void SetFlexibleMemorySize(uint64_t size);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Checked host inspection of guest memory. Direct mappings use their unprotected backing;
+// protected flexible mappings are validated and read-resolved through PageManager.
+bool TryReadGuest(uint64_t vaddr, void* data, uint64_t size);
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void PrepareHostWrite(uint64_t vaddr, uint64_t size);
 

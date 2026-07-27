@@ -678,11 +678,15 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		                           !texture_region.gpu_image_bytes;
 		if (!coherent_read) {
 			if (!is_written) {
-				EXIT("BufferCache: unsupported buffer/image alias, addr=0x%016" PRIx64
-				     " size=0x%016" PRIx64 " read=%d written=%d formatted=%d\n",
-				     vaddr, size, is_read, is_written, is_formatted);
+				if (!is_read || !m_texture_cache->SynchronizeMemoryToBuffer(
+				                    vaddr, size, is_formatted)) {
+					EXIT("BufferCache: unsupported buffer/image alias, addr=0x%016" PRIx64
+					     " size=0x%016" PRIx64 " read=%d written=%d formatted=%d\n",
+					     vaddr, size, is_read, is_written, is_formatted);
+				}
+			} else {
+				(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 			}
-			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 		}
 	}
 	if (is_written) {

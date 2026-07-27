@@ -38,6 +38,7 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   ngg_rectlist_draw_enabled   = true;
+	bool                   readback_linear_images      = false;
 
 	// Audio (launcher-supplied). volume 0..100, mute override, backend "SDL"/"Null".
 	int                    audio_volume                = 100;
@@ -75,6 +76,7 @@ bool SpirvDebugPrintfEnabled();
 
 bool RenderDocEnabled();
 bool NggRectlistDrawEnabled();
+bool ReadbackLinearImagesEnabled();
 
 // Audio
 int  GetAudioVolume();

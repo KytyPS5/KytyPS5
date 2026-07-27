@@ -28,9 +28,11 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/transfer.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/presenter.h"
+#include "kernel/memory.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -40,7 +42,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -64,6 +65,14 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
+vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noexcept {
+	vk::PhysicalDeviceVulkan13Features features {};
+	features.sType            = vk::StructureType::ePhysicalDeviceVulkan13Features;
+	features.dynamicRendering = VK_TRUE;
+	features.synchronization2 = VK_TRUE;
+	return features;
+}
+
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const auto& ext) { return strcmp(ext.extensionName, name) == 0; });
@@ -79,8 +88,8 @@ static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char*
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
 }
 
-void VulkanGetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
-                                  SurfaceCapabilities& r) {
+static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
+                                   SurfaceCapabilities& r) {
 	RequireVulkanSuccess(physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities),
 	                     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
 
@@ -96,22 +105,6 @@ void VulkanGetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::Surfac
 		    return physical_device.getSurfacePresentModesKHR(surface, count, values);
 	    });
 	EXIT_NOT_IMPLEMENTED(r.present_modes.empty());
-
-	r.format_srgb_bgra32  = false;
-	r.format_unorm_bgra32 = false;
-	for (const auto& f: r.formats) {
-		if (f.format == vk::Format::eB8G8R8A8Srgb &&
-		    f.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear) {
-			r.format_srgb_bgra32 = true;
-		}
-		if (f.format == vk::Format::eB8G8R8A8Unorm &&
-		    f.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear) {
-			r.format_unorm_bgra32 = true;
-		}
-		if (r.format_srgb_bgra32 && r.format_unorm_bgra32) {
-			break;
-		}
-	}
 }
 
 static bool CheckFormat(vk::PhysicalDevice device, vk::Format format, bool tile,
@@ -214,6 +207,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		device_features2.pNext = &features13;
 
 		device.getFeatures2(&device_features2);
+		const auto required_features13 = WindowContext::RequiredVulkan13Features();
 
 		const auto queue_family = VulkanFindQueueFamily(device, surface);
 		if (queue_family == static_cast<uint32_t>(-1)) {
@@ -239,8 +233,26 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("samplerMirrorClampToEdge is not supported\n");
 			skip_device = true;
 		}
+		if (features12.timelineSemaphore != VK_TRUE) {
+			LOGF("timelineSemaphore is not supported\n");
+			skip_device = true;
+		}
 		if (features13.robustImageAccess != VK_TRUE) {
 			LOGF("robustImageAccess is not supported\n");
+			skip_device = true;
+		}
+		if (required_features13.dynamicRendering == VK_TRUE &&
+		    features13.dynamicRendering != VK_TRUE) {
+			LOGF("dynamicRendering is not supported\n");
+			skip_device = true;
+		}
+		if (required_features13.synchronization2 == VK_TRUE &&
+		    features13.synchronization2 != VK_TRUE) {
+			LOGF("synchronization2 is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.sampleRateShading != VK_TRUE) {
+			LOGF("sampleRateShading is not supported\n");
 			skip_device = true;
 		}
 
@@ -309,19 +321,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		SurfaceCapabilities candidate_capabilities;
 		if (!skip_device) {
-			VulkanGetSurfaceCapabilities(device, surface, candidate_capabilities);
+			GetSurfaceCapabilities(device, surface, candidate_capabilities);
 
 			if (!(candidate_capabilities.capabilities.supportedUsageFlags &
 			      vk::ImageUsageFlagBits::eTransferDst)) {
 				LOGF("Surface cannot be destination of blit\n");
 				skip_device = true;
 			}
-		}
-
-		if (!skip_device && !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, false,
-		                                 vk::FormatFeatureFlagBits::eBlitSrc)) {
-			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as transfer source\n");
-			skip_device = true;
 		}
 
 		if (!skip_device && !CheckFormat(device, vk::Format::eD32Sfloat, true,
@@ -420,9 +426,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
-static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device) {
+static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
+                                          GraphicContext&    graphics) {
 	EXIT_IF(physical_device == nullptr);
-	auto& graphics = g_window_ctx->graphic_ctx;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 	subgroup_size_control.sType = vk::StructureType::ePhysicalDeviceSubgroupSizeControlProperties;
@@ -463,10 +469,10 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device) {
 }
 
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
-                                     uint32_t                        queue_family,
-                                     const std::vector<const char*>& device_extensions) {
+                                     uint32_t queue_family,
+                                     const std::vector<const char*>& device_extensions,
+                                     GraphicContext& graphics) {
 	EXIT_IF(physical_device == nullptr);
-	auto& graphics = g_window_ctx->graphic_ctx;
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
 	const float               queue_priority = 1.0f;
@@ -502,7 +508,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
-	supported_features13.pNext = nullptr;
+
+	vk::PhysicalDeviceVulkan12Features supported_features12 {};
+	supported_features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
+	supported_features12.pNext = nullptr;
+	supported_features13.pNext = &supported_features12;
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -511,13 +521,21 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 	supported_robustness2.pNext = nullptr;
 	if (robustness2_ext_enabled) {
-		supported_features13.pNext = &supported_robustness2;
+		supported_features12.pNext = &supported_robustness2;
 	}
 
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
 	supported_features2.pNext = &supported_features13;
 	physical_device.getFeatures2(&supported_features2);
+	const auto required_features13 = WindowContext::RequiredVulkan13Features();
+	EXIT_NOT_IMPLEMENTED(supported_features12.timelineSemaphore != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features13.dynamicRendering == VK_TRUE &&
+	                     supported_features13.dynamicRendering != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features13.synchronization2 == VK_TRUE &&
+	                     supported_features13.synchronization2 != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
+	features12.timelineSemaphore = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics             = VK_TRUE;
@@ -529,8 +547,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
-	device_features.sampleRateShading    = supported_features2.features.sampleRateShading;
-	graphics.sample_rate_shading_enabled = device_features.sampleRateShading == VK_TRUE;
+	device_features.sampleRateShading    = VK_TRUE;
+	graphics.sample_rate_shading_enabled = true;
 	device_features.vertexPipelineStoresAndAtomics =
 	    supported_features2.features.vertexPipelineStoresAndAtomics;
 
@@ -552,8 +570,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	vk::PhysicalDeviceVulkan13Features features13 {};
-	features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
+	auto features13 = required_features13;
 	features13.pNext =
 	    robustness2_ext_enabled ? &robustness2 : const_cast<void*>(base_feature_chain);
 	features13.robustImageAccess = supported_features13.robustImageAccess;
@@ -773,12 +790,12 @@ static void VulkanCheckInstanceVersion() {
 	}
 }
 
-void VulkanCreate(WindowContext& window) {
-	EXIT_IF(window.window == nullptr);
-	EXIT_IF(window.graphic_ctx.instance != nullptr);
-	EXIT_IF(window.graphic_ctx.physical_device != nullptr);
-	EXIT_IF(window.graphic_ctx.device != nullptr);
-	EXIT_IF(window.surface_capabilities != nullptr);
+void WindowContext::CreateVulkan() {
+	EXIT_IF(window == nullptr);
+	EXIT_IF(graphic_ctx.instance != nullptr);
+	EXIT_IF(graphic_ctx.physical_device != nullptr);
+	EXIT_IF(graphic_ctx.device != nullptr);
+	EXIT_IF(surface != nullptr);
 
 	auto get_instance_proc_addr =
 	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
@@ -788,7 +805,7 @@ void VulkanCreate(WindowContext& window) {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	VulkanExtensions r;
-	VulkanGetExtensions(window.window, r);
+	VulkanGetExtensions(window, r);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -852,36 +869,35 @@ void VulkanCreate(WindowContext& window) {
 	inst_info.ppEnabledLayerNames =
 	    (r.enable_validation_layers ? r.required_layers.data() : nullptr);
 
-	const vk::Result result = vk::createInstance(&inst_info, nullptr, &window.graphic_ctx.instance);
+	const vk::Result result = vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eErrorIncompatibleDriver:
 			EXIT("Unable to find a compatible Vulkan Driver");
 		default: EXIT("Could not create a Vulkan instance (for unknown reasons)");
 	}
-	VULKAN_HPP_DEFAULT_DISPATCHER.init(window.graphic_ctx.instance);
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
 
 	if (r.enable_validation_layers) {
 		dbg_create_info.pNext = nullptr;
-		if (VulkanCreateDebugUtilsMessengerEXT(window.graphic_ctx.instance, &dbg_create_info,
-		                                       nullptr, &window.graphic_ctx.debug_messenger) !=
+		if (VulkanCreateDebugUtilsMessengerEXT(graphic_ctx.instance, &dbg_create_info, nullptr,
+		                                       &graphic_ctx.debug_messenger) !=
 		    vk::Result::eSuccess) {
 			EXIT("Could not create debug messenger");
 		}
 	}
 
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (SDL_Vulkan_CreateSurface(window.window,
-	                             static_cast<vk::Instance::CType>(window.graphic_ctx.instance),
+	if (SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
 	                             &native_surface) == SDL_FALSE) {
 		EXIT("Could not create a Vulkan surface");
 	}
-	window.surface = native_surface;
+	surface = native_surface;
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
 	    VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {
@@ -889,23 +905,18 @@ void VulkanCreate(WindowContext& window) {
 	}
 #endif
 
-	window.surface_capabilities = new SurfaceCapabilities {};
-
 	uint32_t queue_family = static_cast<uint32_t>(-1);
 
-	VulkanFindPhysicalDevice(window.graphic_ctx.instance, window.surface, device_extensions,
-	                         *window.surface_capabilities, window.graphic_ctx.physical_device,
-	                         queue_family);
+	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions,
+	                         surface_capabilities, graphic_ctx.physical_device, queue_family);
 
-	if (window.graphic_ctx.physical_device == nullptr) {
+	if (graphic_ctx.physical_device == nullptr) {
 		EXIT("Could not find suitable device");
 	}
 
-	window.graphic_ctx.physical_device.getProperties(
-	    &window.graphic_ctx.physical_device_properties);
-	window.graphic_ctx.physical_device.getMemoryProperties(
-	    &window.graphic_ctx.physical_device_memory_properties);
-	const auto& device_properties = window.graphic_ctx.GetPhysicalDeviceProperties();
+	graphic_ctx.physical_device.getProperties(&graphic_ctx.physical_device_properties);
+	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
+	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
 
@@ -913,41 +924,96 @@ void VulkanCreate(WindowContext& window) {
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
 		    [&](uint32_t* count, vk::ExtensionProperties* values) {
-			    return window.graphic_ctx.physical_device.enumerateDeviceExtensionProperties(
-			        nullptr, count, values);
+			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr,
+			                                                                           count,
+			                                                                           values);
 		    });
 
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-			window.graphic_ctx.memory_budget_ext_enabled = true;
+			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 		}
 	}
 
-	memcpy(window.device_name, device_properties.deviceName, sizeof(window.device_name));
-	std::snprintf(window.processor_name, sizeof(window.processor_name), "%s",
+	memcpy(device_name, device_properties.deviceName, sizeof(device_name));
+	std::snprintf(processor_name, sizeof(processor_name), "%s",
 	              Common::GetSystemInfo().ProcessorName.c_str());
 
-	VulkanInitSubgroupSizeControl(window.graphic_ctx.physical_device);
+	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 
-	window.graphic_ctx.device =
-	    VulkanCreateDevice(window.graphic_ctx.physical_device, r, queue_family, device_extensions);
-	if (window.graphic_ctx.device == nullptr) {
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
+	                                        device_extensions, graphic_ctx);
+	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
 	}
-	VULKAN_HPP_DEFAULT_DISPATCHER.init(window.graphic_ctx.device);
-	window.graphic_ctx.queue_family = queue_family;
-	window.graphic_ctx.device.getQueue(queue_family, 0, &window.graphic_ctx.queue);
-	EXIT_IF(window.graphic_ctx.queue == nullptr);
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	graphic_ctx.queue_family = queue_family;
+	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
+	EXIT_IF(graphic_ctx.queue == nullptr);
 
-	if (!window.graphic_ctx.CreateAllocator()) {
+	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 
-	window.swapchain = VulkanCreateSwapchain(2);
-	RenderDocSetActiveWindow(window.graphic_ctx.instance, window.window);
+	render_context = std::make_unique<RenderContext>(graphic_ctx);
+	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
+	presenter      = std::make_unique<Presenter>(*this);
+	RenderDocSetActiveWindow(graphic_ctx.instance, window);
+}
+
+void WindowContext::RefreshSurfaceCapabilities() {
+	EXIT_IF(graphic_ctx.physical_device == nullptr || surface == nullptr);
+	GetSurfaceCapabilities(graphic_ctx.physical_device, surface, surface_capabilities);
+}
+
+void WindowContext::RecreateSurface() {
+	EXIT_IF(window == nullptr || graphic_ctx.instance == nullptr);
+	if (surface != nullptr) {
+		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
+		surface = nullptr;
+	}
+	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
+	if (SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
+	                             &native_surface) == SDL_FALSE) {
+		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
+	}
+	surface = native_surface;
+	RefreshSurfaceCapabilities();
+}
+
+WindowContext::~WindowContext() {
+	presenter.reset();
+	LibKernel::Memory::InstallGpuResources(nullptr);
+	render_context.reset();
+
+	if (graphic_ctx.device != nullptr) {
+		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		graphic_ctx.DestroyAllocator();
+		graphic_ctx.device.destroy(nullptr);
+		graphic_ctx.device = nullptr;
+		graphic_ctx.queue  = nullptr;
+	}
+	if (surface != nullptr) {
+		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
+		surface = nullptr;
+	}
+	if (graphic_ctx.debug_messenger != nullptr) {
+		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.debug_messenger, nullptr);
+		graphic_ctx.debug_messenger = nullptr;
+	}
+	if (graphic_ctx.instance != nullptr) {
+		graphic_ctx.instance.destroy(nullptr);
+		graphic_ctx.instance        = nullptr;
+		graphic_ctx.physical_device = nullptr;
+	}
+	if (window != nullptr) {
+		SDL_DestroyWindow(window);
+		window = nullptr;
+	}
+	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
 }
 
 } // namespace Libs::Graphics

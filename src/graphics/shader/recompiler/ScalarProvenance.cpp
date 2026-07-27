@@ -392,7 +392,7 @@ private:
 
 	void ClearVectorLanes(uint32_t reg, ScalarState& state) {
 		const auto first = state.vector_lanes.lower_bound(VectorLaneKey(reg, 0));
-		const auto last = state.vector_lanes.lower_bound((static_cast<uint64_t>(reg) + 1u) << 32u);
+		const auto last  = state.vector_lanes.lower_bound((static_cast<uint64_t>(reg) + 1u) << 32u);
 		state.vector_lanes.erase(first, last);
 	}
 
@@ -416,8 +416,8 @@ private:
 				for (uint32_t i = 0; i < inst.src_count; i++) {
 					uint32_t src_reg = 0;
 					if (ScalarRegister(inst.src[i], src_reg) &&
-				    state.regs[src_reg] > ScalarProvenance::Unknown) {
-					address_base = state.regs[src_reg];
+					    state.regs[src_reg] > ScalarProvenance::Unknown) {
+						address_base = state.regs[src_reg];
 						break;
 					}
 				}
@@ -529,16 +529,18 @@ private:
 		if (inst.dst.kind == OperandKind::Register && inst.dst.reg.file == RegisterFile::Scc) {
 			state.scc = inst.op == Opcode::MoveU32 && inst.src_count != 0
 			                ? OperandValue(inst.src[0], state)
-			                 : ScalarProvenance::Unknown;
+			                : ScalarProvenance::Unknown;
 			return;
 		}
 		if (inst.dst.kind == OperandKind::Register && inst.dst.reg.file == RegisterFile::M0) {
 			const auto before = state;
 			const auto op     = Operation(inst.op);
-			state.m0          = inst.op == Opcode::MoveU32 && inst.src_count != 0
-			                        ? OperandValue(inst.src[0], before)
-			                    : op != ScalarValueOp::Unknown ? Define(inst, op, before)
-			                                                   : ScalarProvenance::Unknown;
+			state.m0          = ScalarProvenance::Unknown;
+			if (inst.op == Opcode::MoveU32 && inst.src_count != 0) {
+				state.m0 = OperandValue(inst.src[0], before);
+			} else if (op != ScalarValueOp::Unknown) {
+				state.m0 = Define(inst, op, before);
+			}
 			UpdateScc(inst, before, state);
 			return;
 		}
@@ -558,10 +560,14 @@ private:
 		switch (inst.op) {
 			case Opcode::MoveU32:
 			case Opcode::MoveF32Bits:
-				value = inst.src_count == 0 ? ScalarProvenance::Unknown
-				        : inst.src[0].kind == OperandKind::PcRelativeU32
-				            ? InternValue({ScalarValueOp::PcRelativeLow, inst.pc, inst.src[0].imm})
-				            : OperandValue(inst.src[0], before);
+				if (inst.src_count != 0) {
+					if (inst.src[0].kind == OperandKind::PcRelativeU32) {
+						value =
+						    InternValue({ScalarValueOp::PcRelativeLow, inst.pc, inst.src[0].imm});
+					} else {
+						value = OperandValue(inst.src[0], before);
+					}
+				}
 				if (inst.op == Opcode::MoveU32 && inst.src_count != 0 &&
 				    inst.src[0].kind == OperandKind::ImmediateU32 && inst.src[0].imm == 0 &&
 				    dst != 0) {
@@ -578,10 +584,10 @@ private:
 				uint32_t src = 0;
 				if (inst.src_count != 0 && dst + 1 < ScalarRegisters) {
 					if (ScalarRegister(inst.src[0], src) && src + 1 < ScalarRegisters) {
-						value                = before.regs[src];
+						value               = before.regs[src];
 						state.regs[dst + 1] = before.regs[src + 1];
 					} else {
-						value                = OperandValue(inst.src[0], before);
+						value               = OperandValue(inst.src[0], before);
 						state.regs[dst + 1] = Constant(
 						    inst.src[0].kind == OperandKind::ImmediateU32 && inst.src[0].sext_64
 						        ? UINT32_MAX
@@ -687,7 +693,7 @@ private:
 		if (inst.memory.kind == ResourceKind::Buffer ||
 		    (inst.memory.kind == ResourceKind::ScalarBuffer &&
 		     inst.op == Opcode::SBufferLoadDword)) {
-			const auto base              = inst.memory.resource * 4u;
+			const auto base             = inst.memory.resource * 4u;
 			inst.memory.resource_source = AddDescriptor(state, base, 4);
 			return;
 		}

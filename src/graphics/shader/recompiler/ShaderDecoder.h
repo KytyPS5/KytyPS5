@@ -570,6 +570,8 @@ enum ImageSampleFlag : uint32_t {
 
 enum class ImageDimension : uint32_t {
 	Unknown,
+	Dim1D,
+	Dim1DArray,
 	Dim2D,
 	Dim3D,
 	Dim2DArray,
@@ -669,6 +671,7 @@ void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const 
 std::string FamilyToString(Family family);
 std::string OpcodeToString(Opcode opcode);
 std::string OperandToString(const Operand& operand);
+const char* ImageDimensionToString(ImageDimension dimension);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
 

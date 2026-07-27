@@ -54,9 +54,21 @@ public:
 			m_handle = nullptr;
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__APPLE__)
+		{
+			char shm_name[64];
+			snprintf(shm_name, sizeof(shm_name), "/kyty-dm-%d-%llx", static_cast<int>(getpid()),
+			         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
+			m_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+			if (m_fd >= 0) {
+				shm_unlink(shm_name);
+			}
+		}
+#else
 		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+#endif
 		if (m_fd < 0) {
-			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: memfd_create failed: %d\n",
+			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
 			           errno);
 			return;
 		}
@@ -1382,8 +1394,8 @@ private:
 		}
 	}
 
-	uint64_t                     m_granularity = 0x10000;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, uint64_t> m_free;
 #endif
+	uint64_t m_granularity = 0x10000;
 };

@@ -1,0 +1,86 @@
+name: Build KytyPS5 (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          xcode_path="$(ls -d /Applications/Xcode_26*.app | tail -n 1)"
+          test -n "$xcode_path"
+          sudo xcode-select --switch "$xcode_path/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install build dependencies
+        shell: bash
+        run: brew install glslang ninja
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          git --version
+          cmake --version
+          ninja --version
+          clang++ --version
+          glslangValidator --version
+          echo "Host architecture: $(uname -m)"
+          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S src -B _Build/macos \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build _Build/macos --target launcher --parallel
+
+      - name: Install
+        shell: bash
+        run: |
+          cmake --install _Build/macos --prefix _Build/macos/install
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          file _Build/macos/install/launcher
+          file _Build/macos/install/kyty_emulator
+          lipo _Build/macos/install/launcher -verify_arch x86_64
+          lipo _Build/macos/install/kyty_emulator -verify_arch x86_64
+          codesign --verify --strict _Build/macos/install/kyty_emulator
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-macOS-x86_64
+          path: _Build/macos/install/**
+          if-no-files-found: error

@@ -9,7 +9,6 @@ struct SDL_Window;
 namespace Libs::Graphics {
 
 void RenderDocInit();
-bool RenderDocIsLoaded();
 void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window);
 void RenderDocRequestCapture();
 void RenderDocOnPresent();

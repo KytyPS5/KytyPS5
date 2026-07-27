@@ -1,13 +1,14 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 
+#include "common/assert.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <list>
 #include <memory>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -59,7 +60,7 @@ public:
 
 	[[nodiscard]] Entry& GetOrCreate(size_t page) {
 		if (!IsValidPage(page)) {
-			throw std::out_of_range("MultiLevelPageTable page is outside the guest address space");
+			EXIT("MultiLevelPageTable page is outside the guest address space");
 		}
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		if (bucket == nullptr) {

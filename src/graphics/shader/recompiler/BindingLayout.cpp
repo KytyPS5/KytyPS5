@@ -13,11 +13,15 @@ namespace {
 constexpr uint32_t MaxPushConstantBytes = 128;
 
 constexpr std::array ImageBindingKinds = {
+    DescriptorBindingKind::Sampled1D,          DescriptorBindingKind::Sampled1DArray,
     DescriptorBindingKind::Sampled2D,          DescriptorBindingKind::Sampled2DArray,
-    DescriptorBindingKind::Sampled3D,          DescriptorBindingKind::SampledUint2D,
+    DescriptorBindingKind::Sampled3D,          DescriptorBindingKind::SampledUint1D,
+    DescriptorBindingKind::SampledUint1DArray, DescriptorBindingKind::SampledUint2D,
     DescriptorBindingKind::SampledUint2DArray, DescriptorBindingKind::SampledUint3D,
+    DescriptorBindingKind::Storage1D,          DescriptorBindingKind::Storage1DArray,
     DescriptorBindingKind::Storage2D,          DescriptorBindingKind::Storage2DArray,
-    DescriptorBindingKind::Storage3D,          DescriptorBindingKind::StorageUint2D,
+    DescriptorBindingKind::Storage3D,          DescriptorBindingKind::StorageUint1D,
+    DescriptorBindingKind::StorageUint1DArray, DescriptorBindingKind::StorageUint2D,
     DescriptorBindingKind::StorageUint2DArray, DescriptorBindingKind::StorageUint3D,
 };
 
@@ -28,6 +32,8 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 	switch (image.kind) {
 		case ResourceKind::Image:
 			switch (image.dimension) {
+				case Dimension::Dim1D: result = Kind::Sampled1D; return true;
+				case Dimension::Dim1DArray: result = Kind::Sampled1DArray; return true;
 				case Dimension::Dim2D: result = Kind::Sampled2D; return true;
 				case Dimension::Dim2DArray: result = Kind::Sampled2DArray; return true;
 				case Dimension::Dim3D: result = Kind::Sampled3D; return true;
@@ -35,6 +41,8 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 			}
 		case ResourceKind::ImageUint:
 			switch (image.dimension) {
+				case Dimension::Dim1D: result = Kind::SampledUint1D; return true;
+				case Dimension::Dim1DArray: result = Kind::SampledUint1DArray; return true;
 				case Dimension::Dim2D: result = Kind::SampledUint2D; return true;
 				case Dimension::Dim2DArray: result = Kind::SampledUint2DArray; return true;
 				case Dimension::Dim3D: result = Kind::SampledUint3D; return true;
@@ -42,6 +50,8 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 			}
 		case ResourceKind::StorageImage:
 			switch (image.dimension) {
+				case Dimension::Dim1D: result = Kind::Storage1D; return true;
+				case Dimension::Dim1DArray: result = Kind::Storage1DArray; return true;
 				case Dimension::Dim2D: result = Kind::Storage2D; return true;
 				case Dimension::Dim2DArray: result = Kind::Storage2DArray; return true;
 				case Dimension::Dim3D: result = Kind::Storage3D; return true;
@@ -49,6 +59,8 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 			}
 		case ResourceKind::StorageImageUint:
 			switch (image.dimension) {
+				case Dimension::Dim1D: result = Kind::StorageUint1D; return true;
+				case Dimension::Dim1DArray: result = Kind::StorageUint1DArray; return true;
 				case Dimension::Dim2D: result = Kind::StorageUint2D; return true;
 				case Dimension::Dim2DArray: result = Kind::StorageUint2DArray; return true;
 				case Dimension::Dim3D: result = Kind::StorageUint3D; return true;
@@ -213,6 +225,8 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 		}
 		return false;
 	}
+	next.buffer_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
+	next.buffer_offset_count = static_cast<uint32_t>(program.info.buffers.size());
 
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources(program.info.buffers.size());
@@ -269,8 +283,8 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 
 	const auto available_push_dwords = (MaxPushConstantBytes - options.push_constant_offset) / 4u;
 	const auto push_limit            = std::min(options.max_push_dwords, available_push_dwords);
-	if (next.user_data_registers.size() <= push_limit) {
-		next.push_constant_size = static_cast<uint32_t>(next.user_data_registers.size() * 4u);
+	if (next.ShaderDataDwords() <= push_limit) {
+		next.push_constant_size = next.ShaderDataDwords() * sizeof(uint32_t);
 	} else {
 		AddBinding(next, DescriptorBindingKind::UserData);
 	}

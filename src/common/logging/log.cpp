@@ -178,6 +178,11 @@ Direction GetDirection() {
 	return g_direction;
 }
 
+bool IsSilent() {
+	// Before init LOGF must keep writing to stdout, so report non-silent.
+	return g_initialized && g_direction == Direction::Silent;
+}
+
 void Write(std::string_view text) {
 	WriteImpl(text);
 }

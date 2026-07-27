@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 
 #include <array>
+#include <cstring>
 
 namespace Common {
 

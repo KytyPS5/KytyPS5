@@ -185,6 +185,11 @@
          </column>
          <column>
           <property name="text">
+           <string>Game Version</string>
+          </property>
+         </column>
+         <column>
+          <property name="text">
            <string>Firmware Version</string>
           </property>
          </column>

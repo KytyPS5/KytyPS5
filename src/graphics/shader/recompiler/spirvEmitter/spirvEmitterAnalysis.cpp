@@ -572,6 +572,8 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
 
 ImageViewKind ImageViewKindFromDimension(Decoder::ImageDimension dimension) {
 	switch (dimension) {
+		case Decoder::ImageDimension::Dim1D: return ImageViewKind::Dim1D;
+		case Decoder::ImageDimension::Dim1DArray: return ImageViewKind::Dim1DArray;
 		case Decoder::ImageDimension::Dim2DArray: return ImageViewKind::Dim2DArray;
 		case Decoder::ImageDimension::Dim3D: return ImageViewKind::Dim3D;
 		default: return ImageViewKind::Dim2D;
@@ -595,9 +597,23 @@ ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryIn
 
 uint32_t ImageViewCoordinateComponents(ImageViewKind view) {
 	switch (view) {
+		case ImageViewKind::Dim1D: return 1u;
+		case ImageViewKind::Dim1DArray:
+		case ImageViewKind::Dim2D: return 2u;
 		case ImageViewKind::Dim2DArray:
 		case ImageViewKind::Dim3D: return 3u;
-		default: return 2u;
+		default: return 0u;
+	}
+}
+
+uint32_t ImageViewSpatialComponents(ImageViewKind view) {
+	switch (view) {
+		case ImageViewKind::Dim1D:
+		case ImageViewKind::Dim1DArray: return 1u;
+		case ImageViewKind::Dim2D:
+		case ImageViewKind::Dim2DArray: return 2u;
+		case ImageViewKind::Dim3D: return 3u;
+		default: return 0u;
 	}
 }
 
@@ -610,67 +626,24 @@ uint32_t ImageViewSampledImageType(const EmitterState& state, ImageViewKind view
 }
 
 uint32_t ImageViewSizeType(const EmitterState& state, ImageViewKind view) {
-	return ImageViewCoordinateComponents(view) == 3u ? state.vec3_uint_type : state.vec2_uint_type;
+	switch (ImageViewCoordinateComponents(view)) {
+		case 1u: return state.uint_type;
+		case 2u: return state.vec2_uint_type;
+		case 3u: return state.vec3_uint_type;
+		default: return 0;
+	}
 }
 
 uint32_t StorageImageType(const EmitterState& state, bool uint_image, ImageViewKind view) {
-	if (uint_image) {
-		switch (view) {
-			case ImageViewKind::Dim2DArray: return state.storage_image_uint_2d_array_type;
-			case ImageViewKind::Dim3D: return state.storage_image_uint_3d_type;
-			default: return state.storage_image_uint_type;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim2DArray: return state.storage_image_2d_array_type;
-		case ImageViewKind::Dim3D: return state.storage_image_3d_type;
-		default: return state.storage_image_type;
-	}
+	return state.storage_images[StorageImageIndex(uint_image, view)].image_type;
 }
 
 uint32_t StorageImagePointerType(const EmitterState& state, bool uint_image, ImageViewKind view) {
-	if (uint_image) {
-		switch (view) {
-			case ImageViewKind::Dim2DArray: return state.ptr_uniform_storage_image_uint_2d_array;
-			case ImageViewKind::Dim3D: return state.ptr_uniform_storage_image_uint_3d;
-			default: return state.ptr_uniform_storage_image_uint;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim2DArray: return state.ptr_uniform_storage_image_2d_array;
-		case ImageViewKind::Dim3D: return state.ptr_uniform_storage_image_3d;
-		default: return state.ptr_uniform_storage_image;
-	}
+	return state.storage_images[StorageImageIndex(uint_image, view)].pointer_type;
 }
 
 uint32_t StorageImageVariable(const EmitterState& state, bool uint_image, ImageViewKind view) {
-	if (uint_image) {
-		switch (view) {
-			case ImageViewKind::Dim2DArray: return state.storage_image_uint_2d_array_variable;
-			case ImageViewKind::Dim3D: return state.storage_image_uint_3d_variable;
-			default: return state.storage_image_uint_variable;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim2DArray: return state.storage_image_2d_array_variable;
-		case ImageViewKind::Dim3D: return state.storage_image_3d_variable;
-		default: return state.storage_image_variable;
-	}
-}
-
-IR::DescriptorBindingKind StorageBindingKind(bool uint_image, ImageViewKind view) {
-	if (uint_image) {
-		switch (view) {
-			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::StorageUint2DArray;
-			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
-			default: return IR::DescriptorBindingKind::StorageUint2D;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
-		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Storage3D;
-		default: return IR::DescriptorBindingKind::Storage2D;
-	}
+	return state.storage_images[StorageImageIndex(uint_image, view)].variable;
 }
 
 uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,

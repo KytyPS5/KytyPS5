@@ -134,14 +134,13 @@ bool UserDataDwordIndex(const EmitterState& state, IR::Register reg, uint32_t& d
 	return false;
 }
 
-uint32_t EmitVsharpDwordLoad(EmitterState& state, uint32_t dword_index) {
+uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.push_constant_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, state.ptr_push_constant_uint, pointer,
-		                            state.push_constant_variable, ConstantU32(state, 0),
-		                            ConstantU32(state, dword_index / 4u),
-		                            ConstantU32(state, dword_index % 4u)});
+		                           state.push_constant_variable, ConstantU32(state, 0),
+		                           ConstantU32(state, dword_index)});
 		state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
 		return value;
 	}
@@ -149,8 +148,8 @@ uint32_t EmitVsharpDwordLoad(EmitterState& state, uint32_t dword_index) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer_uint, pointer,
-		                            state.vsharp_storage_variable, ConstantU32(state, 0),
-		                            ConstantU32(state, dword_index)});
+		                           state.vsharp_storage_variable, ConstantU32(state, 0),
+		                           ConstantU32(state, dword_index)});
 		state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
 		return value;
 	}
@@ -173,7 +172,7 @@ uint32_t InitialRegisterValue(const EmitterState& state, IR::Register reg) {
 uint32_t EmitInitialRegisterValue(EmitterState& state, IR::Register reg) {
 	uint32_t dword_index = 0;
 	if (UserDataDwordIndex(state, reg, dword_index)) {
-		return EmitVsharpDwordLoad(state, dword_index);
+		return EmitShaderDataDwordLoad(state, dword_index);
 	}
 	return ConstantU32(state, InitialRegisterValue(state, reg));
 }
@@ -192,8 +191,8 @@ void EmitRegisterVariables(EmitterState& state) {
 		    {OpVariable, state.ptr_func_uint, state.dispatch_pc_variable, StorageClassFunction});
 	}
 	if (state.pixel_valid_mask_variable != 0) {
-		state.builder.AddFunction({OpVariable, state.ptr_func_uint,
-		                            state.pixel_valid_mask_variable, StorageClassFunction});
+		state.builder.AddFunction({OpVariable, state.ptr_func_uint, state.pixel_valid_mask_variable,
+		                           StorageClassFunction});
 		state.builder.AddFunction(
 		    {OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
 	}
@@ -226,9 +225,9 @@ void EmitComputeInputRegisters(EmitterState& state) {
 		if (!cs->group_id[i]) {
 			continue;
 		}
-		const auto pointer = PointerForRegister(
-		    state,
-		    {IR::RegisterFile::Scalar, static_cast<uint32_t>(cs->workgroup_register) + reg_offset});
+		const auto pointer =
+		    PointerForRegister(state, {IR::RegisterFile::Scalar,
+		                               static_cast<uint32_t>(cs->workgroup_register) + reg_offset});
 		if (pointer != 0) {
 			state.builder.AddFunction(
 			    {OpStore, pointer,
@@ -238,9 +237,9 @@ void EmitComputeInputRegisters(EmitterState& state) {
 	}
 
 	if (cs->tg_size_en) {
-		const auto pointer = PointerForRegister(
-		    state,
-		    {IR::RegisterFile::Scalar, static_cast<uint32_t>(cs->workgroup_register) + reg_offset});
+		const auto pointer =
+		    PointerForRegister(state, {IR::RegisterFile::Scalar,
+		                               static_cast<uint32_t>(cs->workgroup_register) + reg_offset});
 		if (pointer != 0) {
 			const uint32_t wave_size     = cs->wave_size != 0 ? cs->wave_size : 64u;
 			const uint32_t total_threads = std::max<uint32_t>(cs->threads_num[0], 1u) *
@@ -263,7 +262,7 @@ void EmitComputeInputRegisters(EmitterState& state) {
 			state.builder.AddFunction(
 			    {OpIEqual, state.bool_type, is_first, wave_id, ConstantU32(state, 0)});
 			state.builder.AddFunction({OpSelect, state.uint_type, first_bit, is_first,
-			                            ConstantU32(state, 0x80000000u), ConstantU32(state, 0)});
+			                           ConstantU32(state, 0x80000000u), ConstantU32(state, 0)});
 			state.builder.AddFunction(
 			    {OpBitwiseOr, state.uint_type, base, wave_bits, ConstantU32(state, waves)});
 			state.builder.AddFunction({OpBitwiseOr, state.uint_type, packed, base, first_bit});
@@ -360,7 +359,7 @@ void EmitVertexInputRegisters(EmitterState& state) {
 	const auto instance_index = PointerForRegister(state, {IR::RegisterFile::Vector, 8});
 	if (instance_index != 0) {
 		state.builder.AddFunction({OpStore, instance_index,
-		                            EmitInputScalarU32(state, IR::StageInputKind::InstanceIndex)});
+		                           EmitInputScalarU32(state, IR::StageInputKind::InstanceIndex)});
 	}
 }
 
@@ -861,7 +860,7 @@ uint32_t DispatcherTargetValue(EmitterState& state, uint32_t block_id) {
 
 void EmitDispatcherStoreTarget(EmitterState& state, uint32_t block_id) {
 	state.builder.AddFunction({OpStore, state.dispatch_pc_variable,
-	                            ConstantU32(state, DispatcherTargetValue(state, block_id))});
+	                           ConstantU32(state, DispatcherTargetValue(state, block_id))});
 }
 
 void EmitDispatcherExit(EmitterState& state);
@@ -912,7 +911,7 @@ void EmitDispatcherStoreSelectorTarget(EmitterState& state, const CFG::Terminato
 	for (uint32_t i = 0; i < term.indirect_selector_values.size(); i++) {
 		const auto match = state.builder.AllocateId();
 		state.builder.AddFunction({OpIEqual, state.bool_type, match, selector_value,
-		                            ConstantU32(state, term.indirect_selector_values[i])});
+		                           ConstantU32(state, term.indirect_selector_values[i])});
 		const auto next = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpSelect, state.uint_type, next, match,
@@ -949,7 +948,7 @@ void EmitDispatcherStoreIndirectTarget(EmitterState& state, const CFG::Terminato
 	for (uint32_t i = 0; i < count; i++) {
 		const auto match = state.builder.AllocateId();
 		state.builder.AddFunction({OpIEqual, state.bool_type, match, pc_value,
-		                            ConstantU32(state, term.indirect_target_pcs[i])});
+		                           ConstantU32(state, term.indirect_target_pcs[i])});
 		const auto next = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpSelect, state.uint_type, next, match,
@@ -1001,8 +1000,8 @@ void EmitDispatcherSwitch(EmitterState& state, const IR::Program& program) {
 	const auto done = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpIEqual, state.bool_type, done, pc_value, ConstantU32(state, UINT32_MAX)});
-	state.builder.AddFunction({OpLoopMerge, state.dispatch_merge_label,
-	                            state.dispatch_continue_label, LoopControlNone});
+	state.builder.AddFunction(
+	    {OpLoopMerge, state.dispatch_merge_label, state.dispatch_continue_label, LoopControlNone});
 	state.builder.AddFunction(
 	    {OpBranchConditional, done, state.dispatch_merge_label, state.dispatch_select_label});
 
@@ -1065,6 +1064,7 @@ void EmitFunction(EmitterState& state, const IR::Program& program) {
 	EmitComputeInputRegisters(state);
 	EmitPixelInputRegisters(state);
 	EmitVertexInputRegisters(state);
+	EmitStorageBufferOffsets(state);
 	if (state.dispatcher_fallback) {
 		EmitDispatcherFunction(state, program);
 		state.builder.AddFunction({OpFunctionEnd});

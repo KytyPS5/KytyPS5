@@ -6,6 +6,11 @@
 #include "common/subsystems.h"
 #include "common/virtualMemory.h"
 
+namespace Libs::Graphics {
+class GpuResourceManager;
+enum class PageFaultAccess;
+} // namespace Libs::Graphics
+
 namespace Libs::LibKernel::Memory {
 
 KYTY_SUBSYSTEM_DEFINE(Memory);
@@ -100,6 +105,8 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void PrepareHostWrite(uint64_t vaddr, uint64_t size);
+void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

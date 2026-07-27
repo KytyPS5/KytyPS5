@@ -30,6 +30,16 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr uint32_t NO_ACCESS_PROTECTION = PAGE_NOACCESS;
+constexpr uint32_t READ_ONLY_PROTECTION = PAGE_READONLY;
+constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
+#else
+constexpr uint32_t NO_ACCESS_PROTECTION = 0;
+constexpr uint32_t READ_ONLY_PROTECTION = 1;
+constexpr uint32_t READ_WRITE_PROTECTION = 2;
+#endif
+
 thread_local bool g_in_fault_resolution = false;
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
@@ -184,21 +194,22 @@ struct PageManager::Impl {
 
 	static uint32_t WatcherProtection(const PageState& page) {
 		if (page.access_watchers != 0) {
-			return PAGE_NOACCESS;
+			return NO_ACCESS_PROTECTION;
 		}
 		if (page.write_watchers != 0) {
-			return PAGE_READONLY;
+			return READ_ONLY_PROTECTION;
 		}
 		return page.original_protection;
 	}
 
 	static void PublishDelayedFaults(PageState& page, uint32_t old_protection,
 	                                 uint32_t new_protection) {
-		if (old_protection == PAGE_NOACCESS && new_protection != PAGE_NOACCESS) {
+		if (old_protection == NO_ACCESS_PROTECTION && new_protection != NO_ACCESS_PROTECTION) {
 			page.late_read_pending = true;
 		}
-		if ((old_protection == PAGE_NOACCESS || old_protection == PAGE_READONLY) &&
-		    new_protection == PAGE_READWRITE) {
+		if ((old_protection == NO_ACCESS_PROTECTION ||
+		     old_protection == READ_ONLY_PROTECTION) &&
+		    new_protection == READ_WRITE_PROTECTION) {
 			page.late_write_pending = true;
 		}
 	}
@@ -297,8 +308,7 @@ bool PageManager::IsTracked(uint64_t vaddr) const noexcept {
 }
 
 bool PageManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
-	if (g_in_fault_resolution || vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE ||
-	    size > ADDRESS_SIZE - vaddr) {
+	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
 		return false;
 	}
 	const auto end = PageStart(vaddr + size - 1) + PAGE_SIZE;
@@ -363,9 +373,6 @@ bool PageManager::HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) 
 
 void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
                                      PageWatchMode mode) {
-	if (g_in_fault_resolution) {
-		FailFast("page watchers changed during fault resolution");
-	}
 	if (mode != PageWatchMode::Write && mode != PageWatchMode::ReadWrite) {
 		Fatal("invalid watcher mode");
 	}
@@ -401,11 +408,11 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 				Impl::Protect(page_vaddr, new_protection, old_protection, false);
 			}
 			switch (new_protection) {
-				case PAGE_NOACCESS:
+				case NO_ACCESS_PROTECTION:
 					page.late_read_pending  = false;
 					page.late_write_pending = false;
 					break;
-				case PAGE_READONLY: page.late_write_pending = false; break;
+				case READ_ONLY_PROTECTION: page.late_write_pending = false; break;
 				default: break;
 			}
 		} else {
@@ -500,6 +507,37 @@ PageManager::BackingWrite::~BackingWrite() {
 	m_manager.EndBackingWrite(m_vaddr, m_size);
 }
 
+std::vector<std::unique_ptr<PageManager::BackingWrite>>
+PageManager::ReserveBackingWrites(std::span<const RangeSet::Range> ranges) {
+	if (ranges.empty()) {
+		Fatal("cannot reserve empty backing-write ranges");
+	}
+	std::vector<std::unique_ptr<BackingWrite>> writes;
+	writes.reserve(ranges.size());
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	for (const auto& range: ranges) {
+		if (range.address == 0 || range.size == 0 || range.size > UINT64_MAX - range.address ||
+		    range.address + range.size > UINT64_MAX - (PAGE_SIZE - 1)) {
+			Fatal("invalid backing-write range");
+		}
+		const auto page_begin = PageStart(range.address);
+		const auto page_end   = PageStart(range.address + range.size + PAGE_SIZE - 1);
+		if (begin != 0 && page_begin > end) {
+			writes.push_back(std::make_unique<BackingWrite>(*this, begin, end - begin));
+			begin = 0;
+		}
+		if (begin == 0) {
+			begin = page_begin;
+			end   = page_end;
+		} else {
+			end = std::max(end, page_end);
+		}
+	}
+	writes.push_back(std::make_unique<BackingWrite>(*this, begin, end - begin));
+	return writes;
+}
+
 void PageManager::BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 	if (g_in_fault_resolution) {
 		FailFast("backing write began during fault resolution");
@@ -539,7 +577,7 @@ void PageManager::EndBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 		if (!page.resolving || page.backing_writer != writer) {
 			FailFast("backing write ended without matching owner and resolving state");
 		}
-		const auto old_protection = PAGE_NOACCESS;
+		const auto old_protection = NO_ACCESS_PROTECTION;
 		const auto new_protection = Impl::WatcherProtection(page);
 		if (new_protection != old_protection) {
 			Impl::Protect(address, new_protection, old_protection, false);

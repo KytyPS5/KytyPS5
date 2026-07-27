@@ -20,7 +20,7 @@ function(include_what_you_use_with_mappings target dirs mappings)
 endfunction()
 
 function(clang_tidy_check target config headers dirs)
-  if (CLANG AND ("${target}" IN_LIST KYTY_CLANG_TYDY) AND NOT KYTY_CLANG_CL)
+  if (KYTY_ENABLE_CLANG_TIDY AND CLANG AND ("${target}" IN_LIST KYTY_CLANG_TIDY) AND NOT KYTY_CLANG_CL)
     find_program (CLANG_TIDY_EXE NAMES "clang-tidy")
     if (CLANG_TIDY_EXE)
 		set(std_arg "-extra-arg=-std=c++${CMAKE_CXX_STANDARD}")
@@ -41,7 +41,7 @@ function(clang_tidy_check target config headers dirs)
 endfunction()
 
 function(clang_tidy_fix target config headers dirs)
-  if (CLANG AND ("${target}" IN_LIST KYTY_CLANG_TYDY))
+  if (KYTY_ENABLE_CLANG_TIDY AND CLANG AND ("${target}" IN_LIST KYTY_CLANG_TIDY))
     find_program (CLANG_TIDY_EXE NAMES "clang-tidy")
     if (CLANG_TIDY_EXE)
 		set(std_arg "-extra-arg=-std=c++${CMAKE_CXX_STANDARD}")
@@ -68,7 +68,15 @@ set(KYTY_WARNINGS_ARE_ERRORS OFF)
 set(KYTY_C_FLAGS "")
 set(KYTY_CPP_FLAGS "")
 
-SET(CMAKE_NINJA_FORCE_RESPONSE_FILE 1 CACHE INTERNAL "")
+# Apple's /usr/bin/ar does not understand @response-file syntax, and macOS has a
+# large ARG_MAX so response files aren't needed. Note: the Ninja generator forces a
+# response file whenever CMAKE_NINJA_FORCE_RESPONSE_FILE is *defined* (it tests
+# definedness, not the value), so on Apple it must be fully unset, not set to 0.
+if(APPLE)
+	unset(CMAKE_NINJA_FORCE_RESPONSE_FILE CACHE)
+else()
+	SET(CMAKE_NINJA_FORCE_RESPONSE_FILE 1 CACHE INTERNAL "")
+endif()
 
 if(KYTY_CLANG_CL)
 	if(CMAKE_CXX_FLAGS MATCHES "/W[0-4]")

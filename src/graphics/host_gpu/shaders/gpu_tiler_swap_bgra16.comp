@@ -1,0 +1,35 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
+layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+
+layout(push_constant, std430) uniform Push {
+	uint src_base;
+	uint dst_base;
+	uint width;
+	uint height;
+	uint depth;
+	uint surface_z;
+	uint pitch_bytes;
+	uint slice_bytes;
+	uint blocks_per_row;
+	uint blocks_per_slice;
+	uint tail_x;
+	uint tail_y;
+	uint tail;
+} params;
+
+void main() {
+	uint pixel = gl_GlobalInvocationID.x;
+	if (pixel >= params.width) {
+		return;
+	}
+	uint src = (params.src_base >> 2u) + pixel * 2u;
+	uint dst = (params.dst_base >> 2u) + pixel * 2u;
+	uint bg = input_buffer.data[src];
+	uint ra = input_buffer.data[src + 1u];
+	output_buffer.data[dst] = (ra & 0x0000ffffu) | (bg & 0xffff0000u);
+	output_buffer.data[dst + 1u] = (bg & 0x0000ffffu) | (ra & 0xffff0000u);
+}

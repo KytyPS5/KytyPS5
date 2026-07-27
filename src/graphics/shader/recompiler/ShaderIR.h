@@ -673,15 +673,23 @@ struct StageOutput {
 
 enum class DescriptorBindingKind {
 	Buffers,
+	Sampled1D,
+	Sampled1DArray,
 	Sampled2D,
 	Sampled2DArray,
 	Sampled3D,
+	SampledUint1D,
+	SampledUint1DArray,
 	SampledUint2D,
 	SampledUint2DArray,
 	SampledUint3D,
+	Storage1D,
+	Storage1DArray,
 	Storage2D,
 	Storage2DArray,
 	Storage3D,
+	StorageUint1D,
+	StorageUint1DArray,
 	StorageUint2D,
 	StorageUint2DArray,
 	StorageUint3D,
@@ -705,8 +713,14 @@ struct BindingLayout {
 	uint32_t                       descriptor_set       = 0;
 	uint32_t                       push_constant_offset = 0;
 	uint32_t                       push_constant_size   = 0;
+	uint32_t                       buffer_offset_dword  = 0;
+	uint32_t                       buffer_offset_count  = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
+
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return buffer_offset_dword + (buffer_offset_count + 3u) / 4u;
+	}
 
 	bool operator==(const BindingLayout& other) const = default;
 };
@@ -726,6 +740,7 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	int32_t                          vertex_offset_sgpr = -1;
+	bool                             has_bitwise_xor    = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

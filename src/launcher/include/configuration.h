@@ -73,6 +73,7 @@ public:
 
 	QString    name;
 	QString    title_id;    /* Serial / title id from sce_sys/param.json */
+	QString    gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
 	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
 	QString    basedir;     /* Game base directory */
 	QString    game_path;   /* Launcher-unique game path */
@@ -117,6 +118,7 @@ public:
 	void CopyFrom(const Configuration& other) {
 		name            = other.name;
 		title_id        = other.title_id;
+		gameVersion     = other.gameVersion;
 		firmwareVer     = other.firmwareVer;
 		basedir         = other.basedir;
 		game_path       = other.game_path;

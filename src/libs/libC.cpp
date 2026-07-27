@@ -772,19 +772,19 @@ int KYTY_SYSV_ABI atoi(const char* str) {
 }
 
 float KYTY_SYSV_ABI sinf(float x) {
-	return std::sinf(x);
+	return std::sin(x);
 }
 
 float KYTY_SYSV_ABI cosf(float x) {
-	return std::cosf(x);
+	return std::cos(x);
 }
 
 void KYTY_SYSV_ABI sincosf(float x, float* sinp, float* cosp) {
 	if (sinp != nullptr) {
-		*sinp = std::sinf(x);
+		*sinp = std::sin(x);
 	}
 	if (cosp != nullptr) {
-		*cosp = std::cosf(x);
+		*cosp = std::cos(x);
 	}
 }
 

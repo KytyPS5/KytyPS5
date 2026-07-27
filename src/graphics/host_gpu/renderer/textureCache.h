@@ -3,173 +3,184 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/threads.h"
+#include "common/lruCache.h"
 #include "graphics/host_gpu/memoryTracker.h"
-#include "graphics/host_gpu/renderer/imageInfo.h"
+#include "graphics/host_gpu/renderer/blitHelper.h"
+#include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/multiLevelPageTable.h"
-#include "graphics/host_gpu/renderer/tiler.h"
-#include "graphics/host_gpu/vulkanCommon.h"
 
+#include <compare>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <optional>
+#include <set>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
 
-struct DepthStencilVulkanImage;
-struct GpuTextureVulkanImage;
 struct GraphicContext;
-struct ImageViewInfo;
-struct RenderTextureVulkanImage;
-struct StorageTextureVulkanImage;
-struct VideoOutVulkanImage;
-struct VulkanImage;
-struct VulkanMemory;
+class Buffer;
 class BufferCache;
 class CommandBuffer;
-class DummyTextureCache;
+class CommandScheduler;
 class ResourceMutex;
-
-[[nodiscard]] bool IsExactRenderTargetMipStorage(const ImageInfo& sampled, const ImageInfo& storage,
-                                                 vk::Format sampled_view_format,
-                                                 vk::Format storage_image_format) noexcept;
+class RenderExecutor;
+class StreamBuffer;
+class TileManager;
+struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
-	struct RegionInfo {
-		bool image_pages        = false;
-		bool image_bytes        = false;
-		bool gpu_image_bytes    = false;
-		bool non_sampled_pages  = false;
-		bool metadata_pages     = false;
-		bool metadata_bytes     = false;
-		bool gpu_metadata_bytes = false;
-	};
-	struct MetaRangeInfo {
-		uint64_t metadata_address = 0;
-		uint64_t metadata_size    = 0;
-		uint32_t slice            = 0;
-		bool     full             = false;
+	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
+
+	struct ImageDesc {
+		ImageInfo     info;
+		ImageViewInfo view_info;
+		BindingType   type = BindingType::Texture;
 	};
 
-	TextureCache(GraphicContext& graphics, PageManager& page_manager, BufferCache& buffer_cache,
-	             ResourceMutex& resource_mutex);
+	struct RegionInfo {
+		bool image_pages     = false;
+		bool image_bytes     = false;
+		bool gpu_image_bytes = false;
+	};
+
+	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
+	             BufferCache& buffer_cache, ResourceMutex& resource_mutex);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] VulkanImage& FindTexture(CommandBuffer& command, const ImageInfo& info,
-	                                       bool metadata_read);
-	[[nodiscard]] StorageTextureVulkanImage& FindStorageTexture(CommandBuffer&   command,
-	                                                            const ImageInfo& info);
-	[[nodiscard]] RenderTextureVulkanImage&  FindRenderTarget(CommandBuffer&          command,
-	                                                          const RenderTargetInfo& info);
-	[[nodiscard]] DepthStencilVulkanImage&   FindDepthTarget(CommandBuffer&         command,
-	                                                         const DepthTargetInfo& info);
-	[[nodiscard]] std::vector<VideoOutVulkanImage*>
-	                   RegisterVideoOutSurfaces(const std::vector<VideoOutInfo>& infos);
-	void               RefreshVideoOut(VideoOutVulkanImage& image, bool render_target = false);
-	void               UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images);
-	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
-	                                        uint32_t packed_clear);
-	void               MarkGpuWritten(VulkanImage& image);
-	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
-	                                           bool formatted_buffer_write = false);
-	[[nodiscard]] RenderTextureVulkanImage* FindRenderTargetByRange(CommandBuffer& command,
-	                                                                uint64_t vaddr, uint64_t size);
-	[[nodiscard]] vk::ImageView GetRenderTargetAttachmentView(RenderTextureVulkanImage& image,
-	                                                          vk::Format format, uint32_t level,
-	                                                          uint32_t base_layer,
-	                                                          uint32_t layer_count);
-	[[nodiscard]] vk::ImageView GetDepthTargetAttachmentView(DepthStencilVulkanImage& image,
-	                                                         uint32_t                 base_layer,
-	                                                         uint32_t                 layer_count);
-	[[nodiscard]] vk::ImageView
-	GetDepthTargetSampledView(DepthStencilVulkanImage& image, vk::Format view_format,
-	                          uint32_t swizzle, uint32_t base_level, uint32_t level_count,
-	                          vk::ImageViewType type, uint32_t base_layer, uint32_t layer_count);
-	[[nodiscard]] vk::ImageView GetSampledColorView(VulkanImage& image, vk::Format view_format,
-	                                                uint32_t swizzle, uint32_t base_level,
-	                                                uint32_t level_count, vk::ImageViewType type,
-	                                                uint32_t base_layer, uint32_t layer_count);
-	[[nodiscard]] vk::ImageView
-	GetRenderTargetStorageView(RenderTextureVulkanImage& image, vk::Format view_format,
-	                           uint32_t base_level, uint32_t level_count, vk::ImageViewType type,
-	                           uint32_t base_layer, uint32_t layer_count);
-	[[nodiscard]] vk::ImageView GetStorageTextureSampledView(StorageTextureVulkanImage& image,
-	                                                         const ImageInfo&           info);
-	[[nodiscard]] vk::ImageView GetStorageTextureStorageView(StorageTextureVulkanImage& image,
-	                                                         uint32_t                   base_level);
-	[[nodiscard]] DepthStencilVulkanImage*
-	FindDepthTargetByRange(CommandBuffer& command, uint64_t vaddr, uint64_t size,
-	                       bool allow_containing_sampled = false);
-	[[nodiscard]] RegionInfo QueryRegion(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool       ResolveMetaRange(uint64_t vaddr, uint64_t size, MetaRangeInfo& info);
-	void                     RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers = 1);
-	[[nodiscard]] bool       IsMeta(uint64_t vaddr);
-	[[nodiscard]] bool       IsMetaRange(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool       IsMetaCleared(uint64_t vaddr, uint32_t slice);
-	[[nodiscard]] bool       ClearMeta(uint64_t vaddr);
-	[[nodiscard]] bool       TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear);
-	[[nodiscard]] bool       InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                                          PageFaultPhase phase) noexcept;
-	void                     UnmapMemory(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
+	                                               bool ensure_valid = true);
+	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] Image&        GetImage(ImageId id);
+	[[nodiscard]] const Image&  GetImage(ImageId id) const;
+	void                        MarkGpuWritten(ImageId id);
 
-	VulkanImage& GetDummySampledTexture(bool uint_format, bool image_3d);
-	VulkanImage& GetDummyStorageTexture(bool uint_format, bool image_3d);
+	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
+	                                        uint32_t packed_clear);
+	void               PrepareHostWrite(uint64_t address, uint64_t size);
+	[[nodiscard]] bool SynchronizeImageToBuffer(uint64_t address, uint64_t size);
+	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
+	                                           bool formatted_buffer_write = false);
+	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
+
+	[[nodiscard]] bool IsMeta(uint64_t address);
+	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
+	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+
+	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t address, uint64_t size,
+	                                    PageFaultPhase phase) noexcept;
+	void               UnmapMemory(uint64_t address, uint64_t size);
+	void               ProcessDownloadImages();
+	void               RunGarbageCollector();
 
 private:
-	struct CachedImage;
-	using ImageOwnerIndex = MultiRangePageOwnerIndex<CachedImage*>;
-	struct ReadbackWorker;
-	struct MetaDataInfo {
-		uint64_t size         = 0;
-		uint32_t layers       = 1;
-		uint32_t clear_mask   = 0;
-		bool     gpu_modified = false;
-	};
-	[[nodiscard]] vk::ImageView GetImageView(VulkanImage& image, const ImageViewInfo& info);
-	[[nodiscard]] bool          HasMetaOverlapLocked(uint64_t vaddr, uint64_t size) const;
-	[[nodiscard]] CachedImage*  FindGpuReadbackPageCandidateLocked(uint64_t vaddr, uint64_t size);
-	void                        RequireNoMetaOverlapLocked(uint64_t vaddr, uint64_t size) const;
-	void                        ResolveImageMetadataOverlapsLocked(uint64_t vaddr, uint64_t size);
-	void                        MarkSampledAliasesCpuDirtyLocked(uint64_t vaddr, uint64_t size);
-	void                        RetireSampledTargetAliases(const ImageInfo& requested);
-	void                        ResolveStorageImageOverlaps(const ImageInfo& requested);
-	void                        RetireStorageDepthAliasLocked(const ImageInfo& requested);
-	void                        RegisterImageLocked(CachedImage& image);
-	void                        UnregisterImageLocked(CachedImage& image, bool release_tracking);
-	[[nodiscard]] VulkanImage&  PublishImage(CommandBuffer&               command,
-	                                         std::shared_ptr<CachedImage> image);
-	[[nodiscard]] std::vector<CachedImage*> FindImagesInRegionLocked(uint64_t vaddr, uint64_t size,
-	                                                                 bool page_overlap);
-	void RequireRetirementIsolation(const std::vector<CachedImage*>& retire, const char* operation,
-	                                uint64_t address, uint64_t size) const;
-	void RetireImages(const std::vector<CachedImage*>& retire,
-	                  const CachedImage*               native_image_source = nullptr);
-	void RetireDepthMetadataLocked(const std::vector<CachedImage*>& retire,
-	                               uint64_t                         preserve_address = 0);
-	void MaterializeImagesToGuestLocked(const std::vector<std::shared_ptr<CachedImage>>& images);
-	void SynchronizeColorImageToBufferLocked(CachedImage& cached, uint64_t write_address,
-	                                         uint64_t write_size);
-	void SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
-	                                         uint64_t write_size);
+	enum class TransferDirection { Upload, Download };
+	struct ColorTransferPlan;
+	struct DownloadPlan;
 
-	GraphicContext&                           m_graphics;
-	std::unique_ptr<DummyTextureCache>        m_dummy_textures;
-	TrackingSpinLock                          m_lock;
-	std::mutex                                m_fault_mutex;
-	MemoryTracker                             m_memory_tracker;
-	MemoryTracker                             m_metadata_tracker;
-	Tiler                                     m_tiler;
-	BufferCache&                              m_buffer_cache;
-	ResourceMutex&                            m_resource_mutex;
-	std::vector<std::shared_ptr<CachedImage>> m_images;
-	ImageOwnerIndex                           m_image_owner_index;
-	std::map<uint64_t, MetaDataInfo>          m_surface_metas;
-	std::unique_ptr<ReadbackWorker>           m_readback;
-	std::vector<uint8_t>                      m_buffer_transition_guest;
+	struct Slot {
+		std::shared_ptr<Image> image;
+		uint32_t               generation = 1;
+	};
+
+	struct MetaDataInfo {
+		uint32_t clear_mask = 0;
+	};
+
+	struct OverlapResult {
+		ImageId image;
+		int32_t mip   = -1;
+		int32_t layer = -1;
+	};
+
+	using ImageOwnerIndex = MultiRangePageOwnerIndex<ImageId>;
+
+	[[nodiscard]] Image&                 ResolveImage(ImageId id);
+	[[nodiscard]] const Image&           ResolveImage(ImageId id) const;
+	[[nodiscard]] std::shared_ptr<Image> ResolveOwner(ImageId id) const;
+	[[nodiscard]] ImageId                InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId                GetNullImage(const ImageDesc& desc);
+	void                                 RegisterImage(ImageId id);
+	void                                 UnregisterImage(ImageId id, bool release_tracking);
+	void                                 DeleteImage(ImageId id, bool release_tracking = true);
+	void DeleteImages(std::span<const ImageId> ids, std::optional<ImageId> native_source = {});
+	void RetainImage(CommandBuffer& command, ImageId id);
+	void TouchImage(Image& image);
+	void TrackImageDownload(ImageId id);
+	void TrackImageDownloadLocked(ImageId id, Image& image);
+	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
+	                                      bool exact_format);
+	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	[[nodiscard]] bool               SafeToDownload(const Image& image);
+
+	[[nodiscard]] std::vector<ImageId> FindImagesInRegion(uint64_t address, uint64_t size,
+	                                                      bool page_overlap) const;
+	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
+	                                           ImageId cached, ImageId merged);
+	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+	                                                ImageId cached);
+	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	void                        RefreshImage(ImageId id, const ImageDesc& desc);
+	void                        InitializeImage(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
+	                                                   TransferDirection direction) const;
+	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
+	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
+	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
+	                       DownloadPlan plan);
+	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	void CommitGpuWrite(Image& image);
+	void PrepareImageCopy(Image& image);
+	void RefreshCopySource(ImageId id);
+	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
+	void               CopyImage(ImageId destination, ImageId source);
+	void               AssociateStencil(ImageId depth, GuestRange stencil);
+	void               AssociateStencilLocked(ImageId depth, GuestRange stencil);
+	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
+	void ValidateImageDesc(const ImageDesc& desc) const;
+
+	void InvalidateCpuAliases(uint64_t address, uint64_t size);
+	void RestoreGpuTracking(const Image& image);
+	void ReleaseGpuTracking(ImageId id);
+
+	[[nodiscard]] bool                          SynchronizeImageToBuffer(ImageId id);
+	void                                        DownloadImage(ImageId id);
+	[[nodiscard]] bool                          TryDownloadImage(ImageId id);
+	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapDownload(uint64_t size, uint64_t alignment);
+	void QueueDownload(GuestRange range, StreamBuffer& download, uint8_t* mapped, uint64_t offset);
+
+	GraphicContext&                                   m_graphics;
+	CommandScheduler&                                 m_scheduler;
+	TrackingSpinLock                                  m_lock;
+	MemoryTracker                                     m_memory_tracker;
+	BlitHelper                                        m_blit_helper;
+	std::unique_ptr<TileManager>                      m_tiler;
+	BufferCache&                                      m_buffer_cache;
+	ResourceMutex&                                    m_resource_mutex;
+	std::vector<Slot>                                 m_slots;
+	std::vector<uint32_t>                             m_free_slots;
+	ImageOwnerIndex                                   m_image_owner_index;
+	std::map<vk::Format, ImageId>                     m_null_images;
+	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
+	std::set<ImageId>                                 m_download_images;
+	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_trigger_gc_memory  = 0;
+	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
+	uint64_t m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t m_gc_tick                = 0;
+	bool     m_readback_linear_images = false;
+
+	friend struct TextureCacheTestAccess;
+	friend class RenderExecutor;
 };
 
 } // namespace Libs::Graphics

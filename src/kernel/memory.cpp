@@ -7,7 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/gpuResourceManager.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -40,6 +40,7 @@
 #endif
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <cerrno>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -66,9 +67,11 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 4ull * 1024ull * 1024ull * 1024ull;
 
 static uint64_t g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static Graphics::GpuResourceManager* g_gpu_resources = nullptr;
 
 static Graphics::GpuResourceManager& GetGpuResources() {
-	return Graphics::GetRenderContext().GetGpuResources();
+	EXIT_IF(g_gpu_resources == nullptr);
+	return *g_gpu_resources;
 }
 
 static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
@@ -97,12 +100,10 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size, GpuAccessMode mode) {
 	if (!IsGpuAddressRange(vaddr, size)) {
 		EXIT("invalid GPU unmap range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}
-	auto&                               resources = GetGpuResources();
-	Graphics::GraphicsRunSubmissionLock submission_lock;
 	const auto access = mode == GpuAccessMode::Read    ? Graphics::GpuAccess::Read
 	                    : mode == GpuAccessMode::Write ? Graphics::GpuAccess::Write
 	                                                   : Graphics::GpuAccess::ReadWrite;
-	resources.UnmapMemory(vaddr, size, access);
+	GetGpuResources().UnmapMemory(vaddr, size, access);
 }
 
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
@@ -867,11 +868,13 @@ static void                     MemoryPoolSubtractCommitted(uint64_t len);
 static std::recursive_mutex g_memory_operation_mutex;
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_direct_memory_backing->TryWriteBacking(vaddr, data, size);
+	return g_direct_memory_backing != nullptr &&
+	       g_direct_memory_backing->TryWriteBacking(vaddr, data, size);
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_direct_memory_backing->TryReadBacking(vaddr, data, size);
+	return g_direct_memory_backing != nullptr &&
+	       g_direct_memory_backing->TryReadBacking(vaddr, data, size);
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
@@ -886,7 +889,16 @@ void PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
-	Graphics::GetRenderContext().GetGpuResources().PrepareHostWrite(vaddr, size);
+	GetGpuResources().PrepareHostWrite(vaddr, size);
+}
+
+void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
+	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
+	g_gpu_resources = resources;
+}
+
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
 struct PrtAperture {
@@ -1899,20 +1911,21 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	constexpr size_t   PAGE_SIZE         = 0x4000;
 	constexpr size_t   MAXIMUM_NAME_SIZE = 32;
 	constexpr uint64_t DEFAULT_PS5_BASE  = 0x200000000;
-	constexpr int      MAP_FIXED         = 0x10;
-	constexpr int      MAP_SHARED        = 0x01;
-	constexpr int      MAP_PRIVATE       = 0x02;
-	constexpr int      MAP_NO_OVERWRITE  = 0x80;
-	constexpr int      MAP_VOID          = 0x100;
-	constexpr int      MAP_STACK         = 0x400;
-	constexpr int      MAP_NO_SYNC       = 0x800;
-	constexpr int      MAP_ANON          = 0x1000;
-	constexpr int      MAP_UNKNOWN_8000  = 0x8000;
-	constexpr int      MAP_NO_CORE       = 0x20000;
-	constexpr int      MAP_NO_COALESCE   = 0x400000;
-	constexpr int SUPPORTED_MAP_BITS     = MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_NO_OVERWRITE |
-	                                       MAP_VOID | MAP_STACK | MAP_NO_SYNC | MAP_ANON |
-	                                       MAP_UNKNOWN_8000 | MAP_NO_CORE | MAP_NO_COALESCE;
+	constexpr int GUEST_MAP_FIXED        = 0x10;
+	constexpr int GUEST_MAP_SHARED       = 0x01;
+	constexpr int GUEST_MAP_PRIVATE      = 0x02;
+	constexpr int GUEST_MAP_NO_OVERWRITE = 0x80;
+	constexpr int GUEST_MAP_VOID         = 0x100;
+	constexpr int GUEST_MAP_STACK        = 0x400;
+	constexpr int GUEST_MAP_NO_SYNC      = 0x800;
+	constexpr int GUEST_MAP_ANON         = 0x1000;
+	constexpr int GUEST_MAP_UNKNOWN_8000 = 0x8000;
+	constexpr int GUEST_MAP_NO_CORE      = 0x20000;
+	constexpr int GUEST_MAP_NO_COALESCE  = 0x400000;
+	constexpr int SUPPORTED_MAP_BITS =
+	    GUEST_MAP_SHARED | GUEST_MAP_PRIVATE | GUEST_MAP_FIXED | GUEST_MAP_NO_OVERWRITE |
+	    GUEST_MAP_VOID | GUEST_MAP_STACK | GUEST_MAP_NO_SYNC | GUEST_MAP_ANON |
+	    GUEST_MAP_UNKNOWN_8000 | GUEST_MAP_NO_CORE | GUEST_MAP_NO_COALESCE;
 
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -1945,11 +1958,11 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	bool                 consumed_reserved       = false;
 	VirtualRanges::Range consumed_range {};
 
-	if ((flags & MAP_FIXED) != 0) {
+	if ((flags & GUEST_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0) {
 			return KERNEL_ERROR_EINVAL;
 		}
-		if ((flags & MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
+		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
 		if (g_virtual_ranges->Query(in_addr, 0, &consumed_range) &&
@@ -1994,7 +2007,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	}
 
 	const auto range_type =
-	    ((flags & MAP_STACK) != 0 ? VirtualRangeType::Stack : VirtualRangeType::Flexible);
+	    ((flags & GUEST_MAP_STACK) != 0 ? VirtualRangeType::Stack : VirtualRangeType::Flexible);
 	if (!g_virtual_ranges->Add(out_addr, len, 0, prot, 0, range_type, name,
 	                           committed_from_reserved)) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
@@ -2662,11 +2675,11 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	EXIT_NOT_IMPLEMENTED(addr == nullptr);
-	constexpr int MAP_FIXED        = 0x10;
-	constexpr int MAP_NO_OVERWRITE = 0x80;
+	constexpr int GUEST_MAP_FIXED        = 0x10;
+	constexpr int GUEST_MAP_NO_OVERWRITE = 0x80;
 
-	bool fixed        = ((flags & MAP_FIXED) != 0);
-	bool no_overwrite = ((flags & MAP_NO_OVERWRITE) != 0);
+	bool fixed        = ((flags & GUEST_MAP_FIXED) != 0);
+	bool no_overwrite = ((flags & GUEST_MAP_NO_OVERWRITE) != 0);
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 	GpuAccessMode       gpu_mode = GpuAccessMode::NoAccess;
@@ -3268,8 +3281,8 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	     in_addr, len, flags, alignment);
 
 	constexpr size_t PAGE_SIZE        = 0x4000;
-	constexpr int    MAP_FIXED        = 0x10;
-	constexpr int    MAP_NO_OVERWRITE = 0x80;
+	constexpr int    GUEST_MAP_FIXED        = 0x10;
+	constexpr int    GUEST_MAP_NO_OVERWRITE = 0x80;
 
 	if (addr == nullptr || len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -3281,11 +3294,11 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	uint64_t out_addr            = 0;
 	bool     range_already_added = false;
 	bool     placeholder_backed  = false;
-	if ((flags & MAP_FIXED) != 0) {
+	if ((flags & GUEST_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0) {
 			return KERNEL_ERROR_EINVAL;
 		}
-		if ((flags & MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
+		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
 		if (ReplaceFixedRangeWithReserved(in_addr, len, &placeholder_backed)) {
@@ -3699,8 +3712,8 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out) {
-	constexpr int MAP_FIXED = 0x10;
-	return KernelBatchMap2(entries, num_entries, num_entries_out, MAP_FIXED);
+	constexpr int GUEST_MAP_FIXED = 0x10;
+	return KernelBatchMap2(entries, num_entries, num_entries_out, GUEST_MAP_FIXED);
 }
 
 static bool IsAligned(uint64_t value, uint64_t alignment) {

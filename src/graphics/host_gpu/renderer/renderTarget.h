@@ -3,12 +3,37 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <cstdint>
 #include <type_traits>
 
 namespace Libs::Graphics {
 
 static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
+
+struct RenderAttachment {
+	vk::ImageView           image_view   = nullptr;
+	vk::ImageLayout         image_layout = vk::ImageLayout::eUndefined;
+	std::array<uint32_t, 4> clear_value  = {};
+	bool                    is_clear      = false;
+	bool                    has_depth    = false;
+	bool                    depth_clear  = false;
+	bool                    has_stencil  = false;
+	bool                    stencil_clear = false;
+
+	bool operator==(const RenderAttachment&) const = default;
+};
+
+struct RenderState {
+	std::array<RenderAttachment, RENDER_COLOR_ATTACHMENTS_MAX> color_attachments;
+	RenderAttachment                                           depth_stencil_attachment;
+	uint32_t                                                   width                 = 0;
+	uint32_t                                                   height                = 0;
+	uint32_t                                                   num_layers            = 1;
+	uint32_t                                                   num_color_attachments = 0;
+
+	bool operator==(const RenderState&) const = default;
+};
 
 [[nodiscard]] inline constexpr uint32_t render_sample_count(uint32_t encoded_samples) {
 	return encoded_samples <= 3 ? 1u << encoded_samples : 0;

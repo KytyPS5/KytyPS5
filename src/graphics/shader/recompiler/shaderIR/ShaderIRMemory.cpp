@@ -10,6 +10,71 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+Opcode BufferLoadOpcode(const Decoder::Instruction& decoded) {
+	switch (decoded.data_bits) {
+		case 8u: return decoded.data_signed ? Opcode::BufferLoadSbyte : Opcode::BufferLoadUbyte;
+		case 16u: return decoded.data_signed ? Opcode::BufferLoadSshort : Opcode::BufferLoadUshort;
+		default: return Opcode::BufferLoadDword;
+	}
+}
+
+Opcode BufferStoreOpcode(uint32_t data_bits) {
+	switch (data_bits) {
+		case 8u: return Opcode::BufferStoreByte;
+		case 16u: return Opcode::BufferStoreShort;
+		default: return Opcode::BufferStoreDword;
+	}
+}
+
+Opcode DsReadOpcode(const Decoder::Instruction& decoded) {
+	switch (decoded.data_bits) {
+		case 8u: return decoded.data_signed ? Opcode::DsReadSbyte : Opcode::DsReadUbyte;
+		case 16u: return decoded.data_signed ? Opcode::DsReadSshort : Opcode::DsReadUshort;
+		default: return Opcode::DsReadB32;
+	}
+}
+
+Opcode FlatLoadOpcode(const Decoder::Instruction& decoded) {
+	switch (decoded.data_bits) {
+		case 8u: return decoded.data_signed ? Opcode::FlatLoadSbyte : Opcode::FlatLoadUbyte;
+		case 16u: return decoded.data_signed ? Opcode::FlatLoadSshort : Opcode::FlatLoadUshort;
+		default: return Opcode::FlatLoadDword;
+	}
+}
+
+Opcode FlatStoreOpcode(uint32_t data_bits) {
+	switch (data_bits) {
+		case 8u: return Opcode::FlatStoreByte;
+		case 16u: return Opcode::FlatStoreShort;
+		default: return Opcode::FlatStoreDword;
+	}
+}
+
+Opcode DsWriteOpcode(uint32_t data_bits) {
+	switch (data_bits) {
+		case 8u: return Opcode::DsWriteByte;
+		case 16u: return Opcode::DsWriteShort;
+		default: return Opcode::DsWriteB32;
+	}
+}
+
+Opcode LoweredImageOpcode(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::ImageGetResinfo: return Opcode::ImageGetResinfo;
+		case Decoder::Opcode::ImageGetLod: return Opcode::ImageGetLod;
+		case Decoder::Opcode::ImageLoad:
+		case Decoder::Opcode::ImageLoadMip: return Opcode::ImageLoad;
+		case Decoder::Opcode::ImageGather4Lz:
+		case Decoder::Opcode::ImageGather4C:
+		case Decoder::Opcode::ImageGather4CLz:
+		case Decoder::Opcode::ImageGather4LzO:
+		case Decoder::Opcode::ImageGather4CO:
+		case Decoder::Opcode::ImageGather4CLzO:
+		case Decoder::Opcode::ImageGather4H: return Opcode::ImageGather4;
+		default: return Opcode::ImageSample;
+	}
+}
+
 bool LowerScalarBufferLoadDword(const Decoder::Instruction& decoded, BasicBlock& block, Opcode op,
                                 std::string* error) {
 	for (uint32_t i = 0; i < decoded.data_dwords; i++) {
@@ -54,12 +119,7 @@ bool LowerBufferAddressSources(const Decoder::Instruction& decoded, Instruction&
 }
 
 bool LowerBufferLoad(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op =
-	    decoded.data_bits == 8u
-	        ? (decoded.data_signed ? Opcode::BufferLoadSbyte : Opcode::BufferLoadUbyte)
-	    : decoded.data_bits == 16u
-	        ? (decoded.data_signed ? Opcode::BufferLoadSshort : Opcode::BufferLoadUshort)
-	        : Opcode::BufferLoadDword;
+	const auto ir_op                   = BufferLoadOpcode(decoded);
 	const auto count                   = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
 	const auto typed_format_components = TypedBufferFormatComponentCount(decoded);
 	for (uint32_t i = 0; i < count; i++) {
@@ -85,9 +145,7 @@ bool LowerBufferLoad(const Decoder::Instruction& decoded, BasicBlock& block, std
 }
 
 bool LowerBufferStore(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op = decoded.data_bits == 8u    ? Opcode::BufferStoreByte
-	                   : decoded.data_bits == 16u ? Opcode::BufferStoreShort
-	                                              : Opcode::BufferStoreDword;
+	const auto ir_op = BufferStoreOpcode(decoded.data_bits);
 	auto       count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
 	if (decoded.data_bits == 32u) {
 		const auto typed_format_components = TypedBufferFormatComponentCount(decoded);
@@ -131,11 +189,7 @@ ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
 }
 
 bool LowerDsRead(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op = decoded.data_bits == 8u
-	                       ? (decoded.data_signed ? Opcode::DsReadSbyte : Opcode::DsReadUbyte)
-	                   : decoded.data_bits == 16u
-	                       ? (decoded.data_signed ? Opcode::DsReadSshort : Opcode::DsReadUshort)
-	                       : Opcode::DsReadB32;
+	const auto ir_op = DsReadOpcode(decoded);
 	const auto count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
 	for (uint32_t i = 0; i < count; i++) {
 		Instruction inst;
@@ -164,8 +218,7 @@ bool LowerDsRead2(const Decoder::Instruction& decoded, BasicBlock& block, uint32
 			inst.src_count = 1;
 			inst.memory =
 			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[read] + dword * 4u);
-			if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, index), inst.dst,
-			                          error) ||
+			if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, index), inst.dst, error) ||
 			    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
 				return false;
 			}
@@ -309,11 +362,7 @@ bool LowerImageAtomicU32(const Decoder::Instruction& decoded, BasicBlock& block,
 
 bool LowerFlatLoad(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
 	const auto kind  = FlatSegmentResourceKind(decoded.memory_segment);
-	const auto ir_op = decoded.data_bits == 8u
-	                       ? (decoded.data_signed ? Opcode::FlatLoadSbyte : Opcode::FlatLoadUbyte)
-	                   : decoded.data_bits == 16u
-	                       ? (decoded.data_signed ? Opcode::FlatLoadSshort : Opcode::FlatLoadUshort)
-	                       : Opcode::FlatLoadDword;
+	const auto ir_op = FlatLoadOpcode(decoded);
 	const auto count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
 	if (decoded.data_bits == 32u && count > 1u) {
 		Instruction inst;
@@ -356,9 +405,7 @@ bool LowerFlatLoad(const Decoder::Instruction& decoded, BasicBlock& block, std::
 
 bool LowerFlatStore(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
 	const auto kind  = FlatSegmentResourceKind(decoded.memory_segment);
-	const auto ir_op = decoded.data_bits == 8u    ? Opcode::FlatStoreByte
-	                   : decoded.data_bits == 16u ? Opcode::FlatStoreShort
-	                                              : Opcode::FlatStoreDword;
+	const auto ir_op = FlatStoreOpcode(decoded.data_bits);
 	const auto count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
 	for (uint32_t dword = 0; dword < count; dword++) {
 		Instruction inst;
@@ -382,9 +429,7 @@ bool LowerFlatStore(const Decoder::Instruction& decoded, BasicBlock& block, std:
 }
 
 bool LowerDsWrite(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op = decoded.data_bits == 8u    ? Opcode::DsWriteByte
-	                   : decoded.data_bits == 16u ? Opcode::DsWriteShort
-	                                              : Opcode::DsWriteB32;
+	const auto ir_op = DsWriteOpcode(decoded.data_bits);
 	const auto count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
 	for (uint32_t i = 0; i < count; i++) {
 		Instruction inst;
@@ -445,20 +490,7 @@ bool LowerImageOperation(const Decoder::Instruction& decoded, BasicBlock& block,
 		return true;
 	}
 
-	inst.op        = decoded.opcode == Decoder::Opcode::ImageGetResinfo ? Opcode::ImageGetResinfo
-	                 : decoded.opcode == Decoder::Opcode::ImageGetLod   ? Opcode::ImageGetLod
-	                 : decoded.opcode == Decoder::Opcode::ImageLoad ||
-	                         decoded.opcode == Decoder::Opcode::ImageLoadMip
-	                     ? Opcode::ImageLoad
-	                 : decoded.opcode == Decoder::Opcode::ImageGather4Lz ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4C ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4CLz ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4LzO ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4CO ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4CLzO ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4H
-	                     ? Opcode::ImageGather4
-	                     : Opcode::ImageSample;
+	inst.op        = LoweredImageOpcode(decoded.opcode);
 	inst.src_count = 1;
 	inst.memory    = MemoryInfoFromDecoded(decoded, ResourceKind::Image);
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||

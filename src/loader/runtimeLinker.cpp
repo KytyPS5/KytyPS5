@@ -13,10 +13,11 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
+#include "loader/gamePatch.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
@@ -515,8 +516,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			EXIT("invalid access type for page fault at 0x%016" PRIx64 "\n",
 			     info->access_violation_vaddr);
 		}();
-		if (Libs::Graphics::GetRenderContext().GetGpuResources().HandleFault(
-		        access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
 
@@ -1327,7 +1327,7 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
-void RuntimeLinker::Execute() {
+void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
@@ -1347,6 +1347,9 @@ void RuntimeLinker::Execute() {
 
 	PreloadAdjacentPrograms();
 	RelocateAll();
+	if (!game_patch.empty()) {
+		GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front());
+	}
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");

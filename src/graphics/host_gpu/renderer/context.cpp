@@ -9,63 +9,17 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
-#include <atomic>
+#include <bit>
 #include <cstring>
-#include <deque>
 #include <memory>
 namespace Libs::Graphics {
-static std::atomic<uint64_t> g_command_buffer_submit_seq = 0;
-
-static void ResetNativeCommandBuffer(vk::CommandBuffer buffer) {
-	EXIT_IF(buffer == nullptr);
-	const auto result = buffer.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
-	if (result != vk::Result::eSuccess) {
-		EXIT("failed to reset Vulkan command buffer: %s (%d)\n", VulkanToString(result).c_str(),
-		     static_cast<int>(result));
-	}
-}
-
-struct CommandSlot {
-	Common::Mutex*    pool_mutex = nullptr;
-	uint32_t          id         = 0;
-	vk::CommandBuffer buffer     = nullptr;
-	vk::Fence         fence      = nullptr;
-	bool              busy       = false;
-};
-
-class ThreadCommandPool {
-public:
-	ThreadCommandPool() = default;
-
-	KYTY_CLASS_NO_COPY(ThreadCommandPool);
-
-	CommandSlot* Allocate();
-	void         Destroy();
-
-private:
-	void         Create();
-	CommandSlot* CreateSlot();
-
-	Common::Mutex           m_mutex;
-	vk::CommandPool         m_pool = nullptr;
-	std::deque<CommandSlot> m_slots;
-};
-
-static RenderContext*                 g_render_ctx = nullptr;
-static thread_local ThreadCommandPool g_command_pool;
-
-RenderContext& GetRenderContext() noexcept {
-	return *g_render_ctx;
-}
 
 FenceResourceRetainer::~FenceResourceRetainer() {
 	if (!m_resources.empty()) {
@@ -88,87 +42,12 @@ void FenceResourceRetainer::ReleaseAfterFence() noexcept {
 	m_resources.clear();
 }
 
-void GraphicsRenderInit(GraphicContext& graphics) {
-	g_render_ctx = new RenderContext(graphics);
-}
+CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
+    : m_context(scheduler.Context()), m_scheduler(scheduler), m_graphics(scheduler.Graphics()),
+      m_slot(scheduler.AllocateCommandBuffer()) {}
 
-void GraphicsRenderReleaseThreadCommandPool() {
-	g_command_pool.Destroy();
-}
-
-CommandBuffer::CommandBuffer()
-    : m_graphics(GetRenderContext().GetGraphics()), m_slot(g_command_pool.Allocate()),
-      m_host_stream(m_graphics) {}
-
-void ThreadCommandPool::Create() {
-	auto& graphics = GetRenderContext().GetGraphics();
-	EXIT_IF(m_pool != nullptr || graphics.queue_family == static_cast<uint32_t>(-1));
-
-	vk::CommandPoolCreateInfo pool_info {};
-	pool_info.sType            = vk::StructureType::eCommandPoolCreateInfo;
-	pool_info.pNext            = nullptr;
-	pool_info.queueFamilyIndex = graphics.queue_family;
-	pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-
-	const auto result = graphics.device.createCommandPool(&pool_info, nullptr, &m_pool);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
-}
-
-CommandSlot* ThreadCommandPool::CreateSlot() {
-	auto&                         graphics = GetRenderContext().GetGraphics();
-	vk::CommandBufferAllocateInfo alloc_info {};
-	alloc_info.sType              = vk::StructureType::eCommandBufferAllocateInfo;
-	alloc_info.commandPool        = m_pool;
-	alloc_info.level              = vk::CommandBufferLevel::ePrimary;
-	alloc_info.commandBufferCount = 1;
-
-	vk::CommandBuffer buffer = nullptr;
-	if (graphics.device.allocateCommandBuffers(&alloc_info, &buffer) != vk::Result::eSuccess) {
-		EXIT("Can't allocate command buffers");
-	}
-
-	vk::FenceCreateInfo fence_info {};
-	fence_info.sType = vk::StructureType::eFenceCreateInfo;
-	fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
-
-	vk::Fence fence = nullptr;
-	if (graphics.device.createFence(&fence_info, nullptr, &fence) != vk::Result::eSuccess) {
-		graphics.device.freeCommandBuffers(m_pool, 1, &buffer);
-		EXIT("Can't create fence");
-	}
-	auto& slot      = m_slots.emplace_back();
-	slot.pool_mutex = &m_mutex;
-	slot.id         = static_cast<uint32_t>(m_slots.size() - 1);
-	slot.buffer     = buffer;
-	slot.fence      = fence;
-	return &slot;
-}
-
-CommandSlot* ThreadCommandPool::Allocate() {
-	Common::LockGuard lock(m_mutex);
-	if (m_pool == nullptr) {
-		Create();
-	}
-	auto  it   = std::ranges::find_if(m_slots, [](const auto& slot) { return !slot.busy; });
-	auto* slot = it != m_slots.end() ? &*it : CreateSlot();
-	slot->busy = true;
-	ResetNativeCommandBuffer(slot->buffer);
-	return slot;
-}
-
-void ThreadCommandPool::Destroy() {
-	Common::LockGuard lock(m_mutex);
-	if (m_pool == nullptr) {
-		return;
-	}
-	EXIT_IF(std::ranges::any_of(m_slots, [](const auto& slot) { return slot.busy; }));
-	auto& graphics = GetRenderContext().GetGraphics();
-	for (const auto& slot: m_slots) {
-		graphics.device.destroyFence(slot.fence, nullptr);
-	}
-	graphics.device.destroyCommandPool(m_pool, nullptr);
-	m_slots.clear();
-	m_pool = nullptr;
+CommandBuffer::~CommandBuffer() {
+	Release();
 }
 
 bool CommandBuffer::IsInvalid() const {
@@ -190,18 +69,19 @@ void CommandBuffer::Release() {
 
 	WaitForFence();
 
-	m_host_stream.Release();
-
 	m_slot->busy = false;
-	ResetNativeCommandBuffer(m_slot->buffer);
+	m_slot->Reset();
 	ReleaseResourcesAfterFence();
 	m_slot = nullptr;
 
 	EXIT_NOT_IMPLEMENTED(!IsInvalid());
 }
 
-void CommandBuffer::DeleteAfterFence(VulkanBuffer& buffer) {
-	m_delete_after_fence.push_back(&buffer);
+void CommandBuffer::RetireBufferAfterFence(std::unique_ptr<VulkanBuffer> buffer) {
+	if (IsInvalid() || m_execute || buffer == nullptr || buffer->buffer == nullptr) {
+		EXIT("cannot retire a buffer on an invalid or submitted command buffer\n");
+	}
+	m_retired_buffers.push_back(std::move(buffer));
 }
 
 void CommandBuffer::RetainResourceUntilFence(std::shared_ptr<void> resource) {
@@ -217,12 +97,13 @@ void CommandBuffer::RecycleDescriptorAfterFence(VulkanDescriptorSet& set) {
 
 void CommandBuffer::RecycleDescriptorsAfterFence() {
 	for (auto* set: m_descriptor_sets_after_fence) {
-		GetRenderContext().GetDescriptorCache().Recycle(*set);
+		m_context.GetDescriptorCache().Recycle(*set);
 	}
 	m_descriptor_sets_after_fence.clear();
 }
 
 void CommandBuffer::Begin() const {
+	EXIT_IF(m_rendering);
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -237,6 +118,7 @@ void CommandBuffer::Begin() const {
 }
 
 void CommandBuffer::End() const {
+	EndRendering();
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -255,39 +137,34 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg4      = arg4;
 }
 
-void CommandBuffer::Execute() {
-	Submit(nullptr, {}, nullptr);
-}
-
-void CommandBuffer::ExecuteWithSemaphore(vk::Semaphore          wait_semaphore,
-                                         vk::PipelineStageFlags wait_stage,
-                                         vk::Semaphore          signal_semaphore) {
-	EXIT_IF(wait_semaphore == nullptr || signal_semaphore == nullptr);
-	Submit(wait_semaphore, wait_stage, signal_semaphore);
-}
-
-void CommandBuffer::Submit(vk::Semaphore wait_semaphore, vk::PipelineStageFlags wait_stage,
-                           vk::Semaphore signal_semaphore) {
+void CommandBuffer::Execute(const SubmitInfo& submit) {
 	EXIT_IF(IsInvalid());
 	EXIT_IF(m_execute);
+	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
+	        submit.num_signal_semaphores > SubmitInfo::MaxSemaphores);
 
-	const bool has_wait   = wait_semaphore != nullptr;
-	const bool has_signal = signal_semaphore != nullptr;
-	auto       buffer     = Handle();
-	auto       fence      = m_slot->fence;
+	auto buffer = Handle();
+	auto fence  = m_slot->fence;
+
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.sType                     = vk::StructureType::eTimelineSemaphoreSubmitInfo;
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
 
 	vk::SubmitInfo submit_info {};
 	submit_info.sType                = vk::StructureType::eSubmitInfo;
-	submit_info.pNext                = nullptr;
-	submit_info.waitSemaphoreCount   = has_wait ? 1u : 0u;
-	submit_info.pWaitSemaphores      = has_wait ? &wait_semaphore : nullptr;
-	submit_info.pWaitDstStageMask    = has_wait ? &wait_stage : nullptr;
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
 	submit_info.commandBufferCount   = 1;
 	submit_info.pCommandBuffers      = &buffer;
-	submit_info.signalSemaphoreCount = has_signal ? 1u : 0u;
-	submit_info.pSignalSemaphores    = has_signal ? &signal_semaphore : nullptr;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-	auto& graphics = GetRenderContext().GetGraphics();
+	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
 	auto result = graphics.device.resetFences(1, &fence);
@@ -298,16 +175,16 @@ void CommandBuffer::Submit(vk::Semaphore wait_semaphore, vk::PipelineStageFlags 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	if (Config::GraphicsDebugDumpEnabled()) {
-		LOGF("vkQueueSubmit begin: slot=%u wait_semaphore=%p signal_semaphore=%p"
-		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     m_slot->id, static_cast<void*>(wait_semaphore), static_cast<void*>(signal_semaphore),
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
+		LOGF("vkQueueSubmit begin: slot=%u waits=%u signals=%u debug_op=%u debug_submit=%" PRIu64
+		     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		     m_slot->id, submit.num_wait_semaphores, submit.num_signal_semaphores, m_debug_op,
+		     m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
 		     m_debug_arg4);
 	}
 
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		m_submit_seq = g_command_buffer_submit_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+		m_submit_seq = m_scheduler.NextSubmitSequence();
 		result       = graphics.queue.submit(1, &submit_info, fence);
 	}
 
@@ -333,7 +210,7 @@ void CommandBuffer::WaitForFenceOnly() {
 	if (!m_execute || m_fence_waited) {
 		return;
 	}
-	auto device = GetRenderContext().GetGraphics().device;
+	auto device = m_graphics.device;
 	auto result = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkWaitForFences failed: %s (%d), slot=%u submit_seq=%" PRIu64
@@ -357,12 +234,9 @@ void CommandBuffer::FinalizeFence(bool reset_recording) {
 		m_execute      = false;
 		m_fence_waited = false;
 		if (reset_recording) {
-			ResetNativeCommandBuffer(m_slot->buffer);
-			m_recording_generation++;
+			Common::LockGuard lock(*m_slot->pool_mutex);
+			m_slot->Reset();
 		}
-	}
-	if (reset_recording) {
-		m_host_stream.Reset();
 	}
 	if (was_executed) {
 		ReleaseResourcesAfterFence();
@@ -376,144 +250,71 @@ void CommandBuffer::ReleaseResourcesAfterFence() {
 }
 
 void CommandBuffer::DeleteBuffersAfterFence() {
-	for (auto* buffer: m_delete_after_fence) {
-		GetRenderContext().GetGraphics().DeleteBuffer(*buffer);
-		delete buffer;
+	for (const auto& buffer: m_retired_buffers) {
+		m_graphics.DeleteBuffer(*buffer);
 	}
-	m_delete_after_fence.clear();
+	m_retired_buffers.clear();
 }
 
-void CommandBuffer::BeginRenderPass(VulkanFramebuffer& framebuffer, RenderColorInfo* colors,
-                                    uint32_t requested_color_count, RenderDepthInfo& depth) const {
-	auto buffer = Handle();
-
-	EXIT_IF(colors == nullptr);
-	EXIT_IF(requested_color_count > RENDER_COLOR_ATTACHMENTS_MAX);
-
-	bool with_depth = (depth.format != vk::Format::eUndefined && depth.vulkan_buffer != nullptr);
-	uint32_t color_count = 0;
-	for (uint32_t i = 0; i < requested_color_count; i++) {
-		if (colors[i].vulkan_buffer == nullptr) {
-			break;
-		}
-		color_count++;
+void CommandBuffer::BeginRendering(const RenderState& state) const {
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
+	if (m_rendering && m_render_state == state) {
+		return;
 	}
-	bool with_color = (color_count != 0);
+	EndRendering();
 
-	EXIT_NOT_IMPLEMENTED(!with_depth && !with_color);
-
-	vk::ClearValue clears[RENDER_COLOR_ATTACHMENTS_MAX + 1] = {};
-	for (uint32_t i = 0; i < color_count; i++) {
-		clears[i].color = colors[i].color_clear_value;
-	}
-	clears[color_count].depthStencil = {depth.depth_clear_value, depth.stencil_clear_value};
-
-	vk::Extent2D extent = (with_color ? colors[0].extent : depth.vulkan_buffer->extent);
-
-	vk::RenderPassBeginInfo render_pass_info {};
-	render_pass_info.sType             = vk::StructureType::eRenderPassBeginInfo;
-	render_pass_info.pNext             = nullptr;
-	render_pass_info.renderPass        = framebuffer.render_pass;
-	render_pass_info.framebuffer       = framebuffer.framebuffer;
-	render_pass_info.renderArea.offset = {0, 0};
-	render_pass_info.renderArea.extent = extent;
-	render_pass_info.clearValueCount   = color_count + (with_depth ? 1u : 0u);
-	render_pass_info.pClearValues      = clears;
-
-	for (uint32_t i = 0; i < color_count; i++) {
-		const auto color_initial_layout = framebuffer.color_layout[i];
-		if (colors[i].vulkan_buffer->layout != color_initial_layout) {
-			if (graphics_debug_dump_enabled()) {
-				LOGF("BeginRenderPass: color%u initial barrier image=%p mem=%" PRIu64 " %s -> %s\n",
-				     i, VulkanHandleToPointer(colors[i].vulkan_buffer->image),
-				     colors[i].vulkan_buffer->memory.unique_id,
-				     VulkanToString(colors[i].vulkan_buffer->layout).c_str(),
-				     VulkanToString(color_initial_layout).c_str());
-			}
-
-			vk::ImageMemoryBarrier image_memory_barrier {};
-			image_memory_barrier.sType               = vk::StructureType::eImageMemoryBarrier;
-			image_memory_barrier.pNext               = nullptr;
-			image_memory_barrier.srcAccessMask       = {};
-			image_memory_barrier.dstAccessMask       = vk::AccessFlagBits::eColorAttachmentRead |
-			                                           vk::AccessFlagBits::eColorAttachmentWrite;
-			image_memory_barrier.oldLayout           = colors[i].vulkan_buffer->layout;
-			image_memory_barrier.newLayout           = color_initial_layout;
-			image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			image_memory_barrier.image               = colors[i].vulkan_buffer->image;
-			image_memory_barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
-			image_memory_barrier.subresourceRange.baseMipLevel   = 0;
-			image_memory_barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
-			image_memory_barrier.subresourceRange.baseArrayLayer = 0;
-			image_memory_barrier.subresourceRange.layerCount     = colors[i].vulkan_buffer->layers;
-
-			buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-			                       vk::PipelineStageFlagBits::eColorAttachmentOutput,
-			                       vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1,
-			                       &image_memory_barrier);
-
-			colors[i].vulkan_buffer->layout = image_memory_barrier.newLayout;
-		} else if (graphics_debug_dump_enabled()) {
-			LOGF("BeginRenderPass: color%u initial image=%p mem=%" PRIu64 " layout=%s\n", i,
-			     VulkanHandleToPointer(colors[i].vulkan_buffer->image),
-			     colors[i].vulkan_buffer->memory.unique_id,
-			     VulkanToString(colors[i].vulkan_buffer->layout).c_str());
-		}
+	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
+		const auto& attachment = state.color_attachments[i];
+		colors[i].sType        = vk::StructureType::eRenderingAttachmentInfo;
+		colors[i].imageView    = attachment.image_view;
+		colors[i].imageLayout  = attachment.image_layout;
+		colors[i].loadOp = attachment.is_clear ? vk::AttachmentLoadOp::eClear
+		                                      : vk::AttachmentLoadOp::eLoad;
+		colors[i].storeOp                  = vk::AttachmentStoreOp::eStore;
+		colors[i].clearValue.color.uint32  = attachment.clear_value;
 	}
 
-	const auto depth_layout =
-	    with_depth ? framebuffer.depth_layout : vk::ImageLayout::eDepthStencilAttachmentOptimal;
+	const auto& depth_stencil = state.depth_stencil_attachment;
+	vk::RenderingAttachmentInfo depth {};
+	depth.sType       = vk::StructureType::eRenderingAttachmentInfo;
+	depth.imageView   = depth_stencil.image_view;
+	depth.imageLayout = depth_stencil.image_layout;
+	depth.loadOp = depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear
+	                                        : vk::AttachmentLoadOp::eLoad;
+	depth.storeOp                        = vk::AttachmentStoreOp::eStore;
+	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
-	if (with_depth && depth.vulkan_buffer->layout != depth_layout) {
-		vk::ImageMemoryBarrier image_memory_barrier {};
-		image_memory_barrier.sType = vk::StructureType::eImageMemoryBarrier;
-		image_memory_barrier.pNext = nullptr;
-		image_memory_barrier.srcAccessMask =
-		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		image_memory_barrier.dstAccessMask =
-		    (depth_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		         ? vk::AccessFlagBits::eMemoryRead
-		         : vk::AccessFlagBits::eMemoryWrite);
-		image_memory_barrier.oldLayout           = depth.vulkan_buffer->layout;
-		image_memory_barrier.newLayout           = depth_layout;
-		image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		image_memory_barrier.image               = depth.vulkan_buffer->image;
-		image_memory_barrier.subresourceRange.aspectMask =
-		    ImageViewOps::DepthAspectMask(depth.vulkan_buffer->format);
-		image_memory_barrier.subresourceRange.baseMipLevel   = 0;
-		image_memory_barrier.subresourceRange.levelCount     = 1;
-		image_memory_barrier.subresourceRange.baseArrayLayer = 0;
-		image_memory_barrier.subresourceRange.layerCount     = depth.vulkan_buffer->layers;
+	vk::RenderingAttachmentInfo stencil {};
+	stencil.sType       = vk::StructureType::eRenderingAttachmentInfo;
+	stencil.imageView   = depth_stencil.image_view;
+	stencil.imageLayout = depth_stencil.image_layout;
+	stencil.loadOp = depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear
+	                                            : vk::AttachmentLoadOp::eLoad;
+	stencil.storeOp                            = vk::AttachmentStoreOp::eStore;
+	stencil.clearValue.depthStencil.stencil   = depth_stencil.clear_value[1];
 
-		buffer.pipelineBarrier(
-		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
-		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
-		    vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &image_memory_barrier);
-
-		depth.vulkan_buffer->layout = image_memory_barrier.newLayout;
-	}
-
-	buffer.beginRenderPass(&render_pass_info, vk::SubpassContents::eInline);
-
-	for (uint32_t i = 0; i < color_count; i++) {
-		colors[i].vulkan_buffer->layout = RENDER_COLOR_IMAGE_LAYOUT;
-		if (colors[i].vulkan_buffer->type == VulkanImageType::RenderTexture) {
-			static_cast<RenderTextureVulkanImage*>(colors[i].vulkan_buffer)->initial_clear_pending =
-			    false;
-		}
-	}
-	if (with_depth) {
-		depth.vulkan_buffer->initial_depth_clear_pending   = false;
-		depth.vulkan_buffer->initial_stencil_clear_pending = false;
-	}
+	vk::RenderingInfo rendering {};
+	rendering.sType                = vk::StructureType::eRenderingInfo;
+	rendering.renderArea.extent    = {state.width, state.height};
+	rendering.layerCount           = state.num_layers;
+	rendering.colorAttachmentCount = state.num_color_attachments;
+	rendering.pColorAttachments    = colors.data();
+	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
+	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	Handle().beginRendering(rendering);
+	m_render_state = state;
+	m_rendering    = true;
 }
 
-void CommandBuffer::EndRenderPass() const {
-	auto buffer = Handle();
-
-	buffer.endRenderPass();
+void CommandBuffer::EndRendering() const {
+	if (!m_rendering) {
+		return;
+	}
+	Handle().endRendering();
+	m_rendering    = false;
+	m_render_state = {};
 }
 
 } // namespace Libs::Graphics

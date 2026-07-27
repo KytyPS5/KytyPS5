@@ -8,7 +8,6 @@
 
 namespace Libs::Graphics {
 
-struct ImageImageCopy;
 struct RenderColorInfo;
 struct ShaderVertexInputInfo;
 
@@ -39,13 +38,8 @@ static_assert(sizeof(PipelineDynamicParameters) ==
                   sizeof(uint32_t) + sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) +
                   sizeof(PipelineStencilDynamicState) * 2);
 
-[[nodiscard]] bool           IsSameColorResolveSubresource(const RenderColorInfo& src,
-                                                           const RenderColorInfo& dst);
-[[nodiscard]] ImageImageCopy MakeColorResolveCopy(const RenderColorInfo& src,
-                                                  const RenderColorInfo& dst, uint32_t width,
-                                                  uint32_t height);
-[[nodiscard]] int32_t        ResolveVertexOffset(uint32_t                     index_offset,
-                                                 const ShaderVertexInputInfo& vs_input_info);
+[[nodiscard]] int32_t ResolveVertexOffset(uint32_t                     index_offset,
+                                          const ShaderVertexInputInfo& vs_input_info);
 
 } // namespace Libs::Graphics
 

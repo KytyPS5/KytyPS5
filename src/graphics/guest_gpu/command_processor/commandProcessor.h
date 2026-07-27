@@ -11,8 +11,6 @@
 
 namespace Libs::Graphics {
 
-inline constexpr uint32_t AcquireGcrGl2Writeback = 1u << 15u;
-
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
 enum class Pm4ProcessResult { Complete, Blocked };
@@ -45,7 +43,7 @@ public:
 		int64_t flip_arg  = 0;
 	};
 
-	CommandProcessor()  = default;
+	explicit CommandProcessor(RenderContext& renderer): m_renderer(renderer) {}
 	~CommandProcessor() = default;
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
@@ -60,16 +58,13 @@ public:
 		if (m_readback_active) {
 			EXIT("nested command-processor readback transaction\n");
 		}
-		m_readback_active   = true;
-		m_readback_finished = false;
+		m_readback_active = true;
 	}
-	void FinishReadbackTransaction();
 	void EndReadbackTransaction() {
 		if (!m_readback_active) {
 			EXIT("command-processor readback transaction is not active\n");
 		}
-		m_readback_active   = false;
-		m_readback_finished = false;
+		m_readback_active = false;
 	}
 
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -106,12 +101,10 @@ public:
 	void Flip(void* dst_gpu_addr, uint32_t value);
 	void FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action, void* dst_gpu_addr,
 	                       uint32_t value);
-	void PrepareCpuFlip();
+	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
-	void MemoryBarrier();
+	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
-	void RenderTextureBarrier(uint64_t vaddr, uint64_t size);
-	void DepthStencilBarrier(uint64_t vaddr, uint64_t size);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
@@ -120,11 +113,7 @@ public:
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
 	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
-	void SetEmbeddedDataMarker(const uint32_t* buffer, uint32_t num_dw, uint32_t align) {}
-	void PushMarker(const char* str) {}
-	void PopMarker() {}
 
-	void PrefetchL2(void* addr, uint32_t size) {}
 	void ResetDeCe();
 	void SetCeComplete(bool complete) { m_ce_complete = complete; }
 	void WaitCe();
@@ -164,11 +153,12 @@ private:
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
 
-	CommandScheduler&    GetScheduler() const { return GetRenderContext().GetCommandScheduler(); }
+	CommandScheduler&    GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	RenderCommandBuffer& CurrentBuffer() { return GetScheduler().Current(); }
 	void                 CheckBuffer() const { GetScheduler().CheckActive(); }
-	GpuResourceManager&  GetGpuResources() const { return GetRenderContext().GetGpuResources(); }
+	GpuResourceManager&  GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
+	RenderContext&    m_renderer;
 	HW::Context      m_ctx;
 	HW::UserConfig   m_ucfg;
 	HW::Shader       m_sh_ctx;
@@ -183,8 +173,7 @@ private:
 	uint32_t m_de_count          = 0;
 	uint32_t m_ce_count          = 0;
 	bool     m_ce_complete       = false;
-	bool     m_readback_active   = false;
-	bool     m_readback_finished = false;
+	bool     m_readback_active = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
 

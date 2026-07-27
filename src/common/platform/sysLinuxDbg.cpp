@@ -11,6 +11,9 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <libgen.h> // POSIX basename() lives here on macOS, not in <cstring>
+#endif
 
 void SysStackWalk(void** /*stack*/, int* depth) {
 	*depth = 0;

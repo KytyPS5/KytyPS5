@@ -385,7 +385,9 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void CreateLayout(std::span<vk::DescriptorSetLayout> set_layouts, uint32_t& set_layouts_num,
+static void CreateLayout(DescriptorCache& descriptor_cache,
+                         std::span<vk::DescriptorSetLayout> set_layouts,
+                         uint32_t& set_layouts_num,
                          std::span<vk::PushConstantRange>     push_constant_info,
                          uint32_t&                            push_constant_info_num,
                          const ShaderRecompiler::IR::Program& program,
@@ -405,17 +407,16 @@ static void CreateLayout(std::span<vk::DescriptorSetLayout> set_layouts, uint32_
 	if (need_descriptor) {
 		EXIT_IF(bindings.descriptor_set != set_layouts_num);
 
-		set_layouts[set_layouts_num] =
-		    GetRenderContext().GetDescriptorCache().GetDescriptorSetLayout(stage, program);
+		set_layouts[set_layouts_num] = descriptor_cache.GetDescriptorSetLayout(stage, program);
 		set_layouts_num++;
 	}
 }
 
-static void ConfigureSubgroupSize(vk::ShaderStageFlagBits                                vk_stage,
+static void ConfigureSubgroupSize(const GraphicContext&                                  graphics,
+                                  vk::ShaderStageFlagBits                                vk_stage,
                                   const ShaderRecompiler::IR::Program&                   program,
                                   vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo& required,
                                   vk::PipelineShaderStageCreateInfo&                     stage) {
-	const auto& graphics = GetRenderContext().GetGraphics();
 	const auto  config =
 	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program);
 	switch (config.mode) {
@@ -455,7 +456,9 @@ static void ConfigureSubgroupSize(vk::ShaderStageFlagBits                       
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::RenderPass render_pass,
+void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descriptor_cache,
+                            PipelineCache::GraphicsPipeline& pipeline,
+                            const PipelineRenderingState&   rendering,
                             const ShaderVertexInputInfo&    vs_input_info,
                             std::span<const uint32_t>       vs_shader,
                             const ShaderPixelInputInfo*     ps_input_info,
@@ -463,10 +466,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
                             const PipelineStaticParameters& static_params, uint32_t vs_hash0,
                             uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
                             bool ps_active) {
-	EXIT_IF(render_pass == nullptr);
 	EXIT_IF(ps_active && ps_input_info == nullptr);
-
-	auto& graphics = GetRenderContext().GetGraphics();
 
 	vk::ShaderModule vert_shader_module = nullptr;
 	vk::ShaderModule frag_shader_module = nullptr;
@@ -511,7 +511,8 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	vert_shader_stage_info.pName               = "main";
 	vert_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!vs_input_info.stage);
-	ConfigureSubgroupSize(vk::ShaderStageFlagBits::eVertex, *vs_input_info.stage.program,
+	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eVertex,
+	                      *vs_input_info.stage.program,
 	                      vert_subgroup_size, vert_shader_stage_info);
 
 	vk::PipelineShaderStageCreateInfo                     frag_shader_stage_info {};
@@ -525,7 +526,8 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	frag_shader_stage_info.pSpecializationInfo = nullptr;
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
-		ConfigureSubgroupSize(vk::ShaderStageFlagBits::eFragment, *ps_input_info->stage.program,
+		ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eFragment,
+		                      *ps_input_info->stage.program,
 		                      frag_subgroup_size, frag_shader_stage_info);
 	}
 
@@ -620,10 +622,13 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 					break;
 				}
 				case 3: {
-					auto swizzle = vs_input_info.resources[index].DstSelXYZ();
-					auto expected =
-					    (attr_size == 1 ? DstSel(4, 0, 0)
-					                    : (attr_size == 2 ? DstSel(4, 5, 0) : DstSel(4, 5, 6)));
+					auto swizzle  = vs_input_info.resources[index].DstSelXYZ();
+					auto expected = DstSel(4, 5, 6);
+					switch (attr_size) {
+						case 1: expected = DstSel(4, 0, 0); break;
+						case 2: expected = DstSel(4, 5, 0); break;
+						default: break;
+					}
 					if (swizzle != expected) {
 						log_unsupported_vertex_swizzle(swizzle, expected);
 					}
@@ -820,12 +825,14 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	uint32_t              push_constant_info_num = 0;
 
 	EXIT_IF(!vs_input_info.stage);
-	CreateLayout(set_layouts, set_layouts_num, push_constant_info, push_constant_info_num,
+	CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
+	             push_constant_info_num,
 	             *vs_input_info.stage.program, vk::ShaderStageFlagBits::eVertex,
 	             DescriptorCache::Stage::Vertex);
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
-		CreateLayout(set_layouts, set_layouts_num, push_constant_info, push_constant_info_num,
+		CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
+		             push_constant_info_num,
 		             *ps_input_info->stage.program, vk::ShaderStageFlagBits::eFragment,
 		             DescriptorCache::Stage::Pixel);
 	}
@@ -899,8 +906,14 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	dynamic_state.pDynamicStates    = dynamic_states;
 
 	vk::GraphicsPipelineCreateInfo pipeline_info {};
+	vk::PipelineRenderingCreateInfo rendering_info {};
+	rendering_info.sType                   = vk::StructureType::ePipelineRenderingCreateInfo;
+	rendering_info.colorAttachmentCount    = rendering.color_count;
+	rendering_info.pColorAttachmentFormats = rendering.color_formats.data();
+	rendering_info.depthAttachmentFormat   = rendering.depth_format;
+	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
 	pipeline_info.sType               = vk::StructureType::eGraphicsPipelineCreateInfo;
-	pipeline_info.pNext               = nullptr;
+	pipeline_info.pNext               = &rendering_info;
 	pipeline_info.flags               = {};
 	pipeline_info.stageCount          = shader_stage_count;
 	pipeline_info.pStages             = shader_stages;
@@ -914,7 +927,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	pipeline_info.pColorBlendState    = &color_blending;
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
-	pipeline_info.renderPass          = render_pass;
+	pipeline_info.renderPass          = nullptr;
 	pipeline_info.subpass             = 0;
 	pipeline_info.basePipelineHandle  = nullptr;
 	pipeline_info.basePipelineIndex   = -1;
@@ -949,11 +962,10 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(PipelineCache::ComputePipeline& pipeline,
+void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descriptor_cache,
+                            PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo&   input_info,
                             std::span<const uint32_t>       cs_shader) {
-	auto& graphics = GetRenderContext().GetGraphics();
-
 	vk::ShaderModule comp_shader_module = nullptr;
 
 	vk::ShaderModuleCreateInfo create_info {};
@@ -982,7 +994,8 @@ void CreatePipelineInternal(PipelineCache::ComputePipeline& pipeline,
 	comp_shader_stage_info.pName               = "main";
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
-	ConfigureSubgroupSize(vk::ShaderStageFlagBits::eCompute, *input_info.stage.program,
+	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute,
+	                      *input_info.stage.program,
 	                      comp_subgroup_size, comp_shader_stage_info);
 
 	vk::DescriptorSetLayout set_layouts[1]  = {};
@@ -992,7 +1005,8 @@ void CreatePipelineInternal(PipelineCache::ComputePipeline& pipeline,
 	uint32_t              push_constant_info_num = 0;
 
 	EXIT_IF(!input_info.stage);
-	CreateLayout(set_layouts, set_layouts_num, push_constant_info, push_constant_info_num,
+	CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
+	             push_constant_info_num,
 	             *input_info.stage.program, vk::ShaderStageFlagBits::eCompute,
 	             DescriptorCache::Stage::Compute);
 

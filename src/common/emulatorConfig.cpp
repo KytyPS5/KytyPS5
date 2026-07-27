@@ -93,6 +93,10 @@ bool NggRectlistDrawEnabled() {
 	return g_config->ngg_rectlist_draw_enabled;
 }
 
+bool ReadbackLinearImagesEnabled() {
+	return g_config->readback_linear_images;
+}
+
 int GetAudioVolume() {
 	return g_config->audio_volume;
 }

@@ -7,9 +7,11 @@
 #include "common/abi.h"
 #include "kernel/eventQueue.h"
 
+#include <memory>
+
 namespace Libs::Graphics {
-// struct VulkanSwapchain;
-struct VideoOutVulkanImage;
+class CommandBuffer;
+class Presenter;
 } // namespace Libs::Graphics
 
 namespace Libs::VideoOut {
@@ -22,8 +24,31 @@ struct VideoOutOutputOptions;
 struct VideoOutBuffers;
 struct VideoOutColorSettings;
 
-void VideoOutInit(uint32_t width, uint32_t height);
-void VideoOutWaitFlipDone(int handle, int index);
+class VideoOutDriver final {
+public:
+	struct Impl;
+
+	VideoOutDriver(uint32_t width, uint32_t height, Graphics::Presenter& presenter);
+	~VideoOutDriver();
+	KYTY_CLASS_NO_COPY(VideoOutDriver);
+
+	int SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index, int flip_mode,
+	                      int64_t flip_arg, uint64_t& request_id);
+	void                   PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
+	void                   CompleteFlip(uint64_t request_id);
+	void                   SubmitFlipPreparation(uint64_t request_id);
+	void                   WaitForSubmitSlot();
+	void                   WaitFlipDone(int handle, int index);
+
+	[[nodiscard]] Impl& State() noexcept;
+
+private:
+	std::unique_ptr<Impl> m_impl;
+};
+
+[[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
+                                           Graphics::Presenter& presenter);
+void                          VideoOutShutdown();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
@@ -74,10 +99,6 @@ KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle);
 KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point);
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
-
-void VideoOutBeginVblank();
-void VideoOutEndVblank();
-bool VideoOutFlipWindow(uint32_t micros);
 
 } // namespace Libs::VideoOut
 

@@ -1,9 +1,8 @@
 #include "graphics/host_gpu/renderer/imageView.h"
 
 #include "common/assert.h"
-#include "graphics/host_gpu/objects/textureCommon.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/textureCache.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/image.h"
 
 #include <mutex>
 
@@ -11,61 +10,296 @@ namespace Libs::Graphics {
 
 namespace {
 
-void CreateView(VulkanImage& image, int view_index,
-                vk::ImageViewType view_type, vk::ImageAspectFlags aspect_mask,
-                vk::ComponentMapping components, uint32_t base_array_layer, uint32_t base_mip_level,
-                uint32_t layer_count, uint32_t level_count,
-                vk::Format          view_format = vk::Format::eUndefined,
-	             vk::ImageUsageFlags view_usage  = {}) {
-	auto& graphics = GetRenderContext().GetGraphics();
-	if (view_index < 0 || view_index >= VulkanImage::VIEW_MAX ||
-	    image.image_view[view_index] != nullptr) {
-		EXIT("invalid image-view creation target: image=%p index=%d current_view=%d\n",
-		     static_cast<const void*>(&image), view_index,
-		     view_index >= 0 && view_index < VulkanImage::VIEW_MAX &&
-		         image.image_view[view_index] != nullptr);
-	}
-
-	vk::ImageViewUsageCreateInfo usage_info {};
-	usage_info.sType = vk::StructureType::eImageViewUsageCreateInfo;
-	usage_info.usage = view_usage;
-
-	vk::ImageViewCreateInfo create_info {};
-	create_info.sType      = vk::StructureType::eImageViewCreateInfo;
-	create_info.pNext      = view_usage ? &usage_info : nullptr;
-	create_info.image      = image.image;
-	create_info.viewType   = view_type;
-	create_info.format     = view_format != vk::Format::eUndefined ? view_format : image.format;
-	create_info.components = components;
-	create_info.subresourceRange.aspectMask     = aspect_mask;
-	create_info.subresourceRange.baseArrayLayer = base_array_layer;
-	create_info.subresourceRange.baseMipLevel   = base_mip_level;
-	create_info.subresourceRange.layerCount     = layer_count;
-	create_info.subresourceRange.levelCount     = level_count;
-
-	const auto result =
-	    graphics.device.createImageView(&create_info, nullptr, &image.image_view[view_index]);
-	if (result != vk::Result::eSuccess || image.image_view[view_index] == nullptr) {
-		EXIT("failed to create image view: result=%d image_format=%d view_format=%d index=%d\n",
-		     static_cast<int>(result), static_cast<int>(image.format),
-		     static_cast<int>(create_info.format), view_index);
+[[nodiscard]] bool IsComponentSwizzle(vk::ComponentSwizzle swizzle) {
+	switch (swizzle) {
+		case vk::ComponentSwizzle::eIdentity:
+		case vk::ComponentSwizzle::eZero:
+		case vk::ComponentSwizzle::eOne:
+		case vk::ComponentSwizzle::eR:
+		case vk::ComponentSwizzle::eG:
+		case vk::ComponentSwizzle::eB:
+		case vk::ComponentSwizzle::eA: return true;
+		default: return false;
 	}
 }
 
-void CreateRenderTargetView(VulkanImage& image, int index,
-                            vk::ComponentSwizzle r, vk::ComponentSwizzle g, vk::ComponentSwizzle b,
-                            vk::ComponentSwizzle a, vk::ImageViewType type = vk::ImageViewType::e2D,
-                            vk::Format          view_format = vk::Format::eUndefined,
-                            vk::ImageUsageFlags view_usage = {}, uint32_t level_count = 0) {
-	const auto layer_count = type == vk::ImageViewType::e2DArray ? image.layers : 1u;
-	CreateView(image, index, type, vk::ImageAspectFlagBits::eColor, {r, g, b, a}, 0, 0,
-	           layer_count, level_count == 0 ? image.mip_levels : level_count, view_format,
-	           view_usage);
+[[nodiscard]] bool IsCompatibleViewFormat(vk::Format image_format, vk::Format view_format) {
+	return ImageViewOps::FormatsCompatible(image_format, view_format);
+}
+
+[[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eS8Uint:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Unorm: return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] bool IsDepthViewFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32Uint: return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] bool IsValidViewType(const VulkanImage& image, const ImageViewInfo& info) {
+	switch (image.image_type) {
+		case vk::ImageType::e1D:
+			if (info.type != vk::ImageViewType::e1D && info.type != vk::ImageViewType::e1DArray) {
+				return false;
+			}
+			return info.type != vk::ImageViewType::e1D || info.layer_count == 1;
+		case vk::ImageType::e2D:
+			switch (info.type) {
+				case vk::ImageViewType::e2D: return info.layer_count == 1;
+				case vk::ImageViewType::e2DArray: return true;
+				case vk::ImageViewType::eCube:
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::eCubeCompatible) &&
+					       info.base_layer % 6 == 0 && info.layer_count == 6;
+				case vk::ImageViewType::eCubeArray:
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::eCubeCompatible) &&
+					       info.base_layer % 6 == 0 && info.layer_count % 6 == 0;
+				default: return false;
+			}
+		case vk::ImageType::e3D:
+			switch (info.type) {
+				case vk::ImageViewType::e3D:
+					return info.base_layer == 0 && info.layer_count == 1;
+				case vk::ImageViewType::e2D:
+					return static_cast<bool>(
+					           image.flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+					       info.level_count == 1 && info.layer_count == 1;
+				case vk::ImageViewType::e2DArray:
+					return static_cast<bool>(
+					           image.flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+					       info.level_count == 1;
+				default: return false;
+			}
+		default: return false;
+	}
+}
+
+[[nodiscard]] bool IsValidAspect(const VulkanImage& image, vk::ImageAspectFlags aspect) {
+	const auto depth_format = DepthAspectTransferFormat(image.format);
+	if (depth_format == vk::Format::eUndefined) {
+		return aspect == vk::ImageAspectFlagBits::eColor;
+	}
+	const auto supported = ImageViewOps::DepthAspectMask(image.format);
+	return static_cast<bool>(aspect) && !(aspect & ~supported);
 }
 
 } // namespace
 
 namespace ImageViewOps {
+
+namespace {
+
+enum CompatibilityClass : uint32_t {
+	None    = 0,
+	Bit8    = 1u << 0,
+	Bit16   = 1u << 1,
+	Bit24   = 1u << 2,
+	Bit32   = 1u << 3,
+	Bit48   = 1u << 4,
+	Bit64   = 1u << 5,
+	Bit96   = 1u << 6,
+	Bit128  = 1u << 7,
+	Bit192  = 1u << 8,
+	Bit256  = 1u << 9,
+	Bc1Rgb  = 1u << 10,
+	Bc1Rgba = 1u << 11,
+	Bc2     = 1u << 12,
+	Bc3     = 1u << 13,
+	Bc4     = 1u << 14,
+	Bc5     = 1u << 15,
+	Bc6h    = 1u << 16,
+	Bc7     = 1u << 17,
+	D16     = 1u << 18,
+	D16S8   = 1u << 19,
+	D24     = 1u << 20,
+	D24S8   = 1u << 21,
+	D32     = 1u << 22,
+	D32S8   = 1u << 23,
+	S8      = 1u << 24,
+};
+
+[[nodiscard]] uint32_t FormatClass(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eR4G4UnormPack8:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8Snorm:
+		case vk::Format::eR8Srgb:
+		case vk::Format::eR8Sscaled:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8Uscaled: return Bit8;
+
+		case vk::Format::eA1R5G5B5UnormPack16:
+		case vk::Format::eA4B4G4R4UnormPack16:
+		case vk::Format::eA4R4G4B4UnormPack16:
+		case vk::Format::eB4G4R4A4UnormPack16:
+		case vk::Format::eB5G5R5A1UnormPack16:
+		case vk::Format::eB5G6R5UnormPack16:
+		case vk::Format::eR10X6UnormPack16:
+		case vk::Format::eR12X4UnormPack16:
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16Snorm:
+		case vk::Format::eR16Sscaled:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16Uscaled:
+		case vk::Format::eR4G4B4A4UnormPack16:
+		case vk::Format::eR5G5B5A1UnormPack16:
+		case vk::Format::eR5G6B5UnormPack16:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8Snorm:
+		case vk::Format::eR8G8Srgb:
+		case vk::Format::eR8G8Sscaled:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8G8Uscaled: return Bit16;
+
+		case vk::Format::eB8G8R8Sint:
+		case vk::Format::eB8G8R8Snorm:
+		case vk::Format::eB8G8R8Srgb:
+		case vk::Format::eB8G8R8Sscaled:
+		case vk::Format::eB8G8R8Uint:
+		case vk::Format::eB8G8R8Unorm:
+		case vk::Format::eB8G8R8Uscaled:
+		case vk::Format::eR8G8B8Sint:
+		case vk::Format::eR8G8B8Snorm:
+		case vk::Format::eR8G8B8Srgb:
+		case vk::Format::eR8G8B8Sscaled:
+		case vk::Format::eR8G8B8Uint:
+		case vk::Format::eR8G8B8Unorm:
+		case vk::Format::eR8G8B8Uscaled: return Bit24;
+
+		case vk::Format::eA2B10G10R10SintPack32:
+		case vk::Format::eA2B10G10R10SnormPack32:
+		case vk::Format::eA2B10G10R10SscaledPack32:
+		case vk::Format::eA2B10G10R10UintPack32:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2B10G10R10UscaledPack32:
+		case vk::Format::eA2R10G10B10SintPack32:
+		case vk::Format::eA2R10G10B10SnormPack32:
+		case vk::Format::eA2R10G10B10SscaledPack32:
+		case vk::Format::eA2R10G10B10UintPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA2R10G10B10UscaledPack32:
+		case vk::Format::eA8B8G8R8SintPack32:
+		case vk::Format::eA8B8G8R8SnormPack32:
+		case vk::Format::eA8B8G8R8SrgbPack32:
+		case vk::Format::eA8B8G8R8SscaledPack32:
+		case vk::Format::eA8B8G8R8UintPack32:
+		case vk::Format::eA8B8G8R8UnormPack32:
+		case vk::Format::eA8B8G8R8UscaledPack32:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eB8G8R8A8Sint:
+		case vk::Format::eB8G8R8A8Snorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eB8G8R8A8Sscaled:
+		case vk::Format::eB8G8R8A8Uint:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Uscaled:
+		case vk::Format::eE5B9G9R9UfloatPack32:
+		case vk::Format::eR10X6G10X6Unorm2Pack16:
+		case vk::Format::eR12X4G12X4Unorm2Pack16:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16Snorm:
+		case vk::Format::eR16G16Sscaled:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR16G16Uscaled:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eR8G8B8A8Snorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eR8G8B8A8Sscaled:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Uscaled: return Bit32;
+
+		case vk::Format::eR16G16B16Sfloat:
+		case vk::Format::eR16G16B16Sint:
+		case vk::Format::eR16G16B16Snorm:
+		case vk::Format::eR16G16B16Sscaled:
+		case vk::Format::eR16G16B16Uint:
+		case vk::Format::eR16G16B16Unorm:
+		case vk::Format::eR16G16B16Uscaled: return Bit48;
+
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR16G16B16A16Snorm:
+		case vk::Format::eR16G16B16A16Sscaled:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16G16B16A16Uscaled:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR64Sfloat:
+		case vk::Format::eR64Sint:
+		case vk::Format::eR64Uint: return Bit64;
+
+		case vk::Format::eR32G32B32Sfloat:
+		case vk::Format::eR32G32B32Sint:
+		case vk::Format::eR32G32B32Uint: return Bit96;
+
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eR32G32B32A32Sint:
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR64G64Sfloat:
+		case vk::Format::eR64G64Sint:
+		case vk::Format::eR64G64Uint: return Bit128;
+
+		case vk::Format::eR64G64B64Sfloat:
+		case vk::Format::eR64G64B64Sint:
+		case vk::Format::eR64G64B64Uint: return Bit192;
+
+		case vk::Format::eR64G64B64A64Sfloat:
+		case vk::Format::eR64G64B64A64Sint:
+		case vk::Format::eR64G64B64A64Uint: return Bit256;
+
+		case vk::Format::eBc1RgbSrgbBlock:
+		case vk::Format::eBc1RgbUnormBlock: return Bc1Rgb | Bit64;
+		case vk::Format::eBc1RgbaSrgbBlock:
+		case vk::Format::eBc1RgbaUnormBlock: return Bc1Rgba | Bit64;
+		case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc2UnormBlock: return Bc2 | Bit128;
+		case vk::Format::eBc3SrgbBlock:
+		case vk::Format::eBc3UnormBlock: return Bc3 | Bit128;
+		case vk::Format::eBc4SnormBlock:
+		case vk::Format::eBc4UnormBlock: return Bc4 | Bit64;
+		case vk::Format::eBc5SnormBlock:
+		case vk::Format::eBc5UnormBlock: return Bc5 | Bit128;
+		case vk::Format::eBc6HSfloatBlock:
+		case vk::Format::eBc6HUfloatBlock: return Bc6h | Bit128;
+		case vk::Format::eBc7SrgbBlock:
+		case vk::Format::eBc7UnormBlock: return Bc7 | Bit128;
+
+		case vk::Format::eD16Unorm: return D16;
+		case vk::Format::eD16UnormS8Uint: return D16S8;
+		case vk::Format::eX8D24UnormPack32: return D24;
+		case vk::Format::eD24UnormS8Uint: return D24S8;
+		case vk::Format::eD32Sfloat: return D32;
+		case vk::Format::eD32SfloatS8Uint: return D32S8;
+		case vk::Format::eS8Uint: return S8;
+		default: return None;
+	}
+}
+
+} // namespace
 
 vk::ImageAspectFlags DepthAspectMask(vk::Format format) {
 	switch (format) {
@@ -79,314 +313,104 @@ vk::ImageAspectFlags DepthAspectMask(vk::Format format) {
 	}
 }
 
-bool FormatSupportsStorage(vk::Format format) {
-	auto& graphics = GetRenderContext().GetGraphics();
-	const auto properties = graphics.GetFormatProperties(format);
-	return static_cast<bool>(properties.optimalTilingFeatures &
-	                         vk::FormatFeatureFlagBits::eStorageImage);
-}
-
-void CreateRenderTargetViews(RenderTextureVulkanImage& image) {
-	CreateRenderTargetView(image, VulkanImage::VIEW_DEFAULT,
-	                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-	                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity);
-	if (image.layers > 1) {
-		CreateRenderTargetView(image, VulkanImage::VIEW_DEFAULT_ARRAY,
-		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ImageViewType::e2DArray);
+bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
+	if (base == view) {
+		return true;
 	}
-	if (image.samples == 1 && FormatSupportsStorage(image.format)) {
-		CreateRenderTargetView(image, VulkanImage::VIEW_STORAGE,
-		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ImageViewType::e2D, vk::Format::eUndefined,
-		                       vk::ImageUsageFlags {}, 1);
-		if (image.layers > 1) {
-			CreateRenderTargetView(image, VulkanImage::VIEW_STORAGE_ARRAY,
-			                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-			                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-			                       vk::ImageViewType::e2DArray, vk::Format::eUndefined,
-			                       vk::ImageUsageFlags {}, 1);
-		}
-	}
-}
-
-void CreateDepthViews(DepthStencilVulkanImage& image) {
-	CreateView(image, VulkanImage::VIEW_DEFAULT, vk::ImageViewType::e2D,
-	           DepthAspectMask(image.format),
-	           {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-	            vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity},
-	           0, 0, 1, 1);
-}
-
-void CreateVideoOutViews(VideoOutVulkanImage& image) {
-	CreateRenderTargetView(image, VulkanImage::VIEW_DEFAULT,
-	                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-	                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity);
-	if ((image.format == vk::Format::eR8G8B8A8Srgb || image.format == vk::Format::eB8G8R8A8Srgb) &&
-	    FormatSupportsStorage(vk::Format::eR8G8B8A8Uint)) {
-		CreateRenderTargetView(image, VulkanImage::VIEW_STORAGE,
-		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ImageViewType::e2D, vk::Format::eR8G8B8A8Uint,
-		                       vk::ImageUsageFlagBits::eStorage, 1);
-	}
-}
-
-void DestroyViews(VulkanImage& image) {
-	auto& graphics = GetRenderContext().GetGraphics();
-	for (auto& cached: image.view_cache.views) {
-		if (cached.view != nullptr) {
-			graphics.device.destroyImageView(cached.view, nullptr);
-			cached.view = nullptr;
-		}
-	}
-	image.view_cache.views.clear();
-	for (auto& view: image.image_view) {
-		if (view != nullptr) {
-			graphics.device.destroyImageView(view, nullptr);
-			view = nullptr;
-		}
-	}
+	const auto base_class = FormatClass(base);
+	const auto view_class = FormatClass(view);
+	return view_class != None && (base_class & view_class) == view_class;
 }
 
 } // namespace ImageViewOps
 
-vk::ImageView TextureCache::GetRenderTargetAttachmentView(RenderTextureVulkanImage& image,
-                                                          vk::Format format, uint32_t level,
-                                                          uint32_t base_layer,
-                                                          uint32_t layer_count) {
-	if (image.format == vk::Format::eUndefined || level >= image.mip_levels || level >= 16 ||
-	    layer_count == 0 || base_layer >= image.layers || layer_count > image.layers - base_layer) {
-		EXIT("TextureCache: invalid render-target attachment view, image=%p format=%d"
-		     " level=%u image_levels=%u base_layer=%u layer_count=%u image_layers=%u\n",
-		     static_cast<const void*>(&image), static_cast<int>(format), level, image.mip_levels,
-		     base_layer, layer_count, image.layers);
+vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+	const auto& image = backing;
+	auto        normalized = view_info;
+	const bool  is_storage =
+	    static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
+	normalized.aspect = FullAspectMask(image.format);
+	if (normalized.aspect & vk::ImageAspectFlagBits::eDepth &&
+	    IsDepthViewFormat(normalized.format)) {
+		normalized.format = image.format;
+		normalized.aspect = vk::ImageAspectFlagBits::eDepth;
 	}
-	if (format != image.format && !IsRgba8SrgbReinterpretation(image.format, format)) {
-		EXIT("TextureCache: incompatible render-target attachment view, image_format=%d"
-		     " view_format=%d level=%u\n",
-		     static_cast<int>(image.format), static_cast<int>(format), level);
+	if (normalized.aspect & vk::ImageAspectFlagBits::eStencil &&
+	    IsStencilViewFormat(normalized.format)) {
+		normalized.format = image.format;
+		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
-
-	return GetImageView(
-	    image, {format, layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray,
-	            vk::ImageAspectFlagBits::eColor, level, 1, base_layer, layer_count,
-	            DstSel(4, 5, 6, 7), vk::ImageUsageFlagBits::eColorAttachment});
-}
-
-vk::ImageView TextureCache::GetDepthTargetAttachmentView(DepthStencilVulkanImage& image,
-                                                         uint32_t                 base_layer,
-                                                         uint32_t                 layer_count) {
-	if (layer_count == 0 || base_layer >= image.layers || layer_count > image.layers - base_layer) {
-		EXIT("TextureCache: invalid depth-target attachment view, image=%p base_layer=%u "
-		     "layer_count=%u image_layers=%u\n",
-		     static_cast<const void*>(&image), base_layer, layer_count, image.layers);
-	}
-	return GetImageView(image,
-	                    {image.format,
-	                     layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray,
-	                     ImageViewOps::DepthAspectMask(image.format), 0, 1, base_layer, layer_count,
-	                     DstSel(4, 5, 6, 7), vk::ImageUsageFlagBits::eDepthStencilAttachment});
-}
-
-vk::ImageView TextureCache::GetImageView(VulkanImage& image, const ImageViewInfo& info) {
-	const bool supported_type  = info.type == vk::ImageViewType::e2D ||
-	                             info.type == vk::ImageViewType::e2DArray ||
-	                             info.type == vk::ImageViewType::e3D;
-	const bool supported_usage = info.usage == vk::ImageUsageFlagBits::eSampled ||
-	                             info.usage == vk::ImageUsageFlagBits::eStorage ||
-	                             info.usage == vk::ImageUsageFlagBits::eColorAttachment ||
-	                             info.usage == vk::ImageUsageFlagBits::eDepthStencilAttachment;
-	const bool valid_shape =
-	    (info.type == vk::ImageViewType::e2D && info.layer_count == 1) ||
-	    info.type == vk::ImageViewType::e2DArray ||
-	    (info.type == vk::ImageViewType::e3D && info.base_layer == 0 && info.layer_count == 1);
-	if (info.format == vk::Format::eUndefined || !info.aspect || info.level_count == 0 ||
-	    info.base_level >= (image.mip_levels) ||
-	    info.level_count > image.mip_levels - info.base_level || info.layer_count == 0 ||
-	    info.base_layer >= image.layers || info.layer_count > image.layers - info.base_layer ||
-	    !supported_type || !valid_shape || !supported_usage) {
-		EXIT("TextureCache: invalid dynamic image view, image=%p format=%d aspect=0x%x"
-		     " swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d usage=0x%x"
-		     " image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(&image), static_cast<int>(info.format),
-		     static_cast<vk::ImageAspectFlags::MaskType>(info.aspect), info.swizzle,
-		     info.base_level, info.level_count, info.base_layer, info.layer_count,
-		     static_cast<int>(info.type), static_cast<vk::ImageUsageFlags::MaskType>(info.usage),
-		     image.mip_levels, image.layers);
+	normalized.usage =
+	    is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
+	                               IsCompatibleViewFormat(image.format, normalized.format);
+	const bool slice_view = image.image_type == vk::ImageType::e3D &&
+	                        (normalized.type == vk::ImageViewType::e2D ||
+	                         normalized.type == vk::ImageViewType::e2DArray);
+	const bool levels_valid = normalized.level_count != 0 &&
+	                          normalized.base_level < image.mip_levels &&
+	                          normalized.level_count <= image.mip_levels - normalized.base_level;
+	const auto view_layers = slice_view && levels_valid
+	                             ? std::max(image.extent.depth >> normalized.base_level, 1u)
+	                             : image.layers;
+	const bool ranges_valid = levels_valid &&
+	                          normalized.layer_count != 0 && normalized.base_layer < view_layers &&
+	                          normalized.layer_count <= view_layers - normalized.base_layer;
+	const bool mapping_valid =
+	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
+	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
+	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
+	    !IsValidViewType(image, normalized) ||
+	    !IsValidAspect(image, normalized.aspect)) {
+		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		     static_cast<int>(image.format), static_cast<int>(normalized.format),
+		     static_cast<int>(normalized.type),
+		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
+		     normalized.level_count, normalized.base_layer, normalized.layer_count,
+		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
+		     image.layers);
 	}
 
-	auto&           cache = image.view_cache;
-	std::lock_guard lock(cache.mutex);
-	for (const auto& cached: cache.views) {
-		if (cached.info == info) {
+	std::lock_guard lock(views.mutex);
+	for (const auto& cached: views.views) {
+		if (cached.info == normalized) {
 			return cached.view;
 		}
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.sType = vk::StructureType::eImageViewUsageCreateInfo;
-	usage.usage = info.usage;
+	usage.usage = image.usage;
+	if (!is_storage) {
+		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
+	}
 	vk::ImageViewCreateInfo create {};
 	create.sType                           = vk::StructureType::eImageViewCreateInfo;
 	create.pNext                           = &usage;
 	create.image                           = image.image;
-	create.viewType                        = info.type;
-	create.format                          = info.format;
-	create.components                      = info.usage == vk::ImageUsageFlagBits::eSampled
-	                                             ? TextureGetComponentMapping(info.swizzle)
-	                                             : vk::ComponentMapping {};
-	create.subresourceRange.aspectMask     = info.aspect;
-	create.subresourceRange.baseMipLevel   = info.base_level;
-	create.subresourceRange.levelCount     = info.level_count;
-	create.subresourceRange.baseArrayLayer = info.base_layer;
-	create.subresourceRange.layerCount     = info.layer_count;
-	vk::ImageView view                     = nullptr;
-	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
+	create.viewType                        = normalized.type;
+	create.format                          = normalized.format;
+	create.components                      = normalized.mapping;
+	create.subresourceRange.aspectMask     = normalized.aspect;
+	create.subresourceRange.baseMipLevel   = normalized.base_level;
+	create.subresourceRange.levelCount     = normalized.level_count;
+	create.subresourceRange.baseArrayLayer = normalized.base_layer;
+	create.subresourceRange.layerCount     = normalized.layer_count;
+
+	vk::ImageView view   = nullptr;
+	const auto    result = m_graphics->device.createImageView(&create, nullptr, &view);
 	if (result != vk::Result::eSuccess || view == nullptr) {
-		EXIT("TextureCache: failed to create dynamic image view, result=%d format=%d"
-		     " aspect=0x%x swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d usage=0x%x\n",
-		     static_cast<int>(result), static_cast<int>(info.format),
-		     static_cast<vk::ImageAspectFlags::MaskType>(info.aspect), info.swizzle,
-		     info.base_level, info.level_count, info.base_layer, info.layer_count,
-		     static_cast<int>(info.type), static_cast<vk::ImageUsageFlags::MaskType>(info.usage));
+		EXIT("failed to create image view: result=%d image_format=%d view_format=%d type=%d "
+		     "aspect=0x%x mip=%u+%u layer=%u+%u usage=0x%x\n",
+		     static_cast<int>(result), static_cast<int>(image.format),
+		     static_cast<int>(view_info.format), static_cast<int>(view_info.type),
+		     static_cast<vk::ImageAspectFlags::MaskType>(view_info.aspect), view_info.base_level,
+		     view_info.level_count, view_info.base_layer, view_info.layer_count,
+		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
-	cache.views.push_back({info, view});
+	views.views.push_back({normalized, view});
 	return view;
-}
-
-vk::ImageView TextureCache::GetDepthTargetSampledView(DepthStencilVulkanImage& image,
-                                                      vk::Format view_format, uint32_t swizzle,
-                                                      uint32_t base_level, uint32_t level_count,
-                                                      vk::ImageViewType type, uint32_t base_layer,
-                                                      uint32_t layer_count) {
-	if (view_format == vk::Format::eUndefined ||
-	    !IsSupportedSampledDepthView(image.format, view_format, swizzle)) {
-		EXIT("TextureCache: invalid sampled depth-target view, image=%p image_format=%d"
-		     " view_format=%d swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d"
-		     " image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(&image), static_cast<int>(image.format),
-		     static_cast<int>(view_format), swizzle, base_level, level_count, base_layer,
-		     layer_count, static_cast<int>(type), image.mip_levels, image.layers);
-	}
-	return GetImageView(image, {image.format, type, vk::ImageAspectFlagBits::eDepth, base_level,
-	                            level_count, base_layer, layer_count, swizzle});
-}
-
-vk::ImageView TextureCache::GetSampledColorView(VulkanImage& image, vk::Format view_format,
-                                                uint32_t swizzle, uint32_t base_level,
-                                                uint32_t level_count, vk::ImageViewType type,
-                                                uint32_t base_layer, uint32_t layer_count) {
-	if (view_format == vk::Format::eUndefined || base_level >= 16 ||
-	    (type != vk::ImageViewType::e2D && type != vk::ImageViewType::e2DArray) ||
-	    !IsSupportedSampledColorView(image.format, view_format, swizzle)) {
-		EXIT("TextureCache: invalid sampled color view, image=%p swizzle=0x%03x"
-		     " view_format=%d mip=%u+%u layer=%u+%u type=%d image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(&image), swizzle, static_cast<int>(view_format), base_level,
-		     level_count, base_layer, layer_count, static_cast<int>(type), image.mip_levels,
-		     image.layers);
-	}
-	const auto precreated_view = type == vk::ImageViewType::e2DArray
-	                                 ? VulkanImage::VIEW_DEFAULT_ARRAY
-	                                 : VulkanImage::VIEW_DEFAULT;
-	const bool full_view = base_level == 0 && level_count == image.mip_levels && base_layer == 0 &&
-	                       layer_count == (type == vk::ImageViewType::e2DArray ? image.layers : 1u);
-	if (view_format == image.format && swizzle == DstSel(4, 5, 6, 7) && full_view &&
-	    image.image_view[precreated_view] != nullptr) {
-		return image.image_view[precreated_view];
-	}
-	return GetImageView(image, {view_format, type, vk::ImageAspectFlagBits::eColor, base_level,
-	                            level_count, base_layer, layer_count, swizzle});
-}
-
-vk::ImageView TextureCache::GetRenderTargetStorageView(RenderTextureVulkanImage& image,
-                                                       vk::Format view_format, uint32_t base_level,
-                                                       uint32_t level_count, vk::ImageViewType type,
-                                                       uint32_t base_layer, uint32_t layer_count) {
-	if (view_format == vk::Format::eUndefined ||
-	    (type != vk::ImageViewType::e2D && type != vk::ImageViewType::e2DArray)) {
-		EXIT("TextureCache: invalid render-target storage view, image=%p view_format=%d"
-		     " mip=%u+%u layer=%u+%u type=%d image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(&image), static_cast<int>(view_format), base_level,
-		     level_count, base_layer, layer_count, static_cast<int>(type), image.mip_levels,
-		     image.layers);
-	}
-	const bool exact      = view_format == image.format;
-	const bool compatible = view_format == BgraSrgbStorageViewFormat(image.format);
-	if (!exact && !compatible) {
-		EXIT("TextureCache: incompatible render-target storage view, image_format=%d"
-		     " view_format=%d base=%u count=%u\n",
-		     static_cast<int>(image.format), static_cast<int>(view_format), base_level,
-		     level_count);
-	}
-	if (exact) {
-		const auto index = type == vk::ImageViewType::e2DArray ? VulkanImage::VIEW_STORAGE_ARRAY
-		                                                       : VulkanImage::VIEW_STORAGE;
-		const bool full_view =
-		    base_level == 0 && level_count == 1 && base_layer == 0 &&
-		    layer_count == (type == vk::ImageViewType::e2DArray ? image.layers : 1u);
-		if (full_view && image.image_view[index] != nullptr) {
-			return image.image_view[index];
-		}
-	}
-
-	if (compatible && !ImageViewOps::FormatSupportsStorage(view_format)) {
-		EXIT("TextureCache: compatible render-target storage format lacks storage support,"
-		     " image_format=%d view_format=%d base=%u count=%u\n",
-		     static_cast<int>(image.format), static_cast<int>(view_format), base_level,
-		     level_count);
-	}
-	return GetImageView(image, {view_format, type, vk::ImageAspectFlagBits::eColor, base_level,
-	                            level_count, base_layer, layer_count, DstSel(4, 5, 6, 7),
-	                            vk::ImageUsageFlagBits::eStorage});
-}
-
-vk::ImageView TextureCache::GetStorageTextureSampledView(StorageTextureVulkanImage& image,
-                                                         const ImageInfo&           info) {
-	const auto shape = SelectStorageSampledViewShape(info.type, info.depth, image.layers);
-	if (image.image == nullptr || shape == StorageSampledViewShape::Unsupported ||
-	    info.base_array != 0 || info.levels != image.mip_levels || info.base_level >= info.levels ||
-	    info.view_levels == 0 || info.base_level + info.view_levels > info.levels) {
-		EXIT("TextureCache: invalid sampled view of storage texture, image=%p type=%u depth=%u"
-		     " base=%u levels=%u view_levels=%u image_levels=%u base_array=%u\n",
-		     static_cast<const void*>(&image), info.type, info.depth, info.base_level, info.levels,
-		     info.view_levels, image.mip_levels, info.base_array);
-	}
-	const auto view_format = TextureGetFormat(info.format);
-	if (view_format != image.format && !IsRgba8SrgbReinterpretation(image.format, view_format) &&
-	    !IsR32UintFloatReinterpretation(image.format, view_format)) {
-		EXIT("TextureCache: incompatible sampled view of storage texture, image_format=%d"
-		     " view_format=%d swizzle=0x%03x\n",
-		     static_cast<int>(image.format), static_cast<int>(view_format), info.swizzle);
-	}
-
-	vk::ImageViewType type = static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM);
-	switch (shape) {
-		case StorageSampledViewShape::Image2D: type = vk::ImageViewType::e2D; break;
-		case StorageSampledViewShape::Image2DArray: type = vk::ImageViewType::e2DArray; break;
-		case StorageSampledViewShape::Image3D: type = vk::ImageViewType::e3D; break;
-		case StorageSampledViewShape::Unsupported:
-			EXIT("TextureCache: unsupported sampled storage-image view shape\n");
-	}
-	const auto layer_count = shape == StorageSampledViewShape::Image2DArray ? info.depth : 1u;
-	return GetImageView(image, {view_format, type, vk::ImageAspectFlagBits::eColor, info.base_level,
-	                            info.view_levels, 0, layer_count, info.swizzle});
-}
-
-vk::ImageView TextureCache::GetStorageTextureStorageView(StorageTextureVulkanImage& image,
-                                                         uint32_t                   base_level) {
-	if (image.image == nullptr || base_level >= (image.mip_levels)) {
-		EXIT("TextureCache: invalid storage-texture mip view, image=%p level=%u levels=%u\n",
-		     static_cast<const void*>(&image), base_level, image.mip_levels);
-	}
-	if (base_level == 0) {
-		return image.image_view[VulkanImage::VIEW_DEFAULT];
-	}
-	return GetImageView(image, {image.format, vk::ImageViewType::e2D,
-	                            vk::ImageAspectFlagBits::eColor, base_level, 1, 0, 1,
-	                            DstSel(4, 5, 6, 7), vk::ImageUsageFlagBits::eStorage});
 }
 
 } // namespace Libs::Graphics

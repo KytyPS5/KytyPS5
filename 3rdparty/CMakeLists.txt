@@ -44,7 +44,17 @@ set(SPDLOG_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
 add_subdirectory(spdlog EXCLUDE_FROM_ALL)
 
 if (NOT TARGET FFmpeg::ffmpeg)
-	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+	# On macOS the target arch is driven by CMAKE_OSX_ARCHITECTURES, not the host
+	# CMAKE_SYSTEM_PROCESSOR (which reports arm64 even for an x86_64/Rosetta build).
+	if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+		if(CMAKE_OSX_ARCHITECTURES MATCHES "^(x86_64)$")
+			set(ARCHITECTURE x86_64)
+		elseif(CMAKE_OSX_ARCHITECTURES MATCHES "^(arm64)$")
+			set(ARCHITECTURE arm64)
+		else()
+			set(ARCHITECTURE x86_64 arm64) # universal
+		endif()
+	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
 		set(ARCHITECTURE arm64)
 	else()
 		set(ARCHITECTURE x86_64)

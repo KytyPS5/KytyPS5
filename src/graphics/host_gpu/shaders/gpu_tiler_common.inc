@@ -3,7 +3,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
 
-layout(push_constant) uniform Push {
+layout(set = 0, binding = 2, std140) uniform Push {
 	uint src_base;
 	uint dst_base;
 	uint width;
@@ -27,7 +27,9 @@ void copy_element(uint src, uint dst) {
 	} else {
 		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
 		uint value = (input_buffer.data[src >> 2] >> ((src & 3u) * 8u)) & mask;
-		atomicOr(output_buffer.data[dst >> 2], value << ((dst & 3u) * 8u));
+		uint shift = (dst & 3u) * 8u;
+		atomicAnd(output_buffer.data[dst >> 2], ~(mask << shift));
+		atomicOr(output_buffer.data[dst >> 2], value << shift);
 	}
 }
 

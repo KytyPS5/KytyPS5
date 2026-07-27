@@ -61,7 +61,7 @@ LIB_NAME("libkernel", "libkernel");
 constexpr int      KEYS_MAX                  = 256;
 constexpr int      DESTRUCTOR_ITERATIONS     = 4;
 constexpr size_t   PTHREAD_STACK_DEFAULT     = 0x100000;
-constexpr size_t   PTHREAD_STACK_MIN         = 0x4000;
+constexpr size_t   GUEST_PTHREAD_STACK_MIN   = 0x4000;
 constexpr size_t   PTHREAD_STACK_PAGE        = 0x4000;
 constexpr size_t   PTHREAD_STACK_GRANULARITY = 0x10000;
 constexpr size_t   PTHREAD_STACK_INITIAL     = 0x200000;
@@ -290,12 +290,12 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 	}
 }
 #else
-static bool kernel_clock_gettime_special(KernelClockid clock_id, KernelTimespec* tp, int* error) {
+static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp, int* error) {
 	EXIT_IF(tp == nullptr);
 	EXIT_IF(error == nullptr);
 
 	if (clock_id == KERNEL_CLOCK_PROCTIME) {
-		kernel_us_to_timespec(kernel_get_process_time_us_native(), tp);
+		KernelUsToTimespec(KernelGetProcessTimeUsNative(), tp);
 		return true;
 	}
 
@@ -709,15 +709,15 @@ static int CreateGuestStack(PthreadAttr attr) {
 
 	void* mapped_addr = reinterpret_cast<void*>(stack_addr);
 
-	constexpr int PROT_READ_WRITE = 0x03;
-	constexpr int MAP_PRIVATE     = 0x02;
-	constexpr int MAP_FIXED       = 0x10;
-	constexpr int MAP_STACK       = 0x400;
-	constexpr int MAP_ANON        = 0x1000;
+	constexpr int GUEST_PROT_READ_WRITE = 0x03;
+	constexpr int GUEST_MAP_PRIVATE     = 0x02;
+	constexpr int GUEST_MAP_FIXED       = 0x10;
+	constexpr int GUEST_MAP_STACK       = 0x400;
+	constexpr int GUEST_MAP_ANON        = 0x1000;
 
 	int result = Memory::KernelMapNamedFlexibleMemory(
-	    &mapped_addr, map_size, PROT_READ_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_STACK | MAP_ANON,
-	    "stack");
+	    &mapped_addr, map_size, GUEST_PROT_READ_WRITE,
+	    GUEST_MAP_PRIVATE | GUEST_MAP_FIXED | GUEST_MAP_STACK | GUEST_MAP_ANON, "stack");
 	if (result != OK) {
 		return KERNEL_ERROR_EAGAIN;
 	}
@@ -1056,7 +1056,7 @@ static void PthreadAttrDbgPrint(const PthreadAttr* src) {
 	     "\tstack_addr     = 0x%016" PRIx64 "\n"
 	     "\tstack_size    = %" PRIu64 "\n",
 	     mask, state, guard_size, inherit_sched, param.sched_priority, policy, solosched,
-	     reinterpret_cast<uint64_t>(stack_addr), reinterpret_cast<uint64_t>(stack_size));
+	     reinterpret_cast<uint64_t>(stack_addr), static_cast<uint64_t>(stack_size));
 }
 
 static constexpr int32_t DST_NONE = 0;
@@ -2177,7 +2177,7 @@ int KYTY_SYSV_ABI PthreadAttrSetstack(PthreadAttr* attr, void* addr, size_t size
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstack");
-	if (addr == nullptr || size < PTHREAD_STACK_MIN || attr_value == nullptr) {
+	if (addr == nullptr || size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -2210,7 +2210,7 @@ int KYTY_SYSV_ABI PthreadAttrSetstacksize(PthreadAttr* attr, size_t stack_size) 
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstacksize");
-	if (stack_size < PTHREAD_STACK_MIN || attr_value == nullptr) {
+	if (stack_size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -2640,7 +2640,12 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result        = pthread_condattr_setclock(&(*attr)->p, pclock_id);
+#if defined(__APPLE__)
+	(void)pclock_id;
+	int result = 0;
+#else
+	int result = pthread_condattr_setclock(&(*attr)->p, pclock_id);
+#endif
 	(*attr)->clock_id = clock_id;
 
 	LOGF("\tcondattr setclock: clock_id = %d, native = %d, result = %d\n", clock_id,

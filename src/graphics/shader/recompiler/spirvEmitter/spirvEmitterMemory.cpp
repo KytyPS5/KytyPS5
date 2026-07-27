@@ -210,6 +210,17 @@ bool IsStorageBufferMemoryKind(IR::ResourceKind kind) {
 	}
 }
 
+void EmitStorageBufferOffsets(EmitterState& state) {
+	for (uint32_t i = 0; i < state.program.bindings.buffer_offset_count; i++) {
+		const auto word = EmitShaderDataDwordLoad(
+		    state, state.program.bindings.buffer_offset_dword + i / 4u);
+		const auto shift = ConstantU32(state, (i % 4u) * 8u + 2u);
+		state.storage_buffer_offsets[i] = EmitBinaryU32(
+		    state, OpBitwiseAnd,
+		    EmitBinaryU32(state, OpShiftRightLogical, word, shift), ConstantU32(state, 0x3fu));
+	}
+}
+
 uint32_t EmitBufferAddressFromParts(EmitterState& state, const IR::Instruction& inst,
                                     uint32_t index, uint32_t offset, uint32_t soffset) {
 	const auto& mem           = inst.memory;
@@ -398,6 +409,15 @@ StorageBufferBindingForMemory(EmitterState& state, const IR::MemoryInfo& mem, ui
 	return binding;
 }
 
+uint32_t EmitStorageBufferIndex(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
+                                uint32_t use_pc) {
+	if (IsFlatMemoryKind(mem.kind)) {
+		return index;
+	}
+	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
+	return EmitAddU32(state, index, state.storage_buffer_offsets[binding.array_index]);
+}
+
 uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInfo& mem,
                                         uint32_t use_pc) {
 	if (IsFlatMemoryKind(mem.kind)) {
@@ -422,7 +442,8 @@ uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInf
 }
 
 uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
-                                          uint32_t index, uint32_t use_pc) {
+                                           uint32_t index, uint32_t use_pc) {
+	index                = EmitStorageBufferIndex(state, mem, index, use_pc);
 	const auto object    = EmitStorageBufferObjectPointer(state, mem, use_pc);
 	const auto length    = state.builder.AllocateId();
 	const auto in_bounds = state.builder.AllocateId();
@@ -432,7 +453,8 @@ uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryI
 }
 
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                         uint32_t index, uint32_t use_pc) {
+                                          uint32_t index, uint32_t use_pc) {
+	index = EmitStorageBufferIndex(state, mem, index, use_pc);
 	if (IsFlatMemoryKind(mem.kind)) {
 		if (state.address_memory_variable == 0) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,

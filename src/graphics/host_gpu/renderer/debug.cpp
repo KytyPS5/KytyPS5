@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <fmt/format.h>
@@ -99,8 +100,6 @@ void uc_check(const HW::UserConfig& uc) {
 void sh_print(const char* func, const HW::Shader& /*uc*/) {
 	LOGF("%s\n", func);
 }
-
-void sh_check(const HW::Shader& /*uc*/) {}
 
 std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) {
 	std::vector<std::string> dst;
@@ -431,21 +430,17 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 	LOGF("%s\n", func);
 
 	LOGF("\t z_info.format                         = 0x%08" PRIx32 "\n"
-	     "\t z_info.tile_mode_index                = 0x%08" PRIx32 "\n"
 	     "\t z_info.num_samples                    = 0x%08" PRIx32 "\n"
-	     "\t z_info.tile_surface_enable            = %s\n"
+	     "\t z_info.texture_compatibility          = 0x%08" PRIx32 "\n"
+	     "\t z_info.htile_acceleration             = %s\n"
 	     "\t z_info.expclear_enabled               = %s\n"
-	     "\t z_info.zrange_precision               = 0x%08" PRIx32 "\n"
-	     "\t z_info.embedded_sample_locations      = %s\n"
+	     "\t z_info.z_compare_base                 = 0x%08" PRIx32 "\n"
 	     "\t z_info.partially_resident             = %s\n"
-	     "\t z_info.num_mip_levels                 = 0x%02" PRIx8 "\n"
-	     "\t z_info.plane_compression              = 0x%02" PRIx8 "\n"
+	     "\t z_info.max_mip_level                  = 0x%02" PRIx8 "\n"
 	     "\t stencil_info.format                   = 0x%08" PRIx32 "\n"
-	     "\t stencil_info.tile_stencil_disable     = %s\n"
+	     "\t stencil_info.texture_compatibility    = 0x%08" PRIx32 "\n"
+	     "\t stencil_info.htile_stencil_disabled   = %s\n"
 	     "\t stencil_info.expclear_enabled         = %s\n"
-	     "\t stencil_info.tile_mode_index          = 0x%08" PRIx32 "\n"
-	     "\t stencil_info.tile_split               = 0x%08" PRIx32 "\n"
-	     "\t stencil_info.texture_compatible_stencil = %s\n"
 	     "\t stencil_info.partially_resident       = %s\n"
 	     "\t depth_info.addr5_swizzle_mask         = 0x%08" PRIx32 "\n"
 	     "\t depth_info.array_mode                 = 0x%08" PRIx32 "\n"
@@ -478,15 +473,15 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 	     "\t height                                = 0x%08" PRIx32 "\n"
 	     "\t size.x_max                            = 0x%04" PRIx16 "\n"
 	     "\t size.y_max                            = 0x%04" PRIx16 "\n",
-	     z.z_info.format, z.z_info.tile_mode_index, z.z_info.num_samples,
-	     z.z_info.tile_surface_enable ? "true" : "false",
-	     z.z_info.expclear_enabled ? "true" : "false", z.z_info.zrange_precision,
-	     z.z_info.embedded_sample_locations ? "true" : "false",
-	     z.z_info.partially_resident ? "true" : "false", z.z_info.num_mip_levels,
-	     z.z_info.plane_compression, z.stencil_info.format,
-	     z.stencil_info.tile_stencil_disable ? "true" : "false",
-	     z.stencil_info.expclear_enabled ? "true" : "false", z.stencil_info.tile_mode_index,
-	     z.stencil_info.tile_split, z.stencil_info.texture_compatible_stencil ? "true" : "false",
+	     z.z_info.format, z.z_info.num_samples,
+	     Prospero::GpuEnumValue(z.z_info.texture_compatibility),
+	     z.z_info.htile_acceleration ? "true" : "false",
+	     z.z_info.expclear_enabled ? "true" : "false",
+	     Prospero::GpuEnumValue(z.z_info.z_compare_base),
+	     z.z_info.partially_resident ? "true" : "false", z.z_info.max_mip_level,
+	     z.stencil_info.format, Prospero::GpuEnumValue(z.stencil_info.texture_compatibility),
+	     z.stencil_info.htile_stencil_disabled ? "true" : "false",
+	     z.stencil_info.expclear_enabled ? "true" : "false",
 	     z.stencil_info.partially_resident ? "true" : "false", z.depth_info.addr5_swizzle_mask,
 	     z.depth_info.array_mode, z.depth_info.pipe_config, z.depth_info.bank_width,
 	     z.depth_info.bank_height, z.depth_info.macro_tile_aspect, z.depth_info.num_banks,
@@ -503,36 +498,17 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void ZCheck(const HW::DepthRenderTarget& z) {
+	EXIT_NOT_IMPLEMENTED(!z.z_info.HasValidTextureCompatibility());
+	EXIT_NOT_IMPLEMENTED(!z.stencil_info.HasValidTextureCompatibility());
 	if (z.z_info.format == 0) {
 		EXIT_NOT_IMPLEMENTED(z.z_info.format != 0);
-		EXIT_NOT_IMPLEMENTED(z.z_info.tile_mode_index != 0);
 		EXIT_NOT_IMPLEMENTED(z.z_info.num_samples != 0);
-		EXIT_NOT_IMPLEMENTED(z.z_info.tile_surface_enable != false);
+		EXIT_NOT_IMPLEMENTED(z.z_info.htile_acceleration != false);
 		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
-		if (z.z_info.zrange_precision != 0) {
-			LOGF("Warning: zrange_precision != 0\n");
-			// z.z_info.zrange_precision = 0;
-		}
-		if (z.z_info.embedded_sample_locations) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("DepthTarget: temporary: ignoring embedded sample locations\n");
-				logged = true;
-			}
-		}
 		EXIT_NOT_IMPLEMENTED(z.z_info.partially_resident != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.num_mip_levels != 0);
-		if (z.z_info.plane_compression != 0) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("DepthTarget: temporary: ignoring PS5 plane_compression=0x%02" PRIx8 "\n",
-				     z.z_info.plane_compression);
-				logged = true;
-			}
-		}
+		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
 	} else {
 		EXIT_NOT_IMPLEMENTED(z.z_info.format != 0x00000001 && z.z_info.format != 0x00000003);
-		// EXIT_NOT_IMPLEMENTED(z.z_info.tile_mode_index != 0x00000002);
 		if (z.z_info.num_samples != 0x00000000) {
 			static bool logged = false;
 			if (!logged) {
@@ -541,56 +517,17 @@ static void ZCheck(const HW::DepthRenderTarget& z) {
 				logged = true;
 			}
 		}
-		// EXIT_NOT_IMPLEMENTED(z.z_info.tile_surface_enable != true);
 		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
-		if (z.z_info.zrange_precision != 0x00000001) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("DepthTarget: temporary: ignoring zrange_precision=0x%08" PRIx32 "\n",
-				     z.z_info.zrange_precision);
-				logged = true;
-			}
-		}
-		if (z.z_info.embedded_sample_locations) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("DepthTarget: temporary: ignoring embedded sample locations\n");
-				logged = true;
-			}
-		}
 		EXIT_NOT_IMPLEMENTED(z.z_info.partially_resident != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.num_mip_levels != 0);
-		if (z.z_info.plane_compression != 0) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("DepthTarget: temporary: ignoring PS5 plane_compression=0x%02" PRIx8 "\n",
-				     z.z_info.plane_compression);
-				logged = true;
-			}
-		}
+		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
 	}
 
 	if (z.stencil_info.format == 0) {
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.format != 0);
-		//  EXIT_NOT_IMPLEMENTED(z.stencil_info.tile_stencil_disable != false);
 		EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.tile_mode_index != 0);
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.tile_split != 0);
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.texture_compatible_stencil != true);
 		EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
 	} else {
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.format != 0x00000001);
-		if (z.stencil_info.tile_stencil_disable != true) {
-
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 16) {
-				LOGF("DepthTarget: temporary: ignoring PS5 HTILE stencil acceleration\n");
-			}
-		}
+		EXIT_NOT_IMPLEMENTED(z.stencil_info.format != 0x00000001);
 		EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.tile_mode_index != 0x00000002);
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.tile_split != 0x00000002);
-		// EXIT_NOT_IMPLEMENTED(z.stencil_info.texture_compatible_stencil != true);
 		EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
 	}
 
@@ -1135,10 +1072,10 @@ static ScissorRect ScissorRectClamp(ScissorRect r, uint32_t width, uint32_t heig
 	int max_right  = static_cast<int>(width);
 	int max_bottom = static_cast<int>(height);
 
-	r.left   = (r.left < 0 ? 0 : (r.left > max_right ? max_right : r.left));
-	r.right  = (r.right < 0 ? 0 : (r.right > max_right ? max_right : r.right));
-	r.top    = (r.top < 0 ? 0 : (r.top > max_bottom ? max_bottom : r.top));
-	r.bottom = (r.bottom < 0 ? 0 : (r.bottom > max_bottom ? max_bottom : r.bottom));
+	r.left   = std::clamp(r.left, 0, max_right);
+	r.right  = std::clamp(r.right, 0, max_right);
+	r.top    = std::clamp(r.top, 0, max_bottom);
+	r.bottom = std::clamp(r.bottom, 0, max_bottom);
 
 	if (!ScissorRectValid(r)) {
 		r.right  = r.left;

@@ -15,6 +15,7 @@ KYTY_SUBSYSTEM_DEFINE(Log);
 enum class Direction { Silent, Console, File };
 
 Direction GetDirection();
+bool      IsSilent();
 void      Write(std::string_view text);
 void      Write(fmt::text_style style, std::string_view text);
 void      WriteFatal(std::string_view text);
@@ -41,8 +42,18 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 } // namespace Log
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LOGF(...) ::Log::Write(::fmt::sprintf(__VA_ARGS__))
+#define LOGF(...)                                                                                  \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write(::fmt::sprintf(__VA_ARGS__));                                             \
+		}                                                                                          \
+	} while (false)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LOGF_COLOR(style, ...) ::Log::Write((style), ::fmt::sprintf(__VA_ARGS__))
+#define LOGF_COLOR(style, ...)                                                                     \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Write((style), ::fmt::sprintf(__VA_ARGS__));                                    \
+		}                                                                                          \
+	} while (false)
 
 #endif /* KYTY_COMMON_LOGGING_LOG_H_ */

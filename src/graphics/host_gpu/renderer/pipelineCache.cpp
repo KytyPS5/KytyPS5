@@ -7,7 +7,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
+#include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -36,13 +36,25 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 
 } // namespace
 
+PipelineCache::~PipelineCache() {
+	auto destroy = [this](const auto& pipelines) {
+		for (const auto& [key, pipeline]: pipelines) {
+			(void)key;
+			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+		}
+	};
+	destroy(m_graphics_pipelines);
+	destroy(m_compute_pipelines);
+}
+
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
 PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
-    VulkanFramebuffer& framebuffer, RenderColorInfo* colors, uint32_t color_count,
-    RenderDepthInfo& depth, ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
+    RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
+    ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
     ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology, bool ps_active,
     std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
@@ -61,10 +73,10 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	const HW::BlendColor& bclr                                     = ctx.GetBlendColor();
 	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
-		color_mask[i] = (colors[i].vulkan_buffer != nullptr
-		                     ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
-		                           ctx.GetRenderTargetMask(), colors[i].target_slot))
-		                     : 0);
+		color_mask[i] =
+		    (colors[i].image_id ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
+		                              ctx.GetRenderTargetMask(), colors[i].target_slot))
+		                        : 0);
 	}
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -76,11 +88,40 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 
 	PipelineStaticParameters static_params {};
 	GraphicsPipeline         p {};
-	p.render_pass_id = framebuffer.render_pass_id;
 	p.ps_shader_id   = ps_id;
 	p.vs_shader_id   = vs_id;
 
 	static_params.color_count = color_count;
+	PipelineRenderingState rendering {};
+	rendering.color_count = color_count;
+	uint32_t attachment_samples = 0;
+	for (uint32_t i = 0; i < color_count; i++) {
+		EXIT_IF(!colors[i].image_id || colors[i].format == vk::Format::eUndefined);
+		rendering.color_formats[i] = colors[i].format;
+		if (attachment_samples == 0) {
+			attachment_samples = colors[i].samples;
+		} else if (attachment_samples != colors[i].samples) {
+			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
+			     attachment_samples, colors[i].samples);
+		}
+	}
+	const bool with_depth =
+	    depth.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	if (with_depth) {
+		const auto aspects = ImageViewOps::DepthAspectMask(depth.format);
+		rendering.depth_format =
+		    aspects & vk::ImageAspectFlagBits::eDepth ? depth.format : vk::Format::eUndefined;
+		rendering.stencil_format =
+		    aspects & vk::ImageAspectFlagBits::eStencil ? depth.format : vk::Format::eUndefined;
+		if (attachment_samples == 0) {
+			attachment_samples = depth.samples;
+		} else if (attachment_samples != depth.samples) {
+			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n",
+			     attachment_samples, depth.samples);
+		}
+	}
+	EXIT_IF(attachment_samples == 0 ||
+	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
 	if (ps_active && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
 		static std::atomic<uint32_t> log_count {0};
@@ -94,14 +135,13 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.negative_one_to_one = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable   = clip_control.IsZClipEnabled();
 	static_params.topology            = topology;
-	static_params.samples             = framebuffer.samples;
+	static_params.samples             = attachment_samples;
 	static_params.sample_shading_enable =
-	    ps_active && framebuffer.samples > 1 && ps_input_info->ps_sample_shading;
+	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.with_depth =
-	    (depth.format != vk::Format::eUndefined && depth.vulkan_buffer != nullptr);
+	static_params.with_depth         = with_depth;
 	static_params.depth_test_enable  = depth.depth_test_enable;
 	static_params.depth_write_enable = (depth.depth_write_enable && !depth.depth_clear_enable);
 	static_params.depth_compare_op   = depth.depth_compare_op;
@@ -139,7 +179,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	NormalizeStaticParamsForDynamicState(static_params);
 
 	GraphicsPipelineKey key {};
-	key.render_pass_id = p.render_pass_id;
+	key.rendering      = rendering;
 	key.vs_shader_id   = p.vs_shader_id;
 	key.ps_shader_id   = p.ps_shader_id;
 	key.static_params  = static_params;
@@ -162,7 +202,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	auto cached = std::make_unique<GraphicsPipeline>(p);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
-	CreatePipelineInternal(*cached, framebuffer.render_pass, vs_input_info, vs_spirv, ps_input_info,
+	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, rendering, vs_input_info,
+	                       vs_spirv, ps_input_info,
 	                       ps_spirv, static_params, vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                       ps_id.crc32, ps_active);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
@@ -204,7 +245,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
-	CreatePipelineInternal(*cached, input_info, cs_spirv);
+	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, input_info, cs_spirv);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

@@ -6,8 +6,6 @@
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 #include "graphics/host_gpu/vulkanInstance.h"
 
-#include <memory>
-#include <mutex>
 #include <vector>
 #include <vk_mem_alloc.h>
 
@@ -18,32 +16,20 @@ struct VulkanBuffer;
 struct VulkanImage;
 struct VulkanMemory;
 
-struct VulkanSwapchain {
-	~VulkanSwapchain();
-
-	vk::SwapchainKHR                 swapchain        = nullptr;
-	vk::Format                       swapchain_format = vk::Format::eUndefined;
-	vk::Extent2D                     swapchain_extent = {};
-	std::unique_ptr<vk::Image[]>     swapchain_images;
-	std::unique_ptr<vk::ImageView[]> swapchain_image_views;
-	uint32_t                         swapchain_images_count = 0;
-	std::unique_ptr<vk::Semaphore[]> image_acquired_semaphores;
-	std::unique_ptr<vk::Semaphore[]> render_complete_semaphores;
-	uint32_t                         current_index = 0;
-	uint32_t                         present_frame = 0;
-};
-
 struct GraphicContext: public VulkanInstance {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	void               CreateBuffer(uint64_t size, VulkanBuffer& buffer);
-	void               DeleteBuffer(VulkanBuffer& buffer);
-	[[nodiscard]] bool CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
-	void               DeleteImage(VulkanImage& image);
-	void               MapMemory(VulkanMemory& memory, void*& data);
-	void               UnmapMemory(VulkanMemory& memory);
-	void               AppendHardwareRayTracingDeviceExtensions(
+	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	void                   CreateBuffer(uint64_t size, VulkanBuffer& buffer);
+	void                   DeleteBuffer(VulkanBuffer& buffer);
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	void                   DeleteImage(VulkanImage& image);
+	void                   MapMemory(VulkanMemory& memory, void*& data);
+	void                   UnmapMemory(VulkanMemory& memory);
+	void                   AppendHardwareRayTracingDeviceExtensions(
 	    const std::vector<vk::ExtensionProperties>& available_extensions,
 	    std::vector<const char*>&                   device_extensions);
 	void LoadHardwareRayTracingFunctions() const;
@@ -64,92 +50,29 @@ struct VulkanMemory {
 	uint64_t                unique_id          = 0;
 };
 
-enum class VulkanImageType {
-	Unknown,
-	VideoOut,
-	DepthStencil,
-	Texture,
-	StorageTexture,
-	RenderTexture
-};
-
-struct ImageViewInfo {
-	vk::Format           format      = vk::Format::eUndefined;
-	vk::ImageViewType    type        = vk::ImageViewType::e2D;
-	vk::ImageAspectFlags aspect      = {};
-	uint32_t             base_level  = 0;
-	uint32_t             level_count = 0;
-	uint32_t             base_layer  = 0;
-	uint32_t             layer_count = 1;
-	uint32_t             swizzle     = 0;
-	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
-
-	bool operator==(const ImageViewInfo&) const = default;
-};
-
-struct CachedImageView {
-	ImageViewInfo info;
-	vk::ImageView view = nullptr;
-};
-
-struct ImageViewCache {
-	std::mutex                   mutex;
-	std::vector<CachedImageView> views;
-
-	ImageViewCache() = default;
-	KYTY_CLASS_NO_COPY(ImageViewCache);
+struct VulkanImageState {
+	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
+	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
+	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
 };
 
 struct VulkanImage {
-	static constexpr int VIEW_MAX           = 4;
-	static constexpr int VIEW_DEFAULT       = 0;
-	static constexpr int VIEW_DEFAULT_ARRAY = 1;
-	static constexpr int VIEW_STORAGE       = 2;
-	static constexpr int VIEW_STORAGE_ARRAY = 3;
-
-	explicit VulkanImage(VulkanImageType type): type(type) {}
+	VulkanImage() = default;
 	KYTY_CLASS_NO_COPY(VulkanImage);
 
-	VulkanImageType        type                 = VulkanImageType::Unknown;
-	vk::Format             format               = vk::Format::eUndefined;
-	vk::Extent2D           extent               = {};
-	uint32_t               guest_pitch          = 0;
-	uint32_t               layers               = 1;
-	uint32_t               mip_levels           = 1;
-	uint32_t               samples              = 1;
-	vk::Image              image                = nullptr;
-	vk::ImageView          image_view[VIEW_MAX] = {};
-	vk::ImageLayout        layout               = vk::ImageLayout::eUndefined;
+	vk::Format             format      = vk::Format::eUndefined;
+	vk::ImageType          image_type  = vk::ImageType::e2D;
+	vk::Extent3D           extent      = {1, 1, 1};
+	uint32_t               guest_pitch = 0;
+	uint32_t               layers      = 1;
+	uint32_t               mip_levels  = 1;
+	uint32_t               samples     = 1;
+	vk::ImageUsageFlags    usage       = {};
+	vk::ImageCreateFlags   flags       = {};
+	vk::Image              image       = nullptr;
+	VulkanImageState       state;
+	std::vector<VulkanImageState> subresource_states;
 	Graphics::VulkanMemory memory;
-	ImageViewCache         view_cache;
-};
-
-struct VideoOutVulkanImage: public VulkanImage {
-	VideoOutVulkanImage(): VulkanImage(VulkanImageType::VideoOut) {}
-};
-
-struct DepthStencilVulkanImage: public VulkanImage {
-	DepthStencilVulkanImage(): VulkanImage(VulkanImageType::DepthStencil) {}
-	bool compressed                    = false;
-	bool initial_depth_clear_pending   = false;
-	bool initial_stencil_clear_pending = false;
-};
-
-struct GpuTextureVulkanImage: public VulkanImage {
-	explicit GpuTextureVulkanImage(VulkanImageType type): VulkanImage(type) {}
-};
-
-struct TextureVulkanImage: public GpuTextureVulkanImage {
-	TextureVulkanImage(): GpuTextureVulkanImage(VulkanImageType::Texture) {}
-};
-
-struct StorageTextureVulkanImage: public GpuTextureVulkanImage {
-	StorageTextureVulkanImage(): GpuTextureVulkanImage(VulkanImageType::StorageTexture) {}
-};
-
-struct RenderTextureVulkanImage: public VulkanImage {
-	RenderTextureVulkanImage(): VulkanImage(VulkanImageType::RenderTexture) {}
-	bool initial_clear_pending = false;
 };
 
 struct VulkanBuffer {
@@ -158,8 +81,6 @@ struct VulkanBuffer {
 	vk::BufferUsageFlags usage       = {};
 	uint64_t             buffer_size = 0;
 };
-
-struct StorageVulkanBuffer: public VulkanBuffer {};
 
 } // namespace Libs::Graphics
 

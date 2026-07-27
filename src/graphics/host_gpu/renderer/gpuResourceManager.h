@@ -12,24 +12,25 @@
 
 namespace Libs::Graphics {
 
-class CommandBuffer;
+class CommandScheduler;
+class Gpu;
 
 class GpuResourceManager {
 public:
-	explicit GpuResourceManager(GraphicContext& graphics);
+	GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler);
 	~GpuResourceManager();
 	KYTY_CLASS_NO_COPY(GpuResourceManager);
 
 	[[nodiscard]] BufferCache&  GetBufferCache() { return m_buffer_cache; }
 	[[nodiscard]] TextureCache& GetTextureCache() { return m_texture_cache; }
+	void                        SetGpu(Gpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);
-	void FillBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size, uint32_t value);
-	void CopyBuffer(CommandBuffer& command, uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	void               RunGarbageCollector();
 
 private:
 	static bool FaultThunk(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
@@ -41,6 +42,7 @@ private:
 	ResourceMutex m_resource_mutex;
 	BufferCache   m_buffer_cache;
 	TextureCache  m_texture_cache;
+	Gpu*          m_gpu = nullptr;
 };
 
 } // namespace Libs::Graphics

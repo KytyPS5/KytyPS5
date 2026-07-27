@@ -7,6 +7,13 @@
 
 namespace Libs::Graphics {
 
+SamplerCache::~SamplerCache() {
+	for (const auto& [key, sampler]: m_samplers) {
+		(void)key;
+		m_graphics.device.destroySampler(sampler, nullptr);
+	}
+}
+
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	Common::LockGuard lock(m_mutex);
 

@@ -25,6 +25,10 @@ bool ImageBinding(const IR::ImageResource& image, IR::DescriptorBindingKind& kin
 	if (image.kind == IR::ResourceKind::Image || image.kind == IR::ResourceKind::ImageUint) {
 		const bool integer = image.kind == IR::ResourceKind::ImageUint;
 		switch (image.dimension) {
+			case Dim::Dim1D: kind = integer ? Kind::SampledUint1D : Kind::Sampled1D; return true;
+			case Dim::Dim1DArray:
+				kind = integer ? Kind::SampledUint1DArray : Kind::Sampled1DArray;
+				return true;
 			case Dim::Dim2D: kind = integer ? Kind::SampledUint2D : Kind::Sampled2D; return true;
 			case Dim::Dim3D: kind = integer ? Kind::SampledUint3D : Kind::Sampled3D; return true;
 			case Dim::Dim2DArray:
@@ -38,6 +42,10 @@ bool ImageBinding(const IR::ImageResource& image, IR::DescriptorBindingKind& kin
 		return false;
 	}
 	switch (image.dimension) {
+		case Dim::Dim1D: kind = uint_image ? Kind::StorageUint1D : Kind::Storage1D; return true;
+		case Dim::Dim1DArray:
+			kind = uint_image ? Kind::StorageUint1DArray : Kind::Storage1DArray;
+			return true;
 		case Dim::Dim2D: kind = uint_image ? Kind::StorageUint2D : Kind::Storage2D; return true;
 		case Dim::Dim3D: kind = uint_image ? Kind::StorageUint3D : Kind::Storage3D; return true;
 		case Dim::Dim2DArray:
@@ -175,6 +183,11 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	     inst.src_count != 1)) {
 		return Fail(error, "sampled image instruction has an invalid resource class");
 	}
+	if (inst.op == IR::Opcode::ImageGather4 &&
+	    (inst.memory.image_dimension == Decoder::ImageDimension::Dim1D ||
+	     inst.memory.image_dimension == Decoder::ImageDimension::Dim1DArray)) {
+		return Fail(error, "1D image gather is not supported by SPIR-V");
+	}
 	if (inst.op == IR::Opcode::ImageStore &&
 	    ((kind != IR::ResourceKind::StorageImage && kind != IR::ResourceKind::StorageImageUint) ||
 	     inst.src_count != 2)) {
@@ -238,7 +251,7 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	if (!program.srt.reads.empty()) {
 		Expect(Kind::FlattenedSrt);
 	}
-	if (!program.bindings.user_data_registers.empty() && program.bindings.push_constant_size == 0) {
+	if (program.bindings.ShaderDataDwords() != 0 && program.bindings.push_constant_size == 0) {
 		Expect(Kind::UserData);
 	}
 
@@ -263,8 +276,10 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		}
 	}
 	const auto has_user_storage = present[static_cast<size_t>(Kind::UserData)];
-	if ((!has_user_storage &&
-	     program.bindings.push_constant_size != program.bindings.user_data_registers.size() * 4u) ||
+	if (program.bindings.buffer_offset_dword != program.bindings.user_data_registers.size() ||
+	    program.bindings.buffer_offset_count != program.info.buffers.size() ||
+	    (!has_user_storage &&
+	     program.bindings.push_constant_size != program.bindings.ShaderDataDwords() * 4u) ||
 	    (has_user_storage && program.bindings.push_constant_size != 0) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
@@ -408,10 +423,10 @@ bool ProgramRequiresExactSubgroupSize(const IR::Program& program) {
 }
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
-	             const ShaderVertexInputInfo*  vertex_input_info,
-	             const ShaderPixelInputInfo*   pixel_input_info,
-	             const ShaderComputeInputInfo* compute_input_info, std::vector<uint32_t>& spirv,
-	             std::string* error) {
+                 const ShaderVertexInputInfo*  vertex_input_info,
+                 const ShaderPixelInputInfo*   pixel_input_info,
+                 const ShaderComputeInputInfo* compute_input_info, std::vector<uint32_t>& spirv,
+                 std::string* error) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&

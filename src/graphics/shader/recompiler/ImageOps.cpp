@@ -30,9 +30,11 @@ struct MimgAtomicInfo {
 
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 	switch (dim) {
+		case 0u: return ImageDimension::Dim1D;
 		case 1u: return ImageDimension::Dim2D;
 		case 2u: return ImageDimension::Dim3D;
 		case 3u: return ImageDimension::Dim2DArray;
+		case 4u: return ImageDimension::Dim1DArray;
 		case 5u:
 		case 7u: return ImageDimension::Dim2DArray;
 		case 6u: return ImageDimension::Dim2D;
@@ -42,8 +44,19 @@ constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 
 constexpr uint32_t ImageCoordComponents(ImageDimension dimension) {
 	switch (dimension) {
+		case ImageDimension::Dim1D: return 1u;
+		case ImageDimension::Dim1DArray: return 2u;
 		case ImageDimension::Dim3D:
 		case ImageDimension::Dim2DArray: return 3u;
+		default: return 2u;
+	}
+}
+
+constexpr uint32_t ImageGradientComponents(ImageDimension dimension) {
+	switch (dimension) {
+		case ImageDimension::Dim1D:
+		case ImageDimension::Dim1DArray: return 1u;
+		case ImageDimension::Dim3D: return 3u;
 		default: return 2u;
 	}
 }
@@ -64,7 +77,7 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 		components++;
 	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {
-		components += 4u;
+		components += ImageGradientComponents(dimension) * 2u;
 	}
 	return components;
 }
@@ -212,6 +225,62 @@ const MimgAtomicInfo* LookupAtomic(uint32_t opcode) {
 	return nullptr;
 }
 
+Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
+                        const MimgAtomicInfo* atomic) {
+	if (sample != nullptr) {
+		return Opcode::ImageSample;
+	}
+	if (gather != nullptr) {
+		return gather->decoded;
+	}
+	if (atomic != nullptr) {
+		return atomic->decoded;
+	}
+
+	switch (opcode) {
+		case 0x00u: return Opcode::ImageLoad;
+		case 0x01u: return Opcode::ImageLoadMip;
+		case 0x08u: return Opcode::ImageStore;
+		case 0x09u: return Opcode::ImageStoreMip;
+		case 0x0eu: return Opcode::ImageGetResinfo;
+		case 0x60u: return Opcode::ImageGetLod;
+		default: return Opcode::Unsupported;
+	}
+}
+
+uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInfo* gather) {
+	if (sample != nullptr) {
+		return sample->flags;
+	}
+	if (gather != nullptr) {
+		return gather->flags;
+	}
+	return 0;
+}
+
+uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
+                                     const MimgSampleInfo* sample, const MimgGatherInfo* gather,
+                                     const MimgAtomicInfo* atomic) {
+	if (sample != nullptr) {
+		return ImageSampleAddressComponents(sample->flags, dimension);
+	}
+	if (gather != nullptr) {
+		return ImageSampleAddressComponents(gather->flags, dimension);
+	}
+	if (atomic != nullptr) {
+		return ImageCoordComponents(dimension);
+	}
+
+	switch (opcode) {
+		case 0x01u:
+		case 0x09u: return ImageCoordComponents(dimension) + 1u;
+		case 0x00u:
+		case 0x08u:
+		case 0x60u: return ImageCoordComponents(dimension);
+		default: return 0;
+	}
+}
+
 uint32_t CountDmaskComponents(uint32_t dmask) {
 	uint32_t count = 0;
 	for (uint32_t i = 0; i < 4u; i++) {
@@ -262,39 +331,22 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word_count         = word_count;
 	inst.family             = Family::MIMG;
 	inst.opcode_id          = opcode;
-	inst.opcode             = (sample != nullptr   ? Opcode::ImageSample
-	                            : gather != nullptr ? gather->decoded
-	                            : atomic != nullptr ? atomic->decoded
-	                            : opcode == 0x00u   ? Opcode::ImageLoad
-	                            : opcode == 0x01u   ? Opcode::ImageLoadMip
-	                            : opcode == 0x08u   ? Opcode::ImageStore
-	                            : opcode == 0x09u   ? Opcode::ImageStoreMip
-	                            : opcode == 0x0eu   ? Opcode::ImageGetResinfo
-	                            : opcode == 0x60u   ? Opcode::ImageGetLod
-	                                                : Opcode::Unsupported);
+	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic);
 	inst.dmask              = (word0 >> 8u) & 0xfu;
 	inst.data_dwords        = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
 	inst.glc                = ((word0 >> 13u) & 1u) != 0;
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
-	inst.image_sample_flags = (sample != nullptr   ? sample->flags
-	                            : gather != nullptr ? gather->flags
-	                                                : 0u) |
-	                           (a16 ? ImageSampleFlagA16 : 0u);
-	inst.image_dimension    = dimension;
-	inst.image_nsa_dwords   = nsa_dwords;
+	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
+	if (a16) {
+		inst.image_sample_flags |= ImageSampleFlagA16;
+	}
+	inst.image_dimension  = dimension;
+	inst.image_nsa_dwords = nsa_dwords;
 	for (uint32_t i = 0; i < nsa_dwords * 4u && i < MaxImageNsaAddressComponents; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    sample != nullptr   ? ImageSampleAddressComponents(sample->flags, dimension)
-	    : gather != nullptr ? ImageSampleAddressComponents(gather->flags, dimension)
-	    : atomic != nullptr ? 3u
-	    : opcode == 0x60u   ? ImageCoordComponents(dimension)
-	    : opcode == 0x01u   ? ImageCoordComponents(dimension) + 1u
-	    : opcode == 0x00u   ? ImageCoordComponents(dimension)
-	                        : (opcode == 0x09u   ? ImageCoordComponents(dimension) + 1u
-	                           : opcode == 0x08u ? ImageCoordComponents(dimension)
-	                                             : 0u);
+	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::Unsupported) {
@@ -316,16 +368,6 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 const char* MimgSampleOpcodeName(uint32_t opcode) {
 	const auto* sample = LookupSample(opcode);
 	return sample != nullptr ? sample->name : nullptr;
-}
-
-uint32_t MimgSampleOpcodeFlags(uint32_t opcode) {
-	const auto* sample = LookupSample(opcode);
-	return sample != nullptr ? sample->flags : 0u;
-}
-
-uint32_t MimgSampleAddressComponents(uint32_t opcode) {
-	const auto* sample = LookupSample(opcode);
-	return sample != nullptr ? sample->address_components : 0u;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

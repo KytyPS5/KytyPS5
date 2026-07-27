@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <chrono>
 #include <fmt/format.h>
+#include <limits>
 #include <list>
+#include <unordered_map>
+#include <vector>
 
 namespace Libs::LibKernel::EventQueue {
 
@@ -29,12 +32,13 @@ static uint64_t MonotonicTimeNs() {
 	                                 .count());
 }
 
-static std::list<KernelEqueue> g_equeues;
-static Common::Mutex           g_equeues_mutex;
+static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
+static Common::Mutex                                    g_equeues_mutex;
+static uint64_t                                         g_next_equeue = 1;
 
 class KernelEqueuePrivate {
 public:
-	KernelEqueuePrivate() = default;
+	explicit KernelEqueuePrivate(KernelEqueue handle): m_handle(handle) {}
 	virtual ~KernelEqueuePrivate();
 
 	KYTY_CLASS_NO_COPY(KernelEqueuePrivate);
@@ -42,12 +46,13 @@ public:
 	[[nodiscard]] const std::string& GetName() const { return m_name; }
 	void                             SetName(const std::string& m_name) { this->m_name = m_name; }
 
-	void AddEvent(const KernelEqueueEvent& event);
-	bool TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data);
-	bool DeleteEvent(uintptr_t ident, int16_t filter);
+	int AddEvent(const KernelEqueueEvent& event);
+	int TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data);
+	int DeleteEvent(uintptr_t ident, int16_t filter);
 
-	int GetTriggeredEvents(KernelEvent* ev, int num);
-	int WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
+	int  GetTriggeredEvents(KernelEvent* ev, int num);
+	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
+	void Close();
 
 private:
 	void TriggerExpiredTimers(uint64_t now_ns);
@@ -57,22 +62,38 @@ private:
 	Common::Mutex                m_mutex;
 	Common::CondVar              m_cond_var;
 	std::string                  m_name;
+	KernelEqueue                 m_handle = KERNEL_EQUEUE_INVALID;
+	bool                         m_closed = false;
 };
 
 KernelEqueuePrivate::~KernelEqueuePrivate() {
+	Close();
+}
+
+void KernelEqueuePrivate::Close() {
 	Common::LockGuard lock(m_mutex);
 
+	if (m_closed) {
+		return;
+	}
+	m_closed = true;
 	for (auto& event: m_events) {
 		if (event.filter.delete_event_func != nullptr) {
-			event.filter.delete_event_func(this, &event);
+			auto owner = event.filter.owner;
+			event.filter.delete_event_func(m_handle, &event);
 		}
 	}
+	m_events.clear();
+	m_cond_var.SignalAll();
 }
 
 int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 	Common::LockGuard lock(m_mutex);
 
 	EXIT_IF(num < 1);
+	if (m_closed) {
+		return KERNEL_ERROR_EBADF;
+	}
 
 	TriggerExpiredTimers(MonotonicTimeNs());
 
@@ -146,6 +167,9 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	Common::LockGuard lock(m_mutex);
 
 	EXIT_IF(num < 1);
+	if (m_closed) {
+		return KERNEL_ERROR_EBADF;
+	}
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
@@ -154,7 +178,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
 
-		if (ret > 0 || (elapsed >= micros && micros != 0)) {
+		if (ret != 0 || (elapsed >= micros && micros != 0)) {
 			return ret;
 		}
 
@@ -174,25 +198,36 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	return 0;
 }
 
-void KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
+int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 	Common::LockGuard lock(m_mutex);
 
+	if (m_closed) {
+		return KERNEL_ERROR_EBADF;
+	}
 	auto it = std::find_if(m_events.begin(), m_events.end(),
 	                       [ident = event.event.ident, filter = event.event.filter](const auto& e) {
 		                       return e.event.ident == ident && e.event.filter == filter;
 	                       });
 	if (it != m_events.end()) {
-		*it = event;
+		it->deadline_ns = event.deadline_ns;
+		it->event.udata = event.event.udata;
+		for (auto& pending: it->pending_events) {
+			pending.udata = event.event.udata;
+		}
 	} else {
 		m_events.push_back(event);
 	}
 
 	m_cond_var.Signal();
+	return OK;
 }
 
-bool KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data) {
+int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data) {
 	Common::LockGuard lock(m_mutex);
 
+	if (m_closed) {
+		return KERNEL_ERROR_EBADF;
+	}
 	auto it = std::find_if(m_events.begin(), m_events.end(), [ident, filter](const auto& e) {
 		return e.event.ident == ident && e.event.filter == filter;
 	});
@@ -207,10 +242,10 @@ bool KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tr
 
 		m_cond_var.Signal();
 
-		return true;
+		return OK;
 	}
 
-	return false;
+	return KERNEL_ERROR_ENOENT;
 }
 
 static void UserEventTriggerFunc(KernelEqueueEvent* event, void* trigger_data) {
@@ -241,9 +276,12 @@ static void UserEventResetFunc(KernelEqueueEvent* event) {
 	}
 }
 
-bool KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
+int KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 	Common::LockGuard lock(m_mutex);
 
+	if (m_closed) {
+		return KERNEL_ERROR_EBADF;
+	}
 	auto it = std::find_if(m_events.begin(), m_events.end(), [ident, filter](const auto& e) {
 		return e.event.ident == ident && e.event.filter == filter;
 	});
@@ -251,15 +289,26 @@ bool KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 		auto& event = *it;
 
 		if (event.filter.delete_event_func != nullptr) {
-			event.filter.delete_event_func(this, &event);
+			auto owner = event.filter.owner;
+			event.filter.delete_event_func(m_handle, &event);
 		}
 
 		m_events.erase(it);
 
-		return true;
+		return OK;
 	}
 
-	return false;
+	return KERNEL_ERROR_ENOENT;
+}
+
+KernelEqueueRef KernelPinEqueue(KernelEqueue eq) {
+	if (eq == KERNEL_EQUEUE_INVALID) {
+		return {};
+	}
+
+	Common::LockGuard lock(g_equeues_mutex);
+	const auto        entry = g_equeues.find(eq);
+	return entry != g_equeues.end() ? entry->second : KernelEqueueRef {};
 }
 
 int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name) {
@@ -269,13 +318,15 @@ int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	*eq = new KernelEqueuePrivate;
-
-	(*eq)->SetName(std::string(name));
-
 	{
 		Common::LockGuard lock(g_equeues_mutex);
-		g_equeues.push_back(*eq);
+		if (g_next_equeue > static_cast<uint64_t>(std::numeric_limits<KernelEqueue>::max())) {
+			EXIT("event queue handle space exhausted\n");
+		}
+		*eq        = static_cast<KernelEqueue>(g_next_equeue++);
+		auto owner = std::make_shared<KernelEqueuePrivate>(*eq);
+		owner->SetName(std::string(name));
+		g_equeues.emplace(*eq, std::move(owner));
 	}
 
 	LOGF("\tEqueue create: %s\n", name);
@@ -284,55 +335,50 @@ int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name) {
 }
 
 int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event) {
-	if (eq == nullptr) {
+	auto owner = KernelPinEqueue(eq);
+	if (!owner) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	eq->AddEvent(event);
-
-	return OK;
+	return owner->AddEvent(event);
 }
 
 int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t filter,
                                      void* trigger_data) {
-	if (eq == nullptr) {
+	auto owner = KernelPinEqueue(eq);
+	if (!owner) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	if (!eq->TriggerEvent(ident, filter, trigger_data)) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	return OK;
+	return owner->TriggerEvent(ident, filter, trigger_data);
 }
 
 int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t filter) {
-	if (eq == nullptr) {
+	auto owner = KernelPinEqueue(eq);
+	if (!owner) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	if (!eq->DeleteEvent(ident, filter)) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	return OK;
+	return owner->DeleteEvent(ident, filter);
 }
 
 int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 	PRINT_NAME();
 
-	if (eq == nullptr) {
-		return KERNEL_ERROR_EBADF;
-	}
-
-	LOGF("\tEqueue delete: %s\n", eq->GetName().c_str());
+	KernelEqueueRef owner;
 
 	{
 		Common::LockGuard lock(g_equeues_mutex);
-		g_equeues.remove(eq);
+		const auto        entry = g_equeues.find(eq);
+		if (entry == g_equeues.end()) {
+			return KERNEL_ERROR_EBADF;
+		}
+		owner = std::move(entry->second);
+		g_equeues.erase(entry);
 	}
 
-	delete eq;
+	LOGF("\tEqueue delete: %s\n", owner->GetName().c_str());
+	owner->Close();
 
 	return OK;
 }
@@ -341,7 +387,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
 
-	if (eq == nullptr) {
+	auto owner = KernelPinEqueue(eq);
+	if (!owner) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -357,25 +404,28 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 
 	LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64 ", ev = 0x%016" PRIx64
 	     ", num = %d, timo = %s, thread_id = %d\n",
-	     eq->GetName().c_str(), reinterpret_cast<uint64_t>(__builtin_return_address(0)),
-	     reinterpret_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
+	     owner->GetName().c_str(), reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	     static_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
 	if (timo == nullptr) {
-		*out = eq->WaitForEvents(ev, num, 0);
+		*out = owner->WaitForEvents(ev, num, 0);
 	}
 
 	if (timo != nullptr) {
 		if (*timo == 0) {
-			*out = eq->GetTriggeredEvents(ev, num);
+			*out = owner->GetTriggeredEvents(ev, num);
 		} else {
-			*out = eq->WaitForEvents(ev, num, *timo);
+			*out = owner->WaitForEvents(ev, num, *timo);
 		}
 	}
 
+	if (*out == KERNEL_ERROR_EBADF) {
+		return KERNEL_ERROR_EBADF;
+	}
 	if (*out == 0) {
-		LOGF("\tEqueue wait timedout: %s\n", eq->GetName().c_str());
+		LOGF("\tEqueue wait timedout: %s\n", owner->GetName().c_str());
 		return KERNEL_ERROR_ETIMEDOUT;
 	}
 
@@ -391,11 +441,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t user event add: eq = 0x%016" PRIx64 ", id = %d\n", reinterpret_cast<uint64_t>(eq), id);
-
-	if (eq == nullptr) {
-		return KERNEL_ERROR_EBADF;
-	}
+	LOGF("\t user event add: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	KernelEqueueEvent event {};
 	event.event.ident         = static_cast<uintptr_t>(id);
@@ -407,20 +453,14 @@ int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id) {
 	event.filter.trigger_func = UserEventTriggerFunc;
 	event.filter.reset_func   = UserEventResetFunc;
 
-	eq->AddEvent(event);
-
-	return OK;
+	return KernelAddEvent(eq, event);
 }
 
 int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t user event edge add: eq = 0x%016" PRIx64 ", id = %d\n", reinterpret_cast<uint64_t>(eq),
+	LOGF("\t user event edge add: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
 	     id);
-
-	if (eq == nullptr) {
-		return KERNEL_ERROR_EBADF;
-	}
 
 	KernelEqueueEvent event {};
 	event.event.ident         = static_cast<uintptr_t>(id);
@@ -432,28 +472,31 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 	event.filter.trigger_func = UserEventTriggerFunc;
 	event.filter.reset_func   = UserEventResetFunc;
 
-	eq->AddEvent(event);
-
-	return OK;
+	return KernelAddEvent(eq, event);
 }
 
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();
 
 	LOGF("\t user event trigger: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
+	     static_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
 
 	return KernelTriggerEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata);
 }
 
 int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
-	int triggered = 0;
+	int                        triggered = 0;
+	std::vector<KernelEqueueRef> queues;
 
-	Common::LockGuard lock(g_equeues_mutex);
-
-	for (auto* eq: g_equeues) {
-		if (eq != nullptr &&
-		    eq->TriggerEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata)) {
+	{
+		Common::LockGuard lock(g_equeues_mutex);
+		queues.reserve(g_equeues.size());
+		for (const auto& [handle, queue]: g_equeues) {
+			queues.push_back(queue);
+		}
+	}
+	for (const auto& eq: queues) {
+		if (eq->TriggerEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata) == OK) {
 			triggered++;
 		}
 	}
@@ -464,7 +507,7 @@ int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t user event delete: eq = 0x%016" PRIx64 ", id = %d\n", reinterpret_cast<uint64_t>(eq),
+	LOGF("\t user event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
 	     id);
 
 	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
@@ -472,9 +515,6 @@ int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata) {
-	if (eq == nullptr) {
-		return KERNEL_ERROR_EBADF;
-	}
 	if (ts == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
@@ -496,9 +536,7 @@ int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTim
 	event.event.fflags = 0;
 	event.event.data   = 0;
 	event.event.udata  = udata;
-	eq->AddEvent(event);
-
-	return OK;
+	return KernelAddEvent(eq, event);
 }
 
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id) {
@@ -509,9 +547,9 @@ int KYTY_SYSV_ABI KernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();
 
 	LOGF("\t AMPR event add: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
+	     static_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
 
-	if (eq != nullptr) {
+	if (eq != KERNEL_EQUEUE_INVALID) {
 		KernelEqueueEvent event {};
 		event.event.ident         = static_cast<uintptr_t>(id);
 		event.event.filter        = KERNEL_EVFILT_USER;
@@ -521,7 +559,7 @@ int KYTY_SYSV_ABI KernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
 		event.event.udata         = udata;
 		event.filter.trigger_func = AmprEventTriggerFunc;
 		event.filter.reset_func   = UserEventResetFunc;
-		eq->AddEvent(event);
+		(void)KernelAddEvent(eq, event);
 	}
 
 	return OK;
@@ -531,7 +569,7 @@ int KYTY_SYSV_ABI KernelAddAmprSystemEvent(KernelEqueue eq, int id, void* udata)
 	PRINT_NAME();
 
 	LOGF("\t AMPR system event add: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
+	     static_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
 
 	return KernelAddAmprEvent(eq, id, udata);
 }
@@ -539,11 +577,11 @@ int KYTY_SYSV_ABI KernelAddAmprSystemEvent(KernelEqueue eq, int id, void* udata)
 int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", reinterpret_cast<uint64_t>(eq),
+	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
 	     id);
 
-	if (eq != nullptr) {
-		eq->DeleteEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
+	if (eq != KERNEL_EQUEUE_INVALID) {
+		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
 	}
 
 	return OK;
@@ -553,7 +591,7 @@ int KYTY_SYSV_ABI KernelDeleteAmprSystemEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
 	LOGF("\t AMPR system event delete: eq = 0x%016" PRIx64 ", id = %d\n",
-	     reinterpret_cast<uint64_t>(eq), id);
+	     static_cast<uint64_t>(eq), id);
 
 	return KernelDeleteAmprEvent(eq, id);
 }

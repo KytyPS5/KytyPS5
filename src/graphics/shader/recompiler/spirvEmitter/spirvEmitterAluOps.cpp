@@ -11,10 +11,13 @@ void EmitPerInvocationMask(EmitterState& state, const IR::Operand& dst, uint32_t
 }
 
 uint32_t EmitLogicalBinary(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs) {
-	const auto logical_opcode = opcode == OpBitwiseAnd  ? OpLogicalAnd
-	                            : opcode == OpBitwiseOr ? OpLogicalOr
-	                                                    : OpLogicalNotEqual;
-	const auto value          = state.builder.AllocateId();
+	uint32_t logical_opcode = OpLogicalNotEqual;
+	switch (opcode) {
+		case OpBitwiseAnd: logical_opcode = OpLogicalAnd; break;
+		case OpBitwiseOr: logical_opcode = OpLogicalOr; break;
+		default: break;
+	}
+	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction({logical_opcode, state.bool_type, value, lhs, rhs});
 	return value;
 }
@@ -469,10 +472,11 @@ uint32_t EmitSignExtendLow16U32(EmitterState& state, uint32_t value) {
 
 uint32_t EmitU16LaneBits(EmitterState& state, const IR::Operand& operand, bool high_lane,
                          bool sign_extend) {
-	const auto raw  = EmitValueLoad(state, operand);
-	const auto lane = high_lane ? (operand.op_sel_hi ? 1u : 0u) : (operand.op_sel ? 1u : 0u);
-	auto       bits = lane != 0u ? EmitShiftRightConstant(state, raw, 16) : raw;
-	bits            = EmitAndConstant(state, bits, 0xffffu);
+	const auto raw           = EmitValueLoad(state, operand);
+	const auto selected_lane = high_lane ? operand.op_sel_hi : operand.op_sel;
+	const auto lane          = selected_lane ? 1u : 0u;
+	auto       bits          = lane != 0u ? EmitShiftRightConstant(state, raw, 16) : raw;
+	bits                     = EmitAndConstant(state, bits, 0xffffu);
 	if (high_lane ? operand.negate_hi : operand.negate) {
 		bits = EmitAndConstant(state, EmitNegateU32(state, bits), 0xffffu);
 	}
@@ -502,8 +506,12 @@ void EmitMinMaxU16(EmitterState& state, const IR::Instruction& inst, bool signed
 	const auto rhs  = EmitU16LaneBits(state, inst.src[1], false, signed_value);
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
-	const auto op   = signed_value ? (max_value ? OpSGreaterThan : OpSLessThan)
-	                               : (max_value ? OpUGreaterThan : OpULessThan);
+	uint32_t   op   = 0;
+	if (signed_value) {
+		op = max_value ? OpSGreaterThan : OpSLessThan;
+	} else {
+		op = max_value ? OpUGreaterThan : OpULessThan;
+	}
 	state.builder.AddFunction({op, state.bool_type, cond, lhs, rhs});
 	state.builder.AddFunction({OpSelect, state.uint_type, ret, cond, lhs, rhs});
 	EmitStoreU32(state, inst.dst, EmitAndConstant(state, ret, 0xffffu));
@@ -2039,10 +2047,11 @@ void EmitDot2AccF32F16(EmitterState& state, const IR::Instruction& inst) {
 }
 
 uint32_t EmitPackedF16Lane(EmitterState& state, const IR::Operand& operand, bool high_lane) {
-	const auto raw      = EmitValueLoad(state, operand);
-	const auto unpacked = state.builder.AllocateId();
-	auto       value    = state.builder.AllocateId();
-	const auto lane     = high_lane ? (operand.op_sel_hi ? 1u : 0u) : (operand.op_sel ? 1u : 0u);
+	const auto raw           = EmitValueLoad(state, operand);
+	const auto unpacked      = state.builder.AllocateId();
+	auto       value         = state.builder.AllocateId();
+	const auto selected_lane = high_lane ? operand.op_sel_hi : operand.op_sel;
+	const auto lane          = selected_lane ? 1u : 0u;
 	state.builder.AddFunction(
 	    {OpExtInst, state.vec2_float_type, unpacked, state.glsl_std450, GlslUnpackHalf2x16, raw});
 	state.builder.AddFunction({OpCompositeExtract, state.float_type, value, unpacked, lane});
@@ -2069,10 +2078,11 @@ void EmitCompareF16(EmitterState& state, const IR::Instruction& inst, uint32_t o
 }
 
 uint32_t EmitPackedF16LaneBits(EmitterState& state, const IR::Operand& operand, bool high_lane) {
-	const auto raw  = EmitValueLoad(state, operand);
-	const auto lane = high_lane ? (operand.op_sel_hi ? 1u : 0u) : (operand.op_sel ? 1u : 0u);
-	auto       bits = lane != 0u ? EmitShiftRightConstant(state, raw, 16) : raw;
-	bits            = EmitAndConstant(state, bits, 0xffffu);
+	const auto raw           = EmitValueLoad(state, operand);
+	const auto selected_lane = high_lane ? operand.op_sel_hi : operand.op_sel;
+	const auto lane          = selected_lane ? 1u : 0u;
+	auto       bits          = lane != 0u ? EmitShiftRightConstant(state, raw, 16) : raw;
+	bits                     = EmitAndConstant(state, bits, 0xffffu);
 	if (operand.absolute) {
 		bits = EmitAndConstant(state, bits, 0x7fffu);
 	}
@@ -2403,8 +2413,12 @@ uint32_t EmitPackedInteger16Select(EmitterState& state, uint32_t lhs, uint32_t r
                                    bool signed_compare, bool max_value) {
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
-	const auto op   = signed_compare ? (max_value ? OpSGreaterThanEqual : OpSLessThan)
-	                                 : (max_value ? OpUGreaterThanEqual : OpULessThan);
+	uint32_t   op   = 0;
+	if (signed_compare) {
+		op = max_value ? OpSGreaterThanEqual : OpSLessThan;
+	} else {
+		op = max_value ? OpUGreaterThanEqual : OpULessThan;
+	}
 	state.builder.AddFunction({op, state.bool_type, cond, lhs, rhs});
 	state.builder.AddFunction({OpSelect, state.uint_type, ret, cond, lhs, rhs});
 	return ret;
@@ -2419,9 +2433,12 @@ uint32_t EmitPackedInteger16Lane(EmitterState& state, const IR::Instruction& ins
 		const auto arithmetic = opcode == IR::Opcode::PackedAshrrevI16;
 		const auto value      = EmitU16LaneBits(state, inst.src[1], high_lane, arithmetic);
 		const auto ret        = state.builder.AllocateId();
-		const auto shift_op   = opcode == IR::Opcode::PackedLshlrevB16 ? OpShiftLeftLogical
-		                        : arithmetic                           ? OpShiftRightArithmetic
-		                                                               : OpShiftRightLogical;
+		uint32_t   shift_op   = OpShiftRightLogical;
+		switch (opcode) {
+			case IR::Opcode::PackedLshlrevB16: shift_op = OpShiftLeftLogical; break;
+			case IR::Opcode::PackedAshrrevI16: shift_op = OpShiftRightArithmetic; break;
+			default: break;
+		}
 		state.builder.AddFunction({shift_op, state.uint_type, ret, value, count});
 		return ret;
 	}

@@ -180,9 +180,11 @@ bool IsDecodedSgpr(const Decoder::Operand& op) {
 }
 
 uint32_t DecodedSgprReg(const Decoder::Operand& op) {
-	return op.kind == Decoder::OperandKind::VccLo
-	           ? 106u
-	           : (op.kind == Decoder::OperandKind::VccHi ? 107u : op.reg);
+	switch (op.kind) {
+		case Decoder::OperandKind::VccLo: return 106u;
+		case Decoder::OperandKind::VccHi: return 107u;
+		default: return op.reg;
+	}
 }
 
 bool IsDecodedVgpr(const Decoder::Operand& op) {
@@ -340,14 +342,13 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
 		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
-		uint32_t sad_zero = 0;
+		uint32_t   sad_zero = 0;
 		const bool vertex_offset_add =
 		    vertex_index_accumulator && IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::VAddI32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && inst.dst.reg == 5 &&
-		      inst.opcode == Decoder::Opcode::VSadU32 && IsDecodedVgpr(inst.src2) &&
-		      inst.src2.reg == inst.dst.reg &&
+		     (user_data_base == 8 && inst.dst.reg == 5 && inst.opcode == Decoder::Opcode::VSadU32 &&
+		      IsDecodedVgpr(inst.src2) && inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
 		if (data.loads.empty() && vertex_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
@@ -636,7 +637,7 @@ uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputIn
 } // namespace
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
-	              CompileResult& result, std::string* error) {
+                  CompileResult& result, std::string* error) {
 	if (code.empty()) {
 		if (error != nullptr) {
 			*error = "invalid shader recompiler input";
@@ -804,10 +805,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		runtime.user_data   = std::span<const uint32_t>(user_data, options.user_data_count);
 		runtime.shader_base = options.shader_base != 0 ? options.shader_base
 		                                               : reinterpret_cast<uint64_t>(code.data());
-		runtime.read_memory = options.read_memory != nullptr ? options.read_memory
-		                      : options.user_data == nullptr ? ReadZeroMemory
-		                                                     : nullptr;
-		runtime.userdata    = options.read_memory_data;
+		runtime.read_memory = options.read_memory;
+		if (runtime.read_memory == nullptr && options.user_data == nullptr) {
+			runtime.read_memory = ReadZeroMemory;
+		}
+		runtime.userdata         = options.read_memory_data;
 		runtime.flat_memory_base = options.flat_memory_base;
 		if (!IR::MaterializeResources(ir, runtime, resources, error)) {
 			return false;

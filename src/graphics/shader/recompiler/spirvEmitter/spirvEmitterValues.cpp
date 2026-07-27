@@ -38,14 +38,14 @@ uint32_t EmitSdwaExtractU32(EmitterState& state, const IR::Operand& operand, uin
 		const auto bits         = state.builder.AllocateId();
 		state.builder.AddFunction({OpBitcast, state.int_type, signed_value, value});
 		state.builder.AddFunction({OpBitFieldSExtract, state.int_type, extracted, signed_value,
-		                            ConstantU32(state, offset), ConstantU32(state, width)});
+		                           ConstantU32(state, offset), ConstantU32(state, width)});
 		state.builder.AddFunction({OpBitcast, state.uint_type, bits, extracted});
 		return bits;
 	}
 
 	const auto extracted = state.builder.AllocateId();
 	state.builder.AddFunction({OpBitFieldUExtract, state.uint_type, extracted, value,
-	                            ConstantU32(state, offset), ConstantU32(state, width)});
+	                           ConstantU32(state, offset), ConstantU32(state, width)});
 	return extracted;
 }
 
@@ -65,8 +65,7 @@ DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uin
 	const auto target    = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, quad_base, subid, ConstantU32(state, 0xfffffffcu)});
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 3)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 3)});
 	state.builder.AddFunction(
 	    {OpShiftLeftLogical, state.uint_type, shift, lane, ConstantU32(state, 1)});
 	state.builder.AddFunction(
@@ -86,8 +85,7 @@ DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uin
 	const auto valid        = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, row, subid, ConstantU32(state, 0xfffffff0u)});
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 15)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 15)});
 	if (left) {
 		state.builder.AddFunction(
 		    {OpIAdd, state.uint_type, lane_shifted, lane, ConstantU32(state, amount)});
@@ -114,8 +112,7 @@ DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subi
 	const auto target   = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, row, subid, ConstantU32(state, 0xfffffff0u)});
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 15)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 15)});
 	state.builder.AddFunction(
 	    {OpUGreaterThanEqual, state.bool_type, in_high, lane, ConstantU32(state, amount)});
 	state.builder.AddFunction({OpISub, state.uint_type, minus, lane, ConstantU32(state, amount)});
@@ -174,7 +171,7 @@ uint32_t EmitDppValueU32(EmitterState& state, const IR::Operand& operand, uint32
 	const auto target   = EmitDppTargetLane(state, operand.dpp_ctrl);
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
-	                            ConstantU32(state, ScopeSubgroup), value, target.lane});
+	                           ConstantU32(state, ScopeSubgroup), value, target.lane});
 	if (operand.dpp_fetch_inactive) {
 		return shuffled;
 	}
@@ -235,8 +232,7 @@ uint32_t EmitLaneMaskPartU32(EmitterState& state, uint32_t part) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);
 	const auto lane  = state.builder.AllocateId();
 	const auto bit   = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
 	state.builder.AddFunction(
 	    {OpShiftLeftLogical, state.uint_type, bit, ConstantU32(state, 1), lane});
 	if (part == 0) {
@@ -265,8 +261,7 @@ uint32_t EmitThreadMaskBelowPartU32(EmitterState& state, uint32_t part) {
 	const auto lane  = state.builder.AllocateId();
 	const auto bit   = state.builder.AllocateId();
 	const auto below = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
 	state.builder.AddFunction(
 	    {OpShiftLeftLogical, state.uint_type, bit, ConstantU32(state, 1), lane});
 	state.builder.AddFunction({OpISub, state.uint_type, below, bit, ConstantU32(state, 1)});
@@ -462,7 +457,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 		const auto pointer_type = VertexParameterScalarPointerType(state, kind);
 		const auto pointer      = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, pointer_type, pointer, input.variable_id,
-		                            ConstantU32(state, component)});
+		                           ConstantU32(state, component)});
 		state.builder.AddFunction({OpLoad, scalar_type, raw, pointer});
 	}
 
@@ -527,10 +522,13 @@ uint32_t EmitFloatLoad(EmitterState& state, const IR::Operand& operand) {
 uint32_t ApplyResultModifiersF32(EmitterState& state, uint32_t value, const IR::Operand& dst) {
 	uint32_t result = value;
 	if (dst.omod != 0) {
-		const uint32_t bits   = dst.omod == 1u   ? 0x40000000u
-		                        : dst.omod == 2u ? 0x40800000u
-		                                         : 0x3f000000u;
-		const auto     scaled = state.builder.AllocateId();
+		uint32_t bits = 0x3f000000u;
+		switch (dst.omod) {
+			case 1u: bits = 0x40000000u; break;
+			case 2u: bits = 0x40800000u; break;
+			default: break;
+		}
+		const auto scaled = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpFMul, state.float_type, scaled, result, ConstantF32(state, bits)});
 		result = scaled;
@@ -540,7 +538,7 @@ uint32_t ApplyResultModifiersF32(EmitterState& state, uint32_t value, const IR::
 	}
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction({OpExtInst, state.float_type, ret, state.glsl_std450, GlslFClamp,
-	                            result, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+	                           result, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
 	return ret;
 }
 
@@ -565,7 +563,7 @@ uint32_t EmitMixF32Load(EmitterState& state, const IR::Operand& operand) {
 		const auto unpacked = state.builder.AllocateId();
 		auto       f32      = state.builder.AllocateId();
 		state.builder.AddFunction({OpExtInst, state.vec2_float_type, unpacked, state.glsl_std450,
-		                            GlslUnpackHalf2x16, bits});
+		                           GlslUnpackHalf2x16, bits});
 		state.builder.AddFunction(
 		    {OpCompositeExtract, state.float_type, f32, unpacked, operand.op_sel ? 1u : 0u});
 		if (operand.absolute) {
@@ -651,7 +649,7 @@ uint32_t EmitLaneIndexActiveBool(EmitterState& state, uint32_t lane) {
 	if (state.per_invocation_masks) {
 		const auto ballot = state.builder.AllocateId();
 		state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
-		                            ConstantU32(state, ScopeSubgroup), EmitExecActiveBool(state)});
+		                           ConstantU32(state, ScopeSubgroup), EmitExecActiveBool(state)});
 		return EmitBallotLaneActiveBool(state, ballot, lane);
 	}
 	const auto lane_low = state.builder.AllocateId();
@@ -682,7 +680,7 @@ uint32_t EmitLaneIndexActiveBool(EmitterState& state, uint32_t lane) {
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, active_ballot,
-	                            ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});
+	                           ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {

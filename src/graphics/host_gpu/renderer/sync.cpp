@@ -5,16 +5,16 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/presentation/displayBuffer.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <array>
+#include <cstring>
 #include <limits>
 #include <optional>
 
@@ -57,19 +57,6 @@ uint64_t ReadReferenceClock() {
 	return value;
 }
 
-static void SubmitLabel(CommandBuffer& buffer, LabelCallback callback_1 = nullptr,
-                        LabelCallback callback_2 = nullptr, const uint64_t* args = nullptr) {
-	auto* label = LabelCreate(callback_1, callback_2, args);
-	LabelSet(buffer, *label);
-	LabelDelete(*label);
-}
-
-static bool CompleteDisplayBufferFlip(const uint64_t* args) {
-	EXIT_IF(args == nullptr);
-	Presentation::DisplayBufferCompleteFlipFromGpu(args[0]);
-	return true;
-}
-
 enum class EndOfPipeCompletion { None, Interrupt, Flip, FlipAndInterrupt };
 
 struct EndOfPipeSignal {
@@ -86,17 +73,6 @@ struct EndOfPipeSignal {
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBack };
 
-static bool TriggerEopEventCallback(const uint64_t* args) {
-	EXIT_IF(args == nullptr);
-	GetRenderContext().TriggerEopEvent(static_cast<uint32_t>(args[0]));
-	return true;
-}
-
-static bool TriggerDefaultEopEventCallback(const uint64_t* /*args*/) {
-	GetRenderContext().TriggerEopEvent(0);
-	return true;
-}
-
 static void ValidateEndOfPipeSignal(const EndOfPipeSignal& signal) {
 	if (signal.destination.has_value()) {
 		EXIT_IF(*signal.destination == 0);
@@ -111,19 +87,33 @@ static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
 	                            signal.debug_args[0], signal.debug_args[1], signal.debug_args[2],
 	                            signal.debug_args[3], signal.debug_data);
 
-	const uint64_t args[LABEL_ARGS_MAX] = {signal.completion_data};
+	auto& renderer  = signal.buffer->GetContext();
+	auto& scheduler = renderer.GetCommandScheduler();
+	if (signal.completion != EndOfPipeCompletion::None) {
+		EXIT_IF(!scheduler.Active() || signal.buffer != &scheduler.Current());
+	}
 	switch (signal.completion) {
 		case EndOfPipeCompletion::None: return;
-		case EndOfPipeCompletion::Interrupt:
-			SubmitLabel(*signal.buffer, nullptr, TriggerEopEventCallback, args);
+		case EndOfPipeCompletion::Interrupt: {
+			const auto context_id = static_cast<uint32_t>(signal.completion_data);
+			scheduler.DeferPriorityOperation(
+			    [&renderer, context_id] { renderer.TriggerEopEvent(context_id); });
 			return;
-		case EndOfPipeCompletion::Flip:
-			SubmitLabel(*signal.buffer, CompleteDisplayBufferFlip, nullptr, args);
+		}
+		case EndOfPipeCompletion::Flip: {
+			const auto request_id = signal.completion_data;
+			scheduler.DeferPriorityOperation(
+			    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
 			return;
-		case EndOfPipeCompletion::FlipAndInterrupt:
-			SubmitLabel(*signal.buffer, CompleteDisplayBufferFlip, TriggerDefaultEopEventCallback,
-			            args);
+		}
+		case EndOfPipeCompletion::FlipAndInterrupt: {
+			const auto request_id = signal.completion_data;
+			scheduler.DeferPriorityOperation([&renderer, request_id] {
+				renderer.GetVideoOut().CompleteFlip(request_id);
+				renderer.TriggerEopEvent(0);
+			});
 			return;
+		}
 	}
 }
 
@@ -170,10 +160,6 @@ void TriggerAgcUserInterrupt() {
 	auto result = LibKernel::EventQueue::KernelTriggerUserEventForAll(AGC_USER_INTERRUPT_EVENT,
 	                                                                  reinterpret_cast<void*>(tsc));
 	EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_ENOENT);
-}
-
-void TriggerEopEvent(uint32_t context_id) {
-	GetRenderContext().TriggerEopEvent(context_id);
 }
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -261,11 +247,12 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::Interrupt, context_id);
 }
 
-uint64_t PrepareDisplayBufferFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
-                                  int64_t flip_arg) {
+uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
+                             int64_t flip_arg) {
 	for (;;) {
 		uint64_t   request_id = 0;
-		const auto result     = Presentation::DisplayBufferSubmitFlipFromGpu(
+		auto&      video_out = buffer.GetContext().GetVideoOut();
+		const auto result = video_out.SubmitFlipFromGpu(
 		    buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
@@ -276,7 +263,7 @@ uint64_t PrepareDisplayBufferFlip(CommandBuffer& buffer, int handle, int index, 
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
-		Presentation::DisplayBufferWaitForFlipQueueSlot();
+		video_out.WaitForSubmitSlot();
 	}
 }
 
@@ -331,9 +318,11 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id) {
 	ValidateEndOfPipeSignal({.buffer = &buffer});
-
-	uint64_t args[LABEL_ARGS_MAX] = {static_cast<uint64_t>(context_id)};
-	SubmitLabel(buffer, nullptr, TriggerEopEventCallback, args);
+	auto& renderer  = buffer.GetContext();
+	auto& scheduler = renderer.GetCommandScheduler();
+	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	scheduler.DeferPriorityOperation(
+	    [&renderer, context_id] { renderer.TriggerEopEvent(context_id); });
 }
 
 static void EopEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
@@ -349,7 +338,9 @@ static void EopEventDeleteFunc(LibKernel::EventQueue::KernelEqueue       eq,
 	EXIT_NOT_IMPLEMENTED(event->event.filter != LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS);
 	if (event->event.ident == GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT ||
 	    event->event.ident == GRAPHICS_EVENT_EOP) {
-		GetRenderContext().DeleteEopEq(eq, static_cast<int>(event->event.ident));
+		auto* renderer = static_cast<RenderContext*>(event->filter.data);
+		EXIT_IF(renderer == nullptr);
+		renderer->DeleteEopEq(eq, static_cast<int>(event->event.ident));
 	}
 }
 
@@ -368,7 +359,8 @@ static void EopEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
 	}
 }
 
-int AddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
+int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
+               void* udata) {
 	LibKernel::EventQueue::KernelEqueueEvent event;
 	event.triggered                = false;
 	event.event.ident              = static_cast<uintptr_t>(id);
@@ -379,13 +371,13 @@ int AddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
 	event.filter.delete_event_func = EopEventDeleteFunc;
 	event.filter.reset_func        = EopEventResetFunc;
 	event.filter.trigger_func      = EopEventTriggerFunc;
-	event.filter.data              = nullptr;
+	event.filter.data              = &renderer;
 
 	int result = LibKernel::EventQueue::KernelAddEvent(eq, event);
 
 	if (result == 0 &&
 	    (id == GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT || id == GRAPHICS_EVENT_EOP)) {
-		GetRenderContext().AddEopEq(eq, id);
+		renderer.AddEopEq(eq, id);
 	}
 
 	return result;
@@ -398,12 +390,12 @@ int DeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
 	return result;
 }
 
-void ReadGds(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size) {
-	GetRenderContext().GetGdsBuffer().Read(dst, dw_offset, dw_size);
-}
-
-void DeleteBuffers() {
-	GetRenderContext().GetBufferCache().ResetNullBuffer();
+void ReadGds(Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size) {
+	const auto offset = uint64_t {dw_offset} * sizeof(uint32_t);
+	const auto size   = uint64_t {dw_size} * sizeof(uint32_t);
+	EXIT_IF(dst == nullptr || offset > gds.Size() || size > gds.Size() - offset ||
+	        gds.Mapped().empty());
+	std::memcpy(dst, gds.Mapped().data() + offset, static_cast<size_t>(size));
 }
 
 } // namespace Libs::Graphics::Sync

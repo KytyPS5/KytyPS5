@@ -21,7 +21,7 @@ public:
 	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
-	~SamplerCache() { KYTY_NOT_IMPLEMENTED; }
+	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
 	vk::Sampler GetSampler(const ShaderSamplerResource& r);

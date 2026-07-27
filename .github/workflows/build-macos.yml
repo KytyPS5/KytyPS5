@@ -74,8 +74,8 @@ jobs:
         run: |
           file _Build/macos/install/launcher
           file _Build/macos/install/kyty_emulator
-          lipo -verify_arch x86_64 _Build/macos/install/launcher
-          lipo -verify_arch x86_64 _Build/macos/install/kyty_emulator
+          lipo _Build/macos/install/launcher -verify_arch x86_64
+          lipo _Build/macos/install/kyty_emulator -verify_arch x86_64
           codesign --verify --strict _Build/macos/install/kyty_emulator
 
       - name: Upload artifacts

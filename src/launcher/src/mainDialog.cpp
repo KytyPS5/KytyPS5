@@ -25,7 +25,7 @@
 
 #include "ui_main_dialog.h"
 
-#ifndef __linux__
+#if defined(_WIN32)
 #include <windows.h> // IWYU pragma: keep
 #endif
 
@@ -35,20 +35,20 @@
 
 class QWidget;
 
-#ifdef __linux__
-constexpr char EMULATOR_EXE[] = "kyty_emulator";
-#else
+#if defined(_WIN32)
 constexpr char EMULATOR_EXE[] = "kyty_emulator.exe";
+#else
+constexpr char EMULATOR_EXE[] = "kyty_emulator";
 #endif
 
-#ifndef __linux__
+#if defined(_WIN32)
 constexpr char CMD_EXE[] = "cmd.exe";
-#else
+#elif defined(__linux__)
 constexpr char GNOME[]          = "gnome-terminal";
 constexpr char XTERM[]          = "xterm";
 constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
-#ifndef __linux__
+#if defined(_WIN32)
 constexpr DWORD CMD_X_CHARS = 175;
 constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
@@ -286,7 +286,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		process->setProgram(GNOME);
 		process->setArguments({"--", "bash", "-c", bash_file_name});
 	}
-#else
+#elif defined(_WIN32)
 	{
 		process->setProgram(CMD_EXE);
 		QStringList process_args;
@@ -294,9 +294,12 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		process_args += args;
 		process->setArguments(process_args);
 	}
+#else
+	process->setProgram(interpreter);
+	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
-#ifndef __linux__
+#if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
 		args->startupInfo->dwFlags &= ~static_cast<DWORD>(STARTF_USESTDHANDLES);

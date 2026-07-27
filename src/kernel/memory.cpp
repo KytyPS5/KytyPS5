@@ -8,6 +8,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/gpuResourceManager.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -1005,6 +1006,30 @@ static bool ReleaseReservedRange(uint64_t vaddr, uint64_t size) {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* placeholder_backed);
 
+// Guest thread stacks are mapped with MAP_FIXED below GUEST_STACK_TOP. Reserve
+// that window before any host component (e.g. the GPU driver's address arena)
+// can occupy it; stack maps then commit from the placeholder-backed range.
+static void ReserveGuestStackArea() {
+	constexpr uint64_t RESERVE_ALIGNMENT = 0x10000;
+
+	const uint64_t end   = LibKernel::GUEST_STACK_TOP & ~(RESERVE_ALIGNMENT - 1u);
+	const uint64_t start = end - LibKernel::GUEST_STACK_AREA_SIZE;
+
+	if (!g_placeholder_address_space->ReserveFixed(start, LibKernel::GUEST_STACK_AREA_SIZE)) {
+		LOGF_COLOR(Log::Color::Yellow,
+		           "\t guest stack area is already occupied: addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 "\n",
+		           start, LibKernel::GUEST_STACK_AREA_SIZE);
+		return;
+	}
+
+	if (!g_virtual_ranges->Add(start, LibKernel::GUEST_STACK_AREA_SIZE, 0, 0, 0,
+	                           VirtualRangeType::Reserved, "guest_stack_area", false, true)) {
+		EXIT("failed to register guest stack area: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     start, LibKernel::GUEST_STACK_AREA_SIZE);
+	}
+}
+
 KYTY_SUBSYSTEM_INIT(Memory) {
 	g_flexible_memory_size      = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 	g_physical_memory           = new PhysicalMemory;
@@ -1018,6 +1043,7 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 	EXIT_IF(!g_direct_memory_backing->SelfTest());
 	g_placeholder_address_space->SelfTest();
 	SelfTestSub64SharedPlaceholderAlias();
+	ReserveGuestStackArea();
 }
 
 KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Memory) {}

@@ -21,6 +21,13 @@ namespace LibKernel {
 
 KYTY_SUBSYSTEM_DEFINE(Pthread);
 
+// Guest thread stacks are mapped top-down with MAP_FIXED starting below
+// GUEST_STACK_TOP (see CreateGuestStack in pthread.cpp). The Memory subsystem
+// pre-reserves GUEST_STACK_AREA_SIZE bytes below it at init so host-side
+// allocations (e.g. GPU driver address arenas) cannot occupy the fixed range.
+constexpr uint64_t GUEST_STACK_TOP       = 0x7efff8000ull;
+constexpr uint64_t GUEST_STACK_AREA_SIZE = 0x40000000ull;
+
 struct PthreadAttrPrivate;
 struct PthreadPrivate;
 struct PthreadMutexPrivate;

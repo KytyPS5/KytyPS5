@@ -4,6 +4,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <cinttypes>
@@ -1454,6 +1455,45 @@ void TestProgramMemoryRegistrationAndProtection() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestStackAreaIsReservedForFixedStackMaps() {
+	const char* test = "GuestStackAreaIsReservedForFixedStackMaps";
+
+	constexpr int SceKernelMapStack   = 0x400;
+	constexpr int SceKernelMapPrivate = 0x02;
+	constexpr int SceKernelMapAnon    = 0x1000;
+
+	// Same placement policy as CreateGuestStack: top-down below GUEST_STACK_TOP.
+	constexpr uint64_t map_size = 0x210000;
+	const uint64_t     map_addr =
+	    ((Libs::LibKernel::GUEST_STACK_TOP - 0x200000 - SceKernelPageSize) & ~uint64_t {0xffff}) -
+	    map_size;
+
+	const uint64_t area_end   = Libs::LibKernel::GUEST_STACK_TOP & ~uint64_t {0xffff};
+	const uint64_t area_start = area_end - Libs::LibKernel::GUEST_STACK_AREA_SIZE;
+	ExpectRange(test, Query(test, map_addr), area_start, area_end, 0, 0, 0, 0, 0,
+	            "guest_stack_area");
+
+	void* fixed = reinterpret_cast<void*>(map_addr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &fixed, map_size, SceKernelProtCpuRead | SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapPrivate | SceKernelMapStack | SceKernelMapAnon,
+	            "stack"),
+	        "KernelMapNamedFlexibleMemory(MAP_FIXED stack)");
+	Check(test, reinterpret_cast<uint64_t>(fixed) == map_addr, "fixed stack mapping moved");
+
+	// The pages must be writable, as CreateGuestStack zero-fills them.
+	*reinterpret_cast<uint64_t*>(map_addr)                = 0x4b59545953544b31ull;
+	*reinterpret_cast<uint64_t*>(map_addr + map_size - 8) = 0x4b59545953544b32ull;
+	Check(test, *reinterpret_cast<uint64_t*>(map_addr) == 0x4b59545953544b31ull,
+	      "stack memory readback failed");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(map_addr, map_size),
+	        "KernelMunmap(stack cleanup)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 } // namespace
 
 int main() {
@@ -1463,6 +1503,7 @@ int main() {
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
+	RunTest(TestGuestStackAreaIsReservedForFixedStackMaps);
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);

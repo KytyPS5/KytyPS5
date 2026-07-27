@@ -66,7 +66,7 @@ constexpr size_t   PTHREAD_STACK_PAGE        = 0x4000;
 constexpr size_t   PTHREAD_STACK_GRANULARITY = 0x10000;
 constexpr size_t   PTHREAD_STACK_INITIAL     = 0x200000;
 constexpr size_t   PTHREAD_STACK_EXTRA       = 0x100000;
-constexpr uint64_t PTHREAD_STACK_TOP         = 0x7efff8000ull;
+constexpr uint64_t PTHREAD_STACK_TOP         = GUEST_STACK_TOP;
 constexpr uint32_t SIGNAL_APC_POLL_MICROS    = 10000;
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;

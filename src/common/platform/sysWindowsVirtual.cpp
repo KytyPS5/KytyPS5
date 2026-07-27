@@ -160,7 +160,26 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	if (ptr == 0) {
 		auto err = static_cast<uint32_t>(GetLastError());
 
-		printf("VirtualAlloc() failed: 0x%08" PRIx32 "\n", err);
+		printf("VirtualAlloc() failed: address=0x%016" PRIx64 ", size=0x%016" PRIx64
+		       ", err=0x%08" PRIx32 "\n",
+		       address, size, err);
+
+		// Report what already occupies the requested range so fixed-address
+		// conflicts can be attributed to their owner.
+		uint64_t current = address;
+		while (current < address + size) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0) {
+				break;
+			}
+			printf("\t conflicting region: base=0x%016" PRIx64 ", size=0x%016" PRIx64
+			       ", alloc_base=0x%016" PRIx64 ", state=0x%08" PRIx32 ", type=0x%08" PRIx32 "\n",
+			       reinterpret_cast<uint64_t>(info.BaseAddress),
+			       static_cast<uint64_t>(info.RegionSize),
+			       reinterpret_cast<uint64_t>(info.AllocationBase),
+			       static_cast<uint32_t>(info.State), static_cast<uint32_t>(info.Type));
+			current = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		}
 		return false;
 	}
 

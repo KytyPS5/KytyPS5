@@ -841,6 +841,16 @@ void TestGpuDirtyBits() {
         "explicit GPU dirty transition did not trap CPU access");
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.MarkCleanRegionAsGpuModified(address, page_size * 2);
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            tracker.IsRegionGpuModified(address + page_size, page_size),
+        "clean-page GPU restore overwrote CPU ownership or missed a clean page");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
   tracker.UnmapMemory(address, page_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }

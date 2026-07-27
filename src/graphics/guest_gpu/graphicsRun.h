@@ -3,33 +3,59 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/uniqueFunction.h"
+
+#include <memory>
 
 namespace Libs::Graphics {
 
 class CommandProcessor;
+class GpuState;
+class RenderContext;
 
-class GraphicsRunSubmissionLock final {
+class Gpu final {
 public:
-	GraphicsRunSubmissionLock();
-	~GraphicsRunSubmissionLock();
-	KYTY_CLASS_NO_COPY(GraphicsRunSubmissionLock);
+	explicit Gpu(RenderContext& renderer);
+	~Gpu();
+	KYTY_CLASS_NO_COPY(Gpu);
+
+	void               Shutdown();
+	[[nodiscard]] bool IsStopping();
+	void               SendCommand(Common::UniqueFunction<void>&& command);
+	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	void SendCommandSyncWithProcessor(Common::UniqueFunction<void, CommandProcessor&>&& command);
+
+	void Submit(uint32_t* draw_commands, uint32_t draw_size_dw, uint32_t* constant_commands,
+	            uint32_t constant_size_dw, bool trigger_agc_interrupt_on_done = false);
+	void SubmitCompute(uint32_t queue, uint32_t* commands, uint32_t size_dw,
+	                   bool trigger_agc_interrupt_on_done = false);
+	void SubmitFlipPreparation(uint64_t request_id);
+	void Done();
+	[[nodiscard]] int GetFrameNum() const;
+
+	[[nodiscard]] static bool              IsCommandProcessorThread() noexcept;
+	[[nodiscard]] static CommandProcessor* CurrentCommandProcessor() noexcept;
+	[[nodiscard]] static bool              SubmissionLockHeld() noexcept;
+	[[nodiscard]] static bool              MutexHeld() noexcept;
+
+	class SubmissionLock final {
+	public:
+		explicit SubmissionLock(Gpu& gpu);
+		~SubmissionLock();
+		KYTY_CLASS_NO_COPY(SubmissionLock);
+
+	private:
+		Gpu& m_gpu;
+	};
+
+private:
+	friend class SubmissionLock;
+
+	void PauseSubmissions();
+	void ResumeSubmissions();
+
+	std::unique_ptr<GpuState> m_state;
 };
-
-void GraphicsRunInit();
-
-void GraphicsRunSubmit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t* cmd_const_buffer,
-                       uint32_t num_const_dw, bool trigger_agc_interrupt_on_done = false);
-void GraphicsRunSubmitCompute(uint32_t queue, uint32_t* cmd_buffer, uint32_t num_dw,
-                              bool trigger_agc_interrupt_on_done = false);
-void GraphicsRunSubmitFlipPreparation();
-void GraphicsRunWait();
-void GraphicsRunDone();
-int  GraphicsRunGetFrameNum();
-[[nodiscard]] bool              GraphicsRunIsCommandProcessorThread() noexcept;
-[[nodiscard]] CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept;
-void                            GraphicsRunFinishScheduler();
-[[nodiscard]] bool              GraphicsRunSubmissionLockHeld() noexcept;
-[[nodiscard]] bool              GraphicsRunGpuLockHeld() noexcept;
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

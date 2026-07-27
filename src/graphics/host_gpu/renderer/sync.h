@@ -8,6 +8,8 @@
 namespace Libs::Graphics {
 
 class CommandBuffer;
+class Buffer;
+class RenderContext;
 
 namespace Sync {
 
@@ -16,7 +18,6 @@ namespace Sync {
 [[nodiscard]] uint64_t ReadReferenceClock();
 
 void TriggerAgcUserInterrupt();
-void TriggerEopEvent(uint32_t context_id);
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id);
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -46,8 +47,8 @@ void WriteAtEndOfPipeWithInterruptWriteBack64(uint64_t submit_id, CommandBuffer&
                                               uint64_t* dst_gpu_addr, uint64_t value,
                                               uint32_t context_id = 0);
 
-[[nodiscard]] uint64_t PrepareDisplayBufferFlip(CommandBuffer& buffer, int handle, int index,
-                                                int flip_mode, int64_t flip_arg);
+[[nodiscard]] uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index,
+                                           int flip_mode, int64_t flip_arg);
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,
                               int flip_mode, int64_t flip_arg, uint64_t request_id);
 void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -58,10 +59,10 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
                                                   int handle, int index, int flip_mode,
                                                   int64_t flip_arg, uint64_t request_id);
 
-int  AddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata);
+int  AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
+                void* udata);
 int  DeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id);
-void ReadGds(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
-void DeleteBuffers();
+void ReadGds(Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
 
 } // namespace Sync
 } // namespace Libs::Graphics

@@ -1,0 +1,45 @@
+#version 450
+
+layout(constant_id = 0) const uint D32 = 0u;
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
+layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+
+layout(push_constant, std430) uniform Push {
+	uint src_base;
+	uint dst_base;
+	uint width;
+	uint height;
+	uint depth;
+	uint surface_z;
+	uint pitch_bytes;
+	uint slice_bytes;
+	uint blocks_per_row;
+	uint blocks_per_slice;
+	uint tail_x;
+	uint tail_y;
+	uint tail;
+} params;
+
+uint decode(uint value) {
+	float normalized = D32 != 0u
+		? clamp(uintBitsToFloat(value), 0.0, 1.0)
+		: float(value & 0x00ffffffu) / 16777215.0;
+	return uint(round(normalized * 65535.0));
+}
+
+void main() {
+	uint x = gl_GlobalInvocationID.x;
+	uint y = gl_GlobalInvocationID.y;
+	if (x >= params.width || y >= params.height) {
+		return;
+	}
+	uint src = params.src_base + y * params.pitch_bytes + x * 4u;
+	uint dst = params.dst_base + y * params.slice_bytes + x * 2u;
+	uint shift = (dst & 2u) * 8u;
+	uint mask = 0xffffu << shift;
+	uint word = dst >> 2u;
+	atomicAnd(output_buffer.data[word], ~mask);
+	atomicOr(output_buffer.data[word], decode(input_buffer.data[src >> 2u]) << shift);
+}

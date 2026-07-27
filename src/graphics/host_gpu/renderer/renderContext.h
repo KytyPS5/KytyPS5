@@ -8,38 +8,45 @@
 #include "graphics/host_gpu/renderer/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
-#include "graphics/host_gpu/renderer/gdsBuffer.h"
 #include "graphics/host_gpu/renderer/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/pipelineCache.h"
 #include "graphics/host_gpu/renderer/samplerCache.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
 #include "kernel/eventQueue.h"
 
+#include <memory>
 #include <vector>
+
+namespace Libs::VideoOut {
+class VideoOutDriver;
+}
 
 namespace Libs::Graphics {
 
 constexpr int AGC_USER_INTERRUPT_EVENT = 0x1800;
+class Gpu;
 
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext& graphics);
-	~RenderContext() { KYTY_NOT_IMPLEMENTED; }
+	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
 	[[nodiscard]] GraphicContext& GetGraphics() const noexcept { return m_graphics; }
+	void                          InitializeGpu(VideoOut::VideoOutDriver* video_out);
+	void                          ShutdownGpu();
+	[[nodiscard]] Gpu&            GetGpu() const;
+	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorCache&    GetDescriptorCache() { return m_descriptor_cache; }
-	FramebufferCache&   GetFramebufferCache() { return m_framebuffer_cache; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
-	GdsBuffer&          GetGdsBuffer() { return m_gds_buffer; }
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
+	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	void AddEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
 	void DeleteEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
@@ -47,26 +54,25 @@ public:
 
 private:
 	struct EopEqRegistration {
-		LibKernel::EventQueue::KernelEqueue eq    = nullptr;
-		int                                 id    = 0;
-		uint32_t                            count = 0;
+		LibKernel::EventQueue::KernelEqueue    eq = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+		LibKernel::EventQueue::KernelEqueueRef queue;
+		int                                   id = 0;
 	};
 
-	GraphicContext&    m_graphics;
-	Common::Mutex      m_mutex;
-	CommandScheduler   m_command_scheduler;
-	PipelineCache      m_pipeline_cache;
-	DescriptorCache    m_descriptor_cache;
-	FramebufferCache   m_framebuffer_cache;
-	SamplerCache       m_sampler_cache;
-	GdsBuffer          m_gds_buffer;
-	GpuResourceManager m_gpu_resources;
+	GraphicContext&      m_graphics;
+	Common::Mutex        m_mutex;
+	RenderExecutor       m_render_executor;
+	CommandScheduler     m_command_scheduler;
+	DescriptorCache      m_descriptor_cache;
+	PipelineCache        m_pipeline_cache;
+	SamplerCache         m_sampler_cache;
+	GpuResourceManager   m_gpu_resources;
+	std::unique_ptr<Gpu> m_gpu;
+	VideoOut::VideoOutDriver* m_video_out = nullptr;
 
 	Common::Mutex                  m_eop_mutex;
 	std::vector<EopEqRegistration> m_eop_eqs;
 };
-
-[[nodiscard]] RenderContext& GetRenderContext() noexcept;
 
 } // namespace Libs::Graphics
 

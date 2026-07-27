@@ -9,8 +9,6 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
                 std::string* error);
 
 const char* MimgSampleOpcodeName(uint32_t opcode);
-uint32_t    MimgSampleOpcodeFlags(uint32_t opcode);
-uint32_t    MimgSampleAddressComponents(uint32_t opcode);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
 

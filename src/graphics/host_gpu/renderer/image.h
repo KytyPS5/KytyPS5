@@ -2,49 +2,93 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/imageInfo.h"
 
-#include <algorithm>
-#include <cstddef>
+#include <compare>
+#include <limits>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
-struct DepthStencilVulkanImage;
-struct GpuTextureVulkanImage;
-struct GraphicContext;
-struct RenderTextureVulkanImage;
-struct VideoOutVulkanImage;
-struct VulkanImage;
+class Buffer;
+class CommandScheduler;
+struct ImageTestAccess;
 
-struct Image final: ImageInfo {
-	Image& operator=(const ImageInfo& value) {
-		if (IsCpuDirty()) {
-			EXIT("dirty sampled image cannot be reassigned\n");
-		}
-		static_cast<ImageInfo&>(*this) = value;
-		m_track_begin                  = address;
-		m_track_end                    = address + size;
-		m_maybe_cpu_hash_valid         = false;
-		return *this;
+struct ImageId {
+	uint32_t index      = std::numeric_limits<uint32_t>::max();
+	uint32_t generation = 0;
+
+	[[nodiscard]] explicit operator bool() const noexcept {
+		return index != std::numeric_limits<uint32_t>::max();
 	}
+	auto operator<=>(const ImageId&) const = default;
+};
+
+struct CachedImageView {
+	ImageViewInfo info;
+	vk::ImageView view = nullptr;
+};
+
+struct ImageViewCache {
+	ImageViewCache() = default;
+	KYTY_CLASS_NO_COPY(ImageViewCache);
+
+	std::mutex                   mutex;
+	std::vector<CachedImageView> views;
+};
+
+struct ImageUsage {
+	bool texture       = false;
+	bool storage       = false;
+	bool render_target = false;
+	bool depth_target  = false;
+	bool video_out     = false;
+};
+
+struct ImageBinding {
+	bool is_bound      = false;
+	bool is_target     = false;
+	bool needs_rebind  = false;
+	bool force_general = false;
+};
+
+class Image final {
+public:
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	~Image();
+	KYTY_CLASS_NO_COPY(Image);
+
+	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
+	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	[[nodiscard]] Barriers
+	GetBarriers(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+	            vk::PipelineStageFlags2 destination_stage,
+	            std::optional<ImageSubresourceRange> range);
+	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
+	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+	            uint64_t offset, uint64_t size);
+	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+	              uint64_t offset, uint64_t size);
+	void CopyImage(Image& source);
+	void Resolve(Image& source, const ImageSubresourceRange& source_range,
+	             const ImageSubresourceRange& destination_range);
+	void CopyImageWithBuffer(Image& source, Buffer& buffer);
+	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(address, this->size, vaddr, size)) {
-			m_cpu_dirty            = true;
-			m_maybe_cpu_dirty      = false;
-			m_maybe_cpu_hash_valid = false;
-			m_track_begin          = m_track_end;
-		} else if (ImagePageRangesOverlap(address, this->size, vaddr, size)) {
-			constexpr uint64_t page_mask = 4096 - 1;
-			if (vaddr + size <= address) {
-				const auto next_page = (address + page_mask) & ~page_mask;
-				m_track_begin        = std::min(m_track_end, std::max(m_track_begin, next_page));
-			} else if (vaddr >= address + this->size) {
-				const auto page = (address + this->size) & ~page_mask;
-				m_track_end     = std::max(m_track_begin, std::min(m_track_end, page));
-			}
-			m_maybe_cpu_dirty = m_track_begin == m_track_end;
+		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
+			m_cpu_dirty       = true;
+			m_maybe_cpu_dirty = false;
+			m_maybe_hash_valid = false;
+		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
+			m_maybe_cpu_dirty = true;
 		}
 	}
 
@@ -52,116 +96,92 @@ struct Image final: ImageInfo {
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	[[nodiscard]] bool NeedsMaybeCpuHash() const {
-		return m_maybe_cpu_dirty && !m_maybe_cpu_hash_valid;
-	}
-	[[nodiscard]] bool IsCpuTrackingComplete() const {
-		return m_track_begin == address && m_track_end == address + size;
+		return m_maybe_cpu_dirty && !m_maybe_hash_valid;
 	}
 	void SetMaybeCpuHash(uint64_t hash) {
 		if (!NeedsMaybeCpuHash()) {
-			EXIT("sampled image cannot initialize maybe-dirty hash\n");
+			EXIT("image cannot initialize maybe-dirty hash\n");
 		}
-		m_maybe_cpu_hash       = hash;
-		m_maybe_cpu_hash_valid = true;
+		m_maybe_cpu_hash = hash;
+		m_maybe_hash_valid = true;
 	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
-		if (!m_maybe_cpu_dirty || !m_maybe_cpu_hash_valid || m_cpu_dirty) {
-			EXIT("sampled image cannot resolve maybe-dirty hash\n");
+		if (!m_maybe_cpu_dirty || !m_maybe_hash_valid || m_cpu_dirty) {
+			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
-		m_maybe_cpu_dirty      = false;
-		m_maybe_cpu_hash_valid = false;
-		m_cpu_dirty            = hash != m_maybe_cpu_hash;
-		if (!m_cpu_dirty) {
-			m_track_begin = address;
-			m_track_end   = address + size;
-		}
+		m_maybe_cpu_dirty = false;
+		m_maybe_hash_valid = false;
+		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
 	}
 
 	void RefreshComplete() {
 		if (!IsCpuDirty()) {
-			EXIT("clean sampled image cannot complete a refresh\n");
+			EXIT("clean image cannot complete a refresh\n");
 		}
-		m_cpu_dirty            = false;
-		m_maybe_cpu_dirty      = false;
-		m_maybe_cpu_hash_valid = false;
-		m_track_begin          = address;
-		m_track_end            = address + size;
+		m_cpu_dirty        = false;
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
 	}
 
+	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
+	void MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void ClearGpuModified() noexcept { m_gpu_modified = false; }
+
+	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
+	void MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void ClearBufferModified() noexcept { m_buffer_modified = false; }
+
+	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size, bool pages = false) const noexcept {
+		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
+		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
+	}
+	[[nodiscard]] bool GpuOverlaps(uint64_t address, uint64_t size) const noexcept {
+		return IsGpuModified() && Overlaps(address, size);
+	}
+	[[nodiscard]] bool SafeToDownload() const noexcept {
+		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
+	}
+	[[nodiscard]] uint64_t AccountedSize() const noexcept {
+		return backing.image == nullptr ? 0 : (info.data.size + 1023) & ~uint64_t {1023};
+	}
+	[[nodiscard]] uint64_t HashGuestEdges() const;
+
+	ImageInfo            info;
+	VulkanImage          backing;
+	ImageViewCache       views;
+	ImageUsage           usage;
+	ImageBinding         binding;
+	bool                 registered          = false;
+	ImageId              depth_id {};
+	uint64_t             tick_accessed_last = 0;
+	size_t               lru_id = 0;
+
 private:
-	bool     m_cpu_dirty            = false;
-	bool     m_maybe_cpu_dirty      = false;
-	bool     m_maybe_cpu_hash_valid = false;
-	uint64_t m_track_begin          = 0;
-	uint64_t m_track_end            = 0;
-	uint64_t m_maybe_cpu_hash       = 0;
+	friend struct ImageTestAccess;
+
+	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
+	[[nodiscard]] static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
+	                                       uint64_t capacity) noexcept;
+	[[nodiscard]] static std::pair<uint32_t, uint32_t>
+	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
+
+	GraphicContext*   m_graphics  = nullptr;
+	CommandScheduler* m_scheduler = nullptr;
+	uint64_t        m_maybe_cpu_hash = 0;
+	bool            m_cpu_dirty = false;
+	bool            m_maybe_cpu_dirty = false;
+	bool            m_maybe_hash_valid = false;
+	bool            m_gpu_modified = false;
+	bool            m_buffer_modified = false;
 };
 
 namespace ImageOps {
 
-[[nodiscard]] GpuTextureVulkanImage* CreateTexture(const ImageInfo& info,
-                                                   bool storage, vk::ComponentMapping& components);
-void CreateTextureViews(GpuTextureVulkanImage& image,
-                        const ImageInfo& info, bool storage, vk::ComponentMapping components);
-
-[[nodiscard]] RenderTextureVulkanImage* CreateRenderTarget(
-                                                           const RenderTargetInfo& info);
-[[nodiscard]] uint32_t                  RenderTargetTransferFormat(uint32_t bytes_per_element);
-void UploadRenderTargetLayers(RenderTextureVulkanImage& image,
-                              const RenderTargetInfo& info, uint32_t base_layer,
-                              uint32_t layer_count, bool refresh);
-void UploadRenderTarget(RenderTextureVulkanImage& image,
-                        const RenderTargetInfo& info, bool refresh);
-
-[[nodiscard]] DepthStencilVulkanImage* CreateDepthTarget(
-                                                         const DepthTargetInfo& info);
-
-void ValidateVideoOut(const VideoOutInfo& info);
-[[nodiscard]] VideoOutVulkanImage* CreateVideoOut(
-                                                  const VideoOutInfo& info);
-void                               SwapVideoOutBgra16(void* data, uint64_t size);
-void UploadVideoOut(VideoOutVulkanImage& image, const VideoOutInfo& info,
-                    bool refresh);
-
-[[nodiscard]] GpuTextureVulkanImage* CreateDummyTexture(bool uint_format,
-                                                        bool image_3d, bool storage);
-
-void Destroy(VulkanImage& image);
+void                   Validate(const ImageInfo& info);
+[[nodiscard]] uint32_t RenderTargetTransferFormat(uint32_t bytes_per_element);
 
 } // namespace ImageOps
-
-struct ImageRetirementRange {
-	uint64_t address = 0;
-	uint64_t size    = 0;
-	bool     retire  = false;
-};
-
-struct ImageRetirementConflict {
-	size_t retired  = SIZE_MAX;
-	size_t retained = SIZE_MAX;
-
-	[[nodiscard]] bool Exists() const { return retired != SIZE_MAX; }
-};
-
-[[nodiscard]] inline ImageRetirementConflict
-FindImageRetirementConflict(std::span<const ImageRetirementRange> ranges) {
-	for (size_t retired = 0; retired < ranges.size(); retired++) {
-		if (!ranges[retired].retire) {
-			continue;
-		}
-		for (size_t retained = 0; retained < ranges.size(); retained++) {
-			if (ranges[retained].retire) {
-				continue;
-			}
-			if (ImageRangeOverlaps(ranges[retired].address, ranges[retired].size,
-			                       ranges[retained].address, ranges[retained].size)) {
-				return {retired, retained};
-			}
-		}
-	}
-	return {};
-}
 
 } // namespace Libs::Graphics
 

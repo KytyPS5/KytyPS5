@@ -8,6 +8,11 @@
 
 #include <vector>
 
+namespace Libs::Graphics {
+class GpuResourceManager;
+enum class PageFaultAccess;
+} // namespace Libs::Graphics
+
 namespace Libs::LibKernel::Memory {
 
 KYTY_SUBSYSTEM_DEFINE(Memory);
@@ -97,28 +102,23 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 // One guest virtual range and where it lives inside the single contiguous direct-memory backing.
-// Lets the GPU reach guest memory at addresses only a shader knows, without copying.
 struct GuestMemoryRange {
 	uint64_t vaddr          = 0;
 	uint64_t size           = 0;
 	uint64_t backing_offset = 0;
 };
 
-// Host pointer and size of the contiguous backing every guest mapping aliases. Null when the
-// backing is unavailable.
-bool QueryDirectMemoryBacking(void** base, uint64_t* size);
-// Currently-accessible guest ranges, ordered by address.
-void QueryDirectMemoryRanges(std::vector<GuestMemoryRange>& out);
-
 void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void SetFlexibleMemorySize(uint64_t size);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-// Checked host inspection of guest memory. Direct mappings use their unprotected backing;
-// protected flexible mappings are validated and read-resolved through PageManager.
 bool TryReadGuest(uint64_t vaddr, void* data, uint64_t size);
+bool QueryDirectMemoryBacking(void** base, uint64_t* size);
+void QueryDirectMemoryRanges(std::vector<GuestMemoryRange>& out);
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void PrepareHostWrite(uint64_t vaddr, uint64_t size);
+void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

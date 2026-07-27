@@ -71,7 +71,7 @@ LIB_NAME("libkernel", "libkernel");
 constexpr int      KEYS_MAX                  = 256;
 constexpr int      DESTRUCTOR_ITERATIONS     = 4;
 constexpr size_t   PTHREAD_STACK_DEFAULT     = 0x100000;
-constexpr size_t   PTHREAD_STACK_MIN         = 0x4000;
+constexpr size_t   GUEST_PTHREAD_STACK_MIN   = 0x4000;
 constexpr size_t   PTHREAD_STACK_PAGE        = 0x4000;
 constexpr size_t   PTHREAD_STACK_GRANULARITY = 0x10000;
 constexpr size_t   PTHREAD_STACK_INITIAL     = 0x200000;
@@ -734,15 +734,15 @@ static int CreateGuestStack(PthreadAttr attr) {
 
 	void* mapped_addr = reinterpret_cast<void*>(stack_addr);
 
-	constexpr int PROT_READ_WRITE = 0x03;
-	constexpr int MAP_PRIVATE     = 0x02;
-	constexpr int MAP_FIXED       = 0x10;
-	constexpr int MAP_STACK       = 0x400;
-	constexpr int MAP_ANON        = 0x1000;
+	constexpr int GUEST_PROT_READ_WRITE = 0x03;
+	constexpr int GUEST_MAP_PRIVATE     = 0x02;
+	constexpr int GUEST_MAP_FIXED       = 0x10;
+	constexpr int GUEST_MAP_STACK       = 0x400;
+	constexpr int GUEST_MAP_ANON        = 0x1000;
 
 	int result = Memory::KernelMapNamedFlexibleMemory(
-	    &mapped_addr, map_size, PROT_READ_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_STACK | MAP_ANON,
-	    "stack");
+	    &mapped_addr, map_size, GUEST_PROT_READ_WRITE,
+	    GUEST_MAP_PRIVATE | GUEST_MAP_FIXED | GUEST_MAP_STACK | GUEST_MAP_ANON, "stack");
 	if (result != OK) {
 		return KERNEL_ERROR_EAGAIN;
 	}
@@ -2216,7 +2216,7 @@ int KYTY_SYSV_ABI PthreadAttrSetstack(PthreadAttr* attr, void* addr, size_t size
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstack");
-	if (addr == nullptr || size < PTHREAD_STACK_MIN || attr_value == nullptr) {
+	if (addr == nullptr || size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -2249,7 +2249,7 @@ int KYTY_SYSV_ABI PthreadAttrSetstacksize(PthreadAttr* attr, size_t stack_size) 
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetstacksize");
-	if (stack_size < PTHREAD_STACK_MIN || attr_value == nullptr) {
+	if (stack_size < GUEST_PTHREAD_STACK_MIN || attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 

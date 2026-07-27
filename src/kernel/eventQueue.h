@@ -6,6 +6,7 @@
 #include "kernel/pthread.h"
 
 #include <deque>
+#include <memory>
 
 namespace Libs::LibKernel::EventQueue {
 
@@ -21,7 +22,10 @@ constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
 class KernelEqueuePrivate;
 struct KernelEqueueEvent;
 
-using KernelEqueue = KernelEqueuePrivate*;
+using KernelEqueue    = int64_t;
+using KernelEqueueRef = std::shared_ptr<KernelEqueuePrivate>;
+
+constexpr KernelEqueue KERNEL_EQUEUE_INVALID = 0;
 
 using trigger_func_t = void (*)(KernelEqueueEvent* event, void* trigger_data);
 using reset_func_t   = void (*)(KernelEqueueEvent* event);
@@ -37,10 +41,11 @@ struct KernelEvent {
 };
 
 struct KernelFilter {
-	void*          data              = nullptr;
-	trigger_func_t trigger_func      = nullptr;
-	reset_func_t   reset_func        = nullptr;
-	delete_func_t  delete_event_func = nullptr;
+	void*                 data              = nullptr;
+	std::shared_ptr<void> owner;
+	trigger_func_t        trigger_func      = nullptr;
+	reset_func_t          reset_func        = nullptr;
+	delete_func_t         delete_event_func = nullptr;
 };
 
 struct KernelEqueueEvent {
@@ -50,6 +55,8 @@ struct KernelEqueueEvent {
 	KernelFilter            filter;
 	std::deque<KernelEvent> pending_events;
 };
+
+[[nodiscard]] KernelEqueueRef KernelPinEqueue(KernelEqueue eq);
 
 int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event);
 int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t filter,

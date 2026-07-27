@@ -35,6 +35,8 @@ enum : uint32_t {
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
 	CapabilityImageGatherExtended            = 25,
+	CapabilitySampled1D                      = 43,
+	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
 	CapabilityStorageImageReadWithoutFormat  = 55,
 	CapabilityStorageImageWriteWithoutFormat = 56,
@@ -83,6 +85,7 @@ enum : uint32_t {
 };
 
 enum : uint32_t {
+	Dim1D              = 0,
 	Dim3D              = 2,
 	Dim2D              = 1,
 	ImageFormatUnknown = 0,
@@ -297,6 +300,14 @@ struct SampledImageDescriptors {
 	uint32_t variable           = 0;
 };
 
+struct StorageImageDescriptors {
+	uint32_t image_type         = 0;
+	uint32_t pointer_type       = 0;
+	uint32_t array_type         = 0;
+	uint32_t array_pointer_type = 0;
+	uint32_t variable           = 0;
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_)
 	    : program(program_), resources(resources_) {}
@@ -304,109 +315,80 @@ struct EmitterState {
 	Builder                                builder;
 	const IR::Program&                     program;
 	const IR::ResourceSnapshot&            resources;
-	const ShaderVertexInputInfo*           vertex_input_info              = nullptr;
-	const ShaderPixelInputInfo*            pixel_input_info               = nullptr;
-	const ShaderComputeInputInfo*          compute_input_info             = nullptr;
-	ShaderType                             stage                          = ShaderType::Unknown;
-	uint32_t                               wave_size                      = 64;
-	bool                                   exact_subgroup_operations      = false;
-	bool                                   per_invocation_masks           = false;
-	uint32_t                               void_type                      = 0;
-	uint32_t                               bool_type                      = 0;
-	uint32_t                               uint_type                      = 0;
-	uint32_t                               uint_pair_type                 = 0;
-	uint32_t                               int_pair_type                  = 0;
-	uint32_t                               int_type                       = 0;
-	uint32_t                               float_type                     = 0;
-	uint32_t                               vec2_uint_type                 = 0;
-	uint32_t                               vec3_uint_type                 = 0;
-	uint32_t                               vec4_uint_type                 = 0;
-	uint32_t                               vec2_int_type                  = 0;
-	uint32_t                               vec3_int_type                  = 0;
-	uint32_t                               vec4_int_type                  = 0;
-	uint32_t                               vec2_float_type                = 0;
-	uint32_t                               vec3_float_type                = 0;
-	uint32_t                               vec4_float_type                = 0;
-	uint32_t                               ptr_func_uint                  = 0;
-	uint32_t                               ptr_input_float                = 0;
-	uint32_t                               ptr_input_bool                 = 0;
-	uint32_t                               ptr_input_int                  = 0;
-	uint32_t                               ptr_input_uint                 = 0;
-	uint32_t                               ptr_input_vec2_float           = 0;
-	uint32_t                               ptr_input_vec3_float           = 0;
-	uint32_t                               ptr_input_vec2_int             = 0;
-	uint32_t                               ptr_input_vec3_int             = 0;
-	uint32_t                               ptr_input_vec4_int             = 0;
-	uint32_t                               ptr_input_vec2_uint            = 0;
-	uint32_t                               ptr_input_vec3_uint            = 0;
-	uint32_t                               ptr_input_vec4_uint            = 0;
-	uint32_t                               ptr_input_vec4_float           = 0;
-	uint32_t                               sample_mask_array_type         = 0;
-	uint32_t                               ptr_output_int                 = 0;
-	uint32_t                               ptr_output_sample_mask_array   = 0;
-	uint32_t                               ptr_output_float               = 0;
-	uint32_t                               ptr_output_vec4_float          = 0;
-	uint32_t                               per_vertex_type                = 0;
-	uint32_t                               ptr_output_per_vertex          = 0;
-	uint32_t                               storage_runtime_array_type     = 0;
-	uint32_t                               storage_buffer_type            = 0;
-	uint32_t                               ptr_storage_buffer             = 0;
-	uint32_t                               ptr_storage_buffer_uint        = 0;
-	uint32_t                               storage_buffer_array_type      = 0;
-	uint32_t                               ptr_storage_buffer_array       = 0;
-	uint32_t                               storage_buffer_variable        = 0;
-	uint32_t                               address_memory_array_type      = 0;
-	uint32_t                               ptr_address_memory_array       = 0;
-	uint32_t                               address_memory_variable        = 0;
-	uint32_t                               gds_variable                   = 0;
-	uint32_t                               push_constant_u32x4_array_type = 0;
-	uint32_t                               push_constant_rows_array_type  = 0;
-	uint32_t                               push_constant_block_type       = 0;
-	uint32_t                               ptr_push_constant_block        = 0;
-	uint32_t                               ptr_push_constant_uint         = 0;
-	uint32_t                               push_constant_variable         = 0;
-	uint32_t                               vsharp_storage_variable        = 0;
-	uint32_t                               flattened_srt_variable         = 0;
-	uint32_t                               lds_array_type                 = 0;
-	uint32_t                               ptr_workgroup_array            = 0;
-	uint32_t                               ptr_workgroup_uint             = 0;
-	uint32_t                               lds_variable                   = 0;
-	std::array<SampledImageDescriptors, 6> sampled_images;
+	const ShaderVertexInputInfo*           vertex_input_info            = nullptr;
+	const ShaderPixelInputInfo*            pixel_input_info             = nullptr;
+	const ShaderComputeInputInfo*          compute_input_info           = nullptr;
+	ShaderType                             stage                        = ShaderType::Unknown;
+	uint32_t                               wave_size                    = 64;
+	bool                                   exact_subgroup_operations    = false;
+	bool                                   per_invocation_masks         = false;
+	uint32_t                               void_type                    = 0;
+	uint32_t                               bool_type                    = 0;
+	uint32_t                               uint_type                    = 0;
+	uint32_t                               uint_pair_type               = 0;
+	uint32_t                               int_pair_type                = 0;
+	uint32_t                               int_type                     = 0;
+	uint32_t                               float_type                   = 0;
+	uint32_t                               vec2_uint_type               = 0;
+	uint32_t                               vec3_uint_type               = 0;
+	uint32_t                               vec4_uint_type               = 0;
+	uint32_t                               vec2_int_type                = 0;
+	uint32_t                               vec3_int_type                = 0;
+	uint32_t                               vec4_int_type                = 0;
+	uint32_t                               vec2_float_type              = 0;
+	uint32_t                               vec3_float_type              = 0;
+	uint32_t                               vec4_float_type              = 0;
+	uint32_t                               ptr_func_uint                = 0;
+	uint32_t                               ptr_input_float              = 0;
+	uint32_t                               ptr_input_bool               = 0;
+	uint32_t                               ptr_input_int                = 0;
+	uint32_t                               ptr_input_uint               = 0;
+	uint32_t                               ptr_input_vec2_float         = 0;
+	uint32_t                               ptr_input_vec3_float         = 0;
+	uint32_t                               ptr_input_vec2_int           = 0;
+	uint32_t                               ptr_input_vec3_int           = 0;
+	uint32_t                               ptr_input_vec4_int           = 0;
+	uint32_t                               ptr_input_vec2_uint          = 0;
+	uint32_t                               ptr_input_vec3_uint          = 0;
+	uint32_t                               ptr_input_vec4_uint          = 0;
+	uint32_t                               ptr_input_vec4_float         = 0;
+	uint32_t                               sample_mask_array_type       = 0;
+	uint32_t                               ptr_output_int               = 0;
+	uint32_t                               ptr_output_sample_mask_array = 0;
+	uint32_t                               ptr_output_float             = 0;
+	uint32_t                               ptr_output_vec4_float        = 0;
+	uint32_t                               per_vertex_type              = 0;
+	uint32_t                               ptr_output_per_vertex        = 0;
+	uint32_t                               storage_runtime_array_type   = 0;
+	uint32_t                               storage_buffer_type          = 0;
+	uint32_t                               ptr_storage_buffer           = 0;
+	uint32_t                               ptr_storage_buffer_uint      = 0;
+	uint32_t                               storage_buffer_array_type    = 0;
+	uint32_t                               ptr_storage_buffer_array     = 0;
+	uint32_t                               storage_buffer_variable      = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> storage_buffer_offsets {};
+	uint32_t                               address_memory_array_type    = 0;
+	uint32_t                               ptr_address_memory_array     = 0;
+	uint32_t                               address_memory_variable      = 0;
+	uint32_t                               gds_variable                 = 0;
+	uint32_t                               push_constant_array_type     = 0;
+	uint32_t                               push_constant_block_type     = 0;
+	uint32_t                               ptr_push_constant_block      = 0;
+	uint32_t                               ptr_push_constant_uint       = 0;
+	uint32_t                               push_constant_variable       = 0;
+	uint32_t                               vsharp_storage_variable      = 0;
+	uint32_t                               flattened_srt_variable       = 0;
+	uint32_t                               lds_array_type               = 0;
+	uint32_t                               ptr_workgroup_array          = 0;
+	uint32_t                               ptr_workgroup_uint           = 0;
+	uint32_t                               lds_variable                 = 0;
+	std::array<SampledImageDescriptors, 10> sampled_images;
+	std::array<StorageImageDescriptors, 10> storage_images;
 	uint32_t                               sampler_type                                  = 0;
 	uint32_t                               sampler_array_type                            = 0;
 	uint32_t                               ptr_uniform_sampler                           = 0;
 	uint32_t                               ptr_uniform_sampler_array                     = 0;
 	uint32_t                               sampler_variable                              = 0;
-	uint32_t                               storage_image_type                            = 0;
-	uint32_t                               ptr_uniform_storage_image                     = 0;
-	uint32_t                               storage_image_array_type                      = 0;
-	uint32_t                               ptr_uniform_storage_image_array               = 0;
-	uint32_t                               storage_image_variable                        = 0;
-	uint32_t                               storage_image_2d_array_type                   = 0;
-	uint32_t                               ptr_uniform_storage_image_2d_array            = 0;
-	uint32_t                               storage_image_2d_array_array_type             = 0;
-	uint32_t                               ptr_uniform_storage_image_2d_array_array      = 0;
-	uint32_t                               storage_image_2d_array_variable               = 0;
-	uint32_t                               storage_image_3d_type                         = 0;
-	uint32_t                               ptr_uniform_storage_image_3d                  = 0;
-	uint32_t                               storage_image_3d_array_type                   = 0;
-	uint32_t                               ptr_uniform_storage_image_3d_array            = 0;
-	uint32_t                               storage_image_3d_variable                     = 0;
-	uint32_t                               storage_image_uint_type                       = 0;
-	uint32_t                               ptr_uniform_storage_image_uint                = 0;
-	uint32_t                               storage_image_uint_array_type                 = 0;
-	uint32_t                               ptr_uniform_storage_image_uint_array          = 0;
-	uint32_t                               storage_image_uint_variable                   = 0;
-	uint32_t                               storage_image_uint_2d_array_type              = 0;
-	uint32_t                               ptr_uniform_storage_image_uint_2d_array       = 0;
-	uint32_t                               storage_image_uint_2d_array_array_type        = 0;
-	uint32_t                               ptr_uniform_storage_image_uint_2d_array_array = 0;
-	uint32_t                               storage_image_uint_2d_array_variable          = 0;
-	uint32_t                               storage_image_uint_3d_type                    = 0;
-	uint32_t                               ptr_uniform_storage_image_uint_3d             = 0;
-	uint32_t                               storage_image_uint_3d_array_type              = 0;
-	uint32_t                               ptr_uniform_storage_image_uint_3d_array       = 0;
-	uint32_t                               storage_image_uint_3d_variable                = 0;
 	uint32_t                               ptr_image_uint                                = 0;
 	uint32_t                               func_type                                     = 0;
 	uint32_t                               main_func                                     = 0;
@@ -466,28 +448,82 @@ struct ImageSampleLayout {
 };
 
 enum class ImageViewKind {
+	Dim1D,
+	Dim1DArray,
 	Dim2D,
 	Dim2DArray,
 	Dim3D,
+	Count,
 };
 
+constexpr uint32_t ImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
+
 constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? 3u : 0u);
+	return static_cast<uint32_t>(view) + (integer ? ImageViewKindCount : 0u);
+}
+
+constexpr uint32_t StorageImageIndex(bool integer, ImageViewKind view) {
+	return static_cast<uint32_t>(view) + (integer ? ImageViewKindCount : 0u);
 }
 
 constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
 	if (integer) {
 		switch (view) {
+			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::SampledUint1D;
+			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::SampledUint1DArray;
+			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::SampledUint2D;
 			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::SampledUint2DArray;
 			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::SampledUint3D;
-			default: return IR::DescriptorBindingKind::SampledUint2D;
+			default: break;
 		}
 	}
 	switch (view) {
+		case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Sampled1D;
+		case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Sampled1DArray;
+		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Sampled2D;
 		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Sampled2DArray;
 		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Sampled3D;
-		default: return IR::DescriptorBindingKind::Sampled2D;
+		default: break;
 	}
+	return IR::DescriptorBindingKind::Count;
+}
+
+constexpr IR::DescriptorBindingKind StorageBindingKind(bool integer, ImageViewKind view) {
+	if (integer) {
+		switch (view) {
+			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageUint1D;
+			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::StorageUint1DArray;
+			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageUint2D;
+			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::StorageUint2DArray;
+			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
+			default: break;
+		}
+	}
+	switch (view) {
+		case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Storage1D;
+		case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Storage1DArray;
+		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Storage2D;
+		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
+		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Storage3D;
+		default: break;
+	}
+	return IR::DescriptorBindingKind::Count;
+}
+
+constexpr uint32_t ImageSpirvDimension(ImageViewKind view) {
+	switch (view) {
+		case ImageViewKind::Dim1D:
+		case ImageViewKind::Dim1DArray: return Dim1D;
+		case ImageViewKind::Dim2D:
+		case ImageViewKind::Dim2DArray:
+		case ImageViewKind::Count: return Dim2D;
+		case ImageViewKind::Dim3D: return Dim3D;
+	}
+	return Dim2D;
+}
+
+constexpr uint32_t ImageSpirvArrayed(ImageViewKind view) {
+	return view == ImageViewKind::Dim1DArray || view == ImageViewKind::Dim2DArray ? 1u : 0u;
 }
 
 struct AddCarryResult {
@@ -631,6 +667,8 @@ ImageViewKind SampledImageViewKind(const EmitterState& state, const IR::MemoryIn
                                    uint32_t use_pc);
 
 uint32_t ImageViewCoordinateComponents(ImageViewKind view);
+
+uint32_t ImageViewSpatialComponents(ImageViewKind view);
 
 uint32_t ImageViewImageType(const EmitterState& state, ImageViewKind view, bool integer);
 
@@ -792,14 +830,10 @@ uint32_t EmitImageBiasF32(EmitterState& state, const IR::Instruction& inst,
                           const ImageSampleLayout& layout);
 
 uint32_t EmitImageGradientF32(EmitterState& state, const IR::Instruction& inst,
-                              uint32_t first_component);
+                              uint32_t first_component, ImageViewKind view);
 
-uint32_t EmitImagePackedOffset2I32(EmitterState& state, const IR::Instruction& inst,
-                                   const ImageSampleLayout& layout);
-
-uint32_t EmitImageOffsetCoordF32(EmitterState& state, const IR::Instruction& inst,
-                                 const ImageSampleLayout& layout, uint32_t sampled_image,
-                                 uint32_t coord, ImageViewKind view);
+uint32_t EmitImagePackedOffsetI32(EmitterState& state, const IR::Instruction& inst,
+                                  const ImageSampleLayout& layout, ImageViewKind view);
 
 uint32_t EmitImageCoordU32(EmitterState& state, const IR::Instruction& inst,
                            ImageViewKind view = ImageViewKind::Dim2D);
@@ -838,6 +872,8 @@ uint32_t EmitNotEqualZeroBool(EmitterState& state, uint32_t value);
 uint32_t EmitSelectU32Value(EmitterState& state, uint32_t condition, uint32_t true_value,
                             uint32_t false_value);
 
+uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+
 uint32_t EmitByteAddress(EmitterState& state, const IR::Instruction& inst, uint32_t first_src,
                          uint32_t src_count);
 
@@ -854,6 +890,8 @@ uint32_t EmitBufferIndexWithAddTid(EmitterState& state, const IR::Instruction& i
 uint32_t EmitOptionalLogicalAndBool(EmitterState& state, uint32_t lhs, uint32_t rhs);
 
 bool IsStorageBufferMemoryKind(IR::ResourceKind kind);
+
+void EmitStorageBufferOffsets(EmitterState& state);
 
 uint32_t EmitBufferAddressFromParts(EmitterState& state, const IR::Instruction& inst,
                                     uint32_t index, uint32_t offset, uint32_t soffset);

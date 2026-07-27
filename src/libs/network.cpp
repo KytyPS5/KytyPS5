@@ -858,13 +858,17 @@ struct NetEtherAddr {
 	uint8_t data[6] = {0};
 };
 
-struct SocketSlot {
-	bool used = false;
 #if defined(_WIN32)
-	SOCKET socket = INVALID_SOCKET;
+using NativeSocket = SOCKET;
+static constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
 #else
-	int socket = -1;
+using NativeSocket = int;
+static constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
 #endif
+
+struct SocketSlot {
+	bool         used   = false;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 };
 
 struct NetTimeval {
@@ -1096,7 +1100,7 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, int addrlen, void* 
 }
 #endif
 
-static bool GetSocketBackend(int guest_fd, SOCKET* out) {
+static bool GetSocketBackend(int guest_fd, NativeSocket* out) {
 	EXIT_IF(out == nullptr);
 
 	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
@@ -1121,7 +1125,7 @@ bool KYTY_SYSV_ABI IsSocket(int s) {
 	return g_sockets[static_cast<size_t>(s)].used;
 }
 
-static bool TakeSocketBackend(int guest_fd, SOCKET* out) {
+static bool TakeSocketBackend(int guest_fd, NativeSocket* out) {
 	EXIT_IF(out == nullptr);
 
 	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
@@ -1139,7 +1143,7 @@ static bool TakeSocketBackend(int guest_fd, SOCKET* out) {
 	return true;
 }
 
-static int AllocSocketFd(SOCKET socket) {
+static int AllocSocketFd(NativeSocket socket) {
 	Common::LockGuard lock(g_socket_mutex);
 	for (int fd = SOCKET_FD_MIN; fd < SOCKET_FD_MAX; fd++) {
 		auto& slot = g_sockets[static_cast<size_t>(fd)];
@@ -1518,7 +1522,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 #if defined(_WIN32)
 	struct HostRegistration {
 		EpollRegistration guest;
-		SOCKET            socket = INVALID_SOCKET;
+		NativeSocket      socket = INVALID_NATIVE_SOCKET;
 	};
 
 	fd_set host_read {};
@@ -1531,7 +1535,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 	std::vector<HostRegistration> host_registrations;
 	host_registrations.reserve(registrations.size());
 	for (const auto& registration: registrations) {
-		SOCKET socket = INVALID_SOCKET;
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
 		if (!GetSocketBackend(registration.id, &socket)) {
 			continue;
 		}
@@ -1619,7 +1623,7 @@ int KYTY_SYSV_ABI SocketClose(int s) {
 
 	LOGF("\t s = %d\n", s);
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (!TakeSocketBackend(s, &socket)) {
 		return NET_ERROR_EBADF;
 	}
@@ -1655,8 +1659,8 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	}
 
 #if defined(_WIN32)
-	SOCKET socket = ::socket(host_family, type, protocol);
-	if (socket == INVALID_SOCKET) {
+	NativeSocket socket = ::socket(host_family, type, protocol);
+	if (socket == INVALID_NATIVE_SOCKET) {
 		return SetPosixSocketError();
 	}
 
@@ -1683,7 +1687,7 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 	     "\t addrlen = %" PRIu32 "\n",
 	     s, reinterpret_cast<uint64_t>(addr), addrlen);
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (addr == nullptr || !GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = (addr == nullptr ? Posix::POSIX_EFAULT : Posix::POSIX_EBADF);
 		return -1;
@@ -1716,7 +1720,7 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 	     "\t addrlen = %" PRIu32 "\n",
 	     s, reinterpret_cast<uint64_t>(addr), addrlen);
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (addr == nullptr || !GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = (addr == nullptr ? Posix::POSIX_EFAULT : Posix::POSIX_EBADF);
 		return -1;
@@ -1748,7 +1752,7 @@ int KYTY_SYSV_ABI Listen(int s, int backlog) {
 	     "\t backlog = %d\n",
 	     s, backlog);
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (!GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
 		return -1;
@@ -1774,7 +1778,7 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	     "\t addrlen = 0x%016" PRIx64 "\n",
 	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (!GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
 		return -1;
@@ -1783,8 +1787,8 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 #if defined(_WIN32)
 	sockaddr_storage host_addr {};
 	int              host_addrlen = sizeof(host_addr);
-	SOCKET accepted = ::accept(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
-	if (accepted == INVALID_SOCKET) {
+	NativeSocket accepted = ::accept(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+	if (accepted == INVALID_NATIVE_SOCKET) {
 		return SetPosixSocketError();
 	}
 
@@ -1821,7 +1825,7 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 	     "\t how = %d\n",
 	     s, how);
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (!GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
 		return -1;
@@ -1852,8 +1856,8 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 	     "\t addrlen = 0x%016" PRIx64 "\n",
 	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
 
-	SOCKET     socket    = INVALID_SOCKET;
-	const bool socket_ok = GetSocketBackend(s, &socket);
+	NativeSocket socket    = INVALID_NATIVE_SOCKET;
+	const bool   socket_ok = GetSocketBackend(s, &socket);
 	if (addr == nullptr || addrlen == nullptr || !socket_ok) {
 		*Posix::GetErrorAddr() = (!socket_ok ? Posix::POSIX_EBADF : Posix::POSIX_EFAULT);
 		return -1;
@@ -1882,8 +1886,8 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	     "\t optname = 0x%08" PRIx32 "\n",
 	     s, static_cast<uint32_t>(level), static_cast<uint32_t>(optname));
 
-	SOCKET     socket    = INVALID_SOCKET;
-	const bool socket_ok = GetSocketBackend(s, &socket);
+	NativeSocket socket    = INVALID_NATIVE_SOCKET;
+	const bool   socket_ok = GetSocketBackend(s, &socket);
 	if (optval == nullptr || optlen == nullptr || !socket_ok) {
 		*Posix::GetErrorAddr() = (!socket_ok ? Posix::POSIX_EBADF : Posix::POSIX_EFAULT);
 		return -1;
@@ -1912,7 +1916,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 	     "\t optlen  = %" PRIu32 "\n",
 	     s, static_cast<uint32_t>(level), static_cast<uint32_t>(optname), optlen);
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (optval == nullptr || !GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = (optval == nullptr ? Posix::POSIX_EFAULT : Posix::POSIX_EBADF);
 		return -1;
@@ -1950,7 +1954,7 @@ int64_t KYTY_SYSV_ABI Send(int s, const void* buf, uint64_t len, int flags) {
 	     "\t flags = 0x%08" PRIx32 "\n",
 	     s, reinterpret_cast<uint64_t>(buf), len, static_cast<uint32_t>(flags));
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (buf == nullptr || !GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = (buf == nullptr ? Posix::POSIX_EFAULT : Posix::POSIX_EBADF);
 		return -1;
@@ -1984,7 +1988,7 @@ int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags) {
 	     "\t flags = 0x%08" PRIx32 "\n",
 	     s, reinterpret_cast<uint64_t>(buf), len, static_cast<uint32_t>(flags));
 
-	SOCKET socket = INVALID_SOCKET;
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
 	if (buf == nullptr || !GetSocketBackend(s, &socket)) {
 		*Posix::GetErrorAddr() = (buf == nullptr ? Posix::POSIX_EFAULT : Posix::POSIX_EBADF);
 		return -1;
@@ -2056,7 +2060,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	int                         except_count = 0;
 
 	for (int fd = 0; fd < nfds; fd++) {
-		SOCKET socket = INVALID_SOCKET;
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
 		if (!GetSocketBackend(fd, &socket)) {
 			continue;
 		}
@@ -2107,21 +2111,21 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	GuestFdZero(writefds, nfds);
 	GuestFdZero(exceptfds, nfds);
 	for (int i = 0; i < read_count; i++) {
-		SOCKET socket = INVALID_SOCKET;
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
 		if (GetSocketBackend(read_map[static_cast<size_t>(i)], &socket) &&
 		    FD_ISSET(socket, &host_read)) {
 			GuestFdSet(readfds, read_map[static_cast<size_t>(i)]);
 		}
 	}
 	for (int i = 0; i < write_count; i++) {
-		SOCKET socket = INVALID_SOCKET;
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
 		if (GetSocketBackend(write_map[static_cast<size_t>(i)], &socket) &&
 		    FD_ISSET(socket, &host_write)) {
 			GuestFdSet(writefds, write_map[static_cast<size_t>(i)]);
 		}
 	}
 	for (int i = 0; i < except_count; i++) {
-		SOCKET socket = INVALID_SOCKET;
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
 		if (GetSocketBackend(except_map[static_cast<size_t>(i)], &socket) &&
 		    FD_ISSET(socket, &host_except)) {
 			GuestFdSet(exceptfds, except_map[static_cast<size_t>(i)]);

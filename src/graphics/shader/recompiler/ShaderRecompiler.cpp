@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "common/virtualMemory.h"
 #include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ResourceTracking.h"
@@ -36,23 +35,9 @@ bool ReadZeroMemory(void*, uint64_t, uint32_t* value) {
 	return true;
 }
 
-// The SRT walker rebuilds descriptor addresses from guest data and cannot tell a real pointer from
-// an unresolved base plus a field offset, so validating the address belongs here rather than in the
-// walker. TryRead() lets the kernel decide and reports failure instead of faulting.
-//
-// One catch: process_vm_readv() honours page protection without running our SIGSEGV handler, so a
-// descriptor that happens to sit in a page the GPU tracker has write-protected reads as
-// unavailable even though it is perfectly valid. Direct memory can use its unprotected physical
-// backing. Flexible memory has no such alias, so the final fallback validates the GPU mapping and
-// proactively resolves read protection through PageManager before retrying the checked read.
-// Skipping these fallbacks is not harmless: descriptors are re-materialized to decide whether a
-// cached shader permutation still applies, so a spurious failure looks like a specialization
-// mismatch and recompiles the shader until it trips the 64-permutation cap.
 bool ReadGuestMemory(void*, uint64_t address, uint32_t* value) {
-	if (value == nullptr) {
-		return false;
-	}
-	return LibKernel::Memory::TryReadGuest(address, value, sizeof(*value));
+	return value != nullptr &&
+	       LibKernel::Memory::TryReadGuest(address, value, sizeof(*value));
 }
 
 const char* GetDumpLabel(const CompileOptions& options) {
@@ -201,9 +186,11 @@ bool IsDecodedSgpr(const Decoder::Operand& op) {
 }
 
 uint32_t DecodedSgprReg(const Decoder::Operand& op) {
-	return op.kind == Decoder::OperandKind::VccLo
-	           ? 106u
-	           : (op.kind == Decoder::OperandKind::VccHi ? 107u : op.reg);
+	switch (op.kind) {
+		case Decoder::OperandKind::VccLo: return 106u;
+		case Decoder::OperandKind::VccHi: return 107u;
+		default: return op.reg;
+	}
 }
 
 bool IsDecodedVgpr(const Decoder::Operand& op) {
@@ -361,14 +348,13 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
 		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
-		uint32_t sad_zero = 0;
+		uint32_t   sad_zero = 0;
 		const bool vertex_offset_add =
 		    vertex_index_accumulator && IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::VAddI32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && inst.dst.reg == 5 &&
-		      inst.opcode == Decoder::Opcode::VSadU32 && IsDecodedVgpr(inst.src2) &&
-		      inst.src2.reg == inst.dst.reg &&
+		     (user_data_base == 8 && inst.dst.reg == 5 && inst.opcode == Decoder::Opcode::VSadU32 &&
+		      IsDecodedVgpr(inst.src2) && inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
 		if (data.loads.empty() && vertex_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
@@ -657,7 +643,7 @@ uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputIn
 } // namespace
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
-	              CompileResult& result, std::string* error) {
+                  CompileResult& result, std::string* error) {
 	if (code.empty()) {
 		if (error != nullptr) {
 			*error = "invalid shader recompiler input";
@@ -826,10 +812,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		runtime.user_data   = std::span<const uint32_t>(user_data, options.user_data_count);
 		runtime.shader_base = options.shader_base != 0 ? options.shader_base
 		                                               : reinterpret_cast<uint64_t>(code.data());
-		runtime.read_memory = options.read_memory != nullptr ? options.read_memory
-		                      : options.user_data == nullptr ? ReadZeroMemory
-		                                                     : ReadGuestMemory;
-		runtime.userdata    = options.read_memory_data;
+		runtime.read_memory = options.read_memory;
+		if (runtime.read_memory == nullptr) {
+			runtime.read_memory =
+			    options.user_data == nullptr ? ReadZeroMemory : ReadGuestMemory;
+		}
+		runtime.userdata         = options.read_memory_data;
 		runtime.flat_memory_base = options.flat_memory_base;
 		if (!IR::MaterializeResources(ir, runtime, resources, error)) {
 			return false;

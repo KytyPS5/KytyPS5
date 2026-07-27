@@ -406,8 +406,8 @@ struct TextureBlockLayout {
 
 static bool GetTextureBlockLayout(uint32_t format, uint32_t tile, TextureBlockLayout& out) {
 	uint32_t width_log2 = 0, height_log2 = 0;
-	if (tile == 1 && Gen5Standard256BLayout(format, &out.bytes, &out.texel_width,
-	                                        &out.texel_height, &width_log2, &height_log2)) {
+	if (tile == 1 && Gen5Standard256BLayout(format, &out.bytes, &out.texel_width, &out.texel_height,
+	                                        &width_log2, &height_log2)) {
 		out.block_size = 256;
 	} else if (tile == 5 && Gen5Standard4KBLayout(format, &out.bytes, &out.texel_width,
 	                                              &out.texel_height, &width_log2, &height_log2)) {
@@ -524,7 +524,7 @@ static void SetMacroMipLayout(const TextureBlockLayout& block, uint32_t tile, ui
 }
 
 bool TileGetTextureVolumeLayout(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-	                            uint32_t levels, uint32_t tile, TileVolumeLayout& out) {
+                                uint32_t levels, uint32_t tile, TileVolumeLayout& out) {
 	if (width == 0 || height == 0 || depth == 0 || levels == 0 || levels > 16) {
 		return false;
 	}
@@ -543,21 +543,26 @@ bool TileGetTextureVolumeLayout(uint32_t format, uint32_t width, uint32_t height
 	TileBlockLayout block {};
 	if (!TileGetBlockLayout(family, element.bytes, block)) return false;
 
-	out                   = {};
-	out.family            = family;
-	out.bytes_per_element = element.bytes;
-	out.texel_width       = element.texel_width;
-	out.texel_height      = element.texel_height;
-	out.block_depth       = block.block_depth;
-	out.first_tail_level  = levels;
+	out                    = {};
+	out.family             = family;
+	out.bytes_per_element  = element.bytes;
+	out.texel_width        = element.texel_width;
+	out.texel_height       = element.texel_height;
+	out.block_depth        = block.block_depth;
+	out.first_tail_level   = levels;
 	const uint32_t width0  = (width + element.texel_width - 1u) / element.texel_width;
 	const uint32_t height0 = (height + element.texel_height - 1u) / element.texel_height;
 	const bool     thick4  = family == TileBlockFamily::Standard4KB3D;
 	const bool     thick64 =
 	    family == TileBlockFamily::Standard64KB3D || family == TileBlockFamily::Prt64KB3D;
-	const uint32_t max_tail    = thick4 ? 5u : (thick64 ? 10u : 12u);
-	uint32_t       tail_width  = thick4 ? block.block_width : block.block_width >> 1u;
-	uint32_t       tail_height = thick4 ? block.block_height >> 1u : block.block_height;
+	uint32_t max_tail = 12u;
+	if (thick4) {
+		max_tail = 5u;
+	} else if (thick64) {
+		max_tail = 10u;
+	}
+	uint32_t tail_width  = thick4 ? block.block_width : block.block_width >> 1u;
+	uint32_t tail_height = thick4 ? block.block_height >> 1u : block.block_height;
 	if (family == TileBlockFamily::Depth64KB && element.bytes < 4) {
 		tail_width  = 64;
 		tail_height = 128;
@@ -574,18 +579,23 @@ bool TileGetTextureVolumeLayout(uint32_t format, uint32_t width, uint32_t height
 		}
 		out.level_widths[level]  = AlignUp(mip_width, block.block_width);
 		out.level_heights[level] = AlignUp(mip_height, block.block_height);
-		out.level_sizes[level]   = static_cast<uint64_t>(block.block_depth) *
-		                            out.level_widths[level] * out.level_heights[level] *
-		                            element.bytes;
+		out.level_sizes[level] = static_cast<uint64_t>(block.block_depth) *
+		                         out.level_widths[level] * out.level_heights[level] * element.bytes;
 		out.block_slice_size += out.level_sizes[level];
 	}
 
-	const auto bytes_log2 = std::countr_zero(element.bytes);
+	const auto                 bytes_log2     = std::countr_zero(element.bytes);
+	const Gen5MipTailLocation* tail_locations = nullptr;
+	if (thick4) {
+		tail_locations = GEN5_MIP_TAIL_LOCATIONS_THICK_4KB[bytes_log2];
+	} else if (thick64) {
+		tail_locations = GEN5_MIP_TAIL_LOCATIONS_THICK_64KB[bytes_log2];
+	} else {
+		tail_locations = GEN5_MIP_TAIL_LOCATIONS_THIN_64KB[bytes_log2];
+	}
 	for (uint32_t level = out.first_tail_level; level < levels; ++level) {
-		const auto index = level - out.first_tail_level;
-		const auto tail = thick4 ? GEN5_MIP_TAIL_LOCATIONS_THICK_4KB[bytes_log2][index]
-		                         : (thick64 ? GEN5_MIP_TAIL_LOCATIONS_THICK_64KB[bytes_log2][index]
-		                                    : GEN5_MIP_TAIL_LOCATIONS_THIN_64KB[bytes_log2][index]);
+		const auto index         = level - out.first_tail_level;
+		const auto tail          = tail_locations[index];
 		out.level_sizes[level]   = block.block_size;
 		out.level_widths[level]  = block.block_width;
 		out.level_heights[level] = block.block_height;
@@ -1047,7 +1057,7 @@ static constexpr uint32_t Depth64KB64XOffsetBytes(uint32_t x);
 static constexpr uint32_t Depth64KB64YOffsetBytes(uint32_t y);
 
 bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
-	                    TileBlockLayout& layout) {
+                        TileBlockLayout& layout) {
 	if (!std::has_single_bit(bytes_per_element) || bytes_per_element > 16) {
 		return false;
 	}
@@ -1067,13 +1077,25 @@ bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
 	};
 	switch (family) {
 		case TileBlockFamily::Standard256B:
-			result.block_size   = 256;
-			result.block_width  = bytes_per_element <= 2 ? 16 : (bytes_per_element <= 8 ? 8 : 4);
+			result.block_size = 256;
+			if (bytes_per_element <= 2) {
+				result.block_width = 16;
+			} else if (bytes_per_element <= 8) {
+				result.block_width = 8;
+			} else {
+				result.block_width = 4;
+			}
 			result.block_height = result.block_size / (result.block_width * bytes_per_element);
 			break;
 		case TileBlockFamily::Standard4KB:
-			result.block_size   = 4096;
-			result.block_width  = bytes_per_element <= 2 ? 64 : (bytes_per_element <= 8 ? 32 : 16);
+			result.block_size = 4096;
+			if (bytes_per_element <= 2) {
+				result.block_width = 64;
+			} else if (bytes_per_element <= 8) {
+				result.block_width = 32;
+			} else {
+				result.block_width = 16;
+			}
 			result.block_height = result.block_size / (result.block_width * bytes_per_element);
 			break;
 		case TileBlockFamily::Standard4KB3D: {
@@ -1126,7 +1148,7 @@ bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
 }
 
 bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, uint32_t z,
-	                    uint32_t& byte_offset) {
+                        uint32_t& byte_offset) {
 	TileBlockLayout expected {};
 	if (!TileGetBlockLayout(layout.family, layout.bytes_per_element, expected) ||
 	    layout.block_size != expected.block_size || layout.block_width != expected.block_width ||
@@ -1226,12 +1248,12 @@ bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, u
 }
 
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
-	                 uint32_t& byte_offset) {
+                     uint32_t& byte_offset) {
 	return TileGetBlockXor(layout, block_x, block_y, 0, byte_offset);
 }
 
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
-	                 uint32_t block_z, uint32_t& byte_offset) {
+                     uint32_t block_z, uint32_t& byte_offset) {
 	TileBlockLayout expected {};
 	if (!TileGetBlockLayout(layout.family, layout.bytes_per_element, expected) ||
 	    layout.block_size != expected.block_size || layout.block_width != expected.block_width ||
@@ -1377,8 +1399,8 @@ bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& htile_size
 }
 
 bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch, uint32_t z_format,
-	                  uint32_t stencil_format, bool htile, TileSizeAlign& stencil_size,
-	                  TileSizeAlign& htile_size, TileSizeAlign& depth_size,
+                      uint32_t stencil_format, bool htile, TileSizeAlign& stencil_size,
+                      TileSizeAlign& htile_size, TileSizeAlign& depth_size,
                       uint32_t num_fragments_log2) {
 	EXIT_IF(pitch != 0);
 	// Prospero derives uncompressed depth/stencil as independent 64 KiB block surfaces.
@@ -1410,8 +1432,8 @@ bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch, uint32_t 
 		if (depth_bytes_total <= UINT32_MAX && stencil_bytes_total <= UINT32_MAX && htile_valid) {
 			depth_size   = {static_cast<uint32_t>(depth_bytes_total), 65536};
 			stencil_size = stencil_format == 1
-			                    ? TileSizeAlign {static_cast<uint32_t>(stencil_bytes_total), 65536}
-			                    : TileSizeAlign {};
+			                   ? TileSizeAlign {static_cast<uint32_t>(stencil_bytes_total), 65536}
+			                   : TileSizeAlign {};
 			htile_size   = calculated_htile;
 			return true;
 		}
@@ -1441,7 +1463,7 @@ uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,
 }
 
 bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
-	                         uint32_t bytes_per_element, TileSizeAlign& total_size,
+                             uint32_t bytes_per_element, TileSizeAlign& total_size,
                              uint32_t num_fragments_log2) {
 	total_size            = {};
 	uint32_t block_width  = 0;
@@ -1466,7 +1488,7 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 
 bool TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t pitch,
                                   uint32_t bytes_per_element, uint32_t levels,
-	                              TileSizeAlign& total_size, TileSizeOffset* level_sizes,
+                                  TileSizeAlign& total_size, TileSizeOffset* level_sizes,
                                   TilePaddedSize* padded_size) {
 	total_size = {};
 	if (width == 0 || height == 0 || levels == 0 || levels > 16 ||
@@ -1578,7 +1600,7 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 
 void TileGetTextureTotalSize(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
                              uint32_t pitch, uint32_t levels, uint32_t tile, bool volume_texture,
-	                         TileSizeAlign& total_size) {
+                             TileSizeAlign& total_size) {
 	EXIT_NOT_IMPLEMENTED(depth == 0);
 	if (volume_texture) {
 		TileVolumeLayout volume {};

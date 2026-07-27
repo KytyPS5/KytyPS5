@@ -1051,13 +1051,9 @@ private:
 
 	static bool UnmapView(void* vaddr, uint64_t size) { return munmap(vaddr, size) == 0; }
 
-	// mmap(MAP_FIXED) always atomically replaces whatever was mapped at 'vaddr' before, so
-	// swapping in a fresh PROT_NONE anonymous mapping over the shared file-backed one gives the
-	// same "still reserved, no longer accessible or file-backed" placeholder state Windows reaches
-	// via UnmapViewOfFile2(..., MEM_PRESERVE_PLACEHOLDER).
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
-		void* ptr = mmap(vaddr, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-		                 -1, 0);
+		void* ptr = mmap(vaddr, size, PROT_NONE,
+		                 MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 		return ptr != MAP_FAILED;
 	}
 
@@ -1070,10 +1066,6 @@ private:
 	std::map<uint64_t, MapEntry> m_maps;
 
 public:
-	// The whole backing store is one contiguous host mapping of the shared object every guest view
-	// aliases, so the GPU can be given the same pages without copying anything -- see
-	// Graphics::GuestMemoryWindow. Guest virtual addresses are not contiguous in it, hence the
-	// separate range list.
 	[[nodiscard]] uint8_t* BackingBase() const { return m_backing_base; }
 	[[nodiscard]] uint64_t BackingSize() const { return m_size; }
 
@@ -1090,12 +1082,6 @@ public:
 	}
 };
 
-// Windows has no native way to split/rejoin a VA reservation without the MEM_*_PLACEHOLDER
-// ceremony, so this class tracks free (reserved-but-uncommitted) sub-ranges itself and, on
-// Windows, mirrors every split/coalesce into the kernel via VirtualFree. mmap-backed platforms
-// don't have that restriction — any sub-range of a reservation can be committed, decommitted or
-// released independently at any time — so their bookkeeping is the same m_free map without any
-// matching kernel call for the split/coalesce step itself.
 class PlaceholderAddressSpace {
 public:
 	PlaceholderAddressSpace() {
@@ -1242,6 +1228,7 @@ public:
 		if (!Consume(vaddr, size)) {
 			return false;
 		}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
 		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,

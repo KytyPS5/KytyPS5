@@ -700,7 +700,8 @@ private:
 		if (m_runtime.read_memory == nullptr ||
 		    !m_runtime.read_memory(m_runtime.userdata, address, &result)) {
 			return Fail(error,
-			            fmt::format("ReadConst pc=0x{:08x} cannot read guest memory at 0x{:016x} "
+			            fmt::format("ReadConst pc=0x{:08x} failed at 0x{:016x}: "
+			                        "cannot read guest memory "
 			                        "(base=0x{:016x} lo={} hi={})",
 			                        value.pc, address, base,
 			                        ScalarValueToString(m_program.provenance, value.args[0]),

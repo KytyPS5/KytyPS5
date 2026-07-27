@@ -2,8 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PAGEMANAGER_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/rangeSet.h"
 
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -48,6 +51,8 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool HandleWriteRange(uint64_t vaddr, uint64_t size) noexcept;
+	[[nodiscard]] std::vector<std::unique_ptr<BackingWrite>>
+	     ReserveBackingWrites(std::span<const RangeSet::Range> ranges);
 
 private:
 	void BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept;

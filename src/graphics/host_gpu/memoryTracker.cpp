@@ -31,6 +31,44 @@ MemoryTracker::MemoryTracker(PageManager& page_manager, PageWatchMode gpu_watch_
 
 MemoryTracker::~MemoryTracker() = default;
 
+void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+                                          const char* operation) const noexcept {
+	if (vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
+	    (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 || (size & (TRACKER_PAGE_SIZE - 1)) != 0) {
+		EXIT("MemoryTracker: invalid dirty-page validation range\n");
+	}
+	for (auto page = vaddr; page < vaddr + size; page += TRACKER_PAGE_SIZE) {
+		bool found = false;
+		dirty.ForEachIntersection(page, TRACKER_PAGE_SIZE,
+		                          [&found](RangeSet::Range) { found = true; });
+		if (!found) {
+			EXIT("MemoryTracker: GPU-dirty tracker page has no dirty bytes, operation=%s "
+			     "addr=0x%016" PRIx64 "\n",
+			     operation, page);
+		}
+	}
+}
+
+void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+                                              const char* operation) {
+	ValidateRange(vaddr, size);
+	if (vaddr + size > UINT64_MAX - (TRACKER_PAGE_SIZE - 1)) {
+		EXIT("MemoryTracker: dirty ownership range alignment overflow\n");
+	}
+	const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+		bool has_dirty_bytes = false;
+		dirty.ForEachIntersection(page, TRACKER_PAGE_SIZE,
+		                          [&has_dirty_bytes](RangeSet::Range) { has_dirty_bytes = true; });
+		if (IsRegionGpuModified(page, TRACKER_PAGE_SIZE) != has_dirty_bytes) {
+			EXIT("MemoryTracker: tracker and byte ownership disagree, operation=%s "
+			     "addr=0x%016" PRIx64 "\n",
+			     operation, page);
+		}
+	}
+}
+
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
@@ -113,6 +151,18 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		const auto       changed =
 		    manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);
+		manager->ApplyGpuProtection(changed, true, m_gpu_watch_mode);
+	});
+}
+
+void MemoryTracker::MarkCleanRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	std::lock_guard access(m_access_mutex);
+	RequireMapped(vaddr, size);
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto       changed =
+		    manager->MarkCleanAsGpuModified(manager->GetCpuAddr() + offset, bytes);
 		manager->ApplyGpuProtection(changed, true, m_gpu_watch_mode);
 	});
 }

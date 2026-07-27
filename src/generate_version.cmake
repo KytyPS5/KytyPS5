@@ -1,8 +1,15 @@
-#message("${GIT_EXECUTABLE}")
+set(KYTY_GIT_VERSION "unknown")
 if(GIT_EXECUTABLE)
-	execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always OUTPUT_VARIABLE KYTY_GIT_VERSION)
-else()
-	set(KYTY_GIT_VERSION "unknown")
+	execute_process(
+		COMMAND "${GIT_EXECUTABLE}" describe --tags --always
+		WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
+		OUTPUT_VARIABLE KYTY_GIT_VERSION
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+		RESULT_VARIABLE GIT_RESULT
+		ERROR_QUIET
+	)
+	if(NOT GIT_RESULT EQUAL 0)
+		set(KYTY_GIT_VERSION "unknown")
+	endif()
 endif()
-string(STRIP ${KYTY_GIT_VERSION} KYTY_GIT_VERSION)
-configure_file(${INPUT_FILE} ${OUTPUT_FILE})
+configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

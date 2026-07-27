@@ -87,7 +87,7 @@ bool ValidateOptions(const Program& program, const ShaderInfoOptions& options, s
 }
 
 void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* vertex,
-	                     ShaderInfo& info) {
+                         ShaderInfo& info) {
 	AddInput(info, StageInputKind::VertexIndex, 0, 1, "gl_VertexIndex");
 	AddInput(info, StageInputKind::InstanceIndex, 0, 1, "gl_InstanceIndex");
 	if (vertex == nullptr) {
@@ -130,7 +130,7 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 }
 
 void CollectComputeInputs(const Program& program, const ShaderComputeInputInfo* compute,
-	                      ShaderInfo& info) {
+                          ShaderInfo& info) {
 	if (compute != nullptr) {
 		if (compute->group_id[0] || compute->group_id[1] || compute->group_id[2]) {
 			AddInput(info, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
@@ -197,7 +197,7 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		if (error != nullptr) {
 			*error = !program.resource_tracking_complete ? "shader resources were not tracked"
-			                                            : "shader info already collected";
+			                                             : "shader info already collected";
 		}
 		return false;
 	}
@@ -208,6 +208,18 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	auto next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
+	next.has_bitwise_xor =
+	    std::any_of(program.blocks.begin(), program.blocks.end(), [](const auto& block) {
+		    return std::any_of(block.instructions.begin(), block.instructions.end(),
+		                       [](const auto& inst) {
+			                       switch (inst.op) {
+				                       case Opcode::BitwiseXorU32:
+				                       case Opcode::BitwiseXor3U32:
+				                       case Opcode::XorAddU32: return true;
+				                       default: return false;
+			                       }
+		                       });
+	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
 		case ShaderType::Pixel: CollectPixelInputs(options.pixel, next); break;

@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ResourceTracking.h"
@@ -5,7 +6,6 @@
 #include "graphics/shader/recompiler/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/SrtPatcher.h"
 #include "graphics/shader/recompiler/SrtWalker.h"
-#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -164,7 +164,7 @@ const StageOutput *FindOutput(const ShaderInfo &info, StageOutputKind kind,
   return nullptr;
 }
 
-void Prepare(Program& program) {
+void Prepare(Program &program) {
   std::string error;
   if (!BuildScalarProvenance(program, &error) ||
       !BuildSrtPlan(program, &error) || !PatchSrtReads(program, &error) ||
@@ -230,16 +230,17 @@ void TestScalarAndVectorBufferAlias() {
 void TestBufferImageAliasIsLinkedDuringTracking() {
   Program program;
   program.blocks.resize(1);
-  program.blocks[0].instructions = {
-      BufferUse(4, 0), BufferUse(8, 8),
-      ImageUse(12, Opcode::ImageLoad, ResourceKind::Image,
-               Decoder::ImageDimension::Dim2D)};
+  program.blocks[0].instructions = {BufferUse(4, 0), BufferUse(8, 8),
+                                    ImageUse(12, Opcode::ImageLoad,
+                                             ResourceKind::Image,
+                                             Decoder::ImageDimension::Dim2D)};
 
   Prepare(program);
   Check(program.info.buffers.size() == 2 && program.info.images.size() == 1 &&
             program.info.buffers[0].image_alias == 0 &&
             program.info.buffers[1].image_alias == BufferResource::NoImageAlias,
-        "buffer/image descriptor provenance aliases were not linked during tracking");
+        "buffer/image descriptor provenance aliases were not linked during "
+        "tracking");
 }
 
 void TestImagesAndSamplers() {
@@ -462,9 +463,12 @@ void TestComputeShaderInfoCollection() {
         error.c_str());
   Check(program.shader_info_complete && program.info.inputs.size() == 3 &&
             FindInput(program.info, StageInputKind::WorkgroupId) != nullptr &&
-            FindInput(program.info, StageInputKind::LocalInvocationId) == nullptr &&
-            FindInput(program.info, StageInputKind::LocalInvocationIndex) != nullptr &&
-            FindInput(program.info, StageInputKind::GlobalInvocationId) != nullptr &&
+            FindInput(program.info, StageInputKind::LocalInvocationId) ==
+                nullptr &&
+            FindInput(program.info, StageInputKind::LocalInvocationIndex) !=
+                nullptr &&
+            FindInput(program.info, StageInputKind::GlobalInvocationId) !=
+                nullptr &&
             program.info.buffers == buffers && program.info.images == images &&
             program.info.samplers == samplers &&
             program.info.sampled_pairs == pairs,
@@ -473,16 +477,20 @@ void TestComputeShaderInfoCollection() {
   Program metadata_program;
   metadata_program.stage = ShaderType::Compute;
   metadata_program.blocks.resize(1);
+  Instruction xor_address;
+  xor_address.op = Opcode::BitwiseXor3U32;
+  metadata_program.blocks[0].instructions = {xor_address};
   Prepare(metadata_program);
   compute = {};
   compute.thread_ids_num = 2;
   Check(CollectShaderInfo(metadata_program, {.compute = &compute}, &error),
         error.c_str());
   Check(FindInput(metadata_program.info, StageInputKind::LocalInvocationId) !=
-            nullptr &&
+                nullptr &&
             FindInput(metadata_program.info,
-                      StageInputKind::LocalInvocationIndex) != nullptr,
-        "compute thread metadata did not request local invocation inputs");
+                      StageInputKind::LocalInvocationIndex) != nullptr &&
+            metadata_program.info.has_bitwise_xor,
+        "compute thread metadata or XOR-address heuristic was not collected");
 }
 
 void TestVertexShaderInfoCollection() {
@@ -496,16 +504,15 @@ void TestVertexShaderInfoCollection() {
   Instruction attr2 = attr0;
   attr2.input_info.attr = 2;
   attr2.input_info.chan = 0;
-  program.blocks[0].instructions = {
-      attr0, attr2, Export(8, ExportTargetKind::Position),
-      Export(12, ExportTargetKind::Parameter, 2)};
+  program.blocks[0].instructions = {attr0, attr2,
+                                    Export(8, ExportTargetKind::Position),
+                                    Export(12, ExportTargetKind::Parameter, 2)};
   Prepare(program);
 
   ShaderVertexInputInfo vertex;
   vertex.resources_num = 3;
   std::string error;
-  Check(CollectShaderInfo(program, {.vertex = &vertex}, &error),
-        error.c_str());
+  Check(CollectShaderInfo(program, {.vertex = &vertex}, &error), error.c_str());
   const auto *input0 = FindInput(program.info, StageInputKind::Parameter, 0);
   const auto *input2 = FindInput(program.info, StageInputKind::Parameter, 2);
   Check(program.info.inputs.size() == 4 && input0 != nullptr &&
@@ -534,11 +541,10 @@ void TestPixelShaderInfoCollection() {
   Program program;
   program.stage = ShaderType::Pixel;
   program.blocks.resize(1);
-  program.blocks[0].instructions = {
-      Export(4, ExportTargetKind::Mrt, 3),
-      Export(8, ExportTargetKind::MrtZ, 0, 0x4),
-      Export(12, ExportTargetKind::Mrt, 3),
-      Export(16, ExportTargetKind::Mrt, 7, 0)};
+  program.blocks[0].instructions = {Export(4, ExportTargetKind::Mrt, 3),
+                                    Export(8, ExportTargetKind::MrtZ, 0, 0x4),
+                                    Export(12, ExportTargetKind::Mrt, 3),
+                                    Export(16, ExportTargetKind::Mrt, 7, 0)};
   Prepare(program);
 
   ShaderPixelInputInfo pixel;
@@ -548,8 +554,7 @@ void TestPixelShaderInfoCollection() {
   pixel.ps_depth_export_enable = true;
   pixel.ps_sample_mask_export_enable = true;
   std::string error;
-  Check(CollectShaderInfo(program, {.pixel = &pixel}, &error),
-        error.c_str());
+  Check(CollectShaderInfo(program, {.pixel = &pixel}, &error), error.c_str());
   Check(program.info.inputs.size() == 4 &&
             FindInput(program.info, StageInputKind::FragCoord) != nullptr &&
             FindInput(program.info, StageInputKind::FrontFacing) != nullptr &&
@@ -560,7 +565,8 @@ void TestPixelShaderInfoCollection() {
             FindOutput(program.info, StageOutputKind::Mrt, 7) == nullptr &&
             FindOutput(program.info, StageOutputKind::Depth) == nullptr &&
             FindOutput(program.info, StageOutputKind::SampleMask) != nullptr,
-        "pixel inputs, disabled exports, or sample-mask-only MRTZ collection was wrong");
+        "pixel inputs, disabled exports, or sample-mask-only MRTZ collection "
+        "was wrong");
 
   Program depth_program;
   depth_program.stage = ShaderType::Pixel;
@@ -572,7 +578,8 @@ void TestPixelShaderInfoCollection() {
         error.c_str());
   Check(depth_program.info.outputs.size() == 1 &&
             FindOutput(depth_program.info, StageOutputKind::Depth) != nullptr &&
-            FindOutput(depth_program.info, StageOutputKind::SampleMask) == nullptr,
+            FindOutput(depth_program.info, StageOutputKind::SampleMask) ==
+                nullptr,
         "depth-only MRTZ export incorrectly enabled sample-mask output");
 }
 
@@ -670,13 +677,13 @@ void TestTrackingRequiresSrtPatching() {
   program.blocks.resize(1);
   program.blocks[0].instructions = {BufferUse(4, 0)};
   std::string error;
-  Check(BuildScalarProvenance(program, &error) &&
-            BuildSrtPlan(program, &error),
+  Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error),
         error.c_str());
   const auto source = program.blocks[0].instructions[0].memory.resource_source;
   Check(!TrackResources(program, &error) &&
             error.find("SRT reads were not patched") != std::string::npos &&
-            program.blocks[0].instructions[0].memory.resource_source == source &&
+            program.blocks[0].instructions[0].memory.resource_source ==
+                source &&
             !program.resource_tracking_complete,
         "resource tracking bypassed SRT patch completion");
   Check(PatchSrtReads(program, &error) && TrackResources(program, &error),
@@ -693,8 +700,7 @@ void TestDynamicSrtReadRemainsExplicit() {
     load.src_count = 1;
     insts.push_back(load);
   }
-  insts.push_back(ImageUse(0x40, Opcode::ImageStore,
-                           ResourceKind::StorageImage,
+  insts.push_back(ImageUse(0x40, Opcode::ImageStore, ResourceKind::StorageImage,
                            Decoder::ImageDimension::Dim2D));
   std::string error;
   Check(BuildScalarProvenance(program, &error) &&
@@ -783,12 +789,13 @@ void TestScalarMemoryGroupsSnapshotOperands() {
       const auto value = insts[i].scalar_value;
       const auto &node = program.provenance.values[value];
       const auto offset_arg = buffer ? 4u : 2u;
-      Check(program.provenance.values[node.args[offset_arg]].op ==
-                    ScalarValueOp::UserData &&
-                program.provenance.values[node.args[offset_arg]].imm == 20 &&
-                insts[i].op ==
-                    (buffer ? Opcode::SBufferLoadDword : Opcode::SLoadDword),
-            "overlapping scalar-memory offset was read after a component write");
+      Check(
+          program.provenance.values[node.args[offset_arg]].op ==
+                  ScalarValueOp::UserData &&
+              program.provenance.values[node.args[offset_arg]].imm == 20 &&
+              insts[i].op ==
+                  (buffer ? Opcode::SBufferLoadDword : Opcode::SLoadDword),
+          "overlapping scalar-memory offset was read after a component write");
     }
   };
   CheckOffsetOverlap(false);
@@ -801,8 +808,7 @@ void TestSrtPatchingHandlesGvnAndMoveForwarding() {
   auto &insts = program.blocks[0].instructions;
   for (uint32_t copy = 0; copy < 2; copy++) {
     for (uint32_t i = 0; i < 4; i++) {
-      insts.push_back(ScalarLoad(copy * 0x20 + i * 4, copy * 4 + i, 16,
-                                 i * 4));
+      insts.push_back(ScalarLoad(copy * 0x20 + i * 4, copy * 4 + i, 16, i * 4));
     }
   }
   for (uint32_t i = 0; i < 4; i++) {
@@ -817,8 +823,7 @@ void TestSrtPatchingHandlesGvnAndMoveForwarding() {
             PatchSrtReads(program, &error),
         error.c_str());
   for (uint32_t i = 0; i < 8; i++) {
-    Check(insts[i].op == Opcode::LoadSrtDword &&
-              insts[i].src[0].imm == i % 4,
+    Check(insts[i].op == Opcode::LoadSrtDword && insts[i].src[0].imm == i % 4,
           "all producers of a GVN'd SRT read were not patched");
   }
   for (uint32_t i = 8; i < 12; i++) {
@@ -867,25 +872,25 @@ void TestSrtPatchPlanValidation() {
   }
   insts.push_back(BufferUse(0x20, 0));
   std::string error;
-  Check(BuildScalarProvenance(program, &error) &&
-            BuildSrtPlan(program, &error),
+  Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error),
         error.c_str());
   program.srt.reads = {program.srt.reads[0], program.srt.reads[0]};
   const auto instructions = insts;
   Check(!PatchSrtReads(program, &error) &&
-            error.find("dense value-to-offset bijection") != std::string::npos &&
+            error.find("dense value-to-offset bijection") !=
+                std::string::npos &&
             insts == instructions && !program.srt_patching_complete,
         "duplicate SRT flat slots were accepted or partially patched");
 
   Program dynamic;
   dynamic.blocks.resize(1);
   dynamic.blocks[0].instructions = {BufferUse(4, 0)};
-  Check(BuildScalarProvenance(dynamic, &error) &&
-            BuildSrtPlan(dynamic, &error),
+  Check(BuildScalarProvenance(dynamic, &error) && BuildSrtPlan(dynamic, &error),
         error.c_str());
   dynamic.srt.dynamic_sources = {ScalarProvenance::Undefined};
   Check(!PatchSrtReads(dynamic, &error) &&
-            error.find("invalid dynamic descriptor source") != std::string::npos &&
+            error.find("invalid dynamic descriptor source") !=
+                std::string::npos &&
             !dynamic.srt_patching_complete,
         "undefined dynamic descriptor source was accepted");
 }
@@ -904,8 +909,7 @@ void TestMaterializationSharesReadConstEvaluation() {
   }
   insts.push_back(ImageUse(0x40, Opcode::ImageSample, ResourceKind::Image,
                            Decoder::ImageDimension::Dim2D));
-  insts.push_back(ImageUse(0x44, Opcode::ImageStore,
-                           ResourceKind::StorageImage,
+  insts.push_back(ImageUse(0x44, Opcode::ImageStore, ResourceKind::StorageImage,
                            Decoder::ImageDimension::Dim2D));
   Prepare(program);
   Check(program.info.images.size() == 2 && program.info.samplers.size() == 1,
@@ -928,8 +932,8 @@ void TestMaterializationSharesReadConstEvaluation() {
   for (uint32_t i = 0; i < memory.words.size(); i++) {
     memory.words[i] = 0x100 + i;
   }
-  memory.words[3] |=
-      Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u;
+  memory.words[3] |= Prospero::GpuEnumValue(Prospero::ImageType::kColor2D)
+                     << 28u;
   std::array<uint32_t, 32> user_data{};
   user_data[16] = static_cast<uint32_t>(memory.base);
   user_data[17] = static_cast<uint32_t>(memory.base >> 32u);
@@ -943,12 +947,13 @@ void TestMaterializationSharesReadConstEvaluation() {
             snapshot.images[0] == snapshot.images[1],
         "dense runtime snapshot did not preserve resource order or aliases");
   Check(snapshot.flattened_srt.size() == 8 &&
-            std::equal(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end(),
-                       memory.words.begin()) &&
-            snapshot.user_data == std::vector<uint32_t>(user_data.begin(), user_data.end()),
+            std::equal(snapshot.flattened_srt.begin(),
+                       snapshot.flattened_srt.end(), memory.words.begin()) &&
+            snapshot.user_data ==
+                std::vector<uint32_t>(user_data.begin(), user_data.end()),
         "runtime snapshot omitted flattened SRT or current user data");
-  Check(memory.reads == 8,
-        "aliased image views repeated ReadConst evaluation instead of sharing it");
+  Check(memory.reads == 8, "aliased image views repeated ReadConst evaluation "
+                           "instead of sharing it");
   for (uint32_t i = 0; i < 8; i++) {
     Check(snapshot.images[0].dwords[i] == memory.words[i],
           "materialized image descriptor contains the wrong dword");
@@ -960,16 +965,16 @@ void TestInvalidImagesMaterializeAsNull() {
   sampled.stage = ShaderType::Pixel;
   sampled.user_data_count = 8;
   sampled.blocks.resize(1);
-  sampled.blocks[0].instructions = {
-      ImageUse(0x40, Opcode::ImageLoad, ResourceKind::Image,
-               Decoder::ImageDimension::Dim2D)};
+  sampled.blocks[0].instructions = {ImageUse(0x40, Opcode::ImageLoad,
+                                             ResourceKind::Image,
+                                             Decoder::ImageDimension::Dim2D)};
   Prepare(sampled);
   Check(sampled.info.images.size() == 1 && sampled.info.samplers.empty(),
         "sampled-image normalization test has unexpected resource topology");
 
-  constexpr std::array<uint32_t, 8> stale = {
-      0x00000004, 0x00000004, 0xc0061060, 0x06000514,
-      0x20010000, 0xa4580290, 0x00000004, 0x00000001};
+  constexpr std::array<uint32_t, 8> stale = {0x00000004, 0x00000004, 0xc0061060,
+                                             0x06000514, 0x20010000, 0xa4580290,
+                                             0x00000004, 0x00000001};
   std::string error;
   for (uint32_t type = 0; type < 8; type++) {
     auto descriptor = stale;
@@ -982,6 +987,57 @@ void TestInvalidImagesMaterializeAsNull() {
                           [](uint32_t word) { return word == 0; }) &&
               ValidateResourceSpecialization(sampled, snapshot, &error),
           error.c_str());
+  }
+
+  constexpr std::array<uint32_t, 8> packet = {
+      0xc0071058, 0xe80eeeb8, 0x00000000, 0xffffffff,
+      0xffffffff, 0x00000001, 0x00000000, 0x00000113};
+  ResourceSnapshot packet_snapshot;
+  Check(MaterializeResources(sampled, {packet}, packet_snapshot, &error) &&
+            std::all_of(packet_snapshot.images[0].dwords.begin(),
+                        packet_snapshot.images[0].dwords.end(),
+                        [](uint32_t word) { return word == 0; }),
+        "invalid MSAA image words were not normalized to null");
+
+  struct MsaaCase {
+    uint32_t base_level;
+    uint32_t fragments;
+    uint32_t max_mip;
+    bool valid;
+  };
+  constexpr std::array msaa_cases = {
+      MsaaCase{0, 1, 1, true},  MsaaCase{0, 2, 2, true},
+      MsaaCase{0, 3, 3, true},  MsaaCase{1, 1, 1, false},
+      MsaaCase{0, 2, 1, false}, MsaaCase{0, 0, 0, false},
+      MsaaCase{0, 4, 4, false},
+  };
+  constexpr std::array msaa_types = {
+      Prospero::ImageType::kColor2DMsaa,
+      Prospero::ImageType::kColor2DMsaaArray,
+  };
+  for (const auto type : msaa_types) {
+    for (const auto& test : msaa_cases) {
+      std::array<uint32_t, 8> msaa{};
+      msaa[0] = 1;
+      msaa[1] = 36u << 20u;
+      msaa[3] = (Prospero::GpuEnumValue(type) << 28u) |
+                (test.base_level << 12u) | (test.fragments << 16u);
+      msaa[5] = test.max_mip << 4u;
+      ResourceSnapshot msaa_snapshot;
+      const auto materialized =
+          MaterializeResources(sampled, {msaa}, msaa_snapshot, &error);
+      const auto preserved =
+          materialized &&
+          std::equal(msaa.begin(), msaa.end(),
+                     msaa_snapshot.images[0].dwords.begin());
+      const auto is_null =
+          materialized &&
+          std::all_of(msaa_snapshot.images[0].dwords.begin(),
+                      msaa_snapshot.images[0].dwords.end(),
+                      [](uint32_t word) { return word == 0; });
+      Check(materialized && (test.valid ? preserved : is_null),
+            "MSAA image descriptor validity mismatch");
+    }
   }
 
   auto valid = stale;
@@ -997,9 +1053,9 @@ void TestInvalidImagesMaterializeAsNull() {
   storage.stage = ShaderType::Compute;
   storage.user_data_count = 8;
   storage.blocks.resize(1);
-  storage.blocks[0].instructions = {
-      ImageUse(0x40, Opcode::ImageStore, ResourceKind::StorageImage,
-               Decoder::ImageDimension::Dim2D)};
+  storage.blocks[0].instructions = {ImageUse(0x40, Opcode::ImageStore,
+                                             ResourceKind::StorageImage,
+                                             Decoder::ImageDimension::Dim2D)};
   Prepare(storage);
   ResourceSnapshot storage_snapshot;
   Check(MaterializeResources(storage, {stale}, storage_snapshot, &error) &&
@@ -1009,6 +1065,31 @@ void TestInvalidImagesMaterializeAsNull() {
         "invalid storage image descriptor was not normalized to null");
 }
 
+void TestInvalidBuffersMaterializeAsNull() {
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.user_data_count = 4;
+  program.blocks.resize(1);
+  program.blocks[0].instructions = {BufferUse(0x40, 0)};
+  Prepare(program);
+
+  constexpr std::array<uint32_t, 4> valid = {
+      0x0000100c, 0x00100000, 0x00000001, 0x0004dfac};
+  auto invalid = valid;
+  invalid[3] |= 1u << 30u;
+  std::string error;
+  ResourceSnapshot snapshot;
+  Check(MaterializeResources(program, {invalid}, snapshot, &error) &&
+            std::all_of(snapshot.buffers[0].dwords.begin(),
+                        snapshot.buffers[0].dwords.begin() + 4,
+                        [](uint32_t word) { return word == 0; }),
+        "invalid buffer descriptor was not normalized to null");
+  Check(MaterializeResources(program, {valid}, snapshot, &error) &&
+            std::equal(valid.begin(), valid.end(),
+                       snapshot.buffers[0].dwords.begin()),
+        "valid buffer descriptor was normalized");
+}
+
 void TestMaterializationFailureIsTransactional() {
   Program program;
   program.blocks.resize(1);
@@ -1016,8 +1097,7 @@ void TestMaterializationFailureIsTransactional() {
   for (uint32_t i = 0; i < 8; i++) {
     insts.push_back(ScalarLoad(i * 4, i, 16, i * 4));
   }
-  insts.push_back(ImageUse(0x40, Opcode::ImageStore,
-                           ResourceKind::StorageImage,
+  insts.push_back(ImageUse(0x40, Opcode::ImageStore, ResourceKind::StorageImage,
                            Decoder::ImageDimension::Dim2D));
   Prepare(program);
 
@@ -1046,7 +1126,7 @@ void TestResourceSpecializationIsTypedAndTransactional() {
   null_program.stage = ShaderType::Compute;
   null_program.blocks.resize(1);
   null_program.blocks[0].instructions = {
-      ImageUse(0x10, Opcode::ImageLoad, ResourceKind::Image,
+      ImageUse(0x10, Opcode::ImageLoad, ResourceKind::ImageUint,
                Decoder::ImageDimension::Dim3D)};
   Prepare(null_program);
   ResourceSnapshot null_snapshot;
@@ -1056,18 +1136,93 @@ void TestResourceSpecializationIsTypedAndTransactional() {
   null_snapshot.images[0].dwords[2] = 0x89abcdefu;
   null_snapshot.images[0].dwords[3] = 0x01234567u;
   std::string error;
-  Check(SpecializeResources(null_program, null_snapshot, &error) &&
-            ValidateResourceSpecialization(null_program, null_snapshot, &error) &&
-            null_program.info.images[0].kind == ResourceKind::Image &&
-            null_program.info.images[0].dimension == Decoder::ImageDimension::Dim3D,
-        "zero-base image descriptor did not preserve tracked null-image shape");
+  Check(
+      SpecializeResources(null_program, null_snapshot, &error) &&
+          ValidateResourceSpecialization(null_program, null_snapshot, &error) &&
+          null_program.info.images[0].kind == ResourceKind::Image &&
+          null_program.info.images[0].dimension ==
+              Decoder::ImageDimension::Dim2D &&
+          null_program.blocks[0].instructions[0].memory.image_dimension ==
+              Decoder::ImageDimension::Dim2D,
+      "zero-base image descriptor did not use the canonical null-image shape");
+
+  Program null_atomic;
+  null_atomic.stage = ShaderType::Compute;
+  null_atomic.blocks.resize(1);
+  null_atomic.blocks[0].instructions = {
+      ImageUse(0x14, Opcode::AtomicAddU32, ResourceKind::StorageImageUint,
+               Decoder::ImageDimension::Dim1D)};
+  Prepare(null_atomic);
+  Check(SpecializeResources(null_atomic, null_snapshot, &error) &&
+            ValidateResourceSpecialization(null_atomic, null_snapshot, &error) &&
+            null_atomic.info.images[0].kind ==
+                ResourceKind::StorageImageUint &&
+            null_atomic.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D,
+        "null image atomic did not preserve its required integer storage type");
+
+  Program array_view;
+  array_view.stage = ShaderType::Compute;
+  array_view.blocks.resize(1);
+  array_view.blocks[0].instructions = {
+      ImageUse(0x18, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Dim1D)};
+  Prepare(array_view);
+  ResourceSnapshot array_snapshot;
+  array_snapshot.images.resize(1);
+  array_snapshot.images[0].dword_count = 8;
+  array_snapshot.images[0].dwords[0] = 0x1000;
+  array_snapshot.images[0].dwords[3] =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor1DArray) << 28u;
+  Check(SpecializeResources(array_view, array_snapshot, &error) &&
+            array_view.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim1D &&
+            array_view.blocks[0].instructions[0].memory.image_dimension ==
+                Decoder::ImageDimension::Dim1D,
+        "non-array MIMG view did not narrow a 1D-array descriptor");
+  auto null_after_1d = array_snapshot;
+  null_after_1d.images[0].dwords.fill(0);
+  Check(!ValidateResourceSpecialization(array_view, null_after_1d, &error) &&
+            error.find("canonical null specialization") != std::string::npos,
+        "non-null 1D specialization accepted a canonical 2D null descriptor");
+
+  Program cross_family_array;
+  cross_family_array.stage = ShaderType::Compute;
+  cross_family_array.blocks.resize(1);
+  cross_family_array.blocks[0].instructions = {
+      ImageUse(0x1c, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Dim2DArray)};
+  Prepare(cross_family_array);
+  Check(SpecializeResources(cross_family_array, array_snapshot, &error) &&
+            cross_family_array.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim1DArray &&
+            cross_family_array.blocks[0]
+                    .instructions[0]
+                    .memory.image_dimension ==
+                Decoder::ImageDimension::Dim1DArray,
+        "array MIMG intent did not produce a 1D-array view");
+
+  Program cross_family_2d_array;
+  cross_family_2d_array.stage = ShaderType::Compute;
+  cross_family_2d_array.blocks.resize(1);
+  cross_family_2d_array.blocks[0].instructions = {
+      ImageUse(0x20, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Dim1DArray)};
+  Prepare(cross_family_2d_array);
+  auto array_2d_snapshot = array_snapshot;
+  array_2d_snapshot.images[0].dwords[3] =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u;
+  Check(SpecializeResources(cross_family_2d_array, array_2d_snapshot, &error) &&
+            cross_family_2d_array.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2DArray,
+        "array MIMG intent did not produce a 2D-array view");
 
   Program program;
   program.stage = ShaderType::Compute;
   program.blocks.resize(1);
-  program.blocks[0].instructions = {
-      ImageUse(0x20, Opcode::ImageStore, ResourceKind::StorageImage,
-               Decoder::ImageDimension::Dim3D)};
+  program.blocks[0].instructions = {ImageUse(0x20, Opcode::ImageStore,
+                                             ResourceKind::StorageImage,
+                                             Decoder::ImageDimension::Dim3D)};
   Prepare(program);
 
   ResourceSnapshot snapshot;
@@ -1098,7 +1253,13 @@ void TestResourceSpecializationIsTypedAndTransactional() {
             image.storage_swizzle == 0x3acu &&
             inst.memory.kind == ResourceKind::StorageImageUint &&
             inst.memory.image_dimension == Decoder::ImageDimension::Dim2D,
-        "runtime descriptor shape and integer format did not specialize dense IR");
+        "runtime descriptor shape and integer format did not specialize dense "
+        "IR");
+  auto null_after_uint = snapshot;
+  null_after_uint.images[0].dwords.fill(0);
+  Check(!ValidateResourceSpecialization(program, null_after_uint, &error) &&
+            error.find("canonical null specialization") != std::string::npos,
+        "non-null integer specialization accepted a non-integer null descriptor");
 
   auto stale_swizzle = snapshot;
   stale_swizzle.images[0].dwords[3] =
@@ -1115,9 +1276,12 @@ void TestResourceSpecializationIsTypedAndTransactional() {
         error.c_str());
   const auto *binding =
       FindBinding(program.bindings, DescriptorBindingKind::StorageUint2D);
-  Check(binding != nullptr && binding->resources == std::vector<uint32_t>({0}) &&
-            FindBinding(program.bindings, DescriptorBindingKind::Storage3D) == nullptr,
-        "specialized image topology did not reach the exact native binding group");
+  Check(binding != nullptr &&
+            binding->resources == std::vector<uint32_t>({0}) &&
+            FindBinding(program.bindings, DescriptorBindingKind::Storage3D) ==
+                nullptr,
+        "specialized image topology did not reach the exact native binding "
+        "group");
 }
 
 void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
@@ -1132,11 +1296,12 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
   buffer_snapshot.buffers[0].dword_count = 4;
   buffer_snapshot.buffers[0].dwords[1] = (16u << 16u) | (1u << 31u);
   buffer_snapshot.buffers[0].dwords[3] =
-      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 12u) | (2u << 21u) |
-      (1u << 23u);
+      (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 12u) |
+      (2u << 21u) | (1u << 23u);
   std::string error;
   Check(SpecializeResources(buffer_program, buffer_snapshot, &error) &&
-            ValidateResourceSpecialization(buffer_program, buffer_snapshot, &error),
+            ValidateResourceSpecialization(buffer_program, buffer_snapshot,
+                                           &error),
         error.c_str());
   Check(buffer_program.info.buffers[0].packed_stride ==
                 (16u | (1u << 14u) | (2u << 16u) | (1u << 20u)) &&
@@ -1162,9 +1327,10 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
         error.c_str());
   auto truncated_user_data = buffer_snapshot;
   truncated_user_data.user_data.resize(3);
-  Check(!ValidateResourceSnapshot(buffer_program, truncated_user_data, &error) &&
-            error.find("user SGPR 3") != std::string::npos,
-        "truncated cache snapshot user-data window was accepted");
+  Check(
+      !ValidateResourceSnapshot(buffer_program, truncated_user_data, &error) &&
+          error.find("user SGPR 3") != std::string::npos,
+      "truncated cache snapshot user-data window was accepted");
 
   Program based_program;
   based_program.stage = ShaderType::Compute;
@@ -1173,8 +1339,8 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
   raw.memory.offset = static_cast<uint32_t>(-4);
   raw.src[0] = Sgpr(20);
   raw.src_count = 1;
-  based_program.blocks[0].instructions = {
-      MoveImmediate(0, 16, 0x1000), MoveImmediate(4, 17, 0), raw};
+  based_program.blocks[0].instructions = {MoveImmediate(0, 16, 0x1000),
+                                          MoveImmediate(4, 17, 0), raw};
   Prepare(based_program);
   ResourceSnapshot based_snapshot;
   Check(MaterializeResources(based_program, {}, based_snapshot, &error) &&
@@ -1184,7 +1350,8 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
   relocated.addresses[0].guest_base += 0x1000;
   relocated.addresses[0].binding_base += 0x1000;
   Check(ValidateResourceSpecialization(based_program, relocated, &error),
-        "relocated based address with identical relative bias changed specialization");
+        "relocated based address with identical relative bias changed "
+        "specialization");
   relocated.addresses[0].binding_base++;
   Check(!ValidateResourceSpecialization(based_program, relocated, &error) &&
             error.find("address resource 0") != std::string::npos,
@@ -1199,19 +1366,22 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
   flat_program.blocks[0].instructions = {flat};
   Prepare(flat_program);
   ResourceSnapshot flat_snapshot;
-	flat_snapshot.addresses = {{0x11u, 0x10u}};
+  flat_snapshot.addresses = {{0x11u, 0x10u}};
   flat_snapshot.user_data = {0xdeadbeefu};
   const auto prior_flat_snapshot = flat_snapshot;
-  Check(!MaterializeResources(flat_program, {}, flat_snapshot, &error) &&
-            error.find("requires runtime guest-address translation") != std::string::npos &&
-			flat_snapshot.addresses == prior_flat_snapshot.addresses &&
-            flat_snapshot.user_data == prior_flat_snapshot.user_data,
-        "unbased flat memory without a translator did not fail transactionally");
+  Check(
+      !MaterializeResources(flat_program, {}, flat_snapshot, &error) &&
+          error.find("requires runtime guest-address translation") !=
+              std::string::npos &&
+          flat_snapshot.addresses == prior_flat_snapshot.addresses &&
+          flat_snapshot.user_data == prior_flat_snapshot.user_data,
+      "unbased flat memory without a translator did not fail transactionally");
   SrtRuntime flat_runtime;
   flat_runtime.flat_memory_base = 0x100000000ull;
-  Check(MaterializeResources(flat_program, flat_runtime, flat_snapshot, &error) &&
-            SpecializeResources(flat_program, flat_snapshot, &error),
-        error.c_str());
+  Check(
+      MaterializeResources(flat_program, flat_runtime, flat_snapshot, &error) &&
+          SpecializeResources(flat_program, flat_snapshot, &error),
+      error.c_str());
   auto stale_flat = flat_snapshot;
   stale_flat.addresses[0].guest_base += 0x1000;
   stale_flat.addresses[0].binding_base += 0x1000;
@@ -1232,8 +1402,7 @@ void TestTrackedProgramIsImmutable() {
   }
   insts.push_back(ImageUse(0x50, Opcode::ImageSample, ResourceKind::Image,
                            Decoder::ImageDimension::Dim2D));
-  insts.push_back(ImageUse(0x54, Opcode::ImageStore,
-                           ResourceKind::StorageImage,
+  insts.push_back(ImageUse(0x54, Opcode::ImageStore, ResourceKind::StorageImage,
                            Decoder::ImageDimension::Dim2D));
   insts.push_back(BufferUse(0x58, 12));
   Prepare(program);
@@ -1263,8 +1432,9 @@ void TestTrackedProgramIsImmutable() {
               insts.size() == memory.size(),
           "rejected post-track pass mutated immutable program state");
     for (uint32_t i = 0; i < memory.size(); i++) {
-      Check(insts[i].memory == memory[i],
-            "rejected post-track pass mutated a dense operand or source handle");
+      Check(
+          insts[i].memory == memory[i],
+          "rejected post-track pass mutated a dense operand or source handle");
     }
   };
 
@@ -1289,8 +1459,7 @@ void TestNativeBindingLayout() {
                            Decoder::ImageDimension::Dim2D, 0, 2));
   insts.push_back(ImageUse(12, Opcode::ImageSample, ResourceKind::Image,
                            Decoder::ImageDimension::Dim2DArray, 0, 2));
-  insts.push_back(ImageUse(16, Opcode::ImageStore,
-                           ResourceKind::StorageImage,
+  insts.push_back(ImageUse(16, Opcode::ImageStore, ResourceKind::StorageImage,
                            Decoder::ImageDimension::Dim3D, 4));
   insts.push_back(ImageUse(20, Opcode::ImageStore,
                            ResourceKind::StorageImageUint,
@@ -1315,25 +1484,75 @@ void TestNativeBindingLayout() {
       FindBinding(program.bindings, DescriptorBindingKind::StorageUint2DArray);
   const auto *samplers =
       FindBinding(program.bindings, DescriptorBindingKind::Samplers);
-  Check(program.bindings.descriptor_set == 3 && buffers != nullptr &&
-            sampled2d != nullptr && sampled_array != nullptr &&
-            storage3d != nullptr && storage_uint_array != nullptr &&
-            samplers != nullptr && buffers->binding == 0 &&
-            sampled2d->binding == 1 && sampled_array->binding == 2 &&
-            storage3d->binding == 3 && storage_uint_array->binding == 4 &&
-            samplers->binding == 5 && buffers->resources ==
-                std::vector<uint32_t>{0} &&
-            sampled2d->resources == std::vector<uint32_t>{0} &&
+  const auto *shader_data =
+      FindBinding(program.bindings, DescriptorBindingKind::UserData);
+  const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+  Check(
+      program.bindings.descriptor_set == 3 && buffers != nullptr &&
+          sampled2d != nullptr && sampled_array != nullptr &&
+          storage3d != nullptr && storage_uint_array != nullptr &&
+          samplers != nullptr && buffers->binding == 0 &&
+          sampled2d->binding == 1 && sampled_array->binding == 2 &&
+          storage3d->binding == 3 && storage_uint_array->binding == 4 &&
+          samplers->binding == 5 &&
+          buffers->resources == std::vector<uint32_t>{0} &&
+          sampled2d->resources == std::vector<uint32_t>{0} &&
+          sampled_array->resources == std::vector<uint32_t>{1} &&
+          storage3d->resources == std::vector<uint32_t>{2} &&
+           storage_uint_array->resources == std::vector<uint32_t>{3} &&
+           samplers->resources == std::vector<uint32_t>{0} &&
+           !program.bindings.user_data_registers.empty() &&
+           program.bindings.buffer_offset_dword ==
+               program.bindings.user_data_registers.size() &&
+           program.bindings.buffer_offset_count == 1 &&
+           ((program.bindings.push_constant_size ==
+                 shader_data_dwords * sizeof(uint32_t) &&
+             shader_data == nullptr) ||
+            (program.bindings.push_constant_size == 0 &&
+             shader_data != nullptr && shader_data->binding == 6)) &&
+           FindBinding(program.bindings, DescriptorBindingKind::FlattenedSrt) ==
+               nullptr &&
+          program.binding_layout_complete,
+      "native binding allocator did not preserve dense typed resource groups");
+}
+
+void TestNativeBindingLayoutOneDimensionalImages() {
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.blocks.resize(1);
+  auto &insts = program.blocks[0].instructions;
+  insts.push_back(ImageUse(8, Opcode::ImageSample, ResourceKind::Image,
+                           Decoder::ImageDimension::Dim1D, 0, 2));
+  insts.push_back(ImageUse(12, Opcode::ImageSample, ResourceKind::Image,
+                           Decoder::ImageDimension::Dim1DArray, 0, 2));
+  insts.push_back(ImageUse(16, Opcode::ImageStore, ResourceKind::StorageImage,
+                           Decoder::ImageDimension::Dim1D, 4));
+  insts.push_back(ImageUse(20, Opcode::ImageStore,
+                           ResourceKind::StorageImageUint,
+                           Decoder::ImageDimension::Dim1DArray, 6));
+  Prepare(program);
+
+  ShaderComputeInputInfo compute;
+  compute.thread_ids_num = 1;
+  std::string error;
+  Check(CollectShaderInfo(program, {.compute = &compute}, &error) &&
+            AllocateBindings(program, {}, &error),
+        error.c_str());
+  const auto *sampled =
+      FindBinding(program.bindings, DescriptorBindingKind::Sampled1D);
+  const auto *sampled_array =
+      FindBinding(program.bindings, DescriptorBindingKind::Sampled1DArray);
+  const auto *storage =
+      FindBinding(program.bindings, DescriptorBindingKind::Storage1D);
+  const auto *storage_uint_array =
+      FindBinding(program.bindings, DescriptorBindingKind::StorageUint1DArray);
+  Check(sampled != nullptr && sampled_array != nullptr && storage != nullptr &&
+            storage_uint_array != nullptr &&
+            sampled->resources == std::vector<uint32_t>{0} &&
             sampled_array->resources == std::vector<uint32_t>{1} &&
-            storage3d->resources == std::vector<uint32_t>{2} &&
-            storage_uint_array->resources == std::vector<uint32_t>{3} &&
-            samplers->resources == std::vector<uint32_t>{0} &&
-            !program.bindings.user_data_registers.empty() &&
-            program.bindings.push_constant_size != 0 &&
-            FindBinding(program.bindings,
-                        DescriptorBindingKind::FlattenedSrt) == nullptr &&
-            program.binding_layout_complete,
-        "native binding allocator did not preserve dense typed resource groups");
+            storage->resources == std::vector<uint32_t>{2} &&
+            storage_uint_array->resources == std::vector<uint32_t>{3},
+        "binding allocator did not preserve first-class 1D image groups");
 }
 
 void TestNativeBindingLayoutSrtAndUserDataOverflow() {
@@ -1341,8 +1560,7 @@ void TestNativeBindingLayoutSrtAndUserDataOverflow() {
   srt.stage = ShaderType::Compute;
   srt.blocks.resize(1);
   for (uint32_t i = 0; i < 4; i++) {
-    srt.blocks[0].instructions.push_back(
-        ScalarLoad(i * 4, i, 16, i * 4));
+    srt.blocks[0].instructions.push_back(ScalarLoad(i * 4, i, 16, i * 4));
   }
   srt.blocks[0].instructions.push_back(BufferUse(0x20, 0));
   Prepare(srt);
@@ -1392,7 +1610,7 @@ void TestNativeBindingLayoutGds() {
   program.blocks.resize(1);
   Instruction append;
   append.op = Opcode::DsAppend;
-	append.memory.kind = ResourceKind::Gds;
+  append.memory.kind = ResourceKind::Gds;
   program.blocks[0].instructions.push_back(append);
 
   ShaderComputeInputInfo compute;
@@ -1407,18 +1625,18 @@ void TestNativeBindingLayoutGds() {
   Check(gds != nullptr && gds->binding == 0 && gds->resources.empty(),
         "GDS append/consume did not allocate one native storage binding");
 
-	Program lds;
-	lds.stage = ShaderType::Compute;
-	lds.blocks.resize(1);
-	append.memory.kind = ResourceKind::Lds;
-	lds.blocks[0].instructions.push_back(append);
-	Check(BuildScalarProvenance(lds, &error) && BuildSrtPlan(lds, &error) &&
-	          PatchSrtReads(lds, &error) && TrackResources(lds, &error) &&
-	          CollectShaderInfo(lds, {.compute = &compute}, &error) &&
-	          AllocateBindings(lds, {}, &error),
-	      error.c_str());
-	Check(FindBinding(lds.bindings, DescriptorBindingKind::Gds) == nullptr,
-	      "LDS append/consume incorrectly allocated a GDS binding");
+  Program lds;
+  lds.stage = ShaderType::Compute;
+  lds.blocks.resize(1);
+  append.memory.kind = ResourceKind::Lds;
+  lds.blocks[0].instructions.push_back(append);
+  Check(BuildScalarProvenance(lds, &error) && BuildSrtPlan(lds, &error) &&
+            PatchSrtReads(lds, &error) && TrackResources(lds, &error) &&
+            CollectShaderInfo(lds, {.compute = &compute}, &error) &&
+            AllocateBindings(lds, {}, &error),
+        error.c_str());
+  Check(FindBinding(lds.bindings, DescriptorBindingKind::Gds) == nullptr,
+        "LDS append/consume incorrectly allocated a GDS binding");
 }
 
 void TestNativeBindingLayoutIsTransactional() {
@@ -1466,7 +1684,8 @@ void TestNativeBindingLayoutIsTransactional() {
             CollectShaderInfo(tail, {.compute = &compute}, &error) &&
             AllocateBindings(tail, {.push_constant_offset = 124}, &error) &&
             tail.bindings.push_constant_size == 4 &&
-            FindBinding(tail.bindings, DescriptorBindingKind::UserData) == nullptr,
+            FindBinding(tail.bindings, DescriptorBindingKind::UserData) ==
+                nullptr,
         "valid final dword of the guaranteed push-constant range was rejected");
 }
 
@@ -1529,12 +1748,11 @@ void TestNativeBindingLayoutRejectsUnknownShapeAndBadProvenance() {
   Program image;
   image.stage = ShaderType::Compute;
   image.blocks.resize(1);
-  image.blocks[0].instructions = {
-      ImageUse(4, Opcode::ImageStore, ResourceKind::StorageImage,
-               Decoder::ImageDimension::Dim2D)};
+  image.blocks[0].instructions = {ImageUse(4, Opcode::ImageStore,
+                                           ResourceKind::StorageImage,
+                                           Decoder::ImageDimension::Dim2D)};
   Prepare(image);
-  Check(CollectShaderInfo(image, {.compute = &compute}, &error),
-        error.c_str());
+  Check(CollectShaderInfo(image, {.compute = &compute}, &error), error.c_str());
   image.info.images[0].dimension = Decoder::ImageDimension::Unknown;
   image.bindings.descriptor_set = 77;
   const auto image_layout = image.bindings;
@@ -1618,8 +1836,8 @@ void TestNativeBindingLayoutTracksRawScalarMemoryBase() {
   compute.thread_ids_num = 1;
   Check(BuildScalarProvenance(program, &error) &&
             BuildSrtPlan(program, &error) && program.srt.reads.empty() &&
-            program.srt.dynamic_reads.empty() && PatchSrtReads(program, &error) &&
-            TrackResources(program, &error) &&
+            program.srt.dynamic_reads.empty() &&
+            PatchSrtReads(program, &error) && TrackResources(program, &error) &&
             CollectShaderInfo(program, {.compute = &compute}, &error) &&
             AllocateBindings(program, {}, &error),
         error.c_str());
@@ -1649,23 +1867,27 @@ void TestRawScalarMemoryTracksReachingBaseIdentity() {
   second.src[0] = Sgpr(20);
   second.src_count = 1;
   program.blocks[0].instructions = {
-      MoveImmediate(0, 16, 0x1000), MoveImmediate(4, 17, 0), first,
+      MoveImmediate(0, 16, 0x1000),  MoveImmediate(4, 17, 0),  first,
       MoveImmediate(12, 16, 0x2000), MoveImmediate(16, 17, 0), second};
 
   std::string error;
-  Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error) &&
-            PatchSrtReads(program, &error) && TrackResources(program, &error),
+  Check(BuildScalarProvenance(program, &error) &&
+            BuildSrtPlan(program, &error) && PatchSrtReads(program, &error) &&
+            TrackResources(program, &error),
         error.c_str());
   Check(program.info.addresses.size() == 2 &&
-            program.info.addresses[0].source != program.info.addresses[1].source &&
+            program.info.addresses[0].source !=
+                program.info.addresses[1].source &&
             program.blocks[0].instructions[2].memory.resource == 0 &&
             program.blocks[0].instructions[5].memory.resource == 1,
-        "raw scalar loads with redefined SBASE collapsed to one address resource");
+        "raw scalar loads with redefined SBASE collapsed to one address "
+        "resource");
 
   std::array<uint32_t, 64> user_data{};
   user_data[20] = 4;
   ResourceSnapshot snapshot;
-  Check(MaterializeResources(program, {user_data}, snapshot, &error), error.c_str());
+  Check(MaterializeResources(program, {user_data}, snapshot, &error),
+        error.c_str());
   Check(snapshot.addresses.size() == 2 &&
             snapshot.addresses[0].guest_base == 0x1000 &&
             snapshot.addresses[0].binding_base == 0x0ffc &&
@@ -1692,11 +1914,13 @@ void TestNativeBindingLayoutUsesExplicitFlatMemory() {
         error.c_str());
   const auto *flat =
       FindBinding(program.bindings, DescriptorBindingKind::AddressMemory);
-  Check(flat != nullptr && flat->resources == std::vector<uint32_t>({0}) &&
-            program.info.addresses.size() == 1 &&
-            program.info.addresses[0].kind == ResourceKind::Flat &&
-            FindBinding(program.bindings, DescriptorBindingKind::Buffers) == nullptr,
-        "flat address space was aliased to an ordinary buffer descriptor group");
+  Check(
+      flat != nullptr && flat->resources == std::vector<uint32_t>({0}) &&
+          program.info.addresses.size() == 1 &&
+          program.info.addresses[0].kind == ResourceKind::Flat &&
+          FindBinding(program.bindings, DescriptorBindingKind::Buffers) ==
+              nullptr,
+      "flat address space was aliased to an ordinary buffer descriptor group");
 
   ResourceSnapshot snapshot;
   SrtRuntime runtime;
@@ -1727,8 +1951,8 @@ void TestNativeBindingLayoutHonorsUserDataCount() {
   ShaderComputeInputInfo compute;
   compute.thread_ids_num = 1;
   Check(BuildScalarProvenance(program, &error) &&
-            program.provenance.values[program.blocks[0].instructions[0]
-                                          .scalar_sources[0]]
+            program.provenance
+                    .values[program.blocks[0].instructions[0].scalar_sources[0]]
                     .op == ScalarValueOp::UserData &&
             program.blocks[0].instructions[1].scalar_sources[0] ==
                 ScalarProvenance::Unknown &&
@@ -1753,28 +1977,29 @@ void TestNativeBindingLayoutHonorsUserDataBase() {
   program.user_data_base = 8;
   program.user_data_count = 8;
   program.blocks.resize(1);
-  program.blocks[0].instructions = {
-      Move(0, 20, 7), Move(4, 21, 8), Move(8, 22, 15), Move(12, 23, 16),
-      BufferUse(16, 8)};
+  program.blocks[0].instructions = {Move(0, 20, 7), Move(4, 21, 8),
+                                    Move(8, 22, 15), Move(12, 23, 16),
+                                    BufferUse(16, 8)};
 
   std::string error;
   Check(BuildScalarProvenance(program, &error) &&
             program.blocks[0].instructions[0].scalar_sources[0] ==
                 ScalarProvenance::Unknown &&
-            program.provenance.values[
-                program.blocks[0].instructions[1].scalar_sources[0]].op ==
-                ScalarValueOp::UserData &&
+            program.provenance
+                    .values[program.blocks[0].instructions[1].scalar_sources[0]]
+                    .op == ScalarValueOp::UserData &&
             program.blocks[0].instructions[3].scalar_sources[0] ==
                 ScalarProvenance::Unknown &&
             BuildSrtPlan(program, &error),
         error.c_str());
 
   const std::array<uint32_t, 8> user_data = {
-      0x11111111, 0x22222222, 0x33333333, 0x44444444,
-      0, 0, 0, 0xaaaaaaaa};
+      0x11111111, 0x22222222, 0x33333333, 0x44444444, 0, 0, 0, 0xaaaaaaaa};
   DescriptorValue descriptor;
-  const auto source = program.blocks[0].instructions.back().memory.resource_source;
-  Check(EvaluateDescriptorSource(program, source, 16, {user_data}, descriptor, &error) &&
+  const auto source =
+      program.blocks[0].instructions.back().memory.resource_source;
+  Check(EvaluateDescriptorSource(program, source, 16, {user_data}, descriptor,
+                                 &error) &&
             descriptor.dwords[0] == user_data[0] &&
             descriptor.dwords[3] == user_data[3],
         "vertex user-data base was not translated to runtime-local indices");
@@ -1784,18 +2009,21 @@ void TestNativeBindingLayoutHonorsUserDataBase() {
             CollectShaderInfo(program, {.vertex = &vertex}, &error) &&
             AllocateBindings(program, {}, &error),
         error.c_str());
-  Check(program.bindings.user_data_registers ==
-            std::vector<uint32_t>({8, 9, 10, 11, 15}),
-        "native binding plan did not retain physical shifted user-SGPR indices");
+  Check(
+      program.bindings.user_data_registers ==
+          std::vector<uint32_t>({8, 9, 10, 11, 15}),
+      "native binding plan did not retain physical shifted user-SGPR indices");
 }
 
 void TestTextureNullDescriptorUsesAddressBits() {
   ShaderTextureResource texture;
   const uint32_t captured[8] = {0x00000000, 0xc3800000, 0x0059c09f, 0x91b00fac,
                                 0x00000000, 0x00700000, 0x00000000, 0x00000000};
-  std::copy(std::begin(captured), std::end(captured), std::begin(texture.fields));
-  Check(texture.IsNull(),
-        "zero-address image with populated metadata was not classified as null");
+  std::copy(std::begin(captured), std::end(captured),
+            std::begin(texture.fields));
+  Check(
+      texture.IsNull(),
+      "zero-address image with populated metadata was not classified as null");
   texture.fields[0] = 1;
   Check(!texture.IsNull(), "nonzero image base address was classified as null");
 }
@@ -1803,8 +2031,10 @@ void TestTextureNullDescriptorUsesAddressBits() {
 } // namespace
 
 int main() {
-  const char* current = "startup";
-#define RUN(test) current = #test; test()
+  const char *current = "startup";
+#define RUN(test)                                                              \
+  current = #test;                                                             \
+  test()
   try {
     RUN(TestDenseBufferPatching);
     RUN(TestScalarAndVectorBufferAlias);
@@ -1829,11 +2059,13 @@ int main() {
     RUN(TestSrtPatchPlanValidation);
     RUN(TestMaterializationSharesReadConstEvaluation);
     RUN(TestInvalidImagesMaterializeAsNull);
+    RUN(TestInvalidBuffersMaterializeAsNull);
     RUN(TestMaterializationFailureIsTransactional);
     RUN(TestResourceSpecializationIsTypedAndTransactional);
     RUN(TestRuntimeSpecializationCoversBakedBufferAndAddressFields);
     RUN(TestTrackedProgramIsImmutable);
     RUN(TestNativeBindingLayout);
+    RUN(TestNativeBindingLayoutOneDimensionalImages);
     RUN(TestNativeBindingLayoutSrtAndUserDataOverflow);
     RUN(TestNativeBindingLayoutGds);
     RUN(TestNativeBindingLayoutIsTransactional);
@@ -1849,7 +2081,8 @@ int main() {
     std::cout << "ResourceTrackingTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {
-    std::cerr << "ResourceTrackingTests: " << current << " failed: " << e.what() << '\n';
+    std::cerr << "ResourceTrackingTests: " << current << " failed: " << e.what()
+              << '\n';
     return 1;
   }
 #undef RUN

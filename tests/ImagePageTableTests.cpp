@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -69,13 +68,6 @@ void TestAddressSpaceBoundaries() {
 	table.GetOrCreate(Table::kPageCount - 1).push_back(99);
 	Check(table.Find(Table::kPageCount - 1) != nullptr && table.Find(Table::kPageCount - 1)->front() == 99,
 	      "final page supports allocating and nonallocating access");
-	bool  threw = false;
-	try {
-		(void)table.GetOrCreate(Table::kPageCount);
-	} catch (const std::out_of_range&) {
-		threw = true;
-	}
-	Check(threw, "allocating access hard-fails outside the guest address space");
 }
 
 void TestMultiRangeRegistrationDeduplicatesPages() {

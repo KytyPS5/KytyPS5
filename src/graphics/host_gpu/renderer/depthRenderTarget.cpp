@@ -13,12 +13,10 @@
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
+#include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/displayBuffer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -88,7 +86,8 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, RenderDepthInfo& r) {
+void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+                                              RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
 	(void)submit_id;
 	const auto& hw = buffer.GetRegisters();
@@ -103,31 +102,34 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 	if (!depth_active && !stencil_active) {
 		return;
 	}
+	if (!z.z_info.HasValidTextureCompatibility() ||
+	    !z.stencil_info.HasValidTextureCompatibility()) {
+		DepthFatal("invalid PS5 depth texture-compatibility encoding");
+	}
 	const bool attachment_unbound =
 	    z.z_info.format == Prospero::GpuEnumValue(Prospero::DepthFormat::kInvalid) &&
 	    z.stencil_info.format == Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid) &&
-	    z.z_info.tile_mode_index == 0 && z.z_info.num_samples == 0 &&
-	    z.z_info.zrange_precision <= 1 && !z.z_info.expclear_enabled &&
-	    !z.z_info.embedded_sample_locations && !z.z_info.partially_resident &&
-	    z.z_info.num_mip_levels == 0 && z.z_info.plane_compression == 0 &&
-	    z.stencil_info.tile_mode_index == 0 && z.stencil_info.tile_split == 0 &&
-	    !z.stencil_info.expclear_enabled && !z.stencil_info.texture_compatible_stencil &&
-	    !z.stencil_info.partially_resident && z.depth_view.slice_start == 0 &&
-	    z.depth_view.slice_max == 0 && z.depth_view.current_mip_level == 0 &&
-	    !z.depth_view.depth_write_disable && !z.depth_view.stencil_write_disable &&
-	    z.depth_info.addr5_swizzle_mask == 0 && z.depth_info.array_mode == 0 &&
-	    z.depth_info.pipe_config == 0 && z.depth_info.bank_width == 0 &&
-	    z.depth_info.bank_height == 0 && z.depth_info.macro_tile_aspect == 0 &&
-	    z.depth_info.num_banks == 0 && z.htile_surface.linear == 0 &&
-	    z.htile_surface.full_cache == 0 && z.htile_surface.htile_uses_preload_win == 0 &&
-	    z.htile_surface.preload == 0 && z.htile_surface.prefetch_width == 0 &&
-	    z.htile_surface.prefetch_height == 0 && z.htile_surface.dst_outside_zero_to_one == 0 &&
-	    z.z_read_base_addr == 0 && z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
+	    z.z_info.num_samples == 0 &&
+	    z.z_info.texture_compatibility == Prospero::TextureCompatiblePlaneCompression::kDisable &&
+	    !z.z_info.expclear_enabled && !z.z_info.partially_resident && z.z_info.max_mip_level == 0 &&
+	    z.stencil_info.texture_compatibility == Prospero::TextureCompatibleStencil::kDisable &&
+	    !z.stencil_info.expclear_enabled && !z.stencil_info.partially_resident &&
+	    z.depth_view.slice_start == 0 && z.depth_view.slice_max == 0 &&
+	    z.depth_view.current_mip_level == 0 && !z.depth_view.depth_write_disable &&
+	    !z.depth_view.stencil_write_disable && z.depth_info.addr5_swizzle_mask == 0 &&
+	    z.depth_info.array_mode == 0 && z.depth_info.pipe_config == 0 &&
+	    z.depth_info.bank_width == 0 && z.depth_info.bank_height == 0 &&
+	    z.depth_info.macro_tile_aspect == 0 && z.depth_info.num_banks == 0 &&
+	    z.htile_surface.linear == 0 && z.htile_surface.full_cache == 0 &&
+	    z.htile_surface.htile_uses_preload_win == 0 && z.htile_surface.preload == 0 &&
+	    z.htile_surface.prefetch_width == 0 && z.htile_surface.prefetch_height == 0 &&
+	    z.htile_surface.dst_outside_zero_to_one == 0 && z.z_read_base_addr == 0 &&
+	    z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
 	    z.stencil_write_base_addr == 0 && z.htile_data_base_addr == 0 &&
 	    // DB_DEPTH_SIZE_XY is independent state and may remain programmed after the attachment
 	    // formats and addresses are unbound. A zero encoding is the valid 1x1 value, so its
 	    // presence alone must not manufacture a depth attachment.
-	    !z.z_info.tile_surface_enable && !z.width_height_valid && !z.pitch_height_valid &&
+	    !z.z_info.htile_acceleration && !z.width_height_valid && !z.pitch_height_valid &&
 	    z.size.x_max == 0 && z.size.y_max == 0 && z.pitch_div8_minus1 == 0 &&
 	    z.height_div8_minus1 == 0 && z.slice_div64_minus1 == 0 && z.width == 0 && z.height == 0;
 	if (attachment_unbound) {
@@ -139,13 +141,13 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 	}
 	const bool has_stencil =
 	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
-	const bool has_htile = z.z_info.tile_surface_enable;
+	const bool has_htile = z.z_info.htile_acceleration;
 	const auto samples   = render_sample_count(z.z_info.num_samples);
 	if (samples == 0) {
 		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
 	}
 	const bool htile_stencil_compat = depth_htile_stencil_acceleration_compatible(
-	    has_stencil, has_htile, z.stencil_info.tile_stencil_disable);
+	    has_stencil, has_htile, z.stencil_info.htile_stencil_disabled);
 	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
 	switch (view.type) {
 		case TargetViewType::Image2D: break;
@@ -156,14 +158,10 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
-	// Prospero defines the compression-disable bits as tile writeback policy. Vulkan attachments
-	// expose the same logical depth/stencil values regardless of the driver's backing compression.
 	if ((stencil_active && !has_stencil) || rc.resummarize_enable || rc.copy_centroid ||
 	    rc.copy_sample != 0 || z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
-	    z.z_info.embedded_sample_locations || z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.plane_compression != 0 ||
-	    z.z_info.num_mip_levels != 0 || z.z_info.tile_mode_index != 0 ||
-	    z.z_info.zrange_precision > 1 || z.depth_view.current_mip_level != 0 ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
 	    z.depth_info.addr5_swizzle_mask != 0 || z.depth_info.array_mode != 0 ||
 	    z.depth_info.pipe_config != 0 || z.depth_info.bank_width != 0 ||
 	    z.depth_info.bank_height != 0 || z.depth_info.macro_tile_aspect != 0 ||
@@ -177,27 +175,16 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		DepthFatal("unsupported depth register state");
 	}
 	if (has_stencil) {
-		// Prospero defines Hi-Stencil as HTile-backed acceleration of the logical stencil plane.
-		// Keep the plane native in Vulkan while tracking HTile separately.
 		if (z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt) ||
-		    z.stencil_info.tile_mode_index != 0 || z.stencil_info.tile_split != 0 ||
-		    !htile_stencil_compat || z.stencil_info.texture_compatible_stencil ||
-		    z.stencil_read_base_addr == 0 ||
+		    !htile_stencil_compat || z.stencil_read_base_addr == 0 ||
 		    z.stencil_write_base_addr != z.stencil_read_base_addr ||
 		    (z.stencil_read_base_addr & 0xffffu) != 0 || z.depth_view.stencil_write_disable) {
 			DepthFatal("unsupported stencil attachment state");
 		}
-		if (!z.stencil_info.tile_stencil_disable) {
-			static std::atomic_bool logged = false;
-			if (!logged.load(std::memory_order_relaxed) &&
-			    !logged.exchange(true, std::memory_order_relaxed)) {
-				LOGF("DepthTarget: compatibility: using native stencil with PS5 HTILE "
-				     "acceleration\n");
-			}
-		}
 	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0 ||
-	           z.stencil_info.tile_mode_index != 0 || z.stencil_info.tile_split != 0 ||
-	           !htile_stencil_compat || z.stencil_info.texture_compatible_stencil) {
+	           !htile_stencil_compat ||
+	           z.stencil_info.texture_compatibility !=
+	               Prospero::TextureCompatibleStencil::kDisable) {
 		DepthFatal("stencil state without an active stencil attachment");
 	}
 	if (has_htile) {
@@ -272,28 +259,19 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 	    (has_htile && htile_backing_size > TRACKER_ADDRESS_SIZE - z.htile_data_base_addr)) {
 		DepthFatal("layered depth backing range is invalid");
 	}
-	r.htile                = has_htile;
-	r.width                = width;
-	r.height               = height;
-	r.samples              = samples;
-	r.depth_buffer_size    = depth_backing_size;
-	r.depth_buffer_vaddr   = z.z_read_base_addr;
-	r.stencil_buffer_size  = has_stencil ? stencil_backing_size : 0;
-	r.stencil_buffer_vaddr = has_stencil ? z.stencil_read_base_addr : 0;
-	r.htile_buffer_size    = has_htile ? htile_backing_size : 0;
-	r.htile_buffer_vaddr   = has_htile ? z.htile_data_base_addr : 0;
-	auto& cache            = GetRenderContext().GetTextureCache();
-	if (has_htile) {
-		cache.RegisterMeta(r.htile_buffer_vaddr, r.htile_buffer_size, view.image_layers);
-	}
-	if (has_htile && rc.depth_clear_enable && !cache.ClearMeta(z.htile_data_base_addr)) {
-		DepthFatal("failed to acquire HTile metadata for a depth clear");
-	}
-	const bool meta_clear =
-	    has_htile && cache.IsMetaCleared(z.htile_data_base_addr, z.depth_view.slice_start);
+	r.htile                   = has_htile;
+	r.width                   = width;
+	r.height                  = height;
+	r.samples                 = samples;
+	r.depth_buffer_size       = depth_backing_size;
+	r.depth_buffer_vaddr      = z.z_read_base_addr;
+	r.stencil_buffer_size     = has_stencil ? stencil_backing_size : 0;
+	r.stencil_buffer_vaddr    = has_stencil ? z.stencil_read_base_addr : 0;
+	r.htile_buffer_size       = has_htile ? htile_backing_size : 0;
+	r.htile_buffer_vaddr      = has_htile ? z.htile_data_base_addr : 0;
 	r.depth_clear_enable      = rc.depth_clear_enable;
-	r.depth_meta_clear_enable = meta_clear;
-	r.depth_load_clear_enable = r.depth_clear_enable || r.depth_meta_clear_enable;
+	r.depth_meta_clear_enable = false;
+	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
 	r.depth_write_enable      = dc.z_write_enable && !z.depth_view.depth_write_disable;
@@ -343,55 +321,93 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		r.vaddr[1] = r.stencil_buffer_vaddr;
 		r.size[1]  = r.stencil_buffer_size;
 	}
-	DepthTargetInfo info {};
-	info.address            = r.depth_buffer_vaddr;
-	info.size               = r.depth_buffer_size;
-	info.stencil_address    = r.stencil_buffer_vaddr;
-	info.stencil_size       = r.stencil_buffer_size;
-	info.htile_address      = r.htile_buffer_vaddr;
-	info.htile_size         = r.htile_buffer_size;
-	info.format             = r.format;
-	info.guest_format       = guest_format;
-	info.width              = width;
-	info.height             = height;
-	info.pitch              = pitch;
-	info.bytes_per_element  = bytes;
-	info.tile_mode          = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
-	info.layers             = view.image_layers;
-	info.samples            = samples;
-	info.depth_load_clear   = r.depth_load_clear_enable;
-	info.depth_access       = depth_active;
-	info.stencil_load_clear = rc.stencil_clear_enable;
-	info.stencil_access =
-	    r.stencil_clear_enable ||
-	    (r.stencil_test_enable &&
-	     (stencil_face_accesses_attachment(r.stencil_static_front, r.stencil_dynamic_front) ||
-	      stencil_face_accesses_attachment(r.stencil_static_back, r.stencil_dynamic_back)));
-	info.stencil_htile_compressed =
-	    has_stencil && has_htile && !z.stencil_info.tile_stencil_disable;
-	r.vulkan_buffer = &cache.FindDepthTarget(buffer, info);
-	r.vulkan_view =
-	    cache.GetDepthTargetAttachmentView(*r.vulkan_buffer, view.base_layer, view.layer_count);
-	if (r.vulkan_buffer->initial_depth_clear_pending) {
-		r.depth_load_clear_enable = true;
-		r.depth_clear_value       = 0.0f;
-	}
-	if (r.vulkan_buffer->initial_stencil_clear_pending) {
-		r.stencil_clear_enable = true;
-		r.stencil_clear_value  = 0;
-	}
-	if (meta_clear && !cache.TouchMeta(z.htile_data_base_addr, z.depth_view.slice_start, false)) {
-		DepthFatal("failed to consume HTile clear state");
-	}
+	TextureCache::ImageDesc desc {};
+	desc.type                 = TextureCache::BindingType::DepthTarget;
+	desc.info.data            = {r.depth_buffer_vaddr, r.depth_buffer_size};
+	desc.info.stencil         = {r.stencil_buffer_vaddr, r.stencil_buffer_size};
+	desc.info.pixel_format    = r.format;
+	desc.info.guest_format    = guest_format;
+	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.extent          = {width, height, 1};
+	desc.info.resources       = {1, view.image_layers};
+	desc.info.pitch           = pitch;
+	desc.info.bytes_per_block = bytes;
+	desc.info.samples         = samples;
+	desc.info.tile_mode       = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+	desc.info.mip_layout[0]   = {0, r.depth_buffer_size, pitch, height};
+	desc.info.metadata.range  = {r.htile_buffer_vaddr, r.htile_buffer_size};
+	desc.info.metadata.kind   = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;
+	desc.info.metadata.stencil_compressed =
+	    has_stencil && has_htile && !z.stencil_info.htile_stencil_disabled;
+	desc.view_info.format = r.format;
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	desc.view_info.aspect      = ImageViewOps::DepthAspectMask(r.format);
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer  = view.base_layer;
+	desc.view_info.layer_count = view.layer_count;
+	desc.view_info.usage       = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	r.desc                     = std::move(desc);
+	auto& cache                = m_context.GetTextureCache();
+	r.image_id                 = cache.FindImage(r.desc);
+	r.image_view               = nullptr;
+	BindRenderTarget(r.image_id);
 }
 
-void MarkRenderTargetGpuWritten(const RenderDepthInfo& target) {
-	const bool with_depth =
-	    target.format != vk::Format::eUndefined && target.vulkan_buffer != nullptr;
-
-	if (with_depth && !depth_attachment_read_only(target)) {
-		GetRenderContext().GetTextureCache().MarkGpuWritten(*target.vulkan_buffer);
+vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
+	if (format == vk::Format::eUndefined) {
+		return {};
 	}
+
+	const auto           available = ImageViewOps::DepthAspectMask(format);
+	vk::ImageAspectFlags writes {};
+	if ((available & vk::ImageAspectFlagBits::eDepth) &&
+	    (depth_load_clear_enable || (depth_test_enable && depth_write_enable))) {
+		writes |= vk::ImageAspectFlagBits::eDepth;
+	}
+	if (!(available & vk::ImageAspectFlagBits::eStencil)) {
+		return writes;
+	}
+
+	const auto face_writes = [&](const PipelineStencilStaticState&  state,
+	                             const PipelineStencilDynamicState& dynamic) {
+		if (dynamic.writeMask == 0) {
+			return false;
+		}
+		bool can_pass = state.compareOp != vk::CompareOp::eNever;
+		bool can_fail = state.compareOp != vk::CompareOp::eAlways;
+		if (dynamic.compareMask == 0) {
+			switch (state.compareOp) {
+				case vk::CompareOp::eEqual:
+				case vk::CompareOp::eLessOrEqual:
+				case vk::CompareOp::eGreaterOrEqual:
+				case vk::CompareOp::eAlways:
+					can_pass = true;
+					can_fail = false;
+					break;
+				case vk::CompareOp::eNever:
+				case vk::CompareOp::eLess:
+				case vk::CompareOp::eGreater:
+				case vk::CompareOp::eNotEqual:
+					can_pass = false;
+					can_fail = true;
+					break;
+				default: break;
+			}
+		}
+		const bool depth_pass = !depth_test_enable || depth_compare_op != vk::CompareOp::eNever;
+		const bool depth_fail = depth_test_enable && depth_compare_op != vk::CompareOp::eAlways;
+		return (can_fail && state.failOp != vk::StencilOp::eKeep) ||
+		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
+		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
+	};
+	if (stencil_clear_enable ||
+	    (stencil_test_enable && (face_writes(stencil_static_front, stencil_dynamic_front) ||
+	                             face_writes(stencil_static_back, stencil_dynamic_back)))) {
+		writes |= vk::ImageAspectFlagBits::eStencil;
+	}
+	return writes;
 }
 
 } // namespace Libs::Graphics

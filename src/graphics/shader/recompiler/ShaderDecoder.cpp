@@ -134,15 +134,6 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 	return text;
 }
 
-const char* ImageDimensionToString(ImageDimension dimension) {
-	switch (dimension) {
-		case ImageDimension::Dim2D: return "2d";
-		case ImageDimension::Dim3D: return "3d";
-		case ImageDimension::Dim2DArray: return "2d_array";
-		default: return "unknown";
-	}
-}
-
 std::string FormatMimg(const Instruction& inst) {
 	const char* sample_name =
 	    inst.opcode == Opcode::ImageSample ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
@@ -195,6 +186,17 @@ std::string FormatExp(const Instruction& inst) {
 }
 
 } // namespace
+
+const char* ImageDimensionToString(ImageDimension dimension) {
+	switch (dimension) {
+		case ImageDimension::Dim1D: return "1d";
+		case ImageDimension::Dim1DArray: return "1d_array";
+		case ImageDimension::Dim2D: return "2d";
+		case ImageDimension::Dim3D: return "3d";
+		case ImageDimension::Dim2DArray: return "2d_array";
+		default: return "unknown";
+	}
+}
 
 bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error) {
 	operand = {};

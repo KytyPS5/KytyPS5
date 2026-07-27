@@ -1,7 +1,5 @@
 #include "graphics/shader/shader.h"
 
-#include "graphics/host_gpu/guestMemoryWindow.h"
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -14,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -32,7 +31,6 @@
 #include <span>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -117,15 +115,6 @@ static std::unordered_map<ShaderStageProgramKey,
                           ShaderStageProgramKeyHash>
                   g_shader_program_cache;
 static std::mutex g_shader_program_cache_mutex;
-
-// A compute shader that fails to compile (e.g. a resource index this AOT compiler cannot resolve
-// statically -- see ShaderCompileSpirvCS) is never added to g_shader_program_cache, since that
-// cache only holds successful permutations. Without remembering the failure separately, a shader
-// dispatched many times per frame (a per-tile/per-light compute pass is a common case) reruns the
-// full decode/CFG-build/structurize/lower pipeline from scratch on every single dispatch even
-// though it is guaranteed to fail the same way again, which can turn a single unsupported shader
-// into a many-seconds-per-frame stall instead of one cheap, bounded compile attempt.
-static std::unordered_set<ShaderStageProgramKey, ShaderStageProgramKeyHash> g_failed_cs_shaders;
 
 static constexpr uint32_t ShaderMaxPermutationsPerProgram = 64;
 
@@ -802,6 +791,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    const ShaderVertexInputInfo&                        vs_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	KYTY_PROFILER_FUNCTION();
@@ -832,10 +822,15 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
 	}
 
-	// Keep graphics-stage descriptor sets stable so VS and PS can be compiled independently.
-	// Pipeline creation inserts an empty set 0 layout when a descriptor-less VS is paired with a
-	// descriptor-using PS.
-	ps_info.descriptor_set = 1;
+	ps_info.descriptor_set =
+	    vs_info.stage.program != nullptr && !vs_info.stage.program->bindings.descriptors.empty()
+	        ? 1
+	        : 0;
+	ps_info.push_constant_offset =
+	    vs_info.stage.program != nullptr
+	        ? vs_info.stage.program->bindings.push_constant_offset +
+	              vs_info.stage.program->bindings.push_constant_size
+	        : 0;
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
@@ -1000,9 +995,11 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 	ids.push_back(program.bindings.descriptor_set);
 	ids.push_back(program.bindings.push_constant_offset);
 	ids.push_back(program.bindings.push_constant_size);
+	ids.push_back(program.bindings.buffer_offset_dword);
+	ids.push_back(program.bindings.buffer_offset_count);
 	ids.push_back(static_cast<uint32_t>(program.bindings.user_data_registers.size()));
 	ids.insert(ids.end(), program.bindings.user_data_registers.begin(),
-	            program.bindings.user_data_registers.end());
+	           program.bindings.user_data_registers.end());
 	ids.push_back(static_cast<uint32_t>(program.bindings.descriptors.size()));
 	for (const auto& binding: program.bindings.descriptors) {
 		ids.push_back(static_cast<uint32_t>(binding.kind));
@@ -1065,71 +1062,31 @@ static std::span<const uint32_t> AddShaderProgramPermutation(const char* stage,
 	return spirv;
 }
 
-bool ShaderPrepareInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderVertexInputInfo& info) {
-	return ShaderGetStaticInputInfoVS(regs, sh, info);
-}
-
-void ShaderPrepareInfoPS(
-    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo& info) {
-	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, info);
-}
-
-bool ShaderTryUsePreparedInfoVS(const HW::VertexShaderInfo& regs,
-                                ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
-                                std::span<const uint32_t>& spirv) {
-	const auto shader_hash = regs.gs_regs.chksum;
-	const auto program_id  = ShaderGetIdVS(regs, info, false);
-	const auto key =
-	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
-	std::scoped_lock lock(g_shader_program_cache_mutex);
-	if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
-		for (const auto& permutation: iter->second) {
-			if (TryUseVertexPermutation(*permutation, regs, info, shader_hash)) {
-				spirv = MakeShaderSpirvView(permutation->spirv);
-				LogShaderProgramCacheHit("VS", shader_hash, static_cast<uint64_t>(spirv.size()));
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-bool ShaderTryUsePreparedInfoPS(const HW::PixelShaderInfo& regs,
-                                ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo& ps_info,
-                                std::span<const uint32_t>& spirv) {
-	const auto shader_hash =
-	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
-	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
-	const auto key =
-	    MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id, lane_mask_mode);
-	std::scoped_lock lock(g_shader_program_cache_mutex);
-	if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
-		for (const auto& permutation: iter->second) {
-			if (TryUsePixelPermutation(*permutation, regs, ps_info, shader_hash)) {
-				spirv = MakeShaderSpirvView(permutation->spirv);
-				LogShaderProgramCacheHit("PS", shader_hash, static_cast<uint64_t>(spirv.size()));
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-bool ShaderCompilePreparedInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                                 ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
-                                 std::span<const uint32_t>& spirv) {
+bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                         ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
+                         std::span<const uint32_t>& spirv) {
 	spirv = {};
 
+	if (!ShaderGetStaticInputInfoVS(regs, sh, info)) {
+		return false;
+	}
 	const auto shader_hash = regs.gs_regs.chksum;
 	const auto program_id  = ShaderGetIdVS(regs, info, false);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
 
-	if (ShaderTryUsePreparedInfoVS(regs, lane_mask_mode, info, spirv)) {
-		return true;
+	{
+		std::scoped_lock lock(g_shader_program_cache_mutex);
+		if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
+			for (const auto& permutation: iter->second) {
+				if (TryUseVertexPermutation(*permutation, regs, info, shader_hash)) {
+					spirv = MakeShaderSpirvView(permutation->spirv);
+					LogShaderProgramCacheHit("VS", shader_hash,
+					                         static_cast<uint64_t>(spirv.size()));
+					return true;
+				}
+			}
+		}
 	}
 
 	std::vector<uint32_t> compiled_spirv;
@@ -1144,20 +1101,31 @@ bool ShaderCompilePreparedInfoVS(const HW::VertexShaderInfo& regs, const HW::Sha
 	return true;
 }
 
-bool ShaderCompilePreparedInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                                 ShaderLaneMaskMode lane_mask_mode,
-                                 ShaderPixelInputInfo& ps_info,
-                                 std::span<const uint32_t>& spirv) {
+bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                         ShaderLaneMaskMode lane_mask_mode, const ShaderVertexInputInfo& vs_info,
+                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                         ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv) {
 	spirv = {};
 
+	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, ps_info);
 	const auto shader_hash =
 	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
 	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id, lane_mask_mode);
 
-	if (ShaderTryUsePreparedInfoPS(regs, lane_mask_mode, ps_info, spirv)) {
-		return true;
+	{
+		std::scoped_lock lock(g_shader_program_cache_mutex);
+		if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
+			for (const auto& permutation: iter->second) {
+				if (TryUsePixelPermutation(*permutation, regs, ps_info, shader_hash)) {
+					spirv = MakeShaderSpirvView(permutation->spirv);
+					LogShaderProgramCacheHit("PS", shader_hash,
+					                         static_cast<uint64_t>(spirv.size()));
+					return true;
+				}
+			}
+		}
 	}
 
 	std::vector<uint32_t> compiled_spirv;
@@ -1170,22 +1138,6 @@ bool ShaderCompilePreparedInfoPS(const HW::PixelShaderInfo& regs, const HW::Shad
 	permutation.program = ps_info.stage.program;
 	spirv = AddShaderProgramPermutation("PS", shader_hash, key, std::move(permutation));
 	return true;
-}
-
-bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
-                         std::span<const uint32_t>& spirv) {
-	return ShaderPrepareInfoVS(regs, sh, info) &&
-	       ShaderCompilePreparedInfoVS(regs, sh, lane_mask_mode, info, spirv);
-}
-
-bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode,
-                         const ShaderVertexInputInfo& /*vs_info*/,
-                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-                         ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv) {
-	ShaderPrepareInfoPS(regs, sh, target_export_mapping, ps_info);
-	return ShaderCompilePreparedInfoPS(regs, sh, lane_mask_mode, ps_info, spirv);
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
@@ -1210,15 +1162,10 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 				}
 			}
 		}
-		if (g_failed_cs_shaders.contains(key)) {
-			return false;
-		}
 	}
 
 	std::vector<uint32_t> compiled_spirv;
 	if (!ShaderCompileSpirvCS(regs, sh, info, compiled_spirv)) {
-		std::scoped_lock lock(g_shader_program_cache_mutex);
-		g_failed_cs_shaders.insert(key);
 		return false;
 	}
 
@@ -1345,9 +1292,9 @@ static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
 
 	static std::atomic_int id = 0;
 
-	const auto base_name = Config::GetShaderLogFolder() /
-	                       fmt::format("{:04d}_{:04d}_new_shader_{}_{:016x}",
-	                                   GraphicsRunGetFrameNum(), id++, type, shader_hash);
+	const auto base_name =
+	    Config::GetShaderLogFolder() /
+	    fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
 	Common::File spv_file;
@@ -1396,9 +1343,9 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 
 	static std::atomic_int id = 0;
 
-	const auto base_name = Config::GetShaderLogFolder() / "original" /
-	                       fmt::format("{:04d}_{:04d}_new_shader_{}_{:016x}",
-	                                   GraphicsRunGetFrameNum(), id++, type, shader_hash);
+	const auto base_name =
+	    Config::GetShaderLogFolder() / "original" /
+	    fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
 	Common::File bin_file;
@@ -1447,7 +1394,6 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.descriptor_set       = 0;
 	options.push_constant_offset = 0;
 	options.vertex_input_info    = &input_info;
-	options.guest_window_chunks  = GetGuestMemoryWindow().ChunkCount();
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler VS";
@@ -1499,17 +1445,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.user_data_count      = regs.ps_regs.rsrc2.user_sgpr;
 	options.user_data            = regs.ps_user_sgpr.value;
 	options.descriptor_set       = input_info.descriptor_set;
-	// A graphics pipeline's VS and PS share one VkPipelineLayout/push-constant block
-	// (shaders.cpp CreateLayout, called once per stage into the same push_constant_info array).
-	// VS always compiles with offset 0; give PS the other half of the 128-byte portable minimum
-	// (Vulkan's guaranteed maxPushConstantsSize) so the two stages' ranges/vkCmdPushConstants
-	// calls never alias the same bytes with different data -- they used to, which both corrupted
-	// whichever stage got pushed first and tripped VUID-vkCmdPushConstants-offset-01796. PS
-	// shaders whose data no longer fits in 64 bytes gracefully fall back to the UserData
-	// descriptor-buffer path (BindingLayout.cpp).
-	options.push_constant_offset = 64;
+	options.push_constant_offset = input_info.push_constant_offset;
 	options.pixel_input_info     = &input_info;
-	options.guest_window_chunks  = GetGuestMemoryWindow().ChunkCount();
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler PS";
@@ -1560,7 +1497,6 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.push_constant_offset = 0;
 	options.compute_input_info   = &input_info;
 	options.wave_size            = input_info.wave_size;
-	options.guest_window_chunks  = GetGuestMemoryWindow().ChunkCount();
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";
@@ -1568,18 +1504,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
-		// Compute-shader compile failures are usually a specific unsupported pattern (e.g. a
-		// resource index computed from a cross-lane runtime search that static analysis cannot
-		// resolve to a descriptor) rather than a broadly fatal bug. Skip this dispatch instead of
-		// crashing the whole process so the rest of the frame/game can keep running; the caller
-		// (RenderDispatchDirect) treats a false return as "drop this dispatch".
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF_COLOR(Log::Color::BrightRed,
-			           "ShaderRecompiler CS failed hash=0x%016" PRIx64 ": %s (dispatch skipped)\n",
-			           options.shader_hash, error.c_str());
-		}
-		return false;
+		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
 	}
 	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler CS", options.shader_hash, result.spirv)) {
@@ -1674,6 +1599,7 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 	ret.crc32 = regs.ps_regs.chksum & 0xffffffffu;
 
 	ret.ids.push_back(input_info.descriptor_set);
+	ret.ids.push_back(input_info.push_constant_offset);
 	ret.ids.push_back(input_info.input_num);
 	ret.ids.push_back(input_info.ps_system_input_base);
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_x));

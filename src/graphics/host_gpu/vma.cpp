@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vma.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 
@@ -109,6 +110,58 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+}
+
+uint64_t GraphicContext::GetDeviceMemoryUsage() const {
+	if (!CanReportMemoryUsage() || allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const bool discrete =
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	uint64_t usage = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local = static_cast<bool>(
+		    physical_device_memory_properties.memoryHeaps[heap].flags &
+		    vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (!discrete || device_local) {
+			usage += budgets[heap].usage;
+		}
+	}
+	return usage;
+}
+
+uint64_t GraphicContext::GetTotalMemoryBudget() const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const bool discrete =
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	uint64_t budget = 0;
+	uint64_t local  = 0;
+	uint64_t usage  = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const auto& properties   = physical_device_memory_properties.memoryHeaps[heap];
+		const bool  device_local =
+		    static_cast<bool>(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (device_local) {
+			local += properties.size;
+		}
+		if (!discrete || device_local) {
+			budget += CanReportMemoryUsage() ? budgets[heap].budget : properties.size;
+			usage += CanReportMemoryUsage() ? budgets[heap].usage : 0;
+		}
+	}
+	if (discrete) {
+		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+	}
+	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
+	const auto available = budget > usage ? budget - usage : uint64_t {0};
+	return std::max(local,
+	                available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
 void GraphicContext::CreateBuffer(uint64_t size, VulkanBuffer& buffer) {

@@ -3,6 +3,7 @@
 
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/textureCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
@@ -10,18 +11,17 @@
 namespace Libs::Graphics {
 
 class RenderCommandBuffer;
-struct VulkanImage;
 
 enum class RenderColorType {
 	NoColorOutput,
-	DisplayBuffer,
 	RenderTexture,
 };
 
 struct RenderColorInfo {
-	RenderColorType                 type             = RenderColorType::NoColorOutput;
-	VulkanImage*                    vulkan_buffer    = nullptr;
-	vk::ImageView                   vulkan_view      = nullptr;
+	RenderColorType                 type = RenderColorType::NoColorOutput;
+	TextureCache::ImageDesc         desc;
+	ImageId                         image_id;
+	vk::ImageView                   image_view       = nullptr;
 	vk::Format                      format           = vk::Format::eUndefined;
 	vk::Extent2D                    extent           = {};
 	uint32_t                        base_mip_level   = 0;
@@ -34,13 +34,6 @@ struct RenderColorInfo {
 	bool                            color_clear_enable = false;
 	vk::ClearColorValue             color_clear_value {};
 };
-
-void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, RenderColorInfo& r,
-                              uint32_t render_target_slice_offset    = 0,
-                              uint32_t render_target_slot            = UINT32_MAX,
-                              bool     ignore_target_mask            = false,
-                              bool     reuse_existing_render_texture = false);
-void MarkRenderTargetGpuWritten(const RenderColorInfo& target);
 
 } // namespace Libs::Graphics
 

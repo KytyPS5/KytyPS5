@@ -13,7 +13,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
@@ -568,8 +568,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			EXIT("invalid access type for page fault at 0x%016" PRIx64 "\n",
 			     info->access_violation_vaddr);
 		}();
-		if (Libs::Graphics::GetRenderContext().GetGpuResources().HandleFault(
-		        access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
 

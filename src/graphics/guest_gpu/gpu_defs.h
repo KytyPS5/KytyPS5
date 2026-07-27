@@ -142,6 +142,24 @@ enum class StencilFormat : uint32_t {
 	k8UInt   = 1,
 };
 
+enum class TextureCompatiblePlaneCompression : uint32_t {
+	kDisable = 0x00000000,
+	kEnable  = 0x02900800,
+	kBitMask = 0x02900800,
+};
+
+enum class TextureCompatibleStencil : uint32_t {
+	kDisable = 0x00000000,
+	kEnable  = 0x00100800,
+	kBitMask = 0x00100800,
+};
+
+enum class ZCompareBase : uint32_t {
+	kZMin    = 0x00000000,
+	kZMax    = 0x80000000,
+	kBitMask = 0x80000000,
+};
+
 enum class TileMode : uint32_t {
 	kLinear       = 0x00,
 	kStandard256B = 0x01,

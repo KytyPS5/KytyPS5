@@ -9,20 +9,15 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
-#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/objects/label.h"
-#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/descriptors.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/shaderSubgroup.h"
-#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
@@ -50,217 +45,35 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	return stride == 0 ? records : records * stride;
 }
 
-bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor_size,
-                             HtileClearTarget& resolved) {
-	resolved = {};
-	const bool has_stencil =
-	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
-	const auto* depth_policy = FindDepthFormatPolicy(z.z_info.format);
-	const bool  supported_depth_state =
-	    z.z_info.tile_surface_enable && depth_policy != nullptr && z.z_info.tile_mode_index == 0 &&
-	    z.z_info.num_samples <= 3 && z.z_info.zrange_precision <= 1 && !z.z_info.expclear_enabled &&
-	    !z.z_info.embedded_sample_locations && !z.z_info.partially_resident &&
-	    z.z_info.num_mip_levels == 0 && z.z_info.plane_compression == 0 &&
-	    z.depth_view.current_mip_level == 0 && z.depth_view.slice_start == 0 &&
-	    z.depth_view.slice_max == 0 && z.depth_info.addr5_swizzle_mask == 0 &&
-	    z.depth_info.array_mode == 0 && z.depth_info.pipe_config == 0 &&
-	    z.depth_info.bank_width == 0 && z.depth_info.bank_height == 0 &&
-	    z.depth_info.macro_tile_aspect == 0 && z.depth_info.num_banks == 0;
-	const bool supported_stencil_state =
-	    z.stencil_info.tile_mode_index == 0 && z.stencil_info.tile_split == 0 &&
-	    !z.stencil_info.expclear_enabled &&
-	    depth_htile_stencil_acceleration_compatible(has_stencil, true,
-	                                                z.stencil_info.tile_stencil_disable) &&
-	    !z.stencil_info.texture_compatible_stencil && !z.stencil_info.partially_resident &&
-	    (!has_stencil ||
-	     (z.stencil_info.format == Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt) &&
-	      !z.depth_view.stencil_write_disable));
-	const bool supported_htile_state =
-	    z.htile_surface.linear == 0 && z.htile_surface.full_cache == 0 &&
-	    z.htile_surface.htile_uses_preload_win == 0 && z.htile_surface.preload == 0 &&
-	    z.htile_surface.prefetch_width == 0 && z.htile_surface.prefetch_height == 0 &&
-	    z.htile_surface.dst_outside_zero_to_one == 0;
-	const bool supported_addresses =
-	    z.z_read_base_addr != 0 && z.z_write_base_addr == z.z_read_base_addr &&
-	    (z.z_read_base_addr & 0xffffu) == 0 &&
-	    (has_stencil ? z.stencil_read_base_addr != 0 &&
-	                       z.stencil_write_base_addr == z.stencil_read_base_addr &&
-	                       (z.stencil_read_base_addr & 0xffffu) == 0
-	                 : z.stencil_read_base_addr == 0 && z.stencil_write_base_addr == 0) &&
-	    z.htile_data_base_addr != 0 && (z.htile_data_base_addr & 0x7fffu) == 0 &&
-	    descriptor_size != 0 && (descriptor_size & 0x7fffu) == 0 &&
-	    z.htile_data_base_addr < TRACKER_ADDRESS_SIZE &&
-	    descriptor_size <= TRACKER_ADDRESS_SIZE - z.htile_data_base_addr;
-	if (!supported_depth_state || !supported_stencil_state || !supported_htile_state ||
-	    !supported_addresses) {
-		return false;
-	}
-
-	const bool size_xy_valid = z.size.valid;
-	const bool wh_valid      = z.width_height_valid && z.width != 0 && z.height != 0;
-	if (!size_xy_valid && !wh_valid) {
-		// Prospero emits an exact full-surface metadata descriptor even
-		// when the compute context omits depth extent registers. Admit only that wholly absent
-		// layout state; partially programmed layouts remain unsupported.
-		const bool descriptor_backed_state =
-		    !z.size.valid && z.size.x_max == 0 && z.size.y_max == 0 && !z.width_height_valid &&
-		    z.width == 0 && z.height == 0 && !z.pitch_height_valid && z.pitch_div8_minus1 == 0 &&
-		    z.height_div8_minus1 == 0 && z.slice_div64_minus1 == 0;
-		if (!descriptor_backed_state) {
-			return false;
-		}
-		resolved = {.address = z.htile_data_base_addr, .size = descriptor_size};
-		return true;
-	}
-	const uint32_t width  = size_xy_valid ? static_cast<uint32_t>(z.size.x_max) + 1u : z.width;
-	const uint32_t height = size_xy_valid ? static_cast<uint32_t>(z.size.y_max) + 1u : z.height;
-	if (width > 16384 || height > 16384 ||
-	    (size_xy_valid && wh_valid && (width != z.width || height != z.height)) ||
-	    (!z.pitch_height_valid &&
-	     (z.pitch_div8_minus1 != 0 || z.height_div8_minus1 != 0 || z.slice_div64_minus1 != 0))) {
-		return false;
-	}
-	TileSizeAlign htile_size {};
-	if (!TileGetHtileSize(width, height, htile_size) || htile_size.size != descriptor_size) {
-		return false;
-	}
-	resolved = {.address = z.htile_data_base_addr, .size = htile_size.size};
-	return true;
-}
-
-static void ValidateFullHtileClearDispatch(const ShaderComputeInputInfo& input,
-                                           const ShaderBufferResource& metadata, uint32_t group_x,
-                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
-	const bool thread_dimensions = input.dispatch_thread_dimensions;
-	const bool supported_shape =
-	    input.threads_num[0] == 64 && input.threads_num[1] == 1 && input.threads_num[2] == 1 &&
-	    group_x != 0 && group_y == 1 && group_z == 1 && input.group_id[0] && !input.group_id[1] &&
-	    !input.group_id[2] && input.thread_ids_num == 1 && input.wave_size == 32 &&
-	    !input.tg_size_en && mode == (thread_dimensions ? 0x61u : 0x41u);
-	const bool dimensions_match =
-	    thread_dimensions
-	        ? input.dispatch_threads_num[0] == group_x && input.dispatch_threads_num[1] == 1 &&
-	              input.dispatch_threads_num[2] == 1 && group_x % input.threads_num[0] == 0
-	        : input.dispatch_threads_num[0] == 0 && input.dispatch_threads_num[1] == 0 &&
-	              input.dispatch_threads_num[2] == 0;
-	const uint64_t launched_threads =
-	    thread_dimensions ? group_x : static_cast<uint64_t>(group_x) * input.threads_num[0];
-	if (!supported_shape || !dimensions_match || metadata.Stride() == 0 ||
-	    launched_threads != metadata.NumRecords()) {
-		EXIT("HTile compute clear does not cover the complete metadata surface\n");
-	}
-}
-
-static bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                       const RenderCommandBuffer& buffer, uint32_t group_x,
-                                       uint32_t group_y, uint32_t group_z, uint32_t mode) {
-	const auto& ctx       = buffer.GetRegisters();
+bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+                                                const RenderCommandBuffer&    buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
-	const auto&                 z                   = ctx.GetDepthRenderTarget();
-	const uint64_t              meta_addr           = z.htile_data_base_addr;
-	auto&                       cache               = GetRenderContext().GetTextureCache();
-	uint32_t                    current_references  = 0;
-	uint32_t                    registered_writes   = 0;
-	uint64_t                    described_meta_size = 0;
-	HtileClearTarget            registered_target {};
-	TextureCache::MetaRangeInfo registered_meta {};
+	auto& cache = buffer.GetContext().GetTextureCache();
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		const auto  descriptor_size = BufferDescriptorSize(descriptor);
-		if (meta_addr != 0 && descriptor.Base48() == meta_addr) {
-			current_references++;
-			described_meta_size = descriptor_size;
-		}
-		// An exact registered metadata range remains
-		// identifiable even when it is no longer the currently bound depth target.
-		TextureCache::MetaRangeInfo resolved_meta {};
-		if (resource.written &&
-		    cache.ResolveMetaRange(descriptor.Base48(), descriptor_size, resolved_meta)) {
-			registered_writes++;
-			registered_target = {.address = descriptor.Base48(), .size = descriptor_size};
-			registered_meta   = resolved_meta;
+		if (!resource.written && cache.IsMeta(descriptor.Base48())) {
+			return false;
 		}
 	}
-	if (current_references == 0 && registered_writes == 0) {
-		return false;
-	}
-	if (current_references > 1 || (current_references == 0 && registered_writes > 1)) {
-		EXIT("HTile clear has ambiguous metadata descriptors: current=%u registered=%u\n",
-		     current_references, registered_writes);
-	}
-	HtileClearTarget target {};
-	if (current_references != 0) {
-		if (!ResolveHtileClearTarget(z, described_meta_size, target)) {
-			EXIT("unsupported HTile compute-clear target state: current=%u registered=%u "
-			     "meta=0x%016" PRIx64 "+0x%016" PRIx64 " depth=0x%016" PRIx64 "/0x%016" PRIx64
-			     " stencil=0x%016" PRIx64 "/0x%016" PRIx64
-			     " extent=%d:%ux%u wh=%d:%ux%u pitch=%d:%u/%u/%u zfmt=%u sfmt=%u samples=%u\n",
-			     current_references, registered_writes, meta_addr, described_meta_size,
-			     z.z_read_base_addr, z.z_write_base_addr, z.stencil_read_base_addr,
-			     z.stencil_write_base_addr, z.size.valid, static_cast<uint32_t>(z.size.x_max) + 1u,
-			     static_cast<uint32_t>(z.size.y_max) + 1u, z.width_height_valid, z.width, z.height,
-			     z.pitch_height_valid, z.pitch_div8_minus1, z.height_div8_minus1,
-			     z.slice_div64_minus1, z.z_info.format, z.stencil_info.format,
-			     z.z_info.num_samples);
-		}
-		cache.RegisterMeta(target.address, target.size);
-		if (!cache.ResolveMetaRange(target.address, target.size, registered_meta)) {
-			EXIT("failed to resolve registered HTile compute-clear range\n");
-		}
-	} else {
-		target = registered_target;
-	}
-	GetRenderContext().GetBufferCache().ValidateGpuAccess(target.address, target.size, false, true);
 
-	uint32_t             metadata_writes = 0;
-	ShaderBufferResource metadata_descriptor {};
-	if (!program.info.images.empty() || !program.info.samplers.empty() ||
-	    !program.info.addresses.empty()) {
-		EXIT("HTile clear with non-buffer resources is unsupported: images=%zu samplers=%zu "
-		     "addresses=%zu\n",
-		     program.info.images.size(), program.info.samplers.size(),
-		     program.info.addresses.size());
-	}
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& resource   = program.info.buffers[i];
-		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		const auto  descriptor_size = BufferDescriptorSize(descriptor);
-		if (descriptor.Base48() == target.address) {
-			if (!resource.written || resource.read || resource.atomic ||
-			    descriptor_size != target.size || descriptor.SwizzleEnabled() ||
-			    descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-			    resource.packed_stride != descriptor.PackedStride()) {
-				EXIT("unsupported HTile compute metadata access\n");
+	if (!program.info.has_bitwise_xor) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& resource = program.info.buffers[i];
+			if (resource.written) {
+				const auto descriptor =
+				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				if (cache.ClearMeta(descriptor.Base48())) {
+					return true;
+				}
 			}
-			metadata_descriptor = descriptor;
-			metadata_writes++;
-			continue;
 		}
-		if (resource.written || !resource.read || resource.atomic || descriptor.Base48() == 0 ||
-		    descriptor_size == 0 ||
-		    cache.QueryRegion(descriptor.Base48(), descriptor_size).metadata_pages) {
-			EXIT("unsupported HTile clear side-buffer access\n");
-		}
-		GetRenderContext().GetBufferCache().ValidateGpuAccess(descriptor.Base48(), descriptor_size,
-		                                                      true, false);
 	}
-	if (metadata_writes != 1) {
-		EXIT("HTile clear requires exactly one write-only metadata buffer, writes=%u\n",
-		     metadata_writes);
-	}
-	ValidateFullHtileClearDispatch(input, metadata_descriptor, group_x, group_y, group_z, mode);
-	const bool recorded = registered_meta.full ? cache.ClearMeta(registered_meta.metadata_address)
-	                                           : cache.TouchMeta(registered_meta.metadata_address,
-	                                                             registered_meta.slice, true);
-	if (!recorded) {
-		EXIT("failed to record HTile compute clear\n");
-	}
-	return true;
+	return false;
 }
 
 bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
@@ -324,7 +137,7 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 	                              size)) {
 		return false;
 	}
-	auto& cache = GetRenderContext().GetTextureCache();
+	auto& cache = command.GetContext().GetTextureCache();
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
 		return false;
 	}
@@ -337,8 +150,9 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 	return true;
 }
 
-void RenderDispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t thread_group_x,
-                          uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode) {
+void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer,
+                                    uint32_t thread_group_x, uint32_t thread_group_y,
+                                    uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -347,8 +161,7 @@ void RenderDispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint3
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
-	Common::LockGuard lock(GetRenderContext().GetMutex());
-
+	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -403,17 +216,18 @@ void RenderDispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint3
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
-	const uint32_t frame_num = GraphicsRunGetFrameNum();
+	const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 	const bool     large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y,
-	                               thread_group_z, mode)) {
+	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+		ResetBindings();
 		return;
 	}
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
+		ResetBindings();
 		return;
 	}
 	const auto sampled_images = std::count_if(
@@ -508,38 +322,32 @@ void RenderDispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint3
 		return;
 	}
 
-	for (;;) {
-		const auto recording_generation = buffer.GetRecordingGeneration();
-		auto       vk_buffer            = buffer.Handle();
-		auto&      pipeline = GetRenderContext().GetPipelineCache().CreateComputePipeline(
-		    input_info, sh_ctx.GetCs(), cs_shader);
+	buffer.EndRendering();
+	auto& pipeline =
+	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
+	auto bindings = PrepareBindings(buffer, input_info.stage, vk::ShaderStageFlagBits::eCompute,
+	                                DescriptorCache::Stage::Compute);
+	RebindBuffers(buffer, bindings);
+	RebindImages(buffer, bindings);
 
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	auto vk_buffer = buffer.Handle();
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, bindings);
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
-		BindDescriptors(submit_id, buffer, vk::PipelineBindPoint::eCompute,
-		                pipeline.pipeline_layout, input_info.stage,
-		                vk::ShaderStageFlagBits::eCompute, DescriptorCache::Stage::Compute);
-		if (buffer.GetRecordingGeneration() != recording_generation) {
-			continue;
-		}
-
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
-
-		bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
-		has_storage_writes =
-		    std::any_of(
-		        program.info.images.begin(), program.info.images.end(),
-		        [](const auto& image) {
-			        return image.written &&
-			               (image.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
-			                image.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint);
-		        }) ||
-		    has_storage_writes;
-		if (has_storage_writes) {
-			ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-		}
-		break;
+	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
+	has_storage_writes =
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& image) {
+		                return image.written &&
+		                       (image.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
+		                        image.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint);
+	                }) ||
+	    has_storage_writes;
+	if (has_storage_writes) {
+		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	ResetBindings();
 }
 
 } // namespace Libs::Graphics

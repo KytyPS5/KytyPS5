@@ -160,24 +160,14 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 }
 
 static void Execute() {
-	int thread_model = 1;
-
-	if (thread_model == 0) {
-		Common::Thread t([](void* /*unused*/) { Libs::Graphics::WindowRun(); }, nullptr);
-		t.Detach();
-		auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-		rt->Execute();
-	} else {
-		Common::Thread t(
-		    [](void* /*unused*/) {
-			    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-			    rt->Execute();
-		    },
-		    nullptr);
-		t.Detach();
-		Libs::Graphics::WindowRun();
-		t.Join();
-	}
+	Common::Thread guest_thread(
+	    [](void* /*unused*/) {
+		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		    rt->Execute();
+	    },
+	    nullptr);
+	Libs::Graphics::WindowRun();
+	std::quick_exit(0);
 }
 
 void Run(const RunOptions& options) {

@@ -187,10 +187,6 @@ void RenderDocInit() {
 	}
 }
 
-bool RenderDocIsLoaded() {
-	return g_api != nullptr;
-}
-
 void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window) {
 	if (g_api == nullptr) {
 		return;
@@ -281,9 +277,6 @@ void RenderDocOnPresent() {
 #else
 
 void RenderDocInit() {}
-bool RenderDocIsLoaded() {
-	return false;
-}
 void RenderDocSetActiveWindow(vk::Instance /*instance*/, SDL_Window* /*window*/) {}
 void RenderDocRequestCapture() {}
 void RenderDocOnPresent() {}

@@ -142,6 +142,21 @@ public:
 		return changed;
 	}
 
+	RegionBits MarkCleanAsGpuModified(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits changed;
+		for (auto page = start; page < end; page++) {
+			if (!m_cpu_dirty.test(page) && !m_gpu_dirty.test(page)) {
+				if (m_fault_pending.test(page)) {
+					EXIT("GPU dirty state conflicts with pending fault state\n");
+				}
+				m_gpu_dirty.set(page);
+				changed.set(page);
+			}
+		}
+		return changed;
+	}
+
 	[[nodiscard]] CpuFaultAction BeginCpuFault(uint64_t vaddr, uint64_t size,
 	                                           PageFaultAccess access = PageFaultAccess::Write) {
 		if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {

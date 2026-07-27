@@ -24,24 +24,20 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
-#include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
-#include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -61,7 +57,6 @@
 
 namespace Libs::Graphics {
 
-constexpr float FPS_UPDATE_TIME        = 1.0f;
 constexpr int   KEYBOARD_CONTROLLER_ID = -1000;
 
 struct EventKeyboard {
@@ -213,163 +208,36 @@ constexpr uint32_t KYTY_SDL_BUTTON_RMASK  = SDL_BUTTON_RMASK;  // NOLINT(hicpp-s
 constexpr uint32_t KYTY_SDL_BUTTON_X1MASK = SDL_BUTTON_X1MASK; // NOLINT(hicpp-signed-bitwise)
 constexpr uint32_t KYTY_SDL_BUTTON_X2MASK = SDL_BUTTON_X2MASK; // NOLINT(hicpp-signed-bitwise)
 
-struct WindowGame {
-	void* private_data = nullptr;
-	void* event        = nullptr;
+namespace {
 
-	bool     m_game_need_exit        = {false};
-	bool     m_game_is_paused        = {false};
-	uint32_t m_screen_width          = {0};
-	uint32_t m_screen_height         = {0};
-	double   m_current_time_seconds  = {0.0};
-	double   m_previous_time_seconds = {0.0};
-	int      m_update_num            = {0};
-	int      m_frame_num             = {0};
-	double   m_update_time_seconds   = {0.0};
-	double   m_current_fps           = {0.0};
-	int      m_max_updates_per_frame = {4};
-	double   m_update_fixed_time     = 1.0 / 60.0;
-	int      m_fps_frames_num        = {0};
-	double   m_fps_start_time        = {0};
-};
+std::unique_ptr<WindowContext> g_window;
 
-struct WindowGamePrivate {
-	explicit WindowGamePrivate(GraphicContext& graphics): graphics(graphics) {}
-
-	Common::Mutex   mutex;
-	int             skip_frames = 0;
-	GraphicContext& graphics;
-};
-
-WindowContext* g_window_ctx = nullptr;
-static WindowGame g_window_game;
+} // namespace
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 constexpr uint32_t    KYTY_SDL_WINDOW_FLAGS =
     (static_cast<uint32_t>(SDL_WINDOW_HIDDEN) | static_cast<uint32_t>(SDL_WINDOW_VULKAN));
 constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
-static void CalcFrameTime(WindowGame& game, double game_time_s) {
-	game.m_previous_time_seconds = game.m_current_time_seconds;
-	game.m_current_time_seconds  = game_time_s;
-
-	game.m_frame_num++;
-	game.m_fps_frames_num++;
-
-	const auto fps_time = game.m_current_time_seconds - game.m_fps_start_time;
-	if (fps_time > FPS_UPDATE_TIME) {
-		game.m_current_fps    = static_cast<double>(game.m_fps_frames_num) / fps_time;
-		game.m_fps_frames_num = 0;
-		game.m_fps_start_time = game.m_current_time_seconds;
-	}
-}
-
-static bool Init(WindowGame& /*game*/) {
-	return true;
-}
-static bool Update(WindowGame& /*game*/) {
-	return true;
-}
-static bool Render(WindowGame& /*game*/) {
-	return true;
-}
-static bool Close(WindowGame& /*game*/) {
-	return true;
-}
-static void SetPause(WindowGame& game, bool flag) {
+static void SetPause(WindowLoopState& game, bool flag) {
 	LOGF("Pause: %s\n", flag ? "true" : "false");
 
-	game.m_game_is_paused = flag;
+	game.paused.store(flag, std::memory_order_release);
 }
 
-static bool RenderAndUpdate(WindowGame& game) {
-	static double lag = 0.0;
-
-	lag += game.m_current_time_seconds - game.m_previous_time_seconds;
-
-	int num = 0;
-
-	bool ok = true;
-
-	while (lag >= game.m_update_fixed_time) {
-		if (num < game.m_max_updates_per_frame) {
-			ok = ok && Update(game);
-
-			game.m_update_num++;
-			num++;
-			game.m_update_time_seconds = game.m_update_num * game.m_update_fixed_time;
-		}
-
-		lag -= game.m_update_fixed_time;
-	}
-
-	ok = ok && Render(game);
-
-	return ok;
-}
-
-bool GameInit(WindowGame& game, const Common::Timer& timer) {
-	EXIT_IF(game.private_data || game.event);
-	auto& graphics = g_window_ctx->graphic_ctx;
-
-	EXIT_IF(graphics.screen_width == 0 || graphics.screen_height == 0);
-
-	auto* pdata = new WindowGamePrivate(graphics);
-
-	game.private_data = pdata;
-	game.event        = new SDL_Event;
-
-	game.m_screen_width  = graphics.screen_width;
-	game.m_screen_height = graphics.screen_height;
-
-	CalcFrameTime(game, timer.GetTimeS());
-
-	return Init(game);
-}
-
-bool GameClose(WindowGame& game) {
-	EXIT_IF(!game.private_data || !game.event);
-
-	delete (static_cast<WindowGamePrivate*>(game.private_data));
-	delete (static_cast<SDL_Event*>(game.event));
-
-	return Close(game);
-}
-
-void GameShowWindow(WindowGame& game, const Common::Timer& timer) {
-	auto* p = static_cast<WindowGamePrivate*>(game.private_data);
-
-	EXIT_IF(!p);
-
-	p->mutex.Lock();
-	{
-		if (p->skip_frames > 0) {
-			p->skip_frames--;
-			LOGF("skip frame %d\n", p->skip_frames);
-		} else {
-			VideoOut::VideoOutBeginVblank();
-			if (VideoOut::VideoOutFlipWindow(0)) {
-				CalcFrameTime(game, timer.GetTimeS());
-			}
-			VideoOut::VideoOutEndVblank();
-		}
-	}
-	p->mutex.Unlock();
-}
-
-void GameEventQuit(WindowGame& game) {
+static void GameEventQuit(WindowLoopState& game) {
 	LOGF("Event: quit\n");
 
-	game.m_game_need_exit = true;
+	game.need_exit = true;
 }
 
-void GameEventTerminate(WindowGame& game) {
+static void GameEventTerminate(WindowLoopState& game) {
 	LOGF("Event: terminate\n");
 
-	game.m_game_need_exit = true;
+	game.need_exit = true;
 }
 
-void GameEventKeyboard(WindowGame& game, const EventKeyboard& key) {
+static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #ifdef KYTY_DBG_INPUT
 	LOGF("Key: time = %.04f, %s%s, %s%s, %s, scan = %d, key = %d, mod = %04" PRIx16 "\n",
 	     key.timestamp_seconds, (key.down ? "down" : ""), (key.up ? "up" : ""),
@@ -380,8 +248,10 @@ void GameEventKeyboard(WindowGame& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_ESCAPE: game.m_game_need_exit = true; break;
-			case SDLK_SPACE: SetPause(game, !game.m_game_is_paused); break;
+			case SDLK_ESCAPE: game.need_exit = true; break;
+			case SDLK_SPACE:
+				SetPause(game, !game.paused.load(std::memory_order_acquire));
+				break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
@@ -403,7 +273,7 @@ void GameEventKeyboard(WindowGame& game, const EventKeyboard& key) {
 #endif
 }
 
-void GameEventMouse([[maybe_unused]] WindowGame& game, [[maybe_unused]] const EventMouse& mb) {
+static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 #ifdef KYTY_DBG_INPUT
 	if (mb.wheel) {
 		LOGF("Mouse wheel: time = %.04f, %s[%d, %d]\n", mb.timestamp_seconds,
@@ -424,7 +294,7 @@ void GameEventMouse([[maybe_unused]] WindowGame& game, [[maybe_unused]] const Ev
 #endif
 }
 
-void GameEventFinger([[maybe_unused]] WindowGame& game, [[maybe_unused]] const EventFinger& f) {
+static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #ifdef KYTY_DBG_INPUT
 	if (f.motion) {
 		LOGF("Finger motion: time = %.04f, %d, %d, (x,y) = [%f, %f], (dx,dy) = [%f, %f], pressure "
@@ -439,8 +309,7 @@ void GameEventFinger([[maybe_unused]] WindowGame& game, [[maybe_unused]] const E
 #endif
 }
 
-void GameEventController([[maybe_unused]] WindowGame&            game,
-                         [[maybe_unused]] const EventController& f) {
+static void GameEventController([[maybe_unused]] const EventController& f) {
 	EXIT_NOT_IMPLEMENTED(f.remapped);
 
 #ifdef KYTY_DBG_INPUT
@@ -486,116 +355,104 @@ void GameEventController([[maybe_unused]] WindowGame&            game,
 	}
 }
 
-void GameEventDisplay([[maybe_unused]] WindowGame& game) {
-	auto* p = static_cast<WindowGamePrivate*>(game.private_data);
-
-	p->mutex.Lock();
-	game.m_screen_width  = p->graphics.screen_width;
-	game.m_screen_height = p->graphics.screen_height;
-	p->mutex.Unlock();
-}
-
-void GameEventLowMemory(WindowGame& /*game*/) {
+static void GameEventLowMemory() {
 	LOGF("Event: low_memory\n");
 }
 
-void GameEventWillEnterBackground(WindowGame& game) {
+static void GameEventWillEnterBackground(WindowLoopState& game) {
 	LOGF("Event: will_enter_background\n");
 
 	SetPause(game, true);
 }
 
-void GameEventDidEnterBackground(WindowGame& /*game*/) {
+static void GameEventDidEnterBackground() {
 	LOGF("Event: did_enter_background\n");
 }
 
-void GameEventWillEnterForeground(WindowGame& /*game*/) {
+static void GameEventWillEnterForeground() {
 	LOGF("Event: will_enter_foreground\n");
 }
 
-void GameEventDidEnterForeground(WindowGame& game) {
+static void GameEventDidEnterForeground(WindowLoopState& game) {
 	LOGF("Event: did_enter_foreground\n");
 
 	SetPause(game, false);
 }
 
-void GameEventResize(WindowGame& game, uint32_t new_width, uint32_t new_height) {
+void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	EXIT_IF(new_width == 0 || new_height == 0);
-
-	auto* p = static_cast<WindowGamePrivate*>(game.private_data);
-	EXIT_IF(p == nullptr);
-
-	p->mutex.Lock();
-	{
-		p->skip_frames++;
-		p->graphics.screen_width  = new_width;
-		p->graphics.screen_height = new_height;
-
-		game.m_screen_width  = p->graphics.screen_width;
-		game.m_screen_height = p->graphics.screen_height;
-	}
-	p->mutex.Unlock();
+	graphic_ctx.screen_width  = new_width;
+	graphic_ctx.screen_height = new_height;
 }
 
-static void ProcessWindowEvent(WindowGame& game, SDL_WindowEvent window) {
-	switch (window.event) {
-		case SDL_WINDOWEVENT_SHOWN: LOGF("Window %" PRIu32 " shown\n", window.windowID); break;
+void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
+	const auto& window_event = event;
+	switch (window_event.event) {
+		case SDL_WINDOWEVENT_SHOWN: LOGF("Window %" PRIu32 " shown\n", window_event.windowID); break;
 
-		case SDL_WINDOWEVENT_HIDDEN: LOGF("Window %" PRIu32 " hidden\n", window.windowID); break;
+		case SDL_WINDOWEVENT_HIDDEN:
+			LOGF("Window %" PRIu32 " hidden\n", window_event.windowID);
+			break;
 
-		case SDL_WINDOWEVENT_EXPOSED: LOGF("Window %" PRIu32 " exposed\n", window.windowID); break;
+		case SDL_WINDOWEVENT_EXPOSED:
+			LOGF("Window %" PRIu32 " exposed\n", window_event.windowID);
+			break;
 
 		case SDL_WINDOWEVENT_MOVED:
-			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window.windowID,
-			     window.data1, window.data2);
+			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n",
+			     window_event.windowID, window_event.data1, window_event.data2);
 			break;
 
 		case SDL_WINDOWEVENT_RESIZED:
-			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n", window.windowID,
-			     window.data1, window.data2);
+			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n",
+			     window_event.windowID, window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
-			GameEventResize(game, window.data1, window.data2);
+			Resize(window_event.data1, window_event.data2);
 
 			break;
 
 		case SDL_WINDOWEVENT_SIZE_CHANGED:
-			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n", window.windowID,
-			     window.data1, window.data2);
+			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
+			     window_event.windowID, window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
-			GameEventResize(game, window.data1, window.data2);
+			Resize(window_event.data1, window_event.data2);
 
 			break;
 
 		case SDL_WINDOWEVENT_MINIMIZED:
-			LOGF("Window %" PRIu32 " minimized\n", window.windowID);
+			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_MAXIMIZED:
-			LOGF("Window %" PRIu32 " maximized\n", window.windowID);
+			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
-			LOGF("Window %" PRIu32 " restored\n", window.windowID);
+			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_ENTER:
-			LOGF("Mouse entered window %" PRIu32 "\n", window.windowID);
+			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_LEAVE: LOGF("Mouse left window %" PRIu32 "\n", window.windowID); break;
+		case SDL_WINDOWEVENT_LEAVE:
+			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
+			break;
 		case SDL_WINDOWEVENT_FOCUS_GAINED:
-			LOGF("Window %" PRIu32 " gained keyboard focus\n", window.windowID);
+			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
 			break;
 		case SDL_WINDOWEVENT_FOCUS_LOST:
-			LOGF("Window %" PRIu32 " lost keyboard focus\n", window.windowID);
+			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_CLOSE: LOGF("Window %" PRIu32 " closed\n", window.windowID); break;
+		case SDL_WINDOWEVENT_CLOSE:
+			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
+			break;
 		default:
-			LOGF("Window %" PRIu32 " got unknown event %" PRIu8 "\n", window.windowID,
-			     window.event);
+			LOGF("Window %" PRIu32 " got unknown event %" PRIu8 "\n", window_event.windowID,
+			     window_event.event);
 			break;
 	}
 }
 
-static void ProcessDisplayEvent(WindowGame& game, SDL_DisplayEvent display) {
+void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	bool sdl = false;
 
 	switch (display.event) {
@@ -613,10 +470,6 @@ static void ProcessDisplayEvent(WindowGame& game, SDL_DisplayEvent display) {
 				default: LOGF("???\n");
 			}
 
-			if (!sdl) {
-				GameEventDisplay(game);
-			}
-
 			break;
 		}
 		default:
@@ -626,27 +479,9 @@ static void ProcessDisplayEvent(WindowGame& game, SDL_DisplayEvent display) {
 	}
 }
 
-int GamePollEvent(WindowGame& game) {
-	auto* event = static_cast<SDL_Event*>(game.event);
-
-	EXIT_IF(!event);
-
-	return SDL_PollEvent(event);
-}
-
-int GameWaitEvent(WindowGame& game) {
-	auto* event = static_cast<SDL_Event*>(game.event);
-
-	EXIT_IF(!event);
-
-	return SDL_WaitEvent(event);
-}
-
-void GameProcessEvent(WindowGame& game, double time_s) {
-	auto* event = static_cast<SDL_Event*>(game.event);
-
-	EXIT_IF(!event);
-
+void WindowContext::ProcessEvent(double time_s) {
+	auto& game  = loop;
+	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
 
 	switch (event->type) {
@@ -654,13 +489,13 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 
 		case SDL_APP_TERMINATING: GameEventTerminate(game); break;
 
-		case SDL_APP_LOWMEMORY: GameEventLowMemory(game); break;
+		case SDL_APP_LOWMEMORY: GameEventLowMemory(); break;
 
 		case SDL_APP_WILLENTERBACKGROUND: GameEventWillEnterBackground(game); break;
 
-		case SDL_APP_DIDENTERBACKGROUND: GameEventDidEnterBackground(game); break;
+		case SDL_APP_DIDENTERBACKGROUND: GameEventDidEnterBackground(); break;
 
-		case SDL_APP_WILLENTERFOREGROUND: GameEventWillEnterForeground(game); break;
+		case SDL_APP_WILLENTERFOREGROUND: GameEventWillEnterForeground(); break;
 
 		case SDL_APP_DIDENTERFOREGROUND: GameEventDidEnterForeground(game); break;
 
@@ -683,9 +518,9 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			break;
 		}
 
-		case SDL_WINDOWEVENT: ProcessWindowEvent(game, event->window); break;
+		case SDL_WINDOWEVENT: ProcessWindowEvent(event->window); break;
 
-		case SDL_DISPLAYEVENT: ProcessDisplayEvent(game, event->display); break;
+		case SDL_DISPLAYEVENT: ProcessDisplayEvent(event->display); break;
 
 		case SDL_MOUSEBUTTONDOWN:
 		case SDL_MOUSEBUTTONUP: {
@@ -710,7 +545,7 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			mb.motion_y          = 0;
 			mb.timestamp_seconds = time_s;
 
-			GameEventMouse(game, mb);
+			GameEventMouse(mb);
 
 			break;
 		}
@@ -737,7 +572,7 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			mb.motion_y          = 0;
 			mb.timestamp_seconds = time_s;
 
-			GameEventMouse(game, mb);
+			GameEventMouse(mb);
 
 			break;
 		}
@@ -764,7 +599,7 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			mb.motion_y          = event->motion.yrel;
 			mb.timestamp_seconds = time_s;
 
-			GameEventMouse(game, mb);
+			GameEventMouse(mb);
 
 			break;
 		}
@@ -786,7 +621,7 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			f.pressure          = event->tfinger.pressure;
 			f.timestamp_seconds = time_s;
 
-			GameEventFinger(game, f);
+			GameEventFinger(f);
 
 			break;
 		}
@@ -808,7 +643,7 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			c.released          = false;
 			c.timestamp_seconds = time_s;
 
-			GameEventController(game, c);
+			GameEventController(c);
 
 			break;
 		}
@@ -831,7 +666,7 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			c.released          = (event->cbutton.state == SDL_RELEASED);
 			c.timestamp_seconds = time_s;
 
-			GameEventController(game, c);
+			GameEventController(c);
 
 			break;
 		}
@@ -855,68 +690,43 @@ void GameProcessEvent(WindowGame& game, double time_s) {
 			c.released          = false;
 			c.timestamp_seconds = time_s;
 
-			GameEventController(game, c);
+			GameEventController(c);
 
 			break;
 		}
 	}
 }
 
-void GameMainLoop(WindowGame& game) {
-	bool need_exit = false;
-
+void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
 
-	if (!GameInit(game, timer)) {
-		need_exit = true;
-	}
+	loop.event     = {};
+	loop.need_exit = false;
+	loop.paused.store(false, std::memory_order_release);
 
-	for (;;) {
-		if (need_exit) {
-			break;
-		}
-
-		if (GamePollEvent(game) != 0) {
-			GameProcessEvent(game, timer.GetTimeS());
+	while (!loop.need_exit) {
+		if (SDL_PollEvent(&loop.event) != 0) {
+			ProcessEvent(timer.GetTimeS());
 			continue;
 		}
 
-		if (game.m_game_is_paused) {
+		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
 			}
-
-			// Guest threads keep running while the window update loop is paused. Continue servicing
-			// vblank and the video-out queue so a command-processor WAIT_FLIP_DONE cannot block the
-			// GPU indefinitely and, in turn, deadlock guest-memory fault handling in WaitForIdle().
-			GameShowWindow(game, timer);
-			need_exit = game.m_game_need_exit;
+			if (SDL_WaitEvent(&loop.event) == 0) {
+				EXIT("%s\n", SDL_GetError());
+			}
+			ProcessEvent(timer.GetTimeS());
 			continue;
 		}
 
-		need_exit = game.m_game_need_exit;
-
-		if (game.m_game_is_paused) {
-			if (!timer.IsPaused()) {
-				timer.Pause();
-			}
-		} else {
-			if (timer.IsPaused()) {
-				timer.Resume();
-			}
-
-			if (!need_exit) {
-				need_exit = !RenderAndUpdate(game);
-			}
-
-			if (!need_exit) {
-				GameShowWindow(game, timer);
-			}
+		if (timer.IsPaused()) {
+			timer.Resume();
 		}
+		Common::Thread::SleepMicro(1000);
 	}
-
-	GameClose(game);
 }
 
 static void WindowCreate(WindowContext& context) {
@@ -950,29 +760,33 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetWindowResizable(context.window, SDL_FALSE);
 }
 
-void WindowInit(uint32_t width, uint32_t height) {
+Presenter& WindowInit(uint32_t width, uint32_t height) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	EXIT_IF(g_window_ctx != nullptr);
+	EXIT_IF(g_window != nullptr);
 
-	g_window_ctx = new WindowContext;
+	auto window = std::make_unique<WindowContext>();
 
-	g_window_ctx->graphic_ctx.screen_width  = width;
-	g_window_ctx->graphic_ctx.screen_height = height;
+	window->graphic_ctx.screen_width  = width;
+	window->graphic_ctx.screen_height = height;
 
-	WindowCreate(*g_window_ctx);
-	VulkanCreate(*g_window_ctx);
-	GraphicsRenderInit(g_window_ctx->graphic_ctx);
+	WindowCreate(*window);
+	window->CreateVulkan();
+	auto& presenter = *window->presenter;
+	g_window         = std::move(window);
+	return presenter;
 }
 
 void WindowRun() {
 	KYTY_PROFILER_THREAD("Thread_Window");
+	EXIT_IF(g_window == nullptr);
 
-	GameMainLoop(g_window_game);
+	g_window->Run();
+}
 
-	// TODO: replace std::_Exit shutdown with full Vulkan teardown, then destroy
-	// the VMA allocator immediately before vkDestroyDevice.
-	Common::SubsystemsListSingleton::Instance()->ShutdownAll();
-	std::_Exit(0);
+void WindowShutdown() {
+	if (g_window != nullptr) {
+		g_window.reset();
+	}
 }
 
 static int WindowIconRead(void* user, char* data, int size) {
@@ -1034,7 +848,7 @@ static void WindowLoadPngIcon(const std::string& path, WindowIcon* icon) {
 	EXIT_NOT_IMPLEMENTED(icon->surface == nullptr);
 }
 
-void WindowUpdateIcon() {
+void WindowContext::UpdateIcon() {
 	static WindowIcon icon;
 	static bool       icon_loaded = false;
 
@@ -1047,11 +861,11 @@ void WindowUpdateIcon() {
 	}
 
 	if (icon.surface != nullptr) {
-		SDL_SetWindowIcon(g_window_ctx->window, icon.surface);
+		SDL_SetWindowIcon(window, icon.surface);
 	}
 }
 
-void WindowUpdateTitle() {
+void WindowContext::UpdateTitle() {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -1060,15 +874,29 @@ void WindowUpdateTitle() {
 	    Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id));
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
+	static uint64_t fps_start = Common::Timer::QueryPerformanceCounter();
+	static uint64_t frame_num = 0;
+	static uint64_t fps_frames = 0;
+	static double   current_fps = 0.0;
+
+	const auto now       = Common::Timer::QueryPerformanceCounter();
+	const auto frequency = Common::Timer::QueryPerformanceFrequency();
+	frame_num++;
+	fps_frames++;
+	if (now - fps_start >= frequency) {
+		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
+		              static_cast<double>(now - fps_start);
+		fps_start  = now;
+		fps_frames = 0;
+	}
 
 	auto fps = fmt::format("{}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", (has_title ? title : ""),
 	                       (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	                       (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
-	                       (has_app_ver ? " " : ""), g_window_ctx->device_name,
-	                       g_window_ctx->processor_name, g_window_game.m_frame_num,
-	                       g_window_game.m_current_fps);
+	                       (has_app_ver ? " " : ""), device_name, processor_name,
+	                       frame_num, current_fps);
 
-	SDL_SetWindowTitle(g_window_ctx->window, fps.c_str());
+	SDL_SetWindowTitle(window, fps.c_str());
 }
 
 } // namespace Libs::Graphics

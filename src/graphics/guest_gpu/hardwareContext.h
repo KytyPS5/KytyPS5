@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 
 namespace Libs::Graphics::HW {
 
@@ -131,26 +132,66 @@ struct RenderTarget {
 };
 
 struct DepthZInfo {
-	uint32_t format                    = 0;
-	uint32_t tile_mode_index           = 0;
-	uint32_t num_samples               = 0;
-	uint32_t zrange_precision          = 0;
-	bool     tile_surface_enable       = false;
-	bool     expclear_enabled          = false;
-	bool     embedded_sample_locations = false;
-	bool     partially_resident        = false;
-	uint8_t  num_mip_levels            = 0;
-	uint8_t  plane_compression         = 0;
+	uint32_t                                    format      = 0;
+	uint32_t                                    num_samples = 0;
+	Prospero::TextureCompatiblePlaneCompression texture_compatibility =
+	    Prospero::TextureCompatiblePlaneCompression::kDisable;
+	Prospero::ZCompareBase z_compare_base     = Prospero::ZCompareBase::kZMin;
+	bool                   htile_acceleration = false;
+	bool                   expclear_enabled   = false;
+	bool                   partially_resident = false;
+	uint8_t                max_mip_level      = 0;
+
+	[[nodiscard]] static DepthZInfo Decode(uint32_t value) {
+		DepthZInfo info;
+		info.format                = value & 0x3u;
+		info.num_samples           = (value >> 2u) & 0x3u;
+		info.texture_compatibility = static_cast<Prospero::TextureCompatiblePlaneCompression>(
+		    value & Prospero::GpuEnumValue(Prospero::TextureCompatiblePlaneCompression::kBitMask));
+		info.partially_resident = (value & 0x00001000u) != 0;
+		info.max_mip_level      = static_cast<uint8_t>((value >> 16u) & 0x0fu);
+		info.expclear_enabled   = (value & 0x08000000u) != 0;
+		info.htile_acceleration = (value & 0x20000000u) != 0;
+		info.z_compare_base     = static_cast<Prospero::ZCompareBase>(
+		    value & Prospero::GpuEnumValue(Prospero::ZCompareBase::kBitMask));
+		return info;
+	}
+
+	[[nodiscard]] bool HasValidTextureCompatibility() const {
+		switch (texture_compatibility) {
+			case Prospero::TextureCompatiblePlaneCompression::kDisable:
+			case Prospero::TextureCompatiblePlaneCompression::kEnable: return true;
+			default: return false;
+		}
+	}
 };
 
 struct DepthStencilInfo {
-	uint32_t format                     = 0;
-	uint32_t tile_mode_index            = 0;
-	uint32_t tile_split                 = 0;
-	bool     expclear_enabled           = false;
-	bool     tile_stencil_disable       = false;
-	bool     texture_compatible_stencil = false;
-	bool     partially_resident         = false;
+	uint32_t                           format = 0;
+	Prospero::TextureCompatibleStencil texture_compatibility =
+	    Prospero::TextureCompatibleStencil::kDisable;
+	bool expclear_enabled       = false;
+	bool htile_stencil_disabled = false;
+	bool partially_resident     = false;
+
+	[[nodiscard]] static DepthStencilInfo Decode(uint32_t value) {
+		DepthStencilInfo info;
+		info.format                = value & 0x1u;
+		info.texture_compatibility = static_cast<Prospero::TextureCompatibleStencil>(
+		    value & Prospero::GpuEnumValue(Prospero::TextureCompatibleStencil::kBitMask));
+		info.partially_resident     = (value & 0x00001000u) != 0;
+		info.expclear_enabled       = (value & 0x08000000u) != 0;
+		info.htile_stencil_disabled = (value & 0x20000000u) != 0;
+		return info;
+	}
+
+	[[nodiscard]] bool HasValidTextureCompatibility() const {
+		switch (texture_compatibility) {
+			case Prospero::TextureCompatibleStencil::kDisable:
+			case Prospero::TextureCompatibleStencil::kEnable: return true;
+			default: return false;
+		}
+	}
 };
 
 struct DepthRenderTargetDepthInfo {

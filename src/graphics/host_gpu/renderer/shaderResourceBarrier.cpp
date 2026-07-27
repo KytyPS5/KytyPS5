@@ -36,36 +36,8 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 	return barrier;
 }
 
-vk::ImageMemoryBarrier MakeStorageImageDependency(const VulkanImage& image, bool read,
-                                                  bool written) {
-	EXIT_IF(image.image == nullptr || image.type == VulkanImageType::DepthStencil);
-
-	vk::ImageMemoryBarrier barrier {};
-	barrier.sType         = vk::StructureType::eImageMemoryBarrier;
-	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
-	barrier.dstAccessMask = {};
-	if (read) {
-		barrier.dstAccessMask |= vk::AccessFlagBits::eShaderRead;
-	}
-	if (written) {
-		barrier.dstAccessMask |= vk::AccessFlagBits::eShaderWrite;
-	}
-	barrier.oldLayout                       = image.layout;
-	barrier.newLayout                       = vk::ImageLayout::eGeneral;
-	barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-	barrier.image                           = image.image;
-	barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	barrier.subresourceRange.baseMipLevel   = 0;
-	barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
-	barrier.subresourceRange.baseArrayLayer = 0;
-	barrier.subresourceRange.layerCount     = image.layers;
-	EXIT_IF(!barrier.dstAccessMask || barrier.subresourceRange.layerCount == 0);
-	return barrier;
-}
-
-vk::BufferMemoryBarrier MakeGdsDependency(const VulkanBuffer& buffer) {
-	EXIT_IF(buffer.buffer == nullptr);
+vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
+	EXIT_IF(buffer == nullptr);
 
 	vk::BufferMemoryBarrier barrier {};
 	barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
@@ -74,7 +46,7 @@ vk::BufferMemoryBarrier MakeGdsDependency(const VulkanBuffer& buffer) {
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = buffer.buffer;
+	barrier.buffer              = buffer;
 	barrier.offset              = 0;
 	barrier.size                = VK_WHOLE_SIZE;
 	return barrier;

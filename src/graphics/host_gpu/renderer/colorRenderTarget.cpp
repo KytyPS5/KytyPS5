@@ -10,12 +10,9 @@
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/displayBuffer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,9 +22,11 @@ namespace Libs::Graphics {
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, RenderColorInfo& r,
-                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
-                              bool ignore_target_mask, bool reuse_existing_render_texture) {
+void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+                                          RenderColorInfo& r,
+                                          uint32_t render_target_slice_offset,
+                                          uint32_t render_target_slot, bool ignore_target_mask,
+                                          bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
@@ -57,14 +56,17 @@ void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 
 		// No color output
 		r.type               = RenderColorType::NoColorOutput;
+		r.desc               = {};
 		r.base_addr          = 0;
-		r.vulkan_buffer      = nullptr;
-		r.vulkan_view        = nullptr;
+		r.image_id           = {};
+		r.image_view         = nullptr;
 		r.format             = vk::Format::eUndefined;
 		r.extent             = {};
 		r.base_mip_level     = 0;
+		r.base_array_layer   = 0;
 		r.buffer_size        = 0;
 		r.samples            = 1;
+		r.export_mapping     = {};
 		r.color_clear_enable = false;
 		r.color_clear_value  = {};
 		return;
@@ -176,26 +178,33 @@ void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		pitch = width;
 	}
 
+	TileSizeOffset mip_sizes[16] {};
+	TilePaddedSize mip_padded[16] {};
 	if (tile) {
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
 		if (standard64) {
 			TileGetTextureSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), width,
-			                   height, pitch, levels, rt.attrib3.tile_mode, &layout, nullptr,
-			                   nullptr);
+			                   height, pitch, levels, rt.attrib3.tile_mode, &layout, mip_sizes,
+			                   mip_padded);
 			valid_layout = layout.size != 0 && layout.align == 65536;
 		} else {
 			valid_layout =
 			    levels == 1 ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
 			                                          layout, rt.attrib.num_fragments)
 			                : TileGetRenderTargetMipLayout(width, height, pitch, bytes_per_element,
-			                                               levels, layout, nullptr, nullptr);
+			                                               levels, layout, mip_sizes, mip_padded);
 		}
 		if (!valid_layout) {
 			EXIT("unsupported render-target layout: %ux%u pitch=%u bytes=%u levels=%u\n", width,
 			     height, pitch, bytes_per_element, levels);
 		}
 		size = layout.size;
+		EXIT_IF(size > UINT32_MAX);
+		if (levels == 1) {
+			mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
+			mip_padded[0] = {pitch, height};
+		}
 		if (rt.slice.slice_div64_minus1 != 0 &&
 		    (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u != size) {
 			EXIT("render-target slice span mismatch: encoded=0x%016" PRIx64 " derived=0x%016" PRIx64
@@ -204,6 +213,11 @@ void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		}
 	} else {
 		size = static_cast<uint64_t>(pitch) * height * bytes_per_element * samples;
+		if (size > UINT32_MAX) {
+			EXIT("linear render-target slice exceeds the supported layout size\n");
+		}
+		mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
+		mip_padded[0] = {pitch, height};
 	}
 	if (size == 0 || size > UINT64_MAX / view.image_layers) {
 		EXIT("render-target memory footprint is invalid\n");
@@ -213,119 +227,69 @@ void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		EXIT("render-target backing range is invalid\n");
 	}
 
-	auto video_image = Presentation::DisplayBufferFind(rt.base.addr, true);
-	if (video_image.image != nullptr &&
-	    !IsSupportedDisplayRenderTargetTileMode(rt.attrib3.tile_mode)) {
-		EXIT("unsupported display render-target tile mode: tile=%u expected=%u addr=0x%010" PRIx64
-		     " backing_size=0x%016" PRIx64 " video_size=0x%016" PRIx64 "\n",
-		     rt.attrib3.tile_mode, Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget),
-		     rt.base.addr, backing_size, video_image.size);
-	}
-	bool render_to_texture = view.base_layer != 0 || video_image.image == nullptr;
-	if (!render_to_texture && (levels != 1 || rt.view.current_mip_level != 0)) {
-		EXIT("mipmapped display render targets are unsupported\n");
-	}
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
-	if (decision_log_id < 128 || !render_to_texture) {
+	if (decision_log_id < 128) {
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
-		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32
-		     " samples=%u tile=%s target=%s video_size=0x%016" PRIx64 " video_pitch=%" PRIu64 "\n",
+		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
 		     rt_slot, rt.base.addr, backing_size, width, height, rt.view.current_mip_level,
 		     view_extent.width, view_extent.height, levels, pitch, rt.info.format,
-		     rt.info.channel_type, rt.info.channel_order, samples, tile ? "tiled" : "linear",
-		     render_to_texture ? "RenderTexture" : "DisplayBuffer", video_image.size,
-		     video_image.pitch);
+		     rt.info.channel_type, rt.info.channel_order, samples, tile ? "tiled" : "linear");
 	}
 
-	if (render_to_texture) {
-		(void)reuse_existing_render_texture;
-		RenderTargetInfo target {};
-		target.address           = rt.base.addr;
-		target.size              = backing_size;
-		target.format            = target_format.format;
-		target.width             = width;
-		target.height            = height;
-		target.pitch             = pitch;
-		target.bytes_per_element = target_format.bytes_per_element;
-		target.tile_mode         = rt.attrib3.tile_mode;
-		target.levels            = levels;
-		target.layers            = view.image_layers;
-		target.samples           = samples;
-		auto& texture_cache      = GetRenderContext().GetTextureCache();
-		auto& buffer_vulkan      = texture_cache.FindRenderTarget(buffer, target);
-		r.type                   = RenderColorType::RenderTexture;
-		r.base_addr              = rt.base.addr;
-		r.vulkan_buffer          = &buffer_vulkan;
-		r.vulkan_view            = texture_cache.GetRenderTargetAttachmentView(
-		    buffer_vulkan, target.format, rt.view.current_mip_level, view.base_layer,
-		    view.layer_count);
-		r.format             = target.format;
-		r.extent             = view_extent;
-		r.base_mip_level     = rt.view.current_mip_level;
-		r.buffer_size        = backing_size;
-		r.samples            = samples;
-		r.export_mapping     = target_format.export_mapping;
-		r.color_clear_enable = buffer_vulkan.initial_clear_pending;
-		r.color_clear_value  = {};
-	} else {
-		if (samples != 1) {
-			EXIT("multisampled display render targets are unsupported\n");
-		}
-		const auto layout = static_cast<Prospero::ChannelLayout>(rt.info.format);
-		const auto type   = static_cast<Prospero::ChannelType>(rt.info.channel_type);
-		const auto order  = static_cast<Prospero::ChannelOrder>(rt.info.channel_order);
-
-		bool supported_display_format =
-		    (layout == Prospero::ChannelLayout::k8_8_8_8 &&
-		     (type == Prospero::ChannelType::kSrgb || type == Prospero::ChannelType::kUNorm) &&
-		     (order == Prospero::ChannelOrder::kStandard ||
-		      order == Prospero::ChannelOrder::kAlt)) ||
-		    (layout == Prospero::ChannelLayout::k10_10_10_2 &&
-		     type == Prospero::ChannelType::kUNorm &&
-		     (order == Prospero::ChannelOrder::kStandard ||
-		      order == Prospero::ChannelOrder::kAlt)) ||
-		    (layout == Prospero::ChannelLayout::k16_16_16_16 &&
-		     type == Prospero::ChannelType::kFloat &&
-		     (order == Prospero::ChannelOrder::kStandard || order == Prospero::ChannelOrder::kAlt));
-
-		EXIT_NOT_IMPLEMENTED(!supported_display_format);
-
-		// Display buffer
-		if (video_image.size != size) {
-			LOGF("RenderColorTarget: display buffer size differs from render target span, "
-			     "video_size=0x%016" PRIx64 " render_size=0x%016" PRIx64 "\n",
-			     video_image.size, size);
-		}
-		EXIT_NOT_IMPLEMENTED(video_image.size < size);
-		EXIT_NOT_IMPLEMENTED(video_image.pitch != pitch);
-		r.type           = RenderColorType::DisplayBuffer;
-		r.base_addr      = rt.base.addr;
-		r.vulkan_buffer  = video_image.image;
-		r.vulkan_view    = video_image.image->image_view[VulkanImage::VIEW_DEFAULT];
-		r.format         = video_image.image->format;
-		r.extent         = video_image.image->extent;
-		r.base_mip_level = 0;
-		r.buffer_size    = video_image.size;
-		r.samples        = 1;
-		r.export_mapping = target_format.export_mapping;
+	TextureCache::ImageDesc desc {};
+	desc.type              = TextureCache::BindingType::RenderTarget;
+	desc.info.data         = {rt.base.addr, backing_size};
+	desc.info.pixel_format = target_format.format;
+	desc.info.guest_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
+	desc.info.type   = Prospero::ImageType::kColor2D;
+	desc.info.extent = {width, height, 1};
+	desc.info.resources       = {levels, view.image_layers};
+	desc.info.pitch           = pitch;
+	desc.info.bytes_per_block = bytes_per_element;
+	desc.info.samples         = samples;
+	desc.info.tile_mode       = rt.attrib3.tile_mode;
+	for (uint32_t level = 0; level < levels; level++) {
+		const auto level_offset =
+		    mip_sizes[level].src_size != 0 ? mip_sizes[level].src_offset : mip_sizes[level].offset;
+		const auto level_size =
+		    static_cast<uint64_t>(mip_sizes[level].src_size != 0 ? mip_sizes[level].src_size
+		                                                         : mip_sizes[level].size) *
+		    view.image_layers;
+		desc.info.mip_layout[level] = {
+		    level_offset,
+		    level_size,
+		    mip_padded[level].width,
+		    mip_padded[level].height,
+		};
 	}
-}
-
-void MarkRenderTargetGpuWritten(const RenderColorInfo& target) {
-	const bool with_color = target.vulkan_buffer != nullptr;
-
-	if (with_color) {
-		if (target.type == RenderColorType::RenderTexture ||
-		    target.type == RenderColorType::DisplayBuffer) {
-			GetRenderContext().GetTextureCache().MarkGpuWritten(*target.vulkan_buffer);
-		} else {
-			EXIT("unknown writable render-color resource type\n");
-		}
-	}
+	desc.view_info.format = target_format.format;
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
+	desc.view_info.base_level  = rt.view.current_mip_level;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer  = view.base_layer;
+	desc.view_info.layer_count = view.layer_count;
+	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	auto& texture_cache = m_context.GetTextureCache();
+	r.desc              = std::move(desc);
+	r.image_id          = texture_cache.FindImage(r.desc, exact_format);
+	r.type              = RenderColorType::RenderTexture;
+	r.base_addr         = rt.base.addr;
+	r.image_view        = nullptr;
+	r.format            = r.desc.view_info.format;
+	r.extent            = view_extent;
+	r.base_mip_level    = rt.view.current_mip_level;
+	r.buffer_size       = backing_size;
+	r.samples           = samples;
+	r.export_mapping    = target_format.export_mapping;
+	r.color_clear_enable = false;
+	r.color_clear_value = {};
+	BindRenderTarget(r.image_id);
 }
 
 } // namespace Libs::Graphics

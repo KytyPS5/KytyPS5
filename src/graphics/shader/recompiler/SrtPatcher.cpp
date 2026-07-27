@@ -12,9 +12,13 @@ bool PatchSrtReads(Program& program, std::string* error) {
 	if (!program.srt_plan_complete || program.srt_patching_complete ||
 	    program.resource_tracking_complete) {
 		if (error != nullptr) {
-			*error = !program.srt_plan_complete      ? "SRT plan is not ready"
-			         : program.srt_patching_complete ? "SRT reads already patched"
-			                                          : "resources already tracked";
+			if (!program.srt_plan_complete) {
+				*error = "SRT plan is not ready";
+			} else if (program.srt_patching_complete) {
+				*error = "SRT reads already patched";
+			} else {
+				*error = "resources already tracked";
+			}
 		}
 		return false;
 	}

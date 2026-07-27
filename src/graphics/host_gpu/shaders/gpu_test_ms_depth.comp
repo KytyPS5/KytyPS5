@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 4) in;
+
+layout(set = 0, binding = 0) uniform texture2DMS input_depth;
+layout(set = 0, binding = 1, std430) buffer Output {
+	uint value[];
+}
+output_data;
+
+layout(push_constant) uniform Push {
+	uint samples;
+}
+push;
+
+void main() {
+	const uint sample_id = gl_LocalInvocationID.x;
+	if (sample_id < push.samples) {
+		output_data.value[sample_id] =
+		    floatBitsToUint(texelFetch(input_depth, ivec2(0), int(sample_id)).x);
+	}
+}

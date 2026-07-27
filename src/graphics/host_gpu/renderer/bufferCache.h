@@ -6,42 +6,34 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/streamBuffer.h"
 
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
 struct GraphicContext;
-struct VulkanBuffer;
 class CommandBuffer;
+class CommandScheduler;
 class TextureCache;
 class ResourceMutex;
 
-struct BufferImageCopySource {
-	VulkanBuffer* buffer      = nullptr;
-	uint64_t      offset      = 0;
-	uint64_t      address     = 0;
-	uint64_t      size        = 0;
-	bool          cpu_current = false;
-	// True when the guest range was CPU-dirty before coherence resolution. ObtainBufferForImage
-	// may consume that tracker state while publishing the same bytes to a cached buffer.
-	bool cpu_dirty = false;
-};
-
-struct BufferCacheRange {
-	uint64_t address = 0;
-	uint64_t size    = 0;
-};
-
 struct BufferBinding {
-	VulkanBuffer& buffer;
-	uint64_t      offset;
+	std::shared_ptr<void> owner;
+	vk::Buffer            buffer = nullptr;
+	uint64_t              offset = 0;
 };
 
-[[nodiscard]] bool MergeOverlappingBufferCacheRange(BufferCacheRange& merged,
-                                                    BufferCacheRange  candidate) noexcept;
+struct ImageBufferSource {
+	Buffer*  buffer    = nullptr;
+	uint64_t offset    = 0;
+	bool     gpu_owned = false;
+};
 
 class BufferCache {
 public:
@@ -50,7 +42,8 @@ public:
 		return vaddr & (CACHING_PAGE_SIZE - 1);
 	}
 
-	BufferCache(GraphicContext& graphics, PageManager& page_manager, ResourceMutex& resource_mutex);
+	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
+	            TextureCache& texture_cache, ResourceMutex& resource_mutex);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
@@ -60,39 +53,91 @@ public:
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,
 	                                         bool is_formatted = false);
-	// Emulator-owned, CPU-current scratch only. Guest ranges must use ObtainBuffer so page
-	// ownership is resolved before any CPU access.
-	[[nodiscard]] bool UploadHostData(CommandBuffer& command, const void* src, uint64_t size,
-	                                  uint64_t alignment, VulkanBuffer*& out_buffer,
-	                                  uint64_t& out_offset, uint64_t& out_range);
-	[[nodiscard]] VulkanBuffer&         ObtainNullBuffer(CommandBuffer& command);
-	[[nodiscard]] BufferImageCopySource ObtainBufferForImage(uint64_t vaddr, uint64_t size);
-	void FillBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t size, uint32_t value);
-	void CopyBuffer(CommandBuffer* command, uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
+	[[nodiscard]] StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept;
+	[[nodiscard]] Buffer&       GetGdsBuffer() noexcept { return m_gds_buffer; }
+	[[nodiscard]] const Buffer& GetGdsBuffer() const noexcept { return m_gds_buffer; }
+	[[nodiscard]] BufferBinding UploadTransient(const void* data, uint64_t size,
+	                                            uint64_t alignment);
+	[[nodiscard]] std::shared_ptr<Buffer> ObtainNullBuffer();
+	[[nodiscard]] ImageBufferSource       ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::pair<std::shared_ptr<Buffer>, uint64_t>
+	     ObtainBufferForImageWrite(uint64_t vaddr, uint64_t size);
+	void DiscardGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds = false);
+	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds = false,
+	                bool src_gds = false);
 	[[nodiscard]] bool HasPageOverlap(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	void               PublishImageBacking(uint64_t vaddr, uint64_t size);
+	void               InvalidateImageAliases(uint64_t vaddr, uint64_t size);
+	void BeginBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
+	void CompleteBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
+	[[nodiscard]] bool SynchronizeBacking(uint64_t vaddr, uint64_t size);
+	void               PublishImageBuffer(uint64_t vaddr, uint64_t size);
 	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
-	void SetTextureCache(TextureCache& texture_cache);
-
-	void ResetNullBuffer();
+	void RunGarbageCollector();
 
 private:
-	struct CachedBuffer;
-	struct ReadbackWorker;
+	friend struct BufferCacheTestAccess;
 
-	GraphicContext&               m_graphics;
-	Common::Mutex                 m_mutex;
-	std::shared_ptr<VulkanBuffer> m_null_buffer;
-	// TODO: add LRU cache
+	struct CacheRange {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	struct CachedBuffer;
+	struct DownloadCopy;
+	struct DownloadRange;
+	struct RetiredBuffer;
+	struct FaultReadback;
+	struct PendingBackingPublication;
+	static constexpr uint64_t DOWNLOAD_ALIGNMENT = 64;
+	[[nodiscard]] static uint64_t AlignDown(uint64_t value) noexcept;
+	[[nodiscard]] static uint64_t AlignUp(uint64_t value);
+	[[nodiscard]] static constexpr uint64_t AlignDownload(uint64_t size) noexcept {
+		return (size + DOWNLOAD_ALIGNMENT - 1) & ~(DOWNLOAD_ALIGNMENT - 1);
+	}
+	[[nodiscard]] static bool PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right,
+	                                      uint64_t right_size) noexcept;
+	[[nodiscard]] static std::pair<uint64_t, uint64_t>
+	     DownloadEnvelope(const DownloadCopy& copy);
+	[[nodiscard]] static bool   ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept;
+	void Upload(CommandBuffer& command, Buffer& destination, uint64_t destination_offset,
+	            const void* source, uint64_t size);
+	[[nodiscard]] CachedBuffer& GetOrCreateBuffer(CommandBuffer& command, uint64_t vaddr,
+	                                              uint64_t size);
+	[[nodiscard]] std::vector<DownloadRange>
+	     RecordDownloads(std::span<const DownloadCopy> copies);
+	void PublishDownloads(std::span<const DownloadRange> downloads);
+	void QueueGarbageDownload(std::span<const DownloadCopy> copies, RetiredBuffer retire);
+	void RefreshInvalidatedRanges(CommandBuffer& command, CachedBuffer& cached, uint64_t vaddr,
+	                              uint64_t size, bool upload);
+	void DiscardGpuDirtyBytesLocked(uint64_t vaddr, uint64_t size, const char* operation);
+	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
+
+	GraphicContext&                                   m_graphics;
+	CommandScheduler&                                 m_scheduler;
+	Buffer                                            m_gds_buffer;
+	Common::Mutex                                     m_mutex;
+	std::shared_ptr<Buffer>                           m_null_buffer;
 	std::map<uint64_t, std::unique_ptr<CachedBuffer>> m_buffers;
-	std::unique_ptr<ReadbackWorker>                   m_readback;
+	std::unique_ptr<FaultReadback>                    m_fault_readback;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                          m_image_invalidated_ranges;
+	std::mutex                                        m_publication_mutex;
+	std::vector<PendingBackingPublication>            m_pending_backing_publications;
 	MemoryTracker                                     m_memory_tracker;
+	StreamBuffer                                      m_staging_buffer;
+	StreamBuffer                                      m_stream_buffer;
+	StreamBuffer                                      m_download_buffer;
+	StreamBuffer                                      m_device_buffer;
 	PageManager&                                      m_page_manager;
-	TextureCache*                                     m_texture_cache = nullptr;
+	TextureCache&                                     m_texture_cache;
 	ResourceMutex&                                    m_resource_mutex;
+	uint64_t                                          m_total_used_memory = 0;
+	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	uint64_t m_gc_tick            = 0;
 };
 
 } // namespace Libs::Graphics

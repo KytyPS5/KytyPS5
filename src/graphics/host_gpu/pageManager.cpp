@@ -36,12 +36,14 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-// Mirrors the Win32 PAGE_* protection values so the platform-agnostic state machine below
-// (WatcherProtection/PublishDelayedFaults/UpdatePageWatchers/...) needs no per-platform branches.
-constexpr uint32_t PAGE_NOACCESS  = 0x01;
-constexpr uint32_t PAGE_READONLY  = 0x02;
-constexpr uint32_t PAGE_READWRITE = 0x04;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr uint32_t NO_ACCESS_PROTECTION = PAGE_NOACCESS;
+constexpr uint32_t READ_ONLY_PROTECTION = PAGE_READONLY;
+constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
+#else
+constexpr uint32_t NO_ACCESS_PROTECTION = 0;
+constexpr uint32_t READ_ONLY_PROTECTION = 1;
+constexpr uint32_t READ_WRITE_PROTECTION = 2;
 #endif
 
 thread_local bool g_in_fault_resolution = false;
@@ -206,42 +208,37 @@ struct PageManager::Impl {
 
 	static uint32_t WatcherProtection(const PageState& page) {
 		if (page.access_watchers != 0) {
-			return PAGE_NOACCESS;
+			return NO_ACCESS_PROTECTION;
 		}
 		if (page.write_watchers != 0) {
-			return PAGE_READONLY;
+			return READ_ONLY_PROTECTION;
 		}
 		return page.original_protection;
 	}
 
 	static void PublishDelayedFaults(PageState& page, uint32_t old_protection,
 	                                 uint32_t new_protection) {
-		if (old_protection == PAGE_NOACCESS && new_protection != PAGE_NOACCESS) {
+		if (old_protection == NO_ACCESS_PROTECTION && new_protection != NO_ACCESS_PROTECTION) {
 			page.late_read_pending = true;
 		}
-		if ((old_protection == PAGE_NOACCESS || old_protection == PAGE_READONLY) &&
-		    new_protection == PAGE_READWRITE) {
+		if ((old_protection == NO_ACCESS_PROTECTION ||
+		     old_protection == READ_ONLY_PROTECTION) &&
+		    new_protection == READ_WRITE_PROTECTION) {
 			page.late_write_pending = true;
 		}
 	}
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	// Shadow of the last protection this class applied to each page. mprotect (unlike
-	// VirtualProtect) does not report the previous protection, and parsing /proc/self/maps to
-	// recover it is far too slow for the per-page loops this class runs from (a single
-	// render-target upload protects thousands of pages, and the guest's address space holds
-	// thousands of mapping lines -- scanning the whole file per page made one upload take
-	// seconds). Tracked pages only ever change protection through Protect(), so once a page has
-	// been touched the shadow is authoritative; /proc/self/maps remains the fallback for a page's
-	// first touch and for self-healing if the guest remapped a range behind our back.
 	static std::mutex& ShadowMutex() noexcept {
 		static std::mutex mutex;
 		return mutex;
 	}
+
 	static std::unordered_map<uint64_t, uint32_t>& ShadowProtections() noexcept {
 		static std::unordered_map<uint64_t, uint32_t> map;
 		return map;
 	}
+
 	static bool LookupShadowProtection(uint64_t vaddr, uint32_t& out_protection) noexcept {
 		const auto      page = vaddr & ~static_cast<uint64_t>(PAGE_SIZE - 1);
 		std::lock_guard lock(ShadowMutex());
@@ -253,20 +250,19 @@ struct PageManager::Impl {
 		out_protection = it->second;
 		return true;
 	}
+
 	static void StoreShadowProtection(uint64_t vaddr, uint32_t protection) noexcept {
 		const auto      page = vaddr & ~static_cast<uint64_t>(PAGE_SIZE - 1);
 		std::lock_guard lock(ShadowMutex());
 		ShadowProtections()[page] = protection;
 	}
+
 	static void EraseShadowProtection(uint64_t vaddr) noexcept {
 		const auto      page = vaddr & ~static_cast<uint64_t>(PAGE_SIZE - 1);
 		std::lock_guard lock(ShadowMutex());
 		ShadowProtections().erase(page);
 	}
 
-	// Reads the current PROT_* state of the single page at 'vaddr' out of /proc/self/maps.
-	// Returns false only if 'vaddr' isn't covered by any mapping at all, which never happens for
-	// pages this class tracks (they're always backed by the guest's anonymous RW allocation).
 	static bool LinuxQueryProtection(uint64_t vaddr, uint32_t& out_protection) noexcept {
 		FILE* maps = std::fopen("/proc/self/maps", "re");
 		if (maps == nullptr) {
@@ -278,19 +274,19 @@ struct PageManager::Impl {
 			uint64_t start = 0;
 			uint64_t end   = 0;
 			char     perms[5] {};
-			if (std::sscanf(line, "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, static_cast<char*>(perms)) !=
-			    3) {
+			if (std::sscanf(line, "%" SCNx64 "-%" SCNx64 " %4s", &start, &end,
+			                static_cast<char*>(perms)) != 3) {
 				continue;
 			}
 			if (vaddr < start || vaddr >= end) {
 				continue;
 			}
 			if (perms[1] == 'w') {
-				out_protection = PAGE_READWRITE;
+				out_protection = READ_WRITE_PROTECTION;
 			} else if (perms[0] == 'r') {
-				out_protection = PAGE_READONLY;
+				out_protection = READ_ONLY_PROTECTION;
 			} else {
-				out_protection = PAGE_NOACCESS;
+				out_protection = NO_ACCESS_PROTECTION;
 			}
 			found = true;
 			break;
@@ -315,11 +311,11 @@ struct PageManager::Impl {
 		uint32_t protection = 0;
 		if (!LookupShadowProtection(vaddr, protection) &&
 		    !LinuxQueryProtection(vaddr, protection)) {
-			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (unmapped)", vaddr);
+			Fatal("basic path requires writable memory at 0x%016" PRIx64 " (unmapped)", vaddr);
 		}
-		if (protection != PAGE_READWRITE) {
-			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (protection=0x%08" PRIx32
-			      ")",
+		if (protection != READ_WRITE_PROTECTION) {
+			Fatal("basic path requires writable memory at 0x%016" PRIx64
+			      " (protection=0x%08" PRIx32 ")",
 			      vaddr, protection);
 		}
 		return protection;
@@ -349,17 +345,15 @@ struct PageManager::Impl {
 		const auto allows = [access](uint32_t current) noexcept {
 			switch (access) {
 				case PageFaultAccess::Read:
-					return current == PAGE_READONLY || current == PAGE_READWRITE;
-				case PageFaultAccess::Write: return current == PAGE_READWRITE;
+					return current == READ_ONLY_PROTECTION ||
+					       current == READ_WRITE_PROTECTION;
+				case PageFaultAccess::Write: return current == READ_WRITE_PROTECTION;
 				default: return false;
 			}
 		};
 		if (allows(protection)) {
 			return true;
 		}
-		// A denial decides between resuming and failing fast (or raising a guest exception), so a
-		// stale shadow entry must not produce one. Confirm against the real mapping state before
-		// denying; the deny path is rare enough that the slow query cannot hurt.
 		return shadowed && LinuxQueryProtection(vaddr, protection) && allows(protection);
 #endif
 	}
@@ -388,9 +382,6 @@ struct PageManager::Impl {
 			Fatal("protection transition targets an unmapped page at 0x%016" PRIx64, vaddr);
 		}
 		if (old_protection != expected_old &&
-		    // A shadow entry can go stale if the guest remapped this range (a fresh mapping is RW
-		    // again without passing through Protect); before treating the mismatch as fatal,
-		    // re-check reality once.
 		    !(shadowed && LinuxQueryProtection(vaddr, old_protection) &&
 		      old_protection == expected_old)) {
 			if (fault_path) {
@@ -402,9 +393,9 @@ struct PageManager::Impl {
 		}
 		int native_protection = PROT_NONE;
 		switch (protection) {
-			case PAGE_NOACCESS: native_protection = PROT_NONE; break;
-			case PAGE_READONLY: native_protection = PROT_READ; break;
-			case PAGE_READWRITE: native_protection = PROT_READ | PROT_WRITE; break;
+			case NO_ACCESS_PROTECTION: native_protection = PROT_NONE; break;
+			case READ_ONLY_PROTECTION: native_protection = PROT_READ; break;
+			case READ_WRITE_PROTECTION: native_protection = PROT_READ | PROT_WRITE; break;
 			default: Fatal("unknown protection value 0x%08" PRIx32, protection);
 		}
 		if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
@@ -453,8 +444,7 @@ bool PageManager::IsTracked(uint64_t vaddr) const noexcept {
 }
 
 bool PageManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
-	if (g_in_fault_resolution || vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE ||
-	    size > ADDRESS_SIZE - vaddr) {
+	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
 		return false;
 	}
 	const auto end = PageStart(vaddr + size - 1) + PAGE_SIZE;
@@ -557,11 +547,11 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 				Impl::Protect(page_vaddr, new_protection, old_protection, false);
 			}
 			switch (new_protection) {
-				case PAGE_NOACCESS:
+				case NO_ACCESS_PROTECTION:
 					page.late_read_pending  = false;
 					page.late_write_pending = false;
 					break;
-				case PAGE_READONLY: page.late_write_pending = false; break;
+				case READ_ONLY_PROTECTION: page.late_write_pending = false; break;
 				default: break;
 			}
 		} else {
@@ -606,11 +596,8 @@ void PageManager::OnGpuMap(uint64_t vaddr, uint64_t size, GpuAccess access) {
 			Fatal("invalid map state at 0x%016" PRIx64, addr);
 		}
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-		// A first GPU mapping is only accepted for ordinary writable guest memory. Seed the
-		// protection shadow here so the first texture/buffer watcher does not have to parse
-		// /proc/self/maps independently for every 4 KiB page in a multi-megabyte resource.
 		if (page.mappings == 0) {
-			Impl::StoreShadowProtection(addr, PAGE_READWRITE);
+			Impl::StoreShadowProtection(addr, READ_WRITE_PROTECTION);
 		}
 #endif
 		page.mappings++;
@@ -651,8 +638,6 @@ void PageManager::OnGpuUnmap(uint64_t vaddr, uint64_t size, GpuAccess access) {
 			page.late_read_pending  = false;
 			page.late_write_pending = false;
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-			// The address can later be remapped with fresh host permissions. Do not retain stale
-			// per-page shadow entries (or let the sparse table grow for dead GPU mappings).
 			Impl::EraseShadowProtection(page_vaddr);
 #endif
 		}
@@ -667,6 +652,37 @@ PageManager::BackingWrite::BackingWrite(PageManager& manager, uint64_t vaddr,
 
 PageManager::BackingWrite::~BackingWrite() {
 	m_manager.EndBackingWrite(m_vaddr, m_size);
+}
+
+std::vector<std::unique_ptr<PageManager::BackingWrite>>
+PageManager::ReserveBackingWrites(std::span<const RangeSet::Range> ranges) {
+	if (ranges.empty()) {
+		Fatal("cannot reserve empty backing-write ranges");
+	}
+	std::vector<std::unique_ptr<BackingWrite>> writes;
+	writes.reserve(ranges.size());
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	for (const auto& range: ranges) {
+		if (range.address == 0 || range.size == 0 || range.size > UINT64_MAX - range.address ||
+		    range.address + range.size > UINT64_MAX - (PAGE_SIZE - 1)) {
+			Fatal("invalid backing-write range");
+		}
+		const auto page_begin = PageStart(range.address);
+		const auto page_end   = PageStart(range.address + range.size + PAGE_SIZE - 1);
+		if (begin != 0 && page_begin > end) {
+			writes.push_back(std::make_unique<BackingWrite>(*this, begin, end - begin));
+			begin = 0;
+		}
+		if (begin == 0) {
+			begin = page_begin;
+			end   = page_end;
+		} else {
+			end = std::max(end, page_end);
+		}
+	}
+	writes.push_back(std::make_unique<BackingWrite>(*this, begin, end - begin));
+	return writes;
 }
 
 void PageManager::BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
@@ -708,7 +724,7 @@ void PageManager::EndBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 		if (!page.resolving || page.backing_writer != writer) {
 			FailFast("backing write ended without matching owner and resolving state");
 		}
-		const auto old_protection = PAGE_NOACCESS;
+		const auto old_protection = NO_ACCESS_PROTECTION;
 		const auto new_protection = Impl::WatcherProtection(page);
 		if (new_protection != old_protection) {
 			Impl::Protect(address, new_protection, old_protection, false);
@@ -774,22 +790,9 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 			// falls through to the guest exception path.
 			return allowed;
 		}
-		if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
+		if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
+		    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
 			FailFast("fault access is incompatible with active page watchers");
-		}
-		if (access == PageFaultAccess::Read && page.access_watchers == 0) {
-			// A write_watchers-only page is meant to stay readable (WatcherProtection returns
-			// PAGE_READONLY, not PAGE_NOACCESS, whenever access_watchers is 0). A read fault
-			// reaching here means this CPU observed a stale, more restrictive mapping while some
-			// other thread's watcher-count/protection transition was still becoming visible --
-			// the same class of race the write_watchers==0 && access_watchers==0 branch above
-			// already tolerates via late_read_pending. Re-check the actual current protection
-			// instead of treating a merely-stale read fault as fatal; a genuinely inaccessible
-			// page still fails fast.
-			if (!Impl::AllowsAccess(fault_vaddr, access)) {
-				FailFast("fault access is incompatible with active page watchers");
-			}
-			return true;
 		}
 		page.resolving            = true;
 		page.resolving_read_write = page.access_watchers != 0;

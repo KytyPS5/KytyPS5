@@ -86,15 +86,6 @@ std::string ResourceKindToString(ResourceKind kind) {
 	}
 }
 
-const char* ImageDimensionToString(Decoder::ImageDimension dimension) {
-	switch (dimension) {
-		case Decoder::ImageDimension::Dim2D: return "2d";
-		case Decoder::ImageDimension::Dim3D: return "3d";
-		case Decoder::ImageDimension::Dim2DArray: return "2d_array";
-		default: return "unknown";
-	}
-}
-
 std::string MemoryInfoToString(const MemoryInfo& mem) {
 	if (mem.kind == ResourceKind::None) {
 		return "";
@@ -109,7 +100,7 @@ std::string MemoryInfoToString(const MemoryInfo& mem) {
 	    mem.component_count, mem.data_format, mem.number_format, mem.data_signed ? 1u : 0u,
 	    mem.typed ? 1u : 0u, mem.formatted ? 1u : 0u, mem.memory_segment, mem.glc ? 1u : 0u,
 	    mem.slc ? 1u : 0u, mem.idxen ? 1u : 0u, mem.offen ? 1u : 0u, mem.image_sample_flags,
-	    ImageDimensionToString(mem.image_dimension), mem.image_address_components,
+	    Decoder::ImageDimensionToString(mem.image_dimension), mem.image_address_components,
 	    mem.image_has_mip ? 1u : 0u);
 	if (mem.image_nsa_dwords != 0) {
 		text += fmt::format(" image_nsa_dwords={} image_nsa_addr=", mem.image_nsa_dwords);

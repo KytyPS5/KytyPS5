@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 
 #include <array>
@@ -23,9 +22,13 @@ vk::ShaderStageFlags StageFlags(DescriptorCache::Stage stage) {
 
 bool IsSampledImage(BindingKind kind) {
 	switch (kind) {
+		case BindingKind::Sampled1D:
+		case BindingKind::Sampled1DArray:
 		case BindingKind::Sampled2D:
 		case BindingKind::Sampled2DArray:
 		case BindingKind::Sampled3D:
+		case BindingKind::SampledUint1D:
+		case BindingKind::SampledUint1DArray:
 		case BindingKind::SampledUint2D:
 		case BindingKind::SampledUint2DArray:
 		case BindingKind::SampledUint3D: return true;
@@ -35,9 +38,13 @@ bool IsSampledImage(BindingKind kind) {
 
 bool IsStorageImage(BindingKind kind) {
 	switch (kind) {
+		case BindingKind::Storage1D:
+		case BindingKind::Storage1DArray:
 		case BindingKind::Storage2D:
 		case BindingKind::Storage2DArray:
 		case BindingKind::Storage3D:
+		case BindingKind::StorageUint1D:
+		case BindingKind::StorageUint1DArray:
 		case BindingKind::StorageUint2D:
 		case BindingKind::StorageUint2DArray:
 		case BindingKind::StorageUint3D: return true;
@@ -76,30 +83,34 @@ std::vector<uint32_t> LayoutKey(DescriptorCache::Stage               stage,
 	return key;
 }
 
-vk::ImageLayout SampledLayout(const VulkanImage& image) {
-	switch (image.layout) {
-		case vk::ImageLayout::eTransferDstOptimal:
-		case vk::ImageLayout::eTransferSrcOptimal:
-		case vk::ImageLayout::eColorAttachmentOptimal: return vk::ImageLayout::eGeneral;
-		default: return image.layout;
-	}
-}
-
 vk::DescriptorBufferInfo BufferInfo(const BufferView& view) {
-	EXIT_IF(view.buffer == nullptr || view.buffer->buffer == nullptr);
-	return {view.buffer->buffer, view.offset, view.range};
-}
-
-vk::DescriptorImageInfo MakeDescriptorImageInfo(const DescriptorCache::TextureBinding& texture,
-                                                vk::ImageLayout                        layout) {
-	EXIT_IF(texture.image == nullptr || texture.view < 0 || texture.view >= VulkanImage::VIEW_MAX);
-	const auto view = texture.image_view != nullptr ? texture.image_view
-	                                                : texture.image->image_view[texture.view];
-	EXIT_IF(view == nullptr);
-	return {nullptr, view, layout};
+	EXIT_IF(view.buffer == nullptr);
+	return {view.buffer, view.offset, view.range};
 }
 
 } // namespace
+
+vk::DescriptorImageInfo DescriptorCache::MakeImageInfo(const TextureBinding& texture) {
+	EXIT_IF(!texture.image_id || texture.image_view == nullptr ||
+	        texture.layout == vk::ImageLayout::eUndefined);
+	return {nullptr, texture.image_view, texture.layout};
+}
+
+DescriptorCache::~DescriptorCache() {
+	for (auto& [layout, sets]: m_free_sets_by_layout) {
+		(void)layout;
+		for (auto* set: sets) {
+			delete set;
+		}
+	}
+	for (const auto& [key, layout]: m_descriptor_set_layouts) {
+		(void)key;
+		m_graphics.device.destroyDescriptorSetLayout(layout, nullptr);
+	}
+	for (const auto& pool: m_pools) {
+		m_graphics.device.destroyDescriptorPool(pool.pool, nullptr);
+	}
+}
 
 vk::DescriptorSetLayout
 DescriptorCache::GetDescriptorSetLayoutInternal(Stage                                stage,
@@ -256,13 +267,9 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
 				}
 				break;
 			default: {
-				const auto layout = IsStorageImage(binding.kind) ? vk::ImageLayout::eGeneral
-				                                                 : vk::ImageLayout::eUndefined;
 				for (const auto resource: binding.resources) {
 					const auto& texture = data.images.at(resource);
-					image_infos.push_back(MakeDescriptorImageInfo(
-					    texture,
-					    IsSampledImage(binding.kind) ? SampledLayout(*texture.image) : layout));
+					image_infos.push_back(MakeImageInfo(texture));
 				}
 				break;
 			}

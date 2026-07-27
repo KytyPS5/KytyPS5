@@ -11,8 +11,10 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
-#include "graphics/host_gpu/objects/label.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -37,6 +39,8 @@
 
 namespace Libs::Graphics {
 
+static RenderContext* g_renderer = nullptr;
+
 KYTY_SUBSYSTEM_INIT(Graphics) {
 	// Some games lock up if this is not called first
 	if (Config::RenderDocEnabled()) {
@@ -46,16 +50,22 @@ KYTY_SUBSYSTEM_INIT(Graphics) {
 	auto width  = Config::GetScreenWidth();
 	auto height = Config::GetScreenHeight();
 
-	WindowInit(width, height);
-	VideoOut::VideoOutInit(width, height);
-	GraphicsRunInit();
-	LabelInit();
+	auto& presenter = WindowInit(width, height);
+	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
+	g_renderer       = &presenter.Renderer();
+	g_renderer->InitializeGpu(&video_out);
 	ShaderInit();
 }
 
 KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Graphics) {}
 
-KYTY_SUBSYSTEM_DESTROY(Graphics) {}
+KYTY_SUBSYSTEM_DESTROY(Graphics) {
+	EXIT_IF(g_renderer == nullptr);
+	g_renderer->ShutdownGpu();
+	VideoOut::VideoOutShutdown();
+	WindowShutdown();
+	g_renderer = nullptr;
+}
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
@@ -64,9 +74,9 @@ void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer)
 
 	if (Config::CommandBufferDumpEnabled() && num_dw > 0 && cmd_buffer != nullptr) {
 		Common::File f;
-		auto         file_name =
-		    Config::GetCommandBufferDumpFolder() /
-		    fmt::format("{:04d}_{:04d}_buffer_{}.log", GraphicsRunGetFrameNum(), id++, type);
+		auto         file_name = Config::GetCommandBufferDumpFolder() /
+		                         fmt::format("{:04d}_{:04d}_buffer_{}.log",
+		                                     g_renderer->GetGpu().GetFrameNum(), id++, type);
 		Common::File::CreateDirectories(file_name.parent_path());
 		f.Create(file_name);
 		if (f.IsInvalid()) {
@@ -1382,7 +1392,8 @@ int KYTY_SYSV_ABI GraphicsJumpPatchSetTarget(uint32_t* cmd, const volatile uint3
 int KYTY_SYSV_ABI GraphicsSuspendPoint() {
 	PRINT_NAME();
 
-	GraphicsRunDone();
+	EXIT_IF(g_renderer == nullptr);
+	g_renderer->GetGpu().Done();
 
 	return OK;
 }
@@ -3690,8 +3701,9 @@ static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dword
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
-	GraphicsRunSubmit(dcb, size_in_dwords, nullptr, 0,
-	                  !dcb_has_queued_interrupt(dcb, size_in_dwords));
+	EXIT_IF(g_renderer == nullptr);
+	g_renderer->GetGpu().Submit(dcb, size_in_dwords, nullptr, 0,
+	                            !dcb_has_queued_interrupt(dcb, size_in_dwords));
 	Gen5::track_pending_graphics_segment_after_submit(dcb, size_in_dwords);
 }
 
@@ -3956,7 +3968,8 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
 	const bool trigger_interrupt_on_done = !dcb_has_queued_interrupt(acb, size_in_dwords);
-	GraphicsRunSubmitCompute(queue, acb, size_in_dwords, trigger_interrupt_on_done);
+	EXIT_IF(g_renderer == nullptr);
+	g_renderer->GetGpu().SubmitCompute(queue, acb, size_in_dwords, trigger_interrupt_on_done);
 }
 
 int KYTY_SYSV_ABI GraphicsDriverSubmitAcb(uint32_t queue, const Packet* packet) {
@@ -4005,17 +4018,18 @@ int KYTY_SYSV_ABI GraphicsDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue e
                                            void* udata) {
 	PRINT_NAME();
 
-	if (eq == nullptr) {
+	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
-	return Sync::AddEqEvent(eq, id, udata);
+	EXIT_IF(g_renderer == nullptr);
+	return Sync::AddEqEvent(*g_renderer, eq, id, udata);
 }
 
 int KYTY_SYSV_ABI GraphicsDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	if (eq == nullptr) {
+	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 

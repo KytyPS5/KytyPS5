@@ -59,7 +59,9 @@ public:
 	}
 
 	[[nodiscard]] Entry& GetOrCreate(size_t page) {
-		EXIT_IF(!IsValidPage(page));
+		if (!IsValidPage(page)) {
+			EXIT("MultiLevelPageTable page is outside the guest address space");
+		}
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		if (bucket == nullptr) {
 			bucket = std::make_unique<Bucket>();

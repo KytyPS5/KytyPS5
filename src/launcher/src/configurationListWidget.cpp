@@ -1,5 +1,6 @@
 #include "configurationListWidget.h"
 
+#include "patchesDialog.h"
 #include "common.h"
 #include "compatibilityDatabase.h"
 #include "configuration.h"
@@ -55,10 +56,11 @@ constexpr char SAVE_DATA_DIR[]     = "_SaveData";
 
 constexpr int GAME_NAME_COLUMN             = 0;
 constexpr int GAME_SERIAL_COLUMN           = 1;
-constexpr int GAME_FIRMWARE_VERSION_COLUMN = 2;
-constexpr int GAME_PATH_COLUMN             = 3;
-constexpr int GAME_STATUS_COLUMN           = 4;
-constexpr int GAME_COMMENT_COLUMN          = 5;
+constexpr int GAME_VERSION_COLUMN          = 2;
+constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
+constexpr int GAME_PATH_COLUMN             = 4;
+constexpr int GAME_STATUS_COLUMN           = 5;
+constexpr int GAME_COMMENT_COLUMN          = 6;
 
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
@@ -239,6 +241,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
 	m_ui->cfgs_list->setColumnWidth(GAME_SERIAL_COLUMN, 110);
+	m_ui->cfgs_list->setColumnWidth(GAME_VERSION_COLUMN, 120);
 	m_ui->cfgs_list->setColumnWidth(GAME_FIRMWARE_VERSION_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_PATH_COLUMN, 320);
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
@@ -403,6 +406,7 @@ static Configuration* CloneConfiguration(const Configuration& source) {
 struct GameMetadata {
 	QString title_name;
 	QString title_id;
+	QString gameVersion;
 	QString firmwareVer;
 };
 
@@ -488,6 +492,10 @@ static GameMetadata GetGameMetadata(const QString& param_file, const QString& fa
 	}
 
 	ret.title_id    = GetJsonString(root, QStringLiteral("titleId"));
+	ret.gameVersion = GetJsonString(root, QStringLiteral("appVersion"));
+	if (ret.gameVersion.isEmpty()) {
+		ret.gameVersion = GetJsonString(root, QStringLiteral("contentVersion"));
+	}
 	ret.firmwareVer = GetFirmwareVersion(root);
 
 	return ret;
@@ -501,6 +509,7 @@ static void SetGameFiles(Configuration& info, const QString& game_dir, const QSt
 	info.basedir     = game.absolutePath();
 	info.name        = metadata.title_name;
 	info.title_id    = metadata.title_id;
+	info.gameVersion = metadata.gameVersion;
 	info.firmwareVer = metadata.firmwareVer;
 
 	if (info.name.isEmpty()) {
@@ -866,6 +875,15 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	    style()->standardIcon(QStyle::SP_FileDialogContentsView), tr("View trophies..."));
 	connect(action_view_trophies, &QAction::triggered, this,
 	        &ConfigurationListWidget::ViewTrophies);
+	QAction* action_patches = menu.addAction(tr("Patches (experimental)..."));
+	connect(action_patches, &QAction::triggered, this, [this, item]() {
+		if (item != nullptr) {
+			auto* dialog = new PatchesDialog(item->GetInfo(), this);
+			dialog->show();
+		}
+	});
+	action_patches->setVisible(item != nullptr &&
+	                           PatchesDialog::IsSupportedTitleId(item->GetInfo().title_id));
 	QAction* action_remove_save_data =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
 	                   tr("Remove save data..."), this, SLOT(remove_save_data()));

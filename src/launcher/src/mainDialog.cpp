@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
+#include "patchesDialog.h"
 
 #include <QApplication>
 #include <QByteArray>
@@ -227,6 +228,11 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
+
+	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
+	if (QFileInfo::exists(patch_plan)) {
+		args << "--game-patch" << patch_plan;
+	}
 
 	return args;
 }

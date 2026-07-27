@@ -42,6 +42,8 @@ static void PrintUsage() {
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf(
+	    "  --game-patch <json>                  Validated patch plan to apply before entry.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -59,7 +61,8 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
 	         "4-vertex path.\n");
-	::printf("  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf(
+	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -147,6 +150,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("--game must point to an existing directory or ELF: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--game-patch") {
+			if (!options.game_patch.empty()) {
+				::printf("--game-patch can only be specified once\n");
+				return false;
+			}
+			value = Common::FixFilenameSlash(value);
+			if (!Common::File::IsFileExisting(value)) {
+				::printf("--game-patch must point to an existing file: %s\n", value.c_str());
+				return false;
+			}
+			options.game_patch = value;
 		} else if (arg == "--screen-width") {
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {

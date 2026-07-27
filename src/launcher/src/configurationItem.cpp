@@ -24,6 +24,7 @@ namespace {
 enum Column {
 	NameColumn,
 	SerialColumn,
+	GameVersionColumn,
 	FirmwareVersionColumn,
 	PathColumn,
 	StatusColumn,
@@ -84,6 +85,9 @@ QString GetDisplayText(const Configuration& info) {
 
 	if (!info.title_id.isEmpty()) {
 		lines.append(QStringLiteral("Serial ID: %1").arg(info.title_id));
+	}
+	if (!info.gameVersion.isEmpty()) {
+		lines.append(QStringLiteral("Game version: %1").arg(info.gameVersion));
 	}
 	if (!info.firmwareVer.isEmpty()) {
 		lines.append(QStringLiteral("Firmware version: %1").arg(info.firmwareVer));
@@ -169,6 +173,8 @@ void ConfigurationItem::Update() {
 
 	setText(NameColumn, m_info->name);
 	setText(SerialColumn, m_info->title_id);
+	setText(GameVersionColumn,
+	        m_info->gameVersion.isEmpty() ? QStringLiteral("\u2014") : m_info->gameVersion);
 	setText(FirmwareVersionColumn,
 	        m_info->firmwareVer.isEmpty() ? QStringLiteral("\u2014") : m_info->firmwareVer);
 	setText(PathColumn, path);
@@ -198,9 +204,13 @@ bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
 		case StatusColumn:
 			return GetStatusText(m_info->game_status) <
 			       GetStatusText(other_item->m_info->game_status);
+		case GameVersionColumn:
 		case FirmwareVersionColumn: {
-			const auto& version       = m_info->firmwareVer;
-			const auto& other_version = other_item->m_info->firmwareVer;
+			const auto& version = column == GameVersionColumn ? m_info->gameVersion
+			                                                  : m_info->firmwareVer;
+			const auto& other_version = column == GameVersionColumn
+			                                ? other_item->m_info->gameVersion
+			                                : other_item->m_info->firmwareVer;
 			if (version.isEmpty() || other_version.isEmpty()) {
 				return version.isEmpty() && !other_version.isEmpty();
 			}

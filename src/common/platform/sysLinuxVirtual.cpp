@@ -432,11 +432,6 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	record_alloc(ret_addr, size);
-	uintptr_t page_start  = ret_addr >> 12u;
-	uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
-	for (uintptr_t page = page_start; page <= page_end; page++) {
-		(*g_protects)[page] = PROT_NONE;
-	}
 	pthread_mutex_unlock(&g_virtual_mutex);
 
 	return ret_addr;
@@ -470,11 +465,6 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		uintptr_t page_start  = ret_addr >> 12u;
-		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = PROT_NONE;
-		}
 		pthread_mutex_unlock(&g_virtual_mutex);
 
 		return true;

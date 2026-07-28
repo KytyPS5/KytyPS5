@@ -586,7 +586,13 @@ void Swapchain::RefreshSurfaceSize() {
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
+#if defined(__APPLE__)
+		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
+		// window's view/layer and must run on the main thread on macOS.
+		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); }, true);
+#else
 		m_window.RecreateSurface();
+#endif
 	}
 	RefreshSurfaceSize();
 	Create();
@@ -797,9 +803,20 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 	auto& window = m_impl->window;
 	if (window.window_hidden) {
+#if defined(__APPLE__)
+		// AppKit traps if a window is shown off the main thread; marshal and wait so the
+		// swapchain below is recreated against a visible window.
+		window.RunOnMainThread(
+		    [&window] {
+			    window.UpdateIcon();
+			    SDL_ShowWindow(window.window);
+		    },
+		    true);
+#else
 		window.UpdateIcon();
 
 		SDL_ShowWindow(window.window);
+#endif
 
 		window.window_hidden = false;
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);

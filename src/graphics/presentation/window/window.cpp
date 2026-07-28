@@ -699,6 +699,52 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+#if defined(__APPLE__)
+void WindowContext::RunOnMainThread(std::function<void()> task, bool wait) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+
+	uint64_t ticket = 0;
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		ticket = ++main_tasks_queued;
+	}
+
+	// Wake the main loop in case it is blocked in SDL_WaitEvent.
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+
+	if (!wait) {
+		return;
+	}
+	Common::LockGuard lock(main_task_mutex);
+	while (main_tasks_run < ticket) {
+		main_task_done.Wait(&main_task_mutex);
+	}
+}
+
+void WindowContext::DrainMainThreadTasks() {
+	std::vector<std::function<void()>> tasks;
+	{
+		Common::LockGuard lock(main_task_mutex);
+		tasks.swap(main_tasks);
+	}
+	if (tasks.empty()) {
+		return;
+	}
+	for (auto& task: tasks) {
+		task();
+	}
+	Common::LockGuard lock(main_task_mutex);
+	main_tasks_run += tasks.size();
+	main_task_done.SignalAll();
+}
+#endif
+
 void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
@@ -708,6 +754,9 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
+#if defined(__APPLE__)
+		DrainMainThreadTasks();
+#endif
 		if (SDL_PollEvent(&loop.event) != 0) {
 			ProcessEvent(timer.GetTimeS());
 			continue;
@@ -907,7 +956,13 @@ void WindowContext::UpdateTitle() {
 	                       (has_app_ver ? " " : ""), device_name, processor_name,
 	                       frame_num, current_fps);
 
+#if defined(__APPLE__)
+	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.
+	RunOnMainThread([this, fps = std::move(fps)] { SDL_SetWindowTitle(window, fps.c_str()); },
+	                false);
+#else
 	SDL_SetWindowTitle(window, fps.c_str());
+#endif
 }
 
 } // namespace Libs::Graphics

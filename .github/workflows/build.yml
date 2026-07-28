@@ -198,10 +198,137 @@ jobs:
           path: _Build/macos/install/**
           if-no-files-found: error
 
+  linux:
+    name: Build KytyPS5 (Linux)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang \
+            glslang-tools \
+            libasound2-dev \
+            libdbus-1-dev \
+            libgl1-mesa-dev \
+            libpulse-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxss-dev \
+            lld \
+            ninja-build \
+            wayland-protocols
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          git --version
+          cmake --version
+          ninja --version
+          clang++ --version
+          ld.lld --version
+          glslangValidator --version
+          echo "Qt6_DIR=$Qt6_DIR"
+
+      - name: Configure
+        shell: bash
+        run: |
+          mkdir -p _Build
+          cmake -S src -B _Build/linux \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Verify SDL2 backends
+        shell: bash
+        run: |
+          status=0
+          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
+            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
+              echo "ok   ${feature}"
+            else
+              echo "FAIL ${feature} is not enabled"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build _Build/linux \
+            --target launcher page_manager_tests memory_tracker_tests \
+            --parallel
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir _Build/linux --output-on-failure \
+            -R '^(page_manager|memory_tracker)$'
+
+      - name: Install
+        shell: bash
+        run: |
+          cmake --install _Build/linux --prefix _Build/linux/install
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          file _Build/linux/install/launcher
+          file _Build/linux/install/kyty_emulator
+          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
+          ldd _Build/linux/install/kyty_emulator > /dev/null
+          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          while IFS= read -r -d '' binary; do
+            while read -r dependency; do
+              test -e "_Build/linux/install/lib/$dependency"
+            done < <(
+              readelf -d "$binary" |
+                sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
+            )
+          done < <(
+            find _Build/linux/install/launcher _Build/linux/install/plugins \
+              -type f \( -name launcher -o -name '*.so' \) -print0
+          )
+          _Build/linux/install/kyty_emulator --help > /dev/null
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: _Build/linux/install/**
+          if-no-files-found: error
+
   release:
     name: Release KytyPS5
-    if: github.event_name == 'push'
-    needs: [windows, macos]
+    if: github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5'
+    needs: [windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -222,12 +349,16 @@ jobs:
         run: |
           windows_dir="artifacts/KytyPS5-Windows-x64"
           macos_dir="artifacts/KytyPS5-macOS-x86_64"
+          linux_dir="artifacts/KytyPS5-Linux-x86_64"
           test -d "$windows_dir"
           test -d "$macos_dir"
+          test -d "$linux_dir"
           chmod a+x \
             "$macos_dir/launcher" \
             "$macos_dir/kyty_emulator" \
-            "$macos_dir/libMoltenVK.dylib"
+            "$macos_dir/libMoltenVK.dylib" \
+            "$linux_dir/launcher" \
+            "$linux_dir/kyty_emulator"
           (
             cd "$windows_dir"
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
@@ -236,6 +367,8 @@ jobs:
             cd "$macos_dir"
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-macOS-x86_64.zip" .
           )
+          tar -C "$linux_dir" -czf \
+            "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
 
       - name: Create release
         shell: bash
@@ -245,6 +378,7 @@ jobs:
           assets=(
             "$RELEASE_NAME-Windows-x64.zip"
             "$RELEASE_NAME-macOS-x86_64.zip"
+            "$RELEASE_NAME-Linux-x86_64.tar.gz"
           )
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$RELEASE_NAME" "${assets[@]}" \

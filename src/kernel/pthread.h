@@ -112,6 +112,9 @@ void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+bool PthreadKillHost(Pthread thread, int host_signal);
+#endif
 int  PthreadGetPriorityForKernel(Pthread thread);
 int  PthreadGetCurrentPriorityForKernel();
 

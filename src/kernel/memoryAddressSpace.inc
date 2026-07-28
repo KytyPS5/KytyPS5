@@ -385,9 +385,12 @@ public:
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (preserve_placeholder && placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
+#endif
+			// Only Windows preserves placeholders.
 			return true;
 		}
 
@@ -1079,7 +1082,10 @@ private:
 #endif
 	}
 
-	static bool UnmapViewPreservePlaceholder(void* /*vaddr*/, uint64_t /*size*/) { return false; }
+	// POSIX has no placeholder equivalent.
+	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
+		return munmap(vaddr, size) == 0;
+	}
 
 	int m_fd = -1;
 #endif

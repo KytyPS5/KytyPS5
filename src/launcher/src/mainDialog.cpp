@@ -45,8 +45,6 @@ constexpr char EMULATOR_EXE[] = "kyty_emulator";
 #if defined(_WIN32)
 constexpr char CMD_EXE[] = "cmd.exe";
 #elif defined(__linux__)
-constexpr char GNOME[]          = "gnome-terminal";
-constexpr char XTERM[]          = "xterm";
 constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
 #if defined(_WIN32)
@@ -265,6 +263,57 @@ static bool CreateBashScript(const QString& interpreter, const QStringList& args
 	}
 	return false;
 }
+
+// Find a terminal and its command separator.
+static bool FindTerminal(QString* program, QStringList* prefix) {
+	struct TerminalSpec {
+		const char* executable;
+		const char* separator; // nullptr when the command follows immediately
+	};
+
+	static const TerminalSpec candidates[] = {
+	    {"x-terminal-emulator", "-e"}, {"gnome-terminal", "--"}, {"konsole", "-e"},
+	    {"xfce4-terminal", "-x"},      {"mate-terminal", "--"},  {"tilix", "-e"},
+	    {"alacritty", "-e"},           {"kitty", nullptr},       {"foot", nullptr},
+	    {"wezterm", "-e"},             {"urxvt", "-e"},          {"xterm", "-e"},
+	};
+
+	const auto try_candidate = [program, prefix](const QString& executable, const char* separator) {
+		const auto resolved = QStandardPaths::findExecutable(executable);
+		if (resolved.isEmpty()) {
+			return false;
+		}
+		*program = resolved;
+		prefix->clear();
+		if (separator != nullptr) {
+			*prefix << QString::fromLatin1(separator);
+		}
+		return true;
+	};
+
+	if (const auto from_env = qEnvironmentVariable("TERMINAL"); !from_env.isEmpty()) {
+		// Reuse the known separator for an explicit terminal.
+		const auto env_name  = QFileInfo(from_env).fileName();
+		const char* separator = "-e";
+		for (const auto& candidate: candidates) {
+			if (env_name == QLatin1String(candidate.executable)) {
+				separator = candidate.separator;
+				break;
+			}
+		}
+		if (try_candidate(from_env, separator)) {
+			return true;
+		}
+	}
+
+	for (const auto& candidate: candidates) {
+		if (try_candidate(QString::fromLatin1(candidate.executable), candidate.separator)) {
+			return true;
+		}
+	}
+
+	return false;
+}
 #endif
 
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
@@ -289,8 +338,16 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	}
 
 	{
-		process->setProgram(GNOME);
-		process->setArguments({"--", "bash", "-c", bash_file_name});
+		QString     terminal;
+		QStringList terminal_prefix;
+		if (FindTerminal(&terminal, &terminal_prefix)) {
+			process->setProgram(terminal);
+			process->setArguments(terminal_prefix + QStringList {"bash", "-c", bash_file_name});
+		} else {
+			// Run without a terminal as a fallback.
+			process->setProgram(QStringLiteral("bash"));
+			process->setArguments({QStringLiteral("-c"), bash_file_name});
+		}
 	}
 #elif defined(_WIN32)
 	{
@@ -319,6 +376,15 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	});
 #endif
 	process->start();
+#if !defined(_WIN32)
+	// Report immediate launch failures.
+	if (!process->waitForStarted(5000)) {
+		QMessageBox::critical(this, tr("Error"),
+		                      tr("Failed to start:\n%1\n\n%2")
+		                          .arg(process->program(), process->errorString()));
+		return;
+	}
+#endif
 	process->waitForFinished(100);
 }
 

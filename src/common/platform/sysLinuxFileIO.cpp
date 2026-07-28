@@ -12,7 +12,10 @@
 #include <cerrno>
 #include <cstdlib>
 #include <dirent.h>
+#include <fcntl.h>
+#include <filesystem>
 #include <sys/stat.h>
+#include <system_error>
 #include <unistd.h>
 #include <utime.h>
 
@@ -40,8 +43,41 @@ struct sys_file_t {
 	};
 };
 
+// Darwin uses BSD timestamp member names.
+#if defined(__APPLE__)
+#define KYTY_STAT_ATIME_NS(st) ((st).st_atimespec.tv_nsec)
+#define KYTY_STAT_MTIME_NS(st) ((st).st_mtimespec.tv_nsec)
+#else
+#define KYTY_STAT_ATIME_NS(st) ((st).st_atim.tv_nsec)
+#define KYTY_STAT_MTIME_NS(st) ((st).st_mtim.tv_nsec)
+#endif
+
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
 	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
+}
+
+// Pass access-pattern hints to the host.
+static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
+	if (f == nullptr) {
+		return;
+	}
+
+#if !defined(__APPLE__)
+	int advice = POSIX_FADV_NORMAL;
+	switch (cache_type) {
+		case SYS_FILE_CACHE_RANDOM_ACCESS: advice = POSIX_FADV_RANDOM; break;
+		case SYS_FILE_CACHE_SEQUENTIAL_SCAN: advice = POSIX_FADV_SEQUENTIAL; break;
+		case SYS_FILE_CACHE_AUTO:
+		default: return;
+	}
+	::posix_fadvise(fileno(f), 0, 0, advice);
+#else
+	if (cache_type == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
+		::fcntl(fileno(f), F_RDAHEAD, 1);
+	} else if (cache_type == SYS_FILE_CACHE_RANDOM_ACCESS) {
+		::fcntl(fileno(f), F_RDAHEAD, 0);
+	}
+#endif
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -137,7 +173,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 }
 
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
-                         sys_file_cache_type_t /*cache_type*/) {
+                         sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	ret->type = SYS_FILE_FILE;
@@ -150,6 +186,8 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
 	if (f == nullptr) {
 		ret->type = SYS_FILE_ERROR;
 	}
+
+	apply_cache_hint(f, cache_type);
 
 	ret->f = f;
 
@@ -181,7 +219,7 @@ sys_file_t* SysFileCreate() {
 }
 
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
-                         sys_file_cache_type_t /*cache_type*/) {
+                         sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	auto real_name     = get_internal_name(file_name);
@@ -194,6 +232,8 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
+
+	apply_cache_hint(f, cache_type);
 
 	ret->f = f;
 
@@ -201,7 +241,7 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
 }
 
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
-                          sys_file_cache_type_t /*cache_type*/) {
+                          sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	auto real_name     = get_internal_name(file_name);
@@ -214,6 +254,8 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 	} else {
 		ret->type = SYS_FILE_FILE;
 	}
+
+	apply_cache_hint(f, cache_type);
 
 	ret->f = f;
 
@@ -240,11 +282,17 @@ uint64_t SysFileSize(sys_file_t& f) {
 	[[maybe_unused]] int result = 0;
 
 	if (f.type == SYS_FILE_FILE) {
-		uint32_t pos  = ftell(f.f);
-		result        = fseek(f.f, 0, SEEK_END);
-		uint32_t size = ftell(f.f);
-		result        = fseek(f.f, pos, SEEK_SET);
-		return size;
+		// Preserve sizes above 4 GiB.
+		const off_t pos = ftello(f.f);
+		if (pos < 0) {
+			return 0;
+		}
+		if (fseeko(f.f, 0, SEEK_END) != 0) {
+			return 0;
+		}
+		const off_t size = ftello(f.f);
+		result           = fseeko(f.f, pos, SEEK_SET);
+		return (size < 0 ? 0 : static_cast<uint64_t>(size));
 	}
 
 	if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
@@ -261,8 +309,18 @@ uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	return size;
 }
 
-bool SysFileTruncate(sys_file_t& /*f*/, uint64_t /*size*/) {
-	return false;
+bool SysFileTruncate(sys_file_t& f, uint64_t size) {
+	bool ok = false;
+	if (f.type == SYS_FILE_FILE) {
+		// Flush before resizing and restore the caller's position.
+		const auto position = ftell(f.f);
+		fflush(f.f);
+		ok = (ftruncate(fileno(f.f), static_cast<off_t>(size)) == 0);
+		if (position >= 0) {
+			fseek(f.f, position, SEEK_SET);
+		}
+	}
+	return ok;
 }
 
 bool SysFileUnlink(sys_file_t& /*f*/, const std::filesystem::path& name) {
@@ -383,6 +441,7 @@ SysFileTimeStruct SysFileGetLastAccessTimeUtc(const std::filesystem::path& name)
 	} else {
 		r.is_invalid = false;
 		r.time       = s.st_atime;
+		r.nanos      = KYTY_STAT_ATIME_NS(s);
 	}
 
 	return r;
@@ -401,6 +460,7 @@ SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name) 
 	} else {
 		r.is_invalid = false;
 		r.time       = s.st_mtime;
+		r.nanos      = KYTY_STAT_MTIME_NS(s);
 	}
 
 	return r;
@@ -420,13 +480,36 @@ void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysF
 		a.is_invalid = false;
 		w.is_invalid = false;
 		a.time       = s.st_atime;
+		a.nanos      = KYTY_STAT_ATIME_NS(s);
 		w.time       = s.st_mtime;
+		w.nanos      = KYTY_STAT_MTIME_NS(s);
 	}
 }
 
-void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& /*f*/, SysFileTimeStruct& /*a*/,
-                                         SysFileTimeStruct& /*w*/) {
-	EXIT("not implemented\n");
+void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
+                                         SysFileTimeStruct& w) {
+	if (f.type == SYS_FILE_FILE) {
+		struct stat s {};
+
+		const bool ok = (0 == fstat(fileno(f.f), &s));
+
+		a.is_invalid = w.is_invalid = !ok;
+
+		if (ok) {
+			a.time  = s.st_atime;
+			a.nanos = KYTY_STAT_ATIME_NS(s);
+			w.time  = s.st_mtime;
+			w.nanos = KYTY_STAT_MTIME_NS(s);
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		// Memory-backed files use the current time.
+		SysTimeStruct t {};
+		SysGetSystemTimeUtc(t);
+		SysSystemToFileTimeUtc(t, a);
+		SysSystemToFileTimeUtc(t, w);
+	} else {
+		a.is_invalid = w.is_invalid = true;
+	}
 }
 
 bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& access) {
@@ -532,45 +615,110 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	//	}
 }
 
-void SysFileFindFiles(const std::filesystem::path& /*path*/,
-                      std::vector<sys_file_find_t>& /*out*/) {
-	EXIT("not implemented\n");
-}
+// Recursively collect regular files.
+void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
+	auto real_path = get_internal_name(path);
 
-void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	DIR* dir = opendir(path.c_str());
+	DIR* dir = opendir(real_path.string().c_str());
 	if (dir == nullptr) {
 		return;
 	}
-	for (dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
-		sys_dir_entry_t r {};
-		r.name = entry->d_name;
-		if (entry->d_type == DT_REG) {
-			r.is_file = true;
-		} else if (entry->d_type == DT_DIR) {
-			r.is_file = false;
-		} else {
-			// DT_UNKNOWN / symlink: resolve with stat.
-			struct stat st {};
-			r.is_file = (stat((path / entry->d_name).c_str(), &st) == 0) ? S_ISREG(st.st_mode) : true;
+
+	for (const dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+		const std::string file_name(entry->d_name);
+
+		if (file_name == "." || file_name == "..") {
+			continue;
 		}
-		out.push_back(std::move(r));
+
+		auto        child = real_path / file_name;
+		struct stat s {};
+
+		// lstat, so a symlink is never followed into a cycle during the recursive walk.
+		if (0 != lstat(child.string().c_str(), &s)) {
+			continue;
+		}
+
+		if (S_ISDIR(s.st_mode)) {
+			SysFileFindFiles(child, out);
+		} else if (S_ISREG(s.st_mode)) {
+			sys_file_find_t r {};
+
+			r.path_with_name              = child;
+			r.size                        = static_cast<uint64_t>(s.st_size);
+			r.last_access_time.is_invalid = false;
+			r.last_access_time.time       = s.st_atime;
+			r.last_access_time.nanos      = KYTY_STAT_ATIME_NS(s);
+			r.last_write_time.is_invalid  = false;
+			r.last_write_time.time        = s.st_mtime;
+			r.last_write_time.nanos       = KYTY_STAT_MTIME_NS(s);
+
+			out.push_back(r);
+		}
 	}
+
 	closedir(dir);
 }
 
-bool SysFileCopyFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {
-	EXIT("not implemented\n");
-	return false;
+// Keep "." and ".." to match FindFirstFileW.
+void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
+	auto real_path = get_internal_name(path);
+
+	DIR* dir = opendir(real_path.string().c_str());
+	if (dir == nullptr) {
+		return;
+	}
+
+	for (const dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
+		sys_dir_entry_t r {};
+
+		r.name = entry->d_name;
+
+		if (entry->d_type == DT_UNKNOWN) {
+			// Some filesystems do not populate d_type.
+			struct stat s {};
+			r.is_file = 0 == lstat((real_path / r.name).string().c_str(), &s) && S_ISREG(s.st_mode);
+		} else {
+			r.is_file = entry->d_type != DT_DIR;
+		}
+
+		out.push_back(r);
+	}
+
+	closedir(dir);
 }
 
-bool SysFileMoveFile(const std::filesystem::path& /*src*/, const std::filesystem::path& /*dst*/) {
-	EXIT("not implemented\n");
-	return false;
+bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	std::error_code error;
+	return std::filesystem::copy_file(get_internal_name(src), get_internal_name(dst),
+	                                  std::filesystem::copy_options::overwrite_existing, error) &&
+	       !error;
 }
 
-void SysFileRemoveReadonly(const std::filesystem::path& /*name*/) {
-	EXIT("not implemented\n");
+bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto real_src = get_internal_name(src);
+	auto real_dst = get_internal_name(dst);
+
+	// Match MoveFileW: fail when the destination exists.
+	std::error_code error;
+	if (std::filesystem::exists(real_dst, error)) {
+		return false;
+	}
+
+	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
+}
+
+void SysFileRemoveReadonly(const std::filesystem::path& name) {
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return;
+	}
+
+	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
 }
 
 #endif

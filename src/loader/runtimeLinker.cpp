@@ -36,6 +36,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 #endif
 
 namespace Libs::LibKernel {
@@ -354,6 +360,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		register uintptr_t    guest_rbp_reg asm("r15") = guest_rbp;
 #endif
 
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		asm volatile(
 		    "pushq %%r12\n\t"
 		    "pushq %%r13\n\t"
@@ -377,6 +384,22 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		    : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
 		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
 		      "xmm13", "xmm14", "xmm15");
+#else
+		// Clobbers prevent inputs from being allocated to r12/r13.
+		asm volatile("movq %%rsp, %%r12\n\t"
+		             "movq %%rbp, %%r13\n\t"
+		             "movq %[guest_rsp], %%rsp\n\t"
+		             "movq %[guest_rbp], %%rbp\n\t"
+		             "callq *%[func]\n\t"
+		             "movq %%r13, %%rbp\n\t"
+		             "movq %%r12, %%rsp\n\t"
+		             :
+		             : [func] "r"(func), "D"(params),
+		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
+		               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
+		               "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 		return;
 	}
 
@@ -387,6 +410,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	register uintptr_t    guest_rbp_reg asm("r14") = reinterpret_cast<uintptr_t>(guest_root_frame);
 #endif
 
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "movq %%rbp, %%r12\n\t"
@@ -406,6 +430,19 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
 	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+	// Keep inputs out of r12.
+	asm volatile("movq %%rbp, %%r12\n\t"
+	             "movq %[guest_rbp], %%rbp\n\t"
+	             "callq *%[func]\n\t"
+	             "movq %%r12, %%rbp\n\t"
+	             :
+	             : [func] "r"(func), "D"(params),
+	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
+	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "xmm0",
+	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
+	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
@@ -518,6 +555,69 @@ void KYTY_SYSV_ABI SysStackWalkX86(uint64_t rbp, void** stack, int* depth) {
 	SysStackWalkX86(rbp, rbp, stack, depth);
 }
 
+// Probe diagnostic ranges without raising another fault.
+static bool IsReadableRange(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0) {
+		return false;
+	}
+
+	const uint64_t end = addr + size;
+	if (end < addr) {
+		return false;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t current = addr;
+	while (current < end) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
+		    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			return false;
+		}
+		const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		if (region_end <= current) {
+			return false;
+		}
+		current = std::min(region_end, end);
+	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+	if (page_size == 0) {
+		return false;
+	}
+
+	for (uint64_t current = addr; current < end;) {
+		uint8_t probe = 0;
+
+		iovec local {&probe, sizeof(probe)};
+		iovec remote {reinterpret_cast<void*>(current), sizeof(probe)};
+
+		if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
+		    static_cast<ssize_t>(sizeof(probe))) {
+			return false;
+		}
+
+		const uint64_t next = (current & ~(page_size - 1)) + page_size;
+		if (next <= current) { // wrapped at the top of the address space
+			break;
+		}
+		current = next;
+	}
+#else
+	(void)end;
+#endif
+	return true;
+}
+
+static bool IsDumpableRange(uint64_t addr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return IsReadableRange(addr, size);
+#else
+	(void)size;
+	return addr != 0;
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -563,6 +663,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF("exception module: %s\n", module_name);
 		}
 	}
+#else
+	Dl_info module_info {};
+	if (::dladdr(reinterpret_cast<void*>(info->exception_address), &module_info) != 0 &&
+	    module_info.dli_fname != nullptr) {
+		LOGF("exception module: %s\n", module_info.dli_fname);
+	}
 #endif
 	if (info->exception_address != 0) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -586,12 +692,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF("code-32: unavailable\n");
 		}
 #else
-		LOGF("code-32:");
-		for (uint64_t i = 0; i < 64; i++) {
-			LOGF(" %02" PRIx32, static_cast<uint32_t>(*reinterpret_cast<const uint8_t*>(
-			                        info->exception_address + i - 32)));
+		const auto fault_addr = info->exception_address;
+		const auto dump_start = (fault_addr >= 32 ? fault_addr - 32 : fault_addr);
+		if (IsReadableRange(dump_start, 64)) {
+			auto* dump_ptr = reinterpret_cast<const uint8_t*>(dump_start);
+			LOGF("code-32:");
+			for (uint32_t i = 0; i < 64; i++) {
+				LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
+			}
+			LOGF("\n");
+		} else {
+			LOGF("code-32: unavailable\n");
 		}
-		LOGF("\n");
 #endif
 	} else {
 		LOGF("code: unavailable\n");
@@ -609,36 +721,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
 	     info->r12, info->r13, info->r14, info->r15);
 
-	auto is_readable_range = [](uint64_t addr, uint64_t size) {
-		if (addr == 0 || size == 0) {
-			return false;
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		uint64_t current = addr;
-		uint64_t end     = addr + size;
-		if (end < addr) {
-			return false;
-		}
-		while (current < end) {
-			MEMORY_BASIC_INFORMATION mbi {};
-			if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
-			    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-				return false;
-			}
-			const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-			if (region_end <= current) {
-				return false;
-			}
-			current = std::min(region_end, end);
-		}
-#else
-		(void)addr;
-		(void)size;
-#endif
-		return true;
-	};
-
-	if (is_readable_range(info->rsp, 16u * sizeof(uint64_t))) {
+	if (IsReadableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		LOGF("stack:");
 		for (uint64_t i = 0; i < 16; i++) {
@@ -669,6 +752,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 #else
 		auto*      dump_ptr  = reinterpret_cast<const uint8_t*>(addr >= 16 ? addr - 16 : addr);
 		const auto dump_size = 32u;
+		if (!IsReadableRange(reinterpret_cast<uint64_t>(dump_ptr), dump_size)) {
+			return;
+		}
 #endif
 
 		LOGF("%s code: addr=%016" PRIx64 ", off=%016" PRIx64 ", module=%s:", name, addr,
@@ -684,7 +770,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
 	dump_guest_code("guest rsi[0]", info->rsi);
-	if (info->rsp != 0) {
+	if (IsDumpableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		for (uint64_t i = 0; i < 16; i++) {
 			char name[32] {};
@@ -713,7 +799,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 
-		auto dump_guest_qwords = [&is_readable_range](const char* name, uint64_t addr) {
+		auto dump_guest_qwords = [](const char* name, uint64_t addr) {
 			if (addr == 0) {
 				LOGF("%s = 0\n", name);
 				return;
@@ -728,7 +814,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 #endif
 
-			if (!is_readable_range(addr, 8u * sizeof(uint64_t))) {
+			if (!IsReadableRange(addr, 8u * sizeof(uint64_t))) {
 				LOGF("%s = %016" PRIx64 " (unmapped)\n", name, addr);
 				return;
 			}
@@ -753,7 +839,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
 
-		if (info->exception_address == 0x000000090064364e && info->rbx != 0) {
+		if (info->exception_address == 0x000000090064364e &&
+		    IsDumpableRange(info->rbx, sizeof(uint64_t))) {
 			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
 			dump_guest_qwords("vorbis obj", local[0]);
 			dump_guest_qwords("vorbis len", info->rcx);

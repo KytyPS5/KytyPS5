@@ -1507,7 +1507,7 @@ public:
                 ordered_finished.load(),
             "submission barrier did not drain prior PM4 work");
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
     constexpr uintptr_t fault_base = 0x0000000200500000ull;
     constexpr uint64_t fault_size = 0x10000;
     int64_t fault_direct_offset = -1;
@@ -1689,7 +1689,7 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 fault_direct_offset, fault_size) == 0,
             "processor-fault direct-memory allocation release failed");
-#endif
+
 
     std::binary_semaphore command_entered{0};
     std::binary_semaphore release_command{0};
@@ -1896,7 +1896,7 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -6117,7 +6117,7 @@ public:
             "descriptor discovery direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
-#endif
+
 
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
@@ -15071,7 +15071,6 @@ void CheckEmbeddedFetchVertexOffset() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 struct CacheFaultContext {
   TextureCache *texture = nullptr;
 };
@@ -15088,6 +15087,7 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
   std::_Exit(0x7f);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckReverseRenderTargetFormatContract() {
   const auto format = TextureGetRenderTargetFormat(12u, 7u, 2u);
   Require("ReverseRenderTarget", "exact format",
@@ -15129,6 +15129,7 @@ void CheckReverseRenderTargetFormatContract() {
       "adjacent unproven render-target tuple did not retain the fatal guard");
   std::printf("[host]    %-32s ok\n", "ReverseRenderTargetFormat");
 }
+#endif
 
 [[noreturn]] void RunImageViewDeathCase(const char *kind) {
   if (std::strcmp(kind, "sampled-invalid-selector") == 0) {
@@ -15211,6 +15212,7 @@ void CheckReverseRenderTargetFormatContract() {
   std::_Exit(0x7f);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckSampledColorViews() {
   Require("SampledColorViews", "identity",
           SelectSampledColorView(vk::Format::eR8G8B8A8Unorm,
@@ -15446,6 +15448,7 @@ void CheckSampledColorViews() {
   }
   std::printf("[host]    %-32s ok\n", "SampledColorRenderTargetViews");
 }
+#endif
 
 void CheckSampledDepthResource() {
   ShaderRecompiler::IR::ImageResource resource{};
@@ -16209,6 +16212,7 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
   std::_Exit(0x7f);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckBasicStorageTextureDescriptor() {
   const auto descriptor = BasicStorageTextureDescriptor();
   Require("BasicStorageTexture", "descriptor",
@@ -16567,6 +16571,7 @@ void CheckBasicStorageTextureDescriptor() {
   }
   std::printf("[host]    %-32s ok\n", "BasicStorageTextureDescriptor");
 }
+#endif
 
 void CheckStorageTextureLinearUploadLayout() {
   constexpr uint32_t format =
@@ -16835,6 +16840,7 @@ void CheckStandard64RenderTargetTileRoundTrip() {
   std::printf("[host]    %-32s ok\n", "Standard64RenderTarget");
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckStorageTextureGpuOwnedRebindState() {
   constexpr uintptr_t base = 0x0000000200200000ull;
   constexpr uint64_t size = 0x10000;
@@ -16904,6 +16910,7 @@ void CheckStorageTextureGpuOwnedRebindState() {
           VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "StorageTextureGpuOwnedRebind");
 }
+#endif
 
 void CheckNativeMsaaState() {
   Require("NativeMsaaState", "sample encoding",
@@ -17407,7 +17414,7 @@ void CheckSharedFenceResourceLifetime() {
   std::printf("[host]    %-32s ok\n", "SharedFenceResourceLifetime");
 }
 
-#endif
+
 
 void CheckEmbeddedFetchLaneSpill() {
   std::vector<u32> code;
@@ -17683,18 +17690,6 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuCommandLane();
     return 0;
   }
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
-    RunReverseRenderTargetDeathCase();
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
-    CheckReverseRenderTargetFormatContract();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
-    CheckStandard64RenderTargetTileRoundTrip();
-    return 0;
-  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDynamicRenderingState();
@@ -17714,15 +17709,46 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedImageViewCache();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUnifiedImageViewCache();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUnifiedImageViewCache();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
+    CheckDepthTargetFootprints();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheDirtyGarbageCollection();
+    return 0;
+  }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
+    RunReverseRenderTargetDeathCase();
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
+    CheckReverseRenderTargetFormatContract();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
+    CheckStandard64RenderTargetTileRoundTrip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledColorViews();
     CheckSampledVideoOutView(vulkan.RuntimeRenderer());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckUnifiedImageViewCache();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
@@ -17734,16 +17760,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
     CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckUnifiedTextureCacheFlow();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
@@ -17760,15 +17776,6 @@ int main(int argc, char **argv) {
     CheckStorageTextureGpuOwnedRebindState();
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageStoreYzwxUsesInverseSwizzle());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckUnifiedImageViewCache();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
-    CheckDepthTargetFootprints();
     return 0;
   }
   if (argc == 3 && std::strcmp(argv[1], "--image-view-death") == 0) {

@@ -21,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <system_error>
 #include <vector>
 
 namespace Libs::LibKernel::FileSystem {
@@ -153,6 +154,11 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// Close host files opened before a failed descriptor setup.
+	m_files[index]->f.Close();
+#endif
+
 	delete m_files[index];
 	m_files[index] = nullptr;
 }
@@ -223,6 +229,52 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 	}
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Resolve guest paths case-insensitively on case-sensitive hosts.
+static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
+	std::error_code ec;
+	if (std::filesystem::exists(path, ec)) {
+		return path;
+	}
+
+	// Preserve unmatched components for the caller's ENOENT path.
+	std::filesystem::path resolved = path.has_root_path() ? path.root_path() : std::filesystem::path(".");
+	bool                  matched  = true;
+
+	for (const auto& component: path.relative_path()) {
+		if (component.empty()) {
+			continue;
+		}
+
+		auto candidate = resolved / component;
+		if (!matched || std::filesystem::exists(candidate, ec)) {
+			resolved = std::move(candidate);
+			continue;
+		}
+
+		bool found = false;
+		for (std::filesystem::directory_iterator entry(resolved, ec), end; entry != end;
+		     entry.increment(ec)) {
+			if (ec) {
+				break;
+			}
+			if (Common::EqualNoCase(entry->path().filename().string(), component.string())) {
+				resolved = entry->path();
+				found    = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			resolved = std::move(candidate);
+			matched  = false;
+		}
+	}
+
+	return resolved;
+}
+#endif
+
 std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_file_name) {
 	Common::LockGuard lock(m_mutex);
 
@@ -239,7 +291,11 @@ std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_fi
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return p.dir / rel_path;
+#else
+		return ResolvePathIgnoringCase(p.dir / rel_path);
+#endif
 	}
 
 	return mounted_file_name;
@@ -260,7 +316,11 @@ std::filesystem::path MountPoints::GetRealDirectory(const std::string& mounted_d
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return p.dir / rel_path;
+#else
+		return ResolvePathIgnoringCase(p.dir / rel_path);
+#endif
 	}
 
 	return mounted_directory;

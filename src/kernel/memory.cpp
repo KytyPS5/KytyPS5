@@ -242,6 +242,13 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::Mode mode) {
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// Prefer one syscall, then fall back to the per-page path.
+	if (size > PAGE_SIZE && VirtualMemory::AllocFixed(start, size, mode)) {
+		return true;
+	}
+#endif
+
 	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
@@ -2990,6 +2997,13 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 		}
 	}
 	g_test_host_reservation_pages_before_failure = UINT32_MAX;
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// Prefer one syscall, then fall back to the per-page path.
+	if (size > PAGE_SIZE && VirtualMemory::ReserveFixed(start, size)) {
+		return true;
+	}
 #endif
 
 	bool host_mutated = false;

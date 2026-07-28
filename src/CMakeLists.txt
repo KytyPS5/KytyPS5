@@ -251,6 +251,26 @@ endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
 
+# Linux system libraries required by the static FFmpeg archive.
+if(LINUX)
+	find_package(Threads REQUIRED)
+	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
+
+	# Optional FFmpeg dependencies.
+	find_package(ZLIB)
+	if(ZLIB_FOUND)
+		list(APPEND kyty_emulator_link_libraries ZLIB::ZLIB)
+	endif()
+	find_library(KYTY_BZ2_LIBRARY bz2)
+	if(KYTY_BZ2_LIBRARY)
+		list(APPEND kyty_emulator_link_libraries ${KYTY_BZ2_LIBRARY})
+	endif()
+	find_library(KYTY_LZMA_LIBRARY lzma)
+	if(KYTY_LZMA_LIBRARY)
+		list(APPEND kyty_emulator_link_libraries ${KYTY_LZMA_LIBRARY})
+	endif()
+endif()
+
 set(inc_headers
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/SDL2/include
@@ -394,6 +414,14 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemo
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# These tests use exceptions.
+if(NOT KYTY_CLANG_CL)
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+			virtual_memory_allocation_tests)
+		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
+	endforeach()
+endif()
+
 if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -410,23 +438,25 @@ if(BUILD_TESTING)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 
+	add_test(NAME texture_cache_layered_image
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
+	add_test(NAME texture_cache_image_views
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
+	add_test(NAME texture_cache_storage_sampled
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
+	add_test(NAME texture_cache_depth_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME buffer_cache_dirty_gc
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+
 	if(WIN32)
+		# These tests still depend on the Windows multisample-depth path.
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 		add_test(NAME texture_cache_htile_clear
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
-		add_test(NAME texture_cache_layered_image
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
-		add_test(NAME texture_cache_image_views
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
-		add_test(NAME texture_cache_storage_sampled
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
-		add_test(NAME texture_cache_depth_readback
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
-		add_test(NAME buffer_cache_dirty_gc
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	endif()
 endif()
 
@@ -446,6 +476,8 @@ endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator pthread)
 endif()
+# dlopen/dlsym/dladdr for RenderDoc.
+target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")

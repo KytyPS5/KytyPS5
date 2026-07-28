@@ -23,6 +23,10 @@ struct sys_dbg_stack_info_t {
 	size_t    commited_size;
 	size_t    total_size;
 	size_t    code_size;
+
+	// Full stack reservation reported by pthread.
+	uintptr_t reserved_addr;
+	size_t    reserved_size;
 #endif
 };
 

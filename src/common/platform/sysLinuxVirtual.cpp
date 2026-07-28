@@ -8,9 +8,11 @@
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
+#include <atomic>
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -81,6 +83,70 @@ static VirtualMemory::Mode get_protection_flag(int mode) {
 	}
 }
 
+// Keep automatic mappings inside the guest and GPU-addressable low window.
+#ifdef KYTY_FIXED_NOREPLACE
+static constexpr uintptr_t LOW_ARENA_LIMIT = 0x000000FC00000000ULL; // libc mspace window ceiling
+static constexpr uintptr_t LOW_ARENA_FLOOR = 0x000000A000000000ULL; // 640 GiB
+static constexpr uintptr_t LOW_ARENA_GRAIN = 0x0000000000010000ULL; // 64 KiB
+
+static_assert(LOW_ARENA_LIMIT <= 0x0000010000000000ULL,
+              "arena must stay inside the GPU page tracker's 1<<40 window");
+static_assert(LOW_ARENA_FLOOR < LOW_ARENA_LIMIT, "arena floor must sit below its ceiling");
+
+static std::atomic<uintptr_t> g_low_arena_next {LOW_ARENA_LIMIT};
+#endif
+
+// Caller holds g_virtual_mutex.
+static void record_alloc(uintptr_t addr, size_t size) {
+	auto next = g_allocs->upper_bound(addr);
+	if (next != g_allocs->begin()) {
+		auto       it         = std::prev(next);
+		const auto alloc_addr = it->first;
+		const auto alloc_end  = alloc_addr + it->second;
+		if (alloc_addr <= addr && addr + size <= alloc_end) {
+			g_allocs->erase(it);
+			if (alloc_addr < addr) {
+				(*g_allocs)[alloc_addr] = addr - alloc_addr;
+			}
+			if (addr + size < alloc_end) {
+				(*g_allocs)[addr + size] = alloc_end - (addr + size);
+			}
+		}
+	}
+	(*g_allocs)[addr] = size;
+}
+
+#ifdef KYTY_FIXED_NOREPLACE
+static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
+	return (addr + alignment - 1) & ~(alignment - 1);
+}
+#endif
+
+// Freed arena addresses are not reused while GPU caches remain keyed by address.
+static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) {
+	if (addr != 0) {
+		return mmap(reinterpret_cast<void*>(addr), size, protect, flags, -1, 0); // NOLINT
+	}
+
+#ifdef KYTY_FIXED_NOREPLACE
+	const auto step = align_up_to(size, LOW_ARENA_GRAIN);
+	for (int attempt = 0; attempt < 256; attempt++) {
+		const auto top = g_low_arena_next.fetch_sub(step, std::memory_order_relaxed);
+		if (top < step || top - step < LOW_ARENA_FLOOR) {
+			break;
+		}
+		const auto hint = (top - step) & ~(LOW_ARENA_GRAIN - 1);
+		void*      ptr  = mmap(reinterpret_cast<void*>(hint), size, protect,
+		                       flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
+		if (ptr != MAP_FAILED) {
+			return ptr;
+		}
+	}
+#endif
+
+	return mmap(nullptr, size, protect, flags, -1, 0); // NOLINT
+}
+
 uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
 
@@ -88,14 +154,13 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 
 	int protect = get_protection_flag(mode);
 
-	void* ptr =
-	    mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	void* ptr = map_anonymous(addr, size, protect, MAP_PRIVATE | MAP_ANON);
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		(*g_allocs)[ret_addr] = size;
+		record_alloc(ret_addr, size);
 		uintptr_t page_start  = ret_addr >> 12u;
 		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -122,16 +187,15 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	auto addr    = static_cast<uintptr_t>(address);
 	int  protect = get_protection_flag(mode);
 
-	void* ptr =
-	    mmap(reinterpret_cast<void*>(addr), size, protect, MAP_PRIVATE | MAP_ANON, -1, 0); // NOLINT
+	void* ptr = map_anonymous(addr, size, protect, MAP_PRIVATE | MAP_ANON);
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
 	if (ptr != MAP_FAILED && ((ret_addr & (alignment - 1)) != 0)) {
 		munmap(ptr, size);
 
-		ptr      = mmap(reinterpret_cast<void*>(addr), size + alignment, protect,
-		                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+		ptr      = map_anonymous(addr, size + alignment, protect,
+		                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 #if defined(__APPLE__)
@@ -186,7 +250,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
-	(*g_allocs)[ret_addr] = size;
+	record_alloc(ret_addr, size);
 	uintptr_t page_start  = ret_addr >> 12u;
 	uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 	for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -272,7 +336,7 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		(*g_allocs)[ret_addr] = size;
+		record_alloc(ret_addr, size);
 		uintptr_t page_start  = ret_addr >> 12u;
 		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -303,16 +367,15 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 
 	auto addr = static_cast<uintptr_t>(address);
 
-	void* ptr = mmap(reinterpret_cast<void*>(addr), size, PROT_NONE,
-	                 MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+	void* ptr = map_anonymous(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 
 	auto ret_addr = reinterpret_cast<uintptr_t>(ptr);
 
 	if (ptr != MAP_FAILED && ((ret_addr & (alignment - 1)) != 0)) {
 		munmap(ptr, size);
 
-		ptr      = mmap(reinterpret_cast<void*>(addr), size + alignment, PROT_NONE,
-		                MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0); // NOLINT
+		ptr      = map_anonymous(addr, size + alignment, PROT_NONE,
+		                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 #if defined(__APPLE__)
@@ -368,7 +431,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
-	(*g_allocs)[ret_addr] = size;
+	record_alloc(ret_addr, size);
 	uintptr_t page_start  = ret_addr >> 12u;
 	uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 	for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -406,7 +469,7 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		(*g_allocs)[ret_addr] = size;
+		record_alloc(ret_addr, size);
 		uintptr_t page_start  = ret_addr >> 12u;
 		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
@@ -421,7 +484,29 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 }
 
 bool SysVirtualDecommit(uint64_t address, uint64_t size) {
-	return SysVirtualProtect(address, size, VirtualMemory::Mode::NoAccess);
+	// Drop physical pages while preserving the reservation.
+	if (!SysVirtualProtect(address, size, VirtualMemory::Mode::NoAccess)) {
+		return false;
+	}
+
+	if (size != 0) {
+#if defined(__APPLE__)
+		constexpr int RECLAIM_ADVICE = MADV_FREE;
+#else
+		constexpr int RECLAIM_ADVICE = MADV_DONTNEED;
+#endif
+		const auto page_size = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+		if (page_size != 0) {
+			// Do not discard pages outside the requested range.
+			const auto begin = (static_cast<uintptr_t>(address) + page_size - 1) & ~(page_size - 1);
+			const auto end   = (static_cast<uintptr_t>(address) + size) & ~(page_size - 1);
+			if (end > begin) {
+				::madvise(reinterpret_cast<void*>(begin), end - begin, RECLAIM_ADVICE);
+			}
+		}
+	}
+
+	return true;
 }
 
 bool SysVirtualFree(uint64_t address) {
@@ -473,15 +558,34 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return false;
 	}
-	auto       it         = std::prev(next);
-	const auto alloc_addr = it->first;
-	const auto alloc_end  = alloc_addr + it->second;
-	if (addr < alloc_addr || end > alloc_end || munmap(reinterpret_cast<void*>(addr), size) != 0) {
+
+	// A reservation may have been split into several adjacent records.
+	auto       first      = std::prev(next);
+	const auto alloc_addr = first->first;
+	if (addr < alloc_addr || alloc_addr + first->second <= addr) {
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return false;
 	}
 
-	g_allocs->erase(it);
+	auto      last   = first;
+	uintptr_t cursor = alloc_addr + first->second;
+	while (cursor < end) {
+		auto following = std::next(last);
+		if (following == g_allocs->end() || following->first != cursor) {
+			pthread_mutex_unlock(&g_virtual_mutex);
+			return false;
+		}
+		last   = following;
+		cursor = following->first + following->second;
+	}
+	const auto alloc_end = cursor;
+
+	if (munmap(reinterpret_cast<void*>(addr), size) != 0) {
+		pthread_mutex_unlock(&g_virtual_mutex);
+		return false;
+	}
+
+	g_allocs->erase(first, std::next(last));
 	if (alloc_addr < addr) {
 		(*g_allocs)[alloc_addr] = addr - alloc_addr;
 	}

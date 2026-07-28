@@ -7,11 +7,18 @@
 #include <atomic>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cerrno>
 #include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
 #define KYTY_WIN_CS
+#endif
+
+// macOS has no clock_nanosleep.
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+#define KYTY_POSIX_HIGH_RES_SLEEP
+#include <ctime>
 #endif
 
 #include <sstream>
@@ -119,6 +126,42 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 	return nullptr;
 }
 
+#endif
+
+#ifdef KYTY_POSIX_HIGH_RES_SLEEP
+// Spin for very short waits; use an absolute deadline for longer waits.
+static void SleepHighResolutionNanos(uint64_t nanos) {
+	if (nanos == 0) {
+		return;
+	}
+
+	constexpr uint64_t NANOS_PER_SEC = 1000000000;
+	constexpr uint64_t SPIN_LIMIT_NS = 50000; // below this a context switch dominates
+
+	timespec deadline {};
+	if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+		std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
+		return;
+	}
+
+	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
+	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
+	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
+
+	if (nanos <= SPIN_LIMIT_NS) {
+		timespec now {};
+		do {
+			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+				return;
+			}
+		} while (now.tv_sec < deadline.tv_sec ||
+		         (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
+		return;
+	}
+
+	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
+	}
+}
 #endif
 
 namespace Common {
@@ -249,6 +292,8 @@ void Thread::Sleep(uint32_t millis) {
 void Thread::SleepMicro(uint32_t micros) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000);
 #else
 	std::this_thread::sleep_for(std::chrono::microseconds(micros));
 #endif
@@ -257,6 +302,8 @@ void Thread::SleepMicro(uint32_t micros) {
 void Thread::SleepNano(uint64_t nanos) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns((nanos + 99) / 100);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	SleepHighResolutionNanos(nanos);
 #else
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
 #endif

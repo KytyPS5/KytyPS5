@@ -40,6 +40,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif !defined(__APPLE__)
+#include <csignal>
+#include <ucontext.h>
 #endif
 
 namespace Libs {
@@ -630,6 +633,75 @@ static SignalUcontext CreateSignalUcontext(
 	ctx.uc_mcontext.mc_rsp = reinterpret_cast<uint64_t>(&stack_marker);
 	ctx.uc_mcontext.mc_rbp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
 	ctx.uc_mcontext.mc_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+
+#if defined(__x86_64__)
+	// Capture the remaining guest-visible registers.
+	uint64_t rax = 0;
+	uint64_t rbx = 0;
+	uint64_t rcx = 0;
+	uint64_t rdx = 0;
+	uint64_t rsi = 0;
+	uint64_t rdi = 0;
+	asm volatile("movq %%rax, %0\n\t"
+	             "movq %%rbx, %1\n\t"
+	             "movq %%rcx, %2\n\t"
+	             "movq %%rdx, %3\n\t"
+	             "movq %%rsi, %4\n\t"
+	             "movq %%rdi, %5\n\t"
+	             : "=m"(rax), "=m"(rbx), "=m"(rcx), "=m"(rdx), "=m"(rsi), "=m"(rdi)
+	             :
+	             : "memory");
+
+	uint64_t r8  = 0;
+	uint64_t r9  = 0;
+	uint64_t r10 = 0;
+	uint64_t r11 = 0;
+	uint64_t r12 = 0;
+	uint64_t r13 = 0;
+	uint64_t r14 = 0;
+	uint64_t r15 = 0;
+	asm volatile("movq %%r8,  %0\n\t"
+	             "movq %%r9,  %1\n\t"
+	             "movq %%r10, %2\n\t"
+	             "movq %%r11, %3\n\t"
+	             "movq %%r12, %4\n\t"
+	             "movq %%r13, %5\n\t"
+	             "movq %%r14, %6\n\t"
+	             "movq %%r15, %7\n\t"
+	             : "=m"(r8), "=m"(r9), "=m"(r10), "=m"(r11), "=m"(r12), "=m"(r13), "=m"(r14),
+	               "=m"(r15)
+	             :
+	             : "memory");
+
+	uint64_t rflags = 0;
+	uint64_t cs     = 0;
+	uint64_t ss     = 0;
+	asm volatile("pushfq\n\t"
+	             "popq %0\n\t"
+	             "movq %%cs, %1\n\t"
+	             "movq %%ss, %2\n\t"
+	             : "=r"(rflags), "=r"(cs), "=r"(ss)
+	             :
+	             : "memory");
+
+	ctx.uc_mcontext.mc_rax    = rax;
+	ctx.uc_mcontext.mc_rbx    = rbx;
+	ctx.uc_mcontext.mc_rcx    = rcx;
+	ctx.uc_mcontext.mc_rdx    = rdx;
+	ctx.uc_mcontext.mc_rsi    = rsi;
+	ctx.uc_mcontext.mc_rdi    = rdi;
+	ctx.uc_mcontext.mc_r8     = r8;
+	ctx.uc_mcontext.mc_r9     = r9;
+	ctx.uc_mcontext.mc_r10    = r10;
+	ctx.uc_mcontext.mc_r11    = r11;
+	ctx.uc_mcontext.mc_r12    = r12;
+	ctx.uc_mcontext.mc_r13    = r13;
+	ctx.uc_mcontext.mc_r14    = r14;
+	ctx.uc_mcontext.mc_r15    = r15;
+	ctx.uc_mcontext.mc_rflags = rflags;
+	ctx.uc_mcontext.mc_cs     = cs;
+	ctx.uc_mcontext.mc_ss     = ss;
+#endif
 #endif
 
 	return ctx;
@@ -763,6 +835,123 @@ static void ApplySignalUcontext(CONTEXT* dst_ctx, const SignalUcontext& src_ctx)
 	dst_ctx->SegEs  = src_ctx.uc_mcontext.mc_es;
 	dst_ctx->EFlags = static_cast<DWORD>(src_ctx.uc_mcontext.mc_rflags);
 }
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__) && defined(__x86_64__)
+
+static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
+	SignalUcontext ctx = {};
+	if (host_ctx == nullptr) {
+		return ctx;
+	}
+
+	const auto* gregs = host_ctx->uc_mcontext.gregs;
+
+	ctx.uc_mcontext.mc_rdi    = static_cast<uint64_t>(gregs[REG_RDI]);
+	ctx.uc_mcontext.mc_rsi    = static_cast<uint64_t>(gregs[REG_RSI]);
+	ctx.uc_mcontext.mc_rdx    = static_cast<uint64_t>(gregs[REG_RDX]);
+	ctx.uc_mcontext.mc_rcx    = static_cast<uint64_t>(gregs[REG_RCX]);
+	ctx.uc_mcontext.mc_r8     = static_cast<uint64_t>(gregs[REG_R8]);
+	ctx.uc_mcontext.mc_r9     = static_cast<uint64_t>(gregs[REG_R9]);
+	ctx.uc_mcontext.mc_rax    = static_cast<uint64_t>(gregs[REG_RAX]);
+	ctx.uc_mcontext.mc_rbx    = static_cast<uint64_t>(gregs[REG_RBX]);
+	ctx.uc_mcontext.mc_rbp    = static_cast<uint64_t>(gregs[REG_RBP]);
+	ctx.uc_mcontext.mc_r10    = static_cast<uint64_t>(gregs[REG_R10]);
+	ctx.uc_mcontext.mc_r11    = static_cast<uint64_t>(gregs[REG_R11]);
+	ctx.uc_mcontext.mc_r12    = static_cast<uint64_t>(gregs[REG_R12]);
+	ctx.uc_mcontext.mc_r13    = static_cast<uint64_t>(gregs[REG_R13]);
+	ctx.uc_mcontext.mc_r14    = static_cast<uint64_t>(gregs[REG_R14]);
+	ctx.uc_mcontext.mc_r15    = static_cast<uint64_t>(gregs[REG_R15]);
+	ctx.uc_mcontext.mc_rip    = static_cast<uint64_t>(gregs[REG_RIP]);
+	ctx.uc_mcontext.mc_rsp    = static_cast<uint64_t>(gregs[REG_RSP]);
+	ctx.uc_mcontext.mc_rflags = static_cast<uint64_t>(gregs[REG_EFL]);
+
+	// Linux packs cs/gs/fs into one greg.
+	const auto csgsfs      = static_cast<uint64_t>(gregs[REG_CSGSFS]);
+	ctx.uc_mcontext.mc_cs  = csgsfs & 0xffffu;
+	ctx.uc_mcontext.mc_gs  = static_cast<uint16_t>((csgsfs >> 16u) & 0xffffu);
+	ctx.uc_mcontext.mc_fs  = static_cast<uint16_t>((csgsfs >> 32u) & 0xffffu);
+	ctx.uc_mcontext.mc_len = sizeof(SignalMcontext);
+
+	return ctx;
+}
+
+static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext& src_ctx) {
+	if (dst_ctx == nullptr) {
+		return;
+	}
+
+	auto* gregs = dst_ctx->uc_mcontext.gregs;
+
+	gregs[REG_RDI] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rdi);
+	gregs[REG_RSI] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rsi);
+	gregs[REG_RDX] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rdx);
+	gregs[REG_RCX] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rcx);
+	gregs[REG_R8]  = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r8);
+	gregs[REG_R9]  = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r9);
+	gregs[REG_RAX] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rax);
+	gregs[REG_RBX] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rbx);
+	gregs[REG_RBP] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rbp);
+	gregs[REG_R10] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r10);
+	gregs[REG_R11] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r11);
+	gregs[REG_R12] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r12);
+	gregs[REG_R13] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r13);
+	gregs[REG_R14] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r14);
+	gregs[REG_R15] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_r15);
+	gregs[REG_RIP] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rip);
+	gregs[REG_RSP] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rsp);
+	gregs[REG_EFL] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rflags);
+
+	// The kernel validates packed segment selectors on sigreturn.
+}
+
+static int SignalDispatchHostSignal() {
+	static const int host_signal = SIGRTMIN + 3;
+	return host_signal;
+}
+
+static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
+                                      void* native_context) {
+	Pthread current = PthreadSelfOrNull();
+	if (current == nullptr) {
+		return;
+	}
+
+	auto* host_ctx = static_cast<ucontext_t*>(native_context);
+
+	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
+		if (!TakePendingSignal(current, signum)) {
+			continue;
+		}
+
+		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+		if (handler != nullptr) {
+			SignalDispatchScope scope;
+			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
+			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+				handler(signum, &ctx);
+				ApplySignalUcontextToHost(host_ctx, ctx);
+			} else {
+				// Do not expose or restore a host frame.
+				SanitizeNonGuestSignalUcontext(&ctx, current);
+				handler(signum, &ctx);
+			}
+		}
+		return;
+	}
+}
+
+static bool EnsureHostSignalDispatchInstalled() {
+	static const bool installed = [] {
+		struct sigaction action {};
+		action.sa_sigaction = HostSignalDispatchHandler;
+		sigemptyset(&action.sa_mask);
+		action.sa_flags = SA_SIGINFO | SA_RESTART;
+		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
+	}();
+	return installed;
+}
+
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -984,6 +1173,31 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			DispatchSignalWithSuspendedThreadContext(target_thread, thread, signum, handler);
 		}
 		CloseHandle(target_thread);
+		return OK;
+#elif !defined(__APPLE__) && defined(__x86_64__)
+		// Deliver on the target thread.
+		if (thread == PthreadSelfOrNull()) {
+			SignalDispatchScope scope;
+			auto                ctx = CreateCurrentGuestCallSignalUcontext(
+			                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			handler(signum, &ctx);
+			return OK;
+		}
+
+		if (!EnsureHostSignalDispatchInstalled()) {
+			return KERNEL_ERROR_EINVAL;
+		}
+
+		QueuePendingSignal(thread, signum);
+		if (!PthreadKillHost(thread, SignalDispatchHostSignal())) {
+			TakePendingSignal(thread, signum);
+			LOGF("\t pthread_kill failed for target thread\n");
+			return KERNEL_ERROR_EINVAL;
+		}
+
+		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
+		PthreadWakeForSignal(thread);
+		WaitForSignalDispatch(thread, signum);
 		return OK;
 #else
 		auto ctx = CreateSignalUcontext();
@@ -1291,6 +1505,11 @@ static bool DecodeEhFramePointer(const uint8_t* data, const uint8_t* end, uint8_
 
 	*value = out;
 	return true;
+}
+
+// Kyty does not create guest signal-return trampoline frames.
+int KYTY_SYSV_ABI KernelIsSignalReturn(uint64_t /*pc*/) {
+	return 0;
 }
 
 int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
@@ -3044,6 +3263,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("AqBioC2vF3I", LibKernel::read);
 	LIB_FUNC("f7KBOafysXo", LibKernel::KernelGetModuleInfoFromAddr);
 	LIB_FUNC("RpQJJVKTiFM", LibKernel::KernelGetModuleInfoForUnwind);
+	LIB_FUNC("crb5j7mkk1c", LibKernel::KernelIsSignalReturn); // _is_signal_return
 	LIB_FUNC("Fjc4-n1+y2g", LibKernel::elf_phdr_match_addr);
 	LIB_FUNC("FxVZqBAA7ks", LibKernel::write);
 	LIB_FUNC("FJmglmTMdr4", LibKernel::getargv);

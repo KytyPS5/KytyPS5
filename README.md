@@ -2,15 +2,15 @@
 
 [![Windows Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Linux Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml)
-[![macOS Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-macos.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-macos.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4.svg)](#system-requirements)
+[![macOS Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
-KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows. It is based on
-a heavily modified version of [Kyty](https://github.com/InoriRus/Kyty). The project is in an early
-stage of development, so compatibility is limited and behavior may change significantly between
-builds.
+KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows, with
+experimental macOS support. It is based on a heavily modified version of
+[Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
+compatibility is limited and behavior may change significantly between builds.
 
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
@@ -24,7 +24,10 @@ KytyPS5 can boot 2D games and a selection of 3D games, including titles built wi
 
 Development is focused on compatibility and boot reliability.
 
-Linux support is planned, but Windows is the only supported platform at this time.
+Linux support is planned. Windows remains the primary supported platform.
+
+macOS support is experimental. Compatibility with the same games on Windows and macOS has not yet
+been tested.
 
 ## Bugs and Issues
 

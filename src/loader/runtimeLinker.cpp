@@ -345,38 +345,47 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
-		// The template clobbers r12/r13 before consuming its inputs, so the inputs must
-		// be pinned to registers the template never touches (and which the SysV callee
-		// preserves): plain "r" constraints let the allocator place them in r12/r13,
-		// turning `callq *%[func]` into a jump through the saved host rsp.
+#if defined(__APPLE__)
+		// Clang on macOS can allocate plain "r" inputs to r12/r13, which the template
+		// clobbers before consuming them. Pin the inputs to registers the SysV guest
+		// preserves without changing register allocation on Windows or Linux.
 		register entry_func_t func_reg asm("rbx")      = func;
 		register uintptr_t    guest_rsp_reg asm("r14") = guest_rsp;
 		register uintptr_t    guest_rbp_reg asm("r15") = guest_rbp;
+#endif
 
-		asm volatile("pushq %%r12\n\t"
-		             "pushq %%r13\n\t"
-		             "movq %%rsp, %%r12\n\t"
-		             "movq %%rbp, %%r13\n\t"
-		             "movq %[guest_rsp], %%rsp\n\t"
-		             "movq %[guest_rbp], %%rbp\n\t"
-		             "callq *%[func]\n\t"
-		             "movq %%r13, %%rbp\n\t"
-		             "movq %%r12, %%rsp\n\t"
-		             "popq %%r13\n\t"
-		             "popq %%r12\n\t"
-		             :
-		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func),
-		               [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
-		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
-		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+		asm volatile(
+		    "pushq %%r12\n\t"
+		    "pushq %%r13\n\t"
+		    "movq %%rsp, %%r12\n\t"
+		    "movq %%rbp, %%r13\n\t"
+		    "movq %[guest_rsp], %%rsp\n\t"
+		    "movq %[guest_rbp], %%rbp\n\t"
+		    "callq *%[func]\n\t"
+		    "movq %%r13, %%rbp\n\t"
+		    "movq %%r12, %%rsp\n\t"
+		    "popq %%r13\n\t"
+		    "popq %%r12\n\t"
+		    :
+#if defined(__APPLE__)
+		    : [func] "r"(func_reg), "D"(params),
+		      "S"(atexit_func), [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
+#else
+		    : [func] "r"(func), "D"(params),
+		      "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+#endif
+		    : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
+		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+		      "xmm13", "xmm14", "xmm15");
 		return;
 	}
 
 	uintptr_t guest_root_frame[2] = {};
 
+#if defined(__APPLE__)
 	register entry_func_t func_reg asm("rbx")      = func;
 	register uintptr_t    guest_rbp_reg asm("r14") = reinterpret_cast<uintptr_t>(guest_root_frame);
+#endif
 
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
@@ -387,8 +396,13 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             :
+#if defined(__APPLE__)
 	             : [func] "r"(func_reg), "D"(params),
 	               "S"(atexit_func), [guest_rbp] "r"(guest_rbp_reg)
+#else
+	             : [func] "r"(func), "D"(params),
+	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
+#endif
 	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
 	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");

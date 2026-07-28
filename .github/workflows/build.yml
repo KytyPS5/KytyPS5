@@ -8,6 +8,7 @@ on:
 
 jobs:
   windows:
+    name: Build KytyPS5 (Windows)
     runs-on: windows-2022
 
     steps:
@@ -97,6 +98,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    name: Build KytyPS5 (macOS)
     runs-on: macos-15
 
     steps:
@@ -197,6 +199,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    name: Release KytyPS5
     if: github.event_name == 'push'
     needs: [windows, macos]
     runs-on: ubuntu-latest

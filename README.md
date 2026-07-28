@@ -1,8 +1,8 @@
 # KytyPS5
 
-[![Windows Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Linux Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml)
-[![macOS Build](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
+[![Build KytyPS5 (Linux)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml/badge.svg)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build-linux.yml)
+[![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
 [![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)

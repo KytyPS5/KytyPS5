@@ -1,4 +1,4 @@
-name: Build KytyPS5
+name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  build:
+  windows:
     runs-on: windows-2022
 
     steps:
@@ -89,45 +89,166 @@ jobs:
         run: |
           cmake --install _Build/windows --prefix _Build/windows/install
 
-      - name: Upload Artifacts
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5
+          name: KytyPS5-Windows-x64
           path: _Build/windows/install/**
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode 26
+        shell: bash
+        run: |
+          xcode_path="$(ls -d /Applications/Xcode_26*.app | tail -n 1)"
+          test -n "$xcode_path"
+          sudo xcode-select --switch "$xcode_path/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install build dependencies
+        shell: bash
+        run: brew install glslang ninja
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          git --version
+          cmake --version
+          ninja --version
+          clang++ --version
+          glslangValidator --version
+          echo "Host architecture: $(uname -m)"
+          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S src -B _Build/macos \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build _Build/macos --target launcher --parallel
+
+      - name: Install
+        shell: bash
+        run: |
+          cmake --install _Build/macos --prefix _Build/macos/install
+
+      - name: Bundle MoltenVK
+        shell: bash
+        env:
+          MOLTENVK_VERSION: v1.4.2
+          MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+        run: |
+          archive="$RUNNER_TEMP/MoltenVK-macos.tar"
+          package="$RUNNER_TEMP/MoltenVK"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
+          echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
+          tar -xf "$archive" -C "$RUNNER_TEMP"
+          install -m 755 \
+            "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
+            _Build/macos/install/libMoltenVK.dylib
+          install -m 644 "$package/LICENSE" _Build/macos/install/LICENSE.MoltenVK
+          codesign --force --sign - --timestamp=none _Build/macos/install/libMoltenVK.dylib
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          file _Build/macos/install/launcher
+          file _Build/macos/install/kyty_emulator
+          file _Build/macos/install/libMoltenVK.dylib
+          lipo _Build/macos/install/launcher -verify_arch x86_64
+          lipo _Build/macos/install/kyty_emulator -verify_arch x86_64
+          lipo _Build/macos/install/libMoltenVK.dylib -verify_arch x86_64
+          codesign --verify --strict _Build/macos/install/kyty_emulator
+          codesign --verify --strict _Build/macos/install/libMoltenVK.dylib
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-macOS-x86_64
+          path: _Build/macos/install/**
           if-no-files-found: error
 
   release:
     if: github.event_name == 'push'
-    needs: build
+    needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download build
+      - name: Download builds
         uses: actions/download-artifact@v4
         with:
-          name: KytyPS5
-          path: KytyPS5
+          path: artifacts
 
       - name: Set release name
         shell: bash
         run: |
           echo "RELEASE_NAME=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      - name: Package build
+      - name: Package builds
         shell: bash
-        run: zip -r "$RELEASE_NAME.zip" KytyPS5
+        run: |
+          windows_dir="artifacts/KytyPS5-Windows-x64"
+          macos_dir="artifacts/KytyPS5-macOS-x86_64"
+          test -d "$windows_dir"
+          test -d "$macos_dir"
+          chmod a+x \
+            "$macos_dir/launcher" \
+            "$macos_dir/kyty_emulator" \
+            "$macos_dir/libMoltenVK.dylib"
+          (
+            cd "$windows_dir"
+            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
+          )
+          (
+            cd "$macos_dir"
+            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-macOS-x86_64.zip" .
+          )
 
       - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          assets=(
+            "$RELEASE_NAME-Windows-x64.zip"
+            "$RELEASE_NAME-macOS-x86_64.zip"
+          )
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_NAME" "$RELEASE_NAME.zip" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_NAME" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_NAME" "$RELEASE_NAME.zip" \
+            gh release create "$RELEASE_NAME" "${assets[@]}" \
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \

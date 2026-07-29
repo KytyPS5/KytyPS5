@@ -110,7 +110,6 @@ void DumpPm4PacketStream(Common::File* file, uint32_t* cmd_buffer, uint32_t star
 	auto* cmd = cmd_buffer + start_dw;
 	auto  dw  = num_dw;
 	while (dw != 0) {
-		EXIT_NOT_IMPLEMENTED(dw < 2);
 		EXIT_NOT_IMPLEMENTED(dw > num_dw);
 
 		auto cmd_id = *cmd++;
@@ -120,6 +119,9 @@ void DumpPm4PacketStream(Common::File* file, uint32_t* cmd_buffer, uint32_t star
 		uint32_t len = 0;
 
 		const auto packet_type = static_cast<PacketType>(cmd_id >> 30u);
+		// Type-2 packets are header-only padding; every other packet type requires a body.
+		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2);
+
 		switch (packet_type) {
 			case PacketType::Type3: {
 				const bool    sh_gx = (cmd_id & 0x2u) == 0;

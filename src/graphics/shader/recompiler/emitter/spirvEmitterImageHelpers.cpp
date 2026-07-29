@@ -36,14 +36,23 @@ ImageSampleLayout MakeImageSampleLayout(const IR::Instruction& inst, ImageViewKi
 
 uint32_t EmitImageCoordF32(EmitterState& state, const IR::Instruction& inst,
                            const ImageSampleLayout& layout, ImageViewKind view) {
-	const auto x          = EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord);
+	auto       x          = EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord);
 	const auto components = ImageViewCoordinateComponents(view);
 	if (components == 1u) {
 		return x;
 	}
-	const auto y = inst.memory.image_address_components > layout.coord + 1u
-	                       ? EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord + 1u)
-	                       : EmitZeroF32(state);
+	auto y = inst.memory.image_address_components > layout.coord + 1u
+	             ? EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord + 1u)
+	             : EmitZeroF32(state);
+	if (inst.memory.image_cube && view == ImageViewKind::Dim2DArray) {
+		const auto one = ConstantF32(state, 0x3f800000u);
+		const auto cx  = state.builder.AllocateId();
+		const auto cy  = state.builder.AllocateId();
+		state.builder.AddFunction({OpFSub, state.float_type, cx, x, one});
+		state.builder.AddFunction({OpFSub, state.float_type, cy, y, one});
+		x = cx;
+		y = cy;
+	}
 	const auto coord = state.builder.AllocateId();
 	if (components == 3u) {
 		const auto z = inst.memory.image_address_components > layout.coord + 2u

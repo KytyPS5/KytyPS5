@@ -413,22 +413,44 @@ static bool TryEmulateSse4a(PCONTEXT context) {
 		return false;
 	}
 
-	const uint8_t reg    = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm     = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
-	const uint8_t length = rip[offset + 3];
-	const uint8_t index  = rip[offset + 4];
+	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
 
 	// AMD SSE4a immediate-form EXTRQ/INSERTQ. PS5 code can execute these natively on AMD hardware,
 	// while Intel hosts raise an illegal-instruction exception.
+	const bool immediate_form = (reg == 0);
+
 	if (prefix == 0x66) {
 		auto* dst = GetContextXmm(context, rm);
 		if (dst == nullptr) {
 			return false;
 		}
 
+		uint8_t length = 0;
+		uint8_t index  = 0;
+		size_t  insn_length = 0;
+
+		if (immediate_form) {
+			length      = rip[offset + 3];
+			index       = rip[offset + 4];
+			insn_length = offset + 5;
+		} else {
+			auto* src = GetContextXmm(context, reg);
+			if (src == nullptr) {
+				return false;
+			}
+			length      = static_cast<uint8_t>(src->Low & 0x3fu);
+			index       = static_cast<uint8_t>((src->Low >> 6u) & 0x3fu);
+			insn_length = offset + 3;
+		}
+
+		if (length == 0) {
+			length = 64;
+		}
+
 		dst->Low  = ExtractBitField(dst->Low, length, index);
 		dst->High = 0;
-		context->Rip += offset + 5;
+		context->Rip += insn_length;
 		return true;
 	}
 
@@ -438,8 +460,26 @@ static bool TryEmulateSse4a(PCONTEXT context) {
 		return false;
 	}
 
+	uint8_t length = 0;
+	uint8_t index  = 0;
+	size_t  insn_length = 0;
+
+	if (immediate_form) {
+		length      = rip[offset + 3];
+		index       = rip[offset + 4];
+		insn_length = offset + 5;
+	} else {
+		length      = static_cast<uint8_t>(src->Low & 0x3fu);
+		index       = static_cast<uint8_t>((src->Low >> 6u) & 0x3fu);
+		insn_length = offset + 3;
+	}
+
+	if (length == 0) {
+		length = 64;
+	}
+
 	dst->Low = InsertBitField(dst->Low, src->Low, length, index);
-	context->Rip += offset + 5;
+	context->Rip += insn_length;
 	return true;
 }
 
@@ -579,21 +619,44 @@ static bool TryEmulateSse4a(ucontext_t* context) {
 		return false;
 	}
 
-	const uint8_t reg    = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm     = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
-	const uint8_t length = rip[offset + 3];
-	const uint8_t index  = rip[offset + 4];
+	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
 
 	// AMD SSE4a immediate-form EXTRQ/INSERTQ.
+	const bool immediate_form = (reg == 0);
+
 	if (prefix == 0x66) {
 		auto* dst = GetContextXmm(context, rm);
 		if (dst == nullptr) {
 			return false;
 		}
 
+		uint8_t length   = 0;
+		uint8_t index    = 0;
+		size_t  insn_len = 0;
+
+		if (immediate_form) {
+			length   = rip[offset + 3];
+			index    = rip[offset + 4];
+			insn_len = offset + 5;
+		} else {
+			auto* src = GetContextXmm(context, reg);
+			if (src == nullptr) {
+				return false;
+			}
+			const uint64_t src_low = GetXmmLow(src);
+			length   = static_cast<uint8_t>(src_low & 0x3fu);
+			index    = static_cast<uint8_t>((src_low >> 6u) & 0x3fu);
+			insn_len = offset + 3;
+		}
+
+		if (length == 0) {
+			length = 64;
+		}
+
 		SetXmmLow(dst, ExtractBitField(GetXmmLow(dst), length, index));
 		SetXmmHigh(dst, 0);
-		rip_reg += static_cast<greg_t>(offset + 5);
+		rip_reg += static_cast<greg_t>(insn_len);
 		return true;
 	}
 
@@ -603,8 +666,27 @@ static bool TryEmulateSse4a(ucontext_t* context) {
 		return false;
 	}
 
+	uint8_t length   = 0;
+	uint8_t index    = 0;
+	size_t  insn_len = 0;
+
+	if (immediate_form) {
+		length   = rip[offset + 3];
+		index    = rip[offset + 4];
+		insn_len = offset + 5;
+	} else {
+		const uint64_t src_low = GetXmmLow(src);
+		length   = static_cast<uint8_t>(src_low & 0x3fu);
+		index    = static_cast<uint8_t>((src_low >> 6u) & 0x3fu);
+		insn_len = offset + 3;
+	}
+
+	if (length == 0) {
+		length = 64;
+	}
+
 	SetXmmLow(dst, InsertBitField(GetXmmLow(dst), GetXmmLow(src), length, index));
-	rip_reg += static_cast<greg_t>(offset + 5);
+	rip_reg += static_cast<greg_t>(insn_len);
 	return true;
 }
 

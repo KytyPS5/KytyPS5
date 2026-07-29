@@ -854,6 +854,59 @@ void TestFixedSub64KDirectMapUsesExactAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFixedSub64KReserveAcrossExistingContainer() {
+	const char*        test           = "FixedSub64KReserveAcrossExistingContainer";
+	constexpr uint64_t container_size = SceKernelPageSize * 4;
+	constexpr uint64_t span_size      = container_size * 2;
+
+	void* containers = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&containers, span_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(containers)");
+	const auto container_base = reinterpret_cast<uint64_t>(containers);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, (container_base & (container_size - 1u)) == 0,
+	      "placeholder containers are not 64-KiB aligned");
+#endif
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(container_base, span_size),
+	        "KernelMunmap(containers)");
+
+	void* first_reserve = containers;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &first_reserve, SceKernelPageSize, SceKernelMapFixed, SceKernelPageSize),
+	        "KernelReserveVirtualRange(first container)");
+	Check(test, first_reserve == containers, "first fixed reservation moved");
+
+	const auto cross_start   = container_base + SceKernelPageSize;
+	void*      cross_reserve = reinterpret_cast<void*>(cross_start);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &cross_reserve, container_size, SceKernelMapFixed | SceKernelMapNoOverwrite,
+	            SceKernelPageSize),
+	        "KernelReserveVirtualRange(cross container)");
+	Check(test, cross_reserve == reinterpret_cast<void*>(cross_start),
+	      "cross-container fixed reservation moved");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(cross_start, container_size),
+	      "cross-container reservation did not combine existing and new placeholders");
+#endif
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(cross_start, container_size),
+	        "KernelMunmap(cross container)");
+	ExpectUnmapped(test, cross_start);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(container_base, SceKernelPageSize),
+	        "KernelMunmap(first container)");
+	ExpectUnmapped(test, container_base);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, Libs::LibKernel::Memory::TestHostRangeIsFree(container_base, span_size),
+	      "cross-container placeholders were not fully released");
+#endif
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReserveReplacesPartialDirectMapping() {
 	const char*        test         = "FixedReserveReplacesPartialDirectMapping";
 	constexpr uint64_t page_count   = 13;
@@ -1598,6 +1651,7 @@ int main() {
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 	RunTest(TestFixedSub64KDirectMapUsesExactAddress);
+	RunTest(TestFixedSub64KReserveAcrossExistingContainer);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);

@@ -1122,40 +1122,59 @@ public:
 		if (UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		{
-			std::lock_guard lock(m_mutex);
-			if (FindContaining(vaddr, size) != m_free.end()) {
-				return true;
-			}
+		std::lock_guard lock(m_mutex);
+		if (FindContaining(vaddr, size) != m_free.end()) {
+			return true;
 		}
 
 		// VirtualAlloc2 requires a fixed base address to use the host allocation
-		// granularity. Reserve and retain the enclosing container as placeholders;
+		// granularity. Reuse tracked containers and reserve only missing ones;
 		// Consume() will isolate the exact PS5-page range for MapViewOfFile3.
 		const auto container_start = vaddr & ~(m_granularity - 1u);
 		if (UINT64_MAX - (m_granularity - 1u) < vaddr + size) {
 			return false;
 		}
-		const auto container_end  = AlignUp(vaddr + size, m_granularity);
-		const auto container_size = container_end - container_start;
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(container_start),
-		                          container_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-		                          PAGE_NOACCESS, nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != container_start) {
-			if (ptr != nullptr) {
-				VirtualFree(ptr, 0, MEM_RELEASE);
+		const auto            container_end = AlignUp(vaddr + size, m_granularity);
+		std::vector<uint64_t> reserved_containers;
+		auto                  rollback = [&reserved_containers, this]() {
+			for (auto container = reserved_containers.rbegin();
+			     container != reserved_containers.rend(); ++container) {
+				if (!ReleaseFixedContainerUnlocked(*container)) {
+					EXIT("fixed placeholder reservation rollback failed\n");
+				}
 			}
-			return false;
+		};
+
+		for (auto current = container_start; current < container_end; current += m_granularity) {
+			if (m_fixed_containers.find(current) != m_fixed_containers.end()) {
+				const auto overlap_start = std::max(vaddr, current);
+				const auto overlap_end   = std::min(vaddr + size, current + m_granularity);
+				if (FindContaining(overlap_start, overlap_end - overlap_start) == m_free.end()) {
+					rollback();
+					return false;
+				}
+				continue;
+			}
+
+			auto* ptr =
+			    VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(current), m_granularity,
+			                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+			if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != current) {
+				if (ptr != nullptr) {
+					VirtualFree(ptr, 0, MEM_RELEASE);
+				}
+				rollback();
+				return false;
+			}
+
+			AddFreeUnlocked(current, m_granularity);
+			m_fixed_containers.emplace(current);
+			reserved_containers.push_back(current);
 		}
-		{
-			std::lock_guard lock(m_mutex);
-			AddFreeUnlocked(container_start, container_size);
-			// A fixed sub-granularity reservation owns only its guest range. Remember each
-			// aligned host block so its retained siblings can be reclaimed with the last owner.
-			for (auto current = container_start; current < container_end;
-			     current += m_granularity) {
-				m_fixed_containers.emplace(current);
-			}
+
+		if (FindContaining(vaddr, size) == m_free.end()) {
+			rollback();
+			return false;
 		}
 		return true;
 #else
@@ -1256,49 +1275,7 @@ public:
 	bool ReleaseFixedContainer(uint64_t container_start) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		std::lock_guard lock(m_mutex);
-		auto            container = m_fixed_containers.find(container_start);
-		if (container == m_fixed_containers.end()) {
-			return false;
-		}
-
-		const auto container_end = container_start + m_granularity;
-		auto       current       = container_start;
-		while (current < container_end) {
-			auto next = m_free.upper_bound(current);
-			auto it   = m_free.end();
-			if (next != m_free.begin()) {
-				auto previous = std::prev(next);
-				if (current < previous->first + previous->second) {
-					it = previous;
-				}
-			}
-			if (it == m_free.end()) {
-				it = m_free.lower_bound(current);
-				if (it == m_free.end() || it->first >= container_end) {
-					break;
-				}
-			}
-
-			const auto release_start = std::max(current, it->first);
-			const auto release_end   = std::min(container_end, it->first + it->second);
-			const auto release_size  = release_end - release_start;
-			if (!SplitUnlocked(it, release_start, release_size)) {
-				return false;
-			}
-			it = m_free.find(release_start);
-			if (it == m_free.end() || it->second != release_size) {
-				return false;
-			}
-
-			m_free.erase(it);
-			if (VirtualFree(reinterpret_cast<void*>(release_start), 0, MEM_RELEASE) == 0) {
-				AddFreeUnlocked(release_start, release_size);
-				return false;
-			}
-			current = release_end;
-		}
-		m_fixed_containers.erase(container);
-		return true;
+		return ReleaseFixedContainerUnlocked(container_start);
 #else
 		static_cast<void>(container_start);
 		return false;
@@ -1491,6 +1468,52 @@ private:
 				m_free.emplace(base, end - base);
 			}
 		}
+	}
+
+	bool ReleaseFixedContainerUnlocked(uint64_t container_start) {
+		auto container = m_fixed_containers.find(container_start);
+		if (container == m_fixed_containers.end()) {
+			return false;
+		}
+
+		const auto container_end = container_start + m_granularity;
+		auto       current       = container_start;
+		while (current < container_end) {
+			auto next = m_free.upper_bound(current);
+			auto it   = m_free.end();
+			if (next != m_free.begin()) {
+				auto previous = std::prev(next);
+				if (current < previous->first + previous->second) {
+					it = previous;
+				}
+			}
+			if (it == m_free.end()) {
+				it = m_free.lower_bound(current);
+				if (it == m_free.end() || it->first >= container_end) {
+					break;
+				}
+			}
+
+			const auto release_start = std::max(current, it->first);
+			const auto release_end   = std::min(container_end, it->first + it->second);
+			const auto release_size  = release_end - release_start;
+			if (!SplitUnlocked(it, release_start, release_size)) {
+				return false;
+			}
+			it = m_free.find(release_start);
+			if (it == m_free.end() || it->second != release_size) {
+				return false;
+			}
+
+			m_free.erase(it);
+			if (VirtualFree(reinterpret_cast<void*>(release_start), 0, MEM_RELEASE) == 0) {
+				AddFreeUnlocked(release_start, release_size);
+				return false;
+			}
+			current = release_end;
+		}
+		m_fixed_containers.erase(container);
+		return true;
 	}
 
 	uint64_t                     m_granularity = 0x10000;

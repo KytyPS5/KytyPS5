@@ -385,6 +385,22 @@ Item {
                                     border.width: 1
                                     Behavior on color { ColorAnimation { duration: 120 } }
 
+                                    // Full-row hover/click handler declared *before*
+                                    // the RowLayout content so it is stacked below
+                                    // the Set/Clear buttons and never eats their
+                                    // clicks. Clicking empty row space still enters
+                                    // capture mode for this pad button.
+                                    MouseArea {
+                                        id: rowMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            inputView.forceActiveFocus()
+                                            inputView.capturingPadName = modelData.pad
+                                        }
+                                    }
+
                                     RowLayout {
                                         anchors.fill: parent
                                         anchors.leftMargin: 12
@@ -488,17 +504,6 @@ Item {
                                                 cursorShape: Qt.PointingHandCursor
                                                 onClicked: launcherBridge.setBinding(modelData.pad, "")
                                             }
-                                        }
-                                    }
-
-                                    MouseArea {
-                                        id: rowMouse
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            inputView.forceActiveFocus()
-                                            inputView.capturingPadName = modelData.pad
                                         }
                                     }
                                 }

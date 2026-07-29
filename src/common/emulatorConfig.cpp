@@ -97,18 +97,6 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
-int GetAudioVolume() {
-	return g_config->audio_volume;
-}
-
-bool GetAudioMuted() {
-	return g_config->audio_muted;
-}
-
-std::string GetAudioBackend() {
-	return g_config->audio_backend;
-}
-
 const std::unordered_map<std::string, std::string>& GetKeymap() {
 	static std::unordered_map<std::string, std::string> parsed;
 	// Parse lazily on first access (and reparse if the underlying string

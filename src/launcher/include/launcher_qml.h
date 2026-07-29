@@ -68,6 +68,7 @@ class LauncherQML : public QObject {
 	Q_PROPERTY(QString selectedGameBg READ selectedGameBg WRITE setSelectedGameBg NOTIFY selectedGameBgChanged)
 	Q_PROPERTY(QString selectedGameIcon READ selectedGameIcon WRITE setSelectedGameIcon NOTIFY selectedGameIconChanged)
 	Q_PROPERTY(QString selectedGamePath READ selectedGamePath WRITE setSelectedGamePath NOTIFY selectedGamePathChanged)
+	Q_PROPERTY(QString selectedGameSerial READ selectedGameSerial WRITE setSelectedGameSerial NOTIFY selectedGameSerialChanged)
 
 	// Emulator settings. Mirrors the upstream Configuration fields parsed in
 	// src/main.cpp and exposed by the legacy ConfigurationEditDialog, so the
@@ -109,6 +110,11 @@ public:
 
 	[[nodiscard]] QString selectedGamePath() const { return m_selectedGamePath; }
 	Q_INVOKABLE void setSelectedGamePath(const QString& path);
+
+	// Title ID (e.g. "PPSA01234_00") of the currently selected game; carries
+	// through to --game-patch via PatchesDialog::PatchPlanPath on launch.
+	[[nodiscard]] QString selectedGameSerial() const { return m_selectedGameSerial; }
+	Q_INVOKABLE void setSelectedGameSerial(const QString& serial);
 
 	// Display resolution combobox index. 0: 1280x720, 1: 1920x1080.
 	// (Mirrors upstream Configuration::Resolution, which only exposes these
@@ -195,6 +201,7 @@ signals:
 	void selectedGameBgChanged();
 	void selectedGameIconChanged();
 	void selectedGamePathChanged();
+	void selectedGameSerialChanged();
 	void settingsChanged();
 	void keyBindingsChanged();
 	void logMessageReceived(const QString& level, const QString& module, const QString& message);
@@ -208,6 +215,7 @@ private:
 	QString m_selectedGameBg;
 	QString m_selectedGameIcon;
 	QString m_selectedGamePath;
+	QString m_selectedGameSerial;
 
 	// Emulator settings (mirror upstream Configuration; see
 	// src/launcher/include/configuration.h).

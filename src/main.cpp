@@ -64,9 +64,6 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
-	::printf("  --audio-volume <0..100>              Host master audio volume (default 100).\n");
-	::printf("  --audio-muted <true|false>           Mute audio output.\n");
-	::printf("  --audio-backend <SDL|Null>           Audio backend (SDL or Null).\n");
 	::printf("  --keymap <Pad=Key;...>               Keyboard/mouse -> DualSense mapping.\n");
 }
 
@@ -234,17 +231,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
-		} else if (arg == "--audio-volume") {
-			options.config.audio_volume = Common::ToInt32(value);
-			if (options.config.audio_volume < 0) options.config.audio_volume = 0;
-			if (options.config.audio_volume > 100) options.config.audio_volume = 100;
-		} else if (arg == "--audio-muted") {
-			if (!ParseBool(value, options.config.audio_muted)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--audio-backend") {
-			options.config.audio_backend = value;
 		} else if (arg == "--keymap") {
 			options.config.keymap = value;
 		} else {

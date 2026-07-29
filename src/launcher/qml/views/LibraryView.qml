@@ -238,6 +238,7 @@ Item {
                             launcherBridge.setSelectedGameBg(model.icon)
                             launcherBridge.setSelectedGameIcon(model.iconReal)
                             launcherBridge.setSelectedGamePath(model.path)
+                            launcherBridge.setSelectedGameSerial(model.serial)
                         }
                     }
                 }

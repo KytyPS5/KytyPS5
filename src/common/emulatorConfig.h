@@ -40,11 +40,6 @@ struct ConfigOptions {
 	bool                   ngg_rectlist_draw_enabled   = true;
 	bool                   readback_linear_images      = false;
 
-	// Audio (launcher-supplied). volume 0..100, mute override, backend "SDL"/"Null".
-	int                    audio_volume                = 100;
-	bool                   audio_muted                 = false;
-	std::string            audio_backend               = "SDL";
-
 	// Keyboard/mouse -> DualSense pad mapping, "PadButton=Key;PadButton=Key;..."
 	// expressed using SDL key names (matching SDLK_* via SDL_GetKeyFromName).
 	std::string            keymap;
@@ -77,11 +72,6 @@ bool SpirvDebugPrintfEnabled();
 bool RenderDocEnabled();
 bool NggRectlistDrawEnabled();
 bool ReadbackLinearImagesEnabled();
-
-// Audio
-int  GetAudioVolume();
-bool GetAudioMuted();
-std::string GetAudioBackend();
 
 // Keyboard/mouse mapping (parsed from --keymap).
 const std::unordered_map<std::string, std::string>& GetKeymap();

@@ -3,7 +3,6 @@
 #include "SDL.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -271,13 +270,6 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const auto src_size         = frames * channels * bytes_per_sample;
 
-	// Host master volume (0..100 -> 0..1.0). When != 100 we always need to run
-	// the per-sample scale pass, so promote volume_changed accordingly.
-	const int  master_volume = Config::GetAudioVolume();
-	const bool master_active = (master_volume != 100) && !Config::GetAudioMuted() &&
-	                           Config::GetAudioBackend() != "Null";
-	const double master_scale = master_active ? static_cast<double>(master_volume) / 100.0 : 1.0;
-
 	bool volume_changed = false;
 	for (uint32_t ch = 0; ch < channels; ch++) {
 		if (port.volume[ch] != 32768) {
@@ -285,7 +277,6 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			break;
 		}
 	}
-	if (master_active) volume_changed = true;
 
 	if (!volume_changed && !FormatIsStd(port.format)) {
 		return data;
@@ -299,30 +290,24 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		auto*       dst = reinterpret_cast<float*>(buffer->data());
 		const auto* src = static_cast<const float*>(data);
 
-		const float master_f = static_cast<float>(master_scale);
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < channels; ch++) {
 				const auto src_ch =
 				    (FormatIsStd(port.format) && channels == 8 ? STD_8CH_MAP[ch] : ch);
 				dst[frame * channels + ch] = src[frame * channels + src_ch] *
-				                             (static_cast<float>(port.volume[ch]) / 32768.0f) *
-				                             master_f;
+				                             (static_cast<float>(port.volume[ch]) / 32768.0f);
 			}
 		}
 	} else {
 		auto*       dst = reinterpret_cast<int16_t*>(buffer->data());
 		const auto* src = static_cast<const int16_t*>(data);
 
-		const int64_t master_q15 = static_cast<int64_t>(master_scale * 32768.0);
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < channels; ch++) {
 				const auto src_ch =
 				    (FormatIsStd(port.format) && channels == 8 ? STD_8CH_MAP[ch] : ch);
-				int64_t sample = static_cast<int64_t>(src[frame * channels + src_ch]) *
-				                 port.volume[ch] / 32768;
-				if (master_q15 != 32768) {
-					sample = sample * master_q15 / 32768;
-				}
+				int64_t sample =
+				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[ch] / 32768;
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
@@ -338,15 +323,6 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	EXIT_IF(port == nullptr);
-
-	// Host-side master audio gating: if the user muted audio or selected the
-	// "Null" backend in the launcher, drop all queued audio so nothing plays.
-	if (Config::GetAudioMuted() || Config::GetAudioBackend() == "Null") {
-		if (port->audio_device != 0) {
-			SDL_ClearQueuedAudio(port->audio_device);
-		}
-		return true;
-	}
 
 	if (port->audio_device == 0 || data == nullptr) {
 		return false;

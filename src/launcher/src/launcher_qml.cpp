@@ -1,5 +1,7 @@
 #include "launcher_qml.h"
 
+#include "patchesDialog.h"
+
 #include <QApplication>
 #include <QDebug>
 #include <QDir>
@@ -211,6 +213,13 @@ void LauncherQML::setSelectedGamePath(const QString& path) {
 	}
 }
 
+void LauncherQML::setSelectedGameSerial(const QString& serial) {
+	if (m_selectedGameSerial != serial) {
+		m_selectedGameSerial = serial;
+		emit selectedGameSerialChanged();
+	}
+}
+
 void LauncherQML::setScreenResolution(int val)        { if (m_screenResolution != val)         { m_screenResolution = val;         emit settingsChanged(); saveSettings(); } }
 void LauncherQML::setVblankFrequency(int val)         { if (m_vblankFrequency != val)          { m_vblankFrequency = val;          emit settingsChanged(); saveSettings(); } }
 void LauncherQML::setVulkanValidationEnabled(bool v) { if (m_vulkanValidationEnabled != v)    { m_vulkanValidationEnabled = v;    emit settingsChanged(); saveSettings(); } }
@@ -256,10 +265,6 @@ QVariantMap LauncherQML::defaultKeyBindings() const {
 		{"R3", "Left Ctrl"},
 		{"Options", "Return"},
 		{"TouchPad", "Backspace"},
-		{"TouchpadX", "Mouse:MotionX"},
-		{"TouchpadY", "Mouse:MotionY"},
-		{"TouchClick", "Mouse:Left"},
-		{"MouseTouch", "Mouse:Right"},
 	};
 }
 
@@ -399,7 +404,10 @@ void LauncherQML::launchGame(const QString& path) {
 	}
 
 	QDir search_dir(QApplication::applicationDirPath());
-#ifdef __linux__
+	// macOS ships an extensionless kyty_emulator (matching the Linux build);
+	// only Windows uses the .exe suffix. Treat every non-Linux/macOS host as
+	// Windows so the launcher still finds the executable there.
+#if defined(__linux__) || defined(__APPLE__)
 	QString exeName = "kyty_emulator";
 #else
 	QString exeName = "kyty_emulator.exe";
@@ -471,6 +479,16 @@ void LauncherQML::launchGame(const QString& path) {
 	}
 
 	args << "--game" << gamePath;
+
+	// Resolve any saved patch plan for this title (matches the legacy
+	// mainDialog::BuildArgs flow). Local patches are only supported for PPSA
+	// titles; PatchPlanPath produces a non-existent path otherwise.
+	if (!m_selectedGameSerial.isEmpty() && PatchesDialog::IsSupportedTitleId(m_selectedGameSerial)) {
+		const QString patch_plan = PatchesDialog::PatchPlanPath(m_selectedGameSerial);
+		if (QFileInfo::exists(patch_plan)) {
+			args << "--game-patch" << patch_plan;
+		}
+	}
 
 	qDebug() << "[KytyPS5 Launcher] Launching:" << emulatorPath << args;
 	emit logMessageReceived("INFO", "Loader", QString("Launching %1").arg(gamePath));
@@ -643,10 +661,15 @@ void LauncherQML::populateGamesFromSavedDirs() {
 		QDir root(root_path);
 		if (root_path.isEmpty() || !root.exists()) continue;
 
+		// Queue the selected root itself first so that a directory which
+		// directly contains eboot.bin (a single-game install) is registered as
+		// a game entry. We only descend into subdirectories when the current
+		// directory is *not* itself a game -- matches the legacy Qt Widgets
+		// launcher (ConfigurationListWidget::ScanGameDirectory) and lets the
+		// UI's "Add Game Folder" action work for both per-game folders and
+		// umbrella libraries that hold many game subfolders.
 		QList<QDir> pending;
-		const auto  subdirs =
-		    root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-		for (const auto& sd : subdirs) pending.append(QDir(sd.absoluteFilePath()));
+		pending.append(root);
 
 		while (!pending.isEmpty()) {
 			QDir game_dir = pending.takeFirst();

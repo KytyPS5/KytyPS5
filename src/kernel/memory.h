@@ -166,6 +166,7 @@ void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void TestFailHostReservationAfter(uint32_t successful_pages);
 void TestFailNextFixedReserveRangeRegistration();
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
+bool TestHostRangeIsFree(uint64_t vaddr, uint64_t size);
 #endif
 
 } // namespace Libs::LibKernel::Memory

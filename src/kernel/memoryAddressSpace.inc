@@ -1147,7 +1147,16 @@ public:
 			}
 			return false;
 		}
-		AddFree(container_start, container_size);
+		{
+			std::lock_guard lock(m_mutex);
+			AddFreeUnlocked(container_start, container_size);
+			// A fixed sub-granularity reservation owns only its guest range. Remember each
+			// aligned host block so its retained siblings can be reclaimed with the last owner.
+			for (auto current = container_start; current < container_end;
+			     current += m_granularity) {
+				m_fixed_containers.emplace(current);
+			}
+		}
 		return true;
 #else
 		return VirtualMemory::ReserveFixed(vaddr, size);
@@ -1188,8 +1197,19 @@ public:
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (vaddr == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
 		std::lock_guard lock(m_mutex);
-		auto            it = FindContaining(vaddr, size);
+		const auto      end       = vaddr + size;
+		auto            container = m_fixed_containers.lower_bound(vaddr & ~(m_granularity - 1u));
+		for (; container != m_fixed_containers.end() && *container < end; ++container) {
+			if (*container < vaddr || end < *container + m_granularity) {
+				return false;
+			}
+		}
+
+		auto it = FindContaining(vaddr, size);
 		if (it == m_free.end() || !SplitUnlocked(it, vaddr, size)) {
 			return false;
 		}
@@ -1199,12 +1219,89 @@ public:
 		}
 		m_free.erase(it);
 		if (VirtualFree(reinterpret_cast<void*>(vaddr), 0, MEM_RELEASE) != 0) {
+			auto first = m_fixed_containers.lower_bound(vaddr);
+			while (first != m_fixed_containers.end() && *first < end) {
+				first = m_fixed_containers.erase(first);
+			}
 			return true;
 		}
 		AddFreeUnlocked(vaddr, size);
 		return false;
 #else
 		return VirtualMemory::FreeRange(vaddr, size);
+#endif
+	}
+
+	std::vector<uint64_t> GetFixedContainers(uint64_t vaddr, uint64_t size) {
+		std::vector<uint64_t> containers;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (vaddr == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+			return containers;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end   = vaddr + size;
+		auto            first = m_fixed_containers.lower_bound(vaddr & ~(m_granularity - 1u));
+		while (first != m_fixed_containers.end() && *first < end) {
+			containers.push_back(*first);
+			++first;
+		}
+#else
+		static_cast<void>(vaddr);
+		static_cast<void>(size);
+#endif
+		return containers;
+	}
+
+	bool ReleaseFixedContainer(uint64_t container_start) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::lock_guard lock(m_mutex);
+		auto            container = m_fixed_containers.find(container_start);
+		if (container == m_fixed_containers.end()) {
+			return false;
+		}
+
+		const auto container_end = container_start + m_granularity;
+		auto       current       = container_start;
+		while (current < container_end) {
+			auto next = m_free.upper_bound(current);
+			auto it   = m_free.end();
+			if (next != m_free.begin()) {
+				auto previous = std::prev(next);
+				if (current < previous->first + previous->second) {
+					it = previous;
+				}
+			}
+			if (it == m_free.end()) {
+				it = m_free.lower_bound(current);
+				if (it == m_free.end() || it->first >= container_end) {
+					break;
+				}
+			}
+
+			const auto release_start = std::max(current, it->first);
+			const auto release_end   = std::min(container_end, it->first + it->second);
+			const auto release_size  = release_end - release_start;
+			if (!SplitUnlocked(it, release_start, release_size)) {
+				return false;
+			}
+			it = m_free.find(release_start);
+			if (it == m_free.end() || it->second != release_size) {
+				return false;
+			}
+
+			m_free.erase(it);
+			if (VirtualFree(reinterpret_cast<void*>(release_start), 0, MEM_RELEASE) == 0) {
+				AddFreeUnlocked(release_start, release_size);
+				return false;
+			}
+			current = release_end;
+		}
+		m_fixed_containers.erase(container);
+		return true;
+#else
+		static_cast<void>(container_start);
+		return false;
 #endif
 	}
 
@@ -1399,5 +1496,6 @@ private:
 	uint64_t                     m_granularity = 0x10000;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, uint64_t> m_free;
+	std::set<uint64_t>           m_fixed_containers;
 #endif
 };

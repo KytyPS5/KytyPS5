@@ -814,9 +814,37 @@ void TestFixedSub64KDirectMapUsesExactAddress() {
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(target, SceKernelPageSize),
 	        "KernelMunmap(fixed reserve)");
 	ExpectUnmapped(test, target);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(target, SceKernelPageSize),
+	      "released fixed reserve was not retained while its sibling remained "
+	      "owned");
+#endif
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(adjacent_target, SceKernelPageSize),
 	        "KernelMunmap(adjacent fixed reserve)");
 	ExpectUnmapped(test, adjacent_target);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	for (uint64_t offset = 0; offset < container_size; offset += SceKernelPageSize) {
+		char message[128] = {};
+		std::snprintf(message, sizeof(message),
+		              "host sibling at container offset 0x%04" PRIx64 " remained reserved", offset);
+		Check(test,
+		      Libs::LibKernel::Memory::TestHostRangeIsFree(container_base + offset,
+		                                                   SceKernelPageSize),
+		      message);
+	}
+
+	void* reused_container = container;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &reused_container, container_size, SceKernelMapFixed | SceKernelMapNoOverwrite,
+	            SceKernelPageSize),
+	        "KernelReserveVirtualRange(reuse released container)");
+	Check(test, reused_container == container, "released container was not reusable in place");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(container_base, container_size),
+	        "KernelMunmap(reused container)");
+	Check(test, Libs::LibKernel::Memory::TestHostRangeIsFree(container_base, container_size),
+	      "reused container was not fully released");
+#endif
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(alias),
 	                                                    SceKernelPageSize),
 	        "KernelMunmap(alias)");

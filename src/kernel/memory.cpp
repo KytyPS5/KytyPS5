@@ -19,6 +19,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -364,6 +365,28 @@ public:
 		Common::LockGuard lock(m_mutex);
 
 		return FindOverlap(start, size) != nullptr;
+	}
+
+	bool HasOverlapOutside(uint64_t start, uint64_t size, uint64_t ignored_start,
+	                       uint64_t ignored_size) {
+		Common::LockGuard lock(m_mutex);
+
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return false;
+		}
+		const auto end         = start + size;
+		const auto ignored_end = End(ignored_start, ignored_size);
+		for (const auto& range: m_ranges) {
+			const auto overlap_start = std::max(start, range.start);
+			const auto overlap_end   = std::min(end, End(range.start, range.size));
+			if (overlap_start >= overlap_end) {
+				continue;
+			}
+			if (overlap_start < ignored_start || overlap_end > ignored_end) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool HasGpuAccess(uint64_t start, uint64_t size) {
@@ -866,6 +889,54 @@ static void                     MemoryPoolSubtractCommitted(uint64_t len);
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+static bool ReleasePlaceholderOwnedRange(uint64_t vaddr, uint64_t size,
+                                         bool ownership_still_registered) {
+	if (vaddr == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+
+	const auto end        = vaddr + size;
+	const auto containers = g_placeholder_address_space->GetFixedContainers(vaddr, size);
+	auto       current    = vaddr;
+	for (const auto container_start: containers) {
+		const auto container_end = container_start + g_placeholder_address_space->GetGranularity();
+		const auto overlap_start = std::max(current, container_start);
+		const auto overlap_end   = std::min(end, container_end);
+		if (current < overlap_start &&
+		    !g_placeholder_address_space->ReleaseFree(current, overlap_start - current)) {
+			return false;
+		}
+
+		const bool has_other_owner =
+		    ownership_still_registered
+		        ? g_virtual_ranges->HasOverlapOutside(
+		              container_start, g_placeholder_address_space->GetGranularity(), vaddr, size)
+		        : g_virtual_ranges->HasOverlap(container_start,
+		                                       g_placeholder_address_space->GetGranularity());
+		// Retain every placeholder piece while another guest range still occupies the aligned
+		// block. The last owner releases all retained siblings together.
+		if (!has_other_owner &&
+		    !g_placeholder_address_space->ReleaseFixedContainer(container_start)) {
+			return false;
+		}
+		current = overlap_end;
+	}
+
+	return current == end || g_placeholder_address_space->ReleaseFree(current, end - current);
+}
+
+static bool ReleaseUnownedFixedContainers(uint64_t vaddr, uint64_t size) {
+	const auto containers = g_placeholder_address_space->GetFixedContainers(vaddr, size);
+	for (const auto container_start: containers) {
+		const auto granularity = g_placeholder_address_space->GetGranularity();
+		if (!g_virtual_ranges->HasOverlap(container_start, granularity) &&
+		    !g_placeholder_address_space->ReleaseFixedContainer(container_start)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_direct_memory_backing->TryWriteBacking(vaddr, data, size);
 }
@@ -976,13 +1047,15 @@ static bool ReleaseReservedRange(uint64_t vaddr, uint64_t size) {
 	VirtualRanges::Range range {};
 	if (g_virtual_ranges->Query(vaddr, 0, &range) && range.start == vaddr && range.size == size &&
 	    IsReservedRangeType(range.type) && range.placeholder_backed) {
+		const bool managed_fixed_container =
+		    !g_placeholder_address_space->GetFixedContainers(vaddr, size).empty();
 		if (!g_virtual_ranges->ConsumeReserved(vaddr, size, range.type)) {
 			return false;
 		}
-		if (g_placeholder_address_space->ReleaseFree(vaddr, size)) {
+		if (ReleasePlaceholderOwnedRange(vaddr, size, false)) {
 			return true;
 		}
-		if (VirtualMemory::Free(vaddr)) {
+		if (!managed_fixed_container && VirtualMemory::Free(vaddr)) {
 			return true;
 		}
 		g_virtual_ranges->Add(vaddr, size, 0, 0, 0, range.type, range.name, false, true);
@@ -2166,12 +2239,15 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	}
 	if (IsReservedRangeType(range.type)) {
 		const bool released = range.placeholder_backed
-		                          ? g_placeholder_address_space->ReleaseFree(vaddr, len)
+		                          ? ReleasePlaceholderOwnedRange(vaddr, len, true)
 		                          : VirtualMemory::FreeRange(vaddr, len);
 		if (!released) {
 			return KERNEL_ERROR_EACCES;
 		}
 		g_virtual_ranges->Remove(vaddr, len);
+		if (!ReleaseUnownedFixedContainers(vaddr, len)) {
+			EXIT("failed to release unowned reserved placeholder container\n");
+		}
 		return OK;
 	}
 	UnmapGpuRange(vaddr, len, GetGpuAccessMode(range.protection));
@@ -2272,6 +2348,9 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 			g_virtual_ranges->Add(vaddr, len, 0, 0, 0, VirtualRangeType::Reserved, range.name,
 			                      false, placeholder_restored);
 		}
+	}
+	if (!ReleaseUnownedFixedContainers(vaddr, len)) {
+		EXIT("failed to release unowned fixed placeholder container\n");
 	}
 
 	if (g_free_callback != nullptr && IsCommittedRangeType(range.type)) {
@@ -2592,6 +2671,9 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 		} else if (!alias_shared_unmapped) {
 			VirtualMemory::Protect(alias.map_vaddr, alias.map_size, VirtualMemory::Mode::NoAccess);
 		}
+		if (!ReleaseUnownedFixedContainers(alias.map_vaddr, alias.map_size)) {
+			EXIT("failed to release unowned alias placeholder container\n");
+		}
 	}
 
 	if (vaddr != 0 || size != 0) {
@@ -2623,6 +2705,9 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 			g_virtual_ranges->Add(vaddr, size, 0, 0, 0, VirtualRangeType::Reserved, range.name,
 			                      false, placeholder_restored);
 		}
+	}
+	if ((vaddr != 0 || size != 0) && !ReleaseUnownedFixedContainers(vaddr, size)) {
+		EXIT("failed to release unowned direct-memory placeholder container\n");
 	}
 
 	if (g_free_callback != nullptr) {
@@ -2831,6 +2916,9 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 			g_virtual_ranges->Add(in_addr, len, 0, 0, 0, VirtualRangeType::Reserved,
 			                      consumed_range.name, false, consumed_range.placeholder_backed);
 		}
+		if (!ReleaseUnownedFixedContainers(in_addr, len)) {
+			EXIT("failed to release unowned direct-map placeholder container\n");
+		}
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -2859,6 +2947,9 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		                               &placeholder_restored);
 		if (placeholder_restored) {
 			g_placeholder_address_space->AddFree(out_addr, len);
+		}
+		if (!ReleaseUnownedFixedContainers(out_addr, len)) {
+			EXIT("failed to release unowned direct-map rollback placeholder container\n");
 		}
 		return KERNEL_ERROR_EBUSY;
 	}
@@ -3227,20 +3318,8 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 		if (!restore_chunks()) {
 			EXIT("reserve-fixed range-registration rollback failed\n");
 		}
-		if (*placeholder_backed) {
-			auto free_start = start;
-			for (const auto& chunk: chunks) {
-				if (free_start < chunk.range.start &&
-				    !g_placeholder_address_space->ReleaseFree(free_start,
-				                                              chunk.range.start - free_start)) {
-					EXIT("reserve-fixed range-registration gap cleanup failed\n");
-				}
-				free_start = chunk.range.start + chunk.range.size;
-			}
-			if (free_start < start + size &&
-			    !g_placeholder_address_space->ReleaseFree(free_start, start + size - free_start)) {
-				EXIT("reserve-fixed range-registration tail cleanup failed\n");
-			}
+		if (*placeholder_backed && !ReleaseUnownedFixedContainers(start, size)) {
+			EXIT("reserve-fixed range-registration container cleanup failed\n");
 		}
 		return false;
 	}
@@ -3343,6 +3422,38 @@ void TestFailNextFixedReserveRangeRegistration() {
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {
 	return g_placeholder_address_space->TestContainsFree(vaddr, size);
+}
+
+bool TestHostRangeIsFree(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (vaddr == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+
+	const auto end     = vaddr + size;
+	auto       current = vaddr;
+	while (current < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_FREE) {
+			return false;
+		}
+		const auto region_start = reinterpret_cast<uint64_t>(info.BaseAddress);
+		if (UINT64_MAX - region_start < info.RegionSize) {
+			return false;
+		}
+		const auto region_end = region_start + info.RegionSize;
+		if (current < region_start || current >= region_end) {
+			return false;
+		}
+		current = std::min(end, region_end);
+	}
+	return true;
+#else
+	static_cast<void>(vaddr);
+	static_cast<void>(size);
+	return false;
+#endif
 }
 #endif
 

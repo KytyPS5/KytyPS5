@@ -2,6 +2,8 @@
 
 #include "common/common.h"
 
+#include <cstring>
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #elif !defined(__APPLE__)
@@ -271,21 +273,43 @@ static bool DecodeShaNiInsn(const uint8_t* rip, ShaNiInsn& insn) {
 		insn.imm8         = 0;
 		insn.rex          = rex;
 		insn.modrm_offset = offset + 3;
-		insn.length       = offset + 4;
-		return true;
-	}
-
-	if (rip[offset + 1] == 0x3a && rip[offset + 2] == 0xcc) {
+	} else if (rip[offset + 1] == 0x3a && rip[offset + 2] == 0xcc) {
 		insn.escape       = 0x3a;
 		insn.opcode       = 0xcc;
-		insn.imm8         = rip[offset + 4];
 		insn.rex          = rex;
 		insn.modrm_offset = offset + 3;
-		insn.length       = offset + 5;
-		return true;
+	} else {
+		return false;
 	}
 
-	return false;
+	const uint8_t modrm = rip[insn.modrm_offset];
+	const uint8_t mod   = modrm >> 6u;
+	const uint8_t rm    = modrm & 0x07u;
+	size_t        end   = insn.modrm_offset + 1;
+
+	if (mod != 3u) {
+		uint8_t sib_base = 0xffu;
+		if (rm == 4u) {
+			sib_base = rip[end] & 0x07u;
+			end++;
+		}
+
+		if (mod == 0u && (rm == 5u || (rm == 4u && sib_base == 5u))) {
+			end += 4;
+		} else if (mod == 1u) {
+			end++;
+		} else if (mod == 2u) {
+			end += 4;
+		}
+	}
+
+	if (insn.escape == 0x3a) {
+		insn.imm8 = rip[end];
+		end++;
+	}
+
+	insn.length = end;
+	return true;
 }
 
 static bool ShaNiModrmIsRegister(uint8_t modrm) { return (modrm & 0xc0u) == 0xc0u; }
@@ -297,12 +321,68 @@ static uint8_t ShaNiRegIndex(uint8_t modrm, uint8_t rex, bool reg_field) {
 	return (modrm & 0x07u) | ((rex & 0x01u) << 3u);
 }
 
+static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn& insn,
+                                      const uint64_t (&gpr)[16], const void*& address) {
+	const uint8_t modrm = rip[insn.modrm_offset];
+	const uint8_t mod   = modrm >> 6u;
+	const uint8_t rm    = modrm & 0x07u;
+	if (mod == 3u) {
+		return false;
+	}
+
+	size_t   offset = insn.modrm_offset + 1;
+	uint64_t result = 0;
+
+	if (rm == 4u) {
+		const uint8_t sib        = rip[offset++];
+		const uint8_t scale      = sib >> 6u;
+		const uint8_t index_low  = (sib >> 3u) & 0x07u;
+		const uint8_t base_low   = sib & 0x07u;
+		const bool    has_index  = index_low != 4u || (insn.rex & 0x02u) != 0;
+		const bool    has_base   = mod != 0u || base_low != 5u;
+
+		if (has_base) {
+			const uint8_t base = base_low | ((insn.rex & 0x01u) << 3u);
+			result += gpr[base];
+		}
+		if (has_index) {
+			const uint8_t index = index_low | ((insn.rex & 0x02u) << 2u);
+			result += gpr[index] << scale;
+		}
+
+		if (!has_base) {
+			int32_t displacement = 0;
+			std::memcpy(&displacement, rip + offset, sizeof(displacement));
+			result += static_cast<uint64_t>(static_cast<int64_t>(displacement));
+			offset += sizeof(displacement);
+		}
+	} else if (mod == 0u && rm == 5u) {
+		int32_t displacement = 0;
+		std::memcpy(&displacement, rip + offset, sizeof(displacement));
+		result = reinterpret_cast<uint64_t>(rip + insn.length) +
+		         static_cast<uint64_t>(static_cast<int64_t>(displacement));
+		offset += sizeof(displacement);
+	} else {
+		const uint8_t base = rm | ((insn.rex & 0x01u) << 3u);
+		result             = gpr[base];
+	}
+
+	if (mod == 1u) {
+		const auto displacement = static_cast<int8_t>(rip[offset]);
+		result += static_cast<uint64_t>(static_cast<int64_t>(displacement));
+	} else if (mod == 2u) {
+		int32_t displacement = 0;
+		std::memcpy(&displacement, rip + offset, sizeof(displacement));
+		result += static_cast<uint64_t>(static_cast<int64_t>(displacement));
+	}
+
+	address = reinterpret_cast<const void*>(result);
+	return true;
+}
+
 static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const XmmWords& xmm0,
                              XmmWords& dest) {
 	if (insn.escape == 0x3a && insn.opcode == 0xcc) {
-		if (insn.imm8 > 3u) {
-			return false;
-		}
 		Sha1Rnds4(dest, src2, insn.imm8);
 		return true;
 	}
@@ -344,6 +424,25 @@ static M128A* GetContextXmm(PCONTEXT context, uint8_t index) {
 	return &context->Xmm0 + index;
 }
 
+static void LoadContextGprsWin(PCONTEXT context, uint64_t (&gpr)[16]) {
+	gpr[0]  = context->Rax;
+	gpr[1]  = context->Rcx;
+	gpr[2]  = context->Rdx;
+	gpr[3]  = context->Rbx;
+	gpr[4]  = context->Rsp;
+	gpr[5]  = context->Rbp;
+	gpr[6]  = context->Rsi;
+	gpr[7]  = context->Rdi;
+	gpr[8]  = context->R8;
+	gpr[9]  = context->R9;
+	gpr[10] = context->R10;
+	gpr[11] = context->R11;
+	gpr[12] = context->R12;
+	gpr[13] = context->R13;
+	gpr[14] = context->R14;
+	gpr[15] = context->R15;
+}
+
 static bool TryEmulateShaNi(PCONTEXT context) {
 	if (context == nullptr) {
 		return false;
@@ -356,16 +455,10 @@ static bool TryEmulateShaNi(PCONTEXT context) {
 	}
 
 	const uint8_t modrm_byte = rip[insn.modrm_offset];
-	if (!ShaNiModrmIsRegister(modrm_byte)) {
-		return false;
-	}
-
 	const uint8_t dest_index = ShaNiRegIndex(modrm_byte, insn.rex, true);
-	const uint8_t src_index  = ShaNiRegIndex(modrm_byte, insn.rex, false);
 	auto*         dest_xmm   = GetContextXmm(context, dest_index);
-	auto*         src_xmm    = GetContextXmm(context, src_index);
 	auto*         xmm0       = GetContextXmm(context, 0);
-	if (dest_xmm == nullptr || src_xmm == nullptr || xmm0 == nullptr) {
+	if (dest_xmm == nullptr || xmm0 == nullptr) {
 		return false;
 	}
 
@@ -373,8 +466,24 @@ static bool TryEmulateShaNi(PCONTEXT context) {
 	XmmWords src2 {};
 	XmmWords xmm0_words {};
 	LoadXmmWordsWin(dest_xmm, dest);
-	LoadXmmWordsWin(src_xmm, src2);
 	LoadXmmWordsWin(xmm0, xmm0_words);
+
+	if (ShaNiModrmIsRegister(modrm_byte)) {
+		const uint8_t src_index = ShaNiRegIndex(modrm_byte, insn.rex, false);
+		auto*         src_xmm   = GetContextXmm(context, src_index);
+		if (src_xmm == nullptr) {
+			return false;
+		}
+		LoadXmmWordsWin(src_xmm, src2);
+	} else {
+		uint64_t    gpr[16] {};
+		const void* source = nullptr;
+		LoadContextGprsWin(context, gpr);
+		if (!ResolveShaNiMemoryAddress(rip, insn, gpr, source)) {
+			return false;
+		}
+		std::memcpy(&src2, source, sizeof(src2));
+	}
 
 	if (!ExecuteShaNiInsn(insn, src2, xmm0_words, dest)) {
 		return false;
@@ -519,6 +628,25 @@ static uint32_t* GetContextXmm(ucontext_t* context, uint8_t index) {
 	return static_cast<uint32_t*>(fpregs->_xmm[index].element);
 }
 
+static void LoadContextGprsLin(ucontext_t* context, uint64_t (&gpr)[16]) {
+	gpr[0]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RAX]);
+	gpr[1]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RCX]);
+	gpr[2]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RDX]);
+	gpr[3]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RBX]);
+	gpr[4]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RSP]);
+	gpr[5]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RBP]);
+	gpr[6]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RSI]);
+	gpr[7]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RDI]);
+	gpr[8]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R8]);
+	gpr[9]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R9]);
+	gpr[10] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R10]);
+	gpr[11] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R11]);
+	gpr[12] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R12]);
+	gpr[13] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R13]);
+	gpr[14] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R14]);
+	gpr[15] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R15]);
+}
+
 static void LoadXmmWordsLin(const uint32_t* xmm, XmmWords& out) {
 	out.w[0] = xmm[0];
 	out.w[1] = xmm[1];
@@ -546,16 +674,10 @@ static bool TryEmulateShaNi(ucontext_t* context) {
 	}
 
 	const uint8_t modrm_byte = rip[insn.modrm_offset];
-	if (!ShaNiModrmIsRegister(modrm_byte)) {
-		return false;
-	}
-
 	const uint8_t dest_index = ShaNiRegIndex(modrm_byte, insn.rex, true);
-	const uint8_t src_index  = ShaNiRegIndex(modrm_byte, insn.rex, false);
 	auto*         dest_xmm   = GetContextXmm(context, dest_index);
-	auto*         src_xmm    = GetContextXmm(context, src_index);
 	auto*         xmm0       = GetContextXmm(context, 0);
-	if (dest_xmm == nullptr || src_xmm == nullptr || xmm0 == nullptr) {
+	if (dest_xmm == nullptr || xmm0 == nullptr) {
 		return false;
 	}
 
@@ -563,8 +685,24 @@ static bool TryEmulateShaNi(ucontext_t* context) {
 	XmmWords src2 {};
 	XmmWords xmm0_words {};
 	LoadXmmWordsLin(dest_xmm, dest);
-	LoadXmmWordsLin(src_xmm, src2);
 	LoadXmmWordsLin(xmm0, xmm0_words);
+
+	if (ShaNiModrmIsRegister(modrm_byte)) {
+		const uint8_t src_index = ShaNiRegIndex(modrm_byte, insn.rex, false);
+		auto*         src_xmm   = GetContextXmm(context, src_index);
+		if (src_xmm == nullptr) {
+			return false;
+		}
+		LoadXmmWordsLin(src_xmm, src2);
+	} else {
+		uint64_t    gpr[16] {};
+		const void* source = nullptr;
+		LoadContextGprsLin(context, gpr);
+		if (!ResolveShaNiMemoryAddress(rip, insn, gpr, source)) {
+			return false;
+		}
+		std::memcpy(&src2, source, sizeof(src2));
+	}
 
 	if (!ExecuteShaNiInsn(insn, src2, xmm0_words, dest)) {
 		return false;

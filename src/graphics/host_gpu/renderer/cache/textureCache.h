@@ -4,10 +4,11 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
-#include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
-#include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 
 #include <compare>
 #include <map>
@@ -109,11 +110,17 @@ private:
 	[[nodiscard]] ImageId                InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId                GetNullImage(const ImageDesc& desc);
 	void                                 RegisterImage(ImageId id);
-	void                                 UnregisterImage(ImageId id, bool release_tracking);
-	void                                 DeleteImage(ImageId id, bool release_tracking = true);
+	void                                 UnregisterImage(ImageId id);
+	void                                 DeleteImage(ImageId id);
 	void DeleteImages(std::span<const ImageId> ids, std::optional<ImageId> native_source = {});
 	void RetainImage(CommandBuffer& command, ImageId id);
 	void TouchImage(Image& image);
+	void TrackImage(ImageId id);
+	void TrackImageHead(ImageId id);
+	void TrackImageTail(ImageId id);
+	void UntrackImage(ImageId id);
+	void UntrackImageHead(ImageId id);
+	void UntrackImageTail(ImageId id);
 	void TrackImageDownload(ImageId id);
 	void TrackImageDownloadLocked(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -148,8 +155,7 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void InvalidateCpuAliases(uint64_t address, uint64_t size);
-	void RestoreGpuTracking(const Image& image);
-	void ReleaseGpuTracking(ImageId id);
+	void ClearGpuModified(ImageId id);
 
 	[[nodiscard]] bool                          SynchronizeImageToBuffer(ImageId id);
 	void                                        DownloadImage(ImageId id);
@@ -160,7 +166,7 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;
-	MemoryTracker                                     m_memory_tracker;
+	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	std::unique_ptr<TileManager>                      m_tiler;
 	BufferCache&                                      m_buffer_cache;

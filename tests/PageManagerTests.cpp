@@ -577,6 +577,75 @@ void TestCrossRegionRange() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestBatchedWatcherRanges() {
+  FaultContext context;
+  PageManager manager(InvalidateFault, &context);
+  context.manager = &manager;
+  const auto page_size = manager.GetPageSize();
+  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
+  constexpr uint64_t allocation_size = region_size * 3;
+  auto *memory = Allocate(allocation_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.OnGpuMap(address, allocation_size);
+
+  manager.UpdatePageWatchers(true, address + page_size, page_size);
+  manager.UpdatePageWatchers(true, address + page_size * 3, page_size);
+  manager.UpdatePageWatchers(true, address, page_size * 5);
+  for (uint64_t page = 0; page < 5; page++) {
+    Check(Protection(memory + page * page_size) == PAGE_READONLY,
+          "fragmented watch did not coalesce to read-only");
+  }
+  manager.UpdatePageWatchers(false, address, page_size * 5);
+  Check(IsWritable(memory) &&
+            Protection(memory + page_size) == PAGE_READONLY &&
+            IsWritable(memory + page_size * 2) &&
+            Protection(memory + page_size * 3) == PAGE_READONLY &&
+            IsWritable(memory + page_size * 4),
+        "fragmented unwatch lost overlapping watcher counts");
+  manager.UpdatePageWatchers(false, address + page_size, page_size);
+  manager.UpdatePageWatchers(false, address + page_size * 3, page_size);
+
+  manager.UpdatePageWatchers(true, address, allocation_size);
+  Check(!IsWritable(memory) &&
+            !IsWritable(memory + region_size) &&
+            !IsWritable(memory + region_size * 2) &&
+            !IsWritable(memory + allocation_size - page_size),
+        "large cross-region watch did not protect the full range");
+  manager.UpdatePageWatchers(false, address, allocation_size);
+  Check(IsWritable(memory) &&
+            IsWritable(memory + region_size) &&
+            IsWritable(memory + region_size * 2) &&
+            IsWritable(memory + allocation_size - page_size),
+        "large cross-region unwatch did not restore the full range");
+
+  manager.UpdatePageWatchers(true, address, page_size * 5);
+  manager.UpdatePageWatchers(true, address + page_size, page_size * 3,
+                             Libs::Graphics::PageWatchMode::ReadWrite);
+  Check(Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 3) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 4) == PAGE_READONLY,
+        "mixed watcher modes installed incorrect protections");
+  manager.UpdatePageWatchers(false, address, page_size * 5);
+  Check(IsWritable(memory) &&
+            Protection(memory + page_size) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 3) == PAGE_NOACCESS &&
+            IsWritable(memory + page_size * 4),
+        "write unwatch incorrectly released read/write watchers");
+  manager.UpdatePageWatchers(false, address + page_size, page_size * 3,
+                             Libs::Graphics::PageWatchMode::ReadWrite);
+  Check(IsWritable(memory + page_size) &&
+            IsWritable(memory + page_size * 2) &&
+            IsWritable(memory + page_size * 3),
+        "read/write unwatch did not restore writable protection");
+
+  manager.OnGpuUnmap(address, allocation_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   FaultContext context;
   auto manager = std::make_unique<PageManager>(InvalidateFault, &context);
@@ -795,6 +864,7 @@ int main(int argc, char **argv) {
   TestNativeAccessViolation();
   TestInvalidLateWriteTokenIsConsumed();
   TestCrossRegionRange();
+  TestBatchedWatcherRanges();
   TestConcurrentFault();
   TestExternalDirtyTransferDuringResolution();
   TestMappingDoesNotRequireCpuWriteAccess();

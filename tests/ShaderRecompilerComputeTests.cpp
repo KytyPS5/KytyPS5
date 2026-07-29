@@ -3195,6 +3195,10 @@ public:
       const auto fault_b_image = texture_cache.FindImage(fault_b_desc);
       texture_cache.MarkGpuWritten(fault_a_image);
       texture_cache.MarkGpuWritten(fault_b_image);
+      Require(name, "per-image watcher installation",
+              texture_cache.GetImage(fault_a_image).IsTracked() &&
+                  texture_cache.GetImage(fault_b_image).IsTracked(),
+              "same-page images did not install independent write watchers");
       constexpr uint64_t padding_fault_offset = 0x8080;
       uint32_t write_only_read_a = 0;
       uint32_t write_only_read_b = 0;
@@ -3212,13 +3216,24 @@ public:
               resources.HandleFault(PageFaultAccess::Write,
                                     base + padding_fault_offset) &&
                   texture_cache.GetImage(fault_a_image).IsGpuModified() &&
-                  texture_cache.GetImage(fault_b_image).IsGpuModified(),
+                  texture_cache.GetImage(fault_b_image).IsGpuModified() &&
+                  !texture_cache.GetImage(fault_a_image).IsTracked() &&
+                  !texture_cache.GetImage(fault_b_image).IsTracked() &&
+                  texture_cache.GetImage(fault_a_image).IsMaybeCpuDirty() &&
+                  texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty(),
               "a byte-disjoint CPU write discarded authoritative images");
+      const auto retracked_a = texture_cache.FindImage(fault_a_desc);
+      const auto retracked_b = texture_cache.FindImage(fault_b_desc);
       Require(name, "same-page image re-track",
-              texture_cache.FindImage(fault_a_desc) == fault_a_image &&
-                  texture_cache.FindImage(fault_b_desc) == fault_b_image &&
+              retracked_a == fault_a_image && retracked_b == fault_b_image &&
+                  texture_cache.GetImage(fault_a_image).IsTracked() &&
+                  texture_cache.GetImage(fault_b_image).IsTracked() &&
+                  !texture_cache.GetImage(fault_a_image).IsCpuDirty() &&
+                  !texture_cache.GetImage(fault_b_image).IsCpuDirty() &&
                   texture_cache.SynchronizeImageToBuffer(base + 0x8000,
                                                          sizeof(fault_a)) &&
+                  texture_cache.GetImage(fault_a_image).IsTracked() &&
+                  texture_cache.GetImage(fault_b_image).IsTracked() &&
                   !texture_cache.GetImage(fault_a_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsGpuModified(),
               "retiring one same-page image lost the surviving owner");

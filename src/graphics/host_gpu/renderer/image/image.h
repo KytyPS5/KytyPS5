@@ -66,16 +66,16 @@ public:
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
-	[[nodiscard]] Barriers
-	GetBarriers(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	            vk::PipelineStageFlags2 destination_stage,
-	            std::optional<ImageSubresourceRange> range);
+	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
+	                                   vk::AccessFlags2                     destination_access,
+	                                   vk::PipelineStageFlags2              destination_stage,
+	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
-	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
-	            uint64_t offset, uint64_t size);
-	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
-	              uint64_t offset, uint64_t size);
+	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
+	            uint64_t size);
+	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
+	              uint64_t size);
 	void CopyImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
@@ -84,8 +84,8 @@ public:
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
-			m_cpu_dirty       = true;
-			m_maybe_cpu_dirty = false;
+			m_cpu_dirty        = true;
+			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
@@ -95,6 +95,11 @@ public:
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
+	void               MarkMaybeCpuDirty() {
+		if (!m_cpu_dirty) {
+			m_maybe_cpu_dirty = true;
+		}
+	}
 	[[nodiscard]] bool NeedsMaybeCpuHash() const {
 		return m_maybe_cpu_dirty && !m_maybe_hash_valid;
 	}
@@ -102,14 +107,14 @@ public:
 		if (!NeedsMaybeCpuHash()) {
 			EXIT("image cannot initialize maybe-dirty hash\n");
 		}
-		m_maybe_cpu_hash = hash;
+		m_maybe_cpu_hash   = hash;
 		m_maybe_hash_valid = true;
 	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
 		if (!m_maybe_cpu_dirty || !m_maybe_hash_valid || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
-		m_maybe_cpu_dirty = false;
+		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
@@ -125,14 +130,15 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void MarkBufferModified() noexcept { m_buffer_modified = true; }
-	void ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
-	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size, bool pages = false) const noexcept {
+	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
+	                            bool pages = false) const noexcept {
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
 		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
@@ -142,38 +148,41 @@ public:
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
+	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : (info.data.size + 1023) & ~uint64_t {1023};
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
-	ImageInfo            info;
-	VulkanImage          backing;
-	ImageViewCache       views;
-	ImageUsage           usage;
-	ImageBinding         binding;
-	bool                 registered          = false;
-	ImageId              depth_id {};
-	uint64_t             tick_accessed_last = 0;
-	size_t               lru_id = 0;
+	ImageInfo      info;
+	VulkanImage    backing;
+	ImageViewCache views;
+	ImageUsage     usage;
+	ImageBinding   binding;
+	bool           registered     = false;
+	uint64_t       track_addr     = 0;
+	uint64_t       track_addr_end = 0;
+	ImageId        depth_id {};
+	uint64_t       tick_accessed_last = 0;
+	size_t         lru_id             = 0;
 
 private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
-	[[nodiscard]] static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
-	                                       uint64_t capacity) noexcept;
+	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
+	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext*   m_graphics  = nullptr;
-	CommandScheduler* m_scheduler = nullptr;
-	uint64_t        m_maybe_cpu_hash = 0;
-	bool            m_cpu_dirty = false;
-	bool            m_maybe_cpu_dirty = false;
-	bool            m_maybe_hash_valid = false;
-	bool            m_gpu_modified = false;
-	bool            m_buffer_modified = false;
+	GraphicContext*   m_graphics         = nullptr;
+	CommandScheduler* m_scheduler        = nullptr;
+	uint64_t          m_maybe_cpu_hash   = 0;
+	bool              m_cpu_dirty        = false;
+	bool              m_maybe_cpu_dirty  = false;
+	bool              m_maybe_hash_valid = false;
+	bool              m_gpu_modified     = false;
+	bool              m_buffer_modified  = false;
 };
 
 namespace ImageOps {

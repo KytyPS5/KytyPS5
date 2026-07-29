@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -71,8 +72,8 @@ static int PageProtToPosix(uint32_t protection) {
 // Query the current protection of the page containing vaddr via the Mach VM map and
 // collapse it to the tracker's read/write tags (execute is irrelevant to write tracking).
 static uint32_t MachQueryPageProt(uint64_t vaddr) {
-	auto              region_addr = static_cast<mach_vm_address_t>(vaddr);
-	mach_vm_size_t    region_size = 0;
+	auto                           region_addr = static_cast<mach_vm_address_t>(vaddr);
+	mach_vm_size_t                 region_size = 0;
 	vm_region_basic_info_data_64_t info {};
 	mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
 	mach_port_t                    object_name = MACH_PORT_NULL;
@@ -164,22 +165,27 @@ int ToHostProtection(uint32_t protection) {
 	}
 }
 
+struct HostMapping {
+	uint64_t end        = 0;
+	uint32_t protection = UNKNOWN_PROTECTION;
+};
+
 // Async-signal-safe lookup in the address-ordered /proc/self/maps.
-uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
+HostMapping QueryHostMapping(uint64_t vaddr) noexcept {
 	int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC); // NOLINT
 	if (fd < 0) {
-		return UNKNOWN_PROTECTION;
+		return {};
 	}
 
 	enum class Field { Start, End, Perms, Rest };
 
-	uint32_t result     = UNKNOWN_PROTECTION;
-	auto     field      = Field::Start;
-	uint64_t start      = 0;
-	uint64_t end        = 0;
-	char     perms[4]   = {};
-	uint32_t perms_len  = 0;
-	bool     line_valid = true;
+	HostMapping result {};
+	auto        field      = Field::Start;
+	uint64_t    start      = 0;
+	uint64_t    end        = 0;
+	char        perms[4]   = {};
+	uint32_t    perms_len  = 0;
+	bool        line_valid = true;
 
 	char buffer[8192];
 
@@ -248,10 +254,11 @@ uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
 					if (vaddr < start) {
 						done = true;
 					} else if (vaddr < end && perms_len >= 2) {
-						result = perms[1] == 'w'   ? READ_WRITE_PROTECTION
-						         : perms[0] == 'r' ? READ_ONLY_PROTECTION
-						                           : NO_ACCESS_PROTECTION;
-						done   = true;
+						result.end        = end;
+						result.protection = perms[1] == 'w'   ? READ_WRITE_PROTECTION
+						                    : perms[0] == 'r' ? READ_ONLY_PROTECTION
+						                                      : NO_ACCESS_PROTECTION;
+						done              = true;
 					} else {
 						field = Field::Rest;
 					}
@@ -265,6 +272,10 @@ uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
 
 	::close(fd);
 	return result;
+}
+
+uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
+	return QueryHostMapping(vaddr).protection;
 }
 #endif
 
@@ -301,26 +312,46 @@ uint64_t PageEnd(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		std::atomic_flag lock                 = ATOMIC_FLAG_INIT;
-		uint32_t         mappings             = 0;
-		uint32_t         gpu_read_mappings    = 0;
-		uint32_t         gpu_write_mappings   = 0;
-		uint32_t         write_watchers       = 0;
-		uint32_t         access_watchers      = 0;
-		uint32_t         original_protection  = 0;
-		uint32_t         backing_writer       = 0;
+		std::atomic_flag lock                = ATOMIC_FLAG_INIT;
+		uint32_t         mappings            = 0;
+		uint32_t         gpu_read_mappings   = 0;
+		uint32_t         gpu_write_mappings  = 0;
+		uint32_t         write_watchers      = 0;
+		uint32_t         access_watchers     = 0;
+		uint32_t         original_protection = 0;
+		uint32_t         backing_writer      = 0;
 #if defined(__linux__)
 		// Shadow the protection applied through Protect().
 		uint32_t current_protection = UNKNOWN_PROTECTION;
 #endif
-		bool             resolving            = false;
-		bool             resolving_read_write = false;
-		bool             late_read_pending    = false;
-		bool             late_write_pending   = false;
+		bool resolving            = false;
+		bool resolving_read_write = false;
+		bool late_read_pending    = false;
+		bool late_write_pending   = false;
 	};
 
 	struct Region {
 		std::array<PageState, REGION_PAGES> pages;
+	};
+
+	class PageRangeGuard final {
+	public:
+		explicit PageRangeGuard(std::span<PageState*> pages): m_pages(pages) {
+			for (auto* page: m_pages) {
+				while (page->lock.test_and_set(std::memory_order_acquire)) {
+					std::atomic_signal_fence(std::memory_order_seq_cst);
+				}
+			}
+		}
+		~PageRangeGuard() {
+			for (auto it = m_pages.rbegin(); it != m_pages.rend(); ++it) {
+				(*it)->lock.clear(std::memory_order_release);
+			}
+		}
+		KYTY_CLASS_NO_COPY(PageRangeGuard);
+
+	private:
+		std::span<PageState*> m_pages;
 	};
 
 	Impl(PageFaultHandler handler, void* context): fault_handler(handler), fault_context(context) {
@@ -337,8 +368,7 @@ struct PageManager::Impl {
 #elif defined(__APPLE__)
 		// Under Rosetta the host page size is 4 KB, matching TRACKER_PAGE_SIZE.
 		if (static_cast<uint64_t>(getpagesize()) != PAGE_SIZE) {
-			Fatal("unsupported host page size 0x%08" PRIx32,
-			      static_cast<uint32_t>(getpagesize()));
+			Fatal("unsupported host page size 0x%08" PRIx32, static_cast<uint32_t>(getpagesize()));
 		}
 #else
 		const auto host_page_size = ::sysconf(_SC_PAGESIZE);
@@ -405,42 +435,57 @@ struct PageManager::Impl {
 		if (old_protection == NO_ACCESS_PROTECTION && new_protection != NO_ACCESS_PROTECTION) {
 			page.late_read_pending = true;
 		}
-		if ((old_protection == NO_ACCESS_PROTECTION ||
-		     old_protection == READ_ONLY_PROTECTION) &&
+		if ((old_protection == NO_ACCESS_PROTECTION || old_protection == READ_ONLY_PROTECTION) &&
 		    new_protection == READ_WRITE_PROTECTION) {
 			page.late_write_pending = true;
 		}
 	}
 
-	static uint32_t QueryProtection([[maybe_unused]] PageState& page, uint64_t vaddr) {
+	static void ValidateInitialProtection(std::span<PageState*> pages, uint64_t vaddr) {
+		const auto end = vaddr + pages.size() * PAGE_SIZE;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(vaddr)), &info,
-		                 sizeof(info)) == 0 ||
-		    info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) {
-			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (state=0x%08" PRIx32
-			      ", protection=0x%08" PRIx32 ")",
-			      vaddr, static_cast<uint32_t>(info.State), static_cast<uint32_t>(info.Protect));
+		for (auto address = vaddr; address < end;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), &info,
+			                 sizeof(info)) == 0 ||
+			    info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) {
+				Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (state=0x%08" PRIx32
+				      ", protection=0x%08" PRIx32 ")",
+				      address, static_cast<uint32_t>(info.State),
+				      static_cast<uint32_t>(info.Protect));
+			}
+			const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+			if (region_end <= address) {
+				Fatal("VirtualQuery returned an invalid region at 0x%016" PRIx64, address);
+			}
+			address = std::min(end, region_end);
 		}
-		return info.Protect;
 #elif defined(__APPLE__)
-		const uint32_t protection = MachQueryPageProt(vaddr);
-		if (protection != PAGE_READWRITE) {
-			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (protection=0x%08" PRIx32
-			      ")",
-			      vaddr, protection);
+		for (auto address = vaddr; address < end; address += PAGE_SIZE) {
+			const uint32_t protection = MachQueryPageProt(address);
+			if (protection != PAGE_READWRITE) {
+				Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64
+				      " (protection=0x%08" PRIx32 ")",
+				      address, protection);
+			}
 		}
-		return protection;
 #else
-		const auto host_protection = QueryHostProtection(vaddr);
-		if (host_protection != READ_WRITE_PROTECTION) {
-			Fatal("basic path requires a read/write mapping at 0x%016" PRIx64
-			      " (protection=0x%08" PRIx32 ")",
-			      vaddr, host_protection);
+		for (auto address = vaddr; address < end;) {
+			const auto mapping = QueryHostMapping(address);
+			if (mapping.protection != READ_WRITE_PROTECTION || mapping.end <= address) {
+				Fatal("basic path requires a read/write mapping at 0x%016" PRIx64
+				      " (protection=0x%08" PRIx32 ")",
+				      address, mapping.protection);
+			}
+			address = std::min(end, mapping.end);
 		}
-		page.current_protection = host_protection;
-		return host_protection;
+		for (auto* page: pages) {
+			page->current_protection = READ_WRITE_PROTECTION;
+		}
 #endif
+		for (auto* page: pages) {
+			page->original_protection = READ_WRITE_PROTECTION;
+		}
 	}
 
 	static bool AllowsAccess([[maybe_unused]] const PageState& page, uint64_t vaddr,
@@ -470,7 +515,8 @@ struct PageManager::Impl {
 		const auto permitted = [](uint32_t protection, PageFaultAccess wanted) {
 			switch (wanted) {
 				case PageFaultAccess::Read:
-					return protection == READ_ONLY_PROTECTION || protection == READ_WRITE_PROTECTION;
+					return protection == READ_ONLY_PROTECTION ||
+					       protection == READ_WRITE_PROTECTION;
 				case PageFaultAccess::Write: return protection == READ_WRITE_PROTECTION;
 				default: return false;
 			}
@@ -483,26 +529,84 @@ struct PageManager::Impl {
 #endif
 	}
 
-	static void Protect([[maybe_unused]] PageState& page, uint64_t vaddr, uint32_t protection,
-	                    uint32_t expected_old, bool fault_path) noexcept {
+	static void ProtectRange(std::span<PageState*> pages, uint64_t vaddr, uint32_t protection,
+	                         std::span<const uint32_t> expected_old, bool fault_path) noexcept {
+		const auto size = pages.size() * PAGE_SIZE;
+		if (pages.size() != expected_old.size()) {
+			FailFast("protection range state size mismatch");
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		DWORD old_protection = 0;
-		if (VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
-		                   protection, &old_protection) == 0 ||
-		    old_protection != expected_old) {
-			if (fault_path) {
-				FailFast("VirtualProtect fault transition did not match expected protection");
+		struct HostRange {
+			uint64_t begin = 0;
+			uint64_t end   = 0;
+		};
+		std::vector<HostRange> host_ranges;
+		const auto             end = vaddr + size;
+		for (auto address = vaddr; address < end;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), &info,
+			                 sizeof(info)) == 0 ||
+			    info.State != MEM_COMMIT) {
+				if (fault_path) {
+					FailFast("VirtualProtect fault transition did not match expected protection");
+				}
+				Fatal("invalid protection transition at 0x%016" PRIx64 ", state=0x%08" PRIx32
+				      ", new=0x%08" PRIx32,
+				      address, static_cast<uint32_t>(info.State), protection);
 			}
-			Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
-			      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
-			      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
+			const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+			const auto query_end  = std::min(end, region_end);
+			if (query_end <= address) {
+				if (fault_path) {
+					FailFast("VirtualQuery returned an invalid fault transition region");
+				}
+				Fatal("VirtualQuery returned an invalid region at 0x%016" PRIx64, address);
+			}
+			const auto first_page = static_cast<size_t>((address - vaddr) / PAGE_SIZE);
+			const auto last_page =
+			    static_cast<size_t>((query_end - vaddr + PAGE_SIZE - 1) / PAGE_SIZE);
+			for (auto page = first_page; page < last_page; page++) {
+				if (info.Protect != expected_old[page]) {
+					if (fault_path) {
+						FailFast(
+						    "VirtualProtect fault transition did not match expected protection");
+					}
+					Fatal("invalid protection transition at 0x%016" PRIx64 ", actual=0x%08" PRIx32
+					      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
+					      vaddr + page * PAGE_SIZE, static_cast<uint32_t>(info.Protect),
+					      expected_old[page], protection);
+				}
+			}
+			const auto allocation = reinterpret_cast<uint64_t>(info.AllocationBase);
+			if (host_ranges.empty() || allocation != host_ranges.back().begin) {
+				host_ranges.push_back({allocation, query_end});
+			} else {
+				host_ranges.back().end = query_end;
+			}
+			address = query_end;
+		}
+		for (auto range: host_ranges) {
+			range.begin               = std::max(range.begin, vaddr);
+			DWORD      old_protection = 0;
+			const auto first_page     = static_cast<size_t>((range.begin - vaddr) / PAGE_SIZE);
+			if (VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(range.begin)),
+			                   range.end - range.begin, protection, &old_protection) == 0 ||
+			    old_protection != expected_old[first_page]) {
+				if (fault_path) {
+					FailFast("VirtualProtect fault transition did not match expected protection");
+				}
+				Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
+				      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
+				      range.begin, static_cast<uint32_t>(old_protection), expected_old[first_page],
+				      protection);
+			}
 		}
 #elif defined(__APPLE__)
 		// mprotect cannot report the previous protection, so the expected_old comparison
 		// is dropped; the tracker is the sole mutator of these pages and drives the
 		// transition from its own shadow state.
 		(void)expected_old;
-		if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
+		if (mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size,
 		             PageProtToPosix(protection)) != 0) {
 			if (fault_path) {
 				FailFast("mprotect fault transition failed");
@@ -510,16 +614,18 @@ struct PageManager::Impl {
 			Fatal("mprotect failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr, protection);
 		}
 #else
-		if (page.current_protection != UNKNOWN_PROTECTION &&
-		    page.current_protection != expected_old) {
-			if (fault_path) {
-				FailFast("mprotect fault transition did not match expected protection");
+		for (size_t i = 0; i < pages.size(); i++) {
+			const auto actual = pages[i]->current_protection;
+			if (actual != UNKNOWN_PROTECTION && actual != expected_old[i]) {
+				if (fault_path) {
+					FailFast("mprotect fault transition did not match expected protection");
+				}
+				Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
+				      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
+				      vaddr + i * PAGE_SIZE, actual, expected_old[i], protection);
 			}
-			Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
-			      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
-			      vaddr, page.current_protection, expected_old, protection);
 		}
-		if (::mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
+		if (::mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size,
 		               ToHostProtection(protection)) != 0) {
 			if (fault_path) {
 				FailFast("mprotect failed on the fault path");
@@ -527,8 +633,17 @@ struct PageManager::Impl {
 			Fatal("mprotect failed at 0x%016" PRIx64 ", new=0x%08" PRIx32 " (%s)", vaddr,
 			      protection, std::strerror(errno));
 		}
-		page.current_protection = protection;
+		for (auto* page: pages) {
+			page->current_protection = protection;
+		}
 #endif
+	}
+
+	static void Protect(PageState& page, uint64_t vaddr, uint32_t protection, uint32_t expected_old,
+	                    bool fault_path) noexcept {
+		PageState* pages[]    = {&page};
+		uint32_t   expected[] = {expected_old};
+		ProtectRange(pages, vaddr, protection, expected, fault_path);
 	}
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
@@ -634,65 +749,134 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 	if (mode != PageWatchMode::Write && mode != PageWatchMode::ReadWrite) {
 		Fatal("invalid watcher mode");
 	}
-	const auto end = PageEnd(vaddr, size);
-	for (auto page_vaddr = PageStart(vaddr); page_vaddr < end; page_vaddr += PAGE_SIZE) {
-		auto* region =
-		    track ? m_impl->GetOrCreateRegion(page_vaddr) : m_impl->FindRegion(page_vaddr);
+	const auto begin = PageStart(vaddr);
+	const auto end   = PageEnd(vaddr, size);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end = std::min(end, (chunk_begin / REGION_SIZE + 1) * REGION_SIZE);
+		auto*      region =
+		    track ? m_impl->GetOrCreateRegion(chunk_begin) : m_impl->FindRegion(chunk_begin);
 		if (region == nullptr) {
-			Fatal("untracking unknown page 0x%016" PRIx64, page_vaddr);
+			Fatal("untracking unknown page 0x%016" PRIx64, chunk_begin);
 		}
-		auto&     page = m_impl->GetPage(*region, page_vaddr);
-		SpinGuard lock(page.lock);
-		if (page.resolving && track) {
-			FailFast("new page watcher raced active fault resolution");
+
+		const auto page_count = static_cast<size_t>((chunk_end - chunk_begin) / PAGE_SIZE);
+		std::vector<Impl::PageState*> pages;
+		pages.reserve(page_count);
+		for (auto address = chunk_begin; address < chunk_end; address += PAGE_SIZE) {
+			pages.push_back(&m_impl->GetPage(*region, address));
 		}
-		if (page.mappings == 0) {
-			Fatal("watching unmapped page 0x%016" PRIx64, page_vaddr);
+		Impl::PageRangeGuard lock(pages);
+
+		std::vector<uint8_t> first_watchers(page_count);
+		for (size_t i = 0; i < page_count; i++) {
+			auto&      page    = *pages[i];
+			const auto address = chunk_begin + i * PAGE_SIZE;
+			if (page.resolving && track) {
+				FailFast("new page watcher raced active fault resolution");
+			}
+			if (page.mappings == 0) {
+				Fatal("watching unmapped page 0x%016" PRIx64, address);
+			}
+			auto& watchers =
+			    (mode == PageWatchMode::ReadWrite ? page.access_watchers : page.write_watchers);
+			if (track) {
+				if (watchers == std::numeric_limits<uint32_t>::max()) {
+					Fatal("watcher overflow at 0x%016" PRIx64, address);
+				}
+				first_watchers[i] = page.write_watchers == 0 && page.access_watchers == 0;
+			} else {
+				if (watchers == 0) {
+					Fatal("watcher underflow at 0x%016" PRIx64, address);
+				}
+				if (page.backing_writer != 0 && page.backing_writer != CurrentThread()) {
+					Fatal("backing write ownership changed at 0x%016" PRIx64, address);
+				}
+			}
 		}
-		auto& watchers =
-		    (mode == PageWatchMode::ReadWrite ? page.access_watchers : page.write_watchers);
+
 		if (track) {
-			if (watchers == std::numeric_limits<uint32_t>::max()) {
-				Fatal("watcher overflow at 0x%016" PRIx64, page_vaddr);
-			}
-			const bool first_watcher = page.write_watchers == 0 && page.access_watchers == 0;
-			if (first_watcher) {
-				page.original_protection = Impl::QueryProtection(page, page_vaddr);
-			}
-			const auto old_protection = Impl::WatcherProtection(page);
-			watchers++;
-			const auto new_protection = Impl::WatcherProtection(page);
-			if (new_protection != old_protection) {
-				Impl::Protect(page, page_vaddr, new_protection, old_protection, false);
-			}
-			switch (new_protection) {
-				case NO_ACCESS_PROTECTION:
-					page.late_read_pending  = false;
-					page.late_write_pending = false;
-					break;
-				case READ_ONLY_PROTECTION: page.late_write_pending = false; break;
-				default: break;
-			}
-		} else {
-			if (watchers == 0) {
-				Fatal("watcher underflow at 0x%016" PRIx64, page_vaddr);
-			}
-			if (page.backing_writer != 0 && page.backing_writer != CurrentThread()) {
-				Fatal("backing write ownership changed at 0x%016" PRIx64, page_vaddr);
-			}
-			const auto old_protection = Impl::WatcherProtection(page);
-			watchers--;
-			const auto new_protection = Impl::WatcherProtection(page);
-			if (page.backing_writer == 0 && new_protection != old_protection) {
-				Impl::Protect(page, page_vaddr, new_protection, old_protection, false);
-			}
-			if (page.backing_writer == 0) {
-				Impl::PublishDelayedFaults(page, old_protection, new_protection);
-			}
-			if (page.backing_writer == 0 && page.write_watchers == 0 && page.access_watchers == 0) {
-				page.original_protection = 0;
+			for (size_t first = 0; first < page_count;) {
+				while (first < page_count && first_watchers[first] == 0) {
+					first++;
+				}
+				auto last = first;
+				while (last < page_count && first_watchers[last] != 0) {
+					last++;
+				}
+				if (first != last) {
+					Impl::ValidateInitialProtection(std::span {pages}.subspan(first, last - first),
+					                                chunk_begin + first * PAGE_SIZE);
+				}
+				first = last;
 			}
 		}
+
+		std::vector<uint32_t> old_protections(page_count);
+		std::vector<uint32_t> new_protections(page_count);
+		std::vector<uint8_t>  transitions(page_count);
+		for (size_t i = 0; i < page_count; i++) {
+			auto& page = *pages[i];
+			auto& watchers =
+			    (mode == PageWatchMode::ReadWrite ? page.access_watchers : page.write_watchers);
+			const auto old_protection = Impl::WatcherProtection(page);
+			if (track) {
+				watchers++;
+			} else {
+				watchers--;
+			}
+			const auto new_protection = Impl::WatcherProtection(page);
+			old_protections[i]        = old_protection;
+			new_protections[i]        = new_protection;
+			if (new_protection != old_protection && (track || page.backing_writer == 0)) {
+				transitions[i] = 1;
+			}
+		}
+
+		for (size_t first = 0; first < page_count;) {
+			while (first < page_count && transitions[first] == 0) {
+				first++;
+			}
+			if (first == page_count) {
+				break;
+			}
+			const auto protection = new_protections[first];
+			auto       current    = first + 1;
+			auto       last       = current;
+			for (; current < page_count && new_protections[current] == protection; current++) {
+				if (old_protections[current] != new_protections[current] &&
+				    transitions[current] == 0) {
+					break;
+				}
+				if (transitions[current] != 0) {
+					last = current + 1;
+				}
+			}
+			Impl::ProtectRange(std::span {pages}.subspan(first, last - first),
+			                   chunk_begin + first * PAGE_SIZE, protection,
+			                   std::span {old_protections}.subspan(first, last - first), false);
+			first = current;
+		}
+
+		for (size_t i = 0; i < page_count; i++) {
+			auto&      page       = *pages[i];
+			const auto protection = new_protections[i];
+			if (track) {
+				switch (protection) {
+					case NO_ACCESS_PROTECTION:
+						page.late_read_pending  = false;
+						page.late_write_pending = false;
+						break;
+					case READ_ONLY_PROTECTION: page.late_write_pending = false; break;
+					default: break;
+				}
+			} else if (page.backing_writer == 0) {
+				Impl::PublishDelayedFaults(page, old_protections[i], protection);
+				if (page.write_watchers == 0 && page.access_watchers == 0) {
+					page.original_protection = 0;
+				}
+			}
+		}
+		chunk_begin = chunk_end;
 	}
 }
 

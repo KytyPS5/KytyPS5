@@ -7,13 +7,13 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
-#include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -58,8 +58,8 @@ private:
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache,
                            ResourceMutex& resource_mutex)
-    : m_graphics(graphics), m_scheduler(scheduler),
-      m_memory_tracker(page_manager, PageWatchMode::Write), m_blit_helper(graphics, scheduler),
+    : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
+      m_blit_helper(graphics, scheduler),
       m_tiler(std::make_unique<TileManager>(graphics, scheduler,
                                             buffer_cache.GetUtilityBuffer(MemoryUsage::Stream))),
       m_buffer_cache(buffer_cache), m_resource_mutex(resource_mutex),
@@ -80,7 +80,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 TextureCache::~TextureCache() {
 	for (uint32_t index = 0; index < m_slots.size(); index++) {
 		if (m_slots[index].image != nullptr && m_slots[index].image->registered) {
-			UnregisterImage({index, m_slots[index].generation}, false);
+			UnregisterImage({index, m_slots[index].generation});
 		}
 		m_slots[index].image.reset();
 	}
@@ -117,8 +117,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 		return false;
 	}
 	const auto range = image.info.data;
-	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size) &&
-	       !m_memory_tracker.IsRegionCpuModified(range.address, range.size);
+	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
 Image& TextureCache::ResolveImage(ImageId id) {
@@ -187,21 +186,17 @@ void TextureCache::RegisterImage(ImageId id) {
 	m_total_used_memory += image.AccountedSize();
 }
 
-void TextureCache::UnregisterImage(ImageId id, bool release_tracking) {
+void TextureCache::UnregisterImage(ImageId id) {
 	auto& image = ResolveImage(id);
 	if (!image.registered) {
 		return;
 	}
+	UntrackImage(id);
 	std::vector<ImageOwnerIndex::ByteRange> releases;
 	if (!m_image_owner_index.Unregister(id, releases)) {
 		EXIT("TextureCache: image missing from owner index\n");
 	}
 	m_lru_cache.Free(image.lru_id);
-	if (release_tracking) {
-		for (const auto& range: releases) {
-			m_memory_tracker.UntrackMemory(range.address, range.size);
-		}
-	}
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
@@ -210,7 +205,7 @@ void TextureCache::UnregisterImage(ImageId id, bool release_tracking) {
 	image.registered = false;
 }
 
-void TextureCache::DeleteImage(ImageId id, bool release_tracking) {
+void TextureCache::DeleteImage(ImageId id) {
 	auto owner = ResolveOwner(id);
 	if (owner == nullptr || !owner->registered) {
 		return;
@@ -224,7 +219,7 @@ void TextureCache::DeleteImage(ImageId id, bool release_tracking) {
 			}
 		}
 		for (const auto association: associations) {
-			ReleaseGpuTracking(association);
+			ClearGpuModified(association);
 			DeleteImage(association);
 		}
 	}
@@ -235,7 +230,7 @@ void TextureCache::DeleteImage(ImageId id, bool release_tracking) {
 	if (owner->info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
-	UnregisterImage(id, release_tracking);
+	UnregisterImage(id);
 	const auto erase_slot = [this, id, retained = owner] {
 		auto& slot = m_slots[id.index];
 		if (slot.generation != id.generation || slot.image != retained) {
@@ -266,10 +261,10 @@ void TextureCache::DeleteImages(std::span<const ImageId> ids,
 			continue;
 		}
 		if (native_source == id) {
-			ReleaseGpuTracking(id);
+			ClearGpuModified(id);
 		} else if (owner->IsGpuModified()) {
 			DownloadImage(id);
-			ReleaseGpuTracking(id);
+			ClearGpuModified(id);
 		}
 		DeleteImage(id);
 	}
@@ -293,6 +288,121 @@ void TextureCache::RetainImage(CommandBuffer& command, ImageId id) {
 void TextureCache::TouchImage(Image& image) {
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	}
+}
+
+void TextureCache::TrackImage(ImageId id) {
+	auto& image = ResolveImage(id);
+	if (!image.registered) {
+		return;
+	}
+	const auto image_begin = image.info.data.address;
+	const auto image_end   = image.info.data.End();
+	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
+		return;
+	}
+	if (!image.IsTracked()) {
+		image.track_addr     = image_begin;
+		image.track_addr_end = image_end;
+		m_page_manager.UpdatePageWatchers(true, image_begin, image.info.data.size);
+		return;
+	}
+	if (image_begin < image.track_addr) {
+		TrackImageHead(id);
+	}
+	if (image.track_addr_end < image_end) {
+		TrackImageTail(id);
+	}
+}
+
+void TextureCache::TrackImageHead(ImageId id) {
+	auto& image = ResolveImage(id);
+	if (!image.registered) {
+		return;
+	}
+	const auto image_begin = image.info.data.address;
+	if (image_begin == image.track_addr) {
+		return;
+	}
+	if (!image.IsTracked() || image_begin > image.track_addr) {
+		EXIT("TextureCache: invalid image head tracking range\n");
+	}
+	const auto size  = image.track_addr - image_begin;
+	image.track_addr = image_begin;
+	m_page_manager.UpdatePageWatchers(true, image_begin, size);
+}
+
+void TextureCache::TrackImageTail(ImageId id) {
+	auto& image = ResolveImage(id);
+	if (!image.registered) {
+		return;
+	}
+	const auto image_end = image.info.data.End();
+	if (image_end == image.track_addr_end) {
+		return;
+	}
+	if (!image.IsTracked() || image.track_addr_end > image_end) {
+		EXIT("TextureCache: invalid image tail tracking range\n");
+	}
+	const auto address   = image.track_addr_end;
+	const auto size      = image_end - address;
+	image.track_addr_end = image_end;
+	m_page_manager.UpdatePageWatchers(true, address, size);
+}
+
+void TextureCache::UntrackImage(ImageId id) {
+	auto& image = ResolveImage(id);
+	if (!image.IsTracked()) {
+		return;
+	}
+	const auto address   = image.track_addr;
+	const auto size      = image.track_addr_end - image.track_addr;
+	image.track_addr     = 0;
+	image.track_addr_end = 0;
+	if (size != 0) {
+		m_page_manager.UpdatePageWatchers(false, address, size);
+	}
+}
+
+void TextureCache::UntrackImageHead(ImageId id) {
+	auto&      image = ResolveImage(id);
+	const auto begin = image.info.data.address;
+	if (!image.IsTracked() || begin < image.track_addr) {
+		return;
+	}
+	const auto address = (begin + TRACKER_PAGE_SIZE) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto size    = address - begin;
+	image.track_addr   = address;
+	if (image.track_addr == image.track_addr_end) {
+		image.MarkMaybeCpuDirty();
+		if (image.NeedsMaybeCpuHash()) {
+			image.SetMaybeCpuHash(image.HashGuestEdges());
+		}
+		UntrackImage(id);
+	}
+	if (size != 0) {
+		m_page_manager.UpdatePageWatchers(false, begin, size);
+	}
+}
+
+void TextureCache::UntrackImageTail(ImageId id) {
+	auto&      image = ResolveImage(id);
+	const auto end   = image.info.data.End();
+	if (!image.IsTracked() || image.track_addr_end < end) {
+		return;
+	}
+	const auto address   = end & ~(TRACKER_PAGE_SIZE - 1);
+	const auto size      = end - address;
+	image.track_addr_end = address;
+	if (image.track_addr == image.track_addr_end) {
+		image.MarkMaybeCpuDirty();
+		if (image.NeedsMaybeCpuHash()) {
+			image.SetMaybeCpuHash(image.HashGuestEdges());
+		}
+		UntrackImage(id);
+	}
+	if (size != 0) {
+		m_page_manager.UpdatePageWatchers(false, address, size);
 	}
 }
 
@@ -376,9 +486,6 @@ void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 }
 
 void TextureCache::PrepareImageCopy(Image& image) {
-	const auto range = image.info.data;
-	m_memory_tracker.ForEachUploadRange(
-	    range.address, range.size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
@@ -471,6 +578,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = ResolveImage(destination_id);
 	auto& source      = ResolveImage(source_id);
+	TrackImage(destination_id);
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
@@ -479,7 +587,6 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
-		RestoreGpuTracking(destination);
 		return;
 	}
 	const bool source_depth = source.info.IsDepth();
@@ -503,7 +610,6 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.MarkGpuModified();
 	}
 	destination.ClearBufferModified();
-	RestoreGpuTracking(destination);
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
@@ -511,6 +617,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	RefreshCopySource(source_id);
 	auto& destination = ResolveImage(destination_id);
 	auto& source      = ResolveImage(source_id);
+	TrackImage(destination_id);
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
@@ -520,7 +627,6 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
-	RestoreGpuTracking(destination);
 }
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -590,7 +696,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (copied) {
 		DeleteImages(std::array {cached_id}, cached_id);
 	} else {
-		ReleaseGpuTracking(cached_id);
+		ClearGpuModified(cached_id);
 		DeleteImage(cached_id);
 	}
 	return replacement_id;
@@ -903,39 +1009,29 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	if (image.info.data.Empty()) {
 		return;
 	}
+	TrackImage(id);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
-		m_memory_tracker.ForEachUploadRange(
-		    image.info.data.address, image.info.data.size, false,
-		    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
 		if (image.IsCpuDirty()) {
 			image.RefreshComplete();
 		}
 		return;
 	}
 	if (image.info.samples > 1) {
-		RestoreGpuTracking(image);
 		return;
 	}
-	bool data_gpu_owned = false;
-	bool data_imported  = false;
-	bool uploaded       = false;
-	m_memory_tracker.ForEachUploadRange(
-	    image.info.data.address, image.info.data.size, false,
-	    [&](uint64_t, uint64_t) noexcept { uploaded = true; },
-	    [&]() noexcept {
-		    uploaded |= image.IsBufferModified() || image.IsDefinitelyCpuDirty();
-		    if (!uploaded) {
-			    return;
-		    }
-		    const auto source =
-		        m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		    if (source.buffer == nullptr) {
-			    EXIT("TextureCache: failed to obtain image upload source\n");
-		    }
-		    data_gpu_owned |= source.gpu_owned;
-		    data_imported = true;
-		    UploadImage(image, desc, *source.buffer, source.offset);
-	    });
+	bool       data_gpu_owned = false;
+	bool       data_imported  = false;
+	const bool upload         = image.IsBufferModified() || image.IsCpuDirty();
+	if (upload) {
+		const auto source =
+		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		if (source.buffer == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		data_gpu_owned |= source.gpu_owned;
+		data_imported = true;
+		UploadImage(image, desc, *source.buffer, source.offset);
+	}
 	if (data_imported) {
 		image.ClearBufferModified();
 	}
@@ -945,39 +1041,27 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
-	RestoreGpuTracking(image);
 }
 
 void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
-	auto& image           = ResolveImage(id);
-	bool  unchanged_maybe = false;
+	TrackImage(id);
+	auto& image = ResolveImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
 			image.SetMaybeCpuHash(hash);
 			return;
 		}
-		unchanged_maybe = !image.ResolveMaybeCpuHash(hash);
-		if (unchanged_maybe) {
-			m_memory_tracker.ForEachUploadRange(
-			    image.info.data.address, image.info.data.size, false,
-			    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-		}
+		(void)image.ResolveMaybeCpuHash(hash);
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
-	if (!unchanged_maybe) {
-		cpu_dirty |=
-		    m_memory_tracker.IsRegionCpuModified(image.info.data.address, image.info.data.size);
-	}
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (cpu_dirty) {
 			EXIT("TextureCache: compressed guest image refresh is unsupported\n");
 		}
-		RestoreGpuTracking(image);
 		return;
 	}
 	if (!cpu_dirty) {
-		RestoreGpuTracking(image);
 		return;
 	}
 	InitializeImage(id, desc);
@@ -1029,7 +1113,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 	ImageId result {};
 	bool    replacement_buffer = false;
-	bool    replacing_image    = false;
+	bool    inserted_new       = false;
 	{
 		std::lock_guard            transaction(m_resource_mutex);
 		CacheLock                  lock(*this, m_lock);
@@ -1079,20 +1163,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				}
 				replacement_buffer = resolved.IsBufferModified();
 				DeleteImage(result);
-				result          = {};
-				replacing_image = true;
+				result = {};
 			}
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
+			inserted_new   = true;
 			auto& inserted = ResolveImage(result);
 			if (replacement_buffer || m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                                          inserted.info.data.size)) {
 				inserted.MarkBufferModified();
-			} else if (replacing_image) {
-				m_memory_tracker.MarkRegionAsCpuModified(inserted.info.data.address,
-				                                         inserted.info.data.size);
 			}
+		}
+		if (inserted_new) {
 			InitializeImage(result, desc);
 		} else {
 			RefreshImage(result, desc);
@@ -1101,9 +1184,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		auto& image = ResolveImage(result);
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
-			const bool guest_dirty =
-			    image.IsBufferModified() || image.IsCpuDirty() ||
-			    m_memory_tracker.IsRegionCpuModified(image.info.data.address, image.info.data.size);
+			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
 			const bool native_current =
 			    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
 			if (!native_current) {
@@ -1252,6 +1333,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
+	TrackImage(id);
 	CommitGpuWrite(image);
 }
 
@@ -1265,13 +1347,10 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	}
 	m_buffer_cache.InvalidateImageAliases(range.address, range.size);
 	image.ClearBufferModified();
-	m_memory_tracker.ForEachUploadRange(
-	    range.address, range.size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
-	RestoreGpuTracking(image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1335,8 +1414,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (m_buffer_cache.HasGpuDirtyBytes(address, size)) {
 		m_buffer_cache.DiscardGpuDirtyBytes(address, size);
 	}
-	if (image.IsBufferModified() || image.IsCpuDirty() ||
-	    m_memory_tracker.IsRegionCpuModified(image.info.data.address, image.info.data.size)) {
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
 		ImageDesc refresh {.info = image.info, .view_info = {}, .type = UploadBinding(image)};
 		InitializeImage(selected, refresh);
 		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
@@ -1367,8 +1445,6 @@ void TextureCache::PrepareHostWrite(uint64_t address, uint64_t size) {
 	}
 	CacheLock lock(*this, m_lock);
 	InvalidateCpuAliases(address, size);
-	m_memory_tracker.ForEachDownloadRange<true>(address, size, [](uint64_t, uint64_t) noexcept {});
-	m_memory_tracker.MarkRegionAsCpuModified(address, size);
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
@@ -1567,18 +1643,15 @@ bool TextureCache::SynchronizeImageToBuffer(ImageId id) {
 	if (!plan.valid) {
 		return false;
 	}
-	const auto range   = image.info.data;
-	const bool refresh = image.IsDefinitelyCpuDirty() ||
-	                     m_memory_tracker.IsRegionCpuModified(range.address, range.size);
-	if (refresh) {
+	const auto range = image.info.data;
+	if (image.IsCpuDirty()) {
 		RefreshImage(id,
 		             ImageDesc {.info = image.info, .view_info = {}, .type = UploadBinding(image)});
 	}
 	if (!image.IsGpuModified()) {
 		return true;
 	}
-	if (image.IsDefinitelyCpuDirty() || image.IsBufferModified() ||
-	    m_memory_tracker.IsRegionCpuModified(range.address, range.size)) {
+	if (image.IsDefinitelyCpuDirty() || image.IsBufferModified()) {
 		EXIT("TextureCache: image mirror source is not native-current\n");
 	}
 	auto [destination, offset] =
@@ -1591,7 +1664,7 @@ bool TextureCache::SynchronizeImageToBuffer(ImageId id) {
 	m_buffer_cache.PublishImageBuffer(range.address, range.size);
 	image.MarkBufferModified();
 	RetainImage(m_scheduler.Current(), id);
-	ReleaseGpuTracking(id);
+	ClearGpuModified(id);
 	return true;
 }
 
@@ -1633,7 +1706,7 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 			if (!formatted_buffer_write) {
 				EXIT("TextureCache: buffer write aliases GPU-modified image\n");
 			}
-			ReleaseGpuTracking(id);
+			ClearGpuModified(id);
 		}
 		owner->MarkBufferModified();
 		found = true;
@@ -1660,50 +1733,40 @@ TextureCache::RegionInfo TextureCache::QueryRegion(uint64_t address, uint64_t si
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
+	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
+	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = ResolveOwner(id);
 		if (owner == nullptr || owner->depth_id) {
 			continue;
 		}
-		owner->InvalidateCpuWrite(address, size);
-		if (owner->NeedsMaybeCpuHash()) {
-			owner->SetMaybeCpuHash(owner->HashGuestEdges());
+		if (owner->Overlaps(address, size)) {
+			owner->InvalidateCpuWrite(address, size);
+			UntrackImage(id);
+			continue;
+		}
+		const auto image_begin = owner->info.data.address;
+		const auto image_end   = owner->info.data.End();
+		if (page_end < image_end) {
+			UntrackImageHead(id);
+		} else if (image_begin < page_begin) {
+			UntrackImageTail(id);
+		} else {
+			owner->MarkMaybeCpuDirty();
+			if (owner->NeedsMaybeCpuHash()) {
+				owner->SetMaybeCpuHash(owner->HashGuestEdges());
+			}
+			UntrackImage(id);
 		}
 	}
 }
 
-void TextureCache::RestoreGpuTracking(const Image& image) {
-	if (!image.IsGpuModified()) {
-		return;
-	}
-	constexpr uint64_t page_mask = TRACKER_PAGE_SIZE - 1;
-	const auto         range     = image.info.data;
-	const auto         begin     = range.address & ~page_mask;
-	const auto         end       = (range.End() + page_mask) & ~page_mask;
-	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
-		if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
-		    !m_memory_tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE)) {
-			m_memory_tracker.MarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
-		}
-	}
-}
-
-void TextureCache::ReleaseGpuTracking(ImageId id) {
+void TextureCache::ClearGpuModified(ImageId id) {
 	auto owner = ResolveOwner(id);
 	if (owner == nullptr || !owner->IsGpuModified()) {
 		return;
 	}
-	const auto released = owner->info.data;
 	owner->ClearGpuModified();
-	m_memory_tracker.ForEachDownloadRange<true>(released.address, released.size,
-	                                            [](uint64_t, uint64_t) noexcept {});
-	for (const auto candidate: FindImagesInRegion(released.address, released.size, true)) {
-		const auto survivor = ResolveOwner(candidate);
-		if (survivor != nullptr && survivor.get() != owner.get() && !survivor->depth_id) {
-			RestoreGpuTracking(*survivor);
-		}
-	}
-	RestoreGpuTracking(*owner);
 }
 
 bool TextureCache::IsMeta(uint64_t address) {
@@ -1755,27 +1818,25 @@ bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t address, ui
 		return false;
 	}
 	if (phase == PageFaultPhase::Invalidate) {
-		const bool gpu_image =
-		    m_memory_tracker.InvalidateVirtualGpuWrite(access, address, size, phase);
-		CpuFaultAction action = gpu_image ? CpuFaultAction::Download
-		                                  : m_memory_tracker.BeginCpuFault(address, size, access);
-		{
-			CacheLock lock(*this, m_lock);
+		CacheLock  lock(*this, m_lock);
+		const bool tracked =
+		    std::ranges::any_of(FindImagesInRegion(address, size, true), [&](ImageId id) {
+			    const auto owner = ResolveOwner(id);
+			    return owner != nullptr && !owner->depth_id && owner->IsTracked();
+		    });
+		if (tracked) {
 			InvalidateCpuAliases(address, size);
 		}
-		return action != CpuFaultAction::Untracked;
+		return tracked;
 	}
-
-	if (phase == PageFaultPhase::Complete) {
-		const bool gpu_image = m_memory_tracker.IsRegionGpuModified(address, size);
-		return gpu_image ? m_memory_tracker.InvalidateVirtualGpuWrite(access, address, size, phase)
-		                 : m_memory_tracker.CompleteCpuFault(address, size, access, false);
-	}
-	if (phase != PageFaultPhase::Release) {
+	if (phase != PageFaultPhase::Complete && phase != PageFaultPhase::Release) {
 		return false;
 	}
-	(void)m_memory_tracker.InvalidateVirtualGpuWrite(access, address, size, phase);
-	return true;
+	CacheLock lock(*this, m_lock);
+	return std::ranges::any_of(FindImagesInRegion(address, size, true), [&](ImageId id) {
+		const auto owner = ResolveOwner(id);
+		return owner != nullptr && !owner->depth_id;
+	});
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
@@ -1794,15 +1855,9 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->IsGpuModified()) {
-			ReleaseGpuTracking(id);
+			ClearGpuModified(id);
 		}
 		DeleteImage(id);
-	}
-	m_memory_tracker.UntrackMemory(address, size);
-	for (const auto id: FindImagesInRegion(address, size, true)) {
-		if (const auto survivor = ResolveOwner(id); survivor != nullptr) {
-			RestoreGpuTracking(*survivor);
-		}
 	}
 }
 
@@ -1849,7 +1904,7 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !TryDownloadImage(id)) {
 					continue;
 				}
-				ReleaseGpuTracking(id);
+				ClearGpuModified(id);
 			}
 			DeleteImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {

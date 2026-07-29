@@ -45,6 +45,8 @@ namespace {
 
 constexpr uint32_t ScalarRegisters = 128;
 constexpr uint32_t VectorRegisters = 256;
+// Clamp X/Y/Z are consecutive three-bit fields; the high bit of each selects a border mode.
+constexpr uint32_t SamplerBorderClampMask = (1u << 2u) | (1u << 5u) | (1u << 8u);
 
 struct ScalarState {
 	std::array<uint32_t, ScalarRegisters> regs          = {};
@@ -647,6 +649,24 @@ private:
 		return AddDescriptor(descriptor);
 	}
 
+	uint32_t AddSamplerDescriptor(const ScalarState& state, uint32_t base) {
+		if (base >= ScalarRegisters || 4u > ScalarRegisters - base) {
+			return ScalarProvenance::Unknown;
+		}
+		DescriptorValue descriptor;
+		descriptor.dword_count = 4;
+		for (uint32_t i = 0; i < 4; i++) {
+			descriptor.dwords[i] = state.regs[base + i];
+		}
+		if (auto d0 = descriptor.dwords[0];
+		    d0 < m_graph.values.size() && m_graph.values[d0].op == ScalarValueOp::Constant &&
+		    (m_graph.values[d0].imm & SamplerBorderClampMask) == 0) {
+			// Without a border clamp, the border color and table index in dword 3 are unused.
+			descriptor.dwords[3] = Constant(0);
+		}
+		return AddDescriptor(descriptor);
+	}
+
 	uint32_t AddFlatAddressDescriptor(const Instruction& inst, const ScalarState& state) {
 		const uint32_t first = FlatStore(inst.op) ? 1u : 0u;
 		if (inst.src_count < first + 2u) {
@@ -704,7 +724,7 @@ private:
 			inst.memory.resource_source = AddDescriptor(state, inst.memory.resource * 4u, 8);
 			if (inst.op == Opcode::ImageSample || inst.op == Opcode::ImageGather4 ||
 			    inst.op == Opcode::ImageGetLod) {
-				inst.memory.sampler_source = AddDescriptor(state, inst.memory.sampler * 4u, 4);
+				inst.memory.sampler_source = AddSamplerDescriptor(state, inst.memory.sampler * 4u);
 			}
 		}
 	}

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <cstdint>
+#include <shared_mutex>
 
 namespace Libs::Graphics {
 
@@ -26,7 +27,7 @@ public:
 	void                        SetGpu(Gpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
-	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);
@@ -38,11 +39,13 @@ private:
 	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
 
-	PageManager   m_page_manager;
-	ResourceMutex m_resource_mutex;
-	BufferCache   m_buffer_cache;
-	TextureCache  m_texture_cache;
-	Gpu*          m_gpu = nullptr;
+	PageManager               m_page_manager;
+	ResourceMutex             m_resource_mutex;
+	BufferCache               m_buffer_cache;
+	TextureCache              m_texture_cache;
+	mutable std::shared_mutex m_mapped_ranges_mutex;
+	RangeSet                  m_mapped_ranges;
+	Gpu*                      m_gpu = nullptr;
 };
 
 } // namespace Libs::Graphics

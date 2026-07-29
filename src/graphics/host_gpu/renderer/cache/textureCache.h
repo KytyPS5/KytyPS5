@@ -65,7 +65,7 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
-	void               PrepareHostWrite(uint64_t address, uint64_t size);
+	void               InvalidateMemory(uint64_t address, uint64_t size);
 	[[nodiscard]] bool SynchronizeImageToBuffer(uint64_t address, uint64_t size);
 	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 	                                           bool formatted_buffer_write = false);

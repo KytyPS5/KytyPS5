@@ -301,36 +301,6 @@ void TestSharedWatcherFault() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-void TestMappedHostWriteRange() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size * 3);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-
-  manager.OnGpuMap(address, page_size);
-  manager.OnGpuMap(address + page_size * 2, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  manager.UpdatePageWatchers(true, address + page_size * 2, page_size);
-  Check(manager.HasAnyMapping(address + 16, page_size * 3 - 32),
-        "host-write range did not find partial GPU mappings");
-  Check(!manager.IsMapped(address, page_size * 3),
-        "partial GPU mappings were reported as a full mapping");
-  Check(manager.HandleWriteRange(address + 16, page_size * 3 - 32),
-        "mapped host-write range was not handled");
-  Check(context.calls.load(std::memory_order_relaxed) == 2,
-        "host-write range did not invalidate each mapped watched page");
-  Check(IsWritable(memory) && IsWritable(memory + page_size * 2),
-        "host-write range did not restore writable protection");
-
-  manager.OnGpuUnmap(address, page_size);
-  manager.OnGpuUnmap(address + page_size * 2, page_size);
-  Check(!manager.HasAnyMapping(address, page_size * 3),
-        "host-write range retained stale GPU mappings");
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
 void TestReadWriteWatcherFault() {
   FaultContext context;
   PageManager manager(InvalidateFault, &context);
@@ -855,7 +825,6 @@ int main(int argc, char **argv) {
   }
   TestWatchFaultAndUnwatch();
   TestSharedWatcherFault();
-  TestMappedHostWriteRange();
   TestReadWriteWatcherFault();
   TestPermittedMappedLateFaultsResume();
   TestPartialMappingUnmapPreservesTokens();

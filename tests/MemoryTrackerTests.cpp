@@ -669,6 +669,8 @@ void TestRangeSet() {
   ranges.Add(0x1000, 0x80);
   ranges.Add(0x1080, 0x80);
   ranges.Add(0x1200, 0x40);
+  Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
+        "range set containment did not require full coverage");
   auto intersections = ranges.Intersections(0x1070, 0x1b0);
   Check(intersections.size() == 2 && intersections[0].address == 0x1070 &&
             intersections[0].size == 0x90 && intersections[1].address == 0x1200 &&
@@ -680,6 +682,46 @@ void TestRangeSet() {
             intersections[0].size == 0x40 && intersections[1].address == 0x1220 &&
             intersections[1].size == 0x20,
         "range set subtraction did not preserve both exact tails");
+}
+
+void TestRangeInvalidation() {
+  constexpr uintptr_t base = 0x0000000201000000ull;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  constexpr uint64_t size = Libs::Graphics::TRACKER_REGION_SIZE * 2;
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), size, MEM_RESERVE | MEM_COMMIT,
+                   PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base),
+        "range invalidation allocation failed");
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  page_manager.OnGpuMap(address, size);
+
+  tracker.ForEachUploadRange(
+      address, size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.IsRegionGpuModified(address, size) && !IsWritable(memory),
+        "range invalidation setup did not establish GPU ownership");
+
+  uint32_t flushes = 0;
+  tracker.InvalidateRegion(address + 16, size - 32, [&] {
+    flushes++;
+    tracker.ForEachDownloadRange<true>(
+        address + 16, size - 32, [](uint64_t, uint64_t) noexcept {});
+  });
+  Check(flushes == 1 && !tracker.IsRegionGpuModified(address, size) &&
+            tracker.IsRegionCpuModified(address, size) && IsWritable(memory) &&
+            IsWritable(memory + size - 1),
+        "range invalidation did not batch ownership transfer across regions");
+
+  tracker.InvalidateRegion(address + 16, size - 32, [&] { flushes++; });
+  Check(flushes == 1,
+        "clean range invalidation unnecessarily requested a GPU flush");
+  tracker.UntrackMemory(address, size);
+  page_manager.OnGpuUnmap(address, size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0,
+        "range invalidation VirtualFree failed");
 }
 
 void TestCpuDirtyUploadAndFault() {
@@ -1207,6 +1249,7 @@ int main(int argc, char **argv) {
   TestSameSlabTrackerArbitration();
   TestSharedMetadataAndImagePageFault();
   TestRangeSet();
+  TestRangeInvalidation();
   TestGpuDirtyBits();
   TestCrossRegionUpload();
   TestFaultDuringUploadRemainsDirty();

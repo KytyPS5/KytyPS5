@@ -68,47 +68,52 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	return handled;
 }
 
-void GpuResourceManager::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
-	if (!m_page_manager.HasAnyMapping(vaddr, size)) {
-		return;
+bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
 	}
 	if (CommandScheduler::InDeferredOperation()) {
-		EXIT("unsupported host write from an asynchronous GPU completion, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
+		EXIT("unsupported memory invalidation from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	const auto handle_range = [this, vaddr, size] {
-		if (!m_page_manager.HandleWriteRange(vaddr, size)) {
-			EXIT("failed to prepare host write, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-			     vaddr, size);
-		}
-	};
-	const auto resolve = [this, &handle_range](CommandProcessor& cp) {
+	const auto resolve = [this, vaddr, size](CommandProcessor& cp) {
 		cp.BeginReadbackTransaction();
 		{
 			ResourceMutex::FaultScope fault(m_resource_mutex);
-			handle_range();
+			m_buffer_cache.InvalidateMemory(vaddr, size);
+			m_texture_cache.InvalidateMemory(vaddr, size);
 		}
 		cp.EndReadbackTransaction();
 	};
 	if (auto* cp = Gpu::CurrentCommandProcessor(); cp != nullptr) {
 		resolve(*cp);
-		return;
+		return true;
 	}
 	if (m_resource_mutex.IsOwnedByCurrentThread()) {
-		EXIT("unsupported host write from a pre-owned resource transaction, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
+		EXIT("unsupported memory invalidation from a pre-owned resource transaction, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
 	EXIT_IF(m_gpu == nullptr);
 	m_gpu->SendCommandSyncWithProcessor(resolve);
+	return true;
 }
 
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
-	return m_page_manager.IsMapped(vaddr, size);
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		return false;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.Contains(vaddr, size);
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size, GpuAccess access) {
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+	}
 	m_page_manager.OnGpuMap(vaddr, size, access);
 }
 
@@ -120,6 +125,8 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, GpuAccess ac
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_page_manager.OnGpuUnmap(vaddr, size, access);
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Subtract(vaddr, size);
 	};
 	if (m_gpu == nullptr) {
 		if (m_resource_mutex.IsOwnedByCurrentThread()) {

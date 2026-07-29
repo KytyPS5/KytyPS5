@@ -49,6 +49,7 @@ public:
 
 	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
+	void               InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,
@@ -71,8 +72,8 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               InvalidateImageAliases(uint64_t vaddr, uint64_t size);
-	void BeginBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
-	void CompleteBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
+	void               BeginBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
+	void               CompleteBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
 	[[nodiscard]] bool SynchronizeBacking(uint64_t vaddr, uint64_t size);
 	void               PublishImageBuffer(uint64_t vaddr, uint64_t size);
 	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
@@ -91,27 +92,26 @@ private:
 	struct RetiredBuffer;
 	struct FaultReadback;
 	struct PendingBackingPublication;
-	static constexpr uint64_t DOWNLOAD_ALIGNMENT = 64;
-	[[nodiscard]] static uint64_t AlignDown(uint64_t value) noexcept;
-	[[nodiscard]] static uint64_t AlignUp(uint64_t value);
+	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
+	[[nodiscard]] static uint64_t           AlignDown(uint64_t value) noexcept;
+	[[nodiscard]] static uint64_t           AlignUp(uint64_t value);
 	[[nodiscard]] static constexpr uint64_t AlignDownload(uint64_t size) noexcept {
 		return (size + DOWNLOAD_ALIGNMENT - 1) & ~(DOWNLOAD_ALIGNMENT - 1);
 	}
 	[[nodiscard]] static bool PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right,
-	                                      uint64_t right_size) noexcept;
-	[[nodiscard]] static std::pair<uint64_t, uint64_t>
-	     DownloadEnvelope(const DownloadCopy& copy);
-	[[nodiscard]] static bool   ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept;
+	                                       uint64_t right_size) noexcept;
+	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
+	[[nodiscard]] static bool ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept;
 	void Upload(CommandBuffer& command, Buffer& destination, uint64_t destination_offset,
 	            const void* source, uint64_t size);
 	[[nodiscard]] CachedBuffer& GetOrCreateBuffer(CommandBuffer& command, uint64_t vaddr,
 	                                              uint64_t size);
-	[[nodiscard]] std::vector<DownloadRange>
-	     RecordDownloads(std::span<const DownloadCopy> copies);
+	[[nodiscard]] std::vector<DownloadRange> RecordDownloads(std::span<const DownloadCopy> copies);
 	void PublishDownloads(std::span<const DownloadRange> downloads);
 	void QueueGarbageDownload(std::span<const DownloadCopy> copies, RetiredBuffer retire);
 	void RefreshInvalidatedRanges(CommandBuffer& command, CachedBuffer& cached, uint64_t vaddr,
 	                              uint64_t size, bool upload);
+	void ReadMemory(uint64_t vaddr, uint64_t size);
 	void DiscardGpuDirtyBytesLocked(uint64_t vaddr, uint64_t size, const char* operation);
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
 

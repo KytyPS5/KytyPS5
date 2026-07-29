@@ -699,26 +699,6 @@ bool PageManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return true;
 }
 
-bool PageManager::HasAnyMapping(uint64_t vaddr, uint64_t size) const noexcept {
-	if (g_in_fault_resolution || vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE ||
-	    size > ADDRESS_SIZE - vaddr) {
-		return false;
-	}
-	const auto end = PageEnd(vaddr, size);
-	for (auto page_vaddr = PageStart(vaddr); page_vaddr < end; page_vaddr += PAGE_SIZE) {
-		auto* region = m_impl->FindRegion(page_vaddr);
-		if (region == nullptr) {
-			continue;
-		}
-		auto&     page = m_impl->GetPage(*region, page_vaddr);
-		SpinGuard lock(page.lock);
-		if (page.mappings != 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
 bool PageManager::HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) const noexcept {
 	if (access != GpuAccess::Read && access != GpuAccess::Write && access != GpuAccess::ReadWrite) {
 		FailFast("HasGpuAccess received an invalid GPU access mode");
@@ -1146,24 +1126,6 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 	g_in_fault_resolution = false;
 	if (!released) {
 		FailFast("fault release callback failed");
-	}
-	return true;
-}
-
-bool PageManager::HandleWriteRange(uint64_t vaddr, uint64_t size) noexcept {
-	if (g_in_fault_resolution || vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE ||
-	    size > ADDRESS_SIZE - vaddr) {
-		return false;
-	}
-	const auto end = PageEnd(vaddr, size);
-	for (auto page_vaddr = PageStart(vaddr); page_vaddr < end; page_vaddr += PAGE_SIZE) {
-		if (!IsMapped(page_vaddr, 1)) {
-			continue;
-		}
-		const auto fault_vaddr = std::max(page_vaddr, vaddr);
-		if (!HandleFault(PageFaultAccess::Write, fault_vaddr)) {
-			return false;
-		}
 	}
 	return true;
 }

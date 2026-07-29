@@ -38,10 +38,51 @@ public:
 	                                    bool downloaded) noexcept;
 	[[nodiscard]] bool InvalidateRegion(uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
+	template <typename Flush>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
+		static_assert(std::is_invocable_v<Flush&>);
+		CheckNotInUploadCallback();
+		ValidateRange(vaddr, size);
+
+		const auto update_cpu_state = [this, vaddr, size] {
+			std::lock_guard             access(m_access_mutex);
+			std::vector<RegionManager*> managers;
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
+				managers.push_back(manager);
+			});
+			std::vector<std::unique_lock<TrackingSpinLock>> locks;
+			locks.reserve(managers.size());
+			for (auto* manager: managers) {
+				locks.emplace_back(manager->lock);
+			}
+			const bool gpu_modified = Iterate<false>(
+			    vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				    return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+			    });
+			if (gpu_modified) {
+				return true;
+			}
+			Iterate<false>(vaddr, size,
+			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               const auto changed = manager->ChangeState<DirtySource::Cpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes);
+				               manager->ApplyProtection(changed, false);
+			               });
+			return false;
+		};
+
+		if (!update_cpu_state()) {
+			return;
+		}
+		std::forward<Flush>(on_flush)();
+		if (update_cpu_state()) {
+			EXIT("memory invalidation retained GPU-owned pages\n");
+		}
+	}
 	[[nodiscard]] bool InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr,
 	                                             uint64_t size, PageFaultPhase phase) noexcept;
-	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
-	                           const char* operation) const noexcept;
+	void               ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+	                                         const char* operation) const noexcept;
 	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                               const char* operation);
 

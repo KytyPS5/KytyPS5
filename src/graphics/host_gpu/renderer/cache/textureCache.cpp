@@ -1439,9 +1439,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	return true;
 }
 
-void TextureCache::PrepareHostWrite(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
-		EXIT("TextureCache: invalid host-write range\n");
+		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	CacheLock lock(*this, m_lock);
 	InvalidateCpuAliases(address, size);

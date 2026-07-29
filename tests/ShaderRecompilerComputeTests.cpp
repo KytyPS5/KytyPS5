@@ -1679,7 +1679,9 @@ public:
       Require("GpuCommandLane", "processor fault context",
               Gpu::CurrentCommandProcessor() == &processor,
               "processor resource test lost its command context");
-      resources.PrepareHostWrite(fault_base, sizeof(uint32_t));
+      Require("GpuCommandLane", "processor memory invalidation",
+              resources.InvalidateMemory(fault_base, sizeof(uint32_t)),
+              "processor memory invalidation did not find its mapped range");
     });
     resources.UnmapMemory(fault_base, fault_size, GpuAccess::ReadWrite);
     Require("GpuCommandLane", "processor fault unmap",

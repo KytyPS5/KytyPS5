@@ -66,8 +66,8 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 4ull * 1024ull * 1024ull * 1024ull;
 
-static uint64_t g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
-static Graphics::GpuResourceManager* g_gpu_resources = nullptr;
+static uint64_t                      g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static Graphics::GpuResourceManager* g_gpu_resources        = nullptr;
 
 static Graphics::GpuResourceManager& GetGpuResources() {
 	EXIT_IF(g_gpu_resources == nullptr);
@@ -892,11 +892,11 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	}
 }
 
-void PrepareHostWrite(uint64_t vaddr, uint64_t size) {
+void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
-	GetGpuResources().PrepareHostWrite(vaddr, size);
+	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
 void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
@@ -1915,24 +1915,24 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 
 	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
 
-	constexpr size_t   PAGE_SIZE         = 0x4000;
-	constexpr size_t   MAXIMUM_NAME_SIZE = 32;
-	constexpr uint64_t DEFAULT_PS5_BASE  = 0x200000000;
-	constexpr int GUEST_MAP_FIXED        = 0x10;
-	constexpr int GUEST_MAP_SHARED       = 0x01;
-	constexpr int GUEST_MAP_PRIVATE      = 0x02;
-	constexpr int GUEST_MAP_NO_OVERWRITE = 0x80;
-	constexpr int GUEST_MAP_VOID         = 0x100;
-	constexpr int GUEST_MAP_STACK        = 0x400;
-	constexpr int GUEST_MAP_NO_SYNC      = 0x800;
-	constexpr int GUEST_MAP_ANON         = 0x1000;
-	constexpr int GUEST_MAP_UNKNOWN_8000 = 0x8000;
-	constexpr int GUEST_MAP_NO_CORE      = 0x20000;
-	constexpr int GUEST_MAP_NO_COALESCE  = 0x400000;
-	constexpr int SUPPORTED_MAP_BITS =
-	    GUEST_MAP_SHARED | GUEST_MAP_PRIVATE | GUEST_MAP_FIXED | GUEST_MAP_NO_OVERWRITE |
-	    GUEST_MAP_VOID | GUEST_MAP_STACK | GUEST_MAP_NO_SYNC | GUEST_MAP_ANON |
-	    GUEST_MAP_UNKNOWN_8000 | GUEST_MAP_NO_CORE | GUEST_MAP_NO_COALESCE;
+	constexpr size_t   PAGE_SIZE              = 0x4000;
+	constexpr size_t   MAXIMUM_NAME_SIZE      = 32;
+	constexpr uint64_t DEFAULT_PS5_BASE       = 0x200000000;
+	constexpr int      GUEST_MAP_FIXED        = 0x10;
+	constexpr int      GUEST_MAP_SHARED       = 0x01;
+	constexpr int      GUEST_MAP_PRIVATE      = 0x02;
+	constexpr int      GUEST_MAP_NO_OVERWRITE = 0x80;
+	constexpr int      GUEST_MAP_VOID         = 0x100;
+	constexpr int      GUEST_MAP_STACK        = 0x400;
+	constexpr int      GUEST_MAP_NO_SYNC      = 0x800;
+	constexpr int      GUEST_MAP_ANON         = 0x1000;
+	constexpr int      GUEST_MAP_UNKNOWN_8000 = 0x8000;
+	constexpr int      GUEST_MAP_NO_CORE      = 0x20000;
+	constexpr int      GUEST_MAP_NO_COALESCE  = 0x400000;
+	constexpr int SUPPORTED_MAP_BITS = GUEST_MAP_SHARED | GUEST_MAP_PRIVATE | GUEST_MAP_FIXED |
+	                                   GUEST_MAP_NO_OVERWRITE | GUEST_MAP_VOID | GUEST_MAP_STACK |
+	                                   GUEST_MAP_NO_SYNC | GUEST_MAP_ANON | GUEST_MAP_UNKNOWN_8000 |
+	                                   GUEST_MAP_NO_CORE | GUEST_MAP_NO_COALESCE;
 
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -3294,7 +3294,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	     "\t alignment = 0x%016" PRIx64 "\n",
 	     in_addr, len, flags, alignment);
 
-	constexpr size_t PAGE_SIZE        = 0x4000;
+	constexpr size_t PAGE_SIZE              = 0x4000;
 	constexpr int    GUEST_MAP_FIXED        = 0x10;
 	constexpr int    GUEST_MAP_NO_OVERWRITE = 0x80;
 

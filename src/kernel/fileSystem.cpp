@@ -238,8 +238,9 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 	}
 
 	// Preserve unmatched components for the caller's ENOENT path.
-	std::filesystem::path resolved = path.has_root_path() ? path.root_path() : std::filesystem::path(".");
-	bool                  matched  = true;
+	std::filesystem::path resolved =
+	    path.has_root_path() ? path.root_path() : std::filesystem::path(".");
+	bool matched = true;
 
 	for (const auto& component: path.relative_path()) {
 		if (component.empty()) {
@@ -568,11 +569,11 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 
 	file->mutex.Lock();
 
-	bool     is_invalid = file->f.IsInvalid();
-	const auto pos       = file->f.Tell();
-	const auto file_size = file->f.Size();
-	const auto remaining = pos < file_size ? file_size - pos : 0;
-	Memory::PrepareHostWrite(reinterpret_cast<uint64_t>(buf),
+	bool       is_invalid = file->f.IsInvalid();
+	const auto pos        = file->f.Tell();
+	const auto file_size  = file->f.Size();
+	const auto remaining  = pos < file_size ? file_size - pos : 0;
+	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
@@ -692,13 +693,12 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	file->mutex.Lock();
 
-	bool     is_invalid = file->f.IsInvalid();
-	auto     pos        = file->f.Tell();
-	const auto file_size = file->f.Size();
-	const auto remaining = static_cast<uint64_t>(offset) < file_size
-	                           ? file_size - static_cast<uint64_t>(offset)
-	                           : 0;
-	Memory::PrepareHostWrite(reinterpret_cast<uint64_t>(buf),
+	bool       is_invalid = file->f.IsInvalid();
+	auto       pos        = file->f.Tell();
+	const auto file_size  = file->f.Size();
+	const auto remaining =
+	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
+	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);

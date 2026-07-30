@@ -34,16 +34,15 @@ uint32_t EmitDppWriteActiveBool(EmitterState& state, const IR::Operand& dst) {
 	    {OpShiftLeftLogical, state.uint_type, bank_bit, ConstantU32(state, 1), bank});
 	state.builder.AddFunction(
 	    {OpShiftLeftLogical, state.uint_type, row_bit, ConstantU32(state, 1), row});
-	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, bank_hit,
-	                            ConstantU32(state, dst.dpp_bank_mask), bank_bit});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, state.uint_type, bank_hit, ConstantU32(state, dst.dpp_bank_mask), bank_bit});
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, row_hit, ConstantU32(state, dst.dpp_row_mask), row_bit});
 	state.builder.AddFunction(
 	    {OpINotEqual, state.bool_type, bank_active, bank_hit, ConstantU32(state, 0)});
 	state.builder.AddFunction(
 	    {OpINotEqual, state.bool_type, row_active, row_hit, ConstantU32(state, 0)});
-	state.builder.AddFunction(
-	    {OpLogicalAnd, state.bool_type, dpp_active, bank_active, row_active});
+	state.builder.AddFunction({OpLogicalAnd, state.bool_type, dpp_active, bank_active, row_active});
 	uint32_t write_active = dpp_active;
 	if (!dst.dpp_bound_ctrl) {
 		const auto target  = EmitDppTargetLane(state, dst.dpp_ctrl);
@@ -102,7 +101,7 @@ void EmitStoreU32(EmitterState& state, const IR::Operand& dst, uint32_t value) {
 			const auto selected  = state.builder.AllocateId();
 			state.builder.AddFunction({OpLoad, state.uint_type, old_value, pointer});
 			state.builder.AddFunction({OpSelect, state.uint_type, selected,
-			                            EmitDppWriteActiveBool(state, dst), wave_value, old_value});
+			                           EmitDppWriteActiveBool(state, dst), wave_value, old_value});
 			state.builder.AddFunction({OpStore, pointer, selected});
 			return;
 		}
@@ -131,8 +130,7 @@ uint32_t EmitNotEqualZeroBool(EmitterState& state, uint32_t value) {
 uint32_t EmitSelectU32Value(EmitterState& state, uint32_t condition, uint32_t true_value,
                             uint32_t false_value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpSelect, state.uint_type, ret, condition, true_value, false_value});
+	state.builder.AddFunction({OpSelect, state.uint_type, ret, condition, true_value, false_value});
 	return ret;
 }
 
@@ -212,12 +210,12 @@ bool IsStorageBufferMemoryKind(IR::ResourceKind kind) {
 
 void EmitStorageBufferOffsets(EmitterState& state) {
 	for (uint32_t i = 0; i < state.program.bindings.buffer_offset_count; i++) {
-		const auto word = EmitShaderDataDwordLoad(
-		    state, state.program.bindings.buffer_offset_dword + i / 4u);
-		const auto shift = ConstantU32(state, (i % 4u) * 8u + 2u);
+		const auto word =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.buffer_offset_dword + i / 4u);
+		const auto shift                = ConstantU32(state, (i % 4u) * 8u + 2u);
 		state.storage_buffer_offsets[i] = EmitBinaryU32(
-		    state, OpBitwiseAnd,
-		    EmitBinaryU32(state, OpShiftRightLogical, word, shift), ConstantU32(state, 0x3fu));
+		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
+		    ConstantU32(state, 0x3fu));
 	}
 }
 
@@ -329,8 +327,7 @@ uint32_t EmitRelativeAddress(EmitterState& state, const IR::Instruction& inst, u
 
 uint32_t EmitFlatVirtualAddress(EmitterState& state, const IR::Instruction& inst,
                                 uint32_t first_src, uint32_t src_count) {
-	if (inst.memory.resource >= state.resources.addresses.size() ||
-	    src_count < 2) {
+	if (inst.memory.resource >= state.resources.addresses.size() || src_count < 2) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
 		                             inst.memory.resource, "flat address snapshot is missing");
 	}
@@ -429,20 +426,20 @@ uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInf
 		    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer, pointer,
-		                            state.address_memory_variable,
-		                            ConstantU32(state, binding.array_index)});
+		                           state.address_memory_variable,
+		                           ConstantU32(state, binding.array_index)});
 		return pointer;
 	}
 	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer, pointer,
-	                            state.storage_buffer_variable,
-	                            ConstantU32(state, binding.array_index)});
+	                           state.storage_buffer_variable,
+	                           ConstantU32(state, binding.array_index)});
 	return pointer;
 }
 
 uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
-                                           uint32_t index, uint32_t use_pc) {
+                                          uint32_t index, uint32_t use_pc) {
 	index                = EmitStorageBufferIndex(state, mem, index, use_pc);
 	const auto object    = EmitStorageBufferObjectPointer(state, mem, use_pc);
 	const auto length    = state.builder.AllocateId();
@@ -453,7 +450,7 @@ uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryI
 }
 
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                          uint32_t index, uint32_t use_pc) {
+                                         uint32_t index, uint32_t use_pc) {
 	index = EmitStorageBufferIndex(state, mem, index, use_pc);
 	if (IsFlatMemoryKind(mem.kind)) {
 		if (state.address_memory_variable == 0) {
@@ -589,9 +586,9 @@ uint32_t EmitMemoryLoadSubDwordValueU32(EmitterState& state, const IR::Instructi
 			const auto left       = state.builder.AllocateId();
 			const auto sign_shift = 32u - data_bits;
 			state.builder.AddFunction({OpShiftLeftLogical, state.uint_type, left, masked,
-			                            ConstantU32(state, sign_shift)});
+			                           ConstantU32(state, sign_shift)});
 			state.builder.AddFunction({OpShiftRightArithmetic, state.uint_type, value, left,
-			                            ConstantU32(state, sign_shift)});
+			                           ConstantU32(state, sign_shift)});
 		}
 		return value;
 	};
@@ -659,16 +656,15 @@ void EmitAtomicUpdateU32(EmitterState& state, uint32_t pointer, IR::ResourceKind
 	state.builder.AddFunction({OpBranch, preheader});
 	state.builder.AddFunction({OpLabel, preheader});
 	state.builder.AddFunction({OpAtomicLoad, state.uint_type, initial, pointer,
-	                            ConstantU32(state, scope),
-	                            ConstantU32(state, MemorySemanticsNone)});
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
 	state.builder.AddFunction({OpBranch, header});
 	state.builder.AddFunction({OpLabel, header});
 	state.builder.AddFunction(
 	    {OpPhi, state.uint_type, observed, initial, preheader, exchanged, continue_label});
 	const auto desired = desired_value(observed);
 	state.builder.AddFunction({OpAtomicCompareExchange, state.uint_type, exchanged, pointer,
-	                            ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
-	                            ConstantU32(state, MemorySemanticsNone), desired, observed});
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
+	                           ConstantU32(state, MemorySemanticsNone), desired, observed});
 	const auto success = state.builder.AllocateId();
 	state.builder.AddFunction({OpIEqual, state.bool_type, success, exchanged, observed});
 	state.builder.AddFunction({OpLoopMerge, merge, continue_label, LoopControlNone});
@@ -793,8 +789,7 @@ uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 uint32_t EmitTBufferCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
                                        uint32_t constant) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {opcode, state.bool_type, ret, value, ConstantU32(state, constant)});
+	state.builder.AddFunction({opcode, state.bool_type, ret, value, ConstantU32(state, constant)});
 	return ret;
 }
 
@@ -821,7 +816,7 @@ uint32_t EmitExtractFormatFieldU32(EmitterState& state, uint32_t raw_word, uint3
 		const auto signed_word = EmitTBufferBitcastU32ToI32(state, raw_word);
 		const auto extracted   = state.builder.AllocateId();
 		state.builder.AddFunction({OpBitFieldSExtract, state.int_type, extracted, signed_word,
-		                            ConstantU32(state, offset), ConstantU32(state, bits)});
+		                           ConstantU32(state, offset), ConstantU32(state, bits)});
 		const auto ret = state.builder.AllocateId();
 		state.builder.AddFunction({OpBitcast, state.uint_type, ret, extracted});
 		return ret;
@@ -829,7 +824,7 @@ uint32_t EmitExtractFormatFieldU32(EmitterState& state, uint32_t raw_word, uint3
 
 	const auto extracted = state.builder.AllocateId();
 	state.builder.AddFunction({OpBitFieldUExtract, state.uint_type, extracted, raw_word,
-	                            ConstantU32(state, offset), ConstantU32(state, bits)});
+	                           ConstantU32(state, offset), ConstantU32(state, bits)});
 	return extracted;
 }
 
@@ -940,7 +935,7 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 			state.builder.AddFunction(
 			    {OpFDiv, state.float_type, normalized, value, ConstantF32Value(state, max_value)});
 			state.builder.AddFunction({OpExtInst, state.float_type, clamped, state.glsl_std450,
-			                            GlslFMax, normalized, ConstantF32Value(state, -1.0f)});
+			                           GlslFMax, normalized, ConstantF32Value(state, -1.0f)});
 			return EmitTBufferBitcastF32ToU32(state, clamped);
 		}
 		case Format::ComponentType::Float:
@@ -961,18 +956,8 @@ uint32_t UnpackTBufferFormat(EmitterState& state, const IR::Instruction& inst,
 	return NormalizeFormatComponent(state, info, inst.memory.component_index, raw);
 }
 
-bool EmitTypedTBufferLoad(EmitterState& state, const IR::Instruction& inst,
-                          const Format::BufferFormatInfo& info) {
-	if (!Format::CanUseTypedBufferLoad(info.format)) {
-		return false;
-	}
-	const auto value = EmitMemoryLoadDwordValueU32(state, inst, IR::ResourceKind::Buffer, 0,
-	                                               AddressSourceCount(inst, 0));
-	EmitStoreU32(state, inst.dst, value);
-	return true;
-}
-
-bool EmitFormattedBufferLoad(EmitterState& state, const IR::Instruction& inst) {
+bool EmitFormattedBufferLoadValueU32(EmitterState& state, const IR::Instruction& inst,
+                                     uint32_t& value) {
 	if (!IsFormattedBufferComponent(inst)) {
 		return false;
 	}
@@ -984,16 +969,27 @@ bool EmitFormattedBufferLoad(EmitterState& state, const IR::Instruction& inst) {
 
 	const auto info = Format::GetFormatInfo(format);
 	if (inst.memory.component_index >= info.component_count) {
-		EmitStoreU32(state, inst.dst, ConstantU32(state, 0));
+		value = ConstantU32(state, 0);
 		return true;
 	}
 
-	if (EmitTypedTBufferLoad(state, inst, info)) {
+	if (Format::CanUseTypedBufferLoad(info.format)) {
+		value = EmitMemoryLoadDwordValueU32(state, inst, IR::ResourceKind::Buffer, 0,
+		                                    AddressSourceCount(inst, 0));
 		return true;
 	}
 
-	EmitStoreU32(state, inst.dst, UnpackTBufferFormat(state, inst, info));
+	value = UnpackTBufferFormat(state, inst, info);
 	return true;
+}
+
+uint32_t EmitBufferLoadDwordValueU32(EmitterState& state, const IR::Instruction& inst) {
+	uint32_t value = 0;
+	if (EmitFormattedBufferLoadValueU32(state, inst, value)) {
+		return value;
+	}
+	return EmitMemoryLoadDwordValueU32(state, inst, IR::ResourceKind::Buffer, 0,
+	                                   AddressSourceCount(inst, 0));
 }
 
 uint32_t FormattedBufferDwordStoreComponentCount(Prospero::BufferFormat format,
@@ -1117,8 +1113,8 @@ uint32_t EmitAtomicPointer(EmitterState& state, const IR::Instruction& inst) {
 			    StorageImageDescriptorPointer(state, inst.memory.resource, true, inst.pc, view);
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction({OpImageTexelPointer, state.ptr_image_uint, pointer,
-			                            image_pointer, EmitImageCoordU32(state, inst, view),
-			                            ConstantU32(state, 0)});
+			                           image_pointer, EmitImageCoordU32(state, inst, view),
+			                           ConstantU32(state, 0)});
 			return pointer;
 		}
 		default: return 0;
@@ -1142,8 +1138,8 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 			    EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
 			const auto result = state.builder.AllocateId();
 			state.builder.AddFunction({opcode, state.uint_type, result, pointer,
-			                            ConstantU32(state, ScopeDevice),
-			                            ConstantU32(state, MemorySemanticsNone), value});
+			                           ConstantU32(state, ScopeDevice),
+			                           ConstantU32(state, MemorySemanticsNone), value});
 			EmitDeviceAtomicMemoryBarrier(state);
 			return result;
 		});
@@ -1158,8 +1154,8 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 			const auto pointer = EmitGdsElementPointer(state, index);
 			const auto result  = state.builder.AllocateId();
 			state.builder.AddFunction({opcode, state.uint_type, result, pointer,
-			                            ConstantU32(state, ScopeDevice),
-			                            ConstantU32(state, MemorySemanticsNone), value});
+			                           ConstantU32(state, ScopeDevice),
+			                           ConstantU32(state, MemorySemanticsNone), value});
 			EmitDeviceAtomicMemoryBarrier(state);
 			return result;
 		});
@@ -1177,7 +1173,7 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 	const auto old   = state.builder.AllocateId();
 	const auto scope = inst.memory.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 	state.builder.AddFunction({opcode, state.uint_type, old, pointer, ConstantU32(state, scope),
-	                            ConstantU32(state, MemorySemanticsNone), value});
+	                           ConstantU32(state, MemorySemanticsNone), value});
 	if (inst.memory.kind == IR::ResourceKind::StorageImageUint ||
 	    inst.memory.kind == IR::ResourceKind::Gds) {
 		EmitDeviceAtomicMemoryBarrier(state);
@@ -1199,8 +1195,8 @@ void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst) {
 	    {OpShiftRightLogical, state.uint_type, index, address, ConstantU32(state, 2)});
 	const auto object = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer, object,
-	                            state.address_memory_variable,
-	                            ConstantU32(state, binding.array_index)});
+	                           state.address_memory_variable,
+	                           ConstantU32(state, binding.array_index)});
 	const auto length    = state.builder.AllocateId();
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction({OpArrayLength, state.uint_type, length, object, 0});
@@ -1227,8 +1223,8 @@ void EmitLoadSrtDword(EmitterState& state, const IR::Instruction& inst) {
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer_uint, pointer,
-	                            state.flattened_srt_variable, ConstantU32(state, 0),
-	                            ConstantU32(state, inst.src[0].imm)});
+	                           state.flattened_srt_variable, ConstantU32(state, 0),
+	                           ConstantU32(state, inst.src[0].imm)});
 	state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
 	EmitStoreU32(state, inst.dst, value);
 }
@@ -1262,11 +1258,27 @@ void EmitBufferLoadSshort(EmitterState& state, const IR::Instruction& inst) {
 }
 
 void EmitBufferLoadDword(EmitterState& state, const IR::Instruction& inst) {
+	EmitGuardedByExec(
+	    state, [&]() { EmitStoreU32(state, inst.dst, EmitBufferLoadDwordValueU32(state, inst)); });
+}
+
+void EmitBufferLoadDwordGroup(EmitterState& state, const IR::Instruction* instructions,
+                              uint32_t count) {
+	if (instructions == nullptr || count == 0u) {
+		return;
+	}
+
 	EmitGuardedByExec(state, [&]() {
-		if (EmitFormattedBufferLoad(state, inst)) {
-			return;
+		// RDNA VMEM captures every VADDR component before making overlapping VDATA writes
+		// visible. Keep the split IR components instruction-atomic by deferring all stores.
+		std::vector<uint32_t> values;
+		values.reserve(count);
+		for (uint32_t i = 0; i < count; i++) {
+			values.push_back(EmitBufferLoadDwordValueU32(state, instructions[i]));
 		}
-		EmitMemoryLoadU32(state, inst, IR::ResourceKind::Buffer, 0, AddressSourceCount(inst, 0));
+		for (uint32_t i = 0; i < count; i++) {
+			EmitStoreU32(state, instructions[i].dst, values[i]);
+		}
 	});
 }
 
@@ -1385,7 +1397,7 @@ DsCounterAddress EmitAppendConsumeAddress(EmitterState& state, const IR::Instruc
 	state.builder.AddFunction(
 	    {OpShiftRightLogical, state.uint_type, index, address, ConstantU32(state, 2)});
 	state.builder.AddFunction({OpULessThan, state.bool_type, in_bounds,
-	                            ConstantU32(state, inst.memory.offset + 3u), size});
+	                           ConstantU32(state, inst.memory.offset + 3u), size});
 	return {index, size, in_bounds};
 }
 
@@ -1400,7 +1412,7 @@ uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index) {
 uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer_uint, pointer,
-	                            state.gds_variable, ConstantU32(state, 0), index});
+	                           state.gds_variable, ConstantU32(state, 0), index});
 	return pointer;
 }
 
@@ -1431,7 +1443,7 @@ ExecMaskInfo EmitExecMaskInfo(EmitterState& state) {
 	if (state.per_invocation_masks) {
 		const auto ballot = state.builder.AllocateId();
 		state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
-		                            ConstantU32(state, ScopeSubgroup), EmitExecActiveBool(state)});
+		                           ConstantU32(state, ScopeSubgroup), EmitExecActiveBool(state)});
 		exec_lo = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeExtract, state.uint_type, exec_lo, ballot, 0});
 		if (state.wave_size == 64u) {
@@ -1482,28 +1494,27 @@ void EmitDsAppendConsume(EmitterState& state, const IR::Instruction& inst, uint3
 	const auto do_atomic  = state.builder.AllocateId();
 	state.builder.AddFunction({OpIEqual, state.bool_type, first_lane, subid, exec.first_lane});
 	const auto first_active = EmitLogicalAndBool(state, first_lane, exec.any_active);
-	state.builder.AddFunction(
-	    {OpLogicalAnd, state.bool_type, do_atomic, first_active, in_bounds});
+	state.builder.AddFunction({OpLogicalAnd, state.bool_type, do_atomic, first_active, in_bounds});
 
 	const auto atomic_value = EmitValueOrZeroIfCondition(state, do_atomic, [&]() {
 		const auto pointer = gds ? EmitGdsElementPointer(state, address.index)
 		                         : EmitLdsElementPointer(state, address.index);
 		const auto result  = state.builder.AllocateId();
 		state.builder.AddFunction({atomic_opcode, state.uint_type, result, pointer,
-		                            ConstantU32(state, gds ? ScopeDevice : ScopeWorkgroup),
-		                            ConstantU32(state, MemorySemanticsNone), exec.active_count});
+		                           ConstantU32(state, gds ? ScopeDevice : ScopeWorkgroup),
+		                           ConstantU32(state, MemorySemanticsNone), exec.active_count});
 		if (gds) {
 			EmitDeviceAtomicMemoryBarrier(state);
 		} else {
 			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
 			state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, ScopeWorkgroup),
-			                            ConstantU32(state, semantics)});
+			                           ConstantU32(state, semantics)});
 		}
 		return result;
 	});
 	const auto broadcast    = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, broadcast,
-	                            ConstantU32(state, ScopeSubgroup), atomic_value, exec.first_lane});
+	                           ConstantU32(state, ScopeSubgroup), atomic_value, exec.first_lane});
 	const auto value = EmitSelectU32Value(state, exec.any_active, broadcast, ConstantU32(state, 0));
 	EmitStoreU32(state, inst.dst, value);
 }
@@ -1523,8 +1534,8 @@ void EmitDsFloatMinMaxF32(EmitterState& state, const IR::Instruction& inst, bool
 			const auto value_u32 = state.builder.AllocateId();
 			state.builder.AddFunction({OpBitcast, state.float_type, old_f32, old_u32});
 			state.builder.AddFunction({max_value ? OpFOrdGreaterThan : OpFOrdLessThan,
-			                            state.bool_type, store_src, max_value ? old_f32 : cmp_f32,
-			                            max_value ? cmp_f32 : old_f32});
+			                           state.bool_type, store_src, max_value ? old_f32 : cmp_f32,
+			                           max_value ? cmp_f32 : old_f32});
 			state.builder.AddFunction(
 			    {OpSelect, state.float_type, value_f32, store_src, data_f32, old_f32});
 			state.builder.AddFunction({OpBitcast, state.uint_type, value_u32, value_f32});
@@ -1575,14 +1586,13 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 	const auto xored  = state.builder.AllocateId();
 	const auto base   = state.builder.AllocateId();
 	const auto target = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, masked, lane, ConstantU32(state, control & 0x1fu)});
 	state.builder.AddFunction(
 	    {OpBitwiseOr, state.uint_type, ored, masked, ConstantU32(state, (control >> 5u) & 0x1fu)});
-	state.builder.AddFunction({OpBitwiseXor, state.uint_type, xored, ored,
-	                            ConstantU32(state, (control >> 10u) & 0x1fu)});
+	state.builder.AddFunction(
+	    {OpBitwiseXor, state.uint_type, xored, ored, ConstantU32(state, (control >> 10u) & 0x1fu)});
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, base, subid, ConstantU32(state, 0xffffffe0u)});
 	state.builder.AddFunction({OpBitwiseOr, state.uint_type, target, base, xored});
@@ -1596,7 +1606,7 @@ void EmitDsSwizzleB32(EmitterState& state, const IR::Instruction& inst) {
 	const auto target  = EmitDsSwizzleTargetLane(state, subid, control);
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, value,
-	                            ConstantU32(state, ScopeSubgroup), source, target});
+	                           ConstantU32(state, ScopeSubgroup), source, target});
 	const auto exec_active     = EmitLaneIndexActiveBool(state, target);
 	const auto subgroup_active = EmitSubgroupLaneActiveBool(state, target);
 	const auto source_active   = state.builder.AllocateId();

@@ -3,11 +3,11 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
-#include "graphics/shader/recompiler/ir/BindingLayout.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
+#include "graphics/shader/recompiler/ir/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
 
 #include <algorithm>
 #include <array>
@@ -312,117 +312,117 @@ struct EmitterState {
 	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_)
 	    : program(program_), resources(resources_) {}
 
-	Builder                                builder;
-	const IR::Program&                     program;
-	const IR::ResourceSnapshot&            resources;
-	const ShaderVertexInputInfo*           vertex_input_info            = nullptr;
-	const ShaderPixelInputInfo*            pixel_input_info             = nullptr;
-	const ShaderComputeInputInfo*          compute_input_info           = nullptr;
-	ShaderType                             stage                        = ShaderType::Unknown;
-	uint32_t                               wave_size                    = 64;
-	bool                                   exact_subgroup_operations    = false;
-	bool                                   per_invocation_masks         = false;
-	uint32_t                               void_type                    = 0;
-	uint32_t                               bool_type                    = 0;
-	uint32_t                               uint_type                    = 0;
-	uint32_t                               uint_pair_type               = 0;
-	uint32_t                               int_pair_type                = 0;
-	uint32_t                               int_type                     = 0;
-	uint32_t                               float_type                   = 0;
-	uint32_t                               vec2_uint_type               = 0;
-	uint32_t                               vec3_uint_type               = 0;
-	uint32_t                               vec4_uint_type               = 0;
-	uint32_t                               vec2_int_type                = 0;
-	uint32_t                               vec3_int_type                = 0;
-	uint32_t                               vec4_int_type                = 0;
-	uint32_t                               vec2_float_type              = 0;
-	uint32_t                               vec3_float_type              = 0;
-	uint32_t                               vec4_float_type              = 0;
-	uint32_t                               ptr_func_uint                = 0;
-	uint32_t                               ptr_input_float              = 0;
-	uint32_t                               ptr_input_bool               = 0;
-	uint32_t                               ptr_input_int                = 0;
-	uint32_t                               ptr_input_uint               = 0;
-	uint32_t                               ptr_input_vec2_float         = 0;
-	uint32_t                               ptr_input_vec3_float         = 0;
-	uint32_t                               ptr_input_vec2_int           = 0;
-	uint32_t                               ptr_input_vec3_int           = 0;
-	uint32_t                               ptr_input_vec4_int           = 0;
-	uint32_t                               ptr_input_vec2_uint          = 0;
-	uint32_t                               ptr_input_vec3_uint          = 0;
-	uint32_t                               ptr_input_vec4_uint          = 0;
-	uint32_t                               ptr_input_vec4_float         = 0;
-	uint32_t                               sample_mask_array_type       = 0;
-	uint32_t                               ptr_output_int               = 0;
-	uint32_t                               ptr_output_sample_mask_array = 0;
-	uint32_t                               ptr_output_float             = 0;
-	uint32_t                               ptr_output_vec4_float        = 0;
-	uint32_t                               per_vertex_type              = 0;
-	uint32_t                               ptr_output_per_vertex        = 0;
-	uint32_t                               storage_runtime_array_type   = 0;
-	uint32_t                               storage_buffer_type          = 0;
-	uint32_t                               ptr_storage_buffer           = 0;
-	uint32_t                               ptr_storage_buffer_uint      = 0;
-	uint32_t                               storage_buffer_array_type    = 0;
-	uint32_t                               ptr_storage_buffer_array     = 0;
-	uint32_t                               storage_buffer_variable      = 0;
+	Builder                                          builder;
+	const IR::Program&                               program;
+	const IR::ResourceSnapshot&                      resources;
+	const ShaderVertexInputInfo*                     vertex_input_info  = nullptr;
+	const ShaderPixelInputInfo*                      pixel_input_info   = nullptr;
+	const ShaderComputeInputInfo*                    compute_input_info = nullptr;
+	ShaderType                                       stage              = ShaderType::Unknown;
+	uint32_t                                         wave_size          = 64;
+	bool                                             exact_subgroup_operations    = false;
+	bool                                             per_invocation_masks         = false;
+	uint32_t                                         void_type                    = 0;
+	uint32_t                                         bool_type                    = 0;
+	uint32_t                                         uint_type                    = 0;
+	uint32_t                                         uint_pair_type               = 0;
+	uint32_t                                         int_pair_type                = 0;
+	uint32_t                                         int_type                     = 0;
+	uint32_t                                         float_type                   = 0;
+	uint32_t                                         vec2_uint_type               = 0;
+	uint32_t                                         vec3_uint_type               = 0;
+	uint32_t                                         vec4_uint_type               = 0;
+	uint32_t                                         vec2_int_type                = 0;
+	uint32_t                                         vec3_int_type                = 0;
+	uint32_t                                         vec4_int_type                = 0;
+	uint32_t                                         vec2_float_type              = 0;
+	uint32_t                                         vec3_float_type              = 0;
+	uint32_t                                         vec4_float_type              = 0;
+	uint32_t                                         ptr_func_uint                = 0;
+	uint32_t                                         ptr_input_float              = 0;
+	uint32_t                                         ptr_input_bool               = 0;
+	uint32_t                                         ptr_input_int                = 0;
+	uint32_t                                         ptr_input_uint               = 0;
+	uint32_t                                         ptr_input_vec2_float         = 0;
+	uint32_t                                         ptr_input_vec3_float         = 0;
+	uint32_t                                         ptr_input_vec2_int           = 0;
+	uint32_t                                         ptr_input_vec3_int           = 0;
+	uint32_t                                         ptr_input_vec4_int           = 0;
+	uint32_t                                         ptr_input_vec2_uint          = 0;
+	uint32_t                                         ptr_input_vec3_uint          = 0;
+	uint32_t                                         ptr_input_vec4_uint          = 0;
+	uint32_t                                         ptr_input_vec4_float         = 0;
+	uint32_t                                         sample_mask_array_type       = 0;
+	uint32_t                                         ptr_output_int               = 0;
+	uint32_t                                         ptr_output_sample_mask_array = 0;
+	uint32_t                                         ptr_output_float             = 0;
+	uint32_t                                         ptr_output_vec4_float        = 0;
+	uint32_t                                         per_vertex_type              = 0;
+	uint32_t                                         ptr_output_per_vertex        = 0;
+	uint32_t                                         storage_runtime_array_type   = 0;
+	uint32_t                                         storage_buffer_type          = 0;
+	uint32_t                                         ptr_storage_buffer           = 0;
+	uint32_t                                         ptr_storage_buffer_uint      = 0;
+	uint32_t                                         storage_buffer_array_type    = 0;
+	uint32_t                                         ptr_storage_buffer_array     = 0;
+	uint32_t                                         storage_buffer_variable      = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> storage_buffer_offsets {};
-	uint32_t                               address_memory_array_type    = 0;
-	uint32_t                               ptr_address_memory_array     = 0;
-	uint32_t                               address_memory_variable      = 0;
-	uint32_t                               gds_variable                 = 0;
-	uint32_t                               push_constant_array_type     = 0;
-	uint32_t                               push_constant_block_type     = 0;
-	uint32_t                               ptr_push_constant_block      = 0;
-	uint32_t                               ptr_push_constant_uint       = 0;
-	uint32_t                               push_constant_variable       = 0;
-	uint32_t                               vsharp_storage_variable      = 0;
-	uint32_t                               flattened_srt_variable       = 0;
-	uint32_t                               lds_array_type               = 0;
-	uint32_t                               ptr_workgroup_array          = 0;
-	uint32_t                               ptr_workgroup_uint           = 0;
-	uint32_t                               lds_variable                 = 0;
-	std::array<SampledImageDescriptors, 10> sampled_images;
-	std::array<StorageImageDescriptors, 10> storage_images;
-	uint32_t                               sampler_type                                  = 0;
-	uint32_t                               sampler_array_type                            = 0;
-	uint32_t                               ptr_uniform_sampler                           = 0;
-	uint32_t                               ptr_uniform_sampler_array                     = 0;
-	uint32_t                               sampler_variable                              = 0;
-	uint32_t                               ptr_image_uint                                = 0;
-	uint32_t                               func_type                                     = 0;
-	uint32_t                               main_func                                     = 0;
-	uint32_t                               entry_label                                   = 0;
-	uint32_t                               pixel_valid_mask_variable                     = 0;
-	bool                                   dispatcher_fallback                           = false;
-	uint32_t                               dispatch_pc_variable                          = 0;
-	uint32_t                               dispatch_header_label                         = 0;
-	uint32_t                               dispatch_select_label                         = 0;
-	uint32_t                               dispatch_default_label                        = 0;
-	uint32_t                               dispatch_after_switch_label                   = 0;
-	uint32_t                               dispatch_continue_label                       = 0;
-	uint32_t                               dispatch_merge_label                          = 0;
-	uint32_t                               glsl_std450                                   = 0;
-	uint32_t                               subgroup_local_invocation_id_variable         = 0;
-	uint32_t                               per_vertex_variable                           = 0;
-	uint32_t                               depth_variable                                = 0;
-	uint32_t                               sample_mask_variable                          = 0;
-	bool                                   needs_subgroup_ballot                         = false;
-	bool                                   needs_subgroup_shuffle                        = false;
-	bool                                   needs_subgroup_local_invocation_id            = false;
-	bool                                   needs_compute_derivatives                     = false;
-	bool                                   needs_image_gather_extended                   = false;
-	bool                                   needs_function_lds                            = false;
-	bool                                   needs_pixel_valid_mask                        = false;
-	std::vector<RegisterBinding>           registers;
-	std::vector<InputBinding>              inputs;
-	std::vector<OutputBinding>             outputs;
-	std::vector<uint32_t>                  interface_variables;
-	std::vector<bool>                      reachable_blocks;
-	std::map<uint32_t, uint32_t>           block_labels;
-	std::map<uint32_t, uint32_t>           constants;
-	std::map<uint32_t, uint32_t>           signed_constants;
-	std::map<uint32_t, uint32_t>           float_constants;
+	uint32_t                                         address_memory_array_type = 0;
+	uint32_t                                         ptr_address_memory_array  = 0;
+	uint32_t                                         address_memory_variable   = 0;
+	uint32_t                                         gds_variable              = 0;
+	uint32_t                                         push_constant_array_type  = 0;
+	uint32_t                                         push_constant_block_type  = 0;
+	uint32_t                                         ptr_push_constant_block   = 0;
+	uint32_t                                         ptr_push_constant_uint    = 0;
+	uint32_t                                         push_constant_variable    = 0;
+	uint32_t                                         vsharp_storage_variable   = 0;
+	uint32_t                                         flattened_srt_variable    = 0;
+	uint32_t                                         lds_array_type            = 0;
+	uint32_t                                         ptr_workgroup_array       = 0;
+	uint32_t                                         ptr_workgroup_uint        = 0;
+	uint32_t                                         lds_variable              = 0;
+	std::array<SampledImageDescriptors, 10>          sampled_images;
+	std::array<StorageImageDescriptors, 10>          storage_images;
+	uint32_t                                         sampler_type                          = 0;
+	uint32_t                                         sampler_array_type                    = 0;
+	uint32_t                                         ptr_uniform_sampler                   = 0;
+	uint32_t                                         ptr_uniform_sampler_array             = 0;
+	uint32_t                                         sampler_variable                      = 0;
+	uint32_t                                         ptr_image_uint                        = 0;
+	uint32_t                                         func_type                             = 0;
+	uint32_t                                         main_func                             = 0;
+	uint32_t                                         entry_label                           = 0;
+	uint32_t                                         pixel_valid_mask_variable             = 0;
+	bool                                             dispatcher_fallback                   = false;
+	uint32_t                                         dispatch_pc_variable                  = 0;
+	uint32_t                                         dispatch_header_label                 = 0;
+	uint32_t                                         dispatch_select_label                 = 0;
+	uint32_t                                         dispatch_default_label                = 0;
+	uint32_t                                         dispatch_after_switch_label           = 0;
+	uint32_t                                         dispatch_continue_label               = 0;
+	uint32_t                                         dispatch_merge_label                  = 0;
+	uint32_t                                         glsl_std450                           = 0;
+	uint32_t                                         subgroup_local_invocation_id_variable = 0;
+	uint32_t                                         per_vertex_variable                   = 0;
+	uint32_t                                         depth_variable                        = 0;
+	uint32_t                                         sample_mask_variable                  = 0;
+	bool                                             needs_subgroup_ballot                 = false;
+	bool                                             needs_subgroup_shuffle                = false;
+	bool                                             needs_subgroup_local_invocation_id    = false;
+	bool                                             needs_compute_derivatives             = false;
+	bool                                             needs_image_gather_extended           = false;
+	bool                                             needs_function_lds                    = false;
+	bool                                             needs_pixel_valid_mask                = false;
+	std::vector<RegisterBinding>                     registers;
+	std::vector<InputBinding>                        inputs;
+	std::vector<OutputBinding>                       outputs;
+	std::vector<uint32_t>                            interface_variables;
+	std::vector<bool>                                reachable_blocks;
+	std::map<uint32_t, uint32_t>                     block_labels;
+	std::map<uint32_t, uint32_t>                     constants;
+	std::map<uint32_t, uint32_t>                     signed_constants;
+	std::map<uint32_t, uint32_t>                     float_constants;
 };
 
 constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
@@ -990,11 +990,6 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 uint32_t UnpackTBufferFormat(EmitterState& state, const IR::Instruction& inst,
                              const Format::BufferFormatInfo& info);
 
-bool EmitTypedTBufferLoad(EmitterState& state, const IR::Instruction& inst,
-                          const Format::BufferFormatInfo& info);
-
-bool EmitFormattedBufferLoad(EmitterState& state, const IR::Instruction& inst);
-
 uint32_t FormattedBufferDwordStoreComponentCount(Prospero::BufferFormat format,
                                                  uint32_t               opcode_components);
 
@@ -1019,6 +1014,9 @@ void EmitBufferLoadUshort(EmitterState& state, const IR::Instruction& inst);
 void EmitBufferLoadSshort(EmitterState& state, const IR::Instruction& inst);
 
 void EmitBufferLoadDword(EmitterState& state, const IR::Instruction& inst);
+
+void EmitBufferLoadDwordGroup(EmitterState& state, const IR::Instruction* instructions,
+                              uint32_t count);
 
 void EmitBufferStoreDword(EmitterState& state, const IR::Instruction& inst);
 

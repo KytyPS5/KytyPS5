@@ -12129,6 +12129,84 @@ TestCase BufferLoadVariants() {
            O::BufferLoadDwordx4, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase BufferLoadDwordx4SnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  code.push_back(EncodeMubuf0(0x0eu, 0, true, true));
+  code.push_back(EncodeMubuf1(21, 0, 21));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 21 + i, 4 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadDwordx4SnapshotsOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                  0,           0,           0,           0};
+  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                   0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.opcodes = {O::VMovB32, O::BufferLoadDwordx4, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(16, 2);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferLoadDwordx2SnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  code.push_back(EncodeMubuf0(0x0du, 0, true, true));
+  code.push_back(EncodeMubuf1(21, 0, 21));
+  for (u32 i = 0; i < 2; i++) {
+    AppendStoreVgpr(&code, 21 + i, 2 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadDwordx2SnapshotsOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0, 0};
+  test.expected = {0x11111111u, 0x22222222u, 0x11111111u, 0x22222222u};
+  test.opcodes = {O::VMovB32, O::BufferLoadDwordx2, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(8, 2);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  code.push_back(EncodeMubuf0(0x0fu, 0, true, true));
+  code.push_back(EncodeMubuf1(21, 0, 21));
+  for (u32 i = 0; i < 3; i++) {
+    AppendStoreVgpr(&code, 21 + i, 3 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadDwordx3SnapshotsOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0, 0, 0};
+  test.expected = {0x11111111u, 0x22222222u, 0x33333333u,
+                   0x11111111u, 0x22222222u, 0x33333333u};
+  test.opcodes = {O::VMovB32, O::BufferLoadDwordx3, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(12, 2);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferStoreVariants() {
   using O = ShaderOpcode;
 
@@ -12195,6 +12273,69 @@ TestCase BufferFormatVariants() {
                   O::BufferStoreDword,
                   O::SEndpgm};
   return load;
+}
+
+TestCase BufferLoadFormatXyzwSnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  code.push_back(EncodeMubuf0(0x03u, 0, true, true));
+  code.push_back(EncodeMubuf1(21, 0, 21));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 21 + i, 4 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXyzwSnapshotsOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+                  0,           0,           0,           0};
+  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+                   0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.opcodes = {O::VMovB32, O::BufferLoadFormatXyzw, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(
+      16, 2, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 21, 0x11111111u);
+  AppendVMovLiteral(&code, 22, 0x22222222u);
+  AppendVMovLiteral(&code, 23, 0x33333333u);
+  AppendVMovLiteral(&code, 24, 0x44444444u);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.push_back(EncodeMubuf0(0x03u, 0, true, true));
+  code.push_back(EncodeMubuf1(21, 0, 21));
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 21 + i, 4 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd,
+                  0,          0,          0,          0};
+  test.expected = {0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu, 0xddddddddu,
+                   0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.opcodes = {O::VMovB32, O::SMovB64, O::BufferLoadFormatXyzw,
+                  O::SMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(
+      16, 2, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  return test;
 }
 
 TestCase BufferFormatStoreVariants() {
@@ -12503,6 +12644,63 @@ TestCase TBufferLoadVariants() {
           {O::TBufferLoadFormatX, O::TBufferLoadFormatXy,
            O::TBufferLoadFormatXyz, O::TBufferLoadFormatXyzw, O::VMovB32,
            O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase TBufferLoadFormatXyzwSnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  constexpr auto format =
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float);
+  code.push_back(
+      EncodeMtbuf0(0x03u, format & 0xfu, (format >> 4u) & 0x7u, 0, true, true));
+  code.push_back(EncodeMtbuf1(0x03u, 21, 0, 21));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 21 + i, 4 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "TBufferLoadFormatXyzwSnapshotsOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+                  0,           0,           0,           0};
+  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+                   0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.opcodes = {O::VMovB32, O::TBufferLoadFormatXyzw,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(16, 2);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  constexpr auto format = BufferFormat(Prospero::BufferFormat::k8_8_8_8UInt);
+  code.push_back(
+      EncodeMtbuf0(0x03u, format & 0xfu, (format >> 4u) & 0x7u, 0, true, true));
+  code.push_back(EncodeMtbuf1(0x03u, 21, 0, 21));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 21 + i, 4 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress";
+  test.code = std::move(code);
+  test.initial = {0x44332211u, 0, 0, 0, 0, 0, 0, 0};
+  test.expected = {0x44332211u, 0, 0, 0, 0x11u, 0x22u, 0x33u, 0x44u};
+  test.opcodes = {O::VMovB32, O::TBufferLoadFormatXyzw,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(4, 8);
+  test.has_user_data = true;
+  return test;
 }
 
 TestCase TBufferStoreFormatX8UintWritesOneByte() {
@@ -14839,8 +15037,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(BufferLoadVariants);
+  AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
+  AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
+  AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferStoreVariants);
   AddCase(BufferFormatVariants);
+  AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
+  AddCase(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress);
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
@@ -14854,6 +15057,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXAddTidUsesLaneIndex);
   AddCase(BufferStoreFormatXDropsOutOfRangeRecord);
   AddCase(TBufferLoadVariants);
+  AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
+  AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);
   AddCase(TBufferLoadFormatX8888UintExtractsFirstByte);
   AddCase(TBufferLoadFormatXIdxenUsesDescriptorStride);

@@ -1025,15 +1025,47 @@ void EmitDispatcherSwitch(EmitterState& state, const IR::Program& program) {
 	EmitDispatcherExit(state);
 }
 
+size_t BufferLoadGroupSize(const IR::BasicBlock& block, size_t first_index) {
+	const auto& first = block.instructions[first_index];
+	if (first.op != IR::Opcode::BufferLoadDword || first.memory.component_index != 0u ||
+	    first.memory.component_count <= 1u) {
+		return 1u;
+	}
+
+	size_t count = 1u;
+	while (first_index + count < block.instructions.size() &&
+	       count < first.memory.component_count) {
+		const auto& next = block.instructions[first_index + count];
+		if (next.op != IR::Opcode::BufferLoadDword || next.pc != first.pc ||
+		    next.memory.component_index != count ||
+		    next.memory.component_count != first.memory.component_count) {
+			break;
+		}
+		count++;
+	}
+	return count;
+}
+
+void EmitBlockInstructions(EmitterState& state, const IR::BasicBlock& block) {
+	for (size_t i = 0; i < block.instructions.size();) {
+		const auto count = BufferLoadGroupSize(block, i);
+		if (count > 1u) {
+			EmitBufferLoadDwordGroup(state, block.instructions.data() + i,
+			                         static_cast<uint32_t>(count));
+		} else {
+			EmitInstruction(state, block.instructions[i]);
+		}
+		i += count;
+	}
+}
+
 void EmitDispatcherBlocks(EmitterState& state, const IR::Program& program) {
 	for (const auto& block: program.blocks) {
 		if (block.id >= state.reachable_blocks.size() || !state.reachable_blocks[block.id]) {
 			continue;
 		}
 		state.builder.AddFunction({OpLabel, BlockLabel(state, block.id)});
-		for (const auto& inst: block.instructions) {
-			EmitInstruction(state, inst);
-		}
+		EmitBlockInstructions(state, block);
 		EmitDispatcherTerminator(state, block.terminator);
 	}
 }
@@ -1083,9 +1115,7 @@ void EmitFunction(EmitterState& state, const IR::Program& program) {
 			continue;
 		}
 		state.builder.AddFunction({OpLabel, BlockLabel(state, block.id)});
-		for (const auto& inst: block.instructions) {
-			EmitInstruction(state, inst);
-		}
+		EmitBlockInstructions(state, block);
 		EmitTerminator(state, block.terminator);
 	}
 

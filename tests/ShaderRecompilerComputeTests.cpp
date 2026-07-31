@@ -4733,6 +4733,45 @@ public:
 			        "storage descriptor did not preserve its sRGB backing and "
 			        "select an UNORM Vulkan view");
 
+			ShaderTextureResource sint_storage {{0x01514b00u, 0xc1500000u, 0x000bc00bu,
+			                                     0x91b00204u, 0x00000000u, 0x00700000u,
+			                                     0x102b0000u, 0x0001514au}};
+			Require(name, "PPSA06888 R32 SINT descriptor",
+			        sint_storage.Base40() == 0x1514b0000ull && sint_storage.Width5() + 1u == 48 &&
+			            sint_storage.Height5() + 1u == 48 && sint_storage.Depth() + 1u == 1 &&
+			            sint_storage.Format() ==
+			                Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
+			            sint_storage.Type() ==
+			                Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+			            sint_storage.TileMode() ==
+			                Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+			            sint_storage.DstSelXYZW() == DstSel(4, 0, 0, 1),
+			        "captured write-only signed storage descriptor was decoded incorrectly");
+			const uint64_t mapped_sint_address = base + 0xe0000;
+			const auto     encoded_sint_address = mapped_sint_address >> 8u;
+			sint_storage.fields[0] = static_cast<uint32_t>(encoded_sint_address);
+			sint_storage.fields[1] =
+			    (sint_storage.fields[1] & ~0xffu) |
+			    static_cast<uint32_t>(encoded_sint_address >> 32u);
+			ShaderRecompiler::IR::DescriptorValue sint_storage_descriptor {};
+			std::copy(std::begin(sint_storage.fields), std::end(sint_storage.fields),
+			          sint_storage_descriptor.dwords.begin());
+			sint_storage_descriptor.dword_count = 8;
+			auto sint_storage_resource           = srgb_storage_resource;
+			sint_storage_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+			const auto sint_storage_binding      = RenderExecutorTestAccess::ResolveTexture(
+			    executor, sint_storage_resource, sint_storage_descriptor);
+			const auto sint_storage_view =
+			    texture_cache.FindTexture(sint_storage_binding.image_id, sint_storage_binding.desc);
+			Require(name, "PPSA06888 raw R32 SINT storage view",
+			        sint_storage_view != nullptr &&
+			            sint_storage_binding.desc.info.data.size == 0x10000 &&
+			            sint_storage_binding.desc.info.pixel_format == vk::Format::eR32Sint &&
+			            sint_storage_binding.desc.view_info.format == vk::Format::eR32Uint &&
+			            texture_cache.GetImage(sint_storage_binding.image_id).backing.format ==
+			                vk::Format::eR32Sint,
+			        "write-only R32 SINT storage did not select a bit-compatible uint view");
+
 			auto               narrowed_storage         = storage;
 			constexpr uint64_t narrowed_storage_address = base + 0xd0000;
 			const auto         encoded_narrowed_address = narrowed_storage_address >> 8u;
@@ -13604,6 +13643,33 @@ TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
 	return test;
 }
 
+TestCase ImageStoreR32SintUsesRawUintView() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 20, 2);
+	AppendVMovU32(&code, 21, 1);
+	AppendVMovU32(&code, 22, 0);
+	AppendVMovLiteral(&code, 0, 0x80000001u);
+	code.push_back(EncodeMimg0(0x08, 0x1));
+	code.push_back(EncodeMimg1(0, 20));
+	AppendEnd(&code);
+
+	std::vector<u32> expected_image(16, 0);
+	expected_image[1 * 4 + 2] = 0x80000001u;
+
+	TestCase test;
+	test.name                         = "ImageStoreR32SintUsesRawUintView";
+	test.code                         = code;
+	test.opcodes                      = {O::VMovB32, O::ImageStore, O::SEndpgm};
+	test.user_data                    = MakeStorageTextureData(Prospero::BufferFormat::k32SInt);
+	test.has_user_data                = true;
+	test.storage_image_r32ui          = std::vector<u32>(16, 0);
+	test.expected_storage_image_r32ui = expected_image;
+	test.required_spirv               = {"storage_uint_2d"};
+	return test;
+}
+
 TestCase ImageStoreR32UintUsesUintStorageImage() {
 	using O = ShaderOpcode;
 
@@ -14181,6 +14247,7 @@ std::vector<TestCase> MakeCases() {
 	AddCase(ImageStoreBgraUsesInverseSwizzle);
 	AddCase(ImageStoreYzwxUsesInverseSwizzle);
 	AddCase(ImageStoreR32FloatUsesFormatlessStorageImage);
+	AddCase(ImageStoreR32SintUsesRawUintView);
 	AddCase(ImageStoreR32UintUsesUintStorageImage);
 	AddCase(ComputeTgSizeSgprUsesWaveMetadata);
 	AddCase(ImageAtomicVariants);
@@ -15114,7 +15181,7 @@ void CheckSampledDepthDescriptor(RenderContext& renderer) {
 	auto&            context = renderer.GetGraphics();
 	CommandScheduler scheduler(renderer, context);
 	const auto make_info = [](uint32_t width, uint32_t height, uint32_t pitch, uint32_t layers,
-	                          vk::Format format, Prospero::ImageType type) {
+	                          vk::Format format, Prospero::ImageType type, uint32_t samples = 1) {
 		ImageInfo info {};
 		info.pixel_format    = format;
 		info.guest_format    = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
@@ -15123,7 +15190,7 @@ void CheckSampledDepthDescriptor(RenderContext& renderer) {
 		info.resources       = {1, layers};
 		info.pitch           = pitch;
 		info.bytes_per_block = 4;
-		info.samples         = 1;
+		info.samples         = samples;
 		info.tile_mode       = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
 		info.mip_layout[0] = {0, static_cast<uint64_t>(pitch) * height * layers * 4, pitch, height};
 		return info;
@@ -15140,6 +15207,20 @@ void CheckSampledDepthDescriptor(RenderContext& renderer) {
 	            descriptor.Height5() + 1u == image.info.extent.height &&
 	            IsSupportedDepthTargetDescriptor(descriptor, image),
 	        "normalized depth image rejected a valid padded descriptor");
+
+	const ShaderTextureResource uncompressed_msaa {{
+	    0x00705d00u, 0xc1600000u, 0x010dc1dfu, 0xe1810924u,
+	    0x00000000u, 0x00700010u, 0x00000000u, 0x00000000u,
+	}};
+	auto msaa_info =
+	    make_info(1920, 1080, 1920, 1, vk::Format::eD32Sfloat, Prospero::ImageType::kColor2D, 2);
+	msaa_info.mip_layout[0] = {0, 0x010e0000, 1920, 1152};
+	Image msaa_image(context, scheduler, msaa_info);
+	msaa_image.usage.depth_target = true;
+	Require("SampledDepthDescriptor", "uncompressed 2x MSAA depth",
+	        IsSupportedDepthTargetDescriptor(uncompressed_msaa, msaa_image) &&
+	            IsSupportedDepthTextureEncoding(uncompressed_msaa, msaa_image),
+	        "valid uncompressed MSAA depth descriptor required an HTILE compatibility flag");
 
 	descriptor.fields[3] = (descriptor.fields[3] & ~(0xfu << 28u)) |
 	                       (Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u);

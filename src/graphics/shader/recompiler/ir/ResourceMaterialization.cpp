@@ -220,8 +220,12 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
-			const auto uint_descriptor =
-			    Prospero::IsUintTextureFormat((descriptor.dwords[1] >> 20u) & 0x1ffu);
+			const auto format = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+			const bool raw_sint_storage =
+			    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
+			    !image.read && !image.atomic;
+			const bool uint_descriptor =
+			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
 			const auto uint_program = image.kind == ResourceKind::ImageUint ||
 			                          image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
@@ -408,7 +412,14 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		    image.kind == ResourceKind::StorageImageUint) {
 			image.storage_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		if (Prospero::IsUintTextureFormat((descriptor.dwords[1] >> 20u) & 0x1ffu)) {
+		const auto format  = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+		const bool storage = image.kind == ResourceKind::StorageImage ||
+		                     image.kind == ResourceKind::StorageImageUint;
+		const bool raw_sint_storage =
+		    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
+		    !image.read && !image.atomic;
+		const bool uint_image = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+		if (uint_image) {
 			switch (image.kind) {
 				case ResourceKind::Image: image.kind = ResourceKind::ImageUint; break;
 				case ResourceKind::StorageImage: image.kind = ResourceKind::StorageImageUint; break;

@@ -270,7 +270,7 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	        supported_msaa_array) &&
 	       levels_ok && descriptor.MinLod() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
-	       descriptor.BCSwizzle() == 0 && descriptor.MsaaDepth() == multisampled &&
+	       descriptor.BCSwizzle() == 0 && (!descriptor.MsaaDepth() || multisampled) &&
 	       pitch >= width && pitch == image.info.pitch;
 }
 
@@ -424,10 +424,14 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(descriptor);
 	const bool uint_resource =
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+	const bool raw_sint_storage =
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) && uint_resource &&
+	    resource.written && !resource.read && !resource.atomic;
 	const bool format_ok =
-	    Prospero::IsSupportedTextureFormat(format) &&
-	    uint_resource == Prospero::IsUintTextureFormat(format) &&
-	    (!resource.atomic || format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt));
+	    raw_sint_storage ||
+	    (Prospero::IsSupportedTextureFormat(format) &&
+	     uint_resource == Prospero::IsUintTextureFormat(format) &&
+	     (!resource.atomic || format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt)));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -614,14 +618,14 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
 	const auto tile         = descriptor.TileMode();
+	const bool depth_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
 	const bool msaa_tile =
-	    tile == Prospero::GpuEnumValue(descriptor.MsaaDepth() ? Prospero::TileMode::kDepth
-	                                                          : Prospero::TileMode::kRenderTarget);
+	    depth_tile || tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
 	if ((!multisampled && (base_level > last_level || last_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
-	      descriptor.MaxMip() != last_level || !msaa_tile ||
+	      descriptor.MaxMip() != last_level || !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "kind=%u dimension=%u mip_mode=%u read=%d written=%d "
@@ -657,7 +661,8 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	TileSizeAlign size {};
 	if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
-		pitch            = TileGetRenderTargetPitch(width, bytes, last_level);
+		pitch = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
+		                   : TileGetRenderTargetPitch(width, bytes, last_level);
 		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
 		    size.size > UINT32_MAX / image_layers) {
 			EXIT("unsupported multisample texture layout\n");
@@ -674,8 +679,11 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto              pixel_format        = TextureGetFormat(format);
-	const auto              storage_view_format = SrgbStorageViewFormat(pixel_format);
+	const auto              pixel_format = TextureGetFormat(format);
+	const auto              storage_view_format =
+	    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt)
+	        ? vk::Format::eR32Uint
+	        : SrgbStorageViewFormat(pixel_format);
 	const auto              view_format = storage && storage_view_format != vk::Format::eUndefined
 	                                          ? storage_view_format
 	                                          : pixel_format;

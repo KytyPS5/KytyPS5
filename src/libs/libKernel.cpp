@@ -40,7 +40,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#elif !defined(__APPLE__)
+#elif defined(__APPLE__)
+#include <csignal>
+#include <sys/ucontext.h>
+#else
 #include <csignal>
 #include <ucontext.h>
 #endif
@@ -837,7 +840,7 @@ static void ApplySignalUcontext(CONTEXT* dst_ctx, const SignalUcontext& src_ctx)
 }
 #endif
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__) && defined(__x86_64__)
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && defined(__x86_64__)
 
 static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	SignalUcontext ctx = {};
@@ -845,6 +848,34 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 		return ctx;
 	}
 
+#if defined(__APPLE__)
+	const auto& ss = host_ctx->uc_mcontext->__ss;
+
+	ctx.uc_mcontext.mc_rdi    = ss.__rdi;
+	ctx.uc_mcontext.mc_rsi    = ss.__rsi;
+	ctx.uc_mcontext.mc_rdx    = ss.__rdx;
+	ctx.uc_mcontext.mc_rcx    = ss.__rcx;
+	ctx.uc_mcontext.mc_r8     = ss.__r8;
+	ctx.uc_mcontext.mc_r9     = ss.__r9;
+	ctx.uc_mcontext.mc_rax    = ss.__rax;
+	ctx.uc_mcontext.mc_rbx    = ss.__rbx;
+	ctx.uc_mcontext.mc_rbp    = ss.__rbp;
+	ctx.uc_mcontext.mc_r10    = ss.__r10;
+	ctx.uc_mcontext.mc_r11    = ss.__r11;
+	ctx.uc_mcontext.mc_r12    = ss.__r12;
+	ctx.uc_mcontext.mc_r13    = ss.__r13;
+	ctx.uc_mcontext.mc_r14    = ss.__r14;
+	ctx.uc_mcontext.mc_r15    = ss.__r15;
+	ctx.uc_mcontext.mc_rip    = ss.__rip;
+	ctx.uc_mcontext.mc_rsp    = ss.__rsp;
+	ctx.uc_mcontext.mc_rflags = ss.__rflags;
+	ctx.uc_mcontext.mc_cs     = ss.__cs & 0xffffu;
+	ctx.uc_mcontext.mc_gs     = static_cast<uint16_t>(ss.__gs & 0xffffu);
+	ctx.uc_mcontext.mc_fs     = static_cast<uint16_t>(ss.__fs & 0xffffu);
+	ctx.uc_mcontext.mc_len    = sizeof(SignalMcontext);
+
+	return ctx;
+#else
 	const auto* gregs = host_ctx->uc_mcontext.gregs;
 
 	ctx.uc_mcontext.mc_rdi    = static_cast<uint64_t>(gregs[REG_RDI]);
@@ -874,6 +905,7 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	ctx.uc_mcontext.mc_len = sizeof(SignalMcontext);
 
 	return ctx;
+#endif
 }
 
 static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext& src_ctx) {
@@ -881,6 +913,29 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 		return;
 	}
 
+#if defined(__APPLE__)
+	auto& ss = dst_ctx->uc_mcontext->__ss;
+
+	ss.__rdi    = src_ctx.uc_mcontext.mc_rdi;
+	ss.__rsi    = src_ctx.uc_mcontext.mc_rsi;
+	ss.__rdx    = src_ctx.uc_mcontext.mc_rdx;
+	ss.__rcx    = src_ctx.uc_mcontext.mc_rcx;
+	ss.__r8     = src_ctx.uc_mcontext.mc_r8;
+	ss.__r9     = src_ctx.uc_mcontext.mc_r9;
+	ss.__rax    = src_ctx.uc_mcontext.mc_rax;
+	ss.__rbx    = src_ctx.uc_mcontext.mc_rbx;
+	ss.__rbp    = src_ctx.uc_mcontext.mc_rbp;
+	ss.__r10    = src_ctx.uc_mcontext.mc_r10;
+	ss.__r11    = src_ctx.uc_mcontext.mc_r11;
+	ss.__r12    = src_ctx.uc_mcontext.mc_r12;
+	ss.__r13    = src_ctx.uc_mcontext.mc_r13;
+	ss.__r14    = src_ctx.uc_mcontext.mc_r14;
+	ss.__r15    = src_ctx.uc_mcontext.mc_r15;
+	ss.__rip    = src_ctx.uc_mcontext.mc_rip;
+	ss.__rsp    = src_ctx.uc_mcontext.mc_rsp;
+	ss.__rflags = src_ctx.uc_mcontext.mc_rflags;
+	// Segment selectors are left untouched; XNU validates them on sigreturn.
+#else
 	auto* gregs = dst_ctx->uc_mcontext.gregs;
 
 	gregs[REG_RDI] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rdi);
@@ -903,10 +958,17 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 	gregs[REG_EFL] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rflags);
 
 	// The kernel validates packed segment selectors on sigreturn.
+#endif
 }
 
 static int SignalDispatchHostSignal() {
+#if defined(__APPLE__)
+	// macOS has no realtime signals; SIGUSR1 is otherwise unused on the host side (the
+	// guest's SIGUSR1 is an emulated signal number, not a host registration).
+	static const int host_signal = SIGUSR1;
+#else
 	static const int host_signal = SIGRTMIN + 3;
+#endif
 	return host_signal;
 }
 
@@ -1174,7 +1236,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		}
 		CloseHandle(target_thread);
 		return OK;
-#elif !defined(__APPLE__) && defined(__x86_64__)
+#elif defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
 			SignalDispatchScope scope;

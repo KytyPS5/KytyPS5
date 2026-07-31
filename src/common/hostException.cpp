@@ -324,6 +324,10 @@ bool InstallHandler(Handler handler) {
 	sa.sa_sigaction = SignalHandler;
 	sa.sa_flags     = SA_SIGINFO;
 	sigemptyset(&sa.sa_mask);
+	// The guest signal-dispatch path (KernelRaiseException) interrupts threads with
+	// SIGUSR1; block it while a fault is being resolved so a stop-the-world request
+	// cannot preempt the handler between the protection fix and the retry.
+	sigaddset(&sa.sa_mask, SIGUSR1);
 
 	// macOS raises SIGBUS for protection faults on some paths and SIGSEGV on others;
 	// SIGILL covers instructions the host cannot execute (routed to the x64 emulator).

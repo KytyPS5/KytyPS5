@@ -10752,6 +10752,62 @@ TestCase VectorWritelaneIgnoresExecMask() {
   return test;
 }
 
+TestCase VectorReadlaneFromInactiveWrittenLane() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 4, 0x12345678u);
+  AppendVop3(&code, 0x361, 2, 4, InlineU32(4));
+  AppendSMovLiteral(&code, 4, 0xdeadbeefu);
+  AppendVop3(&code, 0x360, 5, Vgpr(2), InlineU32(4));
+  AppendStoreSgpr(&code, 5, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneInactiveWrittenLane";
+  test.code = code;
+  test.expected = {0x12345678u};
+  test.opcodes = {O::SMovB32, O::VWritelaneB32, O::VReadlaneB32,
+                  O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorLaneWave32RuntimeSelectorWraps() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSop2(0x00, 5, 4, InlineU32(33)));
+  AppendSMovLiteral(&code, 6, 0x12345678u);
+  AppendVMovU32(&code, 2, 0);
+  AppendVop3(&code, 0x361, 2, 6, 5);
+  AppendVop3(&code, 0x360, 7, Vgpr(2), InlineU32(1));
+  AppendStoreSgpr(&code, 7, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorLaneWave32RuntimeSelectorWraps";
+  test.code = code;
+  test.expected = {0x12345678u};
+  test.opcodes = {O::SAddU32, O::SMovB32, O::VWritelaneB32, O::VReadlaneB32,
+                  O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorPermlanex16() {
   using O = ShaderOpcode;
 
@@ -15040,6 +15096,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorWritelaneIgnoresExecMask);
+  AddCase(VectorReadlaneFromInactiveWrittenLane);
+  AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);

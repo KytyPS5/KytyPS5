@@ -2,15 +2,16 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
+#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/ScalarProvenance.h"
-#include "graphics/shader/recompiler/cfg/ShaderCFG.h"
-#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
-#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/SrtPatcher.h"
 #include "graphics/shader/recompiler/ir/SrtWalker.h"
 
@@ -837,6 +838,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	layout_options.push_constant_offset = options.push_constant_offset;
 	if (!IR::AllocateBindings(ir, layout_options, error)) {
 		return false;
+	}
+	const auto read_lane_stats = IR::EliminateReadLane(ir);
+	if (read_lane_stats.rewritten_reads != 0) {
+		LOGF("%s read-lane elimination: reads=%" PRIu32 " shadow_writes=%" PRIu32 "\n",
+		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.shadow_writes);
 	}
 	std::string ir_dump;
 	if (options.dump_ir) {

@@ -102,7 +102,7 @@ uint32_t EmitWqmLaneU32(EmitterState& state, uint32_t src) {
 		state.builder.AddFunction(
 		    {OpINotEqual, state.bool_type, non_zero, masked, ConstantU32(state, 0)});
 		state.builder.AddFunction({OpSelect, state.uint_type, expanded, non_zero,
-		                            ConstantU32(state, mask), ConstantU32(state, 0)});
+		                           ConstantU32(state, mask), ConstantU32(state, 0)});
 		state.builder.AddFunction({OpBitwiseOr, state.uint_type, combined, ret, expanded});
 		ret = combined;
 	}
@@ -122,8 +122,8 @@ void EmitWqmB64(EmitterState& state, const IR::Instruction& inst) {
 	}
 	const auto ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
-	                            ConstantU32(state, ScopeSubgroup),
-	                            EmitLaneMaskOperandActiveBool(state, inst.src[0])});
+	                           ConstantU32(state, ScopeSubgroup),
+	                           EmitLaneMaskOperandActiveBool(state, inst.src[0])});
 	const auto low  = state.builder.AllocateId();
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, state.uint_type, low, ballot, 0});
@@ -150,8 +150,8 @@ void EmitWqmB64(EmitterState& state, const IR::Instruction& inst) {
 		EmitPerInvocationMask(state, inst.dst, active);
 	} else {
 		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction({OpSelect, state.uint_type, result, active,
-		                            ConstantU32(state, 1), ConstantU32(state, 0)});
+		state.builder.AddFunction({OpSelect, state.uint_type, result, active, ConstantU32(state, 1),
+		                           ConstantU32(state, 0)});
 		EmitStoreU32(state, inst.dst, result);
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, 1), ConstantU32(state, 0));
 	}
@@ -205,8 +205,7 @@ void EmitSaveexecB32(EmitterState& state, const IR::Instruction& inst) {
 
 	const auto cond = state.builder.AllocateId();
 	const auto scc  = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpINotEqual, state.bool_type, cond, new_low, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpINotEqual, state.bool_type, cond, new_low, ConstantU32(state, 0)});
 	state.builder.AddFunction(
 	    {OpSelect, state.uint_type, scc, cond, ConstantU32(state, 1), ConstantU32(state, 0)});
 	EmitStoreU32(state, SccOperand(), scc);
@@ -269,18 +268,19 @@ void EmitReadFirstLaneU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto first_lane  = state.builder.AllocateId();
 	const auto first_value = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, state.vec4_uint_type, ballot,
-	                            ConstantU32(state, ScopeSubgroup), active});
+	                           ConstantU32(state, ScopeSubgroup), active});
 	state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, state.uint_type, first_lane,
-	                            ConstantU32(state, ScopeSubgroup), ballot});
+	                           ConstantU32(state, ScopeSubgroup), ballot});
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, first_value,
-	                            ConstantU32(state, ScopeSubgroup), src, first_lane});
+	                           ConstantU32(state, ScopeSubgroup), src, first_lane});
 	EmitStoreU32(state, inst.dst, first_value);
 }
 
 uint32_t EmitLaneIndex(EmitterState& state, const IR::Operand& operand) {
 	const auto lane = state.builder.AllocateId();
+	const auto mask = state.wave_size == 32u ? 31u : 63u;
 	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, EmitValueLoad(state, operand),
-	                            ConstantU32(state, 63)});
+	                           ConstantU32(state, mask)});
 	return lane;
 }
 
@@ -289,7 +289,7 @@ void EmitReadLaneU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto lane  = EmitLaneIndex(state, inst.src[1]);
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, value,
-	                            ConstantU32(state, ScopeSubgroup), src, lane});
+	                           ConstantU32(state, ScopeSubgroup), src, lane});
 	EmitStoreU32(state, inst.dst, value);
 }
 
@@ -336,10 +336,8 @@ void EmitPermlaneB32(EmitterState& state, const IR::Instruction& inst, bool x16)
 		state.builder.AddFunction(
 		    {OpBitwiseXor, state.uint_type, row_value, row, ConstantU32(state, 16)});
 	}
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 15)});
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, lane8, lane, ConstantU32(state, 7)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 15)});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane8, lane, ConstantU32(state, 7)});
 	state.builder.AddFunction(
 	    {OpShiftLeftLogical, state.uint_type, shift, lane8, ConstantU32(state, 2)});
 	state.builder.AddFunction(
@@ -350,7 +348,7 @@ void EmitPermlaneB32(EmitterState& state, const IR::Instruction& inst, bool x16)
 	    {OpBitwiseAnd, state.uint_type, index1, index0, ConstantU32(state, 15)});
 	state.builder.AddFunction({OpBitwiseOr, state.uint_type, target, row_value, index1});
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
-	                            ConstantU32(state, ScopeSubgroup), value, target});
+	                           ConstantU32(state, ScopeSubgroup), value, target});
 	uint32_t ret = shuffled;
 	if (!inst.dst.op_sel) {
 		const auto source_active = EmitLaneIndexActiveBool(state, target);
@@ -375,7 +373,7 @@ void EmitBarrier(EmitterState& state, const IR::Instruction& inst) {
 	(void)inst;
 	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
 	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
-	                            ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

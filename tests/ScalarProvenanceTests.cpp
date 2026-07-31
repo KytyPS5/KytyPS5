@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/ScalarProvenance.h"
 #include "graphics/shader/recompiler/ir/SrtWalker.h"
 
@@ -593,6 +594,122 @@ void TestReadLaneModuloAndDynamicLane() {
 	      "dynamic writelane selector retained unsafe lane provenance");
 }
 
+void TestReadLaneEliminationSnapshotsWriteValue() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(1);
+	program.blocks[0].instructions = {
+	    MoveImmediate(0, 4, 0x12345678u), WriteLane(4, 11, 4, 4),
+	    MoveImmediate(8, 4, 0xdeadbeefu), ReadLane(12, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 1 && stats.shadow_writes == 1,
+	      "fixed readlane was not rewritten through a writelane shadow");
+	const auto& instructions = program.blocks[0].instructions;
+	Check(instructions.size() == 5 && instructions[2].op == Opcode::MoveU32 &&
+	          instructions[2].dst.kind == OperandKind::Register &&
+	          instructions[2].dst.reg.file == RegisterFile::Scalar &&
+	          instructions[2].dst.reg.index >= 128 && instructions[2].src[0] == Sgpr(4),
+	      "writelane did not snapshot its source into a temporary scalar");
+	Check(instructions[4].op == Opcode::MoveU32 && instructions[4].dst == Sgpr(0) &&
+	          instructions[4].src[0] == instructions[2].dst,
+	      "readlane did not consume the writelane snapshot");
+}
+
+void TestReadLaneEliminationMergesControlFlowWrites() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(4);
+	program.blocks[0].successors   = {1, 2};
+	program.blocks[1].predecessors = {0};
+	program.blocks[1].successors   = {3};
+	program.blocks[2].predecessors = {0};
+	program.blocks[2].successors   = {3};
+	program.blocks[3].predecessors = {1, 2};
+	program.blocks[1].instructions = {WriteLane(0, 11, 4, 4)};
+	program.blocks[2].instructions = {WriteLane(4, 11, 5, 4)};
+	program.blocks[3].instructions = {ReadLane(8, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 1 && stats.shadow_writes == 2,
+	      "readlane merge did not shadow both reaching writelane definitions");
+	const auto branch_a_temp = program.blocks[1].instructions[1].dst;
+	const auto branch_b_temp = program.blocks[2].instructions[1].dst;
+	Check(branch_a_temp == branch_b_temp &&
+	          program.blocks[3].instructions[0].op == Opcode::MoveU32 &&
+	          program.blocks[3].instructions[0].src[0] == branch_a_temp,
+	      "control-flow writelanes did not merge through one shadow register");
+}
+
+void TestReadLaneEliminationRequiresWriteOnEveryPath() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(4);
+	program.blocks[0].successors   = {1, 2};
+	program.blocks[1].predecessors = {0};
+	program.blocks[1].successors   = {3};
+	program.blocks[2].predecessors = {0};
+	program.blocks[2].successors   = {3};
+	program.blocks[3].predecessors = {1, 2};
+	program.blocks[1].instructions = {WriteLane(0, 11, 4, 4)};
+	program.blocks[3].instructions = {ReadLane(4, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 0 && stats.shadow_writes == 0 &&
+	          program.blocks[3].instructions[0].op == Opcode::ReadLaneU32,
+	      "readlane without a definition on every path was unsafely rewritten");
+}
+
+void TestReadLaneEliminationHonorsVectorInvalidation() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(1);
+	Instruction overwrite;
+	overwrite.pc        = 4;
+	overwrite.op        = Opcode::MoveU32;
+	overwrite.dst       = Vgpr(11);
+	overwrite.src[0]    = Imm(0);
+	overwrite.src_count = 1;
+	program.blocks[0].instructions = {WriteLane(0, 11, 4, 4), overwrite,
+	                                  ReadLane(8, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 0 && stats.shadow_writes == 0 &&
+	          program.blocks[0].instructions.back().op == Opcode::ReadLaneU32,
+	      "readlane was rewritten across an intervening vector overwrite");
+}
+
+void TestReadLaneEliminationFoldsScalarLaneSelector() {
+	Program program;
+	program.wave_size       = 32;
+	program.user_data_count = 8;
+	program.blocks.resize(1);
+	auto write   = WriteLane(4, 11, 4, 0);
+	write.src[1] = Sgpr(7);
+	auto read    = ReadLane(8, 0, 11, 0);
+	read.src[1]  = Sgpr(7);
+	program.blocks[0].instructions = {MoveImmediate(0, 7, 33), write, read};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 1 && stats.shadow_writes == 1 &&
+	          program.blocks[0].instructions.back().op == Opcode::MoveU32,
+	      "constant scalar lane selector was not folded modulo wave32");
+}
+
 void TestUnresolvedSourceIsMarked() {
 	Program program;
 	program.blocks.resize(1);
@@ -1091,6 +1208,11 @@ int main() {
 		TestReadLaneLoopConvergence();
 		TestReadLaneWideAndRelativeWritesInvalidateSpill();
 		TestReadLaneModuloAndDynamicLane();
+		TestReadLaneEliminationSnapshotsWriteValue();
+		TestReadLaneEliminationMergesControlFlowWrites();
+		TestReadLaneEliminationRequiresWriteOnEveryPath();
+		TestReadLaneEliminationHonorsVectorInvalidation();
+		TestReadLaneEliminationFoldsScalarLaneSelector();
 		TestUnresolvedSourceIsMarked();
 		TestUnsupportedWideWriteInvalidatesBothDwords();
 		TestCyclicPhiIsUnresolved();

@@ -329,6 +329,7 @@ add_kyty_full_emulator_test(shader_cfg_tests ../tests/shaderCfgTests.cpp)
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	../tests/ScalarProvenanceTests.cpp
 	graphics/host_gpu/hostMemory.cpp
+	graphics/shader/recompiler/ir/ReadLaneElimination.cpp
 	graphics/shader/recompiler/ir/ScalarProvenance.cpp
 	graphics/shader/recompiler/ir/SrtWalker.cpp
 )
@@ -441,6 +442,7 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)

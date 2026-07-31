@@ -338,7 +338,6 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
-target_compile_definitions(memory_tracker_tests PRIVATE KYTY_MEMORY_TRACKER_TESTS=1)
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	../tests/ShaderVertexMetadataTests.cpp
@@ -437,6 +436,8 @@ if(BUILD_TESTING)
 	add_test(NAME resource_mutex COMMAND $<TARGET_FILE:resource_mutex_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME virtual_memory_allocation
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring

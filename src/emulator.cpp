@@ -105,7 +105,7 @@ static void ClearDebugTextureFolder() {
 	}
 }
 
-static void Init(const Config::ConfigOptions& cfg) {
+static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& param_json) {
 	EXIT_IF(!Common::Thread::IsMainThread());
 
 	auto* slist = Common::SubsystemsList::Instance();
@@ -127,12 +127,21 @@ static void Init(const Config::ConfigOptions& cfg) {
 	slist->InitAll(true);
 
 	Config::Load(cfg);
+	slist->Add(log, {core, config});
+	slist->InitAll(true);
+
+	if (Common::File::IsFileExisting(param_json)) {
+		Loader::SystemContentLoadParamSfo(param_json);
+		if (const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
+		    flexible_memory_size != 0) {
+			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
+		}
+	}
 
 	slist->Add(audio, {core, log, pthread, memory});
 	slist->Add(controller, {core, log, config});
 	slist->Add(file_system, {core, log, pthread});
 	slist->Add(graphics, {core, log, pthread, memory, config, profiler, controller});
-	slist->Add(log, {core, config});
 	slist->Add(memory, {core, log});
 	slist->Add(network, {core, log, pthread});
 	slist->Add(profiler, {core, config});
@@ -180,7 +189,8 @@ void Run(const RunOptions& options) {
 		EXIT("ELF is required\n");
 	}
 
-	Init(options.config);
+	const auto param_json = options.app0_dir / "sce_sys" / "param.json";
+	Init(options.config, param_json);
 
 	ClearDebugTextureFolder();
 
@@ -191,15 +201,6 @@ void Run(const RunOptions& options) {
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
-
-	auto param_json = options.app0_dir / "sce_sys" / "param.json";
-	if (Common::File::IsFileExisting(param_json)) {
-		Loader::SystemContentLoadParamSfo(param_json);
-		if (auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
-		    flexible_memory_size != 0) {
-			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
-		}
-	}
 
 	MountSandboxDirs();
 

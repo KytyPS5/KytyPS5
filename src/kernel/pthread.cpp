@@ -75,16 +75,16 @@ LIB_NAME("libkernel", "libkernel");
 #undef PTHREAD_STACK_MIN
 #endif
 
-constexpr int      KEYS_MAX                  = 256;
-constexpr int      DESTRUCTOR_ITERATIONS     = 4;
-constexpr size_t   PTHREAD_STACK_DEFAULT     = 0x100000;
-constexpr size_t   GUEST_PTHREAD_STACK_MIN   = 0x4000;
-constexpr size_t   PTHREAD_STACK_PAGE        = 0x4000;
-constexpr size_t   PTHREAD_STACK_GRANULARITY = 0x10000;
-constexpr size_t   PTHREAD_STACK_INITIAL     = 0x200000;
-constexpr size_t   PTHREAD_STACK_EXTRA       = 0x100000;
-constexpr uint64_t PTHREAD_STACK_TOP         = 0x7efff8000ull;
-constexpr uint32_t SIGNAL_APC_POLL_MICROS    = 10000;
+constexpr int      KEYS_MAX                = 256;
+constexpr int      DESTRUCTOR_ITERATIONS   = 4;
+constexpr size_t   PTHREAD_STACK_DEFAULT   = 0x100000;
+constexpr size_t   GUEST_PTHREAD_STACK_MIN = 0x4000;
+constexpr size_t   PTHREAD_STACK_PAGE      = 0x4000;
+constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
+constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
+constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
+constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
+constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
 static constexpr KernelClockid KERNEL_CLOCK_VIRTUAL           = 1;
@@ -697,14 +697,15 @@ static std::atomic<int32_t> g_pthread_thread_id      = 0;
 
 static Common::Mutex g_guest_stack_mutex;
 static uint64_t      g_guest_stack_last = 0;
+struct CachedGuestStack {
+	uint64_t address;
+	size_t   map_size;
+	size_t   guard_size;
+};
+static std::vector<CachedGuestStack> g_guest_stack_cache;
 
 static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
-}
-
-static size_t RoundStackMappingSize(size_t size) {
-	return ((size + PTHREAD_STACK_GRANULARITY - 1) / PTHREAD_STACK_GRANULARITY) *
-	       PTHREAD_STACK_GRANULARITY;
 }
 
 static int CreateGuestStack(PthreadAttr attr) {
@@ -722,34 +723,41 @@ static int CreateGuestStack(PthreadAttr attr) {
 
 	const auto stack_size = RoundStackSize(attr->stack_size);
 	const auto guard_size = RoundStackSize(attr->guard_size);
-	const auto map_size   = RoundStackMappingSize(stack_size + guard_size);
+	const auto map_size   = stack_size + guard_size;
 
 	uint64_t stack_addr = 0;
+	bool     cached     = false;
 	{
 		Common::LockGuard lock(g_guest_stack_mutex);
 
-		if (g_guest_stack_last == 0) {
-			g_guest_stack_last = (PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE) &
-			                     ~(static_cast<uint64_t>(PTHREAD_STACK_GRANULARITY) - 1);
+		auto cached_stack =
+		    std::find_if(g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
+		                 [map_size, guard_size](const auto& stack) {
+			                 return stack.map_size == map_size && stack.guard_size == guard_size;
+		                 });
+		if (cached_stack != g_guest_stack_cache.end()) {
+			stack_addr = cached_stack->address;
+			g_guest_stack_cache.erase(cached_stack);
+			cached = true;
+		} else {
+			if (g_guest_stack_last == 0) {
+				g_guest_stack_last = PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE;
+			}
+			if (map_size > g_guest_stack_last - PTHREAD_STACK_BOTTOM) {
+				return KERNEL_ERROR_EAGAIN;
+			}
+			stack_addr = g_guest_stack_last - map_size;
+			g_guest_stack_last -= map_size;
 		}
-
-		stack_addr = g_guest_stack_last - map_size;
-		g_guest_stack_last -= map_size;
 	}
 
-	void* mapped_addr = reinterpret_cast<void*>(stack_addr);
-
-	constexpr int GUEST_PROT_READ_WRITE = 0x03;
-	constexpr int GUEST_MAP_PRIVATE     = 0x02;
-	constexpr int GUEST_MAP_FIXED       = 0x10;
-	constexpr int GUEST_MAP_STACK       = 0x400;
-	constexpr int GUEST_MAP_ANON        = 0x1000;
-
-	int result = Memory::KernelMapNamedFlexibleMemory(
-	    &mapped_addr, map_size, GUEST_PROT_READ_WRITE,
-	    GUEST_MAP_PRIVATE | GUEST_MAP_FIXED | GUEST_MAP_STACK | GUEST_MAP_ANON, "stack");
-	if (result != OK) {
-		return KERNEL_ERROR_EAGAIN;
+	int result = OK;
+	if (!cached) {
+		stack_addr = Memory::AllocateGuestStackMemory(
+		    stack_addr, map_size, Common::VirtualMemory::Mode::ReadWrite, "stack");
+		if (stack_addr == 0) {
+			return KERNEL_ERROR_EAGAIN;
+		}
 	}
 
 	if (guard_size != 0) {
@@ -761,7 +769,7 @@ static int CreateGuestStack(PthreadAttr attr) {
 	}
 
 	attr->stack_addr     = reinterpret_cast<void*>(stack_addr + guard_size);
-	attr->stack_size     = map_size - guard_size;
+	attr->stack_size     = stack_size;
 	attr->stack_user     = false;
 	attr->stack_map_addr = stack_addr;
 	attr->stack_map_size = map_size;
@@ -777,12 +785,89 @@ static void FreeGuestStack(PthreadAttr attr) {
 		return;
 	}
 
-	Memory::KernelMunmap(attr->stack_map_addr, attr->stack_map_size);
+	const auto guard_size = attr->stack_map_size - attr->stack_size;
+	{
+		Common::LockGuard lock(g_guest_stack_mutex);
+		g_guest_stack_cache.push_back({attr->stack_map_addr, attr->stack_map_size, guard_size});
+	}
 
 	attr->stack_addr     = nullptr;
 	attr->stack_map_addr = 0;
 	attr->stack_map_size = 0;
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
+                                  uint64_t* map_size) {
+	if (first_address == nullptr || second_address == nullptr || map_size == nullptr) {
+		return false;
+	}
+
+	size_t flexible_before = 0;
+	if (Memory::KernelAvailableFlexibleMemorySize(&flexible_before) != OK) {
+		return false;
+	}
+
+	PthreadAttr attr = nullptr;
+	if (PthreadAttrInit(&attr) != OK) {
+		return false;
+	}
+	if (CreateGuestStack(attr) != OK) {
+		PthreadAttrDestroy(&attr);
+		return false;
+	}
+	*first_address = attr->stack_map_addr;
+	*map_size      = attr->stack_map_size;
+	const bool first_owned =
+	    Memory::TestGuestAddressRangeIsOwned(*first_address, static_cast<uint64_t>(*map_size));
+	uint64_t   backing_value = 0;
+	const bool first_private =
+	    !Memory::TryReadBacking(*first_address, &backing_value, sizeof(backing_value));
+	size_t     flexible_during_first = 0;
+	const bool first_capacity_unchanged =
+	    Memory::KernelAvailableFlexibleMemorySize(&flexible_during_first) == OK &&
+	    flexible_during_first == flexible_before;
+	FreeGuestStack(attr);
+
+	if (CreateGuestStack(attr) != OK) {
+		PthreadAttrDestroy(&attr);
+		return false;
+	}
+	*second_address = attr->stack_map_addr;
+	const bool second_owned =
+	    Memory::TestGuestAddressRangeIsOwned(*second_address, static_cast<uint64_t>(*map_size));
+	const bool second_private =
+	    !Memory::TryReadBacking(*second_address, &backing_value, sizeof(backing_value));
+	size_t     flexible_during_second = 0;
+	const bool second_capacity_unchanged =
+	    Memory::KernelAvailableFlexibleMemorySize(&flexible_during_second) == OK &&
+	    flexible_during_second == flexible_before;
+	FreeGuestStack(attr);
+
+	CachedGuestStack cached {};
+	bool             found = false;
+	{
+		Common::LockGuard lock(g_guest_stack_mutex);
+		const auto        entry = std::find_if(
+		    g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
+		    [second_address](const auto& stack) { return stack.address == *second_address; });
+		if (entry != g_guest_stack_cache.end()) {
+			cached = *entry;
+			g_guest_stack_cache.erase(entry);
+			found = true;
+		}
+	}
+
+	const bool unmapped = found && Memory::KernelMunmap(cached.address, cached.map_size) == OK;
+	size_t     flexible_after = 0;
+	const bool final_capacity_unchanged =
+	    Memory::KernelAvailableFlexibleMemorySize(&flexible_after) == OK &&
+	    flexible_after == flexible_before;
+	return PthreadAttrDestroy(&attr) == OK && first_owned && first_private &&
+	       first_capacity_unchanged && second_owned && second_private &&
+	       second_capacity_unchanged && unmapped && final_capacity_unchanged;
+}
+#endif
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)

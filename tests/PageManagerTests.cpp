@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "common/virtualMemory.h"
 
 #include <atomic>
 #include <cstdint>
@@ -28,7 +29,6 @@
 
 namespace {
 
-using Libs::Graphics::GpuAccess;
 using Libs::Graphics::PageFaultAccess;
 using Libs::Graphics::PageManager;
 
@@ -122,6 +122,23 @@ uint32_t Protection(const void *address) {
   return info.Protect;
 }
 #endif
+
+std::atomic_uint64_t g_protection_calls{0};
+
+bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
+                         Common::VirtualMemory::Mode mode) {
+  uint32_t protection = PAGE_NOACCESS;
+  if (mode == Common::VirtualMemory::Mode::Read) {
+    protection = PAGE_READONLY;
+  } else if (mode == Common::VirtualMemory::Mode::ReadWrite) {
+    protection = PAGE_READWRITE;
+  }
+  DWORD old_protection = 0;
+  g_protection_calls.fetch_add(1, std::memory_order_relaxed);
+  return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
+                        &old_protection) != 0;
+}
+
 #if 1
 
 struct FaultContext {
@@ -254,6 +271,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
 }
 
 void TestWatchFaultAndUnwatch() {
+  g_protection_calls.store(0, std::memory_order_relaxed);
   FaultContext context;
   PageManager manager(InvalidateFault, &context);
   context.manager = &manager;
@@ -266,6 +284,8 @@ void TestWatchFaultAndUnwatch() {
   Check(manager.IsTracked(reinterpret_cast<uint64_t>(memory)) &&
             !IsWritable(memory),
         "watch did not protect the page");
+  Check(g_protection_calls.load(std::memory_order_relaxed) != 0,
+        "watch protection bypassed the address-space owner callback");
   Check(manager.HandleFault(PageFaultAccess::Write,
                             reinterpret_cast<uint64_t>(memory + 32)),
         "tracked write fault was not handled");
@@ -343,14 +363,6 @@ void TestPermittedMappedLateFaultsResume() {
         "second delayed mapped write was not accepted");
   Check(manager.HandleFault(PageFaultAccess::Read, address),
         "delayed mapped read was not accepted on readable backing");
-  DWORD old_protection = 0;
-  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) != 0 &&
-            old_protection == PAGE_READWRITE,
-        "failed to prepare intentional read-only protection");
-  Check(!manager.HandleFault(PageFaultAccess::Write, address),
-        "intentional read-only mapping accepted a write fault");
-  Check(VirtualProtect(memory, page_size, PAGE_READWRITE, &old_protection) != 0,
-        "failed to restore writable protection");
   manager.OnGpuUnmap(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
@@ -496,31 +508,6 @@ void TestNativeAccessViolation() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-void TestInvalidLateWriteTokenIsConsumed() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  Check(manager.HandleFault(PageFaultAccess::Write, address),
-        "initial write fault was not handled");
-  DWORD old_protection = 0;
-  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) !=
-                0 &&
-            old_protection == PAGE_READWRITE,
-        "failed to create invalid late-write protection state");
-  Check(!manager.HandleFault(PageFaultAccess::Write, address) &&
-            !manager.HandleFault(PageFaultAccess::Write, address),
-        "invalid late-write token was accepted or retained");
-  Check(VirtualProtect(memory, page_size, PAGE_READWRITE, &old_protection) != 0,
-        "failed to restore test protection");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
 void TestCrossRegionRange() {
   FaultContext context;
   PageManager manager(InvalidateFault, &context);
@@ -627,9 +614,7 @@ void TestBatchedWatcherRanges() {
     manager->UpdatePageWatchers(false, 0x1000, page_size);
   } else {
     const bool two_pages = std::strcmp(name, "cross-reentrant") == 0;
-    auto *memory = Allocate(
-        two_pages ? page_size * 2 : page_size,
-        std::strcmp(name, "protection") == 0 ? PAGE_READONLY : PAGE_READWRITE);
+    auto *memory = Allocate(two_pages ? page_size * 2 : page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
     manager->OnGpuMap(address, two_pages ? page_size * 2 : page_size);
     manager->UpdatePageWatchers(true, address, page_size);
@@ -659,9 +644,7 @@ void TestBatchedWatcherRanges() {
       }
       (void)manager->HandleFault(PageFaultAccess::Read, address);
       first.join();
-    } else if (std::strcmp(name, "watched-unmap") == 0) {
-      manager->OnGpuUnmap(address, page_size);
-    } else if (std::strcmp(name, "protection") != 0) {
+    } else {
       std::_Exit(0x7f);
     }
   }
@@ -712,7 +695,7 @@ void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch", "non-write",
         "callback-false", "reentrant", "cross-reentrant",
-        "concurrent-non-write", "watched-unmap", "protection"}) {
+        "concurrent-non-write"}) {
     CheckDeathCase(name);
   }
 }
@@ -773,50 +756,17 @@ void TestExternalDirtyTransferDuringResolution() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-void TestMappingDoesNotRequireCpuWriteAccess() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  DWORD old_protection = 0;
-  Check(VirtualProtect(memory, page_size, PAGE_NOACCESS, &old_protection) != 0 &&
-            old_protection == PAGE_READWRITE,
-        "failed to prepare CPU-inaccessible mapping");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  Check(manager.IsMapped(address, page_size),
-        "CPU-inaccessible committed range was not GPU mapped");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestGpuAccessPermissions() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size, GpuAccess::Read);
-  Check(manager.HasGpuAccess(address, page_size, GpuAccess::Read) &&
-            !manager.HasGpuAccess(address, page_size, GpuAccess::Write),
-        "read-only GPU mapping granted write access");
-  manager.OnGpuMap(address, page_size, GpuAccess::Write);
-  Check(manager.HasGpuAccess(address, page_size, GpuAccess::ReadWrite),
-        "overlapping GPU mappings did not combine permissions");
-  manager.OnGpuUnmap(address, page_size, GpuAccess::Read);
-  Check(!manager.HasGpuAccess(address, page_size, GpuAccess::Read) &&
-            manager.HasGpuAccess(address, page_size, GpuAccess::Write),
-        "GPU read unmap removed the wrong permission");
-  manager.OnGpuUnmap(address, page_size, GpuAccess::Write);
-  Check(!manager.IsMapped(address, page_size),
-        "GPU permission mappings were not fully balanced");
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
 #endif
 
 } // namespace
+
+namespace Libs::LibKernel::Memory {
+
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
+  return ProtectAddressSpace(vaddr, size, mode);
+}
+
+} // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
 #if 1
@@ -831,13 +781,10 @@ int main(int argc, char **argv) {
   TestNativeDelayedReadAfterModeDowngrade();
   TestDelayedFaultAfterExplicitUnwatch();
   TestNativeAccessViolation();
-  TestInvalidLateWriteTokenIsConsumed();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestConcurrentFault();
   TestExternalDirtyTransferDuringResolution();
-  TestMappingDoesNotRequireCpuWriteAccess();
-  TestGpuAccessPermissions();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

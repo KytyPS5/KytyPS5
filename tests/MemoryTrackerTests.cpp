@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "common/assert.h"
+#include "common/virtualMemory.h"
 
 #include <atomic>
 #include <cstdint>
@@ -209,6 +210,20 @@ class SharedPage final {
   HANDLE mapping_ = nullptr;
 };
 #endif
+
+bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
+                         Common::VirtualMemory::Mode mode) {
+  uint32_t protection = PAGE_NOACCESS;
+  if (mode == Common::VirtualMemory::Mode::Read) {
+    protection = PAGE_READONLY;
+  } else if (mode == Common::VirtualMemory::Mode::ReadWrite) {
+    protection = PAGE_READWRITE;
+  }
+  DWORD old_protection = 0;
+  return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
+                        &old_protection) != 0;
+}
+
 #if 1
 
 bool DummyFault(void *, PageFaultAccess, uint64_t, uint64_t, PageFaultPhase) noexcept {
@@ -353,7 +368,8 @@ struct DownloadTrackerHarness {
     return completed;
   }
 
-  DownloadTrackerHarness() : page_manager(Fault, this), tracker(page_manager) {}
+  DownloadTrackerHarness()
+      : page_manager(Fault, this), tracker(page_manager) {}
 
   PageFaultAccess pending_access = PageFaultAccess::Unknown;
   uint64_t download_address = 0;
@@ -366,11 +382,6 @@ struct DownloadTrackerHarness {
 
 std::atomic<PageManager *> g_native_page_manager{nullptr};
 std::atomic_bool g_native_fault_entered{false};
-std::atomic_bool g_unmap_contended{false};
-
-void UnmapContended() noexcept {
-  g_unmap_contended.store(true, std::memory_order_release);
-}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 LONG CALLBACK NativeTrackerFaultHandler(EXCEPTION_POINTERS *exception) {
@@ -552,7 +563,7 @@ void TestGpuDownloadFaultOwnership() {
             !harness.tracker.IsRegionGpuModified(address, page_size) &&
             harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "GPU write fault did not download before granting CPU ownership");
-  harness.tracker.UnmapMemory(address, page_size);
+  harness.tracker.UntrackMemory(address, page_size);
 }
 
 void TestVirtualGpuWriteDiscard() {
@@ -578,7 +589,7 @@ void TestVirtualGpuWriteDiscard() {
   Check(!harness.tracker.IsRegionGpuModified(address, page_size) &&
             harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "virtual GPU discard did not transfer the page to CPU ownership");
-  harness.tracker.UnmapMemory(address, page_size);
+  harness.tracker.UntrackMemory(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -684,6 +695,15 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+void TestQueriesDoNotRequireMappedOwnership() {
+  constexpr uint64_t address = 0x0000000203000000ull;
+  TrackerHarness harness;
+  const auto page_size = harness.page_manager.GetPageSize();
+  Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
+            !harness.tracker.IsRegionGpuModified(address, page_size),
+        "unowned tracker range did not expose its initial CPU-dirty state");
+}
+
 void TestRangeInvalidation() {
   constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
@@ -767,7 +787,7 @@ void TestCpuDirtyUploadAndFault() {
   Check(IsWritable(memory),
         "explicit CPU dirty transition did not release the rearmed watch");
 
-  tracker.UnmapMemory(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -795,7 +815,7 @@ void TestFaultDuringUploadRemainsDirty() {
       });
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "upload completion erased a racing CPU dirty transition");
-  tracker.UnmapMemory(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -840,7 +860,7 @@ void TestNativeStoreDuringRangeEnumeration() {
             IsWritable(memory),
         "native store during range enumeration was lost");
 
-  tracker.UnmapMemory(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -924,7 +944,7 @@ void TestFaultDuringDownloadSynchronization() {
             page_manager.IsTracked(address + page_size * 2),
         "uncontended dirty page did not retain its clean write watch");
 
-  tracker.UnmapMemory(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
 }
 
 void TestFaultAndExplicitDirtyRace() {
@@ -964,7 +984,7 @@ void TestFaultAndExplicitDirtyRace() {
               IsWritable(memory),
           "fault/explicit-dirty race lost dirty state or write access");
   }
-  tracker.UnmapMemory(address, page_size);
+  tracker.UntrackMemory(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -1016,7 +1036,7 @@ void TestSharedTrackersAndConcurrentPageFaults() {
   }
 
   harness.first.UntrackMemory(address, page_size * 2);
-  harness.second.UnmapMemory(address, page_size * 2);
+  harness.second.UntrackMemory(address, page_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -1049,7 +1069,7 @@ void TestGpuDirtyBits() {
         "explicit GPU dirty transition did not trap CPU access");
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
-  tracker.UnmapMemory(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -1084,7 +1104,7 @@ void TestCrossRegionUpload() {
         "cross-region written upload did not mark GPU dirty state");
   tracker.UnmarkRegionAsGpuModified(boundary - page_size, page_size * 2);
   tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
-  tracker.UnmapMemory(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -1094,9 +1114,6 @@ void TestCrossRegionUpload() {
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
   const auto page_size = page_manager.GetPageSize();
-  if (std::strcmp(name, "unmapped") == 0) {
-    (void)tracker.IsRegionCpuModified(base, page_size);
-  }
   const auto allocation_size =
       std::strcmp(name, "missing-download-bytes") == 0 ? page_size * 2
                                                        : page_size;
@@ -1149,20 +1166,6 @@ void TestCrossRegionUpload() {
           }
     });
     fault.join();
-  } else if (std::strcmp(name, "gpu-dirty-unmap-race") == 0) {
-    g_unmap_contended.store(false, std::memory_order_release);
-    MemoryTracker::SetUnmapContentionHook(UnmapContended);
-    std::thread unmap;
-    tracker.ForEachUploadRange(
-        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-        [&]() noexcept {
-          unmap = std::thread(
-              [&] { tracker.UnmapMemory(address, page_size); });
-          while (!g_unmap_contended.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-          }
-        });
-    unmap.join();
   } else if (std::strcmp(name, "missing-download-bytes") == 0) {
     tracker.ForEachUploadRange(
         address, allocation_size, true, [](uint64_t, uint64_t) noexcept {},
@@ -1193,8 +1196,7 @@ void TestFatalPaths() {
 #endif
   for (const char *name : {"gpu-dirty-fault", "gpu-dirty-read", "virtual-gpu-read",
                            "gpu-dirty-explicit-cpu",
-                           "unmapped", "reentrant-upload",
-                           "writable-upload-race", "gpu-dirty-unmap-race",
+                           "reentrant-upload", "writable-upload-race",
                            "missing-download-bytes"}) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     std::string command = std::string("\"") + path + "\" --death " + name;
@@ -1236,6 +1238,14 @@ void TestFatalPaths() {
 
 } // namespace
 
+namespace Libs::LibKernel::Memory {
+
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
+  return ProtectAddressSpace(vaddr, size, mode);
+}
+
+} // namespace Libs::LibKernel::Memory
+
 int main(int argc, char **argv) {
 #if 1
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
@@ -1249,6 +1259,7 @@ int main(int argc, char **argv) {
   TestSameSlabTrackerArbitration();
   TestSharedMetadataAndImagePageFault();
   TestRangeSet();
+  TestQueriesDoNotRequireMappedOwnership();
   TestRangeInvalidation();
   TestGpuDirtyBits();
   TestCrossRegionUpload();

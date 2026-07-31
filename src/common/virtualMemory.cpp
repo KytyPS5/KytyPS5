@@ -58,25 +58,6 @@ bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	return SysVirtualFlushInstructionCache(address, size);
 }
 
-bool PatchReplace(uint64_t vaddr, uint64_t value) {
-	Mode old_mode {};
-	Protect(vaddr, 8, Mode::ReadWrite, &old_mode);
-
-	auto* ptr = reinterpret_cast<uint64_t*>(vaddr);
-
-	bool ret = (*ptr != value);
-
-	*ptr = value;
-
-	Protect(vaddr, 8, old_mode);
-
-	if (IsExecute(old_mode)) {
-		FlushInstructionCache(vaddr, 8);
-	}
-
-	return ret;
-}
-
 } // namespace VirtualMemory
 
 } // namespace Common

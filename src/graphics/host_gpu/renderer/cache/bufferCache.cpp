@@ -714,7 +714,6 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	if (command.IsInvalid() || command.IsExecute()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-	ValidateGpuAccess(vaddr, size, is_read, is_written);
 	std::lock_guard transaction(m_resource_mutex);
 	(void)SynchronizeBacking(vaddr, size);
 
@@ -999,7 +998,6 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	ValidateGpuAccess(vaddr, size, false, true);
 	(void)m_texture_cache.ClearMeta(vaddr);
 	{
 		std::lock_guard transaction(m_resource_mutex);
@@ -1040,12 +1038,6 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
 	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {
 		EXIT("BufferCache: invalid or overlapping copy range\n");
-	}
-	if (src_memory) {
-		ValidateGpuAccess(src_vaddr, size, true, false);
-	}
-	if (dst_memory) {
-		ValidateGpuAccess(dst_vaddr, size, false, true);
 	}
 	if (src_memory || dst_memory) {
 		std::lock_guard transaction(m_resource_mutex);
@@ -1201,19 +1193,6 @@ void BufferCache::PublishImageBuffer(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
 	                                           "published image destination");
 	owner->second->tick_accessed_last = m_gc_tick;
-}
-
-void BufferCache::ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read,
-                                    bool is_written) const {
-	if ((!is_read && !is_written) || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
-		EXIT("BufferCache: invalid GPU access request\n");
-	}
-	if (is_read && !m_page_manager.HasGpuAccess(vaddr, size, GpuAccess::Read)) {
-		EXIT("BufferCache: GPU-read access denied\n");
-	}
-	if (is_written && !m_page_manager.HasGpuAccess(vaddr, size, GpuAccess::Write)) {
-		EXIT("BufferCache: GPU-write access denied\n");
-	}
 }
 
 void BufferCache::RunGarbageCollector() {

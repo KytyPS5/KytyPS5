@@ -112,11 +112,15 @@ void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
+                                  uint64_t* map_size);
+#endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
 #endif
-int  PthreadGetPriorityForKernel(Pthread thread);
-int  PthreadGetCurrentPriorityForKernel();
+int PthreadGetPriorityForKernel(Pthread thread);
+int PthreadGetCurrentPriorityForKernel();
 
 int KYTY_SYSV_ABI          KernelUsleep(KernelUseconds microseconds);
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds);

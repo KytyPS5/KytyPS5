@@ -870,6 +870,7 @@ void TestMaterializationSharesReadConstEvaluation() {
 	for (uint32_t i = 0; i < memory.words.size(); i++) {
 		memory.words[i] = 0x100 + i;
 	}
+	memory.words[1] |= Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
 	memory.words[3] |= Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u;
 	std::array<uint32_t, 32> user_data {};
 	user_data[16] = static_cast<uint32_t>(memory.base);
@@ -910,6 +911,7 @@ void TestInvalidImagesMaterializeAsNull() {
 	std::string                       error;
 	for (uint32_t type = 0; type < 8; type++) {
 		auto descriptor = stale;
+		descriptor[1] |= Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
 		descriptor[3]   = (descriptor[3] & 0x0fffffffu) | (type << 28u);
 		ResourceSnapshot snapshot;
 		Check(MaterializeResources(sampled, {descriptor}, snapshot, &error) &&
@@ -966,7 +968,18 @@ void TestInvalidImagesMaterializeAsNull() {
 		}
 	}
 
+	std::array<uint32_t, 8> invalid_format {};
+	invalid_format[0] = 1;
+	invalid_format[3] = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u;
+	ResourceSnapshot invalid_format_snapshot;
+	Check(MaterializeResources(sampled, {invalid_format}, invalid_format_snapshot, &error) &&
+	          std::all_of(invalid_format_snapshot.images[0].dwords.begin(),
+	                      invalid_format_snapshot.images[0].dwords.end(),
+	                      [](uint32_t word) { return word == 0; }),
+	      "invalid-format image descriptor was not normalized to null");
+
 	auto valid = stale;
+	valid[1] |= Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
 	valid[3] =
 	    (valid[3] & 0x0fffffffu) | (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u);
 	ResourceSnapshot valid_snapshot;

@@ -14410,6 +14410,12 @@ bool CacheFault(void* opaque, PageFaultAccess access, uint64_t vaddr, uint64_t s
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
+	const auto rgb565 = TextureGetRenderTargetFormat(16u, 0u, 0u);
+	Require("RenderTargetFormat", "RGB565 UNorm",
+	        rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
+	            rgb565.bytes_per_element == 2u && rgb565.export_mapping.IsIdentity(),
+	        "RGB565 UNorm render-target tuple was rejected");
+
 	const auto uint_format = TextureGetRenderTargetFormat(12u, 4u, 0u);
 	Require("RenderTargetFormat", "RGBA16 uint",
 	        uint_format.format == vk::Format::eR16G16B16A16Uint &&

@@ -47,8 +47,9 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 }
 
 bool ValidImageDescriptor(const DescriptorValue& descriptor) {
-	const auto type = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
-	if (type < Prospero::ImageType::kColor1D) {
+	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
 		return false;
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
@@ -199,8 +200,12 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension ||
 		    DescriptorIsCube(descriptor) != image.cube) {
 			if (error != nullptr) {
-				*error =
-				    fmt::format("image descriptor {} no longer matches specialized dimension", i);
+				*error = fmt::format(
+				    "image descriptor {} no longer matches specialized dimension: "
+				    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+				    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
+				    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+				    descriptor.dwords[6], descriptor.dwords[7]);
 			}
 			return false;
 		}

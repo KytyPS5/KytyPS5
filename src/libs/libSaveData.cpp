@@ -375,7 +375,8 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
-			if (!entry.is_file && !Common::StartsWith(entry.name, "sce_")) {
+			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
+			    !Common::StartsWith(entry.name, "sce_")) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {

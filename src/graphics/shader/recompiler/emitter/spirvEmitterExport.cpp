@@ -24,7 +24,7 @@ uint32_t EmitExportVec4F32(EmitterState& state, const IR::Instruction& inst) {
 			const auto raw      = EmitValueLoad(state, inst.src[pair_index]);
 			const auto unpacked = state.builder.AllocateId();
 			state.builder.AddFunction({OpExtInst, state.vec2_float_type, unpacked,
-			                            state.glsl_std450, GlslUnpackHalf2x16, raw});
+			                           state.glsl_std450, GlslUnpackHalf2x16, raw});
 			for (uint32_t lane = 0; lane < 2u; lane++) {
 				const auto component = pair_index * 2u + lane;
 				if (((inst.export_info.en >> component) & 1u) == 0) {
@@ -36,8 +36,8 @@ uint32_t EmitExportVec4F32(EmitterState& state, const IR::Instruction& inst) {
 			}
 		}
 		const auto vec = state.builder.AllocateId();
-		state.builder.AddFunction({OpCompositeConstruct, state.vec4_float_type, vec,
-		                            components[0], components[1], components[2], components[3]});
+		state.builder.AddFunction({OpCompositeConstruct, state.vec4_float_type, vec, components[0],
+		                           components[1], components[2], components[3]});
 		return vec;
 	}
 
@@ -50,7 +50,59 @@ uint32_t EmitExportVec4F32(EmitterState& state, const IR::Instruction& inst) {
 	return vec;
 }
 
-uint32_t ApplyMrtExportMapping(EmitterState& state, const IR::Instruction& inst, uint32_t value) {
+uint32_t EmitExportComponentU32(EmitterState& state, const IR::Instruction& inst,
+                                uint32_t component) {
+	const bool enabled = ((inst.export_info.en >> component) & 1u) != 0;
+	if (!enabled || component >= inst.src_count || component >= 4u) {
+		return ConstantU32(state, component == 3u ? 1u : 0u);
+	}
+	return EmitValueLoad(state, inst.src[component]);
+}
+
+uint32_t EmitExportVec4U32(EmitterState& state, const IR::Instruction& inst) {
+	uint32_t components[4] = {
+	    ConstantU32(state, 0u),
+	    ConstantU32(state, 0u),
+	    ConstantU32(state, 0u),
+	    ConstantU32(state, 1u),
+	};
+
+	if (inst.export_info.compr) {
+		for (uint32_t pair_index = 0; pair_index < 2u && pair_index < inst.src_count;
+		     pair_index++) {
+			const auto raw = EmitValueLoad(state, inst.src[pair_index]);
+			for (uint32_t lane = 0; lane < 2u; lane++) {
+				const auto component = pair_index * 2u + lane;
+				if (((inst.export_info.en >> component) & 1u) == 0) {
+					continue;
+				}
+				components[component] = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpBitFieldUExtract, state.uint_type, components[component], raw,
+				     ConstantU32(state, lane * 16u), ConstantU32(state, 16u)});
+			}
+		}
+	} else {
+		for (uint32_t component = 0; component < 4u; component++) {
+			components[component] = EmitExportComponentU32(state, inst, component);
+		}
+	}
+
+	const auto vec = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, state.vec4_uint_type, vec, components[0],
+	                           components[1], components[2], components[3]});
+	return vec;
+}
+
+static bool MrtUsesUintOutput(const EmitterState& state, const IR::Instruction& inst) {
+	return inst.export_info.kind == IR::ExportTargetKind::Mrt &&
+	       state.pixel_input_info != nullptr &&
+	       inst.export_info.index < std::size(state.pixel_input_info->target_output_mode) &&
+	       state.pixel_input_info->target_output_mode[inst.export_info.index] == 7u;
+}
+
+uint32_t ApplyMrtExportMapping(EmitterState& state, const IR::Instruction& inst, uint32_t value,
+                               uint32_t vector_type) {
 	if (inst.export_info.kind != IR::ExportTargetKind::Mrt || state.pixel_input_info == nullptr ||
 	    inst.export_info.index >= state.pixel_input_info->target_export_mapping.size()) {
 		return value;
@@ -62,8 +114,8 @@ uint32_t ApplyMrtExportMapping(EmitterState& state, const IR::Instruction& inst,
 	}
 
 	const auto mapped = state.builder.AllocateId();
-	state.builder.AddFunction({OpVectorShuffle, state.vec4_float_type, mapped, value, value,
-	                            mapping.Map(0), mapping.Map(1), mapping.Map(2), mapping.Map(3)});
+	state.builder.AddFunction({OpVectorShuffle, vector_type, mapped, value, value, mapping.Map(0),
+	                           mapping.Map(1), mapping.Map(2), mapping.Map(3)});
 	return mapped;
 }
 
@@ -89,7 +141,7 @@ void EmitMrtZExport(EmitterState& state, const IR::Instruction& inst) {
 		const auto ptr  = state.builder.AllocateId();
 		state.builder.AddFunction({OpBitcast, state.int_type, mask, raw});
 		state.builder.AddFunction({OpAccessChain, state.ptr_output_int, ptr,
-		                            state.sample_mask_variable, ConstantU32(state, 0)});
+		                           state.sample_mask_variable, ConstantU32(state, 0)});
 		state.builder.AddFunction({OpStore, ptr, mask});
 	}
 }
@@ -114,11 +166,15 @@ void EmitExport(EmitterState& state, const IR::Instruction& inst) {
 		return;
 	}
 
-	const auto value = ApplyMrtExportMapping(state, inst, EmitExportVec4F32(state, inst));
+	const auto uint_output = MrtUsesUintOutput(state, inst);
+	const auto vector_type = uint_output ? state.vec4_uint_type : state.vec4_float_type;
+	const auto value       = ApplyMrtExportMapping(
+	    state, inst, uint_output ? EmitExportVec4U32(state, inst) : EmitExportVec4F32(state, inst),
+	    vector_type);
 	if (inst.export_info.kind == IR::ExportTargetKind::Position) {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction({OpAccessChain, state.ptr_output_vec4_float, pointer, variable,
-		                            ConstantU32(state, 0)});
+		state.builder.AddFunction(
+		    {OpAccessChain, state.ptr_output_vec4_float, pointer, variable, ConstantU32(state, 0)});
 		state.builder.AddFunction({OpStore, pointer, value});
 		return;
 	}

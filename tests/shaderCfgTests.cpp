@@ -5950,6 +5950,22 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 	Check(SpirvContainsOpcode(result.spirv, 81),
 	      "compressed pixel export SPIR-V lacks OpCompositeExtract");
 	CheckSpirvBinaryValidates(result.spirv);
+
+	ShaderPixelInputInfo uint16_info;
+	uint16_info.target_output_mode[0] = 7;
+	options.pixel_input_info           = &uint16_info;
+	ShaderRecompiler::CompileResult uint16_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, uint16_result, &error), error.c_str());
+	const auto uint16_source = DisassembleSpirvBinary(uint16_result.spirv);
+	Check(Common::ContainsStr(uint16_source, "OpVariable %_ptr_Output_v4uint Output"),
+	      "UINT16 MRT export did not use an unsigned integer output");
+	Check(CountSourceOccurrences(uint16_source, "OpBitFieldUExtract") == 4u &&
+	          Common::ContainsStr(uint16_source, "%uint_0 %uint_16") &&
+	          Common::ContainsStr(uint16_source, "%uint_16 %uint_16"),
+	      "compressed UINT16 MRT export did not extract all low/high 16-bit lanes");
+	Check(!SpirvContainsExtInst(uint16_result.spirv, 62),
+	      "compressed UINT16 MRT export was incorrectly decoded as FP16");
+	CheckSpirvBinaryValidates(uint16_result.spirv);
 }
 
 void TestRenderTargetReverseFloat16ExportMapping() {

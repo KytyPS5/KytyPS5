@@ -3020,6 +3020,37 @@ void TestNewShaderRecompilerImageQueryLowering() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCubeSampleCoordinates() {
+	constexpr uint32_t MimgDimCube = 3;
+	const uint32_t shader[] = {
+	    EncodeMimg0(0x20, 0xf, false, MimgDimCube),
+	    EncodeMimg1(0, 0, 1, 0), // image_sample cube
+	    EncodeMimg0(0x60, 0x3, false, MimgDimCube),
+	    EncodeMimg1(8, 0, 1, 4), // image_get_lod cube
+	    0xbf810000u,
+	};
+
+	auto user_data = ImageTestUserData(Prospero::ImageType::kCube);
+	ShaderRecompiler::CompileOptions options;
+	options.stage     = ShaderType::Compute;
+	options.user_data = user_data.data();
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(result.program.info.images.size() == 1 && result.program.info.images[0].cube,
+	      "cube descriptor identity was not preserved through compilation");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 131) == 4,
+	      "cube sample/get-lod did not remove the RDNA2 S/T bias");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 109) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 112) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 194) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 196) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 130) == 1,
+	      "cube sample did not repack its face ID exactly once, or get-lod used an array layer");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerImageSampleVariants() {
 	const uint32_t shader[] = {
 	    EncodeMimg0(0x24, 0xf),
@@ -6957,6 +6988,7 @@ int main() {
 	TestNewShaderRecompilerScalarBitfieldAlu();
 	TestNewShaderRecompilerMemoryFamilyLowering();
 	TestNewShaderRecompilerImageQueryLowering();
+	TestNewShaderRecompilerCubeSampleCoordinates();
 	TestNewShaderRecompilerImageSampleVariants();
 	TestNewShaderRecompilerImageSampleA16SamplerCoords();
 	TestNewShaderRecompilerImageSampleOpcodeAliases();

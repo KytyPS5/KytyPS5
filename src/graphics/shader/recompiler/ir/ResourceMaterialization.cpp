@@ -12,7 +12,7 @@ namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
-Decoder::ImageDimension DescriptorDimension(const DescriptorValue&       descriptor,
+Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DArray;
@@ -51,8 +51,7 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor) {
 		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
 		const auto fragments  = (descriptor.dwords[3] >> 16u) & 0xfu;
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
-		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
-		       max_mip == fragments;
+		return base_level == 0 && fragments >= 1 && fragments <= 3 && max_mip == fragments;
 	}
 	return true;
 }
@@ -176,12 +175,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		const auto& image      = program.info.images[i];
 		const auto& descriptor = snapshot.images[i];
 		if (NullImageDescriptor(descriptor)) {
-			bool canonical_kind = image.kind == ResourceKind::Image ||
-			                      image.kind == ResourceKind::StorageImage;
+			bool canonical_kind =
+			    image.kind == ResourceKind::Image || image.kind == ResourceKind::StorageImage;
 			if (image.atomic) {
 				canonical_kind = image.kind == ResourceKind::StorageImageUint;
 			}
-			if (image.dimension != Decoder::ImageDimension::Dim2D || !canonical_kind) {
+			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
+			    !canonical_kind) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "image descriptor {} no longer matches canonical null specialization", i);
@@ -367,6 +367,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		auto&       image      = next.images[i];
 		if (NullImageDescriptor(descriptor)) {
 			image.dimension = Decoder::ImageDimension::Dim2D;
+			image.cube      = false;
 			switch (image.kind) {
 				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
 				case ResourceKind::StorageImageUint:

@@ -1217,6 +1217,34 @@ void TestResourceSpecializationIsTypedAndTransactional() {
                 Decoder::ImageDimension::Dim2DArray,
         "array MIMG intent did not produce a 2D-array view");
 
+  Program cube_view;
+  cube_view.stage = ShaderType::Compute;
+  cube_view.blocks.resize(1);
+  cube_view.blocks[0].instructions = {
+      ImageUse(0x24, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Dim2DArray)};
+  Prepare(cube_view);
+  auto cube_snapshot = array_2d_snapshot;
+  cube_snapshot.images[0].dwords[3] =
+      Prospero::GpuEnumValue(Prospero::ImageType::kCube) << 28u;
+  Check(SpecializeResources(cube_view, cube_snapshot, &error) &&
+            ValidateResourceSpecialization(cube_view, cube_snapshot, &error) &&
+            cube_view.info.images[0].cube &&
+            cube_view.blocks[0].instructions[0].memory.image_cube,
+        "cube descriptor identity did not reach the specialized image and IR");
+  auto array_after_cube = cube_snapshot;
+  array_after_cube.images[0].dwords[3] =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u;
+  Check(!ValidateResourceSpecialization(cube_view, array_after_cube, &error),
+        "2D-array descriptor reused a cube-coordinate specialization");
+  auto null_after_cube = cube_snapshot;
+  null_after_cube.images[0].dwords.fill(0);
+  Check(SpecializeResources(cube_view, null_after_cube, &error) &&
+            ValidateResourceSpecialization(cube_view, null_after_cube, &error) &&
+            !cube_view.info.images[0].cube &&
+            !cube_view.blocks[0].instructions[0].memory.image_cube,
+        "canonical null respecialization retained stale cube-coordinate state");
+
   Program program;
   program.stage = ShaderType::Compute;
   program.blocks.resize(1);

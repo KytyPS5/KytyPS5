@@ -3396,6 +3396,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::DB_COUNT_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreDepthMetadataRegister(cmd_offset, value);
 	};
+	for (auto cmd_offset = Pm4::DB_SRESULTS_COMPARE_STATE0;
+	     cmd_offset <= Pm4::DB_SRESULTS_COMPARE_STATE1; cmd_offset++) {
+		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			HwCtxIgnoreDepthMetadataRegister(cmd_offset, value);
+		};
+	}
 	g_hw_ctx_indirect_func[Pm4::DB_RENDER_OVERRIDE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreDepthMetadataRegister(cmd_offset, value);
 	};

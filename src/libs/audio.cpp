@@ -1416,6 +1416,12 @@ struct Ngs2CustomSubmixerRackOption {
 	uint32_t             max_inputs   = 0;
 };
 
+struct Ngs2CustomMasteringRackOption {
+	Ngs2CustomRackOption custom_rack_option;
+	uint32_t             max_channels = 0;
+	uint32_t             max_inputs   = 0;
+};
+
 struct Ngs2CustomSamplerRackOption {
 	Ngs2CustomRackOption custom_rack_option;
 	uint32_t             max_channel_works        = 0;
@@ -1433,6 +1439,7 @@ union Ngs2RackOptionUnion {
 	Ngs2SubmixerRackOption       submixer;
 	Ngs2ReverbRackOption         reverb;
 	Ngs2CustomSubmixerRackOption custom_submixer;
+	Ngs2CustomMasteringRackOption custom_mastering;
 	Ngs2CustomSamplerRackOption  custom_sampler;
 };
 
@@ -1588,6 +1595,7 @@ enum class Ngs2RackType {
 	Mastering,
 	Reverb,
 	CustomSubmixer,
+	CustomMastering,
 	CustomSampler,
 };
 
@@ -1665,6 +1673,20 @@ struct Ngs2VoiceCallbackParam {
 
 struct Ngs2VoiceState {
 	uint32_t state_flags;
+	int32_t  error_code;
+};
+
+struct Ngs2SubmixerVoiceState {
+	Ngs2VoiceState voice_state;
+	float          envelope_height;
+	float          peak_height;
+	float          compressor_height;
+};
+
+struct Ngs2CustomMasteringVoiceState {
+	Ngs2VoiceState voice_state;
+	uint32_t       reserved;
+	uint32_t       reserved2;
 };
 
 struct Ngs2SamplerVoiceState {
@@ -1683,6 +1705,10 @@ static Ngs2RackInternal* g_racks_list = nullptr;
 
 static_assert(sizeof(Ngs2SystemOption) == 144);
 static_assert(sizeof(Ngs2RackOption) == 176);
+static_assert(sizeof(Ngs2VoiceState) == 8);
+static_assert(sizeof(Ngs2SubmixerVoiceState) == 20);
+static_assert(sizeof(Ngs2CustomMasteringVoiceState) == 16);
+static_assert(sizeof(Ngs2SamplerVoiceState) == 56);
 
 static uint32_t Ngs2GetStateFlags(const Ngs2VoiceInternal* voice) {
 	switch (voice->state) {
@@ -1726,6 +1752,7 @@ static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption* option, vo
 static bool Ngs2RackIsCustom(Ngs2RackType type) {
 	switch (type) {
 		case Ngs2RackType::CustomSubmixer:
+		case Ngs2RackType::CustomMastering:
 		case Ngs2RackType::CustomSampler: return true;
 		default: return false;
 	}
@@ -2036,6 +2063,12 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 			rack->option.custom_submixer =
 			    *reinterpret_cast<const Ngs2CustomSubmixerRackOption*>(option);
 			rack->type = Ngs2RackType::CustomSubmixer;
+			break;
+		case 0x4003:
+			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2CustomMasteringRackOption));
+			rack->option.custom_mastering =
+			    *reinterpret_cast<const Ngs2CustomMasteringRackOption*>(option);
+			rack->type = Ngs2RackType::CustomMastering;
 			break;
 		case 0x4001:
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2CustomSamplerRackOption));
@@ -2550,6 +2583,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			case 0x4002:
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSubmixer);
 				break;
+			case 0x4003:
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomMastering);
+				break;
 			default: EXIT("unknown rack_id: 0x%" PRIx32 "\n", rack_id);
 		}
 
@@ -2587,6 +2623,25 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 	Common::LockGuard lock(voice->rack->ngs->mutex);
 
 	switch (voice->rack->type) {
+		case Ngs2RackType::Submixer: {
+			EXIT_NOT_IMPLEMENTED(state_size != sizeof(Ngs2SubmixerVoiceState));
+			auto* submixer = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
+			*submixer     = {};
+			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
+			LOGF("\t state_flags = %u\n", submixer->voice_state.state_flags);
+			break;
+		}
+		case Ngs2RackType::CustomMastering: {
+			const auto configured_size =
+			    voice->rack->option.custom_mastering.custom_rack_option.state_size;
+			EXIT_NOT_IMPLEMENTED(configured_size < sizeof(Ngs2CustomMasteringVoiceState));
+			EXIT_NOT_IMPLEMENTED(state_size != configured_size);
+			std::memset(state, 0, state_size);
+			auto* mastering = reinterpret_cast<Ngs2CustomMasteringVoiceState*>(state);
+			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
+			LOGF("\t state_flags = %u\n", mastering->voice_state.state_flags);
+			break;
+		}
 		case Ngs2RackType::Sampler:
 		case Ngs2RackType::CustomSampler: {
 			if (state_size != sizeof(Ngs2SamplerVoiceState)) {

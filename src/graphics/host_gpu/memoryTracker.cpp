@@ -1,8 +1,83 @@
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#include <shared_mutex>
+#include <unordered_map>
+#endif
+
 #include "graphics/host_gpu/memoryTracker.h"
 
-#include "common/assert.h"
-
 namespace Libs::Graphics {
+
+#if defined(__APPLE__)
+
+namespace {
+struct ThreadOwner {
+	std::atomic<mach_port_t> thread {0};
+	std::atomic<const MemoryTracker*> owner {nullptr};
+};
+constexpr size_t MAX_TRACKER_THREADS = 64;
+ThreadOwner g_tracker_threads[MAX_TRACKER_THREADS] {};
+
+const MemoryTracker* GetUploadOwnerImpl() noexcept {
+	const mach_port_t self = mach_thread_self();
+	for (size_t i = 0; i < MAX_TRACKER_THREADS; i++) {
+		if (g_tracker_threads[i].thread.load(std::memory_order_relaxed) == self) {
+			return g_tracker_threads[i].owner.load(std::memory_order_relaxed);
+		}
+	}
+	return nullptr;
+}
+
+void SetUploadOwnerImpl(const MemoryTracker* owner) noexcept {
+	const mach_port_t self = mach_thread_self();
+	if (owner != nullptr) {
+		for (size_t i = 0; i < MAX_TRACKER_THREADS; i++) {
+			mach_port_t expected = 0;
+			if (g_tracker_threads[i].thread.compare_exchange_strong(expected, self, std::memory_order_relaxed) ||
+			    g_tracker_threads[i].thread.load(std::memory_order_relaxed) == self) {
+				g_tracker_threads[i].owner.store(owner, std::memory_order_relaxed);
+				return;
+			}
+		}
+	} else {
+		for (size_t i = 0; i < MAX_TRACKER_THREADS; i++) {
+			if (g_tracker_threads[i].thread.load(std::memory_order_relaxed) == self) {
+				g_tracker_threads[i].owner.store(nullptr, std::memory_order_relaxed);
+				g_tracker_threads[i].thread.store(0, std::memory_order_relaxed);
+				return;
+			}
+		}
+	}
+}
+} // namespace
+
+const MemoryTracker* MemoryTracker::GetUploadOwner() noexcept {
+	return GetUploadOwnerImpl();
+}
+
+void MemoryTracker::SetUploadOwner(const MemoryTracker* owner) noexcept {
+	SetUploadOwnerImpl(owner);
+}
+#else
+const MemoryTracker* MemoryTracker::GetUploadOwner() noexcept {
+	return s_upload_owner;
+}
+
+void MemoryTracker::SetUploadOwner(const MemoryTracker* owner) noexcept {
+	s_upload_owner = owner;
+}
+#endif
+
+#if defined(KYTY_MEMORY_TRACKER_TESTS)
+namespace {
+std::atomic<MemoryTracker::UnmapContentionHook> g_unmap_contention_hook {nullptr};
+}
+
+void MemoryTracker::SetUnmapContentionHook(UnmapContentionHook hook) noexcept {
+	g_unmap_contention_hook.store(hook, std::memory_order_release);
+}
+#endif
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 

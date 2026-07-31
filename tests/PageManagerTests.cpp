@@ -19,11 +19,25 @@
 #undef min
 #undef max
 #else
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <sys/syslimits.h>
+#endif
 #include <csignal>
+#include <fcntl.h>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <ucontext.h>
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE MAP_FIXED
+#endif
 #include <unistd.h>
 #endif
 
@@ -31,6 +45,10 @@ namespace {
 
 using Libs::Graphics::PageFaultAccess;
 using Libs::Graphics::PageManager;
+
+// Stored in main() for use by CheckDeathCase on non-Linux platforms where
+// /proc/self/exe is unavailable.
+const char *g_argv0 = nullptr;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -59,6 +77,27 @@ int ToHostProt(uint32_t protection) {
 }
 
 uint32_t Protection(const void *address) {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  const auto query_addr = reinterpret_cast<mach_vm_address_t>(address);
+  mach_vm_address_t region_addr = query_addr;
+  mach_vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info {};
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name = MACH_PORT_NULL;
+
+  kern_return_t kr = mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+                                     reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+  if (kr != KERN_SUCCESS || region_addr > query_addr || (region_addr + region_size) <= query_addr) {
+    return 0; // Not mapped
+  }
+  if ((info.protection & VM_PROT_WRITE) != 0) {
+    return PAGE_READWRITE;
+  }
+  if ((info.protection & VM_PROT_READ) != 0) {
+    return PAGE_READONLY;
+  }
+  return PAGE_NOACCESS;
+#else
   const auto addr = reinterpret_cast<uintptr_t>(address);
   std::FILE *maps = std::fopen("/proc/self/maps", "r");
   Check(maps != nullptr, "open /proc/self/maps failed");
@@ -80,6 +119,7 @@ uint32_t Protection(const void *address) {
   }
   std::fclose(maps);
   return result;
+#endif
 }
 
 bool IsWritable(const void *address) { return Protection(address) == PAGE_READWRITE; }
@@ -187,7 +227,11 @@ LONG CALLBACK NativeFaultHandler(EXCEPTION_POINTERS *exception) {
 // SIGSEGV stands in for the vectored exception handler.
 void NativeFaultHandler(int signal_number, siginfo_t *info, void *native_context) {
   auto *context = static_cast<ucontext_t *>(native_context);
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  const auto error_code = static_cast<uint64_t>(context->uc_mcontext->__es.__err);
+#else
   const auto error_code = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
+#endif
   const auto access = (error_code & 0x10u) != 0   ? PageFaultAccess::Execute
                       : (error_code & 0x02u) != 0 ? PageFaultAccess::Write
                                                   : PageFaultAccess::Read;
@@ -210,6 +254,9 @@ void NativeFaultHandler(int signal_number, siginfo_t *info, void *native_context
 }
 
 struct sigaction g_saved_segv_action {};
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+struct sigaction g_saved_bus_action {};
+#endif
 
 void *AddVectoredExceptionHandler(unsigned long /*first*/,
                                   void (*handler)(int, siginfo_t *, void *)) {
@@ -220,10 +267,21 @@ void *AddVectoredExceptionHandler(unsigned long /*first*/,
   if (::sigaction(SIGSEGV, &action, &g_saved_segv_action) != 0) {
     return nullptr;
   }
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  // On macOS, mprotect violations raise SIGBUS (EXC_BAD_ACCESS code=2)
+  // in addition to SIGSEGV; install the handler on both.
+  if (::sigaction(SIGBUS, &action, &g_saved_bus_action) != 0) {
+    ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr);
+    return nullptr;
+  }
+#endif
   return reinterpret_cast<void *>(handler);
 }
 
 int RemoveVectoredExceptionHandler(void * /*token*/) {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  ::sigaction(SIGBUS, &g_saved_bus_action, nullptr);
+#endif
   return ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0 ? 1 : 0;
 }
 #endif
@@ -678,7 +736,15 @@ void CheckDeathCase(const char *name) {
   const pid_t pid = ::fork();
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+    // /proc/self/exe does not exist on macOS; resolve full path via _NSGetExecutablePath.
+    char exe_buf[PATH_MAX]{};
+    uint32_t size = sizeof(exe_buf);
+    const char *exe = (_NSGetExecutablePath(exe_buf, &size) == 0) ? exe_buf : (g_argv0 != nullptr ? g_argv0 : "page_manager_tests");
+    ::execl(exe, "PageManagerTests", "--death", name, nullptr);
+#else
     ::execl("/proc/self/exe", "PageManagerTests", "--death", name, nullptr);
+#endif
     std::_Exit(0x7e);
   }
   int status = 0;
@@ -769,6 +835,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  g_argv0 = argc > 0 ? argv[0] : nullptr;
 #if 1
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);

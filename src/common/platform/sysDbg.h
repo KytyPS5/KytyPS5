@@ -16,7 +16,7 @@ struct sys_dbg_stack_info_t {
 	size_t    commited_size;
 
 	size_t total_size;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	uintptr_t code_addr;
 	uintptr_t addr;
 	uintptr_t commited_addr;

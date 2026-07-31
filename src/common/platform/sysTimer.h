@@ -26,7 +26,7 @@ struct SysTimeStruct {
 struct SysFileTimeStruct {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	FILETIME time;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	// Nanoseconds preserve sub-second file timestamps.
 	time_t time;
 	long   nanos;
@@ -124,7 +124,7 @@ inline void SysQueryPerformanceCounter(uint64_t* counter) {
 	*counter = c.QuadPart;
 }
 
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 
 inline void SysFileToSystemTimeUtc(const SysFileTimeStruct& f, SysTimeStruct& t) {
 	struct tm i {};

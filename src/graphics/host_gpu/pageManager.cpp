@@ -14,6 +14,13 @@
 #include <mutex>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#include <shared_mutex>
+#include <unordered_map>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -56,7 +63,46 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 // Zero is the unknown protection sentinel.
 constexpr uint32_t UNKNOWN_PROTECTION = 0;
 
+#if defined(__APPLE__)
+namespace {
+constexpr size_t MAX_FAULT_THREADS = 64;
+std::atomic<mach_port_t> g_fault_threads[MAX_FAULT_THREADS] {};
+
+bool GetInFaultResolution() noexcept {
+	const mach_port_t self = mach_thread_self();
+	for (size_t i = 0; i < MAX_FAULT_THREADS; i++) {
+		if (g_fault_threads[i].load(std::memory_order_relaxed) == self) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void SetInFaultResolution(bool value) noexcept {
+	const mach_port_t self = mach_thread_self();
+	if (value) {
+		for (size_t i = 0; i < MAX_FAULT_THREADS; i++) {
+			mach_port_t expected = 0;
+			if (g_fault_threads[i].compare_exchange_strong(expected, self, std::memory_order_relaxed)) {
+				return;
+			}
+		}
+	} else {
+		for (size_t i = 0; i < MAX_FAULT_THREADS; i++) {
+			if (g_fault_threads[i].load(std::memory_order_relaxed) == self) {
+				g_fault_threads[i].store(0, std::memory_order_relaxed);
+				return;
+			}
+		}
+	}
+}
+} // anonymous namespace
+#define g_in_fault_resolution GetInFaultResolution()
+#define SET_IN_FAULT_RESOLUTION(v) SetInFaultResolution(v)
+#else
 thread_local bool g_in_fault_resolution = false;
+#define SET_IN_FAULT_RESOLUTION(v) (g_in_fault_resolution = (v))
+#endif
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
@@ -108,7 +154,7 @@ uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return GetCurrentThreadId();
 #elif defined(__APPLE__)
-	return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+	return static_cast<uint32_t>(mach_thread_self());
 #elif defined(__linux__)
 	static thread_local const uint32_t tid = [] {
 		const auto raw = static_cast<uint32_t>(::syscall(SYS_gettid));
@@ -657,20 +703,20 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 		page.resolving_read_write = page.access_watchers != 0;
 		break;
 	}
-	g_in_fault_resolution = true;
+	SET_IN_FAULT_RESOLUTION(true);
 	const bool handled    = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
 	                                              PageFaultPhase::Invalidate);
-	g_in_fault_resolution = false;
+	SET_IN_FAULT_RESOLUTION(false);
 	{
 		SpinGuard lock(page.lock);
 		if (!handled || !page.resolving) {
 			FailFast("fault invalidation did not preserve the resolving state");
 		}
 	}
-	g_in_fault_resolution = true;
+	SET_IN_FAULT_RESOLUTION(true);
 	const bool completed  = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
 	                                              PageFaultPhase::Complete);
-	g_in_fault_resolution = false;
+	SET_IN_FAULT_RESOLUTION(false);
 	{
 		SpinGuard lock(page.lock);
 		if (!completed || !page.resolving) {
@@ -699,10 +745,10 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 		page.resolving            = false;
 		page.resolving_read_write = false;
 	}
-	g_in_fault_resolution = true;
+	SET_IN_FAULT_RESOLUTION(true);
 	const bool released   = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
 	                                              PageFaultPhase::Release);
-	g_in_fault_resolution = false;
+	SET_IN_FAULT_RESOLUTION(false);
 	if (!released) {
 		FailFast("fault release callback failed");
 	}

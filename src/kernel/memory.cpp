@@ -38,7 +38,7 @@
 #ifndef MEM_COALESCE_PLACEHOLDERS
 #define MEM_COALESCE_PLACEHOLDERS 0x00000001
 #endif
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>

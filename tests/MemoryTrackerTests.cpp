@@ -20,12 +20,29 @@
 #undef min
 #undef max
 #else
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #include <csignal>
+#include <fcntl.h>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE MAP_FIXED
+#endif
+#endif
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <sys/syslimits.h>
 #endif
 
 namespace {
@@ -37,6 +54,10 @@ using Libs::Graphics::PageFaultAccess;
 using Libs::Graphics::PageFaultPhase;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::PageWatchMode;
+
+// Stored in main() for use by TestFatalPaths on non-Linux platforms where
+// /proc/self/exe is unavailable.
+const char *g_argv0 = nullptr;
 using Libs::Graphics::RegionManager;
 using Libs::Graphics::RangeSet;
 
@@ -57,6 +78,12 @@ constexpr uint32_t MEM_RESERVE = 0;
 constexpr uint32_t MEM_COMMIT = 0;
 constexpr uint32_t MEM_RELEASE = 0;
 
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+constexpr uintptr_t kTestBaseAddress = 0x0000000400010000ull;
+#else
+constexpr uintptr_t kTestBaseAddress = 0x0000000200010000ull;
+#endif
+
 int ToHostProt(uint32_t protection) {
   switch (protection) {
   case PAGE_NOACCESS:
@@ -69,6 +96,27 @@ int ToHostProt(uint32_t protection) {
 }
 
 uint32_t Protection(const void *address) {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  const auto query_addr = reinterpret_cast<mach_vm_address_t>(address);
+  mach_vm_address_t region_addr = query_addr;
+  mach_vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info {};
+  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name = MACH_PORT_NULL;
+
+  kern_return_t kr = mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+                                     reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+  if (kr != KERN_SUCCESS || region_addr > query_addr || (region_addr + region_size) <= query_addr) {
+    return 0; // Not mapped
+  }
+  if ((info.protection & VM_PROT_WRITE) != 0) {
+    return PAGE_READWRITE;
+  }
+  if ((info.protection & VM_PROT_READ) != 0) {
+    return PAGE_READONLY;
+  }
+  return PAGE_NOACCESS;
+#else
   const auto addr = reinterpret_cast<uintptr_t>(address);
   std::FILE *maps = std::fopen("/proc/self/maps", "r");
   Check(maps != nullptr, "open /proc/self/maps failed");
@@ -90,6 +138,7 @@ uint32_t Protection(const void *address) {
   }
   std::fclose(maps);
   return result;
+#endif
 }
 
 bool IsWritable(const void *address) { return Protection(address) == PAGE_READWRITE; }
@@ -117,9 +166,9 @@ int VirtualFree(void *address, size_t /*size*/, DWORD /*type*/) {
   if (it == sizes.end()) {
     return 0;
   }
-  const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
+  const size_t alloc_size = it->second;
   sizes.erase(it);
-  return ok;
+  return ::munmap(address, alloc_size) == 0 ? 1 : 0;
 }
 
 [[maybe_unused]] int VirtualProtect(void *address, size_t size, uint32_t protection,
@@ -134,7 +183,17 @@ int VirtualFree(void *address, size_t /*size*/, DWORD /*type*/) {
 class SharedPage final {
  public:
   SharedPage(uintptr_t address, uint64_t size) : size_(static_cast<size_t>(size)) {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+    char shm_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/kyty-test-sp-%d-%llx", static_cast<int>(getpid()),
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
+    fd_ = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd_ >= 0) {
+      shm_unlink(shm_name);
+    }
+#else
     fd_ = static_cast<int>(::syscall(SYS_memfd_create, "kyty-shared-page", 0u));
+#endif
     Check(fd_ >= 0, "memfd_create failed");
     Check(::ftruncate(fd_, static_cast<off_t>(size)) == 0, "ftruncate failed");
     guest = static_cast<uint8_t *>(::mmap(reinterpret_cast<void *>(address), size_,
@@ -408,16 +467,27 @@ LONG CALLBACK NativeTrackerFaultHandler(EXCEPTION_POINTERS *exception) {
 // SIGSEGV stands in for the vectored exception handler.
 void NativeTrackerFaultHandler(int signal_number, siginfo_t *info, void *native_context) {
   auto *context = static_cast<ucontext_t *>(native_context);
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  const auto error_code = static_cast<uint64_t>(context->uc_mcontext->__es.__err);
+#else
   const auto error_code = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
-  const auto access = (error_code & 0x10u) != 0    ? PageFaultAccess::Execute
+#endif
+  auto access = (error_code & 0x10u) != 0    ? PageFaultAccess::Execute
                       : (error_code & 0x02u) != 0 ? PageFaultAccess::Write
                                                   : PageFaultAccess::Read;
   auto *page_manager = g_native_page_manager.load(std::memory_order_acquire);
   if (page_manager != nullptr) {
     g_native_fault_entered.store(true, std::memory_order_release);
-    if (page_manager->HandleFault(access, reinterpret_cast<uint64_t>(info->si_addr))) {
+    const auto fault_vaddr = reinterpret_cast<uint64_t>(info->si_addr);
+    if (page_manager->HandleFault(access, fault_vaddr)) {
       return;
     }
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+    if (access == PageFaultAccess::Read &&
+        page_manager->HandleFault(PageFaultAccess::Write, fault_vaddr)) {
+      return;
+    }
+#endif
   }
   struct sigaction restore {};
   restore.sa_handler = SIG_DFL;
@@ -426,6 +496,7 @@ void NativeTrackerFaultHandler(int signal_number, siginfo_t *info, void *native_
 }
 
 struct sigaction g_saved_segv_action {};
+struct sigaction g_saved_bus_action {};
 
 void *AddVectoredExceptionHandler(unsigned long /*first*/,
                                   void (*handler)(int, siginfo_t *, void *)) {
@@ -436,16 +507,25 @@ void *AddVectoredExceptionHandler(unsigned long /*first*/,
   if (::sigaction(SIGSEGV, &action, &g_saved_segv_action) != 0) {
     return nullptr;
   }
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  if (::sigaction(SIGBUS, &action, &g_saved_bus_action) != 0) {
+    return nullptr;
+  }
+#endif
   return reinterpret_cast<void *>(handler);
 }
 
 int RemoveVectoredExceptionHandler(void * /*token*/) {
-  return ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0 ? 1 : 0;
+  bool ok = ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0;
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  ok = ok && (::sigaction(SIGBUS, &g_saved_bus_action, nullptr) == 0);
+#endif
+  return ok ? 1 : 0;
 }
 #endif
 
 void TestPendingFaultBlocksUploadConsumption() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   PageManager page_manager(DummyFault, nullptr);
   const auto page_size = page_manager.GetPageSize();
@@ -495,7 +575,7 @@ void TestPendingFaultBlocksUploadConsumption() {
 }
 
 void TestCleanReadFaultPreservesCpuState() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   PageManager page_manager(DummyFault, nullptr);
   MemoryTracker tracker(page_manager);
   const auto page_size = page_manager.GetPageSize();
@@ -525,7 +605,7 @@ void TestCleanReadFaultPreservesCpuState() {
 }
 
 void TestGpuDownloadFaultOwnership() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   DownloadTrackerHarness harness;
   const auto page_size = harness.page_manager.GetPageSize();
   SharedPage shared(base, page_size);
@@ -567,7 +647,7 @@ void TestGpuDownloadFaultOwnership() {
 }
 
 void TestVirtualGpuWriteDiscard() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness(PageWatchMode::Write);
   harness.discard_virtual = true;
   const auto page_size = harness.page_manager.GetPageSize();
@@ -594,7 +674,7 @@ void TestVirtualGpuWriteDiscard() {
 }
 
 void TestSameSlabTrackerArbitration() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   SplitTrackerHarness harness;
   const auto page_size = harness.page_manager.GetPageSize();
   auto *memory = static_cast<uint8_t *>(VirtualAlloc(
@@ -643,7 +723,7 @@ void TestSameSlabTrackerArbitration() {
 }
 
 void TestSharedMetadataAndImagePageFault() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   SharedMetadataImageHarness harness;
   const auto page_size = harness.page_manager.GetPageSize();
   auto *memory = static_cast<uint8_t *>(VirtualAlloc(
@@ -745,7 +825,7 @@ void TestRangeInvalidation() {
 }
 
 void TestCpuDirtyUploadAndFault() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -792,7 +872,7 @@ void TestCpuDirtyUploadAndFault() {
 }
 
 void TestFaultDuringUploadRemainsDirty() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -820,7 +900,7 @@ void TestFaultDuringUploadRemainsDirty() {
 }
 
 void TestNativeStoreDuringRangeEnumeration() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -865,7 +945,7 @@ void TestNativeStoreDuringRangeEnumeration() {
 }
 
 void TestFaultDuringDownloadSynchronization() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -948,7 +1028,7 @@ void TestFaultDuringDownloadSynchronization() {
 }
 
 void TestFaultAndExplicitDirtyRace() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -989,7 +1069,7 @@ void TestFaultAndExplicitDirtyRace() {
 }
 
 void TestSharedTrackersAndConcurrentPageFaults() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   SharedTrackerHarness harness;
   const auto page_size = harness.page_manager.GetPageSize();
   auto *memory = static_cast<uint8_t *>(
@@ -1041,7 +1121,7 @@ void TestSharedTrackersAndConcurrentPageFaults() {
 }
 
 void TestGpuDirtyBits() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -1074,7 +1154,7 @@ void TestGpuDirtyBits() {
 }
 
 void TestCrossRegionUpload() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1109,7 +1189,7 @@ void TestCrossRegionUpload() {
 }
 
 [[noreturn]] void RunDeathCase(const char *name) {
-  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uintptr_t base = kTestBaseAddress;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -1189,7 +1269,13 @@ void TestCrossRegionUpload() {
 }
 
 void TestFatalPaths() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+  char exe_buf[PATH_MAX]{};
+  char real_buf[PATH_MAX]{};
+  uint32_t size = sizeof(exe_buf);
+  const char *raw_exe = (_NSGetExecutablePath(exe_buf, &size) == 0) ? exe_buf : (g_argv0 != nullptr ? g_argv0 : "memory_tracker_tests");
+  const char *exe_path = ::realpath(raw_exe, real_buf) != nullptr ? real_buf : raw_exe;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   char path[MAX_PATH]{};
   Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
         "GetModuleFileName failed");
@@ -1198,6 +1284,8 @@ void TestFatalPaths() {
                            "gpu-dirty-explicit-cpu",
                            "reentrant-upload", "writable-upload-race",
                            "missing-download-bytes"}) {
+    std::fflush(stdout);
+    std::fflush(stderr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     std::string command = std::string("\"") + path + "\" --death " + name;
     std::vector<char> mutable_command(command.begin(), command.end());
@@ -1221,7 +1309,17 @@ void TestFatalPaths() {
     const pid_t pid = ::fork();
     Check(pid >= 0, "fork failed");
     if (pid == 0) {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+      int devnull = ::open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        ::dup2(devnull, STDOUT_FILENO);
+        ::dup2(devnull, STDERR_FILENO);
+        ::close(devnull);
+      }
+      ::execl(exe_path, "MemoryTrackerTests", "--death", name, nullptr);
+#else
       ::execl("/proc/self/exe", "MemoryTrackerTests", "--death", name, nullptr);
+#endif
       std::_Exit(0x7e);
     }
     int status = 0;
@@ -1229,6 +1327,9 @@ void TestFatalPaths() {
     // Exit status carries only the low 8 bits.
     const bool fatal_exit = WIFEXITED(status) && (WEXITSTATUS(status) == (321 & 0xff) ||
                                                   WEXITSTATUS(status) == (322 & 0xff));
+    std::printf("Death case %s: status=%d, WIFEXITED=%d, WIFSIGNALED=%d, WEXITSTATUS=%d, fatal_exit=%d, WTERMSIG=%d\n",
+                name, status, WIFEXITED(status), WIFSIGNALED(status), WEXITSTATUS(status), fatal_exit, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    std::fflush(stdout);
     Check(fatal_exit || WIFSIGNALED(status),
           "MemoryTracker death path used the wrong exit");
 #endif
@@ -1247,6 +1348,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  g_argv0 = argc > 0 ? argv[0] : nullptr;
 #if 1
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);

@@ -731,7 +731,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	rasterizer.sType                   = vk::StructureType::ePipelineRasterizationStateCreateInfo;
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
-#if defined(__APPLE__)
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	rasterizer.pNext                   = nullptr;
 #else
 	rasterizer.pNext                   = &clip_ext;
@@ -815,7 +815,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	color_blending.sType             = vk::StructureType::ePipelineColorBlendStateCreateInfo;
 	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
 	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if defined(__APPLE__)
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	color_blending.pNext             = nullptr;
 #else
 	color_blending.pNext             = &color_write;
@@ -885,7 +885,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	depth_stencil_info.depthWriteEnable = (static_params.depth_write_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.depthCompareOp   = static_params.depth_compare_op;
 	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
 #else
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
@@ -909,7 +909,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && KYTY_PLATFORM != KYTY_PLATFORM_MACOS
 	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
 #endif
 	};

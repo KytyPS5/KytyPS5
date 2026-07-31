@@ -16,7 +16,7 @@
 #endif
 
 // macOS has no clock_nanosleep.
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && KYTY_PLATFORM != KYTY_PLATFORM_MACOS && !defined(__APPLE__)
 #define KYTY_POSIX_HIGH_RES_SLEEP
 #include <ctime>
 #endif

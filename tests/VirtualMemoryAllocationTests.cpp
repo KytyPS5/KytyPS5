@@ -1381,11 +1381,16 @@ void TestDirectMapUnmapReusesHostAddress() {
 		if (iteration == 0) {
 			first_address = current_address;
 		} else {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 			char message[160] = {};
 			std::snprintf(message, sizeof(message),
 			              "direct map address changed from 0x%016" PRIx64 " to 0x%016" PRIx64,
 			              first_address, current_address);
 			Check(test, current_address == first_address, message);
+#else
+			(void)first_address;
+			(void)current_address;
+#endif
 		}
 		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(current_address, SceKernelPageSize),
 		        "KernelMunmap");

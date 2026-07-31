@@ -217,7 +217,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		if (color_write_ext.colorWriteEnable != VK_TRUE) {
 			LOGF("colorWriteEnable is not supported\n");
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && KYTY_PLATFORM != KYTY_PLATFORM_MACOS
 			skip_device = true;
 #endif
 		}
@@ -228,7 +228,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 		if (depth_clip_enable.depthClipEnable != VK_TRUE) {
 			LOGF("depthClipEnable is not supported\n");
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && KYTY_PLATFORM != KYTY_PLATFORM_MACOS
 			skip_device = true;
 #endif
 		}
@@ -275,7 +275,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 		if (device_features2.features.depthBounds != VK_TRUE) {
 			LOGF("depthBounds is not supported\n");
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && KYTY_PLATFORM != KYTY_PLATFORM_MACOS
 			skip_device = true;
 #endif
 		}
@@ -503,7 +503,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
 	// feature structs from the chain on macOS (the renderer falls back to default depth
 	// clipping and static color-write masks).
-#if defined(__APPLE__)
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	depth_clip_control.pNext = nullptr;
 #else
 	depth_clip_control.pNext = &depth_clip_enable;
@@ -554,7 +554,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.fragmentStoresAndAtomics             = VK_TRUE;
 	device_features.samplerAnisotropy                    = VK_TRUE;
 	device_features.robustBufferAccess                   = VK_TRUE;
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && KYTY_PLATFORM != KYTY_PLATFORM_MACOS
 	device_features.depthBounds                          = VK_TRUE; // unsupported by MoltenVK
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
@@ -914,7 +914,7 @@ void WindowContext::CreateVulkan() {
 	                                              VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 	                                              "VK_KHR_maintenance1"};
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
 	// falls back to default depth clipping and static color-write masks on macOS. It also
 	// requires VK_KHR_portability_subset per the Vulkan portability spec.

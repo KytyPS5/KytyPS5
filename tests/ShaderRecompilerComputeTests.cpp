@@ -87,6 +87,10 @@
 #undef max
 #endif
 
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+#include <dlfcn.h>
+#endif
+
 namespace Libs::Graphics {
 
 template <typename Cache>
@@ -8208,10 +8212,43 @@ private:
   }
 
   void Init() {
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+    // macOS SIP strips DYLD_LIBRARY_PATH from child processes, so bare
+    // library names ("libvulkan.dylib") won't resolve to /opt/homebrew/lib.
+    // Try Homebrew paths explicitly before falling back to the default search.
+    static const char *const kMacOsVulkanPaths[] = {
+        "/Users/abin/workspace/projects/KytyPS5/_Build/macos/vulkan-deps/lib/libvulkan.dylib",
+        "/Users/abin/workspace/projects/KytyPS5/_Build/macos/vulkan-deps/lib/libMoltenVK.dylib",
+        "/Users/abin/workspace/projects/KytyPS5/_Build/vulkan-deps/lib/libvulkan.dylib",
+        "/Users/abin/workspace/projects/KytyPS5/_Build/vulkan-deps/lib/libMoltenVK.dylib",
+        "/opt/homebrew/lib/libvulkan.dylib",
+        "/opt/homebrew/lib/libvulkan.1.dylib",
+        "/usr/local/lib/libvulkan.dylib",
+        "/opt/homebrew/lib/libMoltenVK.dylib",
+        nullptr,
+    };
+    static vk::detail::DynamicLoader loader = [&]() -> vk::detail::DynamicLoader {
+        for (const char *const *p = kMacOsVulkanPaths; *p != nullptr; ++p) {
+            void *h = dlopen(*p, RTLD_NOW | RTLD_LOCAL);
+            if (h != nullptr) {
+                std::fprintf(stderr, "VulkanHarness: successfully opened %s\n", *p);
+                dlclose(h);
+                return vk::detail::DynamicLoader(std::string(*p));
+            } else {
+                std::fprintf(stderr, "VulkanHarness: failed dlopen %s: %s\n", *p, dlerror());
+            }
+        }
+        return vk::detail::DynamicLoader(); // default probe
+    }();
+#else
     static vk::detail::DynamicLoader loader;
+#endif
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
             "vkGetInstanceProcAddr");
+    if (get_instance_proc_addr == nullptr) {
+        std::fprintf(stderr, "VulkanHarness: get_instance_proc_addr is null! loader success=%d\n", (int)loader.success());
+    }
     Require("VulkanHarness", "dispatch", get_instance_proc_addr != nullptr,
             "could not load the Vulkan loader");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
@@ -8224,6 +8261,16 @@ private:
     vk::InstanceCreateInfo instance_info{};
     instance_info.sType = vk::StructureType::eInstanceCreateInfo;
     instance_info.pApplicationInfo = &app;
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+    std::vector<const char *> instance_extensions = {
+        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+    };
+    instance_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+    instance_info.enabledExtensionCount =
+        static_cast<uint32_t>(instance_extensions.size());
+    instance_info.ppEnabledExtensionNames = instance_extensions.data();
+#endif
     RequireVk("VulkanHarness", "dispatch",
               vk::createInstance(&instance_info, nullptr, &m_instance),
               "vkCreateInstance");
@@ -8322,10 +8369,14 @@ private:
     device_features.shaderStorageImageReadWithoutFormat = true;
     device_features.sampleRateShading = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
+    device_extensions.push_back("VK_KHR_portability_subset");
+#endif
+    device_info.enabledExtensionCount =
+        static_cast<uint32_t>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");

@@ -122,6 +122,12 @@ elseif(CLANG OR GCC)
 	    set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -fno-rtti -fno-exceptions -fcolor-diagnostics -finput-charset=UTF-8 -fexec-charset=UTF-8 -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -fmessage-length=0")
 	    if (WIN32)
 	    	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -static")
+	    elseif(APPLE)
+	    	# Force "initial exec" TLS model on macOS. The default "global dynamic"
+	    	# model uses _tlv_get_addr (lazy TLS bootstrap) which crashes under
+	    	# Rosetta 2 when a thread_local is first accessed early in startup.
+	    	# "initial exec" allocates all TLS slots eagerly at load time.
+	    	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -ftls-model=initial-exec")
 	    endif()
 	else()
 		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -fno-exceptions -fdiagnostics-color=always -finput-charset=UTF-8 -fexec-charset=UTF-8 -static-libgcc -static-libstdc++ -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -Wno-unused-value -fmessage-length=0")

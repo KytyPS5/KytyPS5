@@ -36,7 +36,7 @@
 #include <windows.h>
 #endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
@@ -4597,6 +4597,6 @@ int KYTY_SYSV_ABI pthread_getstack(const LibKernel::PthreadAttr* __restrict attr
 
 } // namespace Libs
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 #pragma GCC diagnostic pop
 #endif

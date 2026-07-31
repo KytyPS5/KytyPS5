@@ -8,7 +8,11 @@
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
 #include <csignal>
+#include <mach/mach.h>
+#include <pthread.h>
+#include <shared_mutex>
 #include <sys/ucontext.h>
+#include <unordered_map>
 #else
 #include <csignal>
 #include <initializer_list>
@@ -140,7 +144,43 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
-static thread_local bool    g_in_exception_filter = false;
+#if defined(__APPLE__)
+namespace {
+constexpr size_t MAX_FILTER_THREADS = 64;
+std::atomic<mach_port_t> g_filter_threads[MAX_FILTER_THREADS] {};
+
+bool GetInExceptionFilter() noexcept {
+	const mach_port_t self = mach_thread_self();
+	for (size_t i = 0; i < MAX_FILTER_THREADS; i++) {
+		if (g_filter_threads[i].load(std::memory_order_relaxed) == self) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void SetInExceptionFilter(bool value) noexcept {
+	const mach_port_t self = mach_thread_self();
+	if (value) {
+		for (size_t i = 0; i < MAX_FILTER_THREADS; i++) {
+			mach_port_t expected = 0;
+			if (g_filter_threads[i].compare_exchange_strong(expected, self, std::memory_order_relaxed)) {
+				return;
+			}
+		}
+	} else {
+		for (size_t i = 0; i < MAX_FILTER_THREADS; i++) {
+			if (g_filter_threads[i].load(std::memory_order_relaxed) == self) {
+				g_filter_threads[i].store(0, std::memory_order_relaxed);
+				return;
+			}
+		}
+	}
+}
+} // namespace
+#else
+static thread_local bool g_in_exception_filter = false;
+#endif
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
@@ -170,10 +210,17 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 // re-executing the faulting instruction against the now-fixed protection. An unresolved
 // fault restores the default disposition so the retry terminates the process.
 static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
+#if defined(__APPLE__)
+	if (GetInExceptionFilter()) {
+		FailFast("nested exception while resolving a host fault");
+	}
+	SetInExceptionFilter(true);
+#else
 	if (g_in_exception_filter) {
 		FailFast("nested exception while resolving a host fault");
 	}
 	g_in_exception_filter = true;
+#endif
 
 	auto*       uc  = static_cast<ucontext_t*>(uctx);
 	const auto* mc  = uc->uc_mcontext;
@@ -215,7 +262,11 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	}
 
 	const bool resolved = handler(info);
+#if defined(__APPLE__)
+	SetInExceptionFilter(false);
+#else
 	g_in_exception_filter = false;
+#endif
 
 	if (resolved) {
 		return; // retry the faulting instruction against the fixed mapping
@@ -307,7 +358,11 @@ bool InstallHandler(Handler handler) {
 
 	uint32_t expected_state = 0;
 	if (!g_install_state.compare_exchange_strong(expected_state, 1, std::memory_order_acq_rel)) {
-		return expected_state == 2 && g_handler.load(std::memory_order_acquire) == handler;
+		if (g_install_state.load(std::memory_order_acquire) == 2) {
+			g_handler.store(handler, std::memory_order_release);
+			return true;
+		}
+		return false;
 	}
 
 	g_handler.store(handler, std::memory_order_release);

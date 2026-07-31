@@ -4,6 +4,10 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
 endif()
 
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+	set(CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "Build architecture for macOS" FORCE)
+endif()
+
 project(Kyty)
 
 if(CMAKE_SYSTEM_NAME MATCHES ".*Linux")
@@ -47,8 +51,9 @@ else()
 	set(KYTY_BUILD KYTY_BUILD_RELEASE)
 endif()
 
-if(LINUX OR APPLE)
-	# macOS rides the POSIX/Linux code paths until it gets a dedicated platform
+if(APPLE)
+	set(KYTY_PLATFORM KYTY_PLATFORM_MACOS)
+elseif(LINUX)
 	set(KYTY_PLATFORM KYTY_PLATFORM_LINUX)
 else()
 	set(KYTY_PLATFORM KYTY_PLATFORM_WINDOWS)
@@ -186,7 +191,7 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	loader/*.h
 )
 
-find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
+find_program(KYTY_GLSLANG_VALIDATOR glslangValidator HINTS /opt/homebrew/bin /usr/local/bin REQUIRED)
 set(gpu_tiler_shader_dir "${CMAKE_CURRENT_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
 set(gpu_tiler_shader_names
@@ -478,6 +483,42 @@ if(BUILD_TESTING)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	endif()
+
+	if(APPLE)
+		# Homebrew on Apple Silicon installs to /opt/homebrew/lib; Vulkan-hpp's DynamicLoader
+		# only probes /usr/local/lib as a fallback. Inject the Homebrew path so ctest finds
+		# libvulkan.dylib without requiring DYLD_LIBRARY_PATH to be set manually.
+		set(KYTY_VULKAN_TESTS
+			shader_recompiler_compute
+			command_scheduler_timeline
+			stream_buffer_ring
+			gpu_command_lane
+			gpu_tiler
+			texture_cache_layered_image
+			texture_cache_image_views
+			texture_cache_storage_sampled
+			texture_cache_depth_readback
+			buffer_cache_dirty_gc
+		)
+		set_tests_properties(${KYTY_VULKAN_TESTS} PROPERTIES
+			ENVIRONMENT "VK_DRIVER_FILES=${PROJECT_BINARY_DIR}/vulkan-deps/icd.d/MoltenVK_icd.json;VK_ICD_FILENAMES=${PROJECT_BINARY_DIR}/vulkan-deps/icd.d/MoltenVK_icd.json"
+		)
+	endif()
+
+	add_custom_target(build_tests DEPENDS
+		shader_cfg_tests
+		scalar_provenance_tests
+		page_manager_tests
+		memory_tracker_tests
+		shader_vertex_metadata_tests
+		shader_stage_runtime_tests
+		resource_tracking_tests
+		resource_mutex_tests
+		event_queue_lifetime_tests
+		image_page_table_tests
+		shader_recompiler_compute_tests
+		virtual_memory_allocation_tests
+	)
 endif()
 
 

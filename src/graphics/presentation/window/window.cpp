@@ -247,7 +247,7 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	     (key.repeat ? "repeat" : ""), key.scan_code, key.key_code, key.mod);
 #endif
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX || KYTY_PLATFORM == KYTY_PLATFORM_MACOS
 	if (key.down) {
 		switch (key.key_code) {
 			case SDLK_ESCAPE: game.need_exit = true; break;

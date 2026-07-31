@@ -374,6 +374,8 @@ enum class BufferFormat : uint32_t {
 	k32_32_32_32UInt    = 75,
 	k32_32_32_32SInt    = 76,
 	k32_32_32_32Float   = 77,
+	k8Srgb              = 128,
+	k8_8Srgb            = 129,
 	k8_8_8_8Srgb        = 130,
 	k9_9_9_5Float       = 132,
 	k5_6_5UNorm         = 133,

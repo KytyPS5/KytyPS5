@@ -1917,17 +1917,23 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(6, Pm4::IT_COPY_DATA, 0u));
 
-	const uint32_t control       = buffer[0];
-	const uint32_t src_sel       = ((control & 0xfu) << 1u) | ((control >> 30u) & 0x1u);
-	const uint32_t dst_sel       = ((control >> 8u) & 0xfu) << 1u;
-	const uint8_t  src_cache     = static_cast<uint8_t>((control >> 13u) & 0x3u);
-	const uint8_t  dst_cache     = static_cast<uint8_t>((control >> 25u) & 0x3u);
-	const uint8_t  write_confirm = static_cast<uint8_t>((control >> 20u) & 0x1u);
-	const uint32_t num_bytes     = ((control >> 16u) & 0x1u) != 0 ? 8u : 4u;
-	const uint64_t src           = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
-	const uint64_t dst           = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
-	if (src_sel == (9u << 1u)) {
-		if (dst_sel != (2u << 1u) || dst == 0 || (dst & (num_bytes - 1u)) != 0) {
+	const uint32_t control             = buffer[0];
+	const uint32_t src_sel             = ((control & 0xfu) << 1u) | ((control >> 30u) & 0x1u);
+	const uint32_t dst_sel             = ((control >> 8u) & 0xfu) << 1u;
+	const uint8_t  src_cache           = static_cast<uint8_t>((control >> 13u) & 0x3u);
+	const uint8_t  dst_cache           = static_cast<uint8_t>((control >> 25u) & 0x3u);
+	const uint8_t  write_confirm       = static_cast<uint8_t>((control >> 20u) & 0x1u);
+	const uint32_t num_bytes           = ((control >> 16u) & 0x1u) != 0 ? 8u : 4u;
+	const uint64_t src                 = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	const uint64_t dst                 = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	uint32_t       reference_clock_dst = 0;
+	switch (src_sel) {
+		case 9u: reference_clock_dst = 2u; break;
+		case 18u: reference_clock_dst = 4u; break;
+		default: break;
+	}
+	if (reference_clock_dst != 0) {
+		if (dst_sel != reference_clock_dst || dst == 0 || (dst & (num_bytes - 1u)) != 0) {
 			EXIT("unsupported reference-clock copyData, src_sel=0x%02" PRIx32
 			     " dst_sel=0x%02" PRIx32 " dst=0x%016" PRIx64 " size=%u\n",
 			     src_sel, dst_sel, dst, num_bytes);

@@ -314,6 +314,16 @@ function(add_kyty_full_emulator_test target source)
 	endif()
 endfunction()
 
+function(configure_macos_guest_address_space target)
+	if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
+			(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
+		target_sources(${target} PRIVATE kernel/macosGuestAddressSpace.cpp)
+		target_compile_definitions(${target} PRIVATE KYTY_LINKED_GUEST_ADDRESS_SPACE=1)
+		target_link_options(${target} PRIVATE
+			-Wl,-ld_classic,-no_pie,-no_fixup_chains,-no_huge,-pagezero_size,0x40000,-segaddr,SYSTEM_MANAGED,0x40000,-segaddr,SYSTEM_RESERVED,0x7ffffc000,-segaddr,USER_AREA,0x7000000000,-image_base,0x700000000000)
+	endif()
+endfunction()
+
 add_kyty_full_emulator_test(shader_cfg_tests ../tests/shaderCfgTests.cpp)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
@@ -420,6 +430,7 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
+configure_macos_guest_address_space(virtual_memory_allocation_tests)
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
@@ -471,6 +482,7 @@ endif()
 
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})
+configure_macos_guest_address_space(kyty_emulator)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

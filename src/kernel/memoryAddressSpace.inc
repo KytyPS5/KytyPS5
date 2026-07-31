@@ -1060,7 +1060,9 @@ private:
 		}};
 		for (const auto& [start, end]: regions) {
 			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-#if defined(MAP_FIXED_NOREPLACE)
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+			flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
 			flags |= MAP_FIXED_NOREPLACE;
 #endif
 			void* ptr = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE, flags, -1, 0);

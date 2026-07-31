@@ -88,12 +88,12 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 
 	PipelineStaticParameters static_params {};
 	GraphicsPipeline         p {};
-	p.ps_shader_id   = ps_id;
-	p.vs_shader_id   = vs_id;
+	p.ps_shader_id = ps_id;
+	p.vs_shader_id = vs_id;
 
 	static_params.color_count = color_count;
 	PipelineRenderingState rendering {};
-	rendering.color_count = color_count;
+	rendering.color_count       = color_count;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		EXIT_IF(!colors[i].image_id || colors[i].format == vk::Format::eUndefined);
@@ -116,8 +116,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		if (attachment_samples == 0) {
 			attachment_samples = depth.samples;
 		} else if (attachment_samples != depth.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n",
-			     attachment_samples, depth.samples);
+			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
+			     depth.samples);
 		}
 	}
 	EXIT_IF(attachment_samples == 0 ||
@@ -179,10 +179,10 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	NormalizeStaticParamsForDynamicState(static_params);
 
 	GraphicsPipelineKey key {};
-	key.rendering      = rendering;
-	key.vs_shader_id   = p.vs_shader_id;
-	key.ps_shader_id   = p.ps_shader_id;
-	key.static_params  = static_params;
+	key.rendering     = rendering;
+	key.vs_shader_id  = p.vs_shader_id;
+	key.ps_shader_id  = p.ps_shader_id;
+	key.static_params = static_params;
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return *iter->second;
@@ -203,9 +203,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
 	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, rendering, vs_input_info,
-	                       vs_spirv, ps_input_info,
-	                       ps_spirv, static_params, vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                       ps_id.crc32, ps_active);
+	                       vs_spirv, ps_input_info, ps_spirv, static_params, vs_id.hash0,
+	                       vs_id.crc32, ps_id.hash0, ps_id.crc32, ps_active);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
 

@@ -32,11 +32,11 @@
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
-#include "kernel/memory.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -475,9 +475,9 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 }
 
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
-                                     uint32_t queue_family,
+                                     uint32_t                        queue_family,
                                      const std::vector<const char*>& device_extensions,
-                                     GraphicContext& graphics) {
+                                     GraphicContext&                 graphics) {
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
@@ -551,19 +551,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features12.timelineSemaphore = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
-	device_features.fragmentStoresAndAtomics             = VK_TRUE;
-	device_features.samplerAnisotropy                    = VK_TRUE;
-	device_features.robustBufferAccess                   = VK_TRUE;
+	device_features.fragmentStoresAndAtomics = VK_TRUE;
+	device_features.samplerAnisotropy        = VK_TRUE;
+	device_features.robustBufferAccess       = VK_TRUE;
 #if !defined(__APPLE__)
-	device_features.depthBounds                          = VK_TRUE; // unsupported by MoltenVK
+	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
-	device_features.sampleRateShading    = VK_TRUE;
-	graphics.sample_rate_shading_enabled = true;
+	device_features.sampleRateShading                    = VK_TRUE;
+	graphics.sample_rate_shading_enabled                 = true;
 	device_features.vertexPipelineStoresAndAtomics =
 	    supported_features2.features.vertexPipelineStoresAndAtomics;
 
@@ -909,10 +909,9 @@ void WindowContext::CreateVulkan() {
 	}
 	surface = native_surface;
 
-	std::vector<const char*> device_extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-	                                              VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	                                              VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	                                              "VK_KHR_maintenance1"};
+	std::vector<const char*> device_extensions = {
+	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -932,8 +931,8 @@ void WindowContext::CreateVulkan() {
 
 	uint32_t queue_family = static_cast<uint32_t>(-1);
 
-	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions,
-	                         surface_capabilities, graphic_ctx.physical_device, queue_family);
+	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
+	                         graphic_ctx.physical_device, queue_family);
 
 	if (graphic_ctx.physical_device == nullptr) {
 		EXIT("Could not find suitable device");
@@ -949,9 +948,8 @@ void WindowContext::CreateVulkan() {
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
 		    [&](uint32_t* count, vk::ExtensionProperties* values) {
-			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr,
-			                                                                           count,
-			                                                                           values);
+			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(
+			        nullptr, count, values);
 		    });
 
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
@@ -985,7 +983,7 @@ void WindowContext::CreateVulkan() {
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
-	presenter      = std::make_unique<Presenter>(*this);
+	presenter = std::make_unique<Presenter>(*this);
 	RenderDocSetActiveWindow(graphic_ctx.instance, window);
 }
 

@@ -206,8 +206,8 @@ bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
 			       GetStatusText(other_item->m_info->game_status);
 		case GameVersionColumn:
 		case FirmwareVersionColumn: {
-			const auto& version = column == GameVersionColumn ? m_info->gameVersion
-			                                                  : m_info->firmwareVer;
+			const auto& version =
+			    column == GameVersionColumn ? m_info->gameVersion : m_info->firmwareVer;
 			const auto& other_version = column == GameVersionColumn
 			                                ? other_item->m_info->gameVersion
 			                                : other_item->m_info->firmwareVer;

@@ -4,22 +4,22 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
-#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/shader/recompiler/ExecMask.h"
-#include "graphics/shader/recompiler/ir/ResourceTracking.h"
-#include "graphics/shader/recompiler/ir/ScalarProvenance.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
+#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
+#include "graphics/shader/recompiler/emitter/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/ScalarProvenance.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
-#include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/SrtPatcher.h"
 #include "graphics/shader/recompiler/ir/SrtWalker.h"
-#include "graphics/shader/recompiler/emitter/spirvEmitterInternal.h"
 #include "graphics/shader/shader.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
@@ -411,9 +411,9 @@ constexpr uint32_t EncodeSopp(uint32_t opcode, uint32_t simm = 0) {
 }
 
 void TestNativeShaderResourceDependencies() {
-	const auto stages = ShaderPipelineStages(
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment |
-	    vk::ShaderStageFlagBits::eCompute);
+	const auto stages =
+	    ShaderPipelineStages(vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment |
+	                         vk::ShaderStageFlagBits::eCompute);
 	Check(stages == (vk::PipelineStageFlagBits::eVertexShader |
 	                 vk::PipelineStageFlagBits::eFragmentShader |
 	                 vk::PipelineStageFlagBits::eComputeShader),
@@ -463,8 +463,7 @@ void TestNormalizedImageContracts() {
 	ImageInfo container {};
 	container.data            = {0x10000, 0x15000};
 	container.pixel_format    = vk::Format::eR8G8B8A8Unorm;
-	container.guest_format =
-	    Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+	container.guest_format    = Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
 	container.type            = Prospero::ImageType::kColor2D;
 	container.extent          = {64, 64, 1};
 	container.resources       = {3, 4};
@@ -476,38 +475,34 @@ void TestNormalizedImageContracts() {
 	container.mip_layout[1]   = {0x10000, 0x4000, 32, 32};
 	container.mip_layout[2]   = {0x14000, 0x1000, 16, 16};
 
-	ImageInfo subresource = container;
-	subresource.data      = {0x22000, 0x1000};
-	subresource.extent    = {32, 32, 1};
-	subresource.resources = {1, 1};
-	subresource.pitch     = 32;
-	subresource.mip_layout = {};
+	ImageInfo subresource     = container;
+	subresource.data          = {0x22000, 0x1000};
+	subresource.extent        = {32, 32, 1};
+	subresource.resources     = {1, 1};
+	subresource.pitch         = 32;
+	subresource.mip_layout    = {};
 	subresource.mip_layout[0] = {0, 0x1000, 32, 32};
 
 	Check(container.BlockExtent() == vk::Extent2D {64, 64},
 	      "normalized image block extent changed");
 	Check(subresource.IsCompatible(container), "normalized compatible image was rejected");
 	Check(subresource.MipOf(container) == 1, "normalized mip lookup missed a subresource");
-	Check(subresource.SliceOf(container, 1) == 2,
-	      "normalized slice lookup missed a subresource");
+	Check(subresource.SliceOf(container, 1) == 2, "normalized slice lookup missed a subresource");
 
-	auto incompatible = subresource;
+	auto incompatible    = subresource;
 	incompatible.samples = 2;
 	Check(!incompatible.IsCompatible(container) && incompatible.MipOf(container) == -1,
 	      "sample-count mismatch was accepted as a compatible image");
 
-	auto compressed             = container;
-	compressed.guest_format =
-	    Prospero::GpuEnumValue(Prospero::BufferFormat::kBc3UNorm);
-	compressed.pitch            = 128;
-	compressed.extent.height    = 64;
+	auto compressed          = container;
+	compressed.guest_format  = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc3UNorm);
+	compressed.pitch         = 128;
+	compressed.extent.height = 64;
 	Check(compressed.BlockExtent() == vk::Extent2D {32, 16},
 	      "block-compressed extent was not expressed in blocks");
 
-	Check(ImageViewOps::FormatsCompatible(vk::Format::eR8G8B8A8Unorm,
-	                                      vk::Format::eR8G8B8A8Uint) &&
-	          !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat,
-	                                           vk::Format::eR32Sfloat) &&
+	Check(ImageViewOps::FormatsCompatible(vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Uint) &&
+	          !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat, vk::Format::eR32Sfloat) &&
 	          ImageViewOps::FormatsCompatible(vk::Format::eBc3UnormBlock,
 	                                          vk::Format::eR32G32B32A32Uint),
 	      "Vulkan image-view compatibility classes diverged from production");
@@ -524,20 +519,19 @@ void TestNativeSubgroupPolicy() {
 	safe.wave_size      = 32;
 	safe.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eVertex, safe).mode ==
-	          ShaderSubgroupMode::Natural,
+	                              vk::ShaderStageFlagBits::eVertex, safe)
+	              .mode == ShaderSubgroupMode::Natural,
 	      "native wave32 policy changed");
 	safe.wave_size = 64;
-	Check(SelectGraphicsLaneMaskMode(safe.wave_size) ==
-	              ShaderLaneMaskMode::PerInvocation &&
+	Check(SelectGraphicsLaneMaskMode(safe.wave_size) == ShaderLaneMaskMode::PerInvocation &&
 	          ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                                  vk::ShaderStageFlagBits::eVertex, safe).mode ==
-	              ShaderSubgroupMode::Unsupported,
+	                                  vk::ShaderStageFlagBits::eVertex, safe)
+	                  .mode == ShaderSubgroupMode::Unsupported,
 	      "wave64 graphics mismatch accepted native-wave mask lowering");
 	safe.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eVertex, safe).mode ==
-	          ShaderSubgroupMode::PerInvocationGraphics,
+	                              vk::ShaderStageFlagBits::eVertex, safe)
+	              .mode == ShaderSubgroupMode::PerInvocationGraphics,
 	      "wave64 graphics mismatch did not select per-invocation masks");
 
 	ShaderRecompiler::IR::Program cross_lane = safe;
@@ -545,14 +539,14 @@ void TestNativeSubgroupPolicy() {
 	    ShaderRecompiler::IR::Opcode::ReadLaneU32;
 	Check(ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(cross_lane) &&
 	          ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                                  vk::ShaderStageFlagBits::eVertex, cross_lane).mode ==
-	              ShaderSubgroupMode::PerInvocationGraphics,
+	                                  vk::ShaderStageFlagBits::eVertex, cross_lane)
+	                  .mode == ShaderSubgroupMode::PerInvocationGraphics,
 	      "graphics mismatch did not select per-invocation masks");
 	auto cross_lane_compute           = cross_lane;
 	cross_lane_compute.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "cross-lane compute mismatch bypassed the exact subgroup requirement");
 
 	ShaderRecompiler::IR::Program zero_exec = safe;
@@ -568,8 +562,8 @@ void TestNativeSubgroupPolicy() {
 	zero_bfm.scalar_sources[0] = 2;
 	Check(!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(zero_exec) &&
 	          ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                                  vk::ShaderStageFlagBits::eCompute, zero_exec).mode ==
-	              ShaderSubgroupMode::FlattenedMasks,
+	                                  vk::ShaderStageFlagBits::eCompute, zero_exec)
+	                  .mode == ShaderSubgroupMode::FlattenedMasks,
 	      "compile-time uniform-zero EXEC write did not stay on the mask-free path");
 
 	ShaderRecompiler::IR::Program selective_exec = safe;
@@ -600,8 +594,8 @@ void TestNativeSubgroupPolicy() {
 	ds_partial.blocks.emplace_back().instructions.emplace_back().op =
 	    ShaderRecompiler::IR::Opcode::DsAppend;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eCompute, ds_partial).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eCompute, ds_partial)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "partial wave64 DS append bypassed the exact subgroup requirement");
 	context.max_subgroup_size = 64;
 	const auto controlled =
@@ -614,17 +608,18 @@ void TestNativeSubgroupPolicy() {
 	cross_lane.wave_size                  = 32;
 	cross_lane.lane_mask_mode             = ShaderLaneMaskMode::PerInvocation;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eFragment, cross_lane).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eFragment, cross_lane)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "inverse graphics mismatch was accepted as one guest wave");
 	cross_lane_compute.wave_size = 32;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "inverse cross-lane compute mismatch was accepted");
 }
 
-std::array<uint32_t, 64> ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
+std::array<uint32_t, 64>
+ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
 	std::array<uint32_t, 64> data {};
 	for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
 		data[start]      = 0x1000u + start * 0x100u;
@@ -3021,7 +3016,7 @@ void TestNewShaderRecompilerImageQueryLowering() {
 
 void TestNewShaderRecompilerCubeSampleCoordinates() {
 	constexpr uint32_t MimgDimCube = 3;
-	const uint32_t shader[] = {
+	const uint32_t     shader[]    = {
 	    EncodeMimg0(0x20, 0xf, false, MimgDimCube),
 	    EncodeMimg1(0, 0, 1, 0), // image_sample cube
 	    EncodeMimg0(0x60, 0x3, false, MimgDimCube),
@@ -3029,7 +3024,7 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
 	    0xbf810000u,
 	};
 
-	auto user_data = ImageTestUserData(Prospero::ImageType::kCube);
+	auto                             user_data = ImageTestUserData(Prospero::ImageType::kCube);
 	ShaderRecompiler::CompileOptions options;
 	options.stage     = ShaderType::Compute;
 	options.user_data = user_data.data();
@@ -3525,10 +3520,8 @@ void TestNewShaderRecompilerImageViewDimensions() {
 	      "SPIR-V binary does not contain sampled 2D-array image type");
 	Check(SpirvContainsTypeImage(result.spirv, SpirvDim3D, 0, 1),
 	      "SPIR-V binary does not contain sampled 3D image type");
-	Check(SpirvContainsCapability(result.spirv, 43),
-	      "SPIR-V binary does not request Sampled1D");
-	Check(SpirvContainsCapability(result.spirv, 44),
-	      "SPIR-V binary does not request Image1D");
+	Check(SpirvContainsCapability(result.spirv, 43), "SPIR-V binary does not request Sampled1D");
+	Check(SpirvContainsCapability(result.spirv, 44), "SPIR-V binary does not request Image1D");
 	Check(SpirvContainsOpcode(result.spirv, 95),
 	      "SPIR-V binary does not contain array image fetch");
 	CheckSpirvBinaryValidates(result.spirv);
@@ -3617,7 +3610,7 @@ void TestNewShaderRecompilerRejectsOneDimensionalGather() {
 		    EncodeMimg1(0, 0, 1, 0),
 		    0xbf810000u,
 		};
-		auto user_data = ImageTestUserData(type);
+		auto                             user_data = ImageTestUserData(type);
 		ShaderRecompiler::CompileOptions options;
 		options.stage     = ShaderType::Compute;
 		options.user_data = user_data.data();
@@ -4116,8 +4109,7 @@ void TestNewShaderRecompilerVintrpLowering() {
 	options.pixel_input_info = &flat_ps_info;
 
 	ShaderRecompiler::CompileResult flat_result;
-	Check(ShaderRecompiler::TryRecompile(flat_shader, options, flat_result, &error),
-	      error.c_str());
+	Check(ShaderRecompiler::TryRecompile(flat_shader, options, flat_result, &error), error.c_str());
 	Check(SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
 	      "flat VINTRP input did not emit a Flat decoration");
 	Check(!SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 13u),
@@ -5996,7 +5988,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
 	ShaderPixelInputInfo uint16_info;
 	uint16_info.target_output_mode[0] = 7;
-	options.pixel_input_info           = &uint16_info;
+	options.pixel_input_info          = &uint16_info;
 	ShaderRecompiler::CompileResult uint16_result;
 	Check(ShaderRecompiler::TryRecompile(shader, options, uint16_result, &error), error.c_str());
 	const auto uint16_source = DisassembleSpirvBinary(uint16_result.spirv);
@@ -6027,10 +6019,10 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	          format.export_mapping.ApplyMask(0xfu) == 0xfu,
 	      "reverse RGBA16F render-target export or write-mask mapping is "
 	      "incorrect");
-	const auto legacy_alt = TextureGetRenderTargetFormat(
-	    Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
-	    Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
-	    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
+	const auto legacy_alt =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
 	Check(legacy_alt.format == vk::Format::eB8G8R8A8Unorm && legacy_alt.export_mapping.IsIdentity(),
 	      "legacy BGRA render target acquired a duplicate shader export mapping");
 
@@ -6060,8 +6052,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	CheckSpirvBinaryValidates(reversed_result.spirv);
 
 	HW::PixelShaderInfo regs {};
-	Check(ShaderGetIdPS(regs, identity_info, false) !=
-	          ShaderGetIdPS(regs, reversed_info, false),
+	Check(ShaderGetIdPS(regs, identity_info, false) != ShaderGetIdPS(regs, reversed_info, false),
 	      "pixel shader cache identity omitted the render-target export mapping");
 
 	regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
@@ -6069,7 +6060,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	ShaderMappedData mapped {};
 	mapped.code_size_bytes = sizeof(shader);
 	ShaderMapUserData(regs.ps_regs.data_addr, mapped);
-	HW::ShaderRegisters sh {};
+	HW::ShaderRegisters   sh {};
 	ShaderVertexInputInfo vs_info {};
 	vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 	std::array<Prospero::ColorComponentMapping, 8> mappings {};
@@ -6901,8 +6892,8 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 			ShaderVertexInputInfo vs_info {};
 			vs_info.stage.program = std::move(vs_program);
 			const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
-			ShaderPixelInputInfo      ps_info {};
-			std::span<const uint32_t> spirv;
+			ShaderPixelInputInfo                                 ps_info {};
+			std::span<const uint32_t>                            spirv;
 			Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave, vs_info,
 			                          identity_mappings, ps_info, spirv),
 			      "pixel program-cache transition failed to compile");
@@ -6929,8 +6920,8 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 		ShaderVertexInputInfo vs_info {};
 		vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 		const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
-		ShaderPixelInputInfo      ps_info {};
-		std::span<const uint32_t> spirv;
+		ShaderPixelInputInfo                                 ps_info {};
+		std::span<const uint32_t>                            spirv;
 		Check(ShaderCompileInfoPS(mask_regs, sh, mode, vs_info, identity_mappings, ps_info, spirv),
 		      "pixel lane-mask cache transition failed to compile");
 		Check(ps_info.stage.program != nullptr && ps_info.stage.program->lane_mask_mode == mode,
@@ -7006,8 +6997,7 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
 	options.flat_memory_base = 0;
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
-	const bool                      compiled =
-	    ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
+	const bool compiled = ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
 	Check(compiled, error.c_str());
 	Check(result.program.info.addresses.size() == 2,
 	      "segmented address resources were not tracked independently");

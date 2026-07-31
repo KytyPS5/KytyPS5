@@ -11,7 +11,7 @@ template <typename Result, typename... Args>
 class UniqueFunction {
 	class CallableBase {
 	public:
-		virtual ~CallableBase() = default;
+		virtual ~CallableBase()               = default;
 		virtual Result Invoke(Args&&... args) = 0;
 	};
 
@@ -20,9 +20,7 @@ class UniqueFunction {
 	public:
 		explicit Callable(Function function): m_function(std::move(function)) {}
 
-		Result Invoke(Args&&... args) override {
-			return m_function(std::forward<Args>(args)...);
-		}
+		Result Invoke(Args&&... args) override { return m_function(std::forward<Args>(args)...); }
 
 	private:
 		Function m_function;

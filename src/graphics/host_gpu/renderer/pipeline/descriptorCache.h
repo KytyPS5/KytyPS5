@@ -95,7 +95,7 @@ private:
 	};
 
 	static vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture);
-	void                 CreatePool();
+	void                           CreatePool();
 	VulkanDescriptorSet* Allocate(Stage stage, const ShaderRecompiler::IR::Program& program);
 	vk::DescriptorSetLayout
 	GetDescriptorSetLayoutInternal(Stage stage, const ShaderRecompiler::IR::Program& program);

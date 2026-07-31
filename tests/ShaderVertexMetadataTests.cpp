@@ -18,19 +18,19 @@ void Check(bool value, const char* text) {
 
 struct Fixture {
 	std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets {};
-	ShaderUserData user_data {};
-	ShaderSemantic semantic {};
-	ShaderMappedData mapped {};
+	ShaderUserData                                                             user_data {};
+	ShaderSemantic                                                             semantic {};
+	ShaderMappedData                                                           mapped {};
 
 	Fixture() {
 		offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-		offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 2;
+		offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)]     = 2;
 		offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 4;
 		user_data.direct_resource_offset = offsets.data();
 		user_data.direct_resource_count  = static_cast<uint16_t>(offsets.size());
-		mapped.user_data           = &user_data;
-		mapped.input_semantics     = &semantic;
-		mapped.num_input_semantics = 1;
+		mapped.user_data                 = &user_data;
+		mapped.input_semantics           = &semantic;
+		mapped.num_input_semantics       = 1;
 	}
 };
 
@@ -48,9 +48,9 @@ void CheckRejected(const ShaderMappedData& data, const char* text) {
 }
 
 void TestValidAndInvalidMetadata() {
-	Fixture fixture;
+	Fixture              fixture;
 	ShaderVertexMetadata output;
-	std::string error;
+	std::string          error;
 	Check(ShaderReadVertexMetadata(fixture.mapped, 64, output, &error),
 	      "valid AGC vertex metadata was rejected");
 	Check(output.vertex_buffer_reg == 2 && output.vertex_attrib_reg == 4 &&
@@ -75,8 +75,8 @@ void TestValidAndInvalidMetadata() {
 	CheckRejected(excessive_semantics.mapped, "excessive vertex semantic count was accepted");
 
 	Fixture excessive_register;
-	excessive_register.offsets[
-	    static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 63;
+	excessive_register.offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] =
+	    63;
 	CheckRejected(excessive_register.mapped, "out-of-domain vertex table SGPR was accepted");
 
 	Fixture missing_semantics;

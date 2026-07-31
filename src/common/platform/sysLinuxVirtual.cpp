@@ -136,8 +136,8 @@ static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) 
 			break;
 		}
 		const auto hint = (top - step) & ~(LOW_ARENA_GRAIN - 1);
-		void*      ptr  = mmap(reinterpret_cast<void*>(hint), size, protect,
-		                       flags | MAP_FIXED_NOREPLACE, -1, 0); // NOLINT
+		void* ptr = mmap(reinterpret_cast<void*>(hint), size, protect, flags | MAP_FIXED_NOREPLACE,
+		                 -1, 0); // NOLINT
 		if (ptr != MAP_FAILED) {
 			return ptr;
 		}
@@ -161,8 +161,8 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		uintptr_t page_start  = ret_addr >> 12u;
-		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
+		uintptr_t page_start = ret_addr >> 12u;
+		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
 			(*g_protects)[page] = protect;
 		}
@@ -194,8 +194,8 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	if (ptr != MAP_FAILED && ((ret_addr & (alignment - 1)) != 0)) {
 		munmap(ptr, size);
 
-		ptr      = map_anonymous(addr, size + alignment, protect,
-		                         MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
+		ptr =
+		    map_anonymous(addr, size + alignment, protect, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 #if defined(__APPLE__)
@@ -251,8 +251,8 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	record_alloc(ret_addr, size);
-	uintptr_t page_start  = ret_addr >> 12u;
-	uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
+	uintptr_t page_start = ret_addr >> 12u;
+	uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
 	for (uintptr_t page = page_start; page <= page_end; page++) {
 		(*g_protects)[page] = protect;
 	}
@@ -266,9 +266,9 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 // the first mapped region at or above `region_addr`; if it begins before the end of the
 // requested range, the range overlaps an existing mapping.
 static bool is_mapped(void* ptr, size_t length) {
-	auto              query_addr  = reinterpret_cast<mach_vm_address_t>(ptr);
-	mach_vm_address_t region_addr = query_addr;
-	mach_vm_size_t    region_size = 0;
+	auto                           query_addr  = reinterpret_cast<mach_vm_address_t>(ptr);
+	mach_vm_address_t              region_addr = query_addr;
+	mach_vm_size_t                 region_size = 0;
 	vm_region_basic_info_data_64_t info {};
 	mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
 	mach_port_t                    object_name = MACH_PORT_NULL;
@@ -337,8 +337,8 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		uintptr_t page_start  = ret_addr >> 12u;
-		uintptr_t page_end    = (ret_addr + size - 1) >> 12u;
+		uintptr_t page_start = ret_addr >> 12u;
+		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
 		for (uintptr_t page = page_start; page <= page_end; page++) {
 			(*g_protects)[page] = protect;
 		}

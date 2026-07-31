@@ -272,10 +272,18 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 	};
 
 	static const TerminalSpec candidates[] = {
-	    {"x-terminal-emulator", "-e"}, {"gnome-terminal", "--"}, {"konsole", "-e"},
-	    {"xfce4-terminal", "-x"},      {"mate-terminal", "--"},  {"tilix", "-e"},
-	    {"alacritty", "-e"},           {"kitty", nullptr},       {"foot", nullptr},
-	    {"wezterm", "-e"},             {"urxvt", "-e"},          {"xterm", "-e"},
+	    {"x-terminal-emulator", "-e"},
+	    {"gnome-terminal", "--"},
+	    {"konsole", "-e"},
+	    {"xfce4-terminal", "-x"},
+	    {"mate-terminal", "--"},
+	    {"tilix", "-e"},
+	    {"alacritty", "-e"},
+	    {"kitty", nullptr},
+	    {"foot", nullptr},
+	    {"wezterm", "-e"},
+	    {"urxvt", "-e"},
+	    {"xterm", "-e"},
 	};
 
 	const auto try_candidate = [program, prefix](const QString& executable, const char* separator) {
@@ -293,7 +301,7 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 
 	if (const auto from_env = qEnvironmentVariable("TERMINAL"); !from_env.isEmpty()) {
 		// Reuse the known separator for an explicit terminal.
-		const auto env_name  = QFileInfo(from_env).fileName();
+		const auto  env_name  = QFileInfo(from_env).fileName();
 		const char* separator = "-e";
 		for (const auto& candidate: candidates) {
 			if (env_name == QLatin1String(candidate.executable)) {
@@ -379,9 +387,9 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 #if !defined(_WIN32)
 	// Report immediate launch failures.
 	if (!process->waitForStarted(5000)) {
-		QMessageBox::critical(this, tr("Error"),
-		                      tr("Failed to start:\n%1\n\n%2")
-		                          .arg(process->program(), process->errorString()));
+		QMessageBox::critical(
+		    this, tr("Error"),
+		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
 		return;
 	}
 #endif

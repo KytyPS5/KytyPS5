@@ -2,9 +2,9 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEPTHRENDERTARGET_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
-#include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>

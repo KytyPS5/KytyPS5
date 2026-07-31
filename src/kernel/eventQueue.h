@@ -41,7 +41,7 @@ struct KernelEvent {
 };
 
 struct KernelFilter {
-	void*                 data              = nullptr;
+	void*                 data = nullptr;
 	std::shared_ptr<void> owner;
 	trigger_func_t        trigger_func      = nullptr;
 	reset_func_t          reset_func        = nullptr;

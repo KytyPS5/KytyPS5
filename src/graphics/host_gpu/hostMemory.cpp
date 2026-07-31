@@ -30,7 +30,7 @@ bool IsAccessible(DWORD protect, HostMemoryAccess access) {
 } // namespace
 
 bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAccess access,
-	                      uint64_t& accessible_size) {
+                          uint64_t& accessible_size) {
 	accessible_size = 0;
 	if (addr == 0 || requested_size == 0) {
 		return false;

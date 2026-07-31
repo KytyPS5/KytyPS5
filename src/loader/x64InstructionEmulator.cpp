@@ -79,10 +79,10 @@ static void Sha1Msg1(XmmWords& dest, const XmmWords& src2) {
 	const uint32_t w3 = dest.w[0];
 	const uint32_t w4 = src2.w[3];
 	const uint32_t w5 = src2.w[2];
-	dest.w[3] = w2 ^ w0;
-	dest.w[2] = w3 ^ w1;
-	dest.w[1] = w4 ^ w2;
-	dest.w[0] = w5 ^ w3;
+	dest.w[3]         = w2 ^ w0;
+	dest.w[2]         = w3 ^ w1;
+	dest.w[1]         = w4 ^ w2;
+	dest.w[0]         = w5 ^ w3;
 }
 
 static void Sha1Msg2(XmmWords& dest, const XmmWords& src2) {
@@ -93,18 +93,18 @@ static void Sha1Msg2(XmmWords& dest, const XmmWords& src2) {
 	const uint32_t w17 = Rol32(dest.w[2] ^ w14, 1u);
 	const uint32_t w18 = Rol32(dest.w[1] ^ w15, 1u);
 	const uint32_t w19 = Rol32(dest.w[0] ^ w16, 1u);
-	dest.w[3] = w16;
-	dest.w[2] = w17;
-	dest.w[1] = w18;
-	dest.w[0] = w19;
+	dest.w[3]          = w16;
+	dest.w[2]          = w17;
+	dest.w[1]          = w18;
+	dest.w[0]          = w19;
 }
 
 static void Sha1Nexte(XmmWords& dest, const XmmWords& src2) {
-	const uint32_t tmp  = Rol32(dest.w[3], 30u);
-	dest.w[3]           = src2.w[3] + tmp;
-	dest.w[2]           = src2.w[2];
-	dest.w[1]           = src2.w[1];
-	dest.w[0]           = src2.w[0];
+	const uint32_t tmp = Rol32(dest.w[3], 30u);
+	dest.w[3]          = src2.w[3] + tmp;
+	dest.w[2]          = src2.w[2];
+	dest.w[1]          = src2.w[1];
+	dest.w[0]          = src2.w[0];
 }
 
 static uint32_t Sha1RoundFunc(uint8_t group, uint32_t b, uint32_t c, uint32_t d) {
@@ -185,10 +185,10 @@ static void Sha256Msg1(XmmWords& dest, const XmmWords& src2) {
 	const uint32_t w2 = dest.w[2];
 	const uint32_t w1 = dest.w[1];
 	const uint32_t w0 = dest.w[0];
-	dest.w[3]           = w3 + Sha256Sigma0(w4);
-	dest.w[2]           = w2 + Sha256Sigma0(w3);
-	dest.w[1]           = w1 + Sha256Sigma0(w2);
-	dest.w[0]           = w0 + Sha256Sigma0(w1);
+	dest.w[3]         = w3 + Sha256Sigma0(w4);
+	dest.w[2]         = w2 + Sha256Sigma0(w3);
+	dest.w[1]         = w1 + Sha256Sigma0(w2);
+	dest.w[0]         = w0 + Sha256Sigma0(w1);
 }
 
 static void Sha256Msg2(XmmWords& dest, const XmmWords& src2) {
@@ -312,7 +312,9 @@ static bool DecodeShaNiInsn(const uint8_t* rip, ShaNiInsn& insn) {
 	return true;
 }
 
-static bool ShaNiModrmIsRegister(uint8_t modrm) { return (modrm & 0xc0u) == 0xc0u; }
+static bool ShaNiModrmIsRegister(uint8_t modrm) {
+	return (modrm & 0xc0u) == 0xc0u;
+}
 
 static uint8_t ShaNiRegIndex(uint8_t modrm, uint8_t rex, bool reg_field) {
 	if (reg_field) {
@@ -321,7 +323,7 @@ static uint8_t ShaNiRegIndex(uint8_t modrm, uint8_t rex, bool reg_field) {
 	return (modrm & 0x07u) | ((rex & 0x01u) << 3u);
 }
 
-static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn& insn,
+static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn&    insn,
                                       const uint64_t (&gpr)[16], const void*& address) {
 	const uint8_t modrm = rip[insn.modrm_offset];
 	const uint8_t mod   = modrm >> 6u;
@@ -334,12 +336,12 @@ static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn& insn,
 	uint64_t result = 0;
 
 	if (rm == 4u) {
-		const uint8_t sib        = rip[offset++];
-		const uint8_t scale      = sib >> 6u;
-		const uint8_t index_low  = (sib >> 3u) & 0x07u;
-		const uint8_t base_low   = sib & 0x07u;
-		const bool    has_index  = index_low != 4u || (insn.rex & 0x02u) != 0;
-		const bool    has_base   = mod != 0u || base_low != 5u;
+		const uint8_t sib       = rip[offset++];
+		const uint8_t scale     = sib >> 6u;
+		const uint8_t index_low = (sib >> 3u) & 0x07u;
+		const uint8_t base_low  = sib & 0x07u;
+		const bool    has_index = index_low != 4u || (insn.rex & 0x02u) != 0;
+		const bool    has_base  = mod != 0u || base_low != 5u;
 
 		if (has_base) {
 			const uint8_t base = base_low | ((insn.rex & 0x01u) << 3u);

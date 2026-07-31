@@ -31,10 +31,9 @@ static bool OnOwnStack() {
 	if (pthread_getattr_np(pthread_self(), &attr) != 0) {
 		return false;
 	}
-	void*  base = nullptr;
-	size_t size = 0;
-	const bool ok =
-	    pthread_attr_getstack(&attr, &base, &size) == 0 && base != nullptr && size != 0;
+	void*      base = nullptr;
+	size_t     size = 0;
+	const bool ok = pthread_attr_getstack(&attr, &base, &size) == 0 && base != nullptr && size != 0;
 	pthread_attr_destroy(&attr);
 	if (!ok) {
 		return false;

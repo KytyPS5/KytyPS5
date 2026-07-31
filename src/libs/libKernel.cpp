@@ -1241,7 +1241,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		if (thread == PthreadSelfOrNull()) {
 			SignalDispatchScope scope;
 			auto                ctx = CreateCurrentGuestCallSignalUcontext(
-			                   reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			handler(signum, &ctx);
 			return OK;
 		}

@@ -54,16 +54,15 @@ public:
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);
-	void               CopyFrom(
-	                  CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-	                  uint64_t destination_offset, uint64_t size,
-	                  vk::AccessFlags source_before = vk::AccessFlagBits::eMemoryWrite,
-	                  vk::AccessFlags destination_before =
-	                      vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	                  vk::AccessFlags source_after =
-	                      vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	                  vk::AccessFlags destination_after =
-	                      vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+	              uint64_t destination_offset, uint64_t size,
+	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
+	                                                   vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
+	                                                   vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
+	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 protected:
@@ -107,13 +106,13 @@ private:
 		uint64_t upper_bound = 0;
 	};
 
-	void               ReserveWatches(std::vector<Watch>& watches, size_t grow_size);
+	void                      ReserveWatches(std::vector<Watch>& watches, size_t grow_size);
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);
-	[[nodiscard]] bool WaitPendingOperations(const std::vector<Watch>& watches,
-	                                         std::optional<size_t>     invalidation_mark,
-	                                         uint64_t requested_upper_bound, bool allow_wait,
-	                                         size_t& wait_cursor, uint64_t& wait_bound);
+	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,
+	                                                std::optional<size_t>     invalidation_mark,
+	                                                uint64_t requested_upper_bound, bool allow_wait,
+	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;

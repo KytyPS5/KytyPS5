@@ -12,9 +12,9 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 bool ProgramRequiresExactSubgroupSize(const IR::Program& program);
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
-	             const ShaderVertexInputInfo*  vertex_input_info,
-	             const ShaderPixelInputInfo*   pixel_input_info,
-	             const ShaderComputeInputInfo* compute_input_info, std::vector<uint32_t>& spirv,
+                 const ShaderVertexInputInfo*  vertex_input_info,
+                 const ShaderPixelInputInfo*   pixel_input_info,
+                 const ShaderComputeInputInfo* compute_input_info, std::vector<uint32_t>& spirv,
                  std::string* error);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

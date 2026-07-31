@@ -438,11 +438,12 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	*mount_result = {};
 
 	Common::LockGuard lock(g_mount_mutex);
-	const std::string dir_name  = mount->dir_name->data;
-	const std::string mount_dir = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
-	const bool        create    = ((mount->mount_mode & 4u) != 0);
-	const bool        create2   = ((mount->mount_mode & 32u) != 0);
-	const bool        open      = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
+	const std::string dir_name = mount->dir_name->data;
+	const std::string mount_dir =
+	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
+	const bool create  = ((mount->mount_mode & 4u) != 0);
+	const bool create2 = ((mount->mount_mode & 32u) != 0);
+	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
 
 	const int slot = g_mount_slots.FindAvailable(dir_name);
 	if (slot == SaveDataMountSlots::BUSY) {
@@ -594,9 +595,10 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 	*mount_result = {};
 
 	Common::LockGuard lock(g_mount_mutex);
-	const std::string dir_name  = mount->dir_name->data;
-	const std::string mount_dir = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
-	const int         slot      = g_mount_slots.FindAvailable(dir_name);
+	const std::string dir_name = mount->dir_name->data;
+	const std::string mount_dir =
+	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
+	const int slot = g_mount_slots.FindAvailable(dir_name);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}

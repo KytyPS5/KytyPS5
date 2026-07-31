@@ -59,16 +59,14 @@ void PatchesDialog::Load() {
 		return;
 	}
 
-	const auto patches = QJsonDocument::fromJson(file.readAll())
-	                         .object()
-	                         .value(QStringLiteral("patches"))
-	                         .toArray();
+	const auto patches =
+	    QJsonDocument::fromJson(file.readAll()).object().value(QStringLiteral("patches")).toArray();
 	for (const auto& value: patches) {
 		const auto patch = value.toObject();
 		auto* item = new QListWidgetItem(patch.value(QStringLiteral("name")).toString(), m_patches);
 		item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
 		item->setCheckState(patch.value(QStringLiteral("enabled")).toBool(true) ? Qt::Checked
-		                                                                      : Qt::Unchecked);
+		                                                                        : Qt::Unchecked);
 	}
 
 	m_apply->setEnabled(!patches.isEmpty());
@@ -84,8 +82,8 @@ void PatchesDialog::Save() {
 
 	auto document = QJsonDocument::fromJson(input.readAll());
 	input.close();
-	auto root     = document.object();
-	auto patches  = root.value(QStringLiteral("patches")).toArray();
+	auto root    = document.object();
+	auto patches = root.value(QStringLiteral("patches")).toArray();
 	for (int index = 0; index < patches.size(); index++) {
 		auto patch = patches[index].toObject();
 		patch.insert(QStringLiteral("enabled"),

@@ -182,8 +182,8 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	auto  command        = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
-	destination.Transit(ColorToMsDepthLayout,
-	                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command);
+	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
+	                    command);
 
 	vk::RenderingAttachmentInfo depth_attachment {};
 	depth_attachment.sType                   = vk::StructureType::eRenderingAttachmentInfo;

@@ -172,8 +172,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	return ret;
 }
 
-sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
-                         sys_file_cache_type_t cache_type) {
+sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	ret->type = SYS_FILE_FILE;
@@ -218,8 +217,7 @@ sys_file_t* SysFileCreate() {
 	return ret;
 }
 
-sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
-                         sys_file_cache_type_t cache_type) {
+sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
 	auto real_name     = get_internal_name(file_name);
@@ -241,7 +239,7 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name,
 }
 
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
-                          sys_file_cache_type_t cache_type) {
+                          sys_file_cache_type_t        cache_type) {
 	auto* ret = new sys_file_t;
 
 	auto real_name     = get_internal_name(file_name);

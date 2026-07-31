@@ -1,9 +1,9 @@
 #include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 
 #include <atomic>
-#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -36,7 +36,7 @@ void YieldMany() {
 }
 
 void TestFaultBlocksPublisher() {
-	ResourceMutex   mutex;
+	ResourceMutex    mutex;
 	std::atomic_bool publisher_started {false};
 	std::atomic_bool publisher_entered {false};
 	std::thread      publisher;
@@ -67,7 +67,7 @@ void TestFaultDrainsExistingOwner() {
 	std::atomic_bool release_fault {false};
 	std::atomic_bool publisher_started {false};
 	std::atomic_bool publisher_entered {false};
-	std::thread fault([&] {
+	std::thread      fault([&] {
 		fault_started.store(true, std::memory_order_release);
 		ResourceMutex::FaultScope scope(mutex);
 		fault_entered.store(true, std::memory_order_release);
@@ -111,7 +111,7 @@ void TestFaultScopesSerialize() {
 	std::atomic_bool release_first {false};
 	std::atomic_bool release_second {false};
 	std::atomic_bool publisher_entered {false};
-	std::thread first([&] {
+	std::thread      first([&] {
 		ResourceMutex::FaultScope scope(mutex);
 		first_entered.store(true, std::memory_order_release);
 		while (!release_first.load(std::memory_order_acquire)) {
@@ -155,7 +155,7 @@ void TestFaultScopesSerialize() {
 }
 
 void TestPreownedFaultKeepsResourceTransaction() {
-	ResourceMutex   mutex;
+	ResourceMutex    mutex;
 	std::atomic_bool publisher_started {false};
 	std::atomic_bool publisher_entered {false};
 	std::thread      publisher;
@@ -199,10 +199,10 @@ void TestPreownedFaultKeepsResourceTransaction() {
 void CheckDeathCase(const char* name) {
 	char path[MAX_PATH] {};
 	Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0, "GetModuleFileName failed");
-	std::string command = std::string("\"") + path + "\" --death " + name;
+	std::string       command = std::string("\"") + path + "\" --death " + name;
 	std::vector<char> mutable_command(command.begin(), command.end());
 	mutable_command.push_back('\0');
-	STARTUPINFOA startup {sizeof(startup)};
+	STARTUPINFOA        startup {sizeof(startup)};
 	PROCESS_INFORMATION process {};
 	Check(CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
 	                     nullptr, nullptr, &startup, &process) != 0,

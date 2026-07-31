@@ -61,7 +61,7 @@ namespace Libs::Graphics {
 struct Presenter::Frame {
 	VulkanImage                    image;
 	std::unique_ptr<CommandBuffer> present_commands;
-	bool                           busy = false;
+	bool                           busy         = false;
 	bool                           reusing_last = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
@@ -155,7 +155,7 @@ public:
 			EXIT("last submitted frame is not available for reuse\n");
 		}
 		m_free.erase(free);
-		m_last_frame       = nullptr;
+		m_last_frame        = nullptr;
 		frame->busy         = true;
 		frame->reusing_last = true;
 		m_mutex.Unlock();
@@ -197,30 +197,27 @@ private:
 		}
 	}
 
-	WindowContext&                               m_window;
-	Common::Mutex                               m_mutex;
-	Common::CondVar                             m_available;
+	WindowContext&                                 m_window;
+	Common::Mutex                                  m_mutex;
+	Common::CondVar                                m_available;
 	std::vector<std::unique_ptr<Presenter::Frame>> m_frames;
 	std::deque<Presenter::Frame*>                  m_free;
 	Presenter::Frame*                              m_last_frame = nullptr;
-	vk::Format                                  m_format = vk::Format::eUndefined;
+	vk::Format                                     m_format     = vk::Format::eUndefined;
 };
 
-void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
-                                 vk::Format format) {
+void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
 	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
 	}
 	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
-	const auto required = vk::FormatFeatureFlagBits::eBlitSrc |
-	                      vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
-	                      vk::FormatFeatureFlagBits::eTransferSrc |
-	                      vk::FormatFeatureFlagBits::eTransferDst;
+	const auto required =
+	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
+	    vk::FormatFeatureFlagBits::eTransferSrc | vk::FormatFeatureFlagBits::eTransferDst;
 	if ((features & required) != required) {
 		EXIT("prepared presentation format lacks optimal blit support: format=%d features=0x%x\n",
-		     static_cast<int>(format),
-		     static_cast<vk::FormatFeatureFlags::MaskType>(features));
+		     static_cast<int>(format), static_cast<vk::FormatFeatureFlags::MaskType>(features));
 	}
 
 	auto&      dst        = image;
@@ -234,11 +231,11 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
 		dst.memory = {};
 	}
 
-	dst.extent          = {extent.width, extent.height, 1};
-	dst.format          = format;
-	dst.layers          = 1;
-	dst.mip_levels      = 1;
-	dst.state           = {};
+	dst.extent     = {extent.width, extent.height, 1};
+	dst.format     = format;
+	dst.layers     = 1;
+	dst.mip_levels = 1;
+	dst.state      = {};
 	dst.subresource_states.clear();
 	dst.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
 
@@ -262,13 +259,12 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
 
 void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
-	const auto stage = access == vk::AccessFlagBits2::eTransferRead ||
-	                           access == vk::AccessFlagBits2::eTransferWrite
-	                       ? vk::PipelineStageFlagBits2::eTransfer
-	                       : vk::PipelineStageFlagBits2::eAllCommands;
+	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
+	                                access == vk::AccessFlagBits2::eTransferWrite
+	                            ? vk::PipelineStageFlagBits2::eTransfer
+	                            : vk::PipelineStageFlagBits2::eAllCommands;
 	constexpr auto writes = vk::AccessFlagBits2::eTransferWrite |
-	                        vk::AccessFlagBits2::eShaderWrite |
-	                        vk::AccessFlagBits2::eMemoryWrite;
+	                        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eMemoryWrite;
 	if (image.state.layout == layout && image.state.access_mask == access &&
 	    !static_cast<bool>(image.state.access_mask & writes)) {
 		return;
@@ -299,35 +295,27 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
-	source.Transit(vk::ImageLayout::eTransferSrcOptimal,
-	               vk::AccessFlagBits2::eTransferRead, {}, command);
-	Transit(command, vk::ImageLayout::eTransferDstOptimal,
-	        vk::AccessFlagBits2::eTransferWrite);
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
 	vk::ImageCopy copy {};
-	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0,
-	                       source.backing.layers};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
 	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
-	copy.extent = {std::min(source.backing.extent.width, image.extent.width),
-	               std::min(source.backing.extent.height, image.extent.height), 1};
+	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
+	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-	                  image.image, vk::ImageLayout::eTransferDstOptimal, copy);
-	Transit(command, vk::ImageLayout::eTransferSrcOptimal,
-	        vk::AccessFlagBits2::eTransferRead);
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 }
 
-void Presenter::Frame::Clear(CommandBuffer& command_buffer,
-                             const vk::ClearColorValue& color) {
+void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
 	command_buffer.EndRendering();
 	auto command = command_buffer.Handle();
-	Transit(command, vk::ImageLayout::eTransferDstOptimal,
-	        vk::AccessFlagBits2::eTransferWrite);
-	const vk::ImageSubresourceRange range {
-	    vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1,
-	                        &range);
-	Transit(command, vk::ImageLayout::eTransferSrcOptimal,
-	        vk::AccessFlagBits2::eTransferRead);
+	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
+	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 }
 
 class Swapchain final {
@@ -338,8 +326,8 @@ public:
 	~Swapchain();
 	KYTY_CLASS_NO_COPY(Swapchain);
 
-	void Create();
-	void Recreate(bool surface_lost = false);
+	void                 Create();
+	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source);
 	void                 Submit(CommandBuffer& command);
@@ -395,17 +383,17 @@ struct Presenter::Impl {
 		desc.view_info.usage       = vk::ImageUsageFlagBits::eTransferSrc;
 		desc.type                  = TextureCache::BindingType::VideoOut;
 
-		auto& cache = renderer.GetTextureCache();
-		auto& image = cache.GetImage(cache.FindImage(desc));
+		auto& cache           = renderer.GetTextureCache();
+		auto& image           = cache.GetImage(cache.FindImage(desc));
 		image.usage.video_out = true;
 		return image;
 	}
 
-	RenderContext& renderer;
-	WindowContext& window;
-	Swapchain      swapchain;
+	RenderContext&   renderer;
+	WindowContext&   window;
+	Swapchain        swapchain;
 	CommandScheduler present_scheduler;
-	FramePool      frames;
+	FramePool        frames;
 };
 
 void Swapchain::Create() {
@@ -441,25 +429,20 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm,
-	                             vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 ||
-	    surface.formats.front().format != vk::Format::eUndefined) {
+	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format ==
-			                                        vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format ==
-			                                        vk::Format::eR8G8B8A8Unorm;
+			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
+			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
 		                             });
 		if (it == surface.formats.end()) {
 			EXIT("no supported UNORM swapchain format\n");
 		}
 		format = *it;
 	}
-	m_format = format.format;
-	const auto swapchain_features =
-	    graphics.GetFormatProperties(m_format).optimalTilingFeatures;
+	m_format                      = format.format;
+	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
@@ -503,9 +486,8 @@ void Swapchain::Create() {
 		view.subresourceRange.baseMipLevel   = 0;
 		view.subresourceRange.layerCount     = 1;
 		view.subresourceRange.levelCount     = 1;
-		RequireVulkanSuccess(
-		    graphics.device.createImageView(&view, nullptr, &m_image_views[i]),
-		    "vkCreateImageView");
+		RequireVulkanSuccess(graphics.device.createImageView(&view, nullptr, &m_image_views[i]),
+		                     "vkCreateImageView");
 		EXIT_IF(m_image_views[i] == nullptr);
 	}
 
@@ -600,7 +582,7 @@ void Swapchain::Recreate(bool surface_lost) {
 
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
-	m_image_index = static_cast<uint32_t>(-1);
+	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
@@ -683,10 +665,9 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                           vk::PipelineStageFlagBits::eAllCommands,
-	                           vk::DependencyFlagBits::eByRegion, 0,
-	                           nullptr, 0, nullptr, 1, &to_present);
+	vk_command.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
+	    vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1, &to_present);
 	command.End();
 }
 
@@ -700,7 +681,7 @@ void Swapchain::Submit(CommandBuffer& command) {
 
 Swapchain::Status Swapchain::Present() {
 	EXIT_IF(m_image_index >= m_render_complete.size());
-	const auto ready = m_render_complete[m_image_index];
+	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;
 	present.swapchainCount     = 1;
@@ -738,7 +719,7 @@ Presenter::~Presenter() = default;
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
-	auto* frame = m_impl->frames.Acquire();
+	auto*             frame = m_impl->frames.Acquire();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -752,14 +733,13 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
-	                 {image.backing.extent.width, image.backing.extent.height},
-	                 frame_format);
+	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
 	return *frame;
 }
 
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
-                                                CommandBuffer* producer) {
+                                               CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire();
@@ -772,8 +752,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		frame->Clear(*producer, clear);
 	} else {
 		if (frame->present_commands == nullptr) {
-			frame->present_commands =
-			    std::make_unique<CommandBuffer>(m_impl->present_scheduler);
+			frame->present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
 		}
 		auto& command = *frame->present_commands;
 		command.WaitForFenceAndReset();
@@ -830,8 +809,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			continue;
 		}
 		if (frame.present_commands == nullptr) {
-			frame.present_commands =
-			    std::make_unique<CommandBuffer>(m_impl->present_scheduler);
+			frame.present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
 		}
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());

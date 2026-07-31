@@ -158,7 +158,7 @@ private:
 	void                 CheckBuffer() const { GetScheduler().CheckActive(); }
 	GpuResourceManager&  GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
-	RenderContext&    m_renderer;
+	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
 	HW::UserConfig   m_ucfg;
 	HW::Shader       m_sh_ctx;
@@ -170,9 +170,9 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	uint32_t         m_num_instances                    = 1;
 
-	uint32_t m_de_count          = 0;
-	uint32_t m_ce_count          = 0;
-	bool     m_ce_complete       = false;
+	uint32_t m_de_count        = 0;
+	uint32_t m_ce_count        = 0;
+	bool     m_ce_complete     = false;
 	bool     m_readback_active = false;
 
 	uint32_t m_const_ram[0x3000] = {0};

@@ -14,8 +14,7 @@ namespace Libs::Graphics {
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_cache(graphics), m_pipeline_cache(graphics, m_descriptor_cache),
-      m_sampler_cache(graphics),
-      m_gpu_resources(graphics, m_command_scheduler) {
+      m_sampler_cache(graphics), m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -27,7 +26,7 @@ RenderContext::~RenderContext() {
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
-	m_gpu = std::make_unique<Gpu>(*this);
+	m_gpu       = std::make_unique<Gpu>(*this);
 	m_gpu_resources.SetGpu(m_gpu.get());
 }
 
@@ -99,8 +98,7 @@ void RenderContext::TriggerEopEvent(uint32_t context_id) {
 		    registration.eq, static_cast<uintptr_t>(registration.id),
 		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
 		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
-		if (result == LibKernel::KERNEL_ERROR_EBADF ||
-		    result == LibKernel::KERNEL_ERROR_ENOENT) {
+		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
 			DeleteEopEq(registration.eq, registration.id);
 			continue;
 		}

@@ -44,13 +44,13 @@ CommandSlot* CommandScheduler::CommandPool::CreateSlot() {
 	allocate.commandPool        = m_pool;
 	allocate.level              = vk::CommandBufferLevel::ePrimary;
 	allocate.commandBufferCount = 1;
-	vk::CommandBuffer buffer = nullptr;
+	vk::CommandBuffer buffer    = nullptr;
 	EXIT_IF(graphics.device.allocateCommandBuffers(&allocate, &buffer) != vk::Result::eSuccess);
 
 	vk::FenceCreateInfo fence_create {};
 	fence_create.sType = vk::StructureType::eFenceCreateInfo;
 	fence_create.flags = vk::FenceCreateFlagBits::eSignaled;
-	vk::Fence fence = nullptr;
+	vk::Fence fence    = nullptr;
 	if (graphics.device.createFence(&fence_create, nullptr, &fence) != vk::Result::eSuccess) {
 		graphics.device.freeCommandBuffers(m_pool, 1, &buffer);
 		EXIT("failed to create command-buffer fence\n");
@@ -70,9 +70,9 @@ CommandSlot* CommandScheduler::CommandPool::Allocate(GraphicContext& graphics) {
 		Create(graphics);
 	}
 	EXIT_IF(m_graphics != &graphics);
-	auto found = std::ranges::find_if(m_slots, [](const auto& slot) { return !slot.busy; });
-	auto* slot = found != m_slots.end() ? &*found : CreateSlot();
-	slot->busy = true;
+	auto  found = std::ranges::find_if(m_slots, [](const auto& slot) { return !slot.busy; });
+	auto* slot  = found != m_slots.end() ? &*found : CreateSlot();
+	slot->busy  = true;
 	slot->Reset();
 	return slot;
 }
@@ -331,8 +331,7 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
-		const bool active_before_or_at =
-		    m_priority_active && m_priority_active_tick <= tick;
+		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;

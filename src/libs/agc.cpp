@@ -52,7 +52,7 @@ KYTY_SUBSYSTEM_INIT(Graphics) {
 
 	auto& presenter = WindowInit(width, height);
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
-	g_renderer       = &presenter.Renderer();
+	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
 	ShaderInit();
 }

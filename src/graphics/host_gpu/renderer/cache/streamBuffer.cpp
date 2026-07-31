@@ -135,8 +135,8 @@ void Buffer::Write(uint64_t offset, const void* source, uint64_t size) {
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > m_size || size > m_size - offset);
 	if (!m_is_coherent && size != 0) {
-		const auto result = vmaFlushAllocation(m_graphics->allocator, m_buffer->memory.allocation,
-		                                      offset, size);
+		const auto result =
+		    vmaFlushAllocation(m_graphics->allocator, m_buffer->memory.allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -144,8 +144,8 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
                                         vk::AccessFlags destination) const {
 	if (Handle() == nullptr || size == 0 || offset > m_size || size > m_size - offset) {
-		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " capacity=0x%016" PRIx64 "\n",
+		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " capacity=0x%016" PRIx64 "\n",
 		     static_cast<const void*>(Handle()), offset, size, m_size);
 	}
 	vk::BufferMemoryBarrier barrier {};
@@ -175,10 +175,9 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
-	    Barrier(destination_offset, size, destination_before,
-	            vk::AccessFlagBits::eTransferWrite),
+	    Barrier(destination_offset, size, destination_before, vk::AccessFlagBits::eTransferWrite),
 	};
-	const auto host_access = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
+	const auto host_access  = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
 	auto       before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
@@ -214,9 +213,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
 	native.fillBuffer(Handle(), offset, size, value);
-	const auto after =
-	    Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
-	            vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
+	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
@@ -250,8 +248,8 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	if (Mapped().empty()) {
 		return {nullptr, 0};
 	}
-	uint64_t mapped_size = size;
-	const auto atom = Graphics().physical_device_properties.limits.nonCoherentAtomSize;
+	uint64_t   mapped_size = size;
+	const auto atom        = Graphics().physical_device_properties.limits.nonCoherentAtomSize;
 	if (!NormalizeReservation(IsCoherent(), atom, mapped_size, alignment)) {
 		return {nullptr, 0};
 	}

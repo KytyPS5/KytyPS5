@@ -530,8 +530,8 @@ bool BuildSrtPlan(Program& program, std::string* error) {
 }
 
 bool EvaluateDescriptorSource(const Program& program, uint32_t source, uint32_t use_pc,
-	                          const SrtRuntime& runtime, DescriptorValue& result,
-	                          std::string* error) {
+                              const SrtRuntime& runtime, DescriptorValue& result,
+                              std::string* error) {
 	const DescriptorSourceRequest request {source, use_pc};
 	std::vector<DescriptorValue>  results;
 	if (!EvaluateDescriptorSources(program, std::span {&request, 1}, runtime, results, error)) {
@@ -542,11 +542,11 @@ bool EvaluateDescriptorSource(const Program& program, uint32_t source, uint32_t 
 }
 
 static bool EvaluateRuntimeSourcesImpl(const Program&                           program,
-	                                   std::span<const DescriptorSourceRequest> requests,
-	                                   const SrtRuntime&                        runtime,
-	                                   std::vector<DescriptorValue>&            results,
-	                                   std::vector<uint32_t>& flat, bool evaluate_flat,
-	                                   std::string* error) {
+                                       std::span<const DescriptorSourceRequest> requests,
+                                       const SrtRuntime&                        runtime,
+                                       std::vector<DescriptorValue>&            results,
+                                       std::vector<uint32_t>& flat, bool evaluate_flat,
+                                       std::string* error) {
 	if (!program.srt_plan_complete) {
 		if (error != nullptr) {
 			*error = Diagnostic(program, 0, "SRT plan is not ready");
@@ -602,22 +602,22 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 }
 
 bool EvaluateDescriptorSources(const Program&                           program,
-	                           std::span<const DescriptorSourceRequest> requests,
-	                           const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-	                           std::string* error) {
+                               std::span<const DescriptorSourceRequest> requests,
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                               std::string* error) {
 	std::vector<uint32_t> ignored;
 	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, ignored, false, error);
 }
 
 bool EvaluateRuntimeSources(const Program&                           program,
-	                        std::span<const DescriptorSourceRequest> requests,
-	                        const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-	                        std::vector<uint32_t>& flat, std::string* error) {
+                            std::span<const DescriptorSourceRequest> requests,
+                            const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                            std::vector<uint32_t>& flat, std::string* error) {
 	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, flat, true, error);
 }
 
 bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-	         std::string* error) {
+             std::string* error) {
 	std::vector<DescriptorValue> ignored;
 	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, error);
 }

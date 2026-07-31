@@ -42,8 +42,8 @@ struct ShaderStageRuntime {
 // Resolves an immutable native shader plan against current user data. The prior stage is preserved
 // if any ReadConst, snapshot, or specialization check fails.
 bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::Program> program,
-	                               std::span<const uint32_t> user_data, uint64_t shader_base,
-	                               ShaderStageRuntime& stage, std::string* error);
+                                   std::span<const uint32_t> user_data, uint64_t shader_base,
+                                   ShaderStageRuntime& stage, std::string* error);
 
 struct ShaderId {
 	uint32_t              hash0 = 0;

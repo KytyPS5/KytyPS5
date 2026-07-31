@@ -13,8 +13,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
@@ -828,11 +828,10 @@ static void ShaderGetStaticInputInfoPS(
 	    vs_info.stage.program != nullptr && !vs_info.stage.program->bindings.descriptors.empty()
 	        ? 1
 	        : 0;
-	ps_info.push_constant_offset =
-	    vs_info.stage.program != nullptr
-	        ? vs_info.stage.program->bindings.push_constant_offset +
-	              vs_info.stage.program->bindings.push_constant_size
-	        : 0;
+	ps_info.push_constant_offset = vs_info.stage.program != nullptr
+	                                   ? vs_info.stage.program->bindings.push_constant_offset +
+	                                         vs_info.stage.program->bindings.push_constant_size
+	                                   : 0;
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
@@ -1294,9 +1293,8 @@ static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
 
 	static std::atomic_int id = 0;
 
-	const auto base_name =
-	    Config::GetShaderLogFolder() /
-	    fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
+	const auto base_name = Config::GetShaderLogFolder() /
+	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
 	Common::File spv_file;
@@ -1345,9 +1343,8 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 
 	static std::atomic_int id = 0;
 
-	const auto base_name =
-	    Config::GetShaderLogFolder() / "original" /
-	    fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
+	const auto base_name = Config::GetShaderLogFolder() / "original" /
+	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
 	Common::File bin_file;

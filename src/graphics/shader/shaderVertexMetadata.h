@@ -17,7 +17,7 @@ struct ShaderVertexMetadata {
 
 // Copies the small AGC metadata subset used by the vertex path after validating every guest range.
 bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
-	                          ShaderVertexMetadata& metadata, std::string* error);
+                              ShaderVertexMetadata& metadata, std::string* error);
 
 } // namespace Libs::Graphics
 

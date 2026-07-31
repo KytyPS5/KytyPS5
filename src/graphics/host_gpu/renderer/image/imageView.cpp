@@ -70,15 +70,14 @@ namespace {
 			}
 		case vk::ImageType::e3D:
 			switch (info.type) {
-				case vk::ImageViewType::e3D:
-					return info.base_layer == 0 && info.layer_count == 1;
+				case vk::ImageViewType::e3D: return info.base_layer == 0 && info.layer_count == 1;
 				case vk::ImageViewType::e2D:
-					return static_cast<bool>(
-					           image.flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::e2DArrayCompatible) &&
 					       info.level_count == 1 && info.layer_count == 1;
 				case vk::ImageViewType::e2DArray:
-					return static_cast<bool>(
-					           image.flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::e2DArrayCompatible) &&
 					       info.level_count == 1;
 				default: return false;
 			}
@@ -325,11 +324,10 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 } // namespace ImageViewOps
 
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
-	const auto& image = backing;
+	const auto& image      = backing;
 	auto        normalized = view_info;
-	const bool  is_storage =
-	    static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
-	normalized.aspect = FullAspectMask(image.format);
+	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
+	normalized.aspect      = FullAspectMask(image.format);
 	if (normalized.aspect & vk::ImageAspectFlagBits::eDepth &&
 	    IsDepthViewFormat(normalized.format)) {
 		normalized.format = image.format;
@@ -340,28 +338,26 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
-	normalized.usage =
-	    is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               IsCompatibleViewFormat(image.format, normalized.format);
-	const bool slice_view = image.image_type == vk::ImageType::e3D &&
-	                        (normalized.type == vk::ImageViewType::e2D ||
-	                         normalized.type == vk::ImageViewType::e2DArray);
+	const bool slice_view =
+	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
+	                                               normalized.type == vk::ImageViewType::e2DArray);
 	const bool levels_valid = normalized.level_count != 0 &&
 	                          normalized.base_level < image.mip_levels &&
 	                          normalized.level_count <= image.mip_levels - normalized.base_level;
-	const auto view_layers = slice_view && levels_valid
-	                             ? std::max(image.extent.depth >> normalized.base_level, 1u)
-	                             : image.layers;
-	const bool ranges_valid = levels_valid &&
-	                          normalized.layer_count != 0 && normalized.base_layer < view_layers &&
+	const auto view_layers  = slice_view && levels_valid
+	                              ? std::max(image.extent.depth >> normalized.base_level, 1u)
+	                              : image.layers;
+	const bool ranges_valid = levels_valid && normalized.layer_count != 0 &&
+	                          normalized.base_layer < view_layers &&
 	                          normalized.layer_count <= view_layers - normalized.base_layer;
 	const bool mapping_valid =
 	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
 	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
-	    !IsValidViewType(image, normalized) ||
-	    !IsValidAspect(image, normalized.aspect)) {
+	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
 		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),

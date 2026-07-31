@@ -6,12 +6,12 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
-#include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
 #include <memory>
@@ -32,10 +32,10 @@ public:
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
-	[[nodiscard]] GraphicContext& GetGraphics() const noexcept { return m_graphics; }
-	void                          InitializeGpu(VideoOut::VideoOutDriver* video_out);
-	void                          ShutdownGpu();
-	[[nodiscard]] Gpu&            GetGpu() const;
+	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
+	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
+	void                                    ShutdownGpu();
+	[[nodiscard]] Gpu&                      GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
@@ -56,18 +56,18 @@ private:
 	struct EopEqRegistration {
 		LibKernel::EventQueue::KernelEqueue    eq = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		LibKernel::EventQueue::KernelEqueueRef queue;
-		int                                   id = 0;
+		int                                    id = 0;
 	};
 
-	GraphicContext&      m_graphics;
-	Common::Mutex        m_mutex;
-	RenderExecutor       m_render_executor;
-	CommandScheduler     m_command_scheduler;
-	DescriptorCache      m_descriptor_cache;
-	PipelineCache        m_pipeline_cache;
-	SamplerCache         m_sampler_cache;
-	GpuResourceManager   m_gpu_resources;
-	std::unique_ptr<Gpu> m_gpu;
+	GraphicContext&           m_graphics;
+	Common::Mutex             m_mutex;
+	RenderExecutor            m_render_executor;
+	CommandScheduler          m_command_scheduler;
+	DescriptorCache           m_descriptor_cache;
+	PipelineCache             m_pipeline_cache;
+	SamplerCache              m_sampler_cache;
+	GpuResourceManager        m_gpu_resources;
+	std::unique_ptr<Gpu>      m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 
 	Common::Mutex                  m_eop_mutex;

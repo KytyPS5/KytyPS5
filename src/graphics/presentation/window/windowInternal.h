@@ -28,8 +28,8 @@ struct SurfaceCapabilities {
 };
 
 struct WindowLoopState {
-	SDL_Event       event {};
-	bool            need_exit = false;
+	SDL_Event        event {};
+	bool             need_exit = false;
 	std::atomic_bool paused    = false;
 };
 
@@ -38,14 +38,13 @@ struct WindowContext {
 	~WindowContext();
 	KYTY_CLASS_NO_COPY(WindowContext);
 
-	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features
-	RequiredVulkan13Features() noexcept;
-	void CreateVulkan();
-	void RecreateSurface();
-	void RefreshSurfaceCapabilities();
-	void UpdateIcon();
-	void UpdateTitle();
-	void Resize(uint32_t width, uint32_t height);
+	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
+	void                                                    CreateVulkan();
+	void                                                    RecreateSurface();
+	void                                                    RefreshSurfaceCapabilities();
+	void                                                    UpdateIcon();
+	void                                                    UpdateTitle();
+	void                                                    Resize(uint32_t width, uint32_t height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);
@@ -59,14 +58,14 @@ struct WindowContext {
 	void DrainMainThreadTasks();
 #endif
 
-	GraphicContext      graphic_ctx;
-	SDL_Window*         window        = nullptr;
-	bool                window_hidden = true;
-	vk::SurfaceKHR      surface       = nullptr;
-	SurfaceCapabilities surface_capabilities;
+	GraphicContext                 graphic_ctx;
+	SDL_Window*                    window        = nullptr;
+	bool                           window_hidden = true;
+	vk::SurfaceKHR                 surface       = nullptr;
+	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
-	std::unique_ptr<Presenter> presenter;
-	WindowLoopState            loop;
+	std::unique_ptr<Presenter>     presenter;
+	WindowLoopState                loop;
 
 	char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {0};
 	char processor_name[64]                            = {0};
@@ -76,7 +75,7 @@ struct WindowContext {
 #if defined(__APPLE__)
 	Common::Mutex                      main_task_mutex;
 	Common::CondVar                    main_task_done;
-	std::vector<std::function<void()>> main_tasks;        // guarded by main_task_mutex
+	std::vector<std::function<void()>> main_tasks;            // guarded by main_task_mutex
 	uint64_t                           main_tasks_queued = 0; // guarded by main_task_mutex
 	uint64_t                           main_tasks_run    = 0; // guarded by main_task_mutex
 #endif

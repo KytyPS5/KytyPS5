@@ -84,7 +84,7 @@ uint32_t ByteExtent(const Instruction& inst) {
 }
 
 bool ContainsUnknown(const ScalarProvenance& provenance, uint32_t id, std::vector<uint8_t>& visited,
-	                 std::vector<uint32_t>& path) {
+                     std::vector<uint32_t>& path) {
 	path.push_back(id);
 	if (id <= ScalarProvenance::Unknown || id >= provenance.values.size()) {
 		return true;
@@ -115,7 +115,7 @@ bool ContainsUnknown(const ScalarProvenance& provenance, uint32_t id, std::vecto
 }
 
 bool IsLoopInvariantValue(const ScalarProvenance& provenance, uint32_t id,
-	                      std::vector<uint8_t>& visiting) {
+                          std::vector<uint8_t>& visiting) {
 	if (id <= ScalarProvenance::Unknown || id >= provenance.values.size()) {
 		return false;
 	}

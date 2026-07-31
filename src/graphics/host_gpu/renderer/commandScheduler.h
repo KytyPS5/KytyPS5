@@ -47,21 +47,21 @@ public:
 	void           FinishCurrent();
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
-	void Shutdown();
-	void Wait(uint64_t tick);
-	void PopPendingOperations();
-	void DrainPriorityOperations();
-	void WaitPriorityOperations(uint64_t tick);
-	void DeferOperation(Common::UniqueFunction<void>&& operation);
-	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	void                      Shutdown();
+	void                      Wait(uint64_t tick);
+	void                      PopPendingOperations();
+	void                      DrainPriorityOperations();
+	void                      WaitPriorityOperations(uint64_t tick);
+	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
-	[[nodiscard]] bool     Active() const noexcept { return m_current >= 0; }
-	void                   CheckActive() const;
-	RenderCommandBuffer&   Current() const;
-	[[nodiscard]] uint64_t CurrentTick() const noexcept { return m_master.CurrentTick(); }
-	[[nodiscard]] bool     IsFree(uint64_t tick);
-	[[nodiscard]] RenderContext& Context() const noexcept { return m_context; }
+	[[nodiscard]] bool            Active() const noexcept { return m_current >= 0; }
+	void                          CheckActive() const;
+	RenderCommandBuffer&          Current() const;
+	[[nodiscard]] uint64_t        CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] bool            IsFree(uint64_t tick);
+	[[nodiscard]] RenderContext&  Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext& Graphics() const noexcept { return m_graphics; }
 
 private:
@@ -91,11 +91,11 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	void           BindCurrent() const;
-	CommandBuffer& SubmitCurrent(SubmitInfo& submit);
-	void           BeginNext();
-	void           PriorityOperationsThread(std::stop_token stop);
-	void           RunOperation(Common::UniqueFunction<void>&& operation);
+	void                       BindCurrent() const;
+	CommandBuffer&             SubmitCurrent(SubmitInfo& submit);
+	void                       BeginNext();
+	void                       PriorityOperationsThread(std::stop_token stop);
+	void                       RunOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] CommandSlot* AllocateCommandBuffer();
 	[[nodiscard]] uint64_t     NextSubmitSequence() noexcept;
 
@@ -109,14 +109,14 @@ private:
 	std::mutex                                                    m_operation_mutex;
 	std::condition_variable                                       m_operation_available;
 	std::jthread                                                  m_priority_thread;
-	bool                                                          m_priority_active = false;
+	bool                                                          m_priority_active      = false;
 	uint64_t                                                      m_priority_active_tick = 0;
-	OperationState  m_operation_state = OperationState::Open;
-	int             m_current         = -1;
-	bool            m_recording       = false;
-	HW::Context*    m_registers       = nullptr;
-	HW::UserConfig* m_user_config     = nullptr;
-	HW::Shader*     m_shaders         = nullptr;
+	OperationState        m_operation_state = OperationState::Open;
+	int                   m_current         = -1;
+	bool                  m_recording       = false;
+	HW::Context*          m_registers       = nullptr;
+	HW::UserConfig*       m_user_config     = nullptr;
+	HW::Shader*           m_shaders         = nullptr;
 	std::atomic<uint64_t> m_submit_sequence = 0;
 
 	friend class CommandBuffer;

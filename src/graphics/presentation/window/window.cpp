@@ -1,7 +1,5 @@
 #include "graphics/presentation/window.h"
 
-#include <cstdlib>
-
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -40,6 +38,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -59,7 +58,7 @@
 
 namespace Libs::Graphics {
 
-constexpr int   KEYBOARD_CONTROLLER_ID = -1000;
+constexpr int KEYBOARD_CONTROLLER_ID = -1000;
 
 struct EventKeyboard {
 	bool     down;
@@ -251,9 +250,7 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	if (key.down) {
 		switch (key.key_code) {
 			case SDLK_ESCAPE: game.need_exit = true; break;
-			case SDLK_SPACE:
-				SetPause(game, !game.paused.load(std::memory_order_acquire));
-				break;
+			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
@@ -390,7 +387,9 @@ void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
 	switch (window_event.event) {
-		case SDL_WINDOWEVENT_SHOWN: LOGF("Window %" PRIu32 " shown\n", window_event.windowID); break;
+		case SDL_WINDOWEVENT_SHOWN:
+			LOGF("Window %" PRIu32 " shown\n", window_event.windowID);
+			break;
 
 		case SDL_WINDOWEVENT_HIDDEN:
 			LOGF("Window %" PRIu32 " hidden\n", window_event.windowID);
@@ -401,13 +400,13 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 
 		case SDL_WINDOWEVENT_MOVED:
-			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n",
-			     window_event.windowID, window_event.data1, window_event.data2);
+			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window_event.windowID,
+			     window_event.data1, window_event.data2);
 			break;
 
 		case SDL_WINDOWEVENT_RESIZED:
-			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n",
-			     window_event.windowID, window_event.data1, window_event.data2);
+			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n", window_event.windowID,
+			     window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
 			Resize(window_event.data1, window_event.data2);
@@ -807,9 +806,8 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-	context.window =
-	    SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
-	                     KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
+	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
+	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
 	context.window_hidden = true;
 
@@ -832,7 +830,7 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	WindowCreate(*window);
 	window->CreateVulkan();
 	auto& presenter = *window->presenter;
-	g_window         = std::move(window);
+	g_window        = std::move(window);
 	return presenter;
 }
 
@@ -934,9 +932,9 @@ void WindowContext::UpdateTitle() {
 	    Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id));
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
-	static uint64_t fps_start = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num = 0;
-	static uint64_t fps_frames = 0;
+	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
+	static uint64_t frame_num   = 0;
+	static uint64_t fps_frames  = 0;
 	static double   current_fps = 0.0;
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
@@ -946,15 +944,15 @@ void WindowContext::UpdateTitle() {
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
-		fps_start  = now;
-		fps_frames = 0;
+		fps_start   = now;
+		fps_frames  = 0;
 	}
 
-	auto fps = fmt::format("{}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", (has_title ? title : ""),
-	                       (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	                       (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
-	                       (has_app_ver ? " " : ""), device_name, processor_name,
-	                       frame_num, current_fps);
+	auto fps =
+	    fmt::format("{}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", (has_title ? title : ""),
+	                (has_title ? ", " : ""), (has_title_id ? title_id : ""),
+	                (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
+	                (has_app_ver ? " " : ""), device_name, processor_name, frame_num, current_fps);
 
 #if defined(__APPLE__)
 	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.

@@ -2,8 +2,8 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COLORRENDERTARGET_H_
 
 #include "graphics/guest_gpu/gpu_defs.h"
-#include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>

@@ -1,7 +1,7 @@
-#include "graphics/host_gpu/memoryTracker.h"
-#include "graphics/host_gpu/rangeSet.h"
 #include "common/assert.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/rangeSet.h"
 
 #include <atomic>
 #include <cstdint>
@@ -30,1209 +30,1123 @@
 
 namespace {
 
-using Libs::Graphics::DirtySource;
 using Libs::Graphics::CpuFaultAction;
+using Libs::Graphics::DirtySource;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageFaultAccess;
 using Libs::Graphics::PageFaultPhase;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::PageWatchMode;
-using Libs::Graphics::RegionManager;
 using Libs::Graphics::RangeSet;
+using Libs::Graphics::RegionManager;
 
-void Check(bool value, const char *text) {
-  if (!value) {
-    std::fprintf(stderr, "MemoryTrackerTests: failed: %s\n", text);
-    std::abort();
-  }
+void Check(bool value, const char* text) {
+	if (!value) {
+		std::fprintf(stderr, "MemoryTrackerTests: failed: %s\n", text);
+		std::abort();
+	}
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // POSIX shims for the shared test body.
-using DWORD = uint32_t;
-constexpr uint32_t PAGE_NOACCESS = 1;
-constexpr uint32_t PAGE_READONLY = 2;
+using DWORD                       = uint32_t;
+constexpr uint32_t PAGE_NOACCESS  = 1;
+constexpr uint32_t PAGE_READONLY  = 2;
 constexpr uint32_t PAGE_READWRITE = 3;
-constexpr uint32_t MEM_RESERVE = 0;
-constexpr uint32_t MEM_COMMIT = 0;
-constexpr uint32_t MEM_RELEASE = 0;
+constexpr uint32_t MEM_RESERVE    = 0;
+constexpr uint32_t MEM_COMMIT     = 0;
+constexpr uint32_t MEM_RELEASE    = 0;
 
 int ToHostProt(uint32_t protection) {
-  switch (protection) {
-  case PAGE_NOACCESS:
-    return PROT_NONE;
-  case PAGE_READONLY:
-    return PROT_READ;
-  default:
-    return PROT_READ | PROT_WRITE;
-  }
+	switch (protection) {
+		case PAGE_NOACCESS: return PROT_NONE;
+		case PAGE_READONLY: return PROT_READ;
+		default: return PROT_READ | PROT_WRITE;
+	}
 }
 
-uint32_t Protection(const void *address) {
-  const auto addr = reinterpret_cast<uintptr_t>(address);
-  std::FILE *maps = std::fopen("/proc/self/maps", "r");
-  Check(maps != nullptr, "open /proc/self/maps failed");
-  char line[512];
-  uint32_t result = 0; // 0 => not mapped at all
-  while (std::fgets(line, sizeof(line), maps) != nullptr) {
-    unsigned long start = 0;
-    unsigned long end = 0;
-    char perms[8]{};
-    if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) {
-      continue;
-    }
-    if (addr >= start && addr < end) {
-      result = perms[1] == 'w'   ? PAGE_READWRITE
-               : perms[0] == 'r' ? PAGE_READONLY
-                                 : PAGE_NOACCESS;
-      break;
-    }
-  }
-  std::fclose(maps);
-  return result;
+uint32_t Protection(const void* address) {
+	const auto addr = reinterpret_cast<uintptr_t>(address);
+	std::FILE* maps = std::fopen("/proc/self/maps", "r");
+	Check(maps != nullptr, "open /proc/self/maps failed");
+	char     line[512];
+	uint32_t result = 0; // 0 => not mapped at all
+	while (std::fgets(line, sizeof(line), maps) != nullptr) {
+		unsigned long start = 0;
+		unsigned long end   = 0;
+		char          perms[8] {};
+		if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) {
+			continue;
+		}
+		if (addr >= start && addr < end) {
+			result = perms[1] == 'w'   ? PAGE_READWRITE
+			         : perms[0] == 'r' ? PAGE_READONLY
+			                           : PAGE_NOACCESS;
+			break;
+		}
+	}
+	std::fclose(maps);
+	return result;
 }
 
-bool IsWritable(const void *address) { return Protection(address) == PAGE_READWRITE; }
+bool IsWritable(const void* address) {
+	return Protection(address) == PAGE_READWRITE;
+}
 
 // munmap needs a length where VirtualFree's callers pass 0, so sizes are remembered here.
-std::map<void *, size_t> &AllocationSizes() {
-  static std::map<void *, size_t> sizes;
-  return sizes;
+std::map<void*, size_t>& AllocationSizes() {
+	static std::map<void*, size_t> sizes;
+	return sizes;
 }
 
-void *VirtualAlloc(void *address, size_t size, DWORD /*type*/, uint32_t protection) {
-  const int extra = address != nullptr ? MAP_FIXED_NOREPLACE : 0;
-  void *raw = ::mmap(address, size, ToHostProt(protection),
-                     MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
-  if (raw == MAP_FAILED) {
-    return nullptr;
-  }
-  AllocationSizes()[raw] = size;
-  return raw;
+void* VirtualAlloc(void* address, size_t size, DWORD /*type*/, uint32_t protection) {
+	const int extra = address != nullptr ? MAP_FIXED_NOREPLACE : 0;
+	void*     raw =
+	    ::mmap(address, size, ToHostProt(protection), MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
+	if (raw == MAP_FAILED) {
+		return nullptr;
+	}
+	AllocationSizes()[raw] = size;
+	return raw;
 }
 
-int VirtualFree(void *address, size_t /*size*/, DWORD /*type*/) {
-  auto &sizes = AllocationSizes();
-  auto it = sizes.find(address);
-  if (it == sizes.end()) {
-    return 0;
-  }
-  const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
-  sizes.erase(it);
-  return ok;
+int VirtualFree(void* address, size_t /*size*/, DWORD /*type*/) {
+	auto& sizes = AllocationSizes();
+	auto  it    = sizes.find(address);
+	if (it == sizes.end()) {
+		return 0;
+	}
+	const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
+	sizes.erase(it);
+	return ok;
 }
 
-[[maybe_unused]] int VirtualProtect(void *address, size_t size, uint32_t protection,
-                                    DWORD *old_protection) {
-  if (old_protection != nullptr) {
-    *old_protection = Protection(address);
-  }
-  return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
+[[maybe_unused]] int VirtualProtect(void* address, size_t size, uint32_t protection,
+                                    DWORD* old_protection) {
+	if (old_protection != nullptr) {
+		*old_protection = Protection(address);
+	}
+	return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
 }
 
 // Two views of one anonymous shared object.
 class SharedPage final {
- public:
-  SharedPage(uintptr_t address, uint64_t size) : size_(static_cast<size_t>(size)) {
-    fd_ = static_cast<int>(::syscall(SYS_memfd_create, "kyty-shared-page", 0u));
-    Check(fd_ >= 0, "memfd_create failed");
-    Check(::ftruncate(fd_, static_cast<off_t>(size)) == 0, "ftruncate failed");
-    guest = static_cast<uint8_t *>(::mmap(reinterpret_cast<void *>(address), size_,
-                                          PROT_READ | PROT_WRITE,
-                                          MAP_SHARED | MAP_FIXED_NOREPLACE, fd_, 0));
-    Check(guest == reinterpret_cast<void *>(address), "fixed shared view failed");
-    backing = static_cast<uint8_t *>(
-        ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
-    Check(backing != MAP_FAILED && backing != nullptr, "shared backing view failed");
-  }
+public:
+	SharedPage(uintptr_t address, uint64_t size): size_(static_cast<size_t>(size)) {
+		fd_ = static_cast<int>(::syscall(SYS_memfd_create, "kyty-shared-page", 0u));
+		Check(fd_ >= 0, "memfd_create failed");
+		Check(::ftruncate(fd_, static_cast<off_t>(size)) == 0, "ftruncate failed");
+		guest = static_cast<uint8_t*>(::mmap(reinterpret_cast<void*>(address), size_,
+		                                     PROT_READ | PROT_WRITE,
+		                                     MAP_SHARED | MAP_FIXED_NOREPLACE, fd_, 0));
+		Check(guest == reinterpret_cast<void*>(address), "fixed shared view failed");
+		backing = static_cast<uint8_t*>(
+		    ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
+		Check(backing != MAP_FAILED && backing != nullptr, "shared backing view failed");
+	}
 
-  ~SharedPage() {
-    Check(::munmap(backing, size_) == 0, "shared backing unmap failed");
-    Check(::munmap(guest, size_) == 0, "shared guest unmap failed");
-    Check(::close(fd_) == 0, "shared mapping close failed");
-  }
+	~SharedPage() {
+		Check(::munmap(backing, size_) == 0, "shared backing unmap failed");
+		Check(::munmap(guest, size_) == 0, "shared guest unmap failed");
+		Check(::close(fd_) == 0, "shared mapping close failed");
+	}
 
-  SharedPage(const SharedPage &) = delete;
-  SharedPage &operator=(const SharedPage &) = delete;
+	SharedPage(const SharedPage&)            = delete;
+	SharedPage& operator=(const SharedPage&) = delete;
 
-  uint8_t *guest = nullptr;
-  uint8_t *backing = nullptr;
+	uint8_t* guest   = nullptr;
+	uint8_t* backing = nullptr;
 
- private:
-  size_t size_ = 0;
-  int fd_ = -1;
+private:
+	size_t size_ = 0;
+	int    fd_   = -1;
 };
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-bool IsWritable(const void *address) {
-  MEMORY_BASIC_INFORMATION info{};
-  Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
-  return info.Protect == PAGE_READWRITE;
+bool IsWritable(const void* address) {
+	MEMORY_BASIC_INFORMATION info {};
+	Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
+	return info.Protect == PAGE_READWRITE;
 }
 
-uint32_t Protection(const void *address) {
-  MEMORY_BASIC_INFORMATION info{};
-  Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
-  return info.Protect;
+uint32_t Protection(const void* address) {
+	MEMORY_BASIC_INFORMATION info {};
+	Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
+	return info.Protect;
 }
 
 class SharedPage final {
- public:
-  SharedPage(uintptr_t address, uint64_t size) {
-    mapping_ = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                  static_cast<DWORD>(size >> 32u),
-                                  static_cast<DWORD>(size), nullptr);
-    Check(mapping_ != nullptr, "CreateFileMapping failed");
-    guest = static_cast<uint8_t *>(MapViewOfFileEx(
-        mapping_, FILE_MAP_ALL_ACCESS, 0, 0, size,
-        reinterpret_cast<void *>(address)));
-    Check(guest == reinterpret_cast<void *>(address),
-          "fixed shared view failed");
-    backing = static_cast<uint8_t *>(
-        MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, size));
-    Check(backing != nullptr, "shared backing view failed");
-  }
+public:
+	SharedPage(uintptr_t address, uint64_t size) {
+		mapping_ =
+		    CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+		                       static_cast<DWORD>(size >> 32u), static_cast<DWORD>(size), nullptr);
+		Check(mapping_ != nullptr, "CreateFileMapping failed");
+		guest = static_cast<uint8_t*>(MapViewOfFileEx(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, size,
+		                                              reinterpret_cast<void*>(address)));
+		Check(guest == reinterpret_cast<void*>(address), "fixed shared view failed");
+		backing = static_cast<uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_ALL_ACCESS, 0, 0, size));
+		Check(backing != nullptr, "shared backing view failed");
+	}
 
-  ~SharedPage() {
-    Check(UnmapViewOfFile(backing) != 0, "shared backing unmap failed");
-    Check(UnmapViewOfFile(guest) != 0, "shared guest unmap failed");
-    Check(CloseHandle(mapping_) != 0, "shared mapping close failed");
-  }
+	~SharedPage() {
+		Check(UnmapViewOfFile(backing) != 0, "shared backing unmap failed");
+		Check(UnmapViewOfFile(guest) != 0, "shared guest unmap failed");
+		Check(CloseHandle(mapping_) != 0, "shared mapping close failed");
+	}
 
-  SharedPage(const SharedPage &) = delete;
-  SharedPage &operator=(const SharedPage &) = delete;
+	SharedPage(const SharedPage&)            = delete;
+	SharedPage& operator=(const SharedPage&) = delete;
 
-  uint8_t *guest = nullptr;
-  uint8_t *backing = nullptr;
+	uint8_t* guest   = nullptr;
+	uint8_t* backing = nullptr;
 
- private:
-  HANDLE mapping_ = nullptr;
+private:
+	HANDLE mapping_ = nullptr;
 };
 #endif
 
-bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
-                         Common::VirtualMemory::Mode mode) {
-  uint32_t protection = PAGE_NOACCESS;
-  if (mode == Common::VirtualMemory::Mode::Read) {
-    protection = PAGE_READONLY;
-  } else if (mode == Common::VirtualMemory::Mode::ReadWrite) {
-    protection = PAGE_READWRITE;
-  }
-  DWORD old_protection = 0;
-  return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
-                        &old_protection) != 0;
+bool ProtectAddressSpace(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
+	uint32_t protection = PAGE_NOACCESS;
+	if (mode == Common::VirtualMemory::Mode::Read) {
+		protection = PAGE_READONLY;
+	} else if (mode == Common::VirtualMemory::Mode::ReadWrite) {
+		protection = PAGE_READWRITE;
+	}
+	DWORD old_protection = 0;
+	return VirtualProtect(reinterpret_cast<void*>(vaddr), size, protection, &old_protection) != 0;
 }
 
 #if 1
 
-bool DummyFault(void *, PageFaultAccess, uint64_t, uint64_t, PageFaultPhase) noexcept {
-  return true;
+bool DummyFault(void*, PageFaultAccess, uint64_t, uint64_t, PageFaultPhase) noexcept {
+	return true;
 }
 
 struct TrackerHarness {
-  static bool Fault(void *context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
-                    PageFaultPhase phase) noexcept {
-    auto *self = static_cast<TrackerHarness *>(context);
-    if (self == nullptr || self->target == nullptr) {
-      EXIT("memory-tracker test fault has no target\n");
-    }
-    return self->discard_virtual
-               ? self->target->InvalidateVirtualGpuWrite(access, vaddr, size, phase)
-               : self->target->InvalidateRegion(vaddr, size, phase);
-  }
+	static bool Fault(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
+	                  PageFaultPhase phase) noexcept {
+		auto* self = static_cast<TrackerHarness*>(context);
+		if (self == nullptr || self->target == nullptr) {
+			EXIT("memory-tracker test fault has no target\n");
+		}
+		return self->discard_virtual
+		           ? self->target->InvalidateVirtualGpuWrite(access, vaddr, size, phase)
+		           : self->target->InvalidateRegion(vaddr, size, phase);
+	}
 
-  explicit TrackerHarness(
-      PageWatchMode gpu_watch_mode = PageWatchMode::ReadWrite)
-      : page_manager(Fault, this), tracker(page_manager, gpu_watch_mode) {
-    target = &tracker;
-  }
+	explicit TrackerHarness(PageWatchMode gpu_watch_mode = PageWatchMode::ReadWrite)
+	    : page_manager(Fault, this), tracker(page_manager, gpu_watch_mode) {
+		target = &tracker;
+	}
 
-  MemoryTracker *target = nullptr;
-  bool discard_virtual = false;
-  PageManager page_manager;
-  MemoryTracker tracker;
+	MemoryTracker* target          = nullptr;
+	bool           discard_virtual = false;
+	PageManager    page_manager;
+	MemoryTracker  tracker;
 };
 
 struct SharedTrackerHarness {
-  static bool Fault(void *context, PageFaultAccess, uint64_t vaddr, uint64_t size,
-                    PageFaultPhase phase) noexcept {
-    auto *self = static_cast<SharedTrackerHarness *>(context);
-    if (self == nullptr) {
-      EXIT("shared memory-tracker test fault has no harness\n");
-    }
-    const bool first = self->first.InvalidateRegion(vaddr, size, phase);
-    const bool second = self->second.InvalidateRegion(vaddr, size, phase);
-    return first || second;
-  }
+	static bool Fault(void* context, PageFaultAccess, uint64_t vaddr, uint64_t size,
+	                  PageFaultPhase phase) noexcept {
+		auto* self = static_cast<SharedTrackerHarness*>(context);
+		if (self == nullptr) {
+			EXIT("shared memory-tracker test fault has no harness\n");
+		}
+		const bool first  = self->first.InvalidateRegion(vaddr, size, phase);
+		const bool second = self->second.InvalidateRegion(vaddr, size, phase);
+		return first || second;
+	}
 
-  SharedTrackerHarness()
-      : page_manager(Fault, this), first(page_manager), second(page_manager) {}
+	SharedTrackerHarness(): page_manager(Fault, this), first(page_manager), second(page_manager) {}
 
-  PageManager page_manager;
-  MemoryTracker first;
-  MemoryTracker second;
+	PageManager   page_manager;
+	MemoryTracker first;
+	MemoryTracker second;
 };
 
 struct SharedMetadataImageHarness {
-  static bool Fault(void *context, PageFaultAccess access, uint64_t vaddr,
-                    uint64_t size, PageFaultPhase phase) noexcept {
-    auto *self = static_cast<SharedMetadataImageHarness *>(context);
-    if (self == nullptr ||
-        (access != PageFaultAccess::Read && access != PageFaultAccess::Write)) {
-      EXIT("shared metadata/image test received an invalid fault\n");
-    }
-    const bool metadata = access == PageFaultAccess::Write &&
-                          self->metadata.InvalidateVirtualGpuWrite(
-                              access, vaddr, size, phase);
-    const bool image = self->image.InvalidateRegion(vaddr, size, phase);
-    return metadata || image;
-  }
+	static bool Fault(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
+	                  PageFaultPhase phase) noexcept {
+		auto* self = static_cast<SharedMetadataImageHarness*>(context);
+		if (self == nullptr ||
+		    (access != PageFaultAccess::Read && access != PageFaultAccess::Write)) {
+			EXIT("shared metadata/image test received an invalid fault\n");
+		}
+		const bool metadata = access == PageFaultAccess::Write &&
+		                      self->metadata.InvalidateVirtualGpuWrite(access, vaddr, size, phase);
+		const bool image    = self->image.InvalidateRegion(vaddr, size, phase);
+		return metadata || image;
+	}
 
-  SharedMetadataImageHarness()
-      : page_manager(Fault, this), image(page_manager),
-        metadata(page_manager, PageWatchMode::Write) {}
+	SharedMetadataImageHarness()
+	    : page_manager(Fault, this), image(page_manager),
+	      metadata(page_manager, PageWatchMode::Write) {}
 
-  PageManager page_manager;
-  MemoryTracker image;
-  MemoryTracker metadata;
+	PageManager   page_manager;
+	MemoryTracker image;
+	MemoryTracker metadata;
 };
 
 struct SplitTrackerHarness {
-  static bool Fault(void *context, PageFaultAccess access, uint64_t vaddr,
-                    uint64_t size, PageFaultPhase phase) noexcept {
-    auto *self = static_cast<SplitTrackerHarness *>(context);
-    if (self == nullptr) {
-      EXIT("split memory-tracker test fault has no harness\n");
-    }
-    if (phase == PageFaultPhase::Release) {
-      return true;
-    }
-    const bool buffer = self->buffer.InvalidateRegion(vaddr, size, phase);
-    const bool metadata = self->metadata.InvalidateVirtualGpuWrite(
-        access, vaddr, size, phase);
-    const bool image = self->image.InvalidateRegion(vaddr, size, phase);
-    if (static_cast<unsigned>(buffer) + static_cast<unsigned>(metadata) +
-            static_cast<unsigned>(image) !=
-        1) {
-      EXIT("split memory-tracker fault matched multiple owners\n");
-    }
-    return true;
-  }
+	static bool Fault(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
+	                  PageFaultPhase phase) noexcept {
+		auto* self = static_cast<SplitTrackerHarness*>(context);
+		if (self == nullptr) {
+			EXIT("split memory-tracker test fault has no harness\n");
+		}
+		if (phase == PageFaultPhase::Release) {
+			return true;
+		}
+		const bool buffer   = self->buffer.InvalidateRegion(vaddr, size, phase);
+		const bool metadata = self->metadata.InvalidateVirtualGpuWrite(access, vaddr, size, phase);
+		const bool image    = self->image.InvalidateRegion(vaddr, size, phase);
+		if (static_cast<unsigned>(buffer) + static_cast<unsigned>(metadata) +
+		        static_cast<unsigned>(image) !=
+		    1) {
+			EXIT("split memory-tracker fault matched multiple owners\n");
+		}
+		return true;
+	}
 
-  SplitTrackerHarness()
-      : page_manager(Fault, this), buffer(page_manager), image(page_manager),
-        metadata(page_manager, PageWatchMode::Write) {}
+	SplitTrackerHarness()
+	    : page_manager(Fault, this), buffer(page_manager), image(page_manager),
+	      metadata(page_manager, PageWatchMode::Write) {}
 
-  PageManager page_manager;
-  MemoryTracker buffer;
-  MemoryTracker image;
-  MemoryTracker metadata;
+	PageManager   page_manager;
+	MemoryTracker buffer;
+	MemoryTracker image;
+	MemoryTracker metadata;
 };
 
 struct DownloadTrackerHarness {
-  static bool Fault(void *context, PageFaultAccess access, uint64_t vaddr,
-                    uint64_t size, PageFaultPhase phase) noexcept {
-    auto *self = static_cast<DownloadTrackerHarness *>(context);
-    if (self == nullptr) {
-      EXIT("download memory-tracker test fault has no harness\n");
-    }
-    if (phase == PageFaultPhase::Invalidate) {
-      if (self->pending_access != PageFaultAccess::Unknown) {
-        EXIT("download memory-tracker test has an overlapping request\n");
-      }
-      const auto action = self->tracker.BeginCpuFault(vaddr, size);
-      if (action == CpuFaultAction::Download) {
-        self->pending_access = access;
-      }
-      return action != CpuFaultAction::Untracked;
-    }
-	if (phase == PageFaultPhase::Release) {
-		return true;
+	static bool Fault(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
+	                  PageFaultPhase phase) noexcept {
+		auto* self = static_cast<DownloadTrackerHarness*>(context);
+		if (self == nullptr) {
+			EXIT("download memory-tracker test fault has no harness\n");
+		}
+		if (phase == PageFaultPhase::Invalidate) {
+			if (self->pending_access != PageFaultAccess::Unknown) {
+				EXIT("download memory-tracker test has an overlapping request\n");
+			}
+			const auto action = self->tracker.BeginCpuFault(vaddr, size);
+			if (action == CpuFaultAction::Download) {
+				self->pending_access = access;
+			}
+			return action != CpuFaultAction::Untracked;
+		}
+		if (phase == PageFaultPhase::Release) {
+			return true;
+		}
+		const bool downloaded = self->pending_access != PageFaultAccess::Unknown;
+		if (downloaded) {
+			if (self->pending_access != access || self->download_data.empty()) {
+				EXIT("download memory-tracker test has invalid completion state\n");
+			}
+			if (self->backing == nullptr || self->download_address < self->guest_address) {
+				EXIT("download memory-tracker test has no backing alias\n");
+			}
+			std::memcpy(self->backing + self->download_address - self->guest_address,
+			            self->download_data.data(), self->download_data.size());
+		}
+		const bool completed = self->tracker.CompleteCpuFault(vaddr, size, access, downloaded);
+		self->pending_access = PageFaultAccess::Unknown;
+		return completed;
 	}
-    const bool downloaded = self->pending_access != PageFaultAccess::Unknown;
-    if (downloaded) {
-      if (self->pending_access != access || self->download_data.empty()) {
-        EXIT("download memory-tracker test has invalid completion state\n");
-      }
-      if (self->backing == nullptr ||
-          self->download_address < self->guest_address) {
-        EXIT("download memory-tracker test has no backing alias\n");
-      }
-      std::memcpy(self->backing + self->download_address - self->guest_address,
-                  self->download_data.data(), self->download_data.size());
-    }
-    const bool completed =
-        self->tracker.CompleteCpuFault(vaddr, size, access, downloaded);
-    self->pending_access = PageFaultAccess::Unknown;
-    return completed;
-  }
 
-  DownloadTrackerHarness()
-      : page_manager(Fault, this), tracker(page_manager) {}
+	DownloadTrackerHarness(): page_manager(Fault, this), tracker(page_manager) {}
 
-  PageFaultAccess pending_access = PageFaultAccess::Unknown;
-  uint64_t download_address = 0;
-  uint64_t guest_address = 0;
-  uint8_t *backing = nullptr;
-  std::vector<uint8_t> download_data;
-  PageManager page_manager;
-  MemoryTracker tracker;
+	PageFaultAccess      pending_access   = PageFaultAccess::Unknown;
+	uint64_t             download_address = 0;
+	uint64_t             guest_address    = 0;
+	uint8_t*             backing          = nullptr;
+	std::vector<uint8_t> download_data;
+	PageManager          page_manager;
+	MemoryTracker        tracker;
 };
 
-std::atomic<PageManager *> g_native_page_manager{nullptr};
-std::atomic_bool g_native_fault_entered{false};
+std::atomic<PageManager*> g_native_page_manager {nullptr};
+std::atomic_bool          g_native_fault_entered {false};
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-LONG CALLBACK NativeTrackerFaultHandler(EXCEPTION_POINTERS *exception) {
-  if (exception == nullptr || exception->ExceptionRecord == nullptr ||
-      exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-  const auto operation = exception->ExceptionRecord->ExceptionInformation[0];
-  const auto access = operation == 0   ? PageFaultAccess::Read
-                      : operation == 1 ? PageFaultAccess::Write
-                      : operation == 8 ? PageFaultAccess::Execute
-                                       : PageFaultAccess::Unknown;
-  auto *page_manager = g_native_page_manager.load(std::memory_order_acquire);
-  if (page_manager == nullptr) {
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-  g_native_fault_entered.store(true, std::memory_order_release);
-  return page_manager->HandleFault(
-             access, exception->ExceptionRecord->ExceptionInformation[1])
-             ? EXCEPTION_CONTINUE_EXECUTION
-             : EXCEPTION_CONTINUE_SEARCH;
+LONG CALLBACK NativeTrackerFaultHandler(EXCEPTION_POINTERS* exception) {
+	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+	    exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const auto operation    = exception->ExceptionRecord->ExceptionInformation[0];
+	const auto access       = operation == 0   ? PageFaultAccess::Read
+	                          : operation == 1 ? PageFaultAccess::Write
+	                          : operation == 8 ? PageFaultAccess::Execute
+	                                           : PageFaultAccess::Unknown;
+	auto*      page_manager = g_native_page_manager.load(std::memory_order_acquire);
+	if (page_manager == nullptr) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	g_native_fault_entered.store(true, std::memory_order_release);
+	return page_manager->HandleFault(access, exception->ExceptionRecord->ExceptionInformation[1])
+	           ? EXCEPTION_CONTINUE_EXECUTION
+	           : EXCEPTION_CONTINUE_SEARCH;
 }
 #else
 // SIGSEGV stands in for the vectored exception handler.
-void NativeTrackerFaultHandler(int signal_number, siginfo_t *info, void *native_context) {
-  auto *context = static_cast<ucontext_t *>(native_context);
-  const auto error_code = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
-  const auto access = (error_code & 0x10u) != 0    ? PageFaultAccess::Execute
-                      : (error_code & 0x02u) != 0 ? PageFaultAccess::Write
-                                                  : PageFaultAccess::Read;
-  auto *page_manager = g_native_page_manager.load(std::memory_order_acquire);
-  if (page_manager != nullptr) {
-    g_native_fault_entered.store(true, std::memory_order_release);
-    if (page_manager->HandleFault(access, reinterpret_cast<uint64_t>(info->si_addr))) {
-      return;
-    }
-  }
-  struct sigaction restore {};
-  restore.sa_handler = SIG_DFL;
-  sigemptyset(&restore.sa_mask);
-  ::sigaction(signal_number, &restore, nullptr);
+void NativeTrackerFaultHandler(int signal_number, siginfo_t* info, void* native_context) {
+	auto*      context      = static_cast<ucontext_t*>(native_context);
+	const auto error_code   = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
+	const auto access       = (error_code & 0x10u) != 0   ? PageFaultAccess::Execute
+	                          : (error_code & 0x02u) != 0 ? PageFaultAccess::Write
+	                                                      : PageFaultAccess::Read;
+	auto*      page_manager = g_native_page_manager.load(std::memory_order_acquire);
+	if (page_manager != nullptr) {
+		g_native_fault_entered.store(true, std::memory_order_release);
+		if (page_manager->HandleFault(access, reinterpret_cast<uint64_t>(info->si_addr))) {
+			return;
+		}
+	}
+	struct sigaction restore {};
+	restore.sa_handler = SIG_DFL;
+	sigemptyset(&restore.sa_mask);
+	::sigaction(signal_number, &restore, nullptr);
 }
 
 struct sigaction g_saved_segv_action {};
 
-void *AddVectoredExceptionHandler(unsigned long /*first*/,
-                                  void (*handler)(int, siginfo_t *, void *)) {
-  struct sigaction action {};
-  action.sa_sigaction = handler;
-  sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_SIGINFO;
-  if (::sigaction(SIGSEGV, &action, &g_saved_segv_action) != 0) {
-    return nullptr;
-  }
-  return reinterpret_cast<void *>(handler);
+void* AddVectoredExceptionHandler(unsigned long /*first*/,
+                                  void (*handler)(int, siginfo_t*, void*)) {
+	struct sigaction action {};
+	action.sa_sigaction = handler;
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = SA_SIGINFO;
+	if (::sigaction(SIGSEGV, &action, &g_saved_segv_action) != 0) {
+		return nullptr;
+	}
+	return reinterpret_cast<void*>(handler);
 }
 
-int RemoveVectoredExceptionHandler(void * /*token*/) {
-  return ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0 ? 1 : 0;
+int RemoveVectoredExceptionHandler(void* /*token*/) {
+	return ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0 ? 1 : 0;
 }
 #endif
 
 void TestPendingFaultBlocksUploadConsumption() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
-  PageManager page_manager(DummyFault, nullptr);
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size);
-  RegionManager region(page_manager, address & ~(region_size - 1));
+	constexpr uintptr_t base        = 0x0000000200010000ull;
+	constexpr uint64_t  region_size = 4ull * 1024ull * 1024ull;
+	PageManager         page_manager(DummyFault, nullptr);
+	const auto          page_size = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size);
+	RegionManager region(page_manager, address & ~(region_size - 1));
 
-  Libs::Graphics::RegionBits changed;
-  {
-    std::scoped_lock lock(region.lock);
-    region.Track(address, page_size);
-    changed = region.ForEachModifiedRange<DirtySource::Cpu, true>(
-        address, page_size, [](uint64_t, uint64_t) noexcept {});
-    changed = region.ChangeState<DirtySource::Cpu, true>(address, page_size);
-    Check(region.BeginCpuFault(address, 1) == CpuFaultAction::Continue,
-          "fault ownership rejected an already CPU-dirty page");
-  }
-  page_manager.UpdatePageWatchers(false, address, page_size);
+	Libs::Graphics::RegionBits changed;
+	{
+		std::scoped_lock lock(region.lock);
+		region.Track(address, page_size);
+		changed = region.ForEachModifiedRange<DirtySource::Cpu, true>(
+		    address, page_size, [](uint64_t, uint64_t) noexcept {});
+		changed = region.ChangeState<DirtySource::Cpu, true>(address, page_size);
+		Check(region.BeginCpuFault(address, 1) == CpuFaultAction::Continue,
+		      "fault ownership rejected an already CPU-dirty page");
+	}
+	page_manager.UpdatePageWatchers(false, address, page_size);
 
-  uint32_t ranges = 0;
-  {
-    std::scoped_lock lock(region.lock);
-    const auto pending_change =
-        region.ForEachModifiedRange<DirtySource::Cpu, true>(
-            address, page_size, [&](uint64_t, uint64_t) noexcept { ranges++; });
-    Check(ranges == 0 && pending_change.none() &&
-              region.IsModified<DirtySource::Cpu>(address - region.GetCpuAddr(),
-                                                  page_size),
-          "pending fault page was consumed by upload");
-    Check(region.CompleteCpuFault(address, 1, PageFaultAccess::Write, false),
-          "fault completion was not recorded");
-    changed = region.ForEachModifiedRange<DirtySource::Cpu, true>(
-        address, page_size, [&](uint64_t, uint64_t) noexcept { ranges++; });
-  }
-  Check(ranges == 1, "completed fault page was not available to upload");
-  {
-    std::scoped_lock lock(region.lock);
-    changed = region.ChangeState<DirtySource::Cpu, true>(address, page_size);
-  }
-  region.ApplyProtection(changed, false);
-  page_manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	uint32_t ranges = 0;
+	{
+		std::scoped_lock lock(region.lock);
+		const auto       pending_change = region.ForEachModifiedRange<DirtySource::Cpu, true>(
+		    address, page_size, [&](uint64_t, uint64_t) noexcept { ranges++; });
+		Check(ranges == 0 && pending_change.none() &&
+		          region.IsModified<DirtySource::Cpu>(address - region.GetCpuAddr(), page_size),
+		      "pending fault page was consumed by upload");
+		Check(region.CompleteCpuFault(address, 1, PageFaultAccess::Write, false),
+		      "fault completion was not recorded");
+		changed = region.ForEachModifiedRange<DirtySource::Cpu, true>(
+		    address, page_size, [&](uint64_t, uint64_t) noexcept { ranges++; });
+	}
+	Check(ranges == 1, "completed fault page was not available to upload");
+	{
+		std::scoped_lock lock(region.lock);
+		changed = region.ChangeState<DirtySource::Cpu, true>(address, page_size);
+	}
+	region.ApplyProtection(changed, false);
+	page_manager.OnGpuUnmap(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestCleanReadFaultPreservesCpuState() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  PageManager page_manager(DummyFault, nullptr);
-  MemoryTracker tracker(page_manager);
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(VirtualAlloc(
-      reinterpret_cast<void *>(base), page_size, MEM_RESERVE | MEM_COMMIT,
-      PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size);
-  tracker.ForEachUploadRange(address, page_size, false,
-                             [](uint64_t, uint64_t) noexcept {},
-                             []() noexcept {});
-  Check(!tracker.IsRegionCpuModified(address, page_size) &&
-            !tracker.IsRegionGpuModified(address, page_size),
-        "clean read-fault setup retained dirty ownership");
-  Check(tracker.BeginCpuFault(address, 1, PageFaultAccess::Read) ==
-            CpuFaultAction::Continue,
-        "clean tracked read fault was not accepted");
-  Check(tracker.CompleteCpuFault(address, 1, PageFaultAccess::Read, false),
-        "clean tracked read fault did not complete");
-  Check(!tracker.IsRegionCpuModified(address, page_size) &&
-            !tracker.IsRegionGpuModified(address, page_size),
-        "clean read fault incorrectly transferred write ownership to the CPU");
-  tracker.UntrackMemory(address, page_size);
-  page_manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	PageManager         page_manager(DummyFault, nullptr);
+	MemoryTracker       tracker(page_manager);
+	const auto          page_size = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size);
+	tracker.ForEachUploadRange(
+	    address, page_size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(!tracker.IsRegionCpuModified(address, page_size) &&
+	          !tracker.IsRegionGpuModified(address, page_size),
+	      "clean read-fault setup retained dirty ownership");
+	Check(tracker.BeginCpuFault(address, 1, PageFaultAccess::Read) == CpuFaultAction::Continue,
+	      "clean tracked read fault was not accepted");
+	Check(tracker.CompleteCpuFault(address, 1, PageFaultAccess::Read, false),
+	      "clean tracked read fault did not complete");
+	Check(!tracker.IsRegionCpuModified(address, page_size) &&
+	          !tracker.IsRegionGpuModified(address, page_size),
+	      "clean read fault incorrectly transferred write ownership to the CPU");
+	tracker.UntrackMemory(address, page_size);
+	page_manager.OnGpuUnmap(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestGpuDownloadFaultOwnership() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  DownloadTrackerHarness harness;
-  const auto page_size = harness.page_manager.GetPageSize();
-  SharedPage shared(base, page_size);
-  auto *memory = shared.guest;
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  harness.guest_address = address;
-  harness.backing = shared.backing;
-  harness.page_manager.OnGpuMap(address, page_size);
-  harness.tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  harness.download_address = address + 32;
-  harness.download_data = {0x11, 0x22, 0x33, 0x44};
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Read, address + 32),
-        "GPU-dirty read fault was not handled");
-  Check(std::memcmp(memory + 32, harness.download_data.data(), 4) == 0 &&
-            !harness.tracker.IsRegionGpuModified(address, page_size) &&
-            !harness.tracker.IsRegionCpuModified(address, page_size) &&
-            Protection(memory) == PAGE_READONLY &&
-            harness.page_manager.IsTracked(address),
-        "GPU readback did not leave a clean write-watched page");
+	constexpr uintptr_t    base = 0x0000000200010000ull;
+	DownloadTrackerHarness harness;
+	const auto             page_size = harness.page_manager.GetPageSize();
+	SharedPage             shared(base, page_size);
+	auto*                  memory  = shared.guest;
+	const auto             address = reinterpret_cast<uint64_t>(memory);
+	harness.guest_address          = address;
+	harness.backing                = shared.backing;
+	harness.page_manager.OnGpuMap(address, page_size);
+	harness.tracker.ForEachUploadRange(
+	    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	harness.download_address = address + 32;
+	harness.download_data    = {0x11, 0x22, 0x33, 0x44};
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Read, address + 32),
+	      "GPU-dirty read fault was not handled");
+	Check(std::memcmp(memory + 32, harness.download_data.data(), 4) == 0 &&
+	          !harness.tracker.IsRegionGpuModified(address, page_size) &&
+	          !harness.tracker.IsRegionCpuModified(address, page_size) &&
+	          Protection(memory) == PAGE_READONLY && harness.page_manager.IsTracked(address),
+	      "GPU readback did not leave a clean write-watched page");
 
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 32),
-        "write watcher was not preserved after GPU readback");
-  Check(harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
-        "post-read CPU write did not claim CPU ownership");
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 32),
+	      "write watcher was not preserved after GPU readback");
+	Check(harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+	      "post-read CPU write did not claim CPU ownership");
 
-  harness.tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  harness.download_data = {0xaa, 0xbb, 0xcc, 0xdd};
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 33),
-        "GPU-dirty write fault was not handled");
-  Check(std::memcmp(memory + 32, harness.download_data.data(), 4) == 0 &&
-            !harness.tracker.IsRegionGpuModified(address, page_size) &&
-            harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
-        "GPU write fault did not download before granting CPU ownership");
-  harness.tracker.UntrackMemory(address, page_size);
+	harness.tracker.ForEachUploadRange(
+	    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	harness.download_data = {0xaa, 0xbb, 0xcc, 0xdd};
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 33),
+	      "GPU-dirty write fault was not handled");
+	Check(std::memcmp(memory + 32, harness.download_data.data(), 4) == 0 &&
+	          !harness.tracker.IsRegionGpuModified(address, page_size) &&
+	          harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+	      "GPU write fault did not download before granting CPU ownership");
+	harness.tracker.UntrackMemory(address, page_size);
 }
 
 void TestVirtualGpuWriteDiscard() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness(PageWatchMode::Write);
-  harness.discard_virtual = true;
-  const auto page_size = harness.page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  memory[8] = 0x5a;
-  harness.page_manager.OnGpuMap(address, page_size);
-  harness.tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  Check(Protection(memory) == PAGE_READONLY && memory[8] == 0x5a &&
-            harness.tracker.IsRegionGpuModified(address, page_size),
-        "virtual GPU ownership did not preserve authoritative backing reads");
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8),
-        "virtual GPU write fault was not discarded");
-  Check(!harness.tracker.IsRegionGpuModified(address, page_size) &&
-            harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
-        "virtual GPU discard did not transfer the page to CPU ownership");
-  harness.tracker.UntrackMemory(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness(PageWatchMode::Write);
+	harness.discard_virtual = true;
+	const auto page_size    = harness.page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	memory[8]          = 0x5a;
+	harness.page_manager.OnGpuMap(address, page_size);
+	harness.tracker.ForEachUploadRange(
+	    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(Protection(memory) == PAGE_READONLY && memory[8] == 0x5a &&
+	          harness.tracker.IsRegionGpuModified(address, page_size),
+	      "virtual GPU ownership did not preserve authoritative backing reads");
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8),
+	      "virtual GPU write fault was not discarded");
+	Check(!harness.tracker.IsRegionGpuModified(address, page_size) &&
+	          harness.tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+	      "virtual GPU discard did not transfer the page to CPU ownership");
+	harness.tracker.UntrackMemory(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestSameSlabTrackerArbitration() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  SplitTrackerHarness harness;
-  const auto page_size = harness.page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(VirtualAlloc(
-      reinterpret_cast<void *>(base), page_size * 3,
-      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  harness.page_manager.OnGpuMap(address, page_size * 3);
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	SplitTrackerHarness harness;
+	const auto          page_size = harness.page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size * 3,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	harness.page_manager.OnGpuMap(address, page_size * 3);
 
-  harness.buffer.ForEachUploadRange(
-      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  harness.image.ForEachUploadRange(
-      address + page_size, page_size, false,
-      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  harness.metadata.ForEachUploadRange(
-      address + page_size * 2, page_size, true,
-      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	harness.buffer.ForEachUploadRange(
+	    address, page_size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	harness.image.ForEachUploadRange(
+	    address + page_size, page_size, false, [](uint64_t, uint64_t) noexcept {},
+	    []() noexcept {});
+	harness.metadata.ForEachUploadRange(
+	    address + page_size * 2, page_size, true, [](uint64_t, uint64_t) noexcept {},
+	    []() noexcept {});
 
-  Check(harness.buffer.BeginCpuFault(address + page_size * 2, 1) ==
-            CpuFaultAction::Untracked &&
-            harness.image.BeginCpuFault(address + page_size * 2, 1) ==
-                CpuFaultAction::Untracked,
-        "unrelated same-slab trackers claimed the metadata page");
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write,
-                                         address + page_size * 2 + 8),
-        "metadata write fault was not exclusively handled");
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8),
-        "buffer write fault was not exclusively handled");
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write,
-                                         address + page_size + 8),
-        "image write fault was not exclusively handled");
-  Check(harness.buffer.IsRegionCpuModified(address, page_size) &&
-            harness.image.IsRegionCpuModified(address + page_size, page_size) &&
-            harness.metadata.IsRegionCpuModified(address + page_size * 2,
-                                                  page_size) &&
-            IsWritable(memory) && IsWritable(memory + page_size) &&
-            IsWritable(memory + page_size * 2),
-        "exclusive same-slab faults did not transfer exact CPU ownership");
+	Check(harness.buffer.BeginCpuFault(address + page_size * 2, 1) == CpuFaultAction::Untracked &&
+	          harness.image.BeginCpuFault(address + page_size * 2, 1) == CpuFaultAction::Untracked,
+	      "unrelated same-slab trackers claimed the metadata page");
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + page_size * 2 + 8),
+	      "metadata write fault was not exclusively handled");
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8),
+	      "buffer write fault was not exclusively handled");
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + page_size + 8),
+	      "image write fault was not exclusively handled");
+	Check(harness.buffer.IsRegionCpuModified(address, page_size) &&
+	          harness.image.IsRegionCpuModified(address + page_size, page_size) &&
+	          harness.metadata.IsRegionCpuModified(address + page_size * 2, page_size) &&
+	          IsWritable(memory) && IsWritable(memory + page_size) &&
+	          IsWritable(memory + page_size * 2),
+	      "exclusive same-slab faults did not transfer exact CPU ownership");
 
-  harness.buffer.UntrackMemory(address, page_size);
-  harness.image.UntrackMemory(address + page_size, page_size);
-  harness.metadata.UntrackMemory(address + page_size * 2, page_size);
-  harness.page_manager.OnGpuUnmap(address, page_size * 3);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	harness.buffer.UntrackMemory(address, page_size);
+	harness.image.UntrackMemory(address + page_size, page_size);
+	harness.metadata.UntrackMemory(address + page_size * 2, page_size);
+	harness.page_manager.OnGpuUnmap(address, page_size * 3);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestSharedMetadataAndImagePageFault() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  SharedMetadataImageHarness harness;
-  const auto page_size = harness.page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(VirtualAlloc(
-      reinterpret_cast<void *>(base), page_size, MEM_RESERVE | MEM_COMMIT,
-      PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  harness.page_manager.OnGpuMap(address, page_size);
-  harness.metadata.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  harness.image.ForEachUploadRange(
-      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  Check(Protection(memory) == PAGE_READONLY &&
-            harness.metadata.IsRegionGpuModified(address, page_size) &&
-            !harness.image.IsRegionCpuModified(address, page_size),
-        "shared metadata/image page was not write-watched");
-  Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8),
-        "shared metadata/image write fault was not handled");
-  Check(!harness.metadata.IsRegionGpuModified(address, page_size) &&
-            harness.metadata.IsRegionCpuModified(address, page_size) &&
-            harness.image.IsRegionCpuModified(address, page_size) &&
-            IsWritable(memory),
-        "shared write fault did not invalidate both native trackers");
-  harness.metadata.UntrackMemory(address, page_size);
-  harness.image.UntrackMemory(address, page_size);
-  harness.page_manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t        base = 0x0000000200010000ull;
+	SharedMetadataImageHarness harness;
+	const auto                 page_size = harness.page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	harness.page_manager.OnGpuMap(address, page_size);
+	harness.metadata.ForEachUploadRange(
+	    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	harness.image.ForEachUploadRange(
+	    address, page_size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(Protection(memory) == PAGE_READONLY &&
+	          harness.metadata.IsRegionGpuModified(address, page_size) &&
+	          !harness.image.IsRegionCpuModified(address, page_size),
+	      "shared metadata/image page was not write-watched");
+	Check(harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8),
+	      "shared metadata/image write fault was not handled");
+	Check(!harness.metadata.IsRegionGpuModified(address, page_size) &&
+	          harness.metadata.IsRegionCpuModified(address, page_size) &&
+	          harness.image.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+	      "shared write fault did not invalidate both native trackers");
+	harness.metadata.UntrackMemory(address, page_size);
+	harness.image.UntrackMemory(address, page_size);
+	harness.page_manager.OnGpuUnmap(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestRangeSet() {
-  RangeSet ranges;
-  ranges.Add(0x1000, 0x80);
-  ranges.Add(0x1080, 0x80);
-  ranges.Add(0x1200, 0x40);
-  Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
-        "range set containment did not require full coverage");
-  auto intersections = ranges.Intersections(0x1070, 0x1b0);
-  Check(intersections.size() == 2 && intersections[0].address == 0x1070 &&
-            intersections[0].size == 0x90 && intersections[1].address == 0x1200 &&
-            intersections[1].size == 0x20,
-        "range set did not merge and intersect exact byte ranges");
-  ranges.Subtract(0x1040, 0x1e0);
-  intersections = ranges.Intersections(0x1000, 0x300);
-  Check(intersections.size() == 2 && intersections[0].address == 0x1000 &&
-            intersections[0].size == 0x40 && intersections[1].address == 0x1220 &&
-            intersections[1].size == 0x20,
-        "range set subtraction did not preserve both exact tails");
+	RangeSet ranges;
+	ranges.Add(0x1000, 0x80);
+	ranges.Add(0x1080, 0x80);
+	ranges.Add(0x1200, 0x40);
+	Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
+	      "range set containment did not require full coverage");
+	auto intersections = ranges.Intersections(0x1070, 0x1b0);
+	Check(intersections.size() == 2 && intersections[0].address == 0x1070 &&
+	          intersections[0].size == 0x90 && intersections[1].address == 0x1200 &&
+	          intersections[1].size == 0x20,
+	      "range set did not merge and intersect exact byte ranges");
+	ranges.Subtract(0x1040, 0x1e0);
+	intersections = ranges.Intersections(0x1000, 0x300);
+	Check(intersections.size() == 2 && intersections[0].address == 0x1000 &&
+	          intersections[0].size == 0x40 && intersections[1].address == 0x1220 &&
+	          intersections[1].size == 0x20,
+	      "range set subtraction did not preserve both exact tails");
 }
 
 void TestQueriesDoNotRequireMappedOwnership() {
-  constexpr uint64_t address = 0x0000000203000000ull;
-  TrackerHarness harness;
-  const auto page_size = harness.page_manager.GetPageSize();
-  Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
-            !harness.tracker.IsRegionGpuModified(address, page_size),
-        "unowned tracker range did not expose its initial CPU-dirty state");
+	constexpr uint64_t address = 0x0000000203000000ull;
+	TrackerHarness     harness;
+	const auto         page_size = harness.page_manager.GetPageSize();
+	Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
+	          !harness.tracker.IsRegionGpuModified(address, page_size),
+	      "unowned tracker range did not expose its initial CPU-dirty state");
 }
 
 void TestRangeInvalidation() {
-  constexpr uintptr_t base = 0x0000000201000000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  constexpr uint64_t size = Libs::Graphics::TRACKER_REGION_SIZE * 2;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), size, MEM_RESERVE | MEM_COMMIT,
-                   PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base),
-        "range invalidation allocation failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, size);
+	constexpr uintptr_t base = 0x0000000201000000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	constexpr uint64_t  size         = Libs::Graphics::TRACKER_REGION_SIZE * 2;
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "range invalidation allocation failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, size);
 
-  tracker.ForEachUploadRange(
-      address, size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  Check(tracker.IsRegionGpuModified(address, size) && !IsWritable(memory),
-        "range invalidation setup did not establish GPU ownership");
+	tracker.ForEachUploadRange(
+	    address, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(tracker.IsRegionGpuModified(address, size) && !IsWritable(memory),
+	      "range invalidation setup did not establish GPU ownership");
 
-  uint32_t flushes = 0;
-  tracker.InvalidateRegion(address + 16, size - 32, [&] {
-    flushes++;
-    tracker.ForEachDownloadRange<true>(
-        address + 16, size - 32, [](uint64_t, uint64_t) noexcept {});
-  });
-  Check(flushes == 1 && !tracker.IsRegionGpuModified(address, size) &&
-            tracker.IsRegionCpuModified(address, size) && IsWritable(memory) &&
-            IsWritable(memory + size - 1),
-        "range invalidation did not batch ownership transfer across regions");
+	uint32_t flushes = 0;
+	tracker.InvalidateRegion(address + 16, size - 32, [&] {
+		flushes++;
+		tracker.ForEachDownloadRange<true>(address + 16, size - 32,
+		                                   [](uint64_t, uint64_t) noexcept {});
+	});
+	Check(flushes == 1 && !tracker.IsRegionGpuModified(address, size) &&
+	          tracker.IsRegionCpuModified(address, size) && IsWritable(memory) &&
+	          IsWritable(memory + size - 1),
+	      "range invalidation did not batch ownership transfer across regions");
 
-  tracker.InvalidateRegion(address + 16, size - 32, [&] { flushes++; });
-  Check(flushes == 1,
-        "clean range invalidation unnecessarily requested a GPU flush");
-  tracker.UntrackMemory(address, size);
-  page_manager.OnGpuUnmap(address, size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0,
-        "range invalidation VirtualFree failed");
+	tracker.InvalidateRegion(address + 16, size - 32, [&] { flushes++; });
+	Check(flushes == 1, "clean range invalidation unnecessarily requested a GPU flush");
+	tracker.UntrackMemory(address, size);
+	page_manager.OnGpuUnmap(address, size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "range invalidation VirtualFree failed");
 }
 
 void TestCpuDirtyUploadAndFault() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size * 2);
-  Check(tracker.IsRegionCpuModified(address + 16, 32),
-        "new region was not CPU dirty");
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size * 2,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size * 2);
+	Check(tracker.IsRegionCpuModified(address + 16, 32), "new region was not CPU dirty");
 
-  uint32_t ranges = 0;
-  bool uploaded = false;
-  tracker.ForEachUploadRange(
-      address + 16, 32, false,
-      [&](uint64_t upload_addr, uint64_t upload_size) noexcept {
-        Check(upload_addr == address && upload_size == page_size,
-              "upload range was not page aligned");
-        ranges++;
-      },
-      [&]() noexcept { uploaded = true; });
-  Check(ranges == 1 && uploaded &&
-            !tracker.IsRegionCpuModified(address + 16, 32) &&
-            !IsWritable(memory),
-        "upload did not clear CPU dirty state and arm protection");
+	uint32_t ranges   = 0;
+	bool     uploaded = false;
+	tracker.ForEachUploadRange(
+	    address + 16, 32, false,
+	    [&](uint64_t upload_addr, uint64_t upload_size) noexcept {
+		    Check(upload_addr == address && upload_size == page_size,
+		          "upload range was not page aligned");
+		    ranges++;
+	    },
+	    [&]() noexcept { uploaded = true; });
+	Check(ranges == 1 && uploaded && !tracker.IsRegionCpuModified(address + 16, 32) &&
+	          !IsWritable(memory),
+	      "upload did not clear CPU dirty state and arm protection");
 
-  Check(page_manager.HandleFault(PageFaultAccess::Write, address + 24),
-        "tracked CPU write fault was not handled");
-  Check(tracker.IsRegionCpuModified(address + 16, 32) && IsWritable(memory),
-        "fault did not restore CPU dirty state and write access");
-  tracker.ForEachUploadRange(
-      address + 16, 32, false, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  Check(!tracker.IsRegionCpuModified(address + 16, 32) && !IsWritable(memory),
-        "fault owner state did not support a balanced rearm");
-  tracker.MarkRegionAsCpuModified(address + 16, 32);
-  Check(IsWritable(memory),
-        "explicit CPU dirty transition did not release the rearmed watch");
+	Check(page_manager.HandleFault(PageFaultAccess::Write, address + 24),
+	      "tracked CPU write fault was not handled");
+	Check(tracker.IsRegionCpuModified(address + 16, 32) && IsWritable(memory),
+	      "fault did not restore CPU dirty state and write access");
+	tracker.ForEachUploadRange(
+	    address + 16, 32, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(!tracker.IsRegionCpuModified(address + 16, 32) && !IsWritable(memory),
+	      "fault owner state did not support a balanced rearm");
+	tracker.MarkRegionAsCpuModified(address + 16, 32);
+	Check(IsWritable(memory), "explicit CPU dirty transition did not release the rearmed watch");
 
-  tracker.UntrackMemory(address, page_size * 2);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	tracker.UntrackMemory(address, page_size * 2);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestFaultDuringUploadRemainsDirty() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size);
-  tracker.ForEachUploadRange(
-      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
-      [&]() noexcept {
-        bool handled = false;
-        std::thread fault([&] {
-          handled = page_manager.HandleFault(PageFaultAccess::Write, address);
-        });
-        fault.join();
-        Check(handled, "concurrent write racing upload was not handled");
-      });
-  Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
-        "upload completion erased a racing CPU dirty transition");
-  tracker.UntrackMemory(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size);
+	tracker.ForEachUploadRange(
+	    address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+	    [&]() noexcept {
+		    bool        handled = false;
+		    std::thread fault(
+		        [&] { handled = page_manager.HandleFault(PageFaultAccess::Write, address); });
+		    fault.join();
+		    Check(handled, "concurrent write racing upload was not handled");
+	    });
+	Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+	      "upload completion erased a racing CPU dirty transition");
+	tracker.UntrackMemory(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestNativeStoreDuringRangeEnumeration() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size);
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size);
 
-  void *handler = AddVectoredExceptionHandler(1, NativeTrackerFaultHandler);
-  Check(handler != nullptr, "AddVectoredExceptionHandler failed");
-  Check(g_native_page_manager.exchange(&page_manager, std::memory_order_acq_rel) ==
-            nullptr,
-        "native page manager already installed");
-  g_native_fault_entered.store(false, std::memory_order_release);
+	void* handler = AddVectoredExceptionHandler(1, NativeTrackerFaultHandler);
+	Check(handler != nullptr, "AddVectoredExceptionHandler failed");
+	Check(g_native_page_manager.exchange(&page_manager, std::memory_order_acq_rel) == nullptr,
+	      "native page manager already installed");
+	g_native_fault_entered.store(false, std::memory_order_release);
 
-  std::thread writer;
-  tracker.ForEachUploadRange(
-      address, page_size, false,
-      [&](uint64_t, uint64_t) noexcept {
-        writer = std::thread(
-            [&] { *static_cast<volatile uint8_t *>(memory) = 0x6b; });
-        while (!g_native_fault_entered.load(std::memory_order_acquire)) {
-          std::this_thread::yield();
-        }
-      },
-      [&]() noexcept { writer.join(); });
+	std::thread writer;
+	tracker.ForEachUploadRange(
+	    address, page_size, false,
+	    [&](uint64_t, uint64_t) noexcept {
+		    writer = std::thread([&] { *static_cast<volatile uint8_t*>(memory) = 0x6b; });
+		    while (!g_native_fault_entered.load(std::memory_order_acquire)) {
+			    std::this_thread::yield();
+		    }
+	    },
+	    [&]() noexcept { writer.join(); });
 
-  Check(g_native_page_manager.exchange(nullptr, std::memory_order_acq_rel) ==
-            &page_manager,
-        "native page manager publication changed");
-  Check(RemoveVectoredExceptionHandler(handler) != 0,
-        "RemoveVectoredExceptionHandler failed");
-  Check(memory[0] == 0x6b && tracker.IsRegionCpuModified(address, page_size) &&
-            IsWritable(memory),
-        "native store during range enumeration was lost");
+	Check(g_native_page_manager.exchange(nullptr, std::memory_order_acq_rel) == &page_manager,
+	      "native page manager publication changed");
+	Check(RemoveVectoredExceptionHandler(handler) != 0, "RemoveVectoredExceptionHandler failed");
+	Check(memory[0] == 0x6b && tracker.IsRegionCpuModified(address, page_size) &&
+	          IsWritable(memory),
+	      "native store during range enumeration was lost");
 
-  tracker.UntrackMemory(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	tracker.UntrackMemory(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestFaultDuringDownloadSynchronization() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  SharedPage shared(base, page_size * 3);
-  auto *memory = shared.guest;
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size * 3);
-  tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  tracker.ForEachUploadRange(
-      address + page_size * 2, page_size, true,
-      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  memory[page_size] = 0x31;
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	SharedPage          shared(base, page_size * 3);
+	auto*               memory  = shared.guest;
+	const auto          address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size * 3);
+	tracker.ForEachUploadRange(
+	    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	tracker.ForEachUploadRange(
+	    address + page_size * 2, page_size, true, [](uint64_t, uint64_t) noexcept {},
+	    []() noexcept {});
+	memory[page_size] = 0x31;
 
-  void *handler = AddVectoredExceptionHandler(1, NativeTrackerFaultHandler);
-  Check(handler != nullptr, "AddVectoredExceptionHandler failed");
-  Check(g_native_page_manager.exchange(&page_manager, std::memory_order_acq_rel) ==
-            nullptr,
-        "native page manager already installed");
-  g_native_fault_entered.store(false, std::memory_order_release);
+	void* handler = AddVectoredExceptionHandler(1, NativeTrackerFaultHandler);
+	Check(handler != nullptr, "AddVectoredExceptionHandler failed");
+	Check(g_native_page_manager.exchange(&page_manager, std::memory_order_acq_rel) == nullptr,
+	      "native page manager already installed");
+	g_native_fault_entered.store(false, std::memory_order_release);
 
-  uint32_t ranges = 0;
-  std::vector<uint8_t> download(page_size, 0x5a);
-  std::thread writer;
-  {
-    PageManager::BackingWrite first(page_manager, address, page_size);
-    PageManager::BackingWrite third(page_manager, address + page_size * 2,
-                                    page_size);
-    tracker.ForEachDownloadRange<true>(
-        address, page_size * 3,
-        [&](uint64_t download_address, uint64_t download_size) noexcept {
-          Check((download_address == address ||
-                 download_address == address + page_size * 2) &&
-                    download_size == page_size,
-                "download transaction reported the wrong range");
-          ranges++;
-          if (download_address == address) {
-            writer = std::thread(
-                [&] { *static_cast<volatile uint8_t *>(memory) = 0x7c; });
-            while (!g_native_fault_entered.load(std::memory_order_acquire)) {
-              std::this_thread::yield();
-            }
-          }
-          std::memcpy(shared.backing + download_address - address,
-                      download.data(), download_size);
-          Check(Protection(reinterpret_cast<void *>(download_address)) ==
-                    PAGE_NOACCESS,
-                "backing alias exposed the protected guest page");
-          Check(Protection(memory + page_size) == PAGE_READWRITE,
-                "clean middle page was reserved or protected");
-        });
-    Check(ranges == 2 && Protection(memory) == PAGE_NOACCESS &&
-              Protection(memory + page_size) == PAGE_READWRITE &&
-              Protection(memory + page_size * 2) == PAGE_NOACCESS,
-          "download completion released protection before reservation");
-  }
-  writer.join();
+	uint32_t             ranges = 0;
+	std::vector<uint8_t> download(page_size, 0x5a);
+	std::thread          writer;
+	{
+		PageManager::BackingWrite first(page_manager, address, page_size);
+		PageManager::BackingWrite third(page_manager, address + page_size * 2, page_size);
+		tracker.ForEachDownloadRange<true>(
+		    address, page_size * 3,
+		    [&](uint64_t download_address, uint64_t download_size) noexcept {
+			    Check(
+			        (download_address == address || download_address == address + page_size * 2) &&
+			            download_size == page_size,
+			        "download transaction reported the wrong range");
+			    ranges++;
+			    if (download_address == address) {
+				    writer = std::thread([&] { *static_cast<volatile uint8_t*>(memory) = 0x7c; });
+				    while (!g_native_fault_entered.load(std::memory_order_acquire)) {
+					    std::this_thread::yield();
+				    }
+			    }
+			    std::memcpy(shared.backing + download_address - address, download.data(),
+			                download_size);
+			    Check(Protection(reinterpret_cast<void*>(download_address)) == PAGE_NOACCESS,
+			          "backing alias exposed the protected guest page");
+			    Check(Protection(memory + page_size) == PAGE_READWRITE,
+			          "clean middle page was reserved or protected");
+		    });
+		Check(ranges == 2 && Protection(memory) == PAGE_NOACCESS &&
+		          Protection(memory + page_size) == PAGE_READWRITE &&
+		          Protection(memory + page_size * 2) == PAGE_NOACCESS,
+		      "download completion released protection before reservation");
+	}
+	writer.join();
 
-  Check(g_native_page_manager.exchange(nullptr, std::memory_order_acq_rel) ==
-            &page_manager,
-        "native page manager publication changed");
-  Check(RemoveVectoredExceptionHandler(handler) != 0,
-        "RemoveVectoredExceptionHandler failed");
-  Check(ranges == 2, "partial download did not enumerate both dirty ranges");
-  Check(memory[0] == 0x7c && memory[1] == 0x5a &&
-            memory[page_size] == 0x31 && memory[page_size * 2] == 0x5a,
-        "reserved backing write raced or lost downloaded data");
-  Check(!tracker.IsRegionGpuModified(address, page_size * 3) &&
-            tracker.IsRegionCpuModified(address, page_size * 3),
-        "partial download left incorrect tracker ownership");
-  Check(IsWritable(memory), "first dirty page did not restore write access");
-  Check(IsWritable(memory + page_size), "clean page lost write access");
-  Check(Protection(memory + page_size * 2) == PAGE_READONLY &&
-            page_manager.IsTracked(address + page_size * 2),
-        "uncontended dirty page did not retain its clean write watch");
+	Check(g_native_page_manager.exchange(nullptr, std::memory_order_acq_rel) == &page_manager,
+	      "native page manager publication changed");
+	Check(RemoveVectoredExceptionHandler(handler) != 0, "RemoveVectoredExceptionHandler failed");
+	Check(ranges == 2, "partial download did not enumerate both dirty ranges");
+	Check(memory[0] == 0x7c && memory[1] == 0x5a && memory[page_size] == 0x31 &&
+	          memory[page_size * 2] == 0x5a,
+	      "reserved backing write raced or lost downloaded data");
+	Check(!tracker.IsRegionGpuModified(address, page_size * 3) &&
+	          tracker.IsRegionCpuModified(address, page_size * 3),
+	      "partial download left incorrect tracker ownership");
+	Check(IsWritable(memory), "first dirty page did not restore write access");
+	Check(IsWritable(memory + page_size), "clean page lost write access");
+	Check(Protection(memory + page_size * 2) == PAGE_READONLY &&
+	          page_manager.IsTracked(address + page_size * 2),
+	      "uncontended dirty page did not retain its clean write watch");
 
-  tracker.UntrackMemory(address, page_size * 3);
+	tracker.UntrackMemory(address, page_size * 3);
 }
 
 void TestFaultAndExplicitDirtyRace() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size);
-  for (uint32_t iteration = 0; iteration < 64; iteration++) {
-    tracker.ForEachUploadRange(
-        address, page_size, false, [](uint64_t, uint64_t) noexcept {},
-        []() noexcept {});
-    std::atomic_bool start{false};
-    bool handled = false;
-    std::thread fault([&] {
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      handled = page_manager.HandleFault(PageFaultAccess::Write, address);
-    });
-    std::thread dirty([&] {
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      tracker.MarkRegionAsCpuModified(address, page_size);
-    });
-    start.store(true, std::memory_order_release);
-    fault.join();
-    dirty.join();
-    Check(handled && tracker.IsRegionCpuModified(address, page_size) &&
-              IsWritable(memory),
-          "fault/explicit-dirty race lost dirty state or write access");
-  }
-  tracker.UntrackMemory(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size);
+	for (uint32_t iteration = 0; iteration < 64; iteration++) {
+		tracker.ForEachUploadRange(
+		    address, page_size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+		std::atomic_bool start {false};
+		bool             handled = false;
+		std::thread      fault([&] {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+			handled = page_manager.HandleFault(PageFaultAccess::Write, address);
+		});
+		std::thread      dirty([&] {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+			tracker.MarkRegionAsCpuModified(address, page_size);
+		});
+		start.store(true, std::memory_order_release);
+		fault.join();
+		dirty.join();
+		Check(handled && tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+		      "fault/explicit-dirty race lost dirty state or write access");
+	}
+	tracker.UntrackMemory(address, page_size);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestSharedTrackersAndConcurrentPageFaults() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  SharedTrackerHarness harness;
-  const auto page_size = harness.page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  harness.page_manager.OnGpuMap(address, page_size * 2);
+	constexpr uintptr_t  base = 0x0000000200010000ull;
+	SharedTrackerHarness harness;
+	const auto           page_size = harness.page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size * 2,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	harness.page_manager.OnGpuMap(address, page_size * 2);
 
-  for (auto *tracker : {&harness.first, &harness.second}) {
-    tracker->ForEachUploadRange(
-        address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
-        []() noexcept {});
-  }
-  Check(!IsWritable(memory) && !IsWritable(memory + page_size),
-        "shared trackers did not arm both pages");
+	for (auto* tracker: {&harness.first, &harness.second}) {
+		tracker->ForEachUploadRange(
+		    address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	}
+	Check(!IsWritable(memory) && !IsWritable(memory + page_size),
+	      "shared trackers did not arm both pages");
 
-  std::atomic_bool start{false};
-  bool first_handled = false;
-  bool second_handled = false;
-  std::thread first_fault([&] {
-    while (!start.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-    first_handled = harness.page_manager.HandleFault(PageFaultAccess::Write,
-                                                     address + 8);
-  });
-  std::thread second_fault([&] {
-    while (!start.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-    second_handled = harness.page_manager.HandleFault(
-        PageFaultAccess::Write, address + page_size + 8);
-  });
-  start.store(true, std::memory_order_release);
-  first_fault.join();
-  second_fault.join();
+	std::atomic_bool start {false};
+	bool             first_handled  = false;
+	bool             second_handled = false;
+	std::thread      first_fault([&] {
+		while (!start.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		first_handled = harness.page_manager.HandleFault(PageFaultAccess::Write, address + 8);
+	});
+	std::thread      second_fault([&] {
+		while (!start.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		second_handled =
+		    harness.page_manager.HandleFault(PageFaultAccess::Write, address + page_size + 8);
+	});
+	start.store(true, std::memory_order_release);
+	first_fault.join();
+	second_fault.join();
 
-  Check(first_handled && second_handled,
-        "concurrent faults were not handled by shared trackers");
-  for (auto *tracker : {&harness.first, &harness.second}) {
-    Check(tracker->IsRegionCpuModified(address, page_size * 2),
-          "a shared tracker lost concurrent CPU dirtiness");
-  }
+	Check(first_handled && second_handled, "concurrent faults were not handled by shared trackers");
+	for (auto* tracker: {&harness.first, &harness.second}) {
+		Check(tracker->IsRegionCpuModified(address, page_size * 2),
+		      "a shared tracker lost concurrent CPU dirtiness");
+	}
 
-  harness.first.UntrackMemory(address, page_size * 2);
-  harness.second.UntrackMemory(address, page_size * 2);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	harness.first.UntrackMemory(address, page_size * 2);
+	harness.second.UntrackMemory(address, page_size * 2);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestGpuDirtyBits() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), page_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, page_size * 2);
-  tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-      []() noexcept {});
-  Check(tracker.IsRegionGpuModified(address, page_size) &&
-            !tracker.IsRegionGpuModified(address + page_size, page_size) &&
-            Protection(memory) == PAGE_NOACCESS,
-        "GPU dirty state escaped the requested range");
-  tracker.UnmarkRegionAsGpuModified(address, page_size);
-  Check(!tracker.IsRegionGpuModified(address, page_size) &&
-            Protection(memory) == PAGE_READONLY,
-        "GPU dirty state did not restore write-only tracking");
-  tracker.MarkRegionAsGpuModified(address, page_size);
-  Check(tracker.IsRegionGpuModified(address, page_size) &&
-            Protection(memory) == PAGE_NOACCESS,
-        "explicit GPU dirty transition did not trap CPU access");
-  tracker.UnmarkRegionAsGpuModified(address, page_size);
-  tracker.MarkRegionAsCpuModified(address, page_size);
-  tracker.UntrackMemory(address, page_size * 2);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(base), page_size * 2,
+	                                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, page_size * 2);
+	tracker.ForEachUploadRange(
+	    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	Check(tracker.IsRegionGpuModified(address, page_size) &&
+	          !tracker.IsRegionGpuModified(address + page_size, page_size) &&
+	          Protection(memory) == PAGE_NOACCESS,
+	      "GPU dirty state escaped the requested range");
+	tracker.UnmarkRegionAsGpuModified(address, page_size);
+	Check(!tracker.IsRegionGpuModified(address, page_size) && Protection(memory) == PAGE_READONLY,
+	      "GPU dirty state did not restore write-only tracking");
+	tracker.MarkRegionAsGpuModified(address, page_size);
+	Check(tracker.IsRegionGpuModified(address, page_size) && Protection(memory) == PAGE_NOACCESS,
+	      "explicit GPU dirty transition did not trap CPU access");
+	tracker.UnmarkRegionAsGpuModified(address, page_size);
+	tracker.MarkRegionAsCpuModified(address, page_size);
+	tracker.UntrackMemory(address, page_size * 2);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestCrossRegionUpload() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  const auto boundary = (address + region_size - 1) & ~(region_size - 1);
-  page_manager.OnGpuMap(address, region_size * 2);
-  uint32_t ranges = 0;
-  tracker.ForEachUploadRange(
-      boundary - page_size, page_size * 2, false,
-      [&](uint64_t, uint64_t) noexcept { ranges++; }, []() noexcept {});
-  Check(ranges == 2 &&
-            !tracker.IsRegionCpuModified(boundary - page_size, page_size * 2) &&
-            !IsWritable(reinterpret_cast<void *>(boundary - page_size)) &&
-            !IsWritable(reinterpret_cast<void *>(boundary)),
-        "cross-region upload did not clear and protect both regions");
-  tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
-  tracker.ForEachUploadRange(
-      boundary - page_size, page_size * 2, true,
-      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-  Check(tracker.IsRegionGpuModified(boundary - page_size, page_size * 2),
-        "cross-region written upload did not mark GPU dirty state");
-  tracker.UnmarkRegionAsGpuModified(boundary - page_size, page_size * 2);
-  tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
-  tracker.UntrackMemory(address, region_size * 2);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+	constexpr uintptr_t base        = 0x0000000200010000ull;
+	constexpr uint64_t  region_size = 4ull * 1024ull * 1024ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	auto*               memory       = static_cast<uint8_t*>(VirtualAlloc(
+	    reinterpret_cast<void*>(base), region_size * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address  = reinterpret_cast<uint64_t>(memory);
+	const auto boundary = (address + region_size - 1) & ~(region_size - 1);
+	page_manager.OnGpuMap(address, region_size * 2);
+	uint32_t ranges = 0;
+	tracker.ForEachUploadRange(
+	    boundary - page_size, page_size * 2, false, [&](uint64_t, uint64_t) noexcept { ranges++; },
+	    []() noexcept {});
+	Check(ranges == 2 && !tracker.IsRegionCpuModified(boundary - page_size, page_size * 2) &&
+	          !IsWritable(reinterpret_cast<void*>(boundary - page_size)) &&
+	          !IsWritable(reinterpret_cast<void*>(boundary)),
+	      "cross-region upload did not clear and protect both regions");
+	tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
+	tracker.ForEachUploadRange(
+	    boundary - page_size, page_size * 2, true, [](uint64_t, uint64_t) noexcept {},
+	    []() noexcept {});
+	Check(tracker.IsRegionGpuModified(boundary - page_size, page_size * 2),
+	      "cross-region written upload did not mark GPU dirty state");
+	tracker.UnmarkRegionAsGpuModified(boundary - page_size, page_size * 2);
+	tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
+	tracker.UntrackMemory(address, region_size * 2);
+	Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-[[noreturn]] void RunDeathCase(const char *name) {
-  constexpr uintptr_t base = 0x0000000200010000ull;
-  TrackerHarness harness;
-  auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  const auto allocation_size =
-      std::strcmp(name, "missing-download-bytes") == 0 ? page_size * 2
-                                                       : page_size;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), allocation_size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, allocation_size);
-  if (std::strcmp(name, "gpu-dirty-fault") == 0 ||
-      std::strcmp(name, "gpu-dirty-read") == 0 ||
-      std::strcmp(name, "gpu-dirty-explicit-cpu") == 0 ||
-      std::strcmp(name, "virtual-gpu-read") == 0) {
-    harness.discard_virtual = std::strcmp(name, "virtual-gpu-read") == 0;
-    tracker.ForEachUploadRange(
-        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-        []() noexcept {});
-    if (std::strcmp(name, "gpu-dirty-explicit-cpu") == 0) {
-      tracker.MarkRegionAsCpuModified(address, page_size);
-    } else {
-      (void)page_manager.HandleFault(
-          (std::strcmp(name, "gpu-dirty-read") == 0 ||
-           std::strcmp(name, "virtual-gpu-read") == 0)
-              ? PageFaultAccess::Read
-              : PageFaultAccess::Write,
-          address);
-    }
-  } else if (std::strcmp(name, "reentrant-upload") == 0) {
-    tracker.ForEachUploadRange(
-        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-        [&]() noexcept {
-          (void)tracker.IsRegionCpuModified(address, page_size);
-        });
-  } else if (std::strcmp(name, "writable-upload-race") == 0) {
-    std::atomic_bool start{false};
-    std::atomic_bool entered{false};
-    std::thread fault([&] {
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      entered.store(true, std::memory_order_release);
-      (void)page_manager.HandleFault(PageFaultAccess::Write, address);
-    });
-    tracker.ForEachUploadRange(
-        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
-        [&]() noexcept {
-          start.store(true, std::memory_order_release);
-          while (!entered.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-          }
-    });
-    fault.join();
-  } else if (std::strcmp(name, "missing-download-bytes") == 0) {
-    tracker.ForEachUploadRange(
-        address, allocation_size, true, [](uint64_t, uint64_t) noexcept {},
-        []() noexcept {});
-    RangeSet dirty_bytes;
-    dirty_bytes.Add(address, 1);
-    PageManager::BackingWrite backing(page_manager, address, page_size);
-    tracker.ForEachDownloadRange<true>(
-        address, allocation_size,
-        [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-          for (auto page = dirty_address; page < dirty_address + dirty_size;
-               page += page_size) {
-            if (dirty_bytes.Intersections(page, page_size).empty()) {
-              EXIT("GPU-dirty test page has no dirty byte record\n");
-            }
-          }
-        },
-        [](uint64_t, uint64_t) noexcept {});
-  }
-  std::_Exit(0x7f);
+[[noreturn]] void RunDeathCase(const char* name) {
+	constexpr uintptr_t base = 0x0000000200010000ull;
+	TrackerHarness      harness;
+	auto&               tracker      = harness.tracker;
+	auto&               page_manager = harness.page_manager;
+	const auto          page_size    = page_manager.GetPageSize();
+	const auto          allocation_size =
+	    std::strcmp(name, "missing-download-bytes") == 0 ? page_size * 2 : page_size;
+	auto* memory = static_cast<uint8_t*>(VirtualAlloc(
+	    reinterpret_cast<void*>(base), allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	Check(memory == reinterpret_cast<void*>(base), "fixed VirtualAlloc failed");
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	page_manager.OnGpuMap(address, allocation_size);
+	if (std::strcmp(name, "gpu-dirty-fault") == 0 || std::strcmp(name, "gpu-dirty-read") == 0 ||
+	    std::strcmp(name, "gpu-dirty-explicit-cpu") == 0 ||
+	    std::strcmp(name, "virtual-gpu-read") == 0) {
+		harness.discard_virtual = std::strcmp(name, "virtual-gpu-read") == 0;
+		tracker.ForEachUploadRange(
+		    address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+		if (std::strcmp(name, "gpu-dirty-explicit-cpu") == 0) {
+			tracker.MarkRegionAsCpuModified(address, page_size);
+		} else {
+			(void)page_manager.HandleFault((std::strcmp(name, "gpu-dirty-read") == 0 ||
+			                                std::strcmp(name, "virtual-gpu-read") == 0)
+			                                   ? PageFaultAccess::Read
+			                                   : PageFaultAccess::Write,
+			                               address);
+		}
+	} else if (std::strcmp(name, "reentrant-upload") == 0) {
+		tracker.ForEachUploadRange(
+		    address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+		    [&]() noexcept { (void)tracker.IsRegionCpuModified(address, page_size); });
+	} else if (std::strcmp(name, "writable-upload-race") == 0) {
+		std::atomic_bool start {false};
+		std::atomic_bool entered {false};
+		std::thread      fault([&] {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+			entered.store(true, std::memory_order_release);
+			(void)page_manager.HandleFault(PageFaultAccess::Write, address);
+		});
+		tracker.ForEachUploadRange(
+		    address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+		    [&]() noexcept {
+			    start.store(true, std::memory_order_release);
+			    while (!entered.load(std::memory_order_acquire)) {
+				    std::this_thread::yield();
+			    }
+		    });
+		fault.join();
+	} else if (std::strcmp(name, "missing-download-bytes") == 0) {
+		tracker.ForEachUploadRange(
+		    address, allocation_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+		RangeSet dirty_bytes;
+		dirty_bytes.Add(address, 1);
+		PageManager::BackingWrite backing(page_manager, address, page_size);
+		tracker.ForEachDownloadRange<true>(
+		    address, allocation_size,
+		    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
+			    for (auto page = dirty_address; page < dirty_address + dirty_size;
+			         page += page_size) {
+				    if (dirty_bytes.Intersections(page, page_size).empty()) {
+					    EXIT("GPU-dirty test page has no dirty byte record\n");
+				    }
+			    }
+		    },
+		    [](uint64_t, uint64_t) noexcept {});
+	}
+	std::_Exit(0x7f);
 }
 
 void TestFatalPaths() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  char path[MAX_PATH]{};
-  Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
-        "GetModuleFileName failed");
+	char path[MAX_PATH] {};
+	Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0, "GetModuleFileName failed");
 #endif
-  for (const char *name : {"gpu-dirty-fault", "gpu-dirty-read", "virtual-gpu-read",
-                           "gpu-dirty-explicit-cpu",
-                           "reentrant-upload", "writable-upload-race",
-                           "missing-download-bytes"}) {
+	for (const char* name:
+	     {"gpu-dirty-fault", "gpu-dirty-read", "virtual-gpu-read", "gpu-dirty-explicit-cpu",
+	      "reentrant-upload", "writable-upload-race", "missing-download-bytes"}) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-    std::string command = std::string("\"") + path + "\" --death " + name;
-    std::vector<char> mutable_command(command.begin(), command.end());
-    mutable_command.push_back('\0');
-    STARTUPINFOA startup{sizeof(startup)};
-    PROCESS_INFORMATION process{};
-    Check(CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
-                         FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                         &process) != 0,
-          "CreateProcess failed");
-    Check(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
-          "MemoryTracker death test timed out");
-    DWORD exit_code = 0;
-    Check(GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
-              (exit_code == 321 ||
-               exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
-          "MemoryTracker death path used the wrong exit");
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
+		std::string       command = std::string("\"") + path + "\" --death " + name;
+		std::vector<char> mutable_command(command.begin(), command.end());
+		mutable_command.push_back('\0');
+		STARTUPINFOA        startup {sizeof(startup)};
+		PROCESS_INFORMATION process {};
+		Check(CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+		                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0,
+		      "CreateProcess failed");
+		Check(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+		      "MemoryTracker death test timed out");
+		DWORD exit_code = 0;
+		Check(GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
+		          (exit_code == 321 || exit_code == EXCEPTION_NONCONTINUABLE_EXCEPTION),
+		      "MemoryTracker death path used the wrong exit");
+		CloseHandle(process.hThread);
+		CloseHandle(process.hProcess);
 #else
-    const pid_t pid = ::fork();
-    Check(pid >= 0, "fork failed");
-    if (pid == 0) {
-      ::execl("/proc/self/exe", "MemoryTrackerTests", "--death", name, nullptr);
-      std::_Exit(0x7e);
-    }
-    int status = 0;
-    Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
-    // Exit status carries only the low 8 bits.
-    const bool fatal_exit = WIFEXITED(status) && (WEXITSTATUS(status) == (321 & 0xff) ||
-                                                  WEXITSTATUS(status) == (322 & 0xff));
-    Check(fatal_exit || WIFSIGNALED(status),
-          "MemoryTracker death path used the wrong exit");
+		const pid_t pid = ::fork();
+		Check(pid >= 0, "fork failed");
+		if (pid == 0) {
+			::execl("/proc/self/exe", "MemoryTrackerTests", "--death", name, nullptr);
+			std::_Exit(0x7e);
+		}
+		int status = 0;
+		Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
+		// Exit status carries only the low 8 bits.
+		const bool fatal_exit = WIFEXITED(status) && (WEXITSTATUS(status) == (321 & 0xff) ||
+		                                              WEXITSTATUS(status) == (322 & 0xff));
+		Check(fatal_exit || WIFSIGNALED(status), "MemoryTracker death path used the wrong exit");
 #endif
-  }
+	}
 }
 #endif
 
@@ -1241,40 +1155,40 @@ void TestFatalPaths() {
 namespace Libs::LibKernel::Memory {
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
-  return ProtectAddressSpace(vaddr, size, mode);
+	return ProtectAddressSpace(vaddr, size, mode);
 }
 
 } // namespace Libs::LibKernel::Memory
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
 #if 1
-  if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
-    RunDeathCase(argv[2]);
-  }
-  TestCpuDirtyUploadAndFault();
-  TestPendingFaultBlocksUploadConsumption();
-  TestCleanReadFaultPreservesCpuState();
-  TestGpuDownloadFaultOwnership();
-  TestVirtualGpuWriteDiscard();
-  TestSameSlabTrackerArbitration();
-  TestSharedMetadataAndImagePageFault();
-  TestRangeSet();
-  TestQueriesDoNotRequireMappedOwnership();
-  TestRangeInvalidation();
-  TestGpuDirtyBits();
-  TestCrossRegionUpload();
-  TestFaultDuringUploadRemainsDirty();
-  TestNativeStoreDuringRangeEnumeration();
-  TestFaultDuringDownloadSynchronization();
-  TestFaultAndExplicitDirtyRace();
-  TestSharedTrackersAndConcurrentPageFaults();
-  TestFatalPaths();
-  std::puts("MemoryTrackerTests: all cases passed");
-  return 0;
+	if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
+		RunDeathCase(argv[2]);
+	}
+	TestCpuDirtyUploadAndFault();
+	TestPendingFaultBlocksUploadConsumption();
+	TestCleanReadFaultPreservesCpuState();
+	TestGpuDownloadFaultOwnership();
+	TestVirtualGpuWriteDiscard();
+	TestSameSlabTrackerArbitration();
+	TestSharedMetadataAndImagePageFault();
+	TestRangeSet();
+	TestQueriesDoNotRequireMappedOwnership();
+	TestRangeInvalidation();
+	TestGpuDirtyBits();
+	TestCrossRegionUpload();
+	TestFaultDuringUploadRemainsDirty();
+	TestNativeStoreDuringRangeEnumeration();
+	TestFaultDuringDownloadSynchronization();
+	TestFaultAndExplicitDirtyRace();
+	TestSharedTrackersAndConcurrentPageFaults();
+	TestFatalPaths();
+	std::puts("MemoryTrackerTests: all cases passed");
+	return 0;
 #else
-  (void)argc;
-  (void)argv;
-  std::fputs("MemoryTrackerTests: unsupported platform\n", stderr);
-  return 1;
+	(void)argc;
+	(void)argv;
+	std::fputs("MemoryTrackerTests: unsupported platform\n", stderr);
+	return 1;
 #endif
 }

@@ -107,12 +107,11 @@ void InitSubsystems() {
 	slist->Add(log, {core, config});
 	Check("InitSubsystems", slist->InitAll(false), "failed to initialize logging subsystem");
 
-	const auto param_json =
-	    std::filesystem::temp_directory_path() /
-	    ("kyty_virtual_memory_" +
-	     std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
+	const auto param_json = std::filesystem::temp_directory_path() /
+	                        ("kyty_virtual_memory_" +
+	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
 	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
-	Common::File  param_file;
+	Common::File   param_file;
 	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
 	uint32_t bytes_written = 0;
 	param_file.Write(json, sizeof(json) - 1, &bytes_written);
@@ -247,8 +246,8 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize),
 	      "semantic reservation replaced the owner's placeholder");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
-	          base, SceKernelPageSize, Common::VirtualMemory::Mode::NoAccess),
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize,
+	                                                      Common::VirtualMemory::Mode::NoAccess),
 	      "owner rejected a sparse placeholder protection no-op");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
 	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize),
@@ -402,8 +401,7 @@ void TestFlexibleDmemCompatAndAlignmentFlags() {
 	Check(test, stack_start == nullptr && stack_end == nullptr,
 	      "DMEM_COMPAT flexible mapping was reported as a stack");
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
-	        "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "DMEM_COMPAT cleanup did not restore flexible capacity");
 
@@ -443,8 +441,8 @@ void TestFlexibleNoCoalescePreservesBoundaries() {
 	const auto  baseline = AvailableFlexibleMemory(test);
 	void*       reserve  = nullptr;
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	            &reserve, SceKernelPageSize * 2, 0, SceKernelPageSize),
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 2, 0,
+	                                                           SceKernelPageSize),
 	        "KernelReserveVirtualRange");
 	const auto base = reinterpret_cast<uint64_t>(reserve);
 
@@ -601,13 +599,12 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	    Common::VirtualMemory::Mode::ReadWrite, "runtime_adjacent_second", true);
 	Check(test, adjacent_second == adjacent_first + SceKernelPageSize,
 	      "second adjacent runtime allocation failed");
-	Check(test,
-	      Libs::LibKernel::Memory::FreeGuestMemory(adjacent_first, SceKernelPageSize * 2),
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(adjacent_first, SceKernelPageSize * 2),
 	      "combined adjacent runtime free failed");
-	Check(test,
-	      Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(adjacent_first,
-	                                                          SceKernelPageSize * 2),
-	      "combined adjacent runtime free did not restore one owner placeholder");
+	Check(
+	    test,
+	    Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(adjacent_first, SceKernelPageSize * 2),
+	    "combined adjacent runtime free did not restore one owner placeholder");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -877,12 +874,12 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	                                            SceKernelPageSize, SceKernelProtCpuRead),
 	    "KernelMprotect(middle)");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
-	          base, size, Common::VirtualMemory::Mode::Read),
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size,
+	                                                      Common::VirtualMemory::Mode::Read),
 	      "owner could not protect fragmented backing views");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
-	          base, size, Common::VirtualMemory::Mode::ReadWrite),
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size,
+	                                                      Common::VirtualMemory::Mode::ReadWrite),
 	      "owner could not restore fragmented backing views");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
@@ -1091,12 +1088,12 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x100, 0x200) == 0x200,
 	      "ClampRangeSize did not cross adjacent committed mappings");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
-	          base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::Read),
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize * 2,
+	                                                      Common::VirtualMemory::Mode::Read),
 	      "owner could not protect adjacent backing mappings");
 	Check(test,
-	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
-	          base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::ReadWrite),
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize * 2,
+	                                                      Common::VirtualMemory::Mode::ReadWrite),
 	      "owner could not restore adjacent backing mappings");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),

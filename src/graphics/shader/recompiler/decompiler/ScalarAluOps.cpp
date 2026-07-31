@@ -196,10 +196,10 @@ bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		case Opcode::SMovkI32: return DecodeScalarDestination(sdst, pc, inst.dst, error);
 		case Opcode::SWaitcnt: {
 			const uint32_t waitcnt = word & 0xffffu;
-			inst.dst.kind         = OperandKind::Null;
-			inst.src0.signed_val  = static_cast<int32_t>(waitcnt);
-			inst.src0.value       = waitcnt;
-			inst.src_count        = 1;
+			inst.dst.kind          = OperandKind::Null;
+			inst.src0.signed_val   = static_cast<int32_t>(waitcnt);
+			inst.src0.value        = waitcnt;
+			inst.src_count         = 1;
 			return true;
 		}
 		case Opcode::SSetregB32:
@@ -266,10 +266,10 @@ bool DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.src0.value      = simm;
 	inst.src0.signed_val = static_cast<int16_t>(simm);
 	inst.src_count = (inst.opcode == Opcode::SNop || inst.opcode == Opcode::SWaitcnt ||
-	                   inst.opcode == Opcode::SSleep || inst.opcode == Opcode::SSendmsg ||
-	                   inst.opcode == Opcode::STtraceData || inst.opcode == Opcode::SInstPrefetch)
-	                      ? 1
-	                      : 0;
+	                  inst.opcode == Opcode::SSleep || inst.opcode == Opcode::SSendmsg ||
+	                  inst.opcode == Opcode::STtraceData || inst.opcode == Opcode::SInstPrefetch)
+	                     ? 1
+	                     : 0;
 	inst.branch_offset = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;
 	inst.branch_target = pc + 4u + static_cast<uint32_t>(inst.branch_offset);
 	SetRawWords(inst, code, word_index, 1);

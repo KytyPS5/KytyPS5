@@ -397,10 +397,10 @@ TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64
 	return layout;
 }
 
-std::vector<vk::BufferImageCopy>
-TextureBuildImageCopies(const TextureUploadLayout& layout, uint32_t width, uint32_t height,
-                        uint32_t depth, uint64_t levels, bool array_texture,
-                        bool volume_texture) {
+std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout,
+                                                         uint32_t width, uint32_t height,
+                                                         uint32_t depth, uint64_t levels,
+                                                         bool array_texture, bool volume_texture) {
 	uint32_t mip_width  = width;
 	uint32_t mip_height = height;
 	uint32_t mip_pitch  = volume_texture && static_cast<Prospero::TileMode>(layout.tile) !=
@@ -416,14 +416,13 @@ TextureBuildImageCopies(const TextureUploadLayout& layout, uint32_t width, uint3
 		const auto mip_depth = GetTextureLevelDepth(depth, i, volume_texture);
 
 		for (uint32_t z = 0; z < mip_depth; z++) {
-			const auto slice_offset = z * layout.slice_stride;
+			const auto          slice_offset = z * layout.slice_stride;
 			vk::BufferImageCopy region {};
-			region.bufferOffset =
-			    layout.level_sizes[i].offset + slice_offset;
-			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, i,
-			                           array_texture ? z : 0, 1};
-			region.imageOffset.z = volume_texture ? static_cast<int>(z) : 0;
-			region.imageExtent   = {mip_width, mip_height, 1};
+			region.bufferOffset     = layout.level_sizes[i].offset + slice_offset;
+			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, i, array_texture ? z : 0,
+			                           1};
+			region.imageOffset.z    = volume_texture ? static_cast<int>(z) : 0;
+			region.imageExtent      = {mip_width, mip_height, 1};
 			const bool linear =
 			    static_cast<Prospero::TileMode>(layout.tile) == Prospero::TileMode::kLinear;
 			if (linear) {
@@ -433,9 +432,8 @@ TextureBuildImageCopies(const TextureUploadLayout& layout, uint32_t width, uint3
 				const auto align = [](uint32_t value, uint32_t block) {
 					return ((value + block - 1u) / block) * block;
 				};
-				const auto pitch = align(mip_pitch, layout.texel_block);
-				region.bufferRowLength =
-				    pitch > align(mip_width, layout.texel_block) ? pitch : 0;
+				const auto pitch       = align(mip_pitch, layout.texel_block);
+				region.bufferRowLength = pitch > align(mip_width, layout.texel_block) ? pitch : 0;
 			}
 			regions.push_back(region);
 		}
@@ -480,8 +478,7 @@ static bool SetGpuTileSize(uint64_t offset, uint64_t length, uint64_t capacity, 
 	return true;
 }
 
-bool TextureBuildGpuTileInfos(uint64_t size,
-                              const std::vector<vk::BufferImageCopy>& regions,
+bool TextureBuildGpuTileInfos(uint64_t size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t fmt, uint32_t depth,
                               uint64_t levels, std::vector<GpuTileInfo>& out_infos) {
 	if (size == 0 || levels == 0 || levels > 16 || depth == 0 ||
@@ -522,13 +519,12 @@ bool TextureBuildGpuTileInfos(uint64_t size,
 			for (uint32_t z = 0; z < mip_depth; z += block.block_depth) {
 				const uint32_t copy_depth = std::min(block.block_depth, mip_depth - z);
 				const auto&    region     = regions[region_base + z];
-				const auto     pitch = region.bufferRowLength != 0
-				                           ? region.bufferRowLength
-				                           : region.imageExtent.width;
-				const auto logical_height = region.bufferImageHeight != 0
-				                                ? region.bufferImageHeight
-				                                : region.imageExtent.height;
-				GpuTileInfo    info {};
+				const auto     pitch =
+				    region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;
+				const auto  logical_height = region.bufferImageHeight != 0
+				                                 ? region.bufferImageHeight
+				                                 : region.imageExtent.height;
+				GpuTileInfo info {};
 				info.family            = block.family;
 				info.bytes_per_element = block.bytes_per_element;
 				info.linear_offset     = region.bufferOffset;
@@ -544,20 +540,17 @@ bool TextureBuildGpuTileInfos(uint64_t size,
 					return false;
 				}
 				info.linear_slice_stride = linear_stride;
-				info.width = std::max(
-				    (region.imageExtent.width + element.wide - 1u) / element.wide, 1u);
-				info.height = std::max(
-				    (logical_height + element.tall - 1u) / element.tall, 1u);
-				info.depth       = copy_depth;
-				info.surface_z = block.block_depth == 1
-				                     ? static_cast<uint32_t>(region.imageOffset.z)
-				                     : 0;
-				info.pitch =
-				    std::max((pitch + element.wide - 1u) / element.wide, 1u);
-				info.tail_x      = tail ? volume.tail_x[level] : 0;
-				info.tail_y      = tail ? volume.tail_y[level] : 0;
-				info.tail        = tail;
-				info.tiled_width = volume.level_widths[level];
+				info.width =
+				    std::max((region.imageExtent.width + element.wide - 1u) / element.wide, 1u);
+				info.height = std::max((logical_height + element.tall - 1u) / element.tall, 1u);
+				info.depth  = copy_depth;
+				info.surface_z =
+				    block.block_depth == 1 ? static_cast<uint32_t>(region.imageOffset.z) : 0;
+				info.pitch        = std::max((pitch + element.wide - 1u) / element.wide, 1u);
+				info.tail_x       = tail ? volume.tail_x[level] : 0;
+				info.tail_y       = tail ? volume.tail_y[level] : 0;
+				info.tail         = tail;
+				info.tiled_width  = volume.level_widths[level];
 				info.tiled_height = volume.level_heights[level];
 				infos.push_back(info);
 			}
@@ -581,12 +574,11 @@ bool TextureBuildGpuTileInfos(uint64_t size,
 			const auto level_depth = GetTextureLevelDepth(depth, level, layout.volume_texture);
 			for (uint32_t z = 0; z < level_depth; z++) {
 				const auto& region = regions[region_index++];
-				const auto pitch = region.bufferRowLength != 0
-				                       ? region.bufferRowLength
-				                       : region.imageExtent.width;
-				const auto logical_height = region.bufferImageHeight != 0
-				                                ? region.bufferImageHeight
-				                                : region.imageExtent.height;
+				const auto  pitch =
+				    region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;
+				const auto  logical_height = region.bufferImageHeight != 0
+				                                 ? region.bufferImageHeight
+				                                 : region.imageExtent.height;
 				GpuTileInfo info {};
 				info.family            = block.family;
 				info.bytes_per_element = block.bytes_per_element;
@@ -597,16 +589,14 @@ bool TextureBuildGpuTileInfos(uint64_t size,
 				                    info.tiled_size)) {
 					return false;
 				}
-				info.width = std::max(
-				    (region.imageExtent.width + element.wide - 1u) / element.wide, 1u);
-				info.height = std::max(
-				    (logical_height + element.tall - 1u) / element.tall, 1u);
+				info.width =
+				    std::max((region.imageExtent.width + element.wide - 1u) / element.wide, 1u);
+				info.height    = std::max((logical_height + element.tall - 1u) / element.tall, 1u);
 				info.surface_z = base_family == TileBlockFamily::RenderTarget64KB ||
 				                         base_family == TileBlockFamily::Depth64KB
 				                     ? region.imageSubresource.baseArrayLayer
 				                     : 0;
-				info.pitch =
-				    std::max((pitch + element.wide - 1u) / element.wide, 1u);
+				info.pitch     = std::max((pitch + element.wide - 1u) / element.wide, 1u);
 				info.tail      = tail;
 				info.tail_x    = tail ? level_size.x : 0;
 				info.tail_y    = tail ? level_size.y : 0;

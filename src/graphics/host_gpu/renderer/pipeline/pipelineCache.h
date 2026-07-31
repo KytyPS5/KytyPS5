@@ -88,9 +88,9 @@ static_assert(sizeof(PipelineStaticParameters) ==
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
-	vk::Format depth_format   = vk::Format::eUndefined;
-	vk::Format stencil_format = vk::Format::eUndefined;
-	uint32_t   color_count    = 0;
+	vk::Format                                           depth_format   = vk::Format::eUndefined;
+	vk::Format                                           stencil_format = vk::Format::eUndefined;
+	uint32_t                                             color_count    = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -118,11 +118,12 @@ public:
 		ShaderId cs_shader_id;
 	};
 
-	GraphicsPipeline& CreateGraphicsPipeline(
-	    RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
-	    ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
-	    ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology, bool ps_active,
-	    std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv);
+	GraphicsPipeline&
+	CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
+	                       ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
+	                       ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                       bool ps_active, std::span<const uint32_t> vs_spirv,
+	                       std::span<const uint32_t> ps_spirv);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	                                       const HW::ComputeShaderInfo& cs_regs,
 	                                       std::span<const uint32_t>    cs_spirv);
@@ -199,7 +200,7 @@ private:
 		}
 	};
 
-	GraphicContext& m_graphics;
+	GraphicContext&  m_graphics;
 	DescriptorCache& m_descriptor_cache;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
 	                   GraphicsPipelineKeyHash>
@@ -211,16 +212,13 @@ private:
 
 void LogPipelineTrace(const char* phase, uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0,
                       uint32_t ps_crc32);
-void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descriptor_cache,
-                            PipelineCache::GraphicsPipeline& pipeline,
-                            const PipelineRenderingState&   rendering,
-                            const ShaderVertexInputInfo&    vs_input_info,
-                            std::span<const uint32_t>       vs_shader,
-                            const ShaderPixelInputInfo*     ps_input_info,
-                            std::span<const uint32_t>       ps_shader,
-                            const PipelineStaticParameters& static_params, uint32_t vs_hash0,
-                            uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
-                            bool ps_active);
+void CreatePipelineInternal(
+    GraphicContext& graphics, DescriptorCache& descriptor_cache,
+    PipelineCache::GraphicsPipeline& pipeline, const PipelineRenderingState& rendering,
+    const ShaderVertexInputInfo& vs_input_info, std::span<const uint32_t> vs_shader,
+    const ShaderPixelInputInfo* ps_input_info, std::span<const uint32_t> ps_shader,
+    const PipelineStaticParameters& static_params, uint32_t vs_hash0, uint32_t vs_crc32,
+    uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active);
 void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descriptor_cache,
                             PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo&   input_info,

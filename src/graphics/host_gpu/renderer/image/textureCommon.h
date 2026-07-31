@@ -32,20 +32,19 @@ struct TextureUploadLayout {
 	TilePaddedSize  padded_sizes[16]    = {};
 };
 
-vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle);
+vk::ComponentMapping   TextureGetComponentMapping(uint32_t swizzle);
 vk::Format             TextureGetFormat(uint32_t fmt);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t layout, uint32_t type, uint32_t order);
-TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64_t height,
-                                            uint64_t levels, uint32_t depth, uint64_t pitch,
-                                            uint64_t tile, uint64_t upload_size,
-                                            bool allow_depth_tile, bool volume_texture,
-                                            const char* owner);
-std::vector<vk::BufferImageCopy>
-TextureBuildImageCopies(const TextureUploadLayout& layout, uint32_t width, uint32_t height,
-                        uint32_t depth, uint64_t levels, bool array_texture,
-                        bool volume_texture);
-bool TextureBuildGpuTileInfos(uint64_t size,
-                              const std::vector<vk::BufferImageCopy>& regions,
+TextureUploadLayout    TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64_t height,
+                                               uint64_t levels, uint32_t depth, uint64_t pitch,
+                                               uint64_t tile, uint64_t upload_size,
+                                               bool allow_depth_tile, bool volume_texture,
+                                               const char* owner);
+std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout,
+                                                         uint32_t width, uint32_t height,
+                                                         uint32_t depth, uint64_t levels,
+                                                         bool array_texture, bool volume_texture);
+bool TextureBuildGpuTileInfos(uint64_t size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t fmt, uint32_t depth,
                               uint64_t levels, std::vector<GpuTileInfo>& infos);
 

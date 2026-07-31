@@ -962,9 +962,8 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	auto* index_addr = reinterpret_cast<const void*>(
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(),
-	                                             m_index_type_and_size, index_count, index_addr,
-	                                             flags, 1, m_num_instances);
+	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size,
+	                                         index_count, index_addr, flags, 1, m_num_instances);
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
@@ -1190,8 +1189,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		m_renderer.GetRenderExecutor().DispatchDirect(
-		    m_submit_id, CurrentBuffer(), thread_group_x, thread_group_y, thread_group_z, mode);
+		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		                                              thread_group_y, thread_group_z, mode);
 	}
 
 	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1237,16 +1236,16 @@ void CommandProcessor::DrawIndexAuto(uint32_t index_count, uint32_t flags,
                                      uint32_t first_vertex, uint32_t first_instance) {
 	CheckBuffer();
 
-	m_renderer.GetRenderExecutor().DrawAuto(
-	    m_submit_id, CurrentBuffer(), index_count, flags, render_target_slice_offset,
-	    instance_count, first_vertex, first_instance);
+	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), index_count, flags,
+	                                        render_target_slice_offset, instance_count,
+	                                        first_vertex, first_instance);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                              static_cast<int>(display_buffer_index));
+	                                      static_cast<int>(display_buffer_index));
 }
 
 template <typename T>
@@ -1317,8 +1316,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
-					Sync::ReadGds(m_renderer.GetBufferCache().GetGdsBuffer(), dst,
-					              value & 0xffffu, value >> 16u);
+					Sync::ReadGds(m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
+					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,
 					                            value >> 16u);
 					return;
@@ -1486,8 +1485,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
 	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask =
-	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;

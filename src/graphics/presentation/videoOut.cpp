@@ -69,8 +69,8 @@ enum class FlipRequestSource { Cpu, GpuEop };
 struct VideoOutEventState;
 
 struct VideoOutEventRegistration {
-	EventQueue::KernelEqueue             handle = EventQueue::KERNEL_EQUEUE_INVALID;
-	std::shared_ptr<VideoOutEventState>  state;
+	EventQueue::KernelEqueue            handle = EventQueue::KERNEL_EQUEUE_INVALID;
+	std::shared_ptr<VideoOutEventState> state;
 	uint64_t                            generation = 0;
 	VideoOutEventKind                   kind       = VideoOutEventKind::Flip;
 };
@@ -170,13 +170,13 @@ struct BufferAttributeGroup {
 struct VideoOutConfig {
 	Common::Mutex                       mutex;
 	Common::CondVar                     vblank_cond;
-	std::shared_ptr<VideoOutEventState> events = std::make_shared<VideoOutEventState>();
-	uint32_t                            width      = 0;
-	uint32_t                            height     = 0;
-	uint64_t                            generation = 0;
-	bool                                opened     = false;
-	bool                                closing    = false;
-	int                                 flip_rate  = 0;
+	std::shared_ptr<VideoOutEventState> events      = std::make_shared<VideoOutEventState>();
+	uint32_t                            width       = 0;
+	uint32_t                            height      = 0;
+	uint64_t                            generation  = 0;
+	bool                                opened      = false;
+	bool                                closing     = false;
+	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -250,8 +250,8 @@ public:
 	VideoOutConfig* Get(int handle, uint64_t& generation);
 	bool            IsOpened(int handle);
 
-	void Init(uint32_t width, uint32_t height);
-	FlipQueue& GetFlipQueue() { return m_flip_queue; }
+	void                     Init(uint32_t width, uint32_t height);
+	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
 
 	void VblankBegin();
@@ -259,12 +259,12 @@ public:
 	void PresentThread(std::stop_token token);
 
 private:
-	Common::Mutex        m_mutex;
-	VideoOutConfig       m_video_out_ctx[VIDEO_OUT_NUM_MAX];
+	Common::Mutex            m_mutex;
+	VideoOutConfig           m_video_out_ctx[VIDEO_OUT_NUM_MAX];
 	Graphics::RenderContext& m_renderer;
-	Graphics::Presenter& m_presenter;
-	FlipQueue            m_flip_queue;
-	std::jthread         m_present_thread;
+	Graphics::Presenter&     m_presenter;
+	FlipQueue                m_flip_queue;
+	std::jthread             m_present_thread;
 };
 
 static std::unique_ptr<VideoOutDriver> g_video_out_driver;
@@ -279,7 +279,7 @@ static uintptr_t VideoOutEventId(VideoOutEventKind kind) {
 }
 
 static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutEventState& state,
-                                                   VideoOutEventKind  kind) {
+                                                   VideoOutEventKind   kind) {
 	switch (kind) {
 		case VideoOutEventKind::Flip: return state.flip;
 		case VideoOutEventKind::Vblank: return state.vblank;
@@ -359,9 +359,9 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		if (!registration || registration->generation != video_out.generation) {
 			continue;
 		}
-		const auto result = EventQueue::KernelTriggerEvent(
-		    registration->handle, VideoOutEventId(kind), EventQueue::KERNEL_EVFILT_VIDEO_OUT,
-		    trigger_data);
+		const auto result =
+		    EventQueue::KernelTriggerEvent(registration->handle, VideoOutEventId(kind),
+		                                   EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
@@ -372,9 +372,8 @@ static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEven
 		if (!registration) {
 			continue;
 		}
-		const auto result =
-		    EventQueue::KernelDeleteEvent(registration->handle, VideoOutEventId(kind),
-		                                  EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+		const auto result = EventQueue::KernelDeleteEvent(
+		    registration->handle, VideoOutEventId(kind), EventQueue::KERNEL_EVFILT_VIDEO_OUT);
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
@@ -383,7 +382,7 @@ static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEven
 static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind,
                                  void* udata) {
 	uint64_t generation = 0;
-	auto*    video_out   = DriverState().Get(handle, generation);
+	auto*    video_out  = DriverState().Get(handle, generation);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
@@ -425,27 +424,25 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 	bool                         add_queue = false;
 	{
 		Common::LockGuard event_lock(event_state->mutex);
-		const auto existing = std::find_if(queues.begin(), queues.end(), [&](const auto& candidate) {
-			return candidate->handle == eq && candidate->generation == generation;
-		});
+		const auto        existing =
+		    std::find_if(queues.begin(), queues.end(), [&](const auto& candidate) {
+			    return candidate->handle == eq && candidate->generation == generation;
+		    });
 		if (existing != queues.end()) {
 			registration = *existing;
 		} else {
-			registration = std::make_shared<VideoOutEventRegistration>(
-			    VideoOutEventRegistration {.handle     = eq,
-			                               .state      = event_state,
-			                               .generation = generation,
-			                               .kind       = kind});
+			registration = std::make_shared<VideoOutEventRegistration>(VideoOutEventRegistration {
+			    .handle = eq, .state = event_state, .generation = generation, .kind = kind});
 			queues.push_back(registration);
 			add_queue = true;
 		}
 	}
 	event.filter.data  = registration.get();
 	event.filter.owner = registration;
-	const int result = EventQueue::KernelAddEvent(eq, event);
+	const int result   = EventQueue::KernelAddEvent(eq, event);
 	if (result != OK && add_queue) {
 		Common::LockGuard event_lock(event_state->mutex);
-		const auto added = std::find(queues.begin(), queues.end(), registration);
+		const auto        added = std::find(queues.begin(), queues.end(), registration);
 		if (added != queues.end()) {
 			queues.erase(added);
 		}
@@ -455,7 +452,7 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 
 static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind) {
 	uint64_t generation = 0;
-	auto*    video_out   = DriverState().Get(handle, generation);
+	auto*    video_out  = DriverState().Get(handle, generation);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
@@ -814,8 +811,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				m_presenter.Present(*frame, true);
 			}
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
-			total_wait += static_cast<int64_t>(period) -
-			              static_cast<int64_t>(frame_end - frame_begin);
+			total_wait +=
+			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
 			continue;
 		}
 
@@ -841,8 +838,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		VblankEnd();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
-		total_wait += static_cast<int64_t>(period) -
-		              static_cast<int64_t>(frame_end - frame_begin);
+		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
 	}
 }
 
@@ -1000,8 +996,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
-		frame = &m_presenter.PrepareBlankFrame(width, height,
-		                                       index == VIDEO_OUT_BUFFER_INDEX_BLACK, &buffer);
+		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
+		                                       &buffer);
 	} else {
 		frame = &m_presenter.PrepareFrame(buffer, source_info);
 	}

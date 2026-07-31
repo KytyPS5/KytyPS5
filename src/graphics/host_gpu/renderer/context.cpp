@@ -8,8 +8,8 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
@@ -270,30 +270,30 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		colors[i].sType        = vk::StructureType::eRenderingAttachmentInfo;
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
-		colors[i].loadOp = attachment.is_clear ? vk::AttachmentLoadOp::eClear
-		                                      : vk::AttachmentLoadOp::eLoad;
-		colors[i].storeOp                  = vk::AttachmentStoreOp::eStore;
-		colors[i].clearValue.color.uint32  = attachment.clear_value;
+		colors[i].loadOp =
+		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
+		colors[i].clearValue.color.uint32 = attachment.clear_value;
 	}
 
-	const auto& depth_stencil = state.depth_stencil_attachment;
+	const auto&                 depth_stencil = state.depth_stencil_attachment;
 	vk::RenderingAttachmentInfo depth {};
 	depth.sType       = vk::StructureType::eRenderingAttachmentInfo;
 	depth.imageView   = depth_stencil.image_view;
 	depth.imageLayout = depth_stencil.image_layout;
-	depth.loadOp = depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear
-	                                        : vk::AttachmentLoadOp::eLoad;
-	depth.storeOp                        = vk::AttachmentStoreOp::eStore;
+	depth.loadOp =
+	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
 	stencil.sType       = vk::StructureType::eRenderingAttachmentInfo;
 	stencil.imageView   = depth_stencil.image_view;
 	stencil.imageLayout = depth_stencil.image_layout;
-	stencil.loadOp = depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear
-	                                            : vk::AttachmentLoadOp::eLoad;
-	stencil.storeOp                            = vk::AttachmentStoreOp::eStore;
-	stencil.clearValue.depthStencil.stencil   = depth_stencil.clear_value[1];
+	stencil.loadOp =
+	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
+	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};
 	rendering.sType                = vk::StructureType::eRenderingInfo;

@@ -8,10 +8,10 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
-#include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
@@ -385,9 +385,8 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void CreateLayout(DescriptorCache& descriptor_cache,
-                         std::span<vk::DescriptorSetLayout> set_layouts,
-                         uint32_t& set_layouts_num,
+static void CreateLayout(DescriptorCache&                   descriptor_cache,
+                         std::span<vk::DescriptorSetLayout> set_layouts, uint32_t& set_layouts_num,
                          std::span<vk::PushConstantRange>     push_constant_info,
                          uint32_t&                            push_constant_info_num,
                          const ShaderRecompiler::IR::Program& program,
@@ -412,12 +411,11 @@ static void CreateLayout(DescriptorCache& descriptor_cache,
 	}
 }
 
-static void ConfigureSubgroupSize(const GraphicContext&                                  graphics,
-                                  vk::ShaderStageFlagBits                                vk_stage,
+static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStageFlagBits vk_stage,
                                   const ShaderRecompiler::IR::Program&                   program,
                                   vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo& required,
                                   vk::PipelineShaderStageCreateInfo&                     stage) {
-	const auto  config =
+	const auto config =
 	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program);
 	switch (config.mode) {
 		case ShaderSubgroupMode::Natural: return;
@@ -456,16 +454,13 @@ static void ConfigureSubgroupSize(const GraphicContext&                         
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descriptor_cache,
-                            PipelineCache::GraphicsPipeline& pipeline,
-                            const PipelineRenderingState&   rendering,
-                            const ShaderVertexInputInfo&    vs_input_info,
-                            std::span<const uint32_t>       vs_shader,
-                            const ShaderPixelInputInfo*     ps_input_info,
-                            std::span<const uint32_t>       ps_shader,
-                            const PipelineStaticParameters& static_params, uint32_t vs_hash0,
-                            uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32,
-                            bool ps_active) {
+void CreatePipelineInternal(
+    GraphicContext& graphics, DescriptorCache& descriptor_cache,
+    PipelineCache::GraphicsPipeline& pipeline, const PipelineRenderingState& rendering,
+    const ShaderVertexInputInfo& vs_input_info, std::span<const uint32_t> vs_shader,
+    const ShaderPixelInputInfo* ps_input_info, std::span<const uint32_t> ps_shader,
+    const PipelineStaticParameters& static_params, uint32_t vs_hash0, uint32_t vs_crc32,
+    uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active) {
 	EXIT_IF(ps_active && ps_input_info == nullptr);
 
 	vk::ShaderModule vert_shader_module = nullptr;
@@ -511,8 +506,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	vert_shader_stage_info.pName               = "main";
 	vert_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!vs_input_info.stage);
-	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eVertex,
-	                      *vs_input_info.stage.program,
+	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eVertex, *vs_input_info.stage.program,
 	                      vert_subgroup_size, vert_shader_stage_info);
 
 	vk::PipelineShaderStageCreateInfo                     frag_shader_stage_info {};
@@ -527,8 +521,8 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eFragment,
-		                      *ps_input_info->stage.program,
-		                      frag_subgroup_size, frag_shader_stage_info);
+		                      *ps_input_info->stage.program, frag_subgroup_size,
+		                      frag_shader_stage_info);
 	}
 
 	vk::PipelineShaderStageCreateInfo shader_stages[]    = {vert_shader_stage_info,
@@ -728,13 +722,13 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	clip_ext.depthClipEnable = static_params.depth_clip_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineRasterizationStateCreateInfo rasterizer {};
-	rasterizer.sType                   = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+	rasterizer.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
 #if defined(__APPLE__)
-	rasterizer.pNext                   = nullptr;
+	rasterizer.pNext = nullptr;
 #else
-	rasterizer.pNext                   = &clip_ext;
+	rasterizer.pNext = &clip_ext;
 #endif
 	rasterizer.flags                   = {};
 	rasterizer.depthClampEnable        = VK_FALSE;
@@ -812,13 +806,13 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	color_blending.sType             = vk::StructureType::ePipelineColorBlendStateCreateInfo;
+	color_blending.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
 	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
 	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
 #if defined(__APPLE__)
-	color_blending.pNext             = nullptr;
+	color_blending.pNext = nullptr;
 #else
-	color_blending.pNext             = &color_write;
+	color_blending.pNext = &color_write;
 #endif
 	color_blending.flags             = {};
 	color_blending.logicOpEnable     = VK_FALSE;
@@ -838,15 +832,13 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 
 	EXIT_IF(!vs_input_info.stage);
 	CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
-	             push_constant_info_num,
-	             *vs_input_info.stage.program, vk::ShaderStageFlagBits::eVertex,
-	             DescriptorCache::Stage::Vertex);
+	             push_constant_info_num, *vs_input_info.stage.program,
+	             vk::ShaderStageFlagBits::eVertex, DescriptorCache::Stage::Vertex);
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
-		             push_constant_info_num,
-		             *ps_input_info->stage.program, vk::ShaderStageFlagBits::eFragment,
-		             DescriptorCache::Stage::Pixel);
+		             push_constant_info_num, *ps_input_info->stage.program,
+		             vk::ShaderStageFlagBits::eFragment, DescriptorCache::Stage::Pixel);
 	}
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
@@ -923,32 +915,32 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	dynamic_state.dynamicStateCount = dynamic_states_count;
 	dynamic_state.pDynamicStates    = dynamic_states;
 
-	vk::GraphicsPipelineCreateInfo pipeline_info {};
+	vk::GraphicsPipelineCreateInfo  pipeline_info {};
 	vk::PipelineRenderingCreateInfo rendering_info {};
 	rendering_info.sType                   = vk::StructureType::ePipelineRenderingCreateInfo;
 	rendering_info.colorAttachmentCount    = rendering.color_count;
 	rendering_info.pColorAttachmentFormats = rendering.color_formats.data();
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
-	pipeline_info.sType               = vk::StructureType::eGraphicsPipelineCreateInfo;
-	pipeline_info.pNext               = &rendering_info;
-	pipeline_info.flags               = {};
-	pipeline_info.stageCount          = shader_stage_count;
-	pipeline_info.pStages             = shader_stages;
-	pipeline_info.pVertexInputState   = &vertex_input_info;
-	pipeline_info.pInputAssemblyState = &input_assembly;
-	pipeline_info.pTessellationState  = nullptr;
-	pipeline_info.pViewportState      = &viewport_state;
-	pipeline_info.pRasterizationState = &rasterizer;
-	pipeline_info.pMultisampleState   = &multisampling;
-	pipeline_info.pDepthStencilState  = (static_params.with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState    = &color_blending;
-	pipeline_info.pDynamicState       = &dynamic_state;
-	pipeline_info.layout              = pipeline.pipeline_layout;
-	pipeline_info.renderPass          = nullptr;
-	pipeline_info.subpass             = 0;
-	pipeline_info.basePipelineHandle  = nullptr;
-	pipeline_info.basePipelineIndex   = -1;
+	pipeline_info.sType                    = vk::StructureType::eGraphicsPipelineCreateInfo;
+	pipeline_info.pNext                    = &rendering_info;
+	pipeline_info.flags                    = {};
+	pipeline_info.stageCount               = shader_stage_count;
+	pipeline_info.pStages                  = shader_stages;
+	pipeline_info.pVertexInputState        = &vertex_input_info;
+	pipeline_info.pInputAssemblyState      = &input_assembly;
+	pipeline_info.pTessellationState       = nullptr;
+	pipeline_info.pViewportState           = &viewport_state;
+	pipeline_info.pRasterizationState      = &rasterizer;
+	pipeline_info.pMultisampleState        = &multisampling;
+	pipeline_info.pDepthStencilState = (static_params.with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState   = &color_blending;
+	pipeline_info.pDynamicState      = &dynamic_state;
+	pipeline_info.layout             = pipeline.pipeline_layout;
+	pipeline_info.renderPass         = nullptr;
+	pipeline_info.subpass            = 0;
+	pipeline_info.basePipelineHandle = nullptr;
+	pipeline_info.basePipelineIndex  = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -1012,8 +1004,7 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	comp_shader_stage_info.pName               = "main";
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
-	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute,
-	                      *input_info.stage.program,
+	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute, *input_info.stage.program,
 	                      comp_subgroup_size, comp_shader_stage_info);
 
 	vk::DescriptorSetLayout set_layouts[1]  = {};
@@ -1024,9 +1015,8 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 
 	EXIT_IF(!input_info.stage);
 	CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
-	             push_constant_info_num,
-	             *input_info.stage.program, vk::ShaderStageFlagBits::eCompute,
-	             DescriptorCache::Stage::Compute);
+	             push_constant_info_num, *input_info.stage.program,
+	             vk::ShaderStageFlagBits::eCompute, DescriptorCache::Stage::Compute);
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;

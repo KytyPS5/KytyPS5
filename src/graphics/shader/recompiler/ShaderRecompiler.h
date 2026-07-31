@@ -44,7 +44,7 @@ struct CompileResult {
 };
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
-	              CompileResult& result, std::string* error);
+                  CompileResult& result, std::string* error);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

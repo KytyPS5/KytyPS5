@@ -1,7 +1,6 @@
-#include "graphics/shader/shader.h"
-
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/shader.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,12 +23,12 @@ std::shared_ptr<const Libs::Graphics::ShaderRecompiler::IR::Program> SrtProgram(
 	program.srt_patching_complete      = true;
 	program.resource_tracking_complete = true;
 	program.provenance.values.resize(6);
-	program.provenance.values[0].op  = ScalarValueOp::Undefined;
-	program.provenance.values[1].op  = ScalarValueOp::Unknown;
-	program.provenance.values[2].op  = ScalarValueOp::Constant;
-	program.provenance.values[2].imm = static_cast<uint32_t>(address);
-	program.provenance.values[3].op  = ScalarValueOp::Constant;
-	program.provenance.values[3].imm = static_cast<uint32_t>(address >> 32u);
+	program.provenance.values[0].op   = ScalarValueOp::Undefined;
+	program.provenance.values[1].op   = ScalarValueOp::Unknown;
+	program.provenance.values[2].op   = ScalarValueOp::Constant;
+	program.provenance.values[2].imm  = static_cast<uint32_t>(address);
+	program.provenance.values[3].op   = ScalarValueOp::Constant;
+	program.provenance.values[3].imm  = static_cast<uint32_t>(address >> 32u);
 	program.provenance.values[4].op   = ScalarValueOp::Constant;
 	program.provenance.values[5].op   = ScalarValueOp::ReadConst;
 	program.provenance.values[5].args = {2, 3, 4};
@@ -54,15 +53,14 @@ std::shared_ptr<const Libs::Graphics::ShaderRecompiler::IR::Program> UnbasedFlat
 
 void TestMappedSrtUsesDirectReaderByDefault() {
 	using namespace Libs::Graphics;
-	const uint32_t dword = 0x12345678;
-	auto cached_program  = SrtProgram(reinterpret_cast<uint64_t>(&dword));
+	const uint32_t     dword          = 0x12345678;
+	auto               cached_program = SrtProgram(reinterpret_cast<uint64_t>(&dword));
 	ShaderStageRuntime stage;
-	std::string error;
+	std::string        error;
 	Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error), error.c_str());
 	Check(stage.program == cached_program && stage.resources != nullptr,
 	      "cache rematerialization did not publish the mapped stage");
-	Check(stage.resources->flattened_srt.size() == 1 &&
-	          stage.resources->flattened_srt[0] == dword,
+	Check(stage.resources->flattened_srt.size() == 1 && stage.resources->flattened_srt[0] == dword,
 	      "cache rematerialization did not use the direct reader by default");
 }
 
@@ -72,7 +70,7 @@ void TestUnbasedFlatCacheHitFailsClosed() {
 	auto prior_program   = std::make_shared<const ShaderRecompiler::IR::Program>();
 	auto prior_resources = std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
 	ShaderStageRuntime stage {prior_program, prior_resources};
-	std::string error;
+	std::string        error;
 	Check(!ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error) &&
 	          error.find("requires runtime guest-address translation") != std::string::npos,
 	      "unbased FLAT cache hit did not fail without a runtime translator");

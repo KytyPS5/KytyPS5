@@ -19,10 +19,9 @@ struct GuestRange {
 	uint64_t address = 0;
 	uint64_t size    = 0;
 
-	[[nodiscard]] constexpr bool     Empty() const noexcept { return address == 0 || size == 0; }
-	[[nodiscard]] constexpr bool     Valid() const noexcept {
-		return !Empty() && address < TRACKER_ADDRESS_SIZE &&
-		       size <= TRACKER_ADDRESS_SIZE - address;
+	[[nodiscard]] constexpr bool Empty() const noexcept { return address == 0 || size == 0; }
+	[[nodiscard]] constexpr bool Valid() const noexcept {
+		return !Empty() && address < TRACKER_ADDRESS_SIZE && size <= TRACKER_ADDRESS_SIZE - address;
 	}
 	[[nodiscard]] constexpr uint64_t End() const noexcept { return address + size; }
 	auto                             operator<=>(const GuestRange&) const = default;
@@ -47,10 +46,10 @@ struct ImageSubresources {
 };
 
 struct ImageSubresourceRange {
-	uint32_t base_level  = 0;
-	uint32_t level_count = 1;
-	uint32_t base_layer  = 0;
-	uint32_t layer_count = 1;
+	uint32_t base_level                                      = 0;
+	uint32_t level_count                                     = 1;
+	uint32_t base_layer                                      = 0;
+	uint32_t layer_count                                     = 1;
 	auto     operator<=>(const ImageSubresourceRange&) const = default;
 };
 
@@ -67,10 +66,10 @@ struct ImageInfo {
 	GuestRange                   stencil;
 	ImageMetadataInfo            metadata;
 	uint32_t                     htile_clear_mask = UINT32_MAX;
-	vk::Format                   pixel_format = vk::Format::eUndefined;
-	uint32_t                     guest_format = 0;
-	Prospero::ImageType          type         = Prospero::ImageType::kColor2D;
-	vk::Extent3D                 extent       = {1, 1, 1};
+	vk::Format                   pixel_format     = vk::Format::eUndefined;
+	uint32_t                     guest_format     = 0;
+	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
+	vk::Extent3D                 extent           = {1, 1, 1};
 	ImageSubresources            resources;
 	uint32_t                     pitch           = 0;
 	uint32_t                     bytes_per_block = 0;
@@ -352,8 +351,7 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	}
 	const auto transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
 	return transfer_bytes == info.bytes_per_block ||
-	       (info.bytes_per_block == sizeof(uint16_t) &&
-	        transfer_bytes == sizeof(uint32_t));
+	       (info.bytes_per_block == sizeof(uint16_t) && transfer_bytes == sizeof(uint32_t));
 }
 
 [[nodiscard]] inline VideoOutCompression
@@ -470,18 +468,13 @@ IsSupportedDisplayRenderTargetTileMode(uint32_t tile_mode) noexcept {
                                                  vk::ClearColorValue& clear) {
 	vk::ClearColorValue next {};
 	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
-	const auto srgb8 = [](uint32_t value) {
+	const auto srgb8  = [](uint32_t value) {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
-		return encoded <= 0.04045f ? encoded / 12.92f
-		                           : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
 	switch (format) {
-		case vk::Format::eR32Uint:
-			next.uint32[0] = packed;
-			break;
-		case vk::Format::eR32Sint:
-			next.int32[0] = static_cast<int32_t>(packed);
-			break;
+		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
+		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
 		case vk::Format::eR8G8B8A8Srgb:
 			next.float32[0] = srgb8(packed);
 			next.float32[1] = srgb8(packed >> 8u);

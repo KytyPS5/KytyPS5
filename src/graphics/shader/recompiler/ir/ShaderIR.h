@@ -432,6 +432,7 @@ struct MemoryInfo {
 	bool     typed           = false;
 	bool     formatted       = false;
 	bool     image_has_mip   = false;
+	bool     image_cube      = false;
 	bool     glc             = false;
 	bool     slc             = false;
 	bool     idxen           = false;
@@ -607,6 +608,7 @@ struct ImageResource {
 	bool                    written         = false;
 	bool                    atomic          = false;
 	bool                    depth_compare   = false;
+	bool                    cube            = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };

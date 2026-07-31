@@ -12,7 +12,7 @@ namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
-Decoder::ImageDimension DescriptorDimension(const DescriptorValue&       descriptor,
+Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DArray;
@@ -51,14 +51,18 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor) {
 		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
 		const auto fragments  = (descriptor.dwords[3] >> 16u) & 0xfu;
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
-		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
-		       max_mip == fragments;
+		return base_level == 0 && fragments >= 1 && fragments <= 3 && max_mip == fragments;
 	}
 	return true;
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
+}
+
+bool DescriptorIsCube(const DescriptorValue& descriptor) {
+	return static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
+	       Prospero::ImageType::kCube;
 }
 
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
@@ -171,12 +175,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		const auto& image      = program.info.images[i];
 		const auto& descriptor = snapshot.images[i];
 		if (NullImageDescriptor(descriptor)) {
-			bool canonical_kind = image.kind == ResourceKind::Image ||
-			                      image.kind == ResourceKind::StorageImage;
+			bool canonical_kind =
+			    image.kind == ResourceKind::Image || image.kind == ResourceKind::StorageImage;
 			if (image.atomic) {
 				canonical_kind = image.kind == ResourceKind::StorageImageUint;
 			}
-			if (image.dimension != Decoder::ImageDimension::Dim2D || !canonical_kind) {
+			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
+			    !canonical_kind) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "image descriptor {} no longer matches canonical null specialization", i);
@@ -186,7 +191,8 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			continue;
 		}
 		const auto dimension = DescriptorDimension(descriptor, image.dimension);
-		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension) {
+		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension ||
+		    DescriptorIsCube(descriptor) != image.cube) {
 			if (error != nullptr) {
 				*error =
 				    fmt::format("image descriptor {} no longer matches specialized dimension", i);
@@ -361,6 +367,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		auto&       image      = next.images[i];
 		if (NullImageDescriptor(descriptor)) {
 			image.dimension = Decoder::ImageDimension::Dim2D;
+			image.cube      = false;
 			switch (image.kind) {
 				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
 				case ResourceKind::StorageImageUint:
@@ -386,6 +393,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 			return false;
 		}
 		image.dimension = descriptor_dimension;
+		image.cube      = DescriptorIsCube(descriptor);
 		if (image.kind == ResourceKind::StorageImage ||
 		    image.kind == ResourceKind::StorageImageUint) {
 			image.storage_swizzle = DescriptorImageSwizzle(descriptor);
@@ -402,6 +410,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		std::reference_wrapper<Instruction> inst;
 		ResourceKind                        kind;
 		Decoder::ImageDimension             dimension;
+		bool                                cube;
 	};
 	std::vector<ImagePatch> patches;
 	for (auto& block: program.blocks) {
@@ -420,13 +429,14 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 				return false;
 			}
 			const auto& image = next.images[inst.memory.resource];
-			patches.push_back({std::ref(inst), image.kind, image.dimension});
+			patches.push_back({std::ref(inst), image.kind, image.dimension, image.cube});
 		}
 	}
 	program.info = std::move(next);
 	for (const auto& patch: patches) {
 		patch.inst.get().memory.kind            = patch.kind;
 		patch.inst.get().memory.image_dimension = patch.dimension;
+		patch.inst.get().memory.image_cube      = patch.cube;
 	}
 	return true;
 }

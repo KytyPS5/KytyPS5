@@ -2,6 +2,66 @@
 #include "graphics/shader/recompiler/emitter/spirvEmitterInternal.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+namespace {
+
+uint32_t EmitCubeAxisF32(EmitterState& state, uint32_t value) {
+	const auto normalized = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFSub, state.float_type, normalized, value, ConstantF32(state, 0x3f800000u)});
+	return normalized;
+}
+
+uint32_t EmitCubeLayerF32(EmitterState& state, uint32_t face_id) {
+	// Sampled RDNA2 cubemaps encode face_id as slice * 8 + face. The native
+	// 2D-array view stores six contiguous faces per slice, so remove the two
+	// reserved face IDs from every preceding slice.
+	const auto guest_layer = state.builder.AllocateId();
+	const auto slice       = state.builder.AllocateId();
+	const auto padding     = state.builder.AllocateId();
+	const auto host_layer  = state.builder.AllocateId();
+	const auto result      = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertFToU, state.uint_type, guest_layer, face_id});
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, state.uint_type, slice, guest_layer, ConstantU32(state, 3)});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, state.uint_type, padding, slice, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpISub, state.uint_type, host_layer, guest_layer, padding});
+	state.builder.AddFunction({OpConvertUToF, state.float_type, result, host_layer});
+	return result;
+}
+
+uint32_t EmitImageCoordF32Impl(EmitterState& state, const IR::Instruction& inst,
+                               const IR::Operand& address, uint32_t first_component,
+                               uint32_t components) {
+	auto x = EmitImageAddressFloatLoad(state, inst, address, first_component);
+	if (components == 1u) {
+		return x;
+	}
+	auto y = inst.memory.image_address_components > first_component + 1u
+	             ? EmitImageAddressFloatLoad(state, inst, address, first_component + 1u)
+	             : EmitZeroF32(state);
+	if (inst.memory.image_cube) {
+		// RDNA2 sampled cubemap S/T coordinates are biased by +1 relative to
+		// normalized 2D-array coordinates.
+		x = EmitCubeAxisF32(state, x);
+		y = EmitCubeAxisF32(state, y);
+	}
+	const auto coord = state.builder.AllocateId();
+	if (components == 3u) {
+		auto z = inst.memory.image_address_components > first_component + 2u
+		             ? EmitImageAddressFloatLoad(state, inst, address, first_component + 2u)
+		             : EmitZeroF32(state);
+		if (inst.memory.image_cube) {
+			z = EmitCubeLayerF32(state, z);
+		}
+		state.builder.AddFunction({OpCompositeConstruct, state.vec3_float_type, coord, x, y, z});
+	} else {
+		state.builder.AddFunction({OpCompositeConstruct, state.vec2_float_type, coord, x, y});
+	}
+	return coord;
+}
+
+} // namespace
 
 bool HasImageSampleFlag(const IR::Instruction& inst, uint32_t flag) {
 	return (inst.memory.image_sample_flags & flag) != 0;
@@ -21,7 +81,7 @@ ImageSampleLayout MakeImageSampleLayout(const IR::Instruction& inst, ImageViewKi
 	}
 	if (HasImageSampleFlag(inst, Decoder::ImageSampleFlagDerivative)) {
 		const auto components = ImageViewSpatialComponents(view);
-		layout.grad_x = cursor;
+		layout.grad_x         = cursor;
 		cursor += components;
 		layout.grad_y = cursor;
 		cursor += components;
@@ -36,24 +96,8 @@ ImageSampleLayout MakeImageSampleLayout(const IR::Instruction& inst, ImageViewKi
 
 uint32_t EmitImageCoordF32(EmitterState& state, const IR::Instruction& inst,
                            const ImageSampleLayout& layout, ImageViewKind view) {
-	const auto x          = EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord);
-	const auto components = ImageViewCoordinateComponents(view);
-	if (components == 1u) {
-		return x;
-	}
-	const auto y = inst.memory.image_address_components > layout.coord + 1u
-	                       ? EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord + 1u)
-	                       : EmitZeroF32(state);
-	const auto coord = state.builder.AllocateId();
-	if (components == 3u) {
-		const auto z = inst.memory.image_address_components > layout.coord + 2u
-		                   ? EmitImageAddressFloatLoad(state, inst, inst.src[0], layout.coord + 2u)
-		                   : EmitZeroF32(state);
-		state.builder.AddFunction({OpCompositeConstruct, state.vec3_float_type, coord, x, y, z});
-	} else {
-		state.builder.AddFunction({OpCompositeConstruct, state.vec2_float_type, coord, x, y});
-	}
-	return coord;
+	return EmitImageCoordF32Impl(state, inst, inst.src[0], layout.coord,
+	                             ImageViewCoordinateComponents(view));
 }
 
 uint32_t EmitImageLodF32(EmitterState& state, const IR::Instruction& inst,
@@ -95,10 +139,10 @@ uint32_t EmitImageGradientF32(EmitterState& state, const IR::Instruction& inst,
 	                   : EmitZeroF32(state);
 	const auto grad = state.builder.AllocateId();
 	if (components == 3u) {
-		const auto z = inst.memory.image_address_components > first_component + 2u
-		                   ? EmitImageAddressFloatLoad(state, inst, inst.src[0],
-		                                               first_component + 2u)
-		                   : EmitZeroF32(state);
+		const auto z =
+		    inst.memory.image_address_components > first_component + 2u
+		        ? EmitImageAddressFloatLoad(state, inst, inst.src[0], first_component + 2u)
+		        : EmitZeroF32(state);
 		state.builder.AddFunction({OpCompositeConstruct, state.vec3_float_type, grad, x, y, z});
 	} else {
 		state.builder.AddFunction({OpCompositeConstruct, state.vec2_float_type, grad, x, y});
@@ -120,8 +164,7 @@ uint32_t EmitImagePackedOffsetI32(EmitterState& state, const IR::Instruction& in
 			state.builder.AddFunction(
 			    {OpCompositeConstruct, state.vec3_int_type, ret, zero, zero, zero});
 		} else {
-			state.builder.AddFunction(
-			    {OpCompositeConstruct, state.vec2_int_type, ret, zero, zero});
+			state.builder.AddFunction({OpCompositeConstruct, state.vec2_int_type, ret, zero, zero});
 		}
 		return ret;
 	}
@@ -131,18 +174,18 @@ uint32_t EmitImagePackedOffsetI32(EmitterState& state, const IR::Instruction& in
 	const auto offset_x    = state.builder.AllocateId();
 	state.builder.AddFunction({OpBitcast, state.int_type, packed_i32, packed_bits});
 	state.builder.AddFunction({OpBitFieldSExtract, state.int_type, offset_x, packed_i32,
-	                            ConstantI32(state, 0), ConstantI32(state, 6)});
+	                           ConstantI32(state, 0), ConstantI32(state, 6)});
 	if (components == 1u) {
 		return offset_x;
 	}
 	const auto offset_y = state.builder.AllocateId();
 	const auto offset   = state.builder.AllocateId();
 	state.builder.AddFunction({OpBitFieldSExtract, state.int_type, offset_y, packed_i32,
-	                            ConstantI32(state, 8), ConstantI32(state, 6)});
+	                           ConstantI32(state, 8), ConstantI32(state, 6)});
 	if (components == 3u) {
 		const auto offset_z = state.builder.AllocateId();
 		state.builder.AddFunction({OpBitFieldSExtract, state.int_type, offset_z, packed_i32,
-		                            ConstantI32(state, 16), ConstantI32(state, 6)});
+		                           ConstantI32(state, 16), ConstantI32(state, 6)});
 		state.builder.AddFunction(
 		    {OpCompositeConstruct, state.vec3_int_type, offset, offset_x, offset_y, offset_z});
 	} else {
@@ -158,7 +201,7 @@ uint32_t EmitImageCoordU32(EmitterState& state, const IR::Instruction& inst, Ima
 	if (components == 1u) {
 		return x;
 	}
-	const auto y = inst.memory.image_address_components > 1u
+	const auto y     = inst.memory.image_address_components > 1u
 	                       ? EmitImageAddressValueLoad(state, inst, inst.src[1], 1)
 	                       : ConstantU32(state, 0);
 	const auto coord = state.builder.AllocateId();
@@ -180,7 +223,7 @@ uint32_t EmitImageLoadCoordU32(EmitterState& state, const IR::Instruction& inst,
 	if (components == 1u) {
 		return x;
 	}
-	const auto y = inst.memory.image_address_components > 1u
+	const auto y     = inst.memory.image_address_components > 1u
 	                       ? EmitImageAddressValueLoad(state, inst, inst.src[0], 1)
 	                       : ConstantU32(state, 0);
 	const auto coord = state.builder.AllocateId();
@@ -209,24 +252,8 @@ uint32_t EmitImageMipLodU32(EmitterState& state, const IR::Instruction& inst,
 
 uint32_t EmitImageQueryCoordF32(EmitterState& state, const IR::Instruction& inst,
                                 ImageViewKind view) {
-	const auto x          = EmitImageAddressFloatLoad(state, inst, inst.src[0], 0);
-	const auto components = ImageViewCoordinateComponents(view);
-	if (components == 1u) {
-		return x;
-	}
-	const auto y = inst.memory.image_address_components > 1u
-	                       ? EmitImageAddressFloatLoad(state, inst, inst.src[0], 1)
-	                       : EmitZeroF32(state);
-	const auto coord = state.builder.AllocateId();
-	if (components == 3u) {
-		const auto z = inst.memory.image_address_components > 2u
-		                   ? EmitImageAddressFloatLoad(state, inst, inst.src[0], 2)
-		                   : EmitZeroF32(state);
-		state.builder.AddFunction({OpCompositeConstruct, state.vec3_float_type, coord, x, y, z});
-	} else {
-		state.builder.AddFunction({OpCompositeConstruct, state.vec2_float_type, coord, x, y});
-	}
-	return coord;
+	// OpImageQueryLod takes only the spatial coordinates, even for arrayed images.
+	return EmitImageCoordF32Impl(state, inst, inst.src[0], 0, ImageViewSpatialComponents(view));
 }
 
 uint32_t DmaskComponentIndex(uint32_t dmask, uint32_t component) {

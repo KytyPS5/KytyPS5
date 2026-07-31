@@ -407,11 +407,33 @@ void TestFlexibleDmemCompatAndAlignmentFlags() {
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "DMEM_COMPAT cleanup did not restore flexible capacity");
 
-	void* invalid = nullptr;
+	void* opaque = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &opaque, SceKernelPageSize, SceKernelProtCpuRw, 0x8000, "opaque_runtime_flag"),
+	        "KernelMapNamedFlexibleMemory(opaque runtime flag)");
+	Check(test, AvailableFlexibleMemory(test) + SceKernelPageSize == baseline,
+	      "opaque runtime flag mapping did not consume boot-time flexible backing");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(opaque),
+	                                              SceKernelPageSize),
+	        "KernelMunmap(opaque runtime flag)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "opaque runtime flag cleanup did not restore flexible capacity");
+
+	void* invalid_flag = nullptr;
+	CheckFailed(
+	    test,
+	    Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	        &invalid_flag, SceKernelPageSize, SceKernelProtCpuRw, 0x10000, "unsupported_flag"),
+	    "KernelMapNamedFlexibleMemory(unsupported flag)");
+
+	void* invalid_alignment = nullptr;
 	CheckFailed(test,
 	            Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
-	                &invalid, SceKernelPageSize, SceKernelProtCpuRw, 0x8000, "non_sdk_flag"),
-	            "KernelMapNamedFlexibleMemory(non-SDK flag)");
+	                &invalid_alignment, SceKernelPageSize, SceKernelProtCpuRw, 13 << 24,
+	                "invalid_alignment"),
+	            "KernelMapNamedFlexibleMemory(invalid alignment)");
 
 	std::printf("[host]    %-48s ok\n", test);
 }

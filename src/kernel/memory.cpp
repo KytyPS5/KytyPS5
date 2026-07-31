@@ -2176,11 +2176,12 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	constexpr uint32_t GUEST_MAP_FIXED          = 0x10;
 	constexpr uint32_t GUEST_MAP_NO_OVERWRITE   = 0x80;
 	constexpr uint32_t GUEST_MAP_DMEM_COMPAT    = 0x400;
+	constexpr uint32_t GUEST_MAP_UNKNOWN_8000   = 0x8000;
 	constexpr uint32_t GUEST_MAP_NO_COALESCE    = 0x400000;
 	constexpr uint32_t GUEST_MAP_ALIGNMENT_MASK = 0xff000000;
 	constexpr uint32_t SUPPORTED_MAP_BITS       = GUEST_MAP_FIXED | GUEST_MAP_NO_OVERWRITE |
-	                                              GUEST_MAP_DMEM_COMPAT | GUEST_MAP_NO_COALESCE |
-	                                              GUEST_MAP_ALIGNMENT_MASK;
+	                                              GUEST_MAP_DMEM_COMPAT | GUEST_MAP_UNKNOWN_8000 |
+	                                              GUEST_MAP_NO_COALESCE | GUEST_MAP_ALIGNMENT_MASK;
 
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;

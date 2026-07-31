@@ -27,8 +27,9 @@ Development is focused on compatibility and boot reliability.
 Windows is the primary platform and receives the most testing. Linux builds and runs; see
 [Building on Linux](#building-on-linux).
 
-macOS support is experimental. Compatibility with the same games on Windows and macOS has not yet
-been tested.
+macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
+Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
+on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
 
 ## Bugs and Issues
 
@@ -114,9 +115,10 @@ the Vulkan/SPIR-V validation rules.
 
 ### System requirements
 
-- Windows 10 version 1803, or a current Linux distribution
-- A 64-bit x86 processor
-- A Vulkan 1.3-capable GPU with current drivers
+- Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
+- A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
+- A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
+  MoltenVK)
 
 ### Build requirements (Windows)
 
@@ -188,6 +190,45 @@ time.
 
 Note that the CMake source root is `src`, not the repository root.
 
+### Building on macOS
+
+macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
+code executes through the same translation layer as the emulator itself. Prebuilt archives are
+attached to releases; the steps below are for building from source.
+
+Requirements:
+
+- An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
+- Xcode (or the Command Line Tools)
+- Homebrew packages: `brew install cmake ninja glslang`
+- Qt 6 (Concurrent, Network, Widgets) with x86-64 support. The official Qt installation is
+  universal and works; Homebrew's Qt is arm64-only and will not link
+
+```bash
+git submodule update --init --recursive
+
+cmake -S src -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+
+cmake --build _Build/macos --target launcher --parallel
+cmake --install _Build/macos --prefix _Build/macos/install
+```
+
+The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
+guest code; no manual signing step is required.
+
+Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
+[MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
+`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` and ad-hoc sign it:
+
+```bash
+codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
+```
+
+Release archives already include a signed `libMoltenVK.dylib`.
+
 ### Visual Studio Code
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
@@ -231,6 +272,14 @@ The emulator can also be started directly with a legally obtained game directory
 
 ```bash
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
+```
+
+On macOS, point SDL at the MoltenVK library explicitly; the hardened runtime prevents it from
+being picked up from the executable's directory:
+
+```bash
+cd _Build/macos/install
+SDL_VULKAN_LIBRARY="$PWD/libMoltenVK.dylib" ./kyty_emulator --game "/games/ExampleGame"
 ```
 
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and

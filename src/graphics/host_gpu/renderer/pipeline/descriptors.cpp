@@ -213,19 +213,21 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto pitch  = TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
 	const auto type   = static_cast<Prospero::ImageType>(descriptor.Type());
-	const bool supported_single_layer =
-	    image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
-	    descriptor.BaseArray5() == 0 &&
-	    (type == Prospero::ImageType::kColor2D || type == Prospero::ImageType::kColor2DArray);
+	const bool supported_2d    = type == Prospero::ImageType::kColor2D &&
+	                             image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
+	                             descriptor.BaseArray5() == 0;
+	const bool supported_array = type == Prospero::ImageType::kColor2DArray &&
+	                             descriptor.BaseArray5() <= descriptor.Depth() &&
+	                             descriptor.Depth() < image.info.resources.layers;
 	const bool supported_cube =
 	    type == Prospero::ImageType::kCube && width == height && image.info.resources.layers >= 6 &&
 	    image.info.resources.layers % 6u == 0 &&
 	    static_cast<uint32_t>(descriptor.Depth()) + 1u == image.info.resources.layers &&
 	    descriptor.BaseArray5() == 0;
 	return image.info.IsDepth() && width == image.info.extent.width &&
-	       height == image.info.extent.height && (supported_single_layer || supported_cube) &&
-	       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0 &&
-	       descriptor.MinLod() == 0 && descriptor.BaseArray5() == 0 &&
+	       height == image.info.extent.height &&
+	       (supported_2d || supported_array || supported_cube) && descriptor.BaseLevel() == 0 &&
+	       descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0 && descriptor.MinLod() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth() && pitch >= width &&
 	       pitch == image.info.pitch;

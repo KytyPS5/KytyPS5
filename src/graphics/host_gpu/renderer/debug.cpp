@@ -548,14 +548,6 @@ static void ZCheck(const HW::DepthRenderTarget& z) {
 		EXIT_NOT_IMPLEMENTED(z.htile_surface.prefetch_height != 0x00000000);
 		EXIT_NOT_IMPLEMENTED(z.htile_surface.dst_outside_zero_to_one != 0x00000000);
 
-		if (z.depth_view.slice_start != 0x00000000 || z.depth_view.slice_max != 0x00000000) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DepthTarget: temporary: ignoring PS5 array slice view start=0x%08" PRIx32
-				     ", max=0x%08" PRIx32 "\n",
-				     z.depth_view.slice_start, z.depth_view.slice_max);
-			}
-		}
 		if (z.depth_view.current_mip_level != 0x00000000) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {

@@ -7,8 +7,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -23,10 +23,10 @@ static std::atomic<uint32_t> g_render_color_log_count = 0;
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
-                                          RenderColorInfo& r,
-                                          uint32_t render_target_slice_offset,
-                                          uint32_t render_target_slot, bool ignore_target_mask,
-                                          bool exact_format) {
+                                              RenderColorInfo& r,
+                                              uint32_t         render_target_slice_offset,
+                                              uint32_t render_target_slot, bool ignore_target_mask,
+                                              bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
@@ -79,10 +79,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	const auto view = ResolveTargetViewInfo(
 	    rt.view.base_array_slice_index, rt.view.last_array_slice_index, render_target_slice_offset);
 	switch (view.type) {
-		case TargetViewType::Image2D: break;
-		case TargetViewType::Image2DArray:
-			EXIT("layered render-target views are unsupported: base=%u count=%u\n", view.base_layer,
-			     view.layer_count);
+		case TargetViewType::Image2D:
+		case TargetViewType::Image2DArray: break;
 		case TargetViewType::Unsupported:
 			EXIT("invalid render-target view: base=%u last=%u draw_offset=%u\n",
 			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
@@ -241,12 +239,12 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	}
 
 	TextureCache::ImageDesc desc {};
-	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data         = {rt.base.addr, backing_size};
-	desc.info.pixel_format = target_format.format;
-	desc.info.guest_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
-	desc.info.type   = Prospero::ImageType::kColor2D;
-	desc.info.extent = {width, height, 1};
+	desc.type                 = TextureCache::BindingType::RenderTarget;
+	desc.info.data            = {rt.base.addr, backing_size};
+	desc.info.pixel_format    = target_format.format;
+	desc.info.guest_format    = ImageOps::RenderTargetTransferFormat(bytes_per_element);
+	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.extent          = {width, height, 1};
 	desc.info.resources       = {levels, view.image_layers};
 	desc.info.pitch           = pitch;
 	desc.info.bytes_per_block = bytes_per_element;
@@ -275,20 +273,20 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache = m_context.GetTextureCache();
-	r.desc              = std::move(desc);
-	r.image_id          = texture_cache.FindImage(r.desc, exact_format);
-	r.type              = RenderColorType::RenderTexture;
-	r.base_addr         = rt.base.addr;
-	r.image_view        = nullptr;
-	r.format            = r.desc.view_info.format;
-	r.extent            = view_extent;
-	r.base_mip_level    = rt.view.current_mip_level;
-	r.buffer_size       = backing_size;
-	r.samples           = samples;
-	r.export_mapping    = target_format.export_mapping;
-	r.color_clear_enable = false;
-	r.color_clear_value = {};
+	auto& texture_cache        = m_context.GetTextureCache();
+	r.desc                     = std::move(desc);
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	r.type                     = RenderColorType::RenderTexture;
+	r.base_addr                = rt.base.addr;
+	r.image_view               = nullptr;
+	r.format                   = r.desc.view_info.format;
+	r.extent                   = view_extent;
+	r.base_mip_level           = rt.view.current_mip_level;
+	r.buffer_size              = backing_size;
+	r.samples                  = samples;
+	r.export_mapping           = target_format.export_mapping;
+	r.color_clear_enable       = false;
+	r.color_clear_value        = {};
 	BindRenderTarget(r.image_id);
 }
 

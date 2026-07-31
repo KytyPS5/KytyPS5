@@ -10,10 +10,10 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/debug.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -150,10 +150,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	    has_stencil, has_htile, z.stencil_info.htile_stencil_disabled);
 	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
 	switch (view.type) {
-		case TargetViewType::Image2D: break;
-		case TargetViewType::Image2DArray:
-			DepthFatal("layered depth views are unsupported: base=%u count=%u", view.base_layer,
-			           view.layer_count);
+		case TargetViewType::Image2D:
+		case TargetViewType::Image2DArray: break;
 		case TargetViewType::Unsupported:
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);

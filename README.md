@@ -212,7 +212,12 @@ cmake -S src -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_PREFIX_PATH="$Qt6_DIR"
 
+# To build the graphical launcher (requires Qt 6):
 cmake --build _Build/macos --target launcher --parallel
+cmake --install _Build/macos --prefix _Build/macos/install
+
+# Or to build only the emulator CLI binary (does not require Qt 6):
+cmake --build _Build/macos --target kyty_emulator --parallel
 cmake --install _Build/macos --prefix _Build/macos/install
 ```
 

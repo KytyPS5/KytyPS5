@@ -1,40 +1,42 @@
 // Internal memory address-space helpers included by memory.cpp.
 // Kept in the same translation unit because they depend on memory.cpp-local helpers.
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN = 0x0000040000ull;
-static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX = 0x07fffeffffull;
-static constexpr uint64_t HOST_USER_MIN           = 0x1000000000ull;
-static constexpr uint64_t HOST_USER_MAX           = 0xfbffffffffull;
+static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
+static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
+static constexpr uint64_t HOST_SYSTEM_RESERVED_MIN = HOST_SYSTEM_MANAGED_MAX + 1u;
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
+static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
+static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
+#else
+static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
+static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
+static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 
-class DirectMemoryBacking {
+static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
+                                   uint64_t size) {
+	if (UINT64_MAX - base < range_size || candidate < base) {
+		return false;
+	}
+	const auto range_end = base + range_size;
+	return candidate <= range_end && size <= range_end - candidate;
+}
+
+class GuestBackingStore {
 public:
 	enum class FailureReason {
 		None,
 		BackingUnavailable,
 		PhysicalRangeOutOfBounds,
-		HostAddressNotGranularityAligned,
-		SizeNotGranularityAligned,
-		ReserveAlignedFailed,
 		FixedMapViewFailed,
-		PlaceholderReserveFailed,
 		PlaceholderMapFailed,
 		ProtectFailed,
-		ReservedContainerHasCommittedPages,
-		ReservedContainerReleaseFailed,
-		ReservedContainerRestoreFailed,
-		ReservedContainerSplitNotGranularityAligned,
 		WrongHostAddress,
-		UnmapRollbackFailed,
+		AddressRangeUnavailable,
 	};
 
-	explicit DirectMemoryBacking(uint64_t size): m_size(size) {
+	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		SYSTEM_INFO info {};
-		GetSystemInfo(&info);
-		m_granularity = info.dwAllocationGranularity;
-
 		m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE,
 		                              static_cast<DWORD>(m_size >> 32u),
 		                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
@@ -90,8 +92,12 @@ public:
 #endif
 	}
 
-	~DirectMemoryBacking() {
+	~GuestBackingStore() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (const auto& [_, entry]: m_maps) {
+			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
+		}
+		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -99,6 +105,11 @@ public:
 			CloseHandle(m_handle);
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		for (const auto& [_, entry]: m_maps) {
+			EXIT_IF(
+			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
+		}
+		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -108,31 +119,18 @@ public:
 #endif
 	}
 
-	KYTY_CLASS_NO_COPY(DirectMemoryBacking);
+	KYTY_CLASS_NO_COPY(GuestBackingStore);
 
 	static const char* GetFailureReasonName(FailureReason reason) {
 		switch (reason) {
 			case FailureReason::None: return "n/a";
 			case FailureReason::BackingUnavailable: return "backing-unavailable";
 			case FailureReason::PhysicalRangeOutOfBounds: return "physical-range-out-of-bounds";
-			case FailureReason::HostAddressNotGranularityAligned:
-				return "host-address-not-64k-aligned";
-			case FailureReason::SizeNotGranularityAligned: return "size-not-64k-aligned";
-			case FailureReason::ReserveAlignedFailed: return "reserve-aligned-failed";
 			case FailureReason::FixedMapViewFailed: return "fixed-map-view-failed";
-			case FailureReason::PlaceholderReserveFailed: return "placeholder-reserve-failed";
 			case FailureReason::PlaceholderMapFailed: return "placeholder-map-failed";
 			case FailureReason::ProtectFailed: return "protect-failed";
-			case FailureReason::ReservedContainerHasCommittedPages:
-				return "reserved-container-has-committed-pages";
-			case FailureReason::ReservedContainerReleaseFailed:
-				return "reserved-container-release-failed";
-			case FailureReason::ReservedContainerRestoreFailed:
-				return "reserved-container-restore-failed";
-			case FailureReason::ReservedContainerSplitNotGranularityAligned:
-				return "reserved-container-split-not-64k-aligned";
 			case FailureReason::WrongHostAddress: return "wrong-host-address";
-			case FailureReason::UnmapRollbackFailed: return "unmap-rollback-failed";
+			case FailureReason::AddressRangeUnavailable: return "address-range-unavailable";
 			default: return "unknown";
 		}
 	}
@@ -145,6 +143,20 @@ public:
 #else
 		return false;
 #endif
+	}
+
+	[[nodiscard]] uint64_t GetBackingBase() const {
+		return reinterpret_cast<uint64_t>(m_backing_base);
+	}
+
+	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+
+	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
+		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
+			return false;
+		}
+		std::memset(m_backing_base + backing_offset, 0, size);
+		return true;
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -169,123 +181,6 @@ public:
 		    });
 	}
 
-	uint64_t MapAligned(uint64_t search_addr, uint64_t size, uint64_t backing_offset,
-	                    VirtualMemory::Mode mode, uint64_t alignment,
-	                    FailureReason* failure_reason = nullptr) {
-		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
-			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
-			                                          : FailureReason::PhysicalRangeOutOfBounds);
-			return 0;
-		}
-
-		if (alignment == 0) {
-			alignment = 0x4000;
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		alignment = std::max<uint64_t>(alignment, m_granularity);
-		return MapNewPlaceholderAligned(search_addr, size, backing_offset, mode, alignment,
-		                                failure_reason);
-#else
-		auto reserved = VirtualMemory::ReserveAligned(search_addr, size, alignment);
-		if (reserved == 0) {
-			SetFailure(failure_reason, FailureReason::ReserveAlignedFailed);
-			return 0;
-		}
-#if !defined(__APPLE__)
-		// On macOS the PROT_NONE reservation is left in place: MapView's MAP_FIXED
-		// replaces it atomically, so the range never becomes a hole that dyld,
-		// Rosetta, or Metal background threads could claim (which the subsequent
-		// MAP_FIXED would then silently destroy).
-		if (!ReleaseReservedProbe(reserved, failure_reason)) {
-			return 0;
-		}
-#endif
-		if (MapFixed(reserved, size, backing_offset, mode, failure_reason)) {
-			return reserved;
-		}
-
-		return 0;
-#endif
-	}
-
-	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
-	              FailureReason* failure_reason = nullptr) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (ShouldChunkMap(size) && IsGranularityAligned(vaddr) &&
-		    IsGranularityAligned(backing_offset)) {
-			return MapFixedChunked(vaddr, size, backing_offset, mode, failure_reason);
-		}
-#endif
-
-		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
-			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
-			                                          : FailureReason::PhysicalRangeOutOfBounds);
-			return false;
-		}
-
-		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (mapped == nullptr && ReleaseExactHostAllocation(vaddr, size)) {
-			mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-		}
-		if (mapped == nullptr) {
-			ReleasedReservedHostAllocation released {};
-			if (ReleaseReservedHostAllocationForMap(vaddr, size, &released, failure_reason)) {
-				mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-				if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-					if (mapped != nullptr) {
-						UnmapView(mapped, size);
-						mapped = nullptr;
-					}
-					RestoreReleasedReservedHostAllocation(released);
-				} else if (!ReserveReleasedReservedHostRemainders(released)) {
-					UnmapView(mapped, size);
-					mapped = nullptr;
-					RestoreReleasedReservedHostAllocation(released);
-					SetFailure(failure_reason, FailureReason::ReservedContainerRestoreFailed);
-				}
-			}
-		}
-		if (mapped == nullptr) {
-			std::vector<ReleasedReservedHostAllocation> released_ranges;
-			if (ReleaseReservedHostAllocationsForMap(vaddr, size, &released_ranges,
-			                                         failure_reason)) {
-				mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-				if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-					if (mapped != nullptr) {
-						UnmapView(mapped, size);
-						mapped = nullptr;
-					}
-					RestoreReleasedReservedHostAllocations(released_ranges);
-				} else if (!ReserveReleasedReservedHostRemainders(released_ranges)) {
-					UnmapView(mapped, size);
-					mapped = nullptr;
-					RestoreReleasedReservedHostAllocations(released_ranges);
-					SetFailure(failure_reason, FailureReason::ReservedContainerRestoreFailed);
-				}
-			}
-		}
-#endif
-		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-			if (mapped != nullptr) {
-				if (!UnmapView(mapped, size)) {
-					SetFailure(failure_reason, FailureReason::UnmapRollbackFailed);
-				}
-			}
-			if (mapped != nullptr) {
-				SetFailure(failure_reason, FailureReason::WrongHostAddress);
-			}
-			return false;
-		}
-
-		{
-			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
-		}
-		SetFailure(failure_reason, FailureReason::None);
-		return true;
-	}
-
 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                                 VirtualMemory::Mode mode,
 	                                 FailureReason*      failure_reason = nullptr) {
@@ -299,7 +194,7 @@ public:
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
-				UnmapView(mapped, size);
+				UnmapViewPreservePlaceholder(mapped, size);
 				SetFailure(failure_reason, FailureReason::WrongHostAddress);
 			}
 			return false;
@@ -312,12 +207,20 @@ public:
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
-		return MapFixed(vaddr, size, backing_offset, mode, failure_reason);
+		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
+		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
+			return false;
+		}
+		{
+			std::lock_guard lock(m_mutex);
+			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+		}
+		SetFailure(failure_reason, FailureReason::None);
+		return true;
 #endif
 	}
 
-	bool Unmap(uint64_t vaddr, uint64_t size, bool preserve_placeholder = false,
-	           bool* placeholder_preserved = nullptr) {
+	bool Unmap(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -326,37 +229,58 @@ public:
 			*placeholder_preserved = false;
 		}
 
-		if (!Contains(vaddr, size)) {
-			return false;
-		}
-
-		const auto end     = vaddr + size;
-		auto       current = vaddr;
-		while (current < end) {
-			MapEntry entry {};
-			{
-				std::lock_guard lock(m_mutex);
+		const auto            end = vaddr + size;
+		std::vector<MapEntry> targets;
+		{
+			std::lock_guard lock(m_mutex);
+			auto            current = vaddr;
+			while (current < end) {
+				MapEntry entry {};
 				if (!FindContainingUnlocked(current, 1, &entry)) {
 					return false;
 				}
+				const auto part_size = std::min(end, entry.vaddr + entry.size) - current;
+				targets.push_back(
+				    {current, part_size, entry.backing_offset + current - entry.vaddr, entry.mode});
+				current += part_size;
 			}
-
-			const auto entry_end = entry.vaddr + entry.size;
-			const auto part_size = std::min(end, entry_end) - current;
-			const bool preserve_part_placeholder =
-			    preserve_placeholder && current == vaddr && part_size == size;
-			if (!UnmapOne(current, part_size, preserve_part_placeholder, placeholder_preserved)) {
-				return false;
-			}
-
-			current += part_size;
 		}
 
+		std::vector<MapEntry> removed;
+		removed.reserve(targets.size());
+		for (const auto& entry: targets) {
+			bool part_placeholder_preserved = false;
+			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
+				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+					EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
+					                                     it->mode));
+				}
+				if (placeholder_preserved != nullptr) {
+					*placeholder_preserved = false;
+				}
+				return false;
+			}
+			EXIT_IF(!part_placeholder_preserved);
+			removed.push_back(entry);
+		}
+
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = true;
+		}
 		return true;
 	}
 
-	bool UnmapOne(uint64_t vaddr, uint64_t size, bool preserve_placeholder = false,
-	              bool* placeholder_preserved = nullptr) {
+	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_store_unmaps_before_failure == 0) {
+			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
+			return false;
+		}
+		if (g_test_backing_store_unmaps_before_failure != UINT32_MAX) {
+			g_test_backing_store_unmaps_before_failure--;
+		}
+#endif
+
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
@@ -377,20 +301,15 @@ public:
 		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
 		if (exact_unmap) {
 			const bool unmapped =
-			    preserve_placeholder
-			        ? UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)
-			        : UnmapView(reinterpret_cast<void*>(old.vaddr), old.size);
+			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (preserve_placeholder && placeholder_preserved != nullptr) {
+			if (placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
-#endif
-			// Only Windows preserves placeholders.
 			return true;
 		}
 
@@ -425,47 +344,57 @@ public:
 				}
 				return true;
 			}
-		} else
-#endif
-		{
-			if (!UnmapView(reinterpret_cast<void*>(old.vaddr), old.size)) {
-				std::lock_guard lock(m_mutex);
-				m_maps.emplace(old.vaddr, old);
-				return false;
+
+			if (left_size != 0 && Contains(old.vaddr, left_size)) {
+				EXIT_IF(!UnmapOne(old.vaddr, left_size));
 			}
+			if (right_size != 0 && Contains(right_addr, right_size)) {
+				EXIT_IF(!UnmapOne(right_addr, right_size));
+			}
+			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
+			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
+			EXIT_IF(
+			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		m_maps.emplace(old.vaddr, old);
+		return false;
+#else
+		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
 		}
 
 		bool ok = true;
 		if (left_size != 0) {
-			ok = MapFixed(old.vaddr, left_size, old.backing_offset, old.mode) && ok;
+			ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset, old.mode) &&
+			     ok;
 		}
 		if (right_size != 0) {
-			ok = MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
-			              old.mode) &&
+			ok = MapExistingPlaceholderFixed(right_addr, right_size,
+			                                 old.backing_offset + (right_addr - old.vaddr),
+			                                 old.mode) &&
 			     ok;
 		}
 		if (!ok) {
-			if (left_size != 0) {
-				UnmapOne(old.vaddr, left_size);
+			if (left_size != 0 && Contains(old.vaddr, left_size)) {
+				EXIT_IF(!UnmapOne(old.vaddr, left_size));
 			}
-			if (right_size != 0) {
-				UnmapOne(right_addr, right_size);
+			if (right_size != 0 && Contains(right_addr, right_size)) {
+				EXIT_IF(!UnmapOne(right_addr, right_size));
 			}
-			MapFixed(old.vaddr, old.size, old.backing_offset, old.mode);
+			EXIT_IF(
+			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
 
-		return ok;
-	}
-
-	void UpdateProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
-		for (auto& map_entry: m_maps) {
-			auto& entry = map_entry.second;
-			if (VirtualRangesOverlap(vaddr, size, entry.vaddr, entry.size)) {
-				entry.mode = mode;
-			}
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = true;
 		}
+		return ok;
+#endif
 	}
 
 	bool Contains(uint64_t vaddr, uint64_t size) {
@@ -490,45 +419,6 @@ public:
 		}
 
 		return true;
-	}
-
-	bool SelfTest() {
-		const uint64_t test_size = GetMappableTestSize();
-		if (test_size == 0 || !RangeOk(0, test_size)) {
-			LOGF_COLOR(Log::Color::Yellow, "\t direct-memory backing self-test skipped\n");
-			return false;
-		}
-
-		const auto first = MapAligned(0, test_size, 0, VirtualMemory::Mode::ReadWrite, test_size);
-		if (first == 0) {
-			LOGF_COLOR(Log::Color::Yellow,
-			           "\t direct-memory backing self-test skipped: first alias unavailable\n");
-			return false;
-		}
-
-		const auto second = MapAligned(0, test_size, 0, VirtualMemory::Mode::ReadWrite, test_size);
-		if (second == 0) {
-			Unmap(first, test_size);
-			LOGF_COLOR(Log::Color::Yellow,
-			           "\t direct-memory backing self-test skipped: second alias unavailable\n");
-			return false;
-		}
-
-		auto* second_ptr = reinterpret_cast<uint64_t*>(second);
-
-		constexpr uint64_t test_value = 0x4b595459414c4941ull; // "KYTYALIA"
-		EXIT_IF(!VirtualMemory::Protect(first, test_size, VirtualMemory::Mode::NoAccess));
-		const bool ok =
-		    TryWriteBacking(first, &test_value, sizeof(test_value)) && *second_ptr == test_value;
-		const uint64_t clear = 0;
-		EXIT_IF(!TryWriteBacking(first, &clear, sizeof(clear)));
-
-		Unmap(second, test_size);
-		Unmap(first, test_size);
-
-		LOGF_COLOR(ok ? Log::Color::Green : Log::Color::Red,
-		           "\t direct-memory backing self-test: %s\n", ok ? "shared aliases ok" : "failed");
-		return ok;
 	}
 
 private:
@@ -602,138 +492,7 @@ private:
 		}
 	}
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	static bool ReleaseReservedProbe(uint64_t vaddr, FailureReason* failure_reason) {
-		if (VirtualMemory::Free(vaddr)) {
-			return true;
-		}
-		SetFailure(failure_reason, FailureReason::ReservedContainerReleaseFailed);
-		return false;
-	}
-#endif
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	[[nodiscard]] uint64_t    GetMappableTestSize() const { return m_granularity; }
-	static constexpr uint64_t PageSize() { return 0x4000; }
-
-	[[nodiscard]] static bool IsPageAligned(uint64_t value) {
-		return (value & (PageSize() - 1u)) == 0;
-	}
-
-	[[nodiscard]] bool IsGranularityAligned(uint64_t value) const {
-		return (value & (m_granularity - 1u)) == 0;
-	}
-
-	[[nodiscard]] uint64_t GetMapChunkSize() const {
-		return std::max<uint64_t>(m_granularity, 0x200000ull);
-	}
-
-	[[nodiscard]] bool ShouldChunkMap(uint64_t size) const { return size > GetMapChunkSize(); }
-
-	uint64_t MapNewPlaceholderAligned(uint64_t search_addr, uint64_t size, uint64_t backing_offset,
-	                                  VirtualMemory::Mode mode, uint64_t alignment,
-	                                  FailureReason* failure_reason) {
-		MEM_ADDRESS_REQUIREMENTS requirements {};
-		MEM_EXTENDED_PARAMETER   parameter {};
-		const auto aligned_search = (search_addr + alignment - 1u) & ~(alignment - 1u);
-		requirements.LowestStartingAddress =
-		    reinterpret_cast<void*>(search_addr != 0 ? aligned_search : HOST_SYSTEM_MANAGED_MIN);
-		requirements.HighestEndingAddress =
-		    reinterpret_cast<void*>(search_addr != 0 ? HOST_USER_MAX : HOST_SYSTEM_MANAGED_MAX);
-		requirements.Alignment = alignment;
-		parameter.Type         = MemExtendedParameterAddressRequirements;
-		parameter.Pointer      = &requirements;
-
-		auto reserve = [&]() {
-			return VirtualAlloc2(GetCurrentProcess(), nullptr, size,
-			                     MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter,
-			                     1);
-		};
-		auto* placeholder = reserve();
-		if (placeholder == nullptr && search_addr == 0) {
-			requirements.LowestStartingAddress = reinterpret_cast<void*>(HOST_USER_MIN);
-			requirements.HighestEndingAddress  = reinterpret_cast<void*>(HOST_USER_MAX);
-			placeholder                        = reserve();
-		}
-		if (placeholder == nullptr) {
-			SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
-			return 0;
-		}
-
-		const auto            vaddr = reinterpret_cast<uint64_t>(placeholder);
-		std::vector<MapEntry> entries;
-		uint64_t              mapped = 0;
-		while (mapped < size) {
-			const auto current   = vaddr + mapped;
-			const auto remaining = size - mapped;
-			const auto part_size = std::min<uint64_t>(GetMapChunkSize(), remaining);
-			const bool split     = part_size != remaining;
-			if (split && !SplitPlaceholder(current, part_size)) {
-				for (const auto& entry: entries) {
-					UnmapView(reinterpret_cast<void*>(entry.vaddr), entry.size);
-				}
-				VirtualFree(reinterpret_cast<void*>(current), 0, MEM_RELEASE);
-				SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
-				return 0;
-			}
-			if (ReplacePlaceholderView(current, part_size, backing_offset + mapped, mode,
-			                           failure_reason) == nullptr) {
-				for (const auto& entry: entries) {
-					UnmapView(reinterpret_cast<void*>(entry.vaddr), entry.size);
-				}
-				VirtualFree(reinterpret_cast<void*>(current), 0, MEM_RELEASE);
-				if (split) {
-					VirtualFree(reinterpret_cast<void*>(current + part_size), 0, MEM_RELEASE);
-				}
-				return 0;
-			}
-			entries.push_back(MapEntry {current, part_size, backing_offset + mapped, mode});
-			mapped += part_size;
-		}
-
-		{
-			std::lock_guard lock(m_mutex);
-			for (const auto& entry: entries) {
-				EXIT_IF(!m_maps.emplace(entry.vaddr, entry).second);
-			}
-		}
-		SetFailure(failure_reason, FailureReason::None);
-		return vaddr;
-	}
-
-	bool MapFixedChunked(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
-	                     VirtualMemory::Mode mode, FailureReason* failure_reason) {
-		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
-			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
-			                                          : FailureReason::PhysicalRangeOutOfBounds);
-			return false;
-		}
-		if (!IsGranularityAligned(vaddr) || !IsGranularityAligned(backing_offset)) {
-			SetFailure(failure_reason, FailureReason::HostAddressNotGranularityAligned);
-			return false;
-		}
-
-		const auto chunk_size = GetMapChunkSize();
-		uint64_t   mapped     = 0;
-		while (mapped < size) {
-			const auto part_size = std::min<uint64_t>(chunk_size, size - mapped);
-			if (!MapFixed(vaddr + mapped, part_size, backing_offset + mapped, mode,
-			              failure_reason)) {
-				uint64_t rollback = 0;
-				while (rollback < mapped) {
-					const auto rollback_size = std::min<uint64_t>(chunk_size, mapped - rollback);
-					UnmapOne(vaddr + rollback, rollback_size);
-					rollback += rollback_size;
-				}
-				return false;
-			}
-			mapped += part_size;
-		}
-
-		SetFailure(failure_reason, FailureReason::None);
-		return true;
-	}
-
 	static DWORD GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PAGE_READONLY;
@@ -761,51 +520,6 @@ private:
 		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
-	static bool ReleaseExactHostAllocation(uint64_t vaddr, uint64_t size) {
-		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0) {
-			return false;
-		}
-
-		if ((info.State != MEM_RESERVE && info.State != MEM_COMMIT) ||
-		    reinterpret_cast<uint64_t>(info.BaseAddress) != vaddr ||
-		    reinterpret_cast<uint64_t>(info.AllocationBase) != vaddr || info.RegionSize != size) {
-			return false;
-		}
-
-		return VirtualFree(reinterpret_cast<void*>(vaddr), 0, MEM_RELEASE) != 0;
-	}
-
-	struct ReleasedReservedHostAllocation {
-		uint64_t base      = 0;
-		uint64_t size      = 0;
-		uint64_t map_start = 0;
-		uint64_t map_size  = 0;
-	};
-
-	static bool ReserveHostRange(uint64_t vaddr, uint64_t size) {
-		if (size == 0) {
-			return true;
-		}
-
-		auto* ptr = VirtualAlloc(reinterpret_cast<void*>(vaddr), size, MEM_RESERVE, PAGE_NOACCESS);
-		return ptr != nullptr && reinterpret_cast<uint64_t>(ptr) == vaddr;
-	}
-
-	static bool
-	RestoreReleasedReservedHostAllocation(const ReleasedReservedHostAllocation& released) {
-		return ReserveHostRange(released.base, released.size);
-	}
-
-	static bool RestoreReleasedReservedHostAllocations(
-	    const std::vector<ReleasedReservedHostAllocation>& released_ranges) {
-		bool ok = true;
-		for (const auto& released: released_ranges) {
-			ok = RestoreReleasedReservedHostAllocation(released) && ok;
-		}
-		return ok;
-	}
-
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
@@ -815,233 +529,25 @@ private:
 		                   backing_offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
-				UnmapViewOfFile(ptr);
+				UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			}
 			SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
 			return nullptr;
 		}
 
 		if (!ApplyProtection(ptr, size, mode)) {
-			UnmapViewOfFile(ptr);
+			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
 		}
 		return ptr;
 	}
-
-	static bool
-	ReserveReleasedReservedHostRemainders(const ReleasedReservedHostAllocation& released) {
-		const auto map_end      = released.map_start + released.map_size;
-		const auto released_end = released.base + released.size;
-		const auto left_size    = released.map_start - released.base;
-		const auto right_size   = released_end - map_end;
-
-		if (!ReserveHostRange(released.base, left_size)) {
-			return false;
-		}
-		if (!ReserveHostRange(map_end, right_size)) {
-			if (left_size != 0) {
-				VirtualFree(reinterpret_cast<void*>(released.base), 0, MEM_RELEASE);
-			}
-			return false;
-		}
-		return true;
-	}
-
-	static bool ReserveReleasedReservedHostRemainders(
-	    const std::vector<ReleasedReservedHostAllocation>& released_ranges) {
-		bool ok = true;
-		for (const auto& released: released_ranges) {
-			ok = ReserveReleasedReservedHostRemainders(released) && ok;
-		}
-		return ok;
-	}
-
-	bool QueryReservedHostAllocation(uint64_t vaddr, ReleasedReservedHostAllocation* out,
-	                                 FailureReason* failure_reason) const {
-		EXIT_IF(out == nullptr);
-
-		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0) {
-			SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
-			return false;
-		}
-
-		const auto allocation_base = reinterpret_cast<uint64_t>(info.AllocationBase);
-		const auto query_base      = reinterpret_cast<uint64_t>(info.BaseAddress);
-		if (info.State != MEM_RESERVE || query_base > vaddr || allocation_base > vaddr) {
-			SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
-			return false;
-		}
-
-		uint64_t allocation_end = query_base + info.RegionSize;
-		uint64_t scan           = allocation_end;
-		while (true) {
-			MEMORY_BASIC_INFORMATION next {};
-			if (VirtualQuery(reinterpret_cast<const void*>(scan), &next, sizeof(next)) == 0 ||
-			    reinterpret_cast<uint64_t>(next.AllocationBase) != allocation_base ||
-			    next.State == MEM_FREE) {
-				break;
-			}
-			if (next.State != MEM_RESERVE) {
-				SetFailure(failure_reason, FailureReason::ReservedContainerHasCommittedPages);
-				return false;
-			}
-			allocation_end = reinterpret_cast<uint64_t>(next.BaseAddress) + next.RegionSize;
-			scan           = allocation_end;
-		}
-
-		scan = allocation_base;
-		while (scan < allocation_end) {
-			MEMORY_BASIC_INFORMATION part {};
-			if (VirtualQuery(reinterpret_cast<const void*>(scan), &part, sizeof(part)) == 0 ||
-			    reinterpret_cast<uint64_t>(part.AllocationBase) != allocation_base ||
-			    part.State != MEM_RESERVE) {
-				SetFailure(failure_reason, FailureReason::ReservedContainerHasCommittedPages);
-				return false;
-			}
-			scan = reinterpret_cast<uint64_t>(part.BaseAddress) + part.RegionSize;
-		}
-
-		out->base      = allocation_base;
-		out->size      = allocation_end - allocation_base;
-		out->map_start = 0;
-		out->map_size  = 0;
-		return true;
-	}
-
-	bool ReleaseReservedHostAllocationForMap(uint64_t vaddr, uint64_t size,
-	                                         ReleasedReservedHostAllocation* out,
-	                                         FailureReason*                  failure_reason) const {
-		if (!QueryReservedHostAllocation(vaddr, out, failure_reason)) {
-			return false;
-		}
-
-		const auto allocation_end = out->base + out->size;
-		if (vaddr < out->base || vaddr + size > allocation_end) {
-			SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
-			return false;
-		}
-		if (out->base == vaddr && out->size == size) {
-			return false;
-		}
-		if (!IsGranularityAligned(size)) {
-			SetFailure(failure_reason, FailureReason::ReservedContainerSplitNotGranularityAligned);
-			return false;
-		}
-		if (VirtualFree(reinterpret_cast<void*>(out->base), 0, MEM_RELEASE) == 0) {
-			SetFailure(failure_reason, FailureReason::ReservedContainerReleaseFailed);
-			return false;
-		}
-
-		out->map_start = vaddr;
-		out->map_size  = size;
-		return true;
-	}
-
-	bool ReleaseReservedHostAllocationsForMap(uint64_t vaddr, uint64_t size,
-	                                          std::vector<ReleasedReservedHostAllocation>* out,
-	                                          FailureReason* failure_reason) const {
-		EXIT_IF(out == nullptr);
-
-		out->clear();
-		if (size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
-			SetFailure(failure_reason, FailureReason::ReservedContainerSplitNotGranularityAligned);
-			return false;
-		}
-
-		const auto target_end = vaddr + size;
-		auto       current    = vaddr;
-		while (current < target_end) {
-			ReleasedReservedHostAllocation released {};
-			if (!QueryReservedHostAllocation(current, &released, failure_reason)) {
-				out->clear();
-				return false;
-			}
-
-			const auto map_start = std::max(vaddr, released.base);
-			const auto map_end   = std::min(target_end, released.base + released.size);
-			if (map_start >= map_end || !IsPageAligned(map_start) ||
-			    !IsPageAligned(map_end - map_start)) {
-				SetFailure(failure_reason,
-				           FailureReason::ReservedContainerSplitNotGranularityAligned);
-				out->clear();
-				return false;
-			}
-
-			released.map_start = map_start;
-			released.map_size  = map_end - map_start;
-			out->push_back(released);
-			current = map_end;
-		}
-
-		for (size_t i = 0; i < out->size(); i++) {
-			const auto& released = (*out)[i];
-			if (VirtualFree(reinterpret_cast<void*>(released.base), 0, MEM_RELEASE) == 0) {
-				for (size_t restore_index = 0; restore_index < i; restore_index++) {
-					RestoreReleasedReservedHostAllocation((*out)[restore_index]);
-				}
-				SetFailure(failure_reason, FailureReason::ReservedContainerReleaseFailed);
-				out->clear();
-				return false;
-			}
-		}
-
-		return !out->empty();
-	}
-
-	void* MapPlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
-	                         VirtualMemory::Mode mode, FailureReason* failure_reason) {
-		void* placeholder =
-		    VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
-		if (placeholder == nullptr || reinterpret_cast<uint64_t>(placeholder) != vaddr) {
-			if (placeholder != nullptr) {
-				VirtualFree(placeholder, 0, MEM_RELEASE);
-			}
-			SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
-			return nullptr;
-		}
-
-		auto* ptr = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
-		if (ptr == nullptr) {
-			VirtualFree(reinterpret_cast<void*>(vaddr), 0, MEM_RELEASE);
-			return nullptr;
-		}
-		return ptr;
-	}
-
-	void* MapView(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
-	              FailureReason* failure_reason) {
-		constexpr DWORD access = FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_EXECUTE;
-		void* ptr = MapViewOfFileEx(m_handle, access, static_cast<DWORD>(backing_offset >> 32u),
-		                            static_cast<DWORD>(backing_offset & 0xffffffffu), size,
-		                            reinterpret_cast<void*>(vaddr));
-		if (ptr == nullptr) {
-			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
-			ptr = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
-			if (ptr != nullptr) {
-				return ptr;
-			}
-			return MapPlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
-		}
-
-		if (!ApplyProtection(ptr, size, mode)) {
-			UnmapViewOfFile(ptr);
-			SetFailure(failure_reason, FailureReason::ProtectFailed);
-			return nullptr;
-		}
-		return ptr;
-	}
-
-	static bool UnmapView(void* vaddr, uint64_t /*size*/) { return UnmapViewOfFile(vaddr) != 0; }
 
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t /*size*/) {
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
-	HANDLE   m_handle      = nullptr;
-	uint64_t m_granularity = 0x10000;
+	HANDLE m_handle = nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 
@@ -1070,21 +576,11 @@ private:
 		return ptr;
 	}
 
-	static bool UnmapView(void* vaddr, uint64_t size) {
-#if defined(__APPLE__)
-		// Re-reserve instead of freeing: the guest may MAP_FIXED-remap this range
-		// later, and that must never destroy a host mapping (dyld, Rosetta, Metal)
-		// that moved into the hole in the meantime.
-		return mmap(vaddr, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE,
-		            -1, 0) != MAP_FAILED;
-#else
-		return munmap(vaddr, size) == 0;
-#endif
-	}
-
-	// POSIX has no placeholder equivalent.
+	// Replace the file view atomically instead of exposing an unmapped hole in the
+	// process-lifetime guest reservation.
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
-		return munmap(vaddr, size) == 0;
+		void* ptr = mmap(vaddr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+		return ptr != MAP_FAILED && ptr == vaddr;
 	}
 
 	int m_fd = -1;
@@ -1096,224 +592,303 @@ private:
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
-class PlaceholderAddressSpace {
+class GuestAddressSpace {
 public:
-	PlaceholderAddressSpace() {
+	explicit GuestAddressSpace(uint64_t backing_size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		SYSTEM_INFO info {};
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
+		ReserveGuestRegions();
+		m_backing = new GuestBackingStore(backing_size);
+		EXIT_IF(!m_backing->IsAvailable());
 	}
 
-	KYTY_CLASS_NO_COPY(PlaceholderAddressSpace);
+	~GuestAddressSpace() {
+		delete m_backing;
+		m_backing = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (const auto& [start, size]: m_owned) {
+			const auto end     = start + size;
+			auto       current = start;
+			while (current < end) {
+				MEMORY_BASIC_INFORMATION info {};
+				EXIT_IF(VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) ==
+				        0);
+				const auto region_start = reinterpret_cast<uint64_t>(info.BaseAddress);
+				const auto region_end   = region_start + static_cast<uint64_t>(info.RegionSize);
+				if (info.State == MEM_COMMIT) {
+					EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_start), info.RegionSize,
+					                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
+					continue;
+				}
+				if (info.State == MEM_RESERVE) {
+					EXIT_IF(VirtualFree(info.AllocationBase, 0, MEM_RELEASE) == 0);
+				}
+				current = region_end;
+			}
+		}
+#else
+		for (const auto& [start, size]: m_owned) {
+			munmap(reinterpret_cast<void*>(start), size);
+		}
+#endif
+	}
+
+	KYTY_CLASS_NO_COPY(GuestAddressSpace);
 
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
+	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
+	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
 
-	uint64_t ReserveAligned(uint64_t search_addr, uint64_t size, uint64_t alignment) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (size == 0) {
-			return 0;
-		}
-		alignment = std::max<uint64_t>(alignment != 0 ? alignment : 0x4000, m_granularity);
-
-		MEM_ADDRESS_REQUIREMENTS req {};
-		MEM_EXTENDED_PARAMETER   param {};
-		req.LowestStartingAddress = reinterpret_cast<void*>(
-		    AlignUp(search_addr != 0 ? search_addr : HOST_SYSTEM_MANAGED_MIN, alignment));
-		req.HighestEndingAddress =
-		    reinterpret_cast<void*>(search_addr != 0 ? HOST_USER_MAX : HOST_SYSTEM_MANAGED_MAX);
-		req.Alignment = alignment;
-		param.Type    = MemExtendedParameterAddressRequirements;
-		param.Pointer = &req;
-
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), nullptr, size,
-		                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &param, 1);
-		if (ptr == nullptr && search_addr == 0) {
-			req.LowestStartingAddress = reinterpret_cast<void*>(HOST_USER_MIN);
-			req.HighestEndingAddress  = reinterpret_cast<void*>(HOST_USER_MAX);
-			ptr = VirtualAlloc2(GetCurrentProcess(), nullptr, size,
-			                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &param, 1);
-		}
-		if (ptr == nullptr) {
-			return 0;
-		}
-
-		const auto addr = reinterpret_cast<uint64_t>(ptr);
-		AddFree(addr, size);
-		return addr;
-#else
-		auto addr = VirtualMemory::ReserveAligned(search_addr, size, alignment);
-		return addr;
-#endif
+	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
+		return m_backing->ZeroRange(backing_offset, size);
 	}
 
-	bool ReserveFixed(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
+	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		{
-			std::lock_guard lock(m_mutex);
-			if (FindContaining(vaddr, size) != m_free.end()) {
-				return true;
+		std::lock_guard lock(m_mutex);
+		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
+			return vaddr >= range.first && vaddr + size <= range.first + range.second;
+		});
+	}
+
+	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
+			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
+		});
+	}
+
+	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		return m_backing->TryWriteBacking(vaddr, data, size);
+	}
+
+	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+
+	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		return ProtectMappedUnlocked(vaddr, size, mode);
+	}
+
+	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+
+		std::lock_guard lock(m_mutex);
+		return ProtectMappedUnlocked(vaddr, size, mode);
+	}
+
+	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+	                VirtualMemory::Mode               mode,
+	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+		std::lock_guard lock(m_mutex);
+		if (!ConsumeUnlocked(vaddr, size)) {
+			if (failure_reason != nullptr) {
+				*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 			}
-		}
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
-			if (ptr != nullptr) {
-				VirtualFree(ptr, 0, MEM_RELEASE);
-			}
 			return false;
 		}
-		AddFree(vaddr, size);
-		return true;
-#else
-		return VirtualMemory::ReserveFixed(vaddr, size);
-#endif
-	}
-
-	bool Consume(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		std::lock_guard lock(m_mutex);
-		auto            it = FindContaining(vaddr, size);
-		if (it == m_free.end()) {
-			return false;
-		}
-		if (!SplitUnlocked(it, vaddr, size)) {
-			return false;
-		}
-		it = m_free.find(vaddr);
-		if (it == m_free.end() || it->second != size) {
-			return false;
-		}
-		m_free.erase(it);
-		return true;
-#else
-		return false;
-#endif
-	}
-
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
-#else
-		return false;
-#endif
-	}
-#endif
-
-	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		std::lock_guard lock(m_mutex);
-		auto            it = FindContaining(vaddr, size);
-		if (it == m_free.end() || !SplitUnlocked(it, vaddr, size)) {
-			return false;
-		}
-		it = m_free.find(vaddr);
-		if (it == m_free.end() || it->second != size) {
-			return false;
-		}
-		m_free.erase(it);
-		if (VirtualFree(reinterpret_cast<void*>(vaddr), 0, MEM_RELEASE) != 0) {
+		const auto host_mode = VirtualMemory::IsExecute(mode)
+		                           ? VirtualMemory::Mode::ExecuteReadWrite
+		                           : VirtualMemory::Mode::ReadWrite;
+		if (m_backing->MapExistingPlaceholderFixed(vaddr, size, backing_offset, host_mode,
+		                                           failure_reason)) {
+			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			return true;
 		}
 		AddFreeUnlocked(vaddr, size);
 		return false;
-#else
-		return VirtualMemory::FreeRange(vaddr, size);
+	}
+
+	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
+			return false;
+		}
+		bool placeholder_preserved = false;
+		if (!m_backing->Unmap(vaddr, size, &placeholder_preserved)) {
+			return false;
+		}
+		if (!placeholder_preserved) {
+			return false;
+		}
+		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
+		AddFreeUnlocked(vaddr, size);
+		return true;
+	}
+
+	uint64_t ReserveAligned(uint64_t search_addr, uint64_t size, uint64_t alignment) {
+		if (size == 0) {
+			return 0;
+		}
+		alignment = std::max<uint64_t>(alignment != 0 ? alignment : PageSize(), PageSize());
+		std::lock_guard lock(m_mutex);
+		if (search_addr == 0) {
+			auto addr = FindFreeAlignedUnlocked(HOST_SYSTEM_MANAGED_MIN,
+			                                    HOST_SYSTEM_MANAGED_MAX + 1u, size, alignment);
+			return addr != 0 ? addr
+			                 : FindFreeAlignedUnlocked(HOST_USER_MIN, HOST_USER_MAX + 1u, size,
+			                                           alignment);
+		}
+		return FindFreeAlignedUnlocked(search_addr, HOST_USER_MAX + 1u, size, alignment);
+	}
+
+	uint64_t FindFreeAligned(uint64_t search_start, uint64_t search_end, uint64_t size,
+	                         uint64_t alignment) {
+		if (size == 0 || alignment == 0) {
+			return 0;
+		}
+		alignment = std::max<uint64_t>(alignment, PageSize());
+		std::lock_guard lock(m_mutex);
+		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
+	}
+
+	bool ReserveFixed(uint64_t vaddr, uint64_t size) {
+		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		return FindContaining(vaddr, size) != m_free.end();
+	}
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	bool TestContainsFree(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		return FindContaining(vaddr, size) != m_free.end();
+	}
 #endif
+
+	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (!Consume(vaddr, size)) {
+		std::lock_guard lock(m_mutex);
+		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
+		const auto host_mode = VirtualMemory::IsExecute(mode)
+		                           ? VirtualMemory::Mode::ExecuteReadWrite
+		                           : VirtualMemory::Mode::ReadWrite;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
 		                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-		                          GetProtect(mode), nullptr, 0);
+		                          GetProtect(host_mode), nullptr, 0);
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
 				VirtualFree(ptr, 0, MEM_RELEASE);
 			}
-			AddFree(vaddr, size);
+			AddFreeUnlocked(vaddr, size);
 			return false;
 		}
+		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
 		return true;
 #else
+		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
+			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+			return true;
+		}
+		AddFreeUnlocked(vaddr, size);
 		return false;
 #endif
 	}
 
 	bool ReleaseCommitted(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		if (VirtualFree(reinterpret_cast<void*>(vaddr), size,
-		                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+		std::lock_guard lock(m_mutex);
+		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
-		AddFree(vaddr, size);
-		return true;
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		std::vector<std::pair<uint64_t, uint64_t>> regions;
+		while (current < end) {
+			const auto it       = FindMappedContainingUnlocked(current);
+			const auto part_end = std::min(end, it->second.vaddr + it->second.size);
+			regions.emplace_back(current, part_end - current);
+			current = part_end;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (const auto& [region_vaddr, region_size]: regions) {
+			EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_vaddr), region_size,
+			                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
+		}
 #else
-		return false;
+		for (const auto& [region_vaddr, region_size]: regions) {
+			RestorePlaceholder(region_vaddr, region_size);
+		}
 #endif
+		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
+		AddFreeUnlocked(vaddr, size);
+		return true;
 	}
 
 	bool SelfTest() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const auto addr = ReserveAligned(0, m_granularity, m_granularity);
+		const auto addr = ReserveAligned(0, PageSize(), PageSize());
 		if (addr == 0) {
-			LOGF_COLOR(Log::Color::Yellow,
-			           "\t placeholder address-space self-test skipped: reserve unavailable\n");
+			LOGF_COLOR(Log::Color::Red,
+			           "\t guest address-space self-test: 16 KiB range unavailable\n");
 			return false;
 		}
-		if (!Commit(addr, m_granularity, VirtualMemory::Mode::ReadWrite)) {
-			ReleaseFree(addr, m_granularity);
-			LOGF_COLOR(Log::Color::Red, "\t placeholder address-space self-test: commit failed\n");
+		if (!Commit(addr, PageSize(), VirtualMemory::Mode::ReadWrite)) {
+			LOGF_COLOR(Log::Color::Red, "\t guest address-space self-test: commit failed\n");
 			return false;
 		}
 
 		auto* ptr = reinterpret_cast<uint64_t*>(addr);
 		*ptr      = 0x4b59545950484f4cull; // "KYTYPHOL"
 
-		if (!ReleaseCommitted(addr, m_granularity)) {
-			VirtualFree(reinterpret_cast<void*>(addr), 0, MEM_RELEASE);
+		if (!ReleaseCommitted(addr, PageSize())) {
 			LOGF_COLOR(Log::Color::Red,
-			           "\t placeholder address-space self-test: release-committed failed\n");
+			           "\t guest address-space self-test: release-committed failed\n");
 			return false;
 		}
 
-		const bool ok = ReleaseFree(addr, m_granularity);
-		LOGF_COLOR(ok ? Log::Color::Green : Log::Color::Red,
-		           "\t placeholder address-space self-test: %s\n",
-		           ok ? "ok" : "release-free failed");
-		return ok;
-#else
-		LOGF_COLOR(Log::Color::Yellow, "\t placeholder address-space self-test skipped\n");
-		return false;
-#endif
-	}
-
-	void AddFree(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		std::lock_guard lock(m_mutex);
-		AddFreeUnlocked(vaddr, size);
-#endif
+		LOGF_COLOR(Log::Color::Green, "\t guest address-space self-test: ok\n");
+		return true;
 	}
 
 private:
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	enum class MappingType { Backing, Private };
+
+	struct MappedRegion {
+		uint64_t    vaddr = 0;
+		uint64_t    size  = 0;
+		MappingType type  = MappingType::Private;
+	};
+
 	static constexpr uint64_t PageSize() { return 0x4000; }
 
 	static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
-		return (value + alignment - 1u) & ~(alignment - 1u);
+		if (alignment == 0) {
+			return 0;
+		}
+		const auto remainder = value % alignment;
+		const auto increment = (remainder != 0 ? alignment - remainder : 0);
+		return increment <= UINT64_MAX - value ? value + increment : 0;
+	}
+
+	static uint64_t AlignDown(uint64_t value, uint64_t alignment) {
+		return value & ~(alignment - 1u);
 	}
 
 	[[nodiscard]] static bool IsPageAligned(uint64_t value) {
@@ -1324,6 +899,105 @@ private:
 		return (value & (m_granularity - 1u)) == 0;
 	}
 
+	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		const auto end = vaddr + size;
+		auto       it  = m_mapped.upper_bound(vaddr);
+		if (it != m_mapped.begin()) {
+			--it;
+		}
+		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+			const auto& region      = it->second;
+			const auto  range_start = std::max(vaddr, region.vaddr);
+			const auto  range_end   = std::min(end, region.vaddr + region.size);
+			if (range_start < range_end &&
+			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
+		auto it = FindContaining(vaddr, size);
+		if (it == m_free.end() || !SplitUnlocked(it, vaddr, size)) {
+			return false;
+		}
+		it = m_free.find(vaddr);
+		if (it == m_free.end() || it->second != size) {
+			return false;
+		}
+		m_free.erase(it);
+		return true;
+	}
+
+	std::map<uint64_t, MappedRegion>::iterator FindMappedContainingUnlocked(uint64_t vaddr) {
+		auto next = m_mapped.upper_bound(vaddr);
+		if (next == m_mapped.begin()) {
+			return m_mapped.end();
+		}
+		auto it = std::prev(next);
+		return vaddr < it->second.vaddr + it->second.size ? it : m_mapped.end();
+	}
+
+	bool ContainsMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		while (current < end) {
+			const auto it = FindMappedContainingUnlocked(current);
+			if (it == m_mapped.end() || it->second.type != type) {
+				return false;
+			}
+			current = std::min(end, it->second.vaddr + it->second.size);
+		}
+		return true;
+	}
+
+	bool AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		const auto end  = vaddr + size;
+		auto       next = m_mapped.lower_bound(vaddr);
+		if (next != m_mapped.end() && next->second.vaddr < end) {
+			return false;
+		}
+		if (next != m_mapped.begin()) {
+			const auto& previous = std::prev(next)->second;
+			if (previous.vaddr + previous.size > vaddr) {
+				return false;
+			}
+		}
+		return m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type}).second;
+	}
+
+	bool RemoveMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
+		if (!ContainsMappedUnlocked(vaddr, size, type)) {
+			return false;
+		}
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		while (current < end) {
+			auto       it       = FindMappedContainingUnlocked(current);
+			const auto original = it->second;
+			const auto part_end = std::min(end, original.vaddr + original.size);
+			m_mapped.erase(it);
+			if (original.vaddr < current) {
+				const auto left_size = current - original.vaddr;
+				EXIT_IF(!AddMappedUnlocked(original.vaddr, left_size, original.type));
+			}
+			if (part_end < original.vaddr + original.size) {
+				const auto right_size = original.vaddr + original.size - part_end;
+				EXIT_IF(!AddMappedUnlocked(part_end, right_size, original.type));
+			}
+			current = part_end;
+		}
+		return true;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static DWORD GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PAGE_READONLY;
@@ -1336,6 +1010,89 @@ private:
 			case VirtualMemory::Mode::NoAccess:
 			default: return PAGE_NOACCESS;
 		}
+	}
+#endif
+
+	void ReserveGuestRegions() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		constexpr uint64_t MinimumRegionSize = 0x1000000;
+		const auto         process           = GetCurrentProcess();
+		const auto         guest_end         = HOST_USER_MAX + 1u;
+		auto               next_addr         = HOST_SYSTEM_MANAGED_MIN;
+
+		while (next_addr < guest_end) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) == 0) {
+				EXIT("failed to inspect guest address space at 0x%016" PRIx64 "\n", next_addr);
+			}
+
+			const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+			const auto region_end =
+			    std::min<uint64_t>(guest_end, region_base + static_cast<uint64_t>(info.RegionSize));
+			const auto reserve_start =
+			    AlignUp(std::max<uint64_t>(region_base, HOST_SYSTEM_MANAGED_MIN), m_granularity);
+			const auto reserve_end = AlignDown(region_end, m_granularity);
+
+			if (info.State == MEM_FREE && reserve_end > reserve_start &&
+			    reserve_end - reserve_start > MinimumRegionSize) {
+				auto* ptr = VirtualAlloc2(
+				    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
+				    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+				if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+					EXIT("failed to reserve guest address space at 0x%016" PRIx64
+					     ", size 0x%016" PRIx64 "\n",
+					     reserve_start, reserve_end - reserve_start);
+				}
+				AddFreeUnlocked(reserve_start, reserve_end - reserve_start);
+				m_owned.emplace_back(reserve_start, reserve_end - reserve_start);
+			}
+
+			if (region_end <= next_addr) {
+				EXIT("guest address-space scan did not advance at 0x%016" PRIx64 "\n", next_addr);
+			}
+			next_addr = region_end;
+		}
+#else
+		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
+		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u},
+		    {HOST_SYSTEM_RESERVED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
+		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
+		}};
+		for (const auto& [start, end]: regions) {
+			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+			flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
+			flags |= MAP_FIXED_NOREPLACE;
+#endif
+			void* ptr = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE, flags, -1, 0);
+			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
+				if (ptr != MAP_FAILED) {
+					munmap(ptr, end - start);
+				}
+				EXIT("failed to reserve guest address space at 0x%016" PRIx64 ", size 0x%016" PRIx64
+				     "\n",
+				     start, end - start);
+			}
+			AddFreeUnlocked(start, end - start);
+			m_owned.emplace_back(start, end - start);
+		}
+#endif
+	}
+
+	uint64_t FindFreeAlignedUnlocked(uint64_t search_start, uint64_t search_end, uint64_t size,
+	                                 uint64_t alignment) {
+		if (search_start >= search_end || size > search_end - search_start) {
+			return 0;
+		}
+		for (const auto& [base, range_size]: m_free) {
+			const auto candidate = AlignUp(std::max(base, search_start), alignment);
+			if (candidate < search_end && size <= search_end - candidate &&
+			    GuestFreeRangeContains(base, range_size, candidate, size)) {
+				return candidate;
+			}
+		}
+		return 0;
 	}
 
 	std::map<uint64_t, uint64_t>::iterator FindContaining(uint64_t vaddr, uint64_t size) {
@@ -1357,19 +1114,34 @@ private:
 
 		if (base != vaddr) {
 			const auto left_size = vaddr - base;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (VirtualFree(reinterpret_cast<void*>(base), left_size,
 			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t guest placeholder split failed: base=0x%016" PRIx64
+				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
+				           " request_size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
+				           base, end - base, vaddr, size, static_cast<uint32_t>(GetLastError()));
 				return false;
 			}
+#endif
 			it->second = left_size;
 			it         = m_free.emplace(vaddr, end - vaddr).first;
 		}
 
 		if (it->second != size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (VirtualFree(reinterpret_cast<void*>(it->first), size,
 			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t guest placeholder split failed: base=0x%016" PRIx64
+				           " size=0x%016" PRIx64 " requested=0x%016" PRIx64
+				           " request_size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
+				           it->first, it->second, vaddr, size,
+				           static_cast<uint32_t>(GetLastError()));
 				return false;
 			}
+#endif
 			const auto right_start = it->first + size;
 			const auto right_size  = it->second - size;
 			it->second             = size;
@@ -1408,16 +1180,36 @@ private:
 		}
 
 		if (base != it->first || end != it->first + it->second) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (VirtualFree(reinterpret_cast<void*>(base), end - base,
 			                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0) {
 				m_free.erase(first, last);
 				m_free.emplace(base, end - base);
 			}
+#else
+			m_free.erase(first, last);
+			m_free.emplace(base, end - base);
+#endif
 		}
 	}
 
-	std::mutex                   m_mutex;
-	std::map<uint64_t, uint64_t> m_free;
+	void RestorePlaceholder(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		// The address remains owned for the process lifetime; MAP_FIXED only replaces one of our
+		// mappings and never acquires a new guest address.
+		void* ptr = mmap(reinterpret_cast<void*>(vaddr), size, PROT_NONE,
+		                 MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+		EXIT_IF(ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != vaddr);
+#else
+		(void)vaddr;
+		(void)size;
 #endif
-	uint64_t m_granularity = 0x10000;
+	}
+
+	std::mutex                                 m_mutex;
+	std::map<uint64_t, uint64_t>               m_free;
+	std::map<uint64_t, MappedRegion>            m_mapped;
+	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
+	uint64_t                                   m_granularity = 0x10000;
+	GuestBackingStore*                         m_backing     = nullptr;
 };

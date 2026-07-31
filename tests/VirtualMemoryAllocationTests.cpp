@@ -1,15 +1,21 @@
 #include "common/commonSubsystem.h"
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 namespace {
@@ -18,11 +24,16 @@ using Libs::LibKernel::Memory::VirtualQueryInfo;
 
 // Prospero ABI?
 constexpr uint64_t SceKernelPageSize             = 0x4000;
+constexpr uint64_t SceKernelTotalPhysicalSize    = 13824ull * 1024ull * 1024ull;
+constexpr uint64_t TestFlexibleMemorySize        = 3072ull * 1024ull * 1024ull;
 constexpr int      SceKernelProtCpuRead          = 0x01;
 constexpr int      SceKernelProtCpuRw            = 0x02;
+constexpr int      SceKernelProtCpuExec          = 0x04;
 constexpr int      SceKernelMapFixed             = 0x10;
 constexpr int      SceKernelMapNoOverwrite       = 0x80;
+constexpr int      SceKernelMapDmemCompat        = 0x400;
 constexpr int      SceKernelMapNoCoalesce        = 0x400000;
+constexpr int      SceKernelMapAligned64Kb       = 16 << 24;
 constexpr int      SceKernelVqFindNext           = 1;
 constexpr int      SceKernelMtypeC               = 11;
 constexpr uint64_t SceKernelDirectMemoryStart    = 0;
@@ -94,6 +105,29 @@ void InitSubsystems() {
 	Config::Load(options);
 
 	slist->Add(log, {core, config});
+	Check("InitSubsystems", slist->InitAll(false), "failed to initialize logging subsystem");
+
+	const auto param_json =
+	    std::filesystem::temp_directory_path() /
+	    ("kyty_virtual_memory_" +
+	     std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
+	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
+	Common::File  param_file;
+	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
+	uint32_t bytes_written = 0;
+	param_file.Write(json, sizeof(json) - 1, &bytes_written);
+	param_file.Close();
+	Check("InitSubsystems", bytes_written == sizeof(json) - 1,
+	      "failed to write temporary param.json");
+
+	Loader::SystemContentLoadParamSfo(param_json);
+	const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
+	Check("InitSubsystems", Common::File::DeleteFile(param_json),
+	      "failed to remove temporary param.json");
+	Check("InitSubsystems", flexible_memory_size == TestFlexibleMemorySize,
+	      "failed to read flexible memory size from param.json");
+	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
+
 	slist->Add(memory, {core, log, thread});
 	Check("InitSubsystems", slist->InitAll(false), "failed to initialize memory subsystem");
 
@@ -128,6 +162,13 @@ size_t AvailableFlexibleMemory(const char* test) {
 	size_t    size = 0;
 	const int ret  = Libs::LibKernel::Memory::KernelAvailableFlexibleMemorySize(&size);
 	CheckOk(test, ret, "KernelAvailableFlexibleMemorySize");
+	return size;
+}
+
+size_t ConfiguredFlexibleMemory(const char* test) {
+	size_t size = 0;
+	CheckOk(test, Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&size),
+	        "KernelConfiguredFlexibleMemorySize");
 	return size;
 }
 
@@ -186,6 +227,387 @@ void TestProsperoArgumentAndInfoSizeContracts() {
 	            "KernelVirtualQuery(short info)");
 	CheckFailed(test, Libs::LibKernel::Memory::KernelVirtualQuery(nullptr, 2, &info, sizeof(info)),
 	            "KernelVirtualQuery(unknown flags)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
+	const char* test = "GuestAddressSpaceOwnsReservationsBeforeBacking";
+	void*       addr = nullptr;
+
+	Check(test, Libs::LibKernel::Memory::TestGuestBackingOutsideAddressSpace(),
+	      "boot-time shared backing alias overlaps an owned guest interval");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&addr, SceKernelPageSize, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize),
+	      "guest reservation was allocated outside the early owner");
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize),
+	      "semantic reservation replaced the owner's placeholder");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	          base, SceKernelPageSize, Common::VirtualMemory::Mode::NoAccess),
+	      "owner rejected a sparse placeholder protection no-op");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize),
+	      "released semantic reservation escaped owner control");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestAddressSpaceHasNoFixedFallback() {
+	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
+	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
+	void*       addr            = unowned_address;
+
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	                &addr, SceKernelPageSize, SceKernelMapFixed | SceKernelMapNoOverwrite,
+	                SceKernelPageSize),
+	            "KernelReserveVirtualRange(unowned fixed address)");
+	Check(test, reinterpret_cast<uint64_t>(addr) == 0x10000,
+	      "failed fixed reservation unexpectedly moved");
+
+	addr = unowned_address;
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	                &addr, SceKernelPageSize, SceKernelProtCpuRw,
+	                SceKernelMapFixed | SceKernelMapNoOverwrite, "unowned_flexible"),
+	            "KernelMapNamedFlexibleMemory(unowned fixed address)");
+
+	int64_t phys_addr = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
+	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	addr = unowned_address;
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	                &addr, SceKernelPageSize, SceKernelProtCpuRw,
+	                SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr, SceKernelPageSize,
+	                "unowned_direct"),
+	            "KernelMapNamedDirectMemory(unowned fixed address)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelCheckedReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestFreeRangeSearchDoesNotUnderflow() {
+	const char* test = "GuestFreeRangeSearchDoesNotUnderflow";
+
+	Check(test, Libs::LibKernel::Memory::TestGuestFreeRangeBounds(),
+	      "free-range containment accepted a candidate beyond the range end");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleMemoryCapacityIsBootFixed() {
+	const char* test       = "FlexibleMemoryCapacityIsBootFixed";
+	const auto  configured = ConfiguredFlexibleMemory(test);
+	const auto  baseline   = AvailableFlexibleMemory(test);
+	const auto  backing    = Libs::LibKernel::Memory::TestGuestBackingSize();
+
+	Check(test, configured == TestFlexibleMemorySize,
+	      "boot flexible pool did not use the param.json value");
+	Check(test, configured == baseline, "boot flexible pool did not start at configured capacity");
+	Check(test, backing == SceKernelTotalPhysicalSize,
+	      "boot backing is not the single 13.5 GiB physical file");
+	Check(test, backing == Libs::LibKernel::Memory::KernelGetDirectMemorySize() + configured,
+	      "direct and flexible regions do not partition the boot backing");
+
+	const auto address =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "boot_fixed_flexible");
+	Check(test, ConfiguredFlexibleMemory(test) == configured,
+	      "configured flexible capacity changed after allocation");
+	Check(test, Libs::LibKernel::Memory::TestGuestBackingSize() == backing,
+	      "shared backing size changed after allocation");
+	Check(test, AvailableFlexibleMemory(test) == baseline - SceKernelPageSize,
+	      "flexible allocation did not consume the boot-time pool");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(address, SceKernelPageSize),
+	        "KernelMunmap");
+	Check(test, ConfiguredFlexibleMemory(test) == configured,
+	      "configured flexible capacity changed after release");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "flexible release did not restore the boot-time pool");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleMemoryUsesSharedBacking() {
+	const char* test     = "FlexibleMemoryUsesSharedBacking";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	void*       address  = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &address, SceKernelPageSize * 2, SceKernelProtCpuRw, 0, "shared_flexible"),
+	        "KernelMapNamedFlexibleMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 2),
+	      "flexible mapping escaped the guest owner");
+
+	constexpr uint64_t first_value     = 0x464c45584241434bull; // "FLEXBACK"
+	constexpr uint64_t second_value    = 0x534841524544464cull; // "SHAREDFL"
+	*reinterpret_cast<uint64_t*>(base) = first_value;
+	uint64_t value                     = 0;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)),
+	      "TryReadBacking did not resolve flexible memory");
+	Check(test, value == first_value, "backing did not observe a flexible-memory CPU write");
+	Check(test,
+	      Libs::LibKernel::Memory::TryWriteBacking(base + SceKernelPageSize, &second_value,
+	                                               sizeof(second_value)),
+	      "TryWriteBacking did not resolve flexible memory");
+	Check(test, *reinterpret_cast<uint64_t*>(base + SceKernelPageSize) == second_value,
+	      "flexible-memory view did not observe a backing write");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "flexible backing offsets were not returned to the boot-time pool");
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)),
+	      "unmapped flexible memory remained registered in the backing owner");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleDmemCompatAndAlignmentFlags() {
+	const char* test     = "FlexibleDmemCompatAndAlignmentFlags";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	void*       address  = nullptr;
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &address, SceKernelPageSize, SceKernelProtCpuRw,
+	            SceKernelMapDmemCompat | SceKernelMapAligned64Kb, "dmem_compat"),
+	        "KernelMapNamedFlexibleMemory(DMEM_COMPAT|ALIGNED_64KB)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	Check(test, (base & (0x10000 - 1u)) == 0, "SDK alignment flag was not honored");
+	const auto info = Query(test, base);
+	Check(test, info.is_flexible == 1 && info.is_stack == 0,
+	      "SCE_KERNEL_MAP_DMEM_COMPAT was misclassified as MAP_STACK");
+	Check(test, AvailableFlexibleMemory(test) + SceKernelPageSize == baseline,
+	      "DMEM_COMPAT mapping did not consume boot-time flexible backing");
+
+	void* stack_start = reinterpret_cast<void*>(UINT64_MAX);
+	void* stack_end   = reinterpret_cast<void*>(UINT64_MAX);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelIsStack(reinterpret_cast<void*>(base), &stack_start,
+	                                               &stack_end),
+	        "KernelIsStack");
+	Check(test, stack_start == nullptr && stack_end == nullptr,
+	      "DMEM_COMPAT flexible mapping was reported as a stack");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "DMEM_COMPAT cleanup did not restore flexible capacity");
+
+	void* opaque = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &opaque, SceKernelPageSize, SceKernelProtCpuRw, 0x8000, "opaque_runtime_flag"),
+	        "KernelMapNamedFlexibleMemory(opaque runtime flag)");
+	Check(test, AvailableFlexibleMemory(test) + SceKernelPageSize == baseline,
+	      "opaque runtime flag mapping did not consume boot-time flexible backing");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(opaque),
+	                                              SceKernelPageSize),
+	        "KernelMunmap(opaque runtime flag)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "opaque runtime flag cleanup did not restore flexible capacity");
+
+	void* invalid_flag = nullptr;
+	CheckFailed(
+	    test,
+	    Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	        &invalid_flag, SceKernelPageSize, SceKernelProtCpuRw, 0x10000, "unsupported_flag"),
+	    "KernelMapNamedFlexibleMemory(unsupported flag)");
+
+	void* invalid_alignment = nullptr;
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	                &invalid_alignment, SceKernelPageSize, SceKernelProtCpuRw, 13 << 24,
+	                "invalid_alignment"),
+	            "KernelMapNamedFlexibleMemory(invalid alignment)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleNoCoalescePreservesBoundaries() {
+	const char* test     = "FlexibleNoCoalescePreservesBoundaries";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	void*       reserve  = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &reserve, SceKernelPageSize * 2, 0, SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+
+	void* left = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &left, SceKernelPageSize, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoCoalesce, "no_coalesce"),
+	        "KernelMapNamedFlexibleMemory(left)");
+	void* right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoCoalesce, "no_coalesce"),
+	        "KernelMapNamedFlexibleMemory(right)");
+
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 1, 0,
+	            0, 1, "no_coalesce");
+	ExpectRange(test, Query(test, base + SceKernelPageSize), base + SceKernelPageSize,
+	            base + SceKernelPageSize * 2, SceKernelProtCpuRw, 1, 0, 0, 1, "no_coalesce");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "NO_COALESCE cleanup did not restore flexible capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleMemoryReuseIsZeroFilled() {
+	const char* test     = "FlexibleMemoryReuseIsZeroFilled";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	const auto  first =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "flexible_zero_source");
+	std::memset(reinterpret_cast<void*>(first), 0xa5, SceKernelPageSize);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(first, SceKernelPageSize),
+	        "KernelMunmap(source)");
+
+	const auto reused =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "flexible_zero_reuse");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(reused);
+	Check(test,
+	      std::all_of(bytes, bytes + SceKernelPageSize, [](uint8_t value) { return value == 0; }),
+	      "reused flexible backing exposed stale bytes");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(reused, SceKernelPageSize),
+	        "KernelMunmap(reuse)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "zero-fill test leaked flexible backing capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
+	const char* test     = "GuestStackUsesPrivateOwnerMemoryAndCache";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	uint64_t    first    = 0;
+	uint64_t    second   = 0;
+	uint64_t    map_size = 0;
+
+	Check(test, Libs::LibKernel::TestGuestStackOwnerLifecycle(&first, &second, &map_size),
+	      "guest stack owner lifecycle failed");
+	Check(test, first != 0 && first == second, "guest stack cache did not reuse its owner mapping");
+	Check(test, map_size != 0 && (map_size & (SceKernelPageSize - 1u)) == 0,
+	      "guest stack mapping is not 16 KiB aligned");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "private guest stack changed flexible backing capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
+	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
+
+	Check(test, Loader::TestMainEntryUsesGuestStack(),
+	      "main-entry stack switch did not preserve the guest/host stack invariants");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFragmentedBackingUnmapRollback() {
+	const char* test     = "FragmentedBackingUnmapRollback";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	const auto  left =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_hole_left");
+	const auto blocker =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_blocker");
+	const auto right =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_hole_right");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(left, SceKernelPageSize),
+	        "KernelMunmap(left hole)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(right, SceKernelPageSize),
+	        "KernelMunmap(right hole)");
+
+	const auto fragmented =
+	    MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw, "fragmented_backing");
+	auto* first_word = reinterpret_cast<uint64_t*>(fragmented);
+	auto* last_word =
+	    reinterpret_cast<uint64_t*>(fragmented + SceKernelPageSize * 2 - sizeof(uint64_t));
+	*first_word = 0x465241474c454654ull; // "FRAGLEFT"
+	*last_word  = 0x4652414752474854ull; // "FRAGRGHT"
+
+	Libs::LibKernel::Memory::TestFailGuestBackingStoreUnmapAfter(1);
+	CheckFailed(test, Libs::LibKernel::Memory::KernelMunmap(fragmented, SceKernelPageSize * 2),
+	            "KernelMunmap(injected second-view failure)");
+	ExpectRange(test, Query(test, fragmented), fragmented, fragmented + SceKernelPageSize * 2,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "fragmented_backing");
+	Check(test, *first_word == 0x465241474c454654ull && *last_word == 0x4652414752474854ull,
+	      "transactional backing-unmap rollback lost mapped contents");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(fragmented, SceKernelPageSize * 2),
+	        "KernelMunmap(retry)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(blocker, SceKernelPageSize),
+	        "KernelMunmap(blocker)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "fragmented backing rollback test leaked flexible capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestRuntimeMemoryOwnerLifecycle() {
+	const char* test = "RuntimeMemoryOwnerLifecycle";
+	Check(test,
+	      Libs::LibKernel::Memory::AllocateRuntimeMemory(0x10000, SceKernelPageSize,
+	                                                     Common::VirtualMemory::Mode::ReadWrite,
+	                                                     "runtime_outside_owner", true) == 0,
+	      "fixed runtime allocation escaped the guest owner");
+
+	const auto base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, SceKernelPageSize * 2, Common::VirtualMemory::Mode::ReadWrite, "runtime_lifecycle");
+	Check(test, base != 0, "runtime allocation failed");
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 2),
+	      "runtime allocation is outside the owner");
+	*reinterpret_cast<uint64_t*>(base) = 0x52554e54494d454full; // "RUNTIMEO"
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(base, SceKernelPageSize,
+	                                                  Common::VirtualMemory::Mode::Read),
+	      "runtime protection failed");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, SceKernelPageSize * 2),
+	      "runtime free failed");
+	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize * 2),
+	      "runtime free did not restore the owner placeholder");
+
+	const auto reused = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::ReadWrite, "runtime_reuse", true);
+	Check(test, reused == base, "fixed runtime allocation did not reuse the owner placeholder");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(reused, SceKernelPageSize * 2),
+	      "reused runtime free failed");
+
+	const auto adjacent_first = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, SceKernelPageSize, Common::VirtualMemory::Mode::ReadWrite, "runtime_adjacent_first");
+	Check(test, adjacent_first != 0, "first adjacent runtime allocation failed");
+	const auto adjacent_second = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    adjacent_first + SceKernelPageSize, SceKernelPageSize,
+	    Common::VirtualMemory::Mode::ReadWrite, "runtime_adjacent_second", true);
+	Check(test, adjacent_second == adjacent_first + SceKernelPageSize,
+	      "second adjacent runtime allocation failed");
+	Check(test,
+	      Libs::LibKernel::Memory::FreeGuestMemory(adjacent_first, SceKernelPageSize * 2),
+	      "combined adjacent runtime free failed");
+	Check(test,
+	      Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(adjacent_first,
+	                                                          SceKernelPageSize * 2),
+	      "combined adjacent runtime free did not restore one owner placeholder");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -341,9 +763,11 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	            &addr, SceKernelPageSize * 4, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
 	            "prospero_direct"),
 	        "KernelMapNamedDirectMemory");
-	const auto base  = reinterpret_cast<uint64_t>(addr);
-	const auto phys  = static_cast<uint64_t>(phys_addr);
-	void*      alias = nullptr;
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	const auto phys = static_cast<uint64_t>(phys_addr);
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 4),
+	      "direct mapping escaped the guest owner");
+	void* alias = nullptr;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
 	            &alias, SceKernelPageSize * 4, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
@@ -430,6 +854,192 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestDirectPartialProtectUnmapPreservesNeighbors() {
+	const char* test      = "DirectPartialProtectUnmapPreservesNeighbors";
+	const auto  size      = SceKernelPageSize * 3;
+	int64_t     phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, size, SceKernelProtCpuRw,
+	                                                            0, phys_addr, SceKernelPageSize,
+	                                                            "partial_protect_direct"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	CheckOk(
+	    test,
+	    Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(base + SceKernelPageSize),
+	                                            SceKernelPageSize, SceKernelProtCpuRead),
+	    "KernelMprotect(middle)");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	          base, size, Common::VirtualMemory::Mode::Read),
+	      "owner could not protect fragmented backing views");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	          base, size, Common::VirtualMemory::Mode::ReadWrite),
+	      "owner could not restore fragmented backing views");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	Common::VirtualMemory::Mode old_left {};
+	Common::VirtualMemory::Mode old_right {};
+	Check(test,
+	      Common::VirtualMemory::Protect(base, SceKernelPageSize,
+	                                     Common::VirtualMemory::Mode::ReadWrite, &old_left),
+	      "could not inspect left-page protection");
+	Check(test,
+	      Common::VirtualMemory::Protect(base + SceKernelPageSize * 2, SceKernelPageSize,
+	                                     Common::VirtualMemory::Mode::ReadWrite, &old_right),
+	      "could not inspect right-page protection");
+	Check(test, old_left == Common::VirtualMemory::Mode::ReadWrite,
+	      "partial unmap changed the left neighbor protection");
+	Check(test, old_right == Common::VirtualMemory::Mode::ReadWrite,
+	      "partial unmap changed the right neighbor protection");
+	*reinterpret_cast<uint64_t*>(base) = 0x4c45465450524f54ull; // "LEFTPROT"
+	*reinterpret_cast<uint64_t*>(base + SceKernelPageSize * 2) =
+	    0x5247485450524f54ull; // "RGHTPROT"
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectMapValidationBeforeOwnerMutation() {
+	const char* test    = "DirectMapValidationBeforeOwnerMutation";
+	int64_t     invalid = -1;
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize + 1,
+	                SceKernelPageSize, SceKernelMtypeC, &invalid),
+	            "KernelAllocateDirectMemory(unaligned size)");
+	Check(test, invalid == -1, "invalid direct allocation changed the output address");
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
+	                0x1000, SceKernelMtypeC, &invalid),
+	            "KernelAllocateDirectMemory(sub-page alignment)");
+	Check(test, invalid == -1, "invalid alignment changed the output address");
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize * 2,
+	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	auto expect_invalid = [&](size_t len, int prot, int flags, int64_t phys, size_t alignment,
+	                          const char* action) {
+		void* address = nullptr;
+		CheckFailed(test,
+		            Libs::LibKernel::Memory::KernelMapDirectMemory(&address, len, prot, flags, phys,
+		                                                           alignment),
+		            action);
+		Check(test, address == nullptr, "invalid direct map changed the output address");
+	};
+	expect_invalid(SceKernelPageSize + 1, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
+	               "KernelMapDirectMemory(unaligned size)");
+	expect_invalid(SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr + 1, SceKernelPageSize,
+	               "KernelMapDirectMemory(unaligned physical address)");
+	expect_invalid(SceKernelPageSize, SceKernelProtCpuExec, 0, phys_addr, SceKernelPageSize,
+	               "KernelMapDirectMemory(executable)");
+
+	void* aligned = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(
+	            &aligned, SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr, 0xc000),
+	        "KernelMapDirectMemory(16K-multiple alignment)");
+	Check(test, reinterpret_cast<uint64_t>(aligned) % 0xc000 == 0,
+	      "non-power-of-two 16K alignment was not honored");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(aligned),
+	                                              SceKernelPageSize),
+	        "KernelMunmap(16K-multiple alignment)");
+
+	void* ignored_flag = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&ignored_flag, SceKernelPageSize,
+	                                                       SceKernelProtCpuRw, 0x08, phys_addr,
+	                                                       SceKernelPageSize),
+	        "KernelMapDirectMemory(ignored flag)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(ignored_flag),
+	                                              SceKernelPageSize),
+	        "KernelMunmap(ignored flag)");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize * 2),
+	        "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectReleaseRollbackRestoresOwnerMapping() {
+	const char* test      = "DirectReleaseRollbackRestoresOwnerMapping";
+	int64_t     phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
+	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &address, SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
+	            "release_rollback"),
+	        "KernelMapNamedDirectMemory");
+	const auto base                    = reinterpret_cast<uint64_t>(address);
+	*reinterpret_cast<uint64_t*>(base) = 0x52454c524f4c4c42ull; // "RELROLLB"
+
+	Libs::LibKernel::Memory::TestFailNextPhysicalMemoryUnmap();
+	CheckFailed(
+	    test,
+	    Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	    "KernelCheckedReleaseDirectMemory(injected failure)");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 0, 1,
+	            0, 1, "release_rollback", static_cast<uint64_t>(phys_addr));
+	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x52454c524f4c4c42ull,
+	      "release rollback lost the shared-backing contents");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelCheckedReleaseDirectMemory(retry)");
+	ExpectUnmapped(test, base);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectReleaseContracts() {
+	const char* test = "DirectReleaseContracts";
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(0, 0),
+	        "KernelReleaseDirectMemory(zero length)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(0, 0),
+	        "KernelCheckedReleaseDirectMemory(zero length)");
+	CheckFailed(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(1, SceKernelPageSize),
+	            "KernelReleaseDirectMemory(unaligned start)");
+	CheckFailed(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(0, SceKernelPageSize + 1),
+	            "KernelReleaseDirectMemory(unaligned size)");
+
+	const auto free_offset = static_cast<int64_t>(
+	    Libs::LibKernel::Memory::KernelGetDirectMemorySize() - SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(free_offset, SceKernelPageSize),
+	        "KernelReleaseDirectMemory(unallocated range)");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(
+	          free_offset, SceKernelPageSize) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+	      "checked release did not report an unallocated range");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestReleasedReserveCanBeReused() {
 	const char* test = "ReleasedReserveCanBeReused";
 	void*       addr = nullptr;
@@ -478,21 +1088,23 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	        "KernelMapNamedFlexibleMemory(right)");
 
 	Check(test,
-	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x100, 0x200) ==
-	          0x200,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x100, 0x200) == 0x200,
 	      "ClampRangeSize did not cross adjacent committed mappings");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	          base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::Read),
+	      "owner could not protect adjacent backing mappings");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(
+	          base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::ReadWrite),
+	      "owner could not restore adjacent backing mappings");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
 	        "KernelMunmap(adjacent mappings)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "multi-range unmap leaked flexible-memory budget");
-	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, 0, 0, 0, 0, 0,
-	            "adjacent_left");
-	ExpectRange(test, Query(test, base + SceKernelPageSize), base + SceKernelPageSize,
-	            base + SceKernelPageSize * 2, 0, 0, 0, 0, 0, "adjacent_right");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
-	        "KernelMunmap(restored reserve)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + SceKernelPageSize);
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -544,6 +1156,52 @@ void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	        "KernelReleaseDirectMemory(second)");
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(first, SceKernelPageSize),
 	        "KernelReleaseDirectMemory(first)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectMapAcrossContiguousAllocations() {
+	const char* test   = "DirectMapAcrossContiguousAllocations";
+	const auto  end    = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+	int64_t     first  = 0;
+	int64_t     second = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, end, SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC, &first),
+	        "KernelAllocateDirectMemory(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, end, SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC, &second),
+	        "KernelAllocateDirectMemory(second)");
+	Check(test, second == first + static_cast<int64_t>(SceKernelPageSize),
+	      "test allocations are not physically contiguous");
+
+	void* mapping = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &mapping, SceKernelPageSize * 2, SceKernelProtCpuRw, 0, first, SceKernelPageSize,
+	            "contiguous_allocations"),
+	        "KernelMapNamedDirectMemory");
+	auto* words = reinterpret_cast<uint64_t*>(mapping);
+	words[0]    = 0x434f4e5449474c46ull; // "CONTIGLF"
+	*reinterpret_cast<uint64_t*>(reinterpret_cast<uint64_t>(mapping) + SceKernelPageSize) =
+	    0x434f4e5449475254ull; // "CONTIGRT"
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(first, SceKernelPageSize * 2),
+	        "KernelCheckedReleaseDirectMemory(contiguous span)");
+	ExpectUnmapped(test, reinterpret_cast<uint64_t>(mapping));
+
+	int64_t reclaimed = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, end, SceKernelPageSize * 2, SceKernelPageSize, SceKernelMtypeC, &reclaimed),
+	        "KernelAllocateDirectMemory(reclaimed)");
+	Check(test, reclaimed == first, "released contiguous span was not coalesced");
+	CheckOk(
+	    test,
+	    Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(reclaimed, SceKernelPageSize * 2),
+	    "KernelCheckedReleaseDirectMemory(reclaimed)");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -933,38 +1591,6 @@ void TestFixedReserveRollbackConsumesRestoredPlaceholder() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFixedReserveRollbackRestoresDecommittedHostPages() {
-	const char*        test   = "FixedReserveRollbackRestoresDecommittedHostPages";
-	constexpr uint64_t size   = SceKernelPageSize * 3;
-	void*              mapped = nullptr;
-
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(&mapped, size, SceKernelProtCpuRw,
-	                                                              0, "host_reserve_rollback"),
-	        "KernelMapNamedFlexibleMemory");
-	const auto base                    = reinterpret_cast<uint64_t>(mapped);
-	*reinterpret_cast<uint64_t*>(base) = 0x4b595459484f5354ull; // "KYTYHOST"
-	*reinterpret_cast<uint64_t*>(base + SceKernelPageSize * 2) =
-	    0x4b5954595441494cull; // "KYTYTAIL"
-
-	Libs::LibKernel::Memory::TestFailHostReservationAfter(1);
-	void* replacement = mapped;
-	CheckFailed(
-	    test,
-	    Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	        &replacement, size, SceKernelMapFixed | SceKernelMapNoCoalesce, SceKernelPageSize),
-	    "KernelReserveVirtualRange(partial host reservation)");
-	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x4b595459484f5354ull,
-	      "rollback did not restore the first flexible page");
-	Check(test, *reinterpret_cast<uint64_t*>(base + SceKernelPageSize * 2) == 0x4b5954595441494cull,
-	      "rollback damaged the flexible tail page");
-	ExpectRange(test, Query(test, base), base, base + size, SceKernelProtCpuRw, 1, 0, 0, 1,
-	            "host_reserve_rollback");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
 void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
 	const char*        test      = "FixedReserveRangeAddRollbackKeepsPlaceholder";
 	constexpr uint64_t size      = SceKernelPageSize * 4;
@@ -1055,8 +1681,10 @@ void TestLargeHintedReserveHostsSmallDirectMap() {
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys, SceKernelPageSize * 2),
 	        "KernelReleaseDirectMemory");
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(window), window_size),
-	        "KernelMunmap(window reserve)");
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(window) +
+	                                                  SceKernelPageSize * 2,
+	                                              window_size - SceKernelPageSize * 2),
+	        "KernelMunmap(window reserve remainder)");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(arena), arena_size),
 	        "KernelMunmap(arena reserve)");
@@ -1153,18 +1781,25 @@ void TestProsperoSampleMemoryPoolExpandCommit() {
 	                                                        SceKernelProtCpuRw, 0),
 	        "KernelMemoryPoolCommit");
 	ExpectRange(test, Query(test, base), base, base + commit_len, SceKernelProtCpuRw, 0, 0, 1, 1);
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, commit_len),
+	      "pooled commit escaped the guest owner");
 	Check(test, AvailableFlexibleMemory(test) == flexible_baseline,
 	      "pooled commit consumed flexible memory instead of expanded direct "
 	      "backing");
 	CheckFailed(test,
-	            Libs::LibKernel::Memory::KernelReleaseDirectMemory(pool_offset,
-	                                                               SceKernelMemoryPoolExpandLen),
-	            "KernelReleaseDirectMemory(committed pool expansion)");
+	            Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(
+	                pool_offset, SceKernelMemoryPoolExpandLen),
+	            "KernelCheckedReleaseDirectMemory(committed pool expansion)");
 
 	constexpr uint64_t first_value     = 0x504f4f4c4241434bull; // "POOLBACK"
 	constexpr uint64_t second_value    = 0x5348415245444d45ull; // "SHAREDME"
 	*reinterpret_cast<uint64_t*>(base) = first_value;
 	*reinterpret_cast<uint64_t*>(base + SceKernelMemoryPoolCommitLen) = second_value;
+	uint64_t backing_read                                             = 0;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(base, &backing_read, sizeof(backing_read)),
+	      "TryReadBacking did not resolve pooled memory");
+	Check(test, backing_read == first_value,
+	      "shared backing did not observe a pooled-memory CPU write");
 
 	CheckOk(
 	    test,
@@ -1276,8 +1911,10 @@ void TestFragmentedMemoryPoolBacking() {
 	        "KernelMemoryPoolCommit(fragmented recommit)");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, commit_len),
 	        "KernelMunmap(fragmented commit)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelMemoryPoolReserveLen),
-	        "KernelMunmap(fragmented reserve cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + commit_len,
+	                                              SceKernelMemoryPoolReserveLen - commit_len),
+	        "KernelMunmap(fragmented reserve remainder)");
 
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(first_pool,
@@ -1427,21 +2064,31 @@ void TestMemoryPoolCommitDecommitQueryFlags() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestProgramMemoryRegistrationAndProtection() {
-	const char* test = "ProgramMemoryRegistrationAndProtection";
+void TestProgramMemoryAllocationAndProtection() {
+	const char* test = "ProgramMemoryAllocationAndProtection";
 	const auto  size = SceKernelPageSize * 3;
-	const auto base = Common::VirtualMemory::Alloc(0, size, Common::VirtualMemory::Mode::ReadWrite);
-	Check(test, base != 0, "program host allocation failed");
-
-	Libs::LibKernel::Memory::RegisterProgramMemory(
-	    base, size, Common::VirtualMemory::Mode::ReadWrite, "program_test");
+	const auto  base = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x900000000, size, Common::VirtualMemory::Mode::ReadWrite, "program_test");
+	Check(test, base != 0, "program guest allocation failed");
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, size),
+	      "program allocation escaped the guest owner");
 	ExpectRange(test, Query(test, base), base, base + size,
 	            SceKernelProtCpuRead | SceKernelProtCpuRw, 0, 0, 0, 1, "program_test");
 
-	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(base, SceKernelPageSize,
-	                                                       Common::VirtualMemory::Mode::Read);
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(base, SceKernelPageSize,
+	                                                  Common::VirtualMemory::Mode::Read),
+	      "ProtectGuestMemory(first page) failed");
 	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRead, 0, 0,
 	            0, 1, "program_test");
+
+	Common::VirtualMemory::Mode previous_mode = Common::VirtualMemory::Mode::NoAccess;
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(
+	          base, SceKernelPageSize, Common::VirtualMemory::Mode::ReadWrite, &previous_mode),
+	      "ProtectGuestMemory(tracked restore) failed");
+	Check(test, previous_mode == Common::VirtualMemory::Mode::Read,
+	      "semantic guest protection did not preserve its tracked old mode");
 
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMprotect(
@@ -1451,15 +2098,23 @@ void TestProgramMemoryRegistrationAndProtection() {
 	ExpectRange(test, Query(test, base), base, base + size,
 	            SceKernelProtCpuRead | SceKernelProtCpuRw, 0, 0, 0, 1, "program_test");
 
-	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(
-	    base + SceKernelPageSize * 2, SceKernelPageSize, Common::VirtualMemory::Mode::Read);
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(
+	          base + SceKernelPageSize * 2, SceKernelPageSize, Common::VirtualMemory::Mode::Read),
+	      "ProtectGuestMemory(last page) failed");
 	ExpectRange(test, Query(test, base + SceKernelPageSize * 2), base + SceKernelPageSize * 2,
 	            base + size, SceKernelProtCpuRead, 0, 0, 0, 1, "program_test");
 
-	Libs::LibKernel::Memory::UnregisterProgramMemory(base, size);
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, size), "program guest free failed");
 	ExpectUnmapped(test, base);
-	Check(test, Common::VirtualMemory::Free(base), "program host free failed");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestModuleRelocationUsesWritableHostMapping() {
+	const char* test = "ModuleRelocationUsesWritableHostMapping";
+	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
+	      "module relocation did not retain writable host memory and semantic guest protection");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1469,6 +2124,18 @@ int main() {
 	InitSubsystems();
 
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
+	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
+	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
+	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
+	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
+	RunTest(TestFlexibleMemoryUsesSharedBacking);
+	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
+	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
+	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
+	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
+	RunTest(TestFragmentedBackingUnmapRollback);
+	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
@@ -1476,7 +2143,12 @@ int main() {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+	RunTest(TestDirectMapValidationBeforeOwnerMutation);
+	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
+	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
+	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
@@ -1485,7 +2157,6 @@ int main() {
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
-	RunTest(TestFixedReserveRollbackRestoresDecommittedHostPages);
 	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestMemoryPoolAlignmentContracts);
@@ -1493,7 +2164,8 @@ int main() {
 	RunTest(TestFragmentedMemoryPoolBacking);
 	RunTest(TestMemoryPoolMultiRangeDecommit);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
-	RunTest(TestProgramMemoryRegistrationAndProtection);
+	RunTest(TestProgramMemoryAllocationAndProtection);
+	RunTest(TestModuleRelocationUsesWritableHostMapping);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

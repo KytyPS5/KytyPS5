@@ -48,9 +48,10 @@ struct LibraryId {
 
 struct ThreadLocalStorage {
 	struct Block {
-		uint8_t*                     ptr       = nullptr;
-		application_heap_free_func_t free_func = nullptr;
-		bool                         vm_alloc  = false;
+		uint8_t*                     ptr        = nullptr;
+		application_heap_free_func_t free_func  = nullptr;
+		bool                         vm_alloc   = false;
+		uint64_t                     alloc_size = 0;
 	};
 
 	~ThreadLocalStorage();
@@ -203,6 +204,11 @@ private:
 	application_heap_free_func_t           m_application_heap_free           = nullptr;
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestMainEntryUsesGuestStack();
+bool TestModuleRelocationUsesWritableHostMapping();
+#endif
 
 } // namespace Loader
 

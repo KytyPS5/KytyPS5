@@ -1377,7 +1377,6 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
-	m_buffer_cache.ValidateGpuAccess(address, size, false, true);
 	std::lock_guard      transaction(m_resource_mutex);
 	CacheLock            lock(*this, m_lock);
 	ImageId              selected {};

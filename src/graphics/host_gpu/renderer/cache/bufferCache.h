@@ -77,8 +77,7 @@ public:
 	void               CompleteBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
 	[[nodiscard]] bool SynchronizeBacking(uint64_t vaddr, uint64_t size);
 	void               PublishImageBuffer(uint64_t vaddr, uint64_t size);
-	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
-	void RunGarbageCollector();
+	void               RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;

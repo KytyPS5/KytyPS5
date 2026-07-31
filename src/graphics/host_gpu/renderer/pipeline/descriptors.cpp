@@ -616,8 +616,6 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
-		m_context.GetBufferCache().ValidateGpuAccess(address, size.size, resource.read,
-		                                             resource.written);
 	}
 
 	const auto              pixel_format        = TextureGetFormat(format);

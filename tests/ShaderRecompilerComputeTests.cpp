@@ -1274,6 +1274,59 @@ public:
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
   }
 
+  void CheckGpuMappedRangeLifecycle() {
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    Gpu gpu(Renderer());
+    GpuResourceManager resources(m_runtime_context, scheduler);
+    resources.SetGpu(&gpu);
+
+    constexpr uint64_t base = 0x0000000200000000ull;
+    constexpr uint64_t page = 0x4000;
+    resources.MapMemory(base, page * 4);
+    resources.MapMemory(base + page * 2, page * 4);
+    Require("GpuMappedRangeLifecycle", "union",
+            resources.IsMapped(base, page * 6) &&
+                !resources.IsMapped(base, page * 7),
+            "overlapping maps did not form one interval union");
+
+    resources.UnmapMemory(base + page * 2, page * 2);
+    Require("GpuMappedRangeLifecycle", "subtract",
+            resources.IsMapped(base, page * 2) &&
+                resources.IsMapped(base + page * 4, page * 2) &&
+                !resources.IsMapped(base, page * 6),
+            "partial unmap did not punch the expected interval hole");
+
+    resources.UnmapMemory(base + page * 2, page * 2);
+    Require("GpuMappedRangeLifecycle", "idempotent unmap",
+            resources.IsMapped(base, page * 2) &&
+                resources.IsMapped(base + page * 4, page * 2),
+            "unmapping an absent interval changed neighboring mappings");
+
+    resources.UnmapMemory(base, page * 6);
+    Require("GpuMappedRangeLifecycle", "clear",
+            !resources.IsMapped(base, page * 6),
+            "full unmap did not clear the interval union");
+
+    constexpr uint64_t old_prt = base + page * 8;
+    constexpr uint64_t new_prt = base + page * 16;
+    resources.MapMemory(old_prt, page * 4);
+    resources.UnmapMemory(old_prt, page * 4);
+    resources.MapMemory(new_prt, page * 6);
+    Require("GpuMappedRangeLifecycle", "PRT replacement",
+            !resources.IsMapped(old_prt, page * 4) &&
+                resources.IsMapped(new_prt, page * 6),
+            "old-unmap/new-map did not replace full PRT coverage");
+
+    resources.SetGpu(nullptr);
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
+  }
+
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -1526,7 +1579,7 @@ public:
             fault_memory == reinterpret_cast<void *>(fault_base),
             "fixed processor-fault allocation failed");
     auto &resources = context.GetGpuResources();
-    resources.MapMemory(fault_base, fault_size, GpuAccess::ReadWrite);
+    resources.MapMemory(fault_base, fault_size);
 
     constexpr uint64_t immediate_dst = fault_base + 0x1000;
     constexpr uint64_t immediate_memory_dst = fault_base + 0x2000;
@@ -1683,7 +1736,7 @@ public:
               resources.InvalidateMemory(fault_base, sizeof(uint32_t)),
               "processor memory invalidation did not find its mapped range");
     });
-    resources.UnmapMemory(fault_base, fault_size, GpuAccess::ReadWrite);
+    resources.UnmapMemory(fault_base, fault_size);
     Require("GpuCommandLane", "processor fault unmap",
             Libs::LibKernel::Memory::KernelMunmap(fault_base, fault_size) == 0,
             "processor-fault direct-memory mapping release failed");
@@ -1953,7 +2006,7 @@ public:
       GpuResourceManager resources(m_runtime_context, scheduler);
       resources.SetGpu(&gpu);
       auto &cache = resources.GetBufferCache();
-      resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.MapMemory(base, allocation_size);
 
       const auto MarkGpuWrite = [&](uint64_t address, uint64_t size) {
         auto allocation =
@@ -2376,7 +2429,7 @@ public:
                                  sizeof(reacquire_value));
 
       resources.SetGpu(nullptr);
-      resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
     gpu.Shutdown();
@@ -2431,7 +2484,7 @@ public:
               narrow_download != nullptr && narrow_download_offset % 4 == 0 &&
                   wide_download != nullptr && wide_download_offset % 16 == 0,
               "wide/block image readback was not aligned to its texel block");
-      resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.MapMemory(base, allocation_size);
 
       ImageDesc sampled{};
       sampled.type = BindingType::Texture;
@@ -4834,7 +4887,7 @@ public:
       m_device.destroyShaderModule(ms_depth_module, nullptr);
 
       resources.SetGpu(nullptr);
-      resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
     gpu.Shutdown();
@@ -4879,7 +4932,7 @@ public:
     scheduler.Begin(registers, user_config, shaders);
     {
       GpuResourceManager resources(m_runtime_context, scheduler);
-      resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.MapMemory(base, allocation_size);
       const uint32_t pitch = TileGetTexturePitch(format, 1, 1, tile);
       TileSizeAlign total{};
       TileSizeOffset mip{};
@@ -4978,7 +5031,7 @@ public:
                   std::vector<u32>{0x40004200u, 0x44003c00u},
               "tiled BGRA16 Buffer mirror changed guest component order");
       DestroyBuffer(&mirror_readback);
-      resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
     Require(name, "unmap",
@@ -5025,7 +5078,7 @@ public:
       auto &resources = context.GetGpuResources();
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
-      resources.MapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.MapMemory(base, allocation_size);
 
       constexpr auto stencil_format =
           Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
@@ -6011,10 +6064,8 @@ public:
       const auto stale_ordered_color =
           texture_cache.FindImage(ordered_color_desc);
       RenderExecutorTestAccess::BindRenderTarget(executor, stale_ordered_color);
-      resources.UnmapMemory(ordered_color_address, target_mip_size,
-                            GpuAccess::ReadWrite);
-      resources.MapMemory(ordered_color_address, target_mip_size,
-                          GpuAccess::ReadWrite);
+      resources.UnmapMemory(ordered_color_address, target_mip_size);
+      resources.MapMemory(ordered_color_address, target_mip_size);
 
       auto ordered_depth_desc = depth;
       ordered_depth_desc.info.stencil = {ordered_color_address,
@@ -6167,7 +6218,7 @@ public:
               texture_cache.GetImage(depth_id).usage.storage,
           "storage stencil binding did not acquire the associated depth owner");
       RenderExecutorTestAccess::ResetBindings(executor);
-      resources.UnmapMemory(base, allocation_size, GpuAccess::ReadWrite);
+      resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
 
@@ -17198,12 +17249,12 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 void CheckStorageTextureGpuOwnedRebindState() {
   constexpr uintptr_t base = 0x0000000200200000ull;
   constexpr uint64_t size = 0x10000;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  const auto guest_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+      base, size, Common::VirtualMemory::Mode::ReadWrite,
+      "storage_texture_gpu_owned_rebind", true);
+  auto *memory = reinterpret_cast<uint8_t *>(guest_memory);
   Require("StorageTextureGpuOwnedRebind", "allocation",
-          memory == reinterpret_cast<void *>(base),
-          "fixed VirtualAlloc failed");
+          guest_memory == base, "fixed guest-owner allocation failed");
   PageManager page_manager(CacheFault, nullptr);
   MemoryTracker tracker(page_manager);
   page_manager.OnGpuMap(base, size);
@@ -17215,7 +17266,6 @@ void CheckStorageTextureGpuOwnedRebindState() {
   Require(
       "StorageTextureGpuOwnedRebind", "owned",
       tracker.IsRegionGpuModified(base, size) &&
-          page_manager.IsMapped(base, size) &&
           (!HostMemoryQueryReadable(base, size, readable) || readable < size) &&
           HostMemoryQueryRange(base, size, HostMemoryAccess::Mapped, mapped) &&
           mapped == size &&
@@ -17261,7 +17311,8 @@ void CheckStorageTextureGpuOwnedRebindState() {
   tracker.UntrackMemory(base, size);
   page_manager.OnGpuUnmap(base, size);
   Require("StorageTextureGpuOwnedRebind", "free",
-          VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+          Libs::LibKernel::Memory::FreeGuestMemory(base, size),
+          "guest-owner free failed");
   std::printf("[host]    %-32s ok\n", "StorageTextureGpuOwnedRebind");
 }
 #endif
@@ -18029,6 +18080,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSchedulerTimeline();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuMappedRangeLifecycle();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stream-buffer-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStreamBufferRing();
@@ -18184,6 +18240,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckCommandPoolGrowth();
   vulkan.CheckGpuTilerCpuParity();

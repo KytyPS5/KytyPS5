@@ -4,7 +4,6 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -115,22 +114,19 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
-void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size, GpuAccess access) {
+void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
 	}
-	m_page_manager.OnGpuMap(vaddr, size, access);
+	m_page_manager.OnGpuMap(vaddr, size);
 }
 
-void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, GpuAccess access) {
-	if (!IsMapped(vaddr, size)) {
-		EXIT("cannot unmap an unmapped GPU resource range\n");
-	}
-	const auto unmap = [this, vaddr, size, access] {
-		m_texture_cache.UnmapMemory(vaddr, size);
+void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	const auto unmap = [this, vaddr, size] {
 		m_buffer_cache.UnmapMemory(vaddr, size);
-		m_page_manager.OnGpuUnmap(vaddr, size, access);
+		m_texture_cache.UnmapMemory(vaddr, size);
+		m_page_manager.OnGpuUnmap(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};

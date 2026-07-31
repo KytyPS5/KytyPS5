@@ -145,7 +145,7 @@ int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end);
 int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment);
 bool              KernelHandleReservedRangeAccessViolation(uint64_t vaddr);
 int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size);
-int KYTY_SYSV_ABI KernelConfiguredFlexibleMemorySize(uint64_t* size);
+int KYTY_SYSV_ABI KernelConfiguredFlexibleMemorySize(size_t* size);
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot);
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot);
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
@@ -163,17 +163,30 @@ int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entrie
 int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* output,
                                                 size_t                      output_size);
 
-void RegisterProgramMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
-                           const char* name);
-void UpdateProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
-void UnregisterProgramMemory(uint64_t vaddr, uint64_t size);
+uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
+                               Common::VirtualMemory::Mode mode, const char* name);
+void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
+                               Common::VirtualMemory::Mode mode, const char* name,
+                               bool fixed = false);
+uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size,
+                                  Common::VirtualMemory::Mode mode, const char* name);
+bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
+                            Common::VirtualMemory::Mode* old_mode = nullptr);
+// Transient PageManager watch state; does not change the guest mapping's semantic protection.
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-void TestFailNextPhysicalMemoryUnmap();
-void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
-void TestFailHostReservationAfter(uint32_t successful_pages);
-void TestFailNextFixedReserveRangeRegistration();
-bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
+void     TestFailNextPhysicalMemoryUnmap();
+void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
+void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
+void     TestFailNextFixedReserveRangeRegistration();
+bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
+bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
+bool     TestGuestBackingOutsideAddressSpace();
+uint64_t TestGuestBackingSize();
+bool     TestGuestFreeRangeBounds();
 #endif
 
 } // namespace Libs::LibKernel::Memory

@@ -4,16 +4,6 @@
 
 namespace Libs::Graphics {
 
-#if defined(KYTY_MEMORY_TRACKER_TESTS)
-namespace {
-std::atomic<MemoryTracker::UnmapContentionHook> g_unmap_contention_hook {nullptr};
-}
-
-void MemoryTracker::SetUnmapContentionHook(UnmapContentionHook hook) noexcept {
-	g_unmap_contention_hook.store(hook, std::memory_order_release);
-}
-#endif
-
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager, PageWatchMode gpu_watch_mode)
@@ -94,7 +84,6 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	RequireMapped(vaddr, size);
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
@@ -104,7 +93,6 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	RequireMapped(vaddr, size);
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
@@ -114,7 +102,6 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	RequireMapped(vaddr, size);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		const auto       changed =
@@ -126,7 +113,6 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	RequireMapped(vaddr, size);
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		const auto       changed =
@@ -138,7 +124,6 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	RequireMapped(vaddr, size);
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		if (!manager->IsFullyModified<DirtySource::Gpu>(offset, bytes)) {
@@ -151,8 +136,6 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::UntrackMemoryLocked(uint64_t vaddr, uint64_t size) {
-	RequireMapped(vaddr, size);
-
 	std::vector<RegionManager*> managers;
 	managers.reserve((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) /
 	                 TRACKER_REGION_SIZE);
@@ -183,22 +166,6 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
 	UntrackMemoryLocked(vaddr, size);
-}
-
-void MemoryTracker::UnmapMemory(uint64_t vaddr, uint64_t size) {
-	CheckNotInUploadCallback();
-	std::unique_lock access(m_access_mutex, std::try_to_lock);
-	if (!access.owns_lock()) {
-#if defined(KYTY_MEMORY_TRACKER_TESTS)
-		if (const auto hook = g_unmap_contention_hook.load(std::memory_order_acquire);
-		    hook != nullptr) {
-			hook();
-		}
-#endif
-		access.lock();
-	}
-	UntrackMemoryLocked(vaddr, size);
-	m_page_manager.OnGpuUnmap(vaddr, size);
 }
 
 bool MemoryTracker::InvalidateRegion(uint64_t vaddr, uint64_t size, PageFaultPhase phase) noexcept {

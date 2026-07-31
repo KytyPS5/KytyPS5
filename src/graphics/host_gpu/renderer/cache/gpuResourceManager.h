@@ -34,11 +34,6 @@ public:
 	void               RunGarbageCollector();
 
 private:
-	static bool FaultThunk(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                       PageFaultPhase phase) noexcept;
-	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
-
 	PageManager               m_page_manager;
 	ResourceMutex             m_resource_mutex;
 	BufferCache               m_buffer_cache;

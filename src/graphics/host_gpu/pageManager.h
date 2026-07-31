@@ -11,11 +11,8 @@
 namespace Libs::Graphics {
 
 enum class PageFaultAccess { Read, Write, Execute, Unknown };
-enum class PageFaultPhase { Invalidate, Complete, Release };
 enum class PageWatchMode { Write, ReadWrite };
 
-using PageFaultHandler = bool (*)(void* context, PageFaultAccess access, uint64_t vaddr,
-                                  uint64_t size, PageFaultPhase phase) noexcept;
 class PageManager final {
 public:
 	class BackingWrite final {
@@ -30,21 +27,19 @@ public:
 		uint64_t     m_size  = 0;
 	};
 
-	PageManager(PageFaultHandler fault_handler, void* fault_context);
+	PageManager();
 	// The owner must stop all PageManager callers before destruction.
 	~PageManager();
 
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
-	[[nodiscard]] bool     IsTracked(uint64_t vaddr) const noexcept;
 
 	void UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 	                        PageWatchMode mode = PageWatchMode::Write);
 	void OnGpuMap(uint64_t vaddr, uint64_t size);
 	void OnGpuUnmap(uint64_t vaddr, uint64_t size);
 
-	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] std::vector<std::unique_ptr<BackingWrite>>
 	ReserveBackingWrites(std::span<const RangeSet::Range> ranges);
 

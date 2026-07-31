@@ -7,32 +7,10 @@
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_page_manager(FaultThunk, this),
-      m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, m_resource_mutex),
+    : m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, m_resource_mutex),
       m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache, m_resource_mutex) {}
 
 GpuResourceManager::~GpuResourceManager() = default;
-
-bool GpuResourceManager::FaultThunk(void* context, PageFaultAccess access, uint64_t vaddr,
-                                    uint64_t size, PageFaultPhase phase) noexcept {
-	return static_cast<GpuResourceManager*>(context)->InvalidateMemory(access, vaddr, size, phase);
-}
-
-bool GpuResourceManager::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-                                          PageFaultPhase phase) noexcept {
-	// Let the authoritative image materialize first. A clean overlapping buffer marks a write
-	// fault CPU-dirty when it begins ownership transfer; doing that before image preflight would
-	// make the image appear to race a real CPU write. Completion and release retain buffer-first
-	// ordering so its pending fault is gone before TextureCache publishes the downloaded backing.
-	if (phase == PageFaultPhase::Invalidate) {
-		const bool image_handled  = m_texture_cache.InvalidateMemory(access, vaddr, size, phase);
-		const bool buffer_handled = m_buffer_cache.InvalidateMemory(access, vaddr, size, phase);
-		return buffer_handled || image_handled;
-	}
-	const bool buffer_handled = m_buffer_cache.InvalidateMemory(access, vaddr, size, phase);
-	const bool image_handled  = m_texture_cache.InvalidateMemory(access, vaddr, size, phase);
-	return buffer_handled || image_handled;
-}
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	constexpr uint64_t fault_size = 8;

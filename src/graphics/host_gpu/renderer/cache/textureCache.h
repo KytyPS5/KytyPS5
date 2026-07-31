@@ -76,11 +76,9 @@ public:
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
-	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t address, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
-	void               UnmapMemory(uint64_t address, uint64_t size);
-	void               ProcessDownloadImages();
-	void               RunGarbageCollector();
+	void UnmapMemory(uint64_t address, uint64_t size);
+	void ProcessDownloadImages();
+	void RunGarbageCollector();
 
 private:
 	enum class TransferDirection { Upload, Download };

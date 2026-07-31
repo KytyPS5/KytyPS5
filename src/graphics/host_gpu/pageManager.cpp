@@ -56,8 +56,6 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 // Zero is the unknown protection sentinel.
 constexpr uint32_t UNKNOWN_PROTECTION = 0;
 
-thread_local bool g_in_fault_resolution = false;
-
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
@@ -162,11 +160,8 @@ struct PageManager::Impl {
 		uint32_t         original_protection = 0;
 		uint32_t         backing_writer      = 0;
 		// Shadow the protection applied through Protect().
-		uint32_t current_protection   = UNKNOWN_PROTECTION;
-		bool     resolving            = false;
-		bool     resolving_read_write = false;
-		bool     late_read_pending    = false;
-		bool     late_write_pending   = false;
+		uint32_t current_protection = UNKNOWN_PROTECTION;
+		bool     resolving          = false;
 	};
 
 	struct Region {
@@ -193,10 +188,7 @@ struct PageManager::Impl {
 		std::span<PageState*> m_pages;
 	};
 
-	Impl(PageFaultHandler handler, void* context): fault_handler(handler), fault_context(context) {
-		if (fault_handler == nullptr) {
-			Fatal("null page-manager fault callback");
-		}
+	Impl() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		SYSTEM_INFO info {};
 		GetSystemInfo(&info);
@@ -268,17 +260,6 @@ struct PageManager::Impl {
 		return page.original_protection;
 	}
 
-	static void PublishDelayedFaults(PageState& page, uint32_t old_protection,
-	                                 uint32_t new_protection) {
-		if (old_protection == NO_ACCESS_PROTECTION && new_protection != NO_ACCESS_PROTECTION) {
-			page.late_read_pending = true;
-		}
-		if ((old_protection == NO_ACCESS_PROTECTION || old_protection == READ_ONLY_PROTECTION) &&
-		    new_protection == READ_WRITE_PROTECTION) {
-			page.late_write_pending = true;
-		}
-	}
-
 	static void InitializeProtection(std::span<PageState*> pages) {
 		for (auto* page: pages) {
 			page->original_protection = READ_WRITE_PROTECTION;
@@ -286,19 +267,8 @@ struct PageManager::Impl {
 		}
 	}
 
-	static bool AllowsAccess(const PageState& page, [[maybe_unused]] uint64_t vaddr,
-	                         PageFaultAccess access) noexcept {
-		switch (access) {
-			case PageFaultAccess::Read:
-				return page.current_protection == READ_ONLY_PROTECTION ||
-				       page.current_protection == READ_WRITE_PROTECTION;
-			case PageFaultAccess::Write: return page.current_protection == READ_WRITE_PROTECTION;
-			default: return false;
-		}
-	}
-
 	void ProtectRange(std::span<PageState*> pages, uint64_t vaddr, uint32_t protection,
-	                  std::span<const uint32_t> expected_old, bool fault_path) noexcept {
+	                  std::span<const uint32_t> expected_old) noexcept {
 		const auto size = pages.size() * PAGE_SIZE;
 		if (pages.size() != expected_old.size()) {
 			FailFast("protection range state size mismatch");
@@ -306,9 +276,6 @@ struct PageManager::Impl {
 		for (size_t i = 0; i < pages.size(); i++) {
 			const auto actual = pages[i]->current_protection;
 			if (actual != UNKNOWN_PROTECTION && actual != expected_old[i]) {
-				if (fault_path) {
-					FailFast("mprotect fault transition did not match expected protection");
-				}
 				Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
 				      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
 				      vaddr + i * PAGE_SIZE, actual, expected_old[i], protection);
@@ -316,9 +283,6 @@ struct PageManager::Impl {
 		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
-			if (fault_path) {
-				FailFast("address-space fault protection transition failed");
-			}
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
 			      protection);
 		}
@@ -327,45 +291,26 @@ struct PageManager::Impl {
 		}
 	}
 
-	void Protect(PageState& page, uint64_t vaddr, uint32_t protection, uint32_t expected_old,
-	             bool fault_path) noexcept {
+	void Protect(PageState& page, uint64_t vaddr, uint32_t protection,
+	             uint32_t expected_old) noexcept {
 		PageState* pages[]    = {&page};
 		uint32_t   expected[] = {expected_old};
-		ProtectRange(pages, vaddr, protection, expected, fault_path);
+		ProtectRange(pages, vaddr, protection, expected);
 	}
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
-	PageFaultHandler                        fault_handler = nullptr;
-	void*                                   fault_context = nullptr;
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-PageManager::PageManager(PageFaultHandler fault_handler, void* fault_context)
-    : m_impl(std::make_unique<Impl>(fault_handler, fault_context)) {}
+PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
-	if (g_in_fault_resolution) {
-		FailFast("nested page fault while resolving a watched page");
-	}
 	return PAGE_SIZE;
-}
-
-bool PageManager::IsTracked(uint64_t vaddr) const noexcept {
-	if (g_in_fault_resolution) {
-		FailFast("IsTracked called during fault resolution");
-	}
-	auto* region = m_impl->FindRegion(vaddr);
-	if (region == nullptr) {
-		return false;
-	}
-	auto&     page = m_impl->GetPage(*region, vaddr);
-	SpinGuard lock(page.lock);
-	return page.write_watchers != 0 || page.access_watchers != 0;
 }
 
 void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
@@ -473,27 +418,14 @@ void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 			}
 			m_impl->ProtectRange(std::span {pages}.subspan(first, last - first),
 			                     chunk_begin + first * PAGE_SIZE, protection,
-			                     std::span {old_protections}.subspan(first, last - first), false);
+			                     std::span {old_protections}.subspan(first, last - first));
 			first = current;
 		}
 
-		for (size_t i = 0; i < page_count; i++) {
-			auto&      page       = *pages[i];
-			const auto protection = new_protections[i];
-			if (track) {
-				switch (protection) {
-					case NO_ACCESS_PROTECTION:
-						page.late_read_pending  = false;
-						page.late_write_pending = false;
-						break;
-					case READ_ONLY_PROTECTION: page.late_write_pending = false; break;
-					default: break;
-				}
-			} else if (page.backing_writer == 0) {
-				Impl::PublishDelayedFaults(page, old_protections[i], protection);
-				if (page.write_watchers == 0 && page.access_watchers == 0) {
-					page.original_protection = 0;
-				}
+		for (auto* page: pages) {
+			if (!track && page->backing_writer == 0 && page->write_watchers == 0 &&
+			    page->access_watchers == 0) {
+				page->original_protection = 0;
 			}
 		}
 		chunk_begin = chunk_end;
@@ -546,9 +478,6 @@ PageManager::ReserveBackingWrites(std::span<const RangeSet::Range> ranges) {
 }
 
 void PageManager::BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
-	if (g_in_fault_resolution) {
-		FailFast("backing write began during fault resolution");
-	}
 	const auto end    = PageEnd(vaddr, size);
 	const auto writer = CurrentThread();
 	for (auto address = PageStart(vaddr); address < end; address += PAGE_SIZE) {
@@ -561,16 +490,12 @@ void PageManager::BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 		if (page.resolving || page.backing_writer != 0 || page.access_watchers == 0) {
 			Fatal("backing write races page resolution at 0x%016" PRIx64, address);
 		}
-		page.resolving            = true;
-		page.resolving_read_write = true;
-		page.backing_writer       = writer;
+		page.resolving      = true;
+		page.backing_writer = writer;
 	}
 }
 
 void PageManager::EndBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
-	if (g_in_fault_resolution) {
-		FailFast("backing write ended during fault resolution");
-	}
 	const auto end    = PageEnd(vaddr, size);
 	const auto writer = CurrentThread();
 	for (auto address = PageStart(vaddr); address < end; address += PAGE_SIZE) {
@@ -586,127 +511,14 @@ void PageManager::EndBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 		const auto old_protection = NO_ACCESS_PROTECTION;
 		const auto new_protection = Impl::WatcherProtection(page);
 		if (new_protection != old_protection) {
-			m_impl->Protect(page, address, new_protection, old_protection, false);
+			m_impl->Protect(page, address, new_protection, old_protection);
 		}
-		Impl::PublishDelayedFaults(page, old_protection, new_protection);
 		if (page.write_watchers == 0 && page.access_watchers == 0) {
 			page.original_protection = 0;
 		}
-		page.backing_writer       = 0;
-		page.resolving            = false;
-		page.resolving_read_write = false;
+		page.backing_writer = 0;
+		page.resolving      = false;
 	}
-}
-
-bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	if (g_in_fault_resolution) {
-		FailFast("nested HandleFault call");
-	}
-	auto* region = m_impl->FindRegion(fault_vaddr);
-	if (region == nullptr) {
-		return false;
-	}
-	auto& page   = m_impl->GetPage(*region, fault_vaddr);
-	bool  waited = false;
-	while (true) {
-		SpinGuard lock(page.lock);
-		if (access == PageFaultAccess::Read && page.late_read_pending &&
-		    Impl::AllowsAccess(page, fault_vaddr, access)) {
-			page.late_read_pending = false;
-			return true;
-		}
-		if (access == PageFaultAccess::Write && page.late_write_pending &&
-		    Impl::AllowsAccess(page, fault_vaddr, access)) {
-			page.late_write_pending = false;
-			return true;
-		}
-		if (page.resolving) {
-			if (page.backing_writer == CurrentThread()) {
-				FailFast("backing writer faulted on its own reserved page");
-			}
-			if ((!page.resolving_read_write && access != PageFaultAccess::Write) ||
-			    (page.resolving_read_write && access != PageFaultAccess::Read &&
-			     access != PageFaultAccess::Write)) {
-				FailFast("fault access is incompatible with the active resolver");
-			}
-			waited = true;
-			continue;
-		}
-		if (page.write_watchers == 0 && page.access_watchers == 0) {
-			if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
-				return false;
-			}
-			bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
-			                                                      : page.late_write_pending);
-			const bool allowed = Impl::AllowsAccess(page, fault_vaddr, access);
-			pending            = false;
-			if (waited && !allowed) {
-				FailFast("page remained inaccessible after waiting for its resolver");
-			}
-			// More than one CPU can fault before a protection transition becomes visible. The first
-			// delayed fault consumes the hint bit; later faults must also resume once the mapped
-			// page already permits the requested access. A genuinely read-only/no-access page still
-			// falls through to the guest exception path.
-			return allowed;
-		}
-		if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
-		    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
-			FailFast("fault access is incompatible with active page watchers");
-		}
-		page.resolving            = true;
-		page.resolving_read_write = page.access_watchers != 0;
-		break;
-	}
-	g_in_fault_resolution = true;
-	const bool handled    = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
-	                                              PageFaultPhase::Invalidate);
-	g_in_fault_resolution = false;
-	{
-		SpinGuard lock(page.lock);
-		if (!handled || !page.resolving) {
-			FailFast("fault invalidation did not preserve the resolving state");
-		}
-	}
-	g_in_fault_resolution = true;
-	const bool completed  = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
-	                                              PageFaultPhase::Complete);
-	g_in_fault_resolution = false;
-	{
-		SpinGuard lock(page.lock);
-		if (!completed || !page.resolving) {
-			FailFast("fault completion did not preserve the resolving state");
-		}
-		if (page.write_watchers != 0 || page.access_watchers != 0) {
-			const auto old_protection  = Impl::WatcherProtection(page);
-			const bool read_only_fault = access == PageFaultAccess::Read;
-			if (read_only_fault && page.access_watchers == 0) {
-				FailFast("read fault completed without a read/write watcher");
-			}
-			page.access_watchers = 0;
-			if (!read_only_fault) {
-				page.write_watchers = 0;
-			}
-			const auto restored_protection = Impl::WatcherProtection(page);
-			m_impl->Protect(page, PageStart(fault_vaddr), restored_protection, old_protection,
-			                true);
-			if (page.write_watchers == 0) {
-				page.original_protection = 0;
-			}
-			Impl::PublishDelayedFaults(page, old_protection, restored_protection);
-		} else if (!Impl::AllowsAccess(page, fault_vaddr, access)) {
-			FailFast("fault completion left the page inaccessible");
-		}
-		page.resolving            = false;
-		page.resolving_read_write = false;
-	}
-	g_in_fault_resolution = true;
-	const bool released   = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
-	                                              PageFaultPhase::Release);
-	g_in_fault_resolution = false;
-	if (!released) {
-		FailFast("fault release callback failed");
-	}
-	return true;
 }
 
 } // namespace Libs::Graphics

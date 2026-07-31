@@ -3135,10 +3135,7 @@ public:
 			Require(name, "partial image unmap tracking",
 			        partial_unmap_image_id &&
 			            !texture_cache.FindImageFromRange(partial_unmap_image.info.data.address,
-			                                              0x2000, false) &&
-			            !texture_cache.InvalidateMemory(
-			                PageFaultAccess::Write, partial_unmap_image.info.data.address + 0x1000,
-			                0x1000, PageFaultPhase::Invalidate),
+			                                              0x2000, false),
 			        "partial unmap left the deleted image's mapped tail tracked");
 
 			constexpr uint64_t unformatted_alias_offset = 0x2500000;
@@ -14459,17 +14456,6 @@ void CheckEmbeddedFetchVertexOffset() {
 	std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
-struct CacheFaultContext {
-	TextureCache* texture = nullptr;
-};
-
-bool CacheFault(void* opaque, PageFaultAccess access, uint64_t vaddr, uint64_t size,
-                PageFaultPhase phase) noexcept {
-	auto* context = static_cast<CacheFaultContext*>(opaque);
-	return context != nullptr && context->texture != nullptr &&
-	       context->texture->InvalidateMemory(access, vaddr, size, phase);
-}
-
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
 	(void)TextureGetRenderTargetFormat(12u, 7u, 3u);
 	std::_Exit(0x7f);
@@ -16110,7 +16096,7 @@ void CheckStorageTextureGpuOwnedRebindState() {
 	auto* memory = reinterpret_cast<uint8_t*>(guest_memory);
 	Require("StorageTextureGpuOwnedRebind", "allocation", guest_memory == base,
 	        "fixed guest-owner allocation failed");
-	PageManager   page_manager(CacheFault, nullptr);
+	PageManager   page_manager;
 	MemoryTracker tracker(page_manager);
 	page_manager.OnGpuMap(base, size);
 	tracker.ForEachUploadRange(

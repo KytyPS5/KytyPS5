@@ -30,13 +30,6 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] CpuFaultAction
-	                   BeginCpuFault(uint64_t vaddr, uint64_t size,
-	                                 PageFaultAccess access = PageFaultAccess::Write) noexcept;
-	[[nodiscard]] bool CompleteCpuFault(uint64_t vaddr, uint64_t size, PageFaultAccess access,
-	                                    bool downloaded) noexcept;
-	[[nodiscard]] bool InvalidateRegion(uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
 		static_assert(std::is_invocable_v<Flush&>);
@@ -78,10 +71,8 @@ public:
 			EXIT("memory invalidation retained GPU-owned pages\n");
 		}
 	}
-	[[nodiscard]] bool InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr,
-	                                             uint64_t size, PageFaultPhase phase) noexcept;
-	void               ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
-	                                         const char* operation) const noexcept;
+	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+	                           const char* operation) const noexcept;
 	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                               const char* operation);
 
@@ -102,9 +93,6 @@ public:
 		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const auto address = manager->GetCpuAddr() + offset;
-			if (manager->HasPendingFault(address, bytes)) {
-				EXIT("GPU download synchronization raced a pending CPU fault\n");
-			}
 			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes,
 			                                                                preflight);
 		});
@@ -141,7 +129,6 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->Track(manager->GetCpuAddr() + offset, bytes);
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {

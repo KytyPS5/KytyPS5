@@ -157,7 +157,6 @@ void MemoryTracker::UntrackMemoryLocked(uint64_t vaddr, uint64_t size) {
 		const auto changed =
 		    manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 		manager->ApplyProtection(changed, false);
-		manager->Untrack(manager->GetCpuAddr() + offset, bytes);
 	});
 	locks.clear();
 }
@@ -166,95 +165,6 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
 	UntrackMemoryLocked(vaddr, size);
-}
-
-bool MemoryTracker::InvalidateRegion(uint64_t vaddr, uint64_t size, PageFaultPhase phase) noexcept {
-	switch (phase) {
-		case PageFaultPhase::Release: return true;
-		case PageFaultPhase::Invalidate: {
-			const auto action = BeginCpuFault(vaddr, size);
-			switch (action) {
-				case CpuFaultAction::Untracked: return false;
-				case CpuFaultAction::Continue: return true;
-				case CpuFaultAction::Download:
-					EXIT("generic region invalidation cannot download GPU-dirty memory\n");
-			}
-		}
-		case PageFaultPhase::Complete:
-			return CompleteCpuFault(vaddr, size, PageFaultAccess::Write, false);
-	}
-	EXIT("unsupported region invalidation phase\n");
-}
-
-bool MemoryTracker::InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-                                              PageFaultPhase phase) noexcept {
-	switch (phase) {
-		case PageFaultPhase::Release: return true;
-		case PageFaultPhase::Invalidate: {
-			const bool gpu_modified = Iterate<false>(
-			    vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				    std::scoped_lock lock(manager->lock);
-				    return manager->IsModified<DirtySource::Gpu>(offset, bytes);
-			    });
-			if (!gpu_modified) {
-				return false;
-			}
-			const auto action = BeginCpuFault(vaddr, size);
-			if (access != PageFaultAccess::Write || action != CpuFaultAction::Download) {
-				EXIT("virtual GPU write fault requires write access to GPU-dirty memory\n");
-			}
-			return true;
-		}
-		case PageFaultPhase::Complete: {
-			if (access != PageFaultAccess::Write) {
-				EXIT("virtual GPU write completion requires write access\n");
-			}
-			bool completed = false;
-			Iterate<false>(
-			    vaddr, size, [&completed](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				    std::scoped_lock lock(manager->lock);
-				    if (completed) {
-					    EXIT("virtual GPU write fault spans multiple tracked regions\n");
-				    }
-				    completed =
-				        manager->CompleteVirtualGpuWrite(manager->GetCpuAddr() + offset, bytes);
-			    });
-			return completed;
-		}
-	}
-	EXIT("unsupported virtual GPU write invalidation phase\n");
-}
-
-CpuFaultAction MemoryTracker::BeginCpuFault(uint64_t vaddr, uint64_t size,
-                                            PageFaultAccess access) noexcept {
-	CheckNotInUploadCallback();
-	CpuFaultAction action = CpuFaultAction::Untracked;
-	Iterate<false>(
-	    vaddr, size, [&action, access](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		    std::scoped_lock lock(manager->lock);
-		    if (action != CpuFaultAction::Untracked) {
-			    EXIT("CPU fault spans multiple tracked regions\n");
-		    }
-		    action = manager->BeginCpuFault(manager->GetCpuAddr() + offset, bytes, access);
-	    });
-	return action;
-}
-
-bool MemoryTracker::CompleteCpuFault(uint64_t vaddr, uint64_t size, PageFaultAccess access,
-                                     bool downloaded) noexcept {
-	CheckNotInUploadCallback();
-	bool found = false;
-	Iterate<false>(
-	    vaddr, size,
-	    [&found, access, downloaded](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		    std::scoped_lock lock(manager->lock);
-		    if (found) {
-			    EXIT("CPU fault completion spans multiple tracked regions\n");
-		    }
-		    found = manager->CompleteCpuFault(manager->GetCpuAddr() + offset, bytes, access,
-		                                      downloaded);
-	    });
-	return found;
 }
 
 } // namespace Libs::Graphics

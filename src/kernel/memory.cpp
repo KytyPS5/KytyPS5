@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -805,15 +806,15 @@ private:
 	Common::Mutex              m_mutex;
 };
 
-static PhysicalMemory*       g_physical_memory       = nullptr;
-static FlexibleMemory*       g_flexible_memory       = nullptr;
-static PooledMemory*         g_pooled_memory         = nullptr;
-static VirtualRanges*        g_virtual_ranges        = nullptr;
-static GuestAddressSpace*    g_guest_address_space   = nullptr;
-static callback_func_t       g_alloc_callback        = nullptr;
-static callback_func_t       g_free_callback         = nullptr;
-static std::atomic<uint64_t> g_memory_pool_committed = 0;
-static void                  MemoryPoolSubtractCommitted(uint64_t len);
+static std::unique_ptr<PhysicalMemory>    g_physical_memory;
+static std::unique_ptr<FlexibleMemory>    g_flexible_memory;
+static std::unique_ptr<PooledMemory>      g_pooled_memory;
+static std::unique_ptr<VirtualRanges>     g_virtual_ranges;
+static std::unique_ptr<GuestAddressSpace> g_guest_address_space;
+static callback_func_t                    g_alloc_callback        = nullptr;
+static callback_func_t                    g_free_callback         = nullptr;
+static std::atomic<uint64_t>              g_memory_pool_committed = 0;
+static void                               MemoryPoolSubtractCommitted(uint64_t len);
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
@@ -970,11 +971,11 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 KYTY_SUBSYSTEM_INIT(Memory) {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
-	g_guest_address_space = new GuestAddressSpace(PhysicalMemory::TotalSize());
-	g_physical_memory     = new PhysicalMemory;
-	g_flexible_memory     = new FlexibleMemory;
-	g_pooled_memory       = new PooledMemory;
-	g_virtual_ranges      = new VirtualRanges;
+	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	g_physical_memory     = std::make_unique<PhysicalMemory>();
+	g_flexible_memory     = std::make_unique<FlexibleMemory>();
+	g_pooled_memory       = std::make_unique<PooledMemory>();
+	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 }
@@ -982,16 +983,11 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Memory) {}
 
 KYTY_SUBSYSTEM_DESTROY(Memory) {
-	delete g_pooled_memory;
-	g_pooled_memory = nullptr;
-	delete g_flexible_memory;
-	g_flexible_memory = nullptr;
-	delete g_physical_memory;
-	g_physical_memory = nullptr;
-	delete g_virtual_ranges;
-	g_virtual_ranges = nullptr;
-	delete g_guest_address_space;
-	g_guest_address_space = nullptr;
+	g_pooled_memory.reset();
+	g_flexible_memory.reset();
+	g_physical_memory.reset();
+	g_virtual_ranges.reset();
+	g_guest_address_space.reset();
 }
 
 struct AlignedPos {

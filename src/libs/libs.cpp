@@ -66,6 +66,7 @@ LIB_DEFINE(InitSaveData_1);
 LIB_DEFINE(InitShare_1);
 LIB_DEFINE(InitSysmodule_1);
 LIB_DEFINE(InitSystemService_1);
+LIB_DEFINE(InitTextToSpeech2_1);
 LIB_DEFINE(InitUserService_1);
 LIB_DEFINE(InitVideoOut_1);
 
@@ -100,6 +101,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(InitShare_1);
 	LIB_LOAD(InitSysmodule_1);
 	LIB_LOAD(InitSystemService_1);
+	LIB_LOAD(InitTextToSpeech2_1);
 	LIB_LOAD(LibUlt::InitUlt_1);
 	LIB_LOAD(InitUserService_1);
 	LIB_LOAD(VideoDec2::InitVideoDec2_1);

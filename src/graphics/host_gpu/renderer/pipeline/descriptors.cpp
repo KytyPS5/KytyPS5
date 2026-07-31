@@ -623,8 +623,14 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
 	      descriptor.MaxMip() != last_level || !msaa_tile ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u\n", base_level, last_level,
-		     levels);
+		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
+		     "kind=%u dimension=%u mip_mode=%u read=%d written=%d "
+		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     base_level, last_level, levels, descriptor.MaxMip(), descriptor.Type(), tile,
+		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
+		     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written,
+		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =

@@ -334,15 +334,19 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "sampled_2d",
 	                                        "sampled_2d_array",
 	                                        "sampled_3d",
+	                                        "sampled_2d_msaa",
+	                                        "sampled_2d_msaa_array",
 	                                        "sampled_uint_1d",
 	                                        "sampled_uint_1d_array",
 	                                        "sampled_uint_2d",
 	                                        "sampled_uint_2d_array",
-	                                        "sampled_uint_3d"};
+	                                        "sampled_uint_3d",
+	                                        "sampled_uint_2d_msaa",
+	                                        "sampled_uint_2d_msaa_array"};
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
+		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
 		Decorate(state.sampled_images[i].variable, SampledNames[i],
-		         SampledBindingKind(i >= ImageViewKindCount, view));
+		         SampledBindingKind(i >= SampledImageViewKindCount, view));
 	}
 	constexpr const char* StorageNames[] = {"storage_1d",
 	                                        "storage_1d_array",
@@ -355,9 +359,9 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "storage_uint_2d_array",
 	                                        "storage_uint_3d"};
 	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
+		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
 		Decorate(state.storage_images[i].variable, StorageNames[i],
-		         StorageBindingKind(i >= ImageViewKindCount, view));
+		         StorageBindingKind(i >= StorageImageViewKindCount, view));
 	}
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
@@ -480,7 +484,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.needs_image_gather_extended) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
-	if (std::any_of(state.storage_images.begin(), state.storage_images.begin() + ImageViewKindCount,
+	if (std::any_of(state.storage_images.begin(),
+	                state.storage_images.begin() + StorageImageViewKindCount,
 	                [](const auto& image) { return image.variable != 0; })) {
 		state.builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
 		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
@@ -724,11 +729,12 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	}
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
 		auto&      image     = state.sampled_images[i];
-		const auto view      = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		const bool integer   = i >= ImageViewKindCount;
+		const auto view      = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		const bool integer   = i >= SampledImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
 		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
-		                       0, ImageSpirvArrayed(view), 0, 1, ImageFormatUnknown});
+		                       0, ImageSpirvArrayed(view), ImageSpirvMultisampled(view), 1,
+		                       ImageFormatUnknown});
 		state.builder.AddType({OpTypeSampledImage, image.sampled_image_type, image.image_type});
 		state.builder.AddType(
 		    {OpTypePointer, image.pointer_type, StorageClassUniformConstant, image.image_type});
@@ -756,8 +762,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	}
 	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
 		auto&      image     = state.storage_images[i];
-		const auto view      = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		const bool integer   = i >= ImageViewKindCount;
+		const auto view      = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		const bool integer   = i >= StorageImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
 		const auto format    = integer ? ImageFormatR32ui : ImageFormatUnknown;
 		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
@@ -808,15 +814,15 @@ void AllocateDescriptorVariables(EmitterState& state) {
 		state.flattened_srt_variable = state.builder.AllocateId();
 	}
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		if (DescriptorBinding(state, SampledBindingKind(i >= ImageViewKindCount, view)) !=
+		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		if (DescriptorBinding(state, SampledBindingKind(i >= SampledImageViewKindCount, view)) !=
 		    nullptr) {
 			state.sampled_images[i].variable = state.builder.AllocateId();
 		}
 	}
 	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		if (DescriptorBinding(state, StorageBindingKind(i >= ImageViewKindCount, view)) !=
+		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		if (DescriptorBinding(state, StorageBindingKind(i >= StorageImageViewKindCount, view)) !=
 		    nullptr) {
 			state.storage_images[i].variable = state.builder.AllocateId();
 		}

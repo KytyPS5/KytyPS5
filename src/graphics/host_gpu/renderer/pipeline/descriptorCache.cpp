@@ -26,11 +26,15 @@ bool IsSampledImage(BindingKind kind) {
 		case BindingKind::Sampled1DArray:
 		case BindingKind::Sampled2D:
 		case BindingKind::Sampled2DArray:
+		case BindingKind::Sampled2DMsaa:
+		case BindingKind::Sampled2DMsaaArray:
 		case BindingKind::Sampled3D:
 		case BindingKind::SampledUint1D:
 		case BindingKind::SampledUint1DArray:
 		case BindingKind::SampledUint2D:
 		case BindingKind::SampledUint2DArray:
+		case BindingKind::SampledUint2DMsaa:
+		case BindingKind::SampledUint2DMsaaArray:
 		case BindingKind::SampledUint3D: return true;
 		default: return false;
 	}

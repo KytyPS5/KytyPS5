@@ -5774,7 +5774,7 @@ public:
           std::make_shared<ShaderRecompiler::IR::Program>(
               *array_runtime.program);
       colliding_msaa_program->info.images[0].dimension =
-          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
       auto colliding_msaa_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
       colliding_msaa_snapshot->images.push_back(colliding_msaa_descriptor);
@@ -5836,7 +5836,7 @@ public:
       auto msaa_program = std::make_shared<ShaderRecompiler::IR::Program>(
           *array_runtime.program);
       msaa_program->info.images[0].dimension =
-          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
       auto msaa_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
       msaa_snapshot->images.push_back(msaa_descriptor);
@@ -5877,7 +5877,7 @@ public:
       auto msaa_array_program = std::make_shared<ShaderRecompiler::IR::Program>(
           *msaa_runtime.program);
       msaa_array_program->info.images[0].dimension =
-          ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+          ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
       auto msaa_array_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
       msaa_array_snapshot->images.push_back(msaa_array_descriptor);

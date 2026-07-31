@@ -15,7 +15,8 @@ constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
-	                      requested == Decoder::ImageDimension::Dim2DArray;
+	                      requested == Decoder::ImageDimension::Dim2DArray ||
+	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
 		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
 		case Prospero::ImageType::kColor1DArray:
@@ -26,13 +27,17 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 		case Prospero::ImageType::kColor3D: return Decoder::ImageDimension::Dim3D;
 		case Prospero::ImageType::kCube: return Decoder::ImageDimension::Dim2DArray;
 		case Prospero::ImageType::kColor2DArray:
-		case Prospero::ImageType::kColor2DMsaaArray:
 			if (is_array) {
 				return Decoder::ImageDimension::Dim2DArray;
 			}
 			return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2D:
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2D;
+		case Prospero::ImageType::kColor2DMsaaArray:
+			if (is_array) {
+				return Decoder::ImageDimension::Dim2DMsaaArray;
+			}
+			return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
+		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }

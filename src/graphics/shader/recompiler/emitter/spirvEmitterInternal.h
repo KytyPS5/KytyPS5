@@ -99,6 +99,7 @@ enum : uint32_t {
 	ImageOperandsGradMask         = 0x00000004u,
 	ImageOperandsOffsetMask       = 0x00000010u,
 	ImageOperandsConstOffsetsMask = 0x00000020u,
+	ImageOperandsSampleMask       = 0x00000040u,
 };
 
 enum : uint32_t {
@@ -150,7 +151,6 @@ enum : uint32_t {
 	OpImageGather                  = 96,
 	OpImageDrefGather              = 97,
 	OpImageWrite                   = 99,
-	OpImage                        = 100,
 	OpImageQuerySizeLod            = 103,
 	OpImageQueryLod                = 105,
 	OpImageQueryLevels             = 106,
@@ -382,7 +382,7 @@ struct EmitterState {
 	uint32_t                                         ptr_workgroup_array       = 0;
 	uint32_t                                         ptr_workgroup_uint        = 0;
 	uint32_t                                         lds_variable              = 0;
-	std::array<SampledImageDescriptors, 10>          sampled_images;
+	std::array<SampledImageDescriptors, 14>          sampled_images;
 	std::array<StorageImageDescriptors, 10>          storage_images;
 	uint32_t                                         sampler_type                          = 0;
 	uint32_t                                         sampler_array_type                    = 0;
@@ -453,17 +453,20 @@ enum class ImageViewKind {
 	Dim2D,
 	Dim2DArray,
 	Dim3D,
+	Dim2DMsaa,
+	Dim2DMsaaArray,
 	Count,
 };
 
-constexpr uint32_t ImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
+constexpr uint32_t SampledImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
+constexpr uint32_t StorageImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Dim2DMsaa);
 
 constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? ImageViewKindCount : 0u);
+	return static_cast<uint32_t>(view) + (integer ? SampledImageViewKindCount : 0u);
 }
 
 constexpr uint32_t StorageImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? ImageViewKindCount : 0u);
+	return static_cast<uint32_t>(view) + (integer ? StorageImageViewKindCount : 0u);
 }
 
 constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
@@ -474,6 +477,9 @@ constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKi
 			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::SampledUint2D;
 			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::SampledUint2DArray;
 			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::SampledUint3D;
+			case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::SampledUint2DMsaa;
+			case ImageViewKind::Dim2DMsaaArray:
+				return IR::DescriptorBindingKind::SampledUint2DMsaaArray;
 			default: break;
 		}
 	}
@@ -483,6 +489,8 @@ constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKi
 		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Sampled2D;
 		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Sampled2DArray;
 		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Sampled3D;
+		case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::Sampled2DMsaa;
+		case ImageViewKind::Dim2DMsaaArray: return IR::DescriptorBindingKind::Sampled2DMsaaArray;
 		default: break;
 	}
 	return IR::DescriptorBindingKind::Count;
@@ -516,6 +524,8 @@ constexpr uint32_t ImageSpirvDimension(ImageViewKind view) {
 		case ImageViewKind::Dim1DArray: return Dim1D;
 		case ImageViewKind::Dim2D:
 		case ImageViewKind::Dim2DArray:
+		case ImageViewKind::Dim2DMsaa:
+		case ImageViewKind::Dim2DMsaaArray:
 		case ImageViewKind::Count: return Dim2D;
 		case ImageViewKind::Dim3D: return Dim3D;
 	}
@@ -523,7 +533,14 @@ constexpr uint32_t ImageSpirvDimension(ImageViewKind view) {
 }
 
 constexpr uint32_t ImageSpirvArrayed(ImageViewKind view) {
-	return view == ImageViewKind::Dim1DArray || view == ImageViewKind::Dim2DArray ? 1u : 0u;
+	return view == ImageViewKind::Dim1DArray || view == ImageViewKind::Dim2DArray ||
+	               view == ImageViewKind::Dim2DMsaaArray
+	           ? 1u
+	           : 0u;
+}
+
+constexpr uint32_t ImageSpirvMultisampled(ImageViewKind view) {
+	return view == ImageViewKind::Dim2DMsaa || view == ImageViewKind::Dim2DMsaaArray ? 1u : 0u;
 }
 
 struct AddCarryResult {

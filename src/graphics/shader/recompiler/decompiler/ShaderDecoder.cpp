@@ -194,6 +194,8 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 		case ImageDimension::Dim2D: return "2d";
 		case ImageDimension::Dim3D: return "3d";
 		case ImageDimension::Dim2DArray: return "2d_array";
+		case ImageDimension::Dim2DMsaa: return "2d_msaa";
+		case ImageDimension::Dim2DMsaaArray: return "2d_msaa_array";
 		default: return "unknown";
 	}
 }
@@ -220,9 +222,9 @@ bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::strin
 	}
 	if (code >= 240u && code <= 247u) {
 		constexpr float values[] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
-		operand.kind            = OperandKind::FloatInlineConstant;
-		operand.float_val       = values[code - 240u];
-		operand.value           = FloatBits(operand.float_val);
+		operand.kind             = OperandKind::FloatInlineConstant;
+		operand.float_val        = values[code - 240u];
+		operand.value            = FloatBits(operand.float_val);
 		return true;
 	}
 	if (code >= 256u && code <= 511u) {
@@ -285,7 +287,7 @@ bool DecodeVectorGpr(uint32_t reg, Operand& operand, std::string* error) {
 		SetError(error, "VGPR index is out of range");
 		return false;
 	}
-	operand       = {};
+	operand      = {};
 	operand.kind = OperandKind::Vgpr;
 	operand.reg  = reg;
 	return true;

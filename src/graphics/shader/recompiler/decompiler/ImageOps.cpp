@@ -35,9 +35,9 @@ constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 		case 2u: return ImageDimension::Dim3D;
 		case 3u: return ImageDimension::Dim2DArray;
 		case 4u: return ImageDimension::Dim1DArray;
-		case 5u:
-		case 7u: return ImageDimension::Dim2DArray;
-		case 6u: return ImageDimension::Dim2D;
+		case 5u: return ImageDimension::Dim2DArray;
+		case 6u: return ImageDimension::Dim2DMsaa;
+		case 7u: return ImageDimension::Dim2DMsaaArray;
 		default: return ImageDimension::Unknown;
 	}
 }
@@ -46,8 +46,10 @@ constexpr uint32_t ImageCoordComponents(ImageDimension dimension) {
 	switch (dimension) {
 		case ImageDimension::Dim1D: return 1u;
 		case ImageDimension::Dim1DArray: return 2u;
+		case ImageDimension::Dim2DMsaa:
 		case ImageDimension::Dim3D:
 		case ImageDimension::Dim2DArray: return 3u;
+		case ImageDimension::Dim2DMsaaArray: return 4u;
 		default: return 2u;
 	}
 }

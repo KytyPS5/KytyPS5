@@ -30,9 +30,15 @@ bool ImageBinding(const IR::ImageResource& image, IR::DescriptorBindingKind& kin
 				kind = integer ? Kind::SampledUint1DArray : Kind::Sampled1DArray;
 				return true;
 			case Dim::Dim2D: kind = integer ? Kind::SampledUint2D : Kind::Sampled2D; return true;
+			case Dim::Dim2DMsaa:
+				kind = integer ? Kind::SampledUint2DMsaa : Kind::Sampled2DMsaa;
+				return true;
 			case Dim::Dim3D: kind = integer ? Kind::SampledUint3D : Kind::Sampled3D; return true;
 			case Dim::Dim2DArray:
 				kind = integer ? Kind::SampledUint2DArray : Kind::Sampled2DArray;
+				return true;
+			case Dim::Dim2DMsaaArray:
+				kind = integer ? Kind::SampledUint2DMsaaArray : Kind::Sampled2DMsaaArray;
 				return true;
 			case Dim::Unknown: return false;
 		}
@@ -51,6 +57,8 @@ bool ImageBinding(const IR::ImageResource& image, IR::DescriptorBindingKind& kin
 		case Dim::Dim2DArray:
 			kind = uint_image ? Kind::StorageUint2DArray : Kind::Storage2DArray;
 			return true;
+		case Dim::Dim2DMsaa:
+		case Dim::Dim2DMsaaArray: return false;
 		case Dim::Unknown: return false;
 	}
 	return false;

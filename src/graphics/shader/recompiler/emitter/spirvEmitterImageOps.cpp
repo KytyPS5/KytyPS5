@@ -35,9 +35,9 @@ uint32_t ConstantImageGatherHorizontalOffsets(EmitterState& state, ImageViewKind
 uint32_t LoadStorageImageDescriptorAtIndex(EmitterState& state, uint32_t resource,
                                            uint32_t array_index, bool uint_image,
                                            ImageViewKind view) {
-	const auto kind = StorageBindingKind(uint_image, view);
+	const auto  kind        = StorageBindingKind(uint_image, view);
 	const auto& descriptors = state.storage_images[StorageImageIndex(uint_image, view)];
-	const auto pointer =
+	const auto  pointer =
 	    DescriptorElementPointer(state, descriptors.pointer_type, descriptors.variable, array_index,
 	                             kind, resource, "storage image descriptor array was not emitted");
 	const auto image = state.builder.AllocateId();
@@ -133,10 +133,18 @@ void EmitImageLoad(EmitterState& state, const IR::Instruction& inst) {
 	const bool integer = inst.memory.kind == IR::ResourceKind::ImageUint;
 
 	const auto color = state.builder.AllocateId();
-	state.builder.AddFunction({OpImageFetch, integer ? state.vec4_uint_type : state.vec4_float_type,
-	                           color, image, EmitImageLoadCoordU32(state, inst, view),
-	                           ImageOperandsLodMask,
-	                           EmitImageMipLodU32(state, inst, inst.src[0], view)});
+	const auto coord = EmitImageLoadCoordU32(state, inst, view);
+	if (ImageSpirvMultisampled(view) != 0) {
+		const auto sample = EmitImageAddressValueLoad(state, inst, inst.src[0],
+		                                              ImageViewCoordinateComponents(view));
+		state.builder.AddFunction({OpImageFetch,
+		                           integer ? state.vec4_uint_type : state.vec4_float_type, color,
+		                           image, coord, ImageOperandsSampleMask, sample});
+	} else {
+		state.builder.AddFunction(
+		    {OpImageFetch, integer ? state.vec4_uint_type : state.vec4_float_type, color, image,
+		     coord, ImageOperandsLodMask, EmitImageMipLodU32(state, inst, inst.src[0], view)});
+	}
 
 	const auto dmask     = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
 	uint32_t   dst_index = 0;
@@ -158,8 +166,8 @@ void EmitImageLoad(EmitterState& state, const IR::Instruction& inst) {
 void EmitImageStore(EmitterState& state, const IR::Instruction& inst) {
 	const auto uint_image = inst.memory.kind == IR::ResourceKind::StorageImageUint;
 	const auto view       = StorageImageViewKind(state, inst.memory, uint_image, inst.pc);
-	const auto binding    = ResourceForDescriptor(state, StorageBindingKind(uint_image, view),
-	                                              inst.memory.resource);
+	const auto binding =
+	    ResourceForDescriptor(state, StorageBindingKind(uint_image, view), inst.memory.resource);
 	const auto image = LoadStorageImageDescriptorAtIndex(state, inst.memory.resource,
 	                                                     binding.array_index, uint_image, view);
 
@@ -261,9 +269,9 @@ void EmitImageSample(EmitterState& state, const IR::Instruction& inst) {
 	} else if (integer) {
 		result_type = state.vec4_uint_type;
 	}
-	const auto explicit_lod = ImageSampleNeedsExplicitLod(state, inst);
-	const auto opcode       = ImageSampleOpcode(state, inst);
-	std::vector<uint32_t> words = {opcode, result_type, sample, sampled_image, base_coord};
+	const auto            explicit_lod = ImageSampleNeedsExplicitLod(state, inst);
+	const auto            opcode       = ImageSampleOpcode(state, inst);
+	std::vector<uint32_t> words        = {opcode, result_type, sample, sampled_image, base_coord};
 	if (dref) {
 		words.push_back(EmitImageDrefF32(state, inst, layout));
 	}

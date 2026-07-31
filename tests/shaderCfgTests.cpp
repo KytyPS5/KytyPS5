@@ -221,7 +221,7 @@ uint32_t SpirvExtInstCount(const std::vector<uint32_t>& binary, uint32_t ext_ins
 }
 
 bool SpirvContainsTypeImage(const std::vector<uint32_t>& binary, uint32_t dim, uint32_t arrayed,
-                            uint32_t sampled) {
+                            uint32_t sampled, uint32_t multisampled = 0) {
 	for (size_t i = 5; i < binary.size();) {
 		const uint32_t word       = binary[i];
 		const uint32_t opcode     = word & 0xffffu;
@@ -230,7 +230,7 @@ bool SpirvContainsTypeImage(const std::vector<uint32_t>& binary, uint32_t dim, u
 			return false;
 		}
 		if (opcode == 25u && word_count >= 9u && binary[i + 3] == dim && binary[i + 5] == arrayed &&
-		    binary[i + 7] == sampled) {
+		    binary[i + 6] == multisampled && binary[i + 7] == sampled) {
 			return true;
 		}
 		i += word_count;
@@ -2972,7 +2972,6 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
 	Check(SpirvContainsOpcode(result.spirv, 61), "SPIR-V binary does not contain OpLoad");
 	Check(SpirvContainsOpcode(result.spirv, 62), "SPIR-V binary does not contain OpStore");
 	Check(SpirvContainsOpcode(result.spirv, 95), "SPIR-V binary does not contain OpImageFetch");
-	Check(SpirvContainsOpcode(result.spirv, 100), "SPIR-V binary does not contain OpImage");
 	Check(SpirvContainsOpcode(result.spirv, 103),
 	      "SPIR-V binary does not contain OpImageQuerySizeLod");
 	Check(SpirvContainsOpcode(result.spirv, 88),
@@ -3764,6 +3763,50 @@ void TestNewShaderRecompilerImageLoadVariants() {
 	Check(SpirvContainsOpcode(result.spirv, 124),
 	      "SPIR-V binary does not contain OpBitcast for image-load result bits");
 	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageLoad2DMsaa() {
+	const uint32_t shader[] = {
+	    0xf0000130u, // image_load v3, v[5:7], s[0:7] dmask:x dim:2d_msaa
+	    0x00000305u,
+	    0xbf810000u,
+	};
+
+	auto user_data = ImageTestUserData(Prospero::ImageType::kColor2DMsaa);
+	user_data[3] |= 2u << 16u;
+	user_data[5] |= 2u << 4u;
+	user_data[6] |= 1u << 10u;
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage     = ShaderType::Pixel;
+	options.dump_ir   = true;
+	options.user_data = user_data.data();
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.decoded_dump, "image_dim=2d_msaa") &&
+	          Common::ContainsStr(result.ir_dump, "image_dim=2d_msaa") &&
+	          Common::ContainsStr(result.ir_dump, "image_addr=3 image_mip=0"),
+	      "RDNA2 2D-MSAA load did not preserve x, y, and fragment ID");
+	Check(result.program.info.images.size() == 1 &&
+	          result.program.info.images[0].dimension ==
+	              ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa,
+	      "2D-MSAA descriptor specialization lost the multisample dimension");
+	Check(ShaderRecompiler::IR::FindBinding(
+	          result.program.bindings,
+	          ShaderRecompiler::IR::DescriptorBindingKind::Sampled2DMsaa) != nullptr,
+	      "2D-MSAA image did not receive a multisampled descriptor binding");
+	Check(SpirvContainsTypeImage(result.spirv, 1, 0, 1, 1),
+	      "SPIR-V binary does not contain a multisampled 2D image type");
+	CheckSpirvBinaryValidates(result.spirv);
+	const auto source = DisassembleSpirvBinary(result.spirv);
+	Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "sampled_2d_msaa"),
+	      "2D-MSAA load did not access its multisampled descriptor");
+	Check(SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Sample "),
+	      "2D-MSAA load did not emit the fragment ID as a SPIR-V Sample operand");
+	Check(!SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Lod "),
+	      "2D-MSAA load incorrectly emitted its fragment ID as a mip level");
 }
 
 void TestNewShaderRecompilerImageStoreLowering() {
@@ -7018,6 +7061,7 @@ int main() {
 	TestNewShaderRecompilerImageGatherVariants();
 	TestNewShaderRecompilerImageLoadA16UintCoords();
 	TestNewShaderRecompilerImageLoadVariants();
+	TestNewShaderRecompilerImageLoad2DMsaa();
 	TestNewShaderRecompilerImageStoreLowering();
 	TestNewShaderRecompilerStorageImage3DDescriptorVariant();
 	TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D();

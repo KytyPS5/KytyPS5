@@ -73,6 +73,11 @@ static Prospero::ImageType TextureBaseType(Prospero::ImageType type) {
 	}
 }
 
+static bool IsMultisampledTexture(Prospero::ImageType type) {
+	return type == Prospero::ImageType::kColor2DMsaa ||
+	       type == Prospero::ImageType::kColor2DMsaaArray;
+}
+
 static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& command_buffer,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -159,6 +164,8 @@ static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageRes
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
 			supported_dimension = true;
 			break;
 		default: break;
@@ -195,6 +202,22 @@ TargetTextureViewInfo ResolveTargetTextureView(const ShaderRecompiler::IR::Image
 			           ? TargetTextureViewInfo {vk::ImageViewType::e2DArray, base_layer,
 			                                    image_layers - base_layer}
 			           : TargetTextureViewInfo {};
+		case Prospero::ImageType::kColor2DMsaa:
+			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+			               base_layer == 0 && image_layers == 1
+			           ? TargetTextureViewInfo {vk::ImageViewType::e2D, 0, 1}
+			           : TargetTextureViewInfo {};
+		case Prospero::ImageType::kColor2DMsaaArray:
+			if (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+			    base_layer == 0 && image_layers == 1) {
+				return {vk::ImageViewType::e2D, 0, 1};
+			}
+			return resource.dimension ==
+			                   ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray &&
+			               base_layer < image_layers
+			           ? TargetTextureViewInfo {vk::ImageViewType::e2DArray, base_layer,
+			                                    image_layers - base_layer}
+			           : TargetTextureViewInfo {};
 		default: return {};
 	}
 }
@@ -209,10 +232,14 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 }
 
 bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, const Image& image) {
-	const auto width  = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
-	const auto pitch  = TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
-	const auto type   = static_cast<Prospero::ImageType>(descriptor.Type());
+	const auto width        = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+	const auto height       = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	const auto type         = static_cast<Prospero::ImageType>(descriptor.Type());
+	const bool multisampled = IsMultisampledTexture(type);
+	const auto samples      = multisampled ? 1u << descriptor.LastLevel() : 1u;
+	const auto pitch =
+	    multisampled ? TileGetDepthPitch(width, image.info.bytes_per_block, descriptor.LastLevel())
+	                 : TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
 	const bool supported_2d    = type == Prospero::ImageType::kColor2D &&
 	                             image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
 	                             descriptor.BaseArray5() == 0;
@@ -224,28 +251,45 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	    image.info.resources.layers % 6u == 0 &&
 	    static_cast<uint32_t>(descriptor.Depth()) + 1u == image.info.resources.layers &&
 	    descriptor.BaseArray5() == 0;
+	const bool supported_msaa_2d    = type == Prospero::ImageType::kColor2DMsaa &&
+	                                  image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
+	                                  descriptor.BaseArray5() == 0;
+	const bool supported_msaa_array = type == Prospero::ImageType::kColor2DMsaaArray &&
+	                                  descriptor.BaseArray5() <= descriptor.Depth() &&
+	                                  descriptor.Depth() < image.info.resources.layers;
+	const bool levels_ok =
+	    multisampled
+	        ? descriptor.BaseLevel() == 0 && descriptor.LastLevel() >= 1 &&
+	              descriptor.LastLevel() <= 3 && descriptor.MaxMip() == descriptor.LastLevel() &&
+	              image.info.resources.levels == 1 && image.info.samples == samples
+	        : descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
+	              descriptor.MaxMip() == 0 && image.info.samples == 1;
 	return image.info.IsDepth() && width == image.info.extent.width &&
 	       height == image.info.extent.height &&
-	       (supported_2d || supported_array || supported_cube) && descriptor.BaseLevel() == 0 &&
-	       descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0 && descriptor.MinLod() == 0 &&
+	       (supported_2d || supported_array || supported_cube || supported_msaa_2d ||
+	        supported_msaa_array) &&
+	       levels_ok && descriptor.MinLod() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
-	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth() && pitch >= width &&
-	       pitch == image.info.pitch;
+	       descriptor.BCSwizzle() == 0 && descriptor.MsaaDepth() == multisampled &&
+	       pitch >= width && pitch == image.info.pitch;
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, const Image& image) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
-	constexpr uint32_t field3_common        = 0x01800000u;
-	constexpr uint32_t field5_expected      = 0x00700000u;
-	const uint32_t     field3_expected =
-	    (descriptor.Type() << 28u) | field3_common | descriptor.DstSelXYZW();
-	const uint32_t field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
-	const bool     common          = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
-	                                 (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	                                 descriptor.fields[3] == field3_expected &&
-	                                 descriptor.fields[4] == field4_expected &&
-	                                 descriptor.fields[5] == field5_expected;
+	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
+	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
+	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
+	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
+	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
+	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
+	const uint32_t     field5_expected =
+	    0x00700000u | (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
+	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
+	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
+	                    descriptor.fields[3] == field3_expected &&
+	                    descriptor.fields[4] == field4_expected &&
+	                    descriptor.fields[5] == field5_expected;
 	if (!common || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0)) {
 		return false;
 	}
@@ -253,8 +297,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 		return true;
 	}
 	constexpr uint32_t htile_control = 0x00280000u;
-	const auto         metadata_addr = descriptor.MetaAddr() << 8u;
-	return (descriptor.fields[6] & 0x00ffffffu) == htile_control && metadata_addr != 0 &&
+	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
+	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
+	return (descriptor.fields[6] & 0x00ffffffu) == expected_control && metadata_addr != 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	       image.info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	       image.info.metadata.kind == ImageMetadataKind::Htile &&
@@ -520,6 +565,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.layer_count = 1;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
@@ -528,6 +574,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.layer_count = image_layers - view.base_layer;
 			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
@@ -558,22 +605,23 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		return {id, nullptr, std::move(desc)};
 	}
 
-	const auto address    = descriptor.Base40();
-	const auto width      = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height     = static_cast<uint32_t>(descriptor.Height5()) + 1u;
-	const auto base_level = descriptor.BaseLevel();
-	const auto last_level = descriptor.LastLevel();
-	const auto type       = TextureType(descriptor);
-	const bool multisampled =
-	    type == Prospero::ImageType::kColor2DMsaa || type == Prospero::ImageType::kColor2DMsaaArray;
-	const auto levels     = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
-	const auto tile       = descriptor.TileMode();
-	const bool msaa_tile  = tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+	const auto address      = descriptor.Base40();
+	const auto width        = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+	const auto height       = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	const auto base_level   = descriptor.BaseLevel();
+	const auto last_level   = descriptor.LastLevel();
+	const auto type         = TextureType(descriptor);
+	const bool multisampled = IsMultisampledTexture(type);
+	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
+	const auto tile         = descriptor.TileMode();
+	const bool msaa_tile =
+	    tile == Prospero::GpuEnumValue(descriptor.MsaaDepth() ? Prospero::TileMode::kDepth
+	                                                          : Prospero::TileMode::kRenderTarget);
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
 	if ((!multisampled && (base_level > last_level || last_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
-	      descriptor.MaxMip() != last_level || !msaa_tile || descriptor.MsaaDepth() ||
+	      descriptor.MaxMip() != last_level || !msaa_tile ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u\n", base_level, last_level,
 		     levels);

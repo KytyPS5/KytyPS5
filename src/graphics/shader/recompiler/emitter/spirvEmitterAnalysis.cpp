@@ -129,7 +129,7 @@ uint32_t MaxCollectedVectorRegisterEnd(const std::vector<RegisterBinding>& regis
 }
 
 void CollectMoveRelSourceRegisters(const IR::Program&            program,
-	                               std::vector<RegisterBinding>& registers) {
+                                   std::vector<RegisterBinding>& registers) {
 	const auto max_vector_end = MaxCollectedVectorRegisterEnd(registers);
 	for (const auto& block: program.blocks) {
 		for (const auto& inst: block.instructions) {
@@ -276,8 +276,7 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 		if (HasOutput(state.outputs, output.kind, output.index)) {
 			continue;
 		}
-		state.outputs.push_back(
-		    {output.kind, output.index, output.location, 0, output.debug_name});
+		state.outputs.push_back({output.kind, output.index, output.location, 0, output.debug_name});
 	}
 }
 
@@ -576,6 +575,8 @@ ImageViewKind ImageViewKindFromDimension(Decoder::ImageDimension dimension) {
 		case Decoder::ImageDimension::Dim1DArray: return ImageViewKind::Dim1DArray;
 		case Decoder::ImageDimension::Dim2DArray: return ImageViewKind::Dim2DArray;
 		case Decoder::ImageDimension::Dim3D: return ImageViewKind::Dim3D;
+		case Decoder::ImageDimension::Dim2DMsaa: return ImageViewKind::Dim2DMsaa;
+		case Decoder::ImageDimension::Dim2DMsaaArray: return ImageViewKind::Dim2DMsaaArray;
 		default: return ImageViewKind::Dim2D;
 	}
 }
@@ -601,7 +602,9 @@ uint32_t ImageViewCoordinateComponents(ImageViewKind view) {
 		case ImageViewKind::Dim1DArray:
 		case ImageViewKind::Dim2D: return 2u;
 		case ImageViewKind::Dim2DArray:
+		case ImageViewKind::Dim2DMsaaArray:
 		case ImageViewKind::Dim3D: return 3u;
+		case ImageViewKind::Dim2DMsaa: return 2u;
 		default: return 0u;
 	}
 }
@@ -611,7 +614,9 @@ uint32_t ImageViewSpatialComponents(ImageViewKind view) {
 		case ImageViewKind::Dim1D:
 		case ImageViewKind::Dim1DArray: return 1u;
 		case ImageViewKind::Dim2D:
-		case ImageViewKind::Dim2DArray: return 2u;
+		case ImageViewKind::Dim2DArray:
+		case ImageViewKind::Dim2DMsaa:
+		case ImageViewKind::Dim2DMsaaArray: return 2u;
 		case ImageViewKind::Dim3D: return 3u;
 		default: return 0u;
 	}
@@ -663,8 +668,7 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& m
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t use_pc) {
 	(void)use_pc;
-	const auto binding =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
+	const auto binding = ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto pointer = DescriptorElementPointer(
 	    state, state.ptr_uniform_sampler, state.sampler_variable, binding.array_index,
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");

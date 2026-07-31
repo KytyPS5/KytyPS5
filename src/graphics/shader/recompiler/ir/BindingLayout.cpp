@@ -13,16 +13,30 @@ namespace {
 constexpr uint32_t MaxPushConstantBytes = 128;
 
 constexpr std::array ImageBindingKinds = {
-    DescriptorBindingKind::Sampled1D,          DescriptorBindingKind::Sampled1DArray,
-    DescriptorBindingKind::Sampled2D,          DescriptorBindingKind::Sampled2DArray,
-    DescriptorBindingKind::Sampled3D,          DescriptorBindingKind::SampledUint1D,
-    DescriptorBindingKind::SampledUint1DArray, DescriptorBindingKind::SampledUint2D,
-    DescriptorBindingKind::SampledUint2DArray, DescriptorBindingKind::SampledUint3D,
-    DescriptorBindingKind::Storage1D,          DescriptorBindingKind::Storage1DArray,
-    DescriptorBindingKind::Storage2D,          DescriptorBindingKind::Storage2DArray,
-    DescriptorBindingKind::Storage3D,          DescriptorBindingKind::StorageUint1D,
-    DescriptorBindingKind::StorageUint1DArray, DescriptorBindingKind::StorageUint2D,
-    DescriptorBindingKind::StorageUint2DArray, DescriptorBindingKind::StorageUint3D,
+    DescriptorBindingKind::Sampled1D,
+    DescriptorBindingKind::Sampled1DArray,
+    DescriptorBindingKind::Sampled2D,
+    DescriptorBindingKind::Sampled2DArray,
+    DescriptorBindingKind::Sampled2DMsaa,
+    DescriptorBindingKind::Sampled2DMsaaArray,
+    DescriptorBindingKind::Sampled3D,
+    DescriptorBindingKind::SampledUint1D,
+    DescriptorBindingKind::SampledUint1DArray,
+    DescriptorBindingKind::SampledUint2D,
+    DescriptorBindingKind::SampledUint2DArray,
+    DescriptorBindingKind::SampledUint2DMsaa,
+    DescriptorBindingKind::SampledUint2DMsaaArray,
+    DescriptorBindingKind::SampledUint3D,
+    DescriptorBindingKind::Storage1D,
+    DescriptorBindingKind::Storage1DArray,
+    DescriptorBindingKind::Storage2D,
+    DescriptorBindingKind::Storage2DArray,
+    DescriptorBindingKind::Storage3D,
+    DescriptorBindingKind::StorageUint1D,
+    DescriptorBindingKind::StorageUint1DArray,
+    DescriptorBindingKind::StorageUint2D,
+    DescriptorBindingKind::StorageUint2DArray,
+    DescriptorBindingKind::StorageUint3D,
 };
 
 bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
@@ -36,6 +50,8 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 				case Dimension::Dim1DArray: result = Kind::Sampled1DArray; return true;
 				case Dimension::Dim2D: result = Kind::Sampled2D; return true;
 				case Dimension::Dim2DArray: result = Kind::Sampled2DArray; return true;
+				case Dimension::Dim2DMsaa: result = Kind::Sampled2DMsaa; return true;
+				case Dimension::Dim2DMsaaArray: result = Kind::Sampled2DMsaaArray; return true;
 				case Dimension::Dim3D: result = Kind::Sampled3D; return true;
 				default: return false;
 			}
@@ -45,6 +61,8 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 				case Dimension::Dim1DArray: result = Kind::SampledUint1DArray; return true;
 				case Dimension::Dim2D: result = Kind::SampledUint2D; return true;
 				case Dimension::Dim2DArray: result = Kind::SampledUint2DArray; return true;
+				case Dimension::Dim2DMsaa: result = Kind::SampledUint2DMsaa; return true;
+				case Dimension::Dim2DMsaaArray: result = Kind::SampledUint2DMsaaArray; return true;
 				case Dimension::Dim3D: result = Kind::SampledUint3D; return true;
 				default: return false;
 			}
@@ -71,7 +89,7 @@ bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
 }
 
 bool CollectValue(const ScalarProvenance& provenance, uint32_t id, std::vector<uint8_t>& visited,
-	              std::set<uint32_t>& registers) {
+                  std::set<uint32_t>& registers) {
 	if (id <= ScalarProvenance::Unknown) {
 		return true;
 	}
@@ -104,7 +122,7 @@ bool CollectValue(const ScalarProvenance& provenance, uint32_t id, std::vector<u
 }
 
 bool CollectSource(const Program& program, uint32_t source, bool allow_unknown,
-	               std::vector<uint8_t>& visited, std::set<uint32_t>& registers) {
+                   std::vector<uint8_t>& visited, std::set<uint32_t>& registers) {
 	if (allow_unknown && source == ScalarProvenance::Unknown) {
 		return true;
 	}
@@ -165,8 +183,7 @@ bool CollectUserData(const Program& program, std::vector<uint32_t>& result) {
 				return false;
 			}
 			for (uint32_t i = 0; i < inst.src_count; i++) {
-				if (!CollectValue(program.provenance, inst.scalar_sources[i], visited,
-				                  registers)) {
+				if (!CollectValue(program.provenance, inst.scalar_sources[i], visited, registers)) {
 					return false;
 				}
 			}
@@ -199,7 +216,7 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		if (error != nullptr) {
 			*error = !program.shader_info_complete ? "shader info is not ready"
-			                                      : "binding layout already allocated";
+			                                       : "binding layout already allocated";
 		}
 		return false;
 	}

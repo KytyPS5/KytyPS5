@@ -88,7 +88,9 @@ SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	return resource.kind == ShaderRecompiler::IR::ResourceKind::Image &&
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic;
 }

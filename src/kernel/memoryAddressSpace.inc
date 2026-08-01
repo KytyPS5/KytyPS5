@@ -1059,6 +1059,7 @@ private:
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
 		}};
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		std::vector<std::pair<uint64_t, uint64_t>> occupied;
 		FILE*                                      maps = fopen("/proc/self/maps", "r");
 		EXIT_IF(maps == nullptr);
@@ -1126,6 +1127,27 @@ private:
 				reserve_range(current, region_end);
 			}
 		}
+#else
+		for (const auto& [start, end]: regions) {
+			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+			flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
+			flags |= MAP_FIXED_NOREPLACE;
+#endif
+			void* ptr = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE, flags, -1, 0);
+			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
+				if (ptr != MAP_FAILED) {
+					munmap(ptr, end - start);
+				}
+				EXIT("failed to reserve guest address space at 0x%016" PRIx64
+				     ", size 0x%016" PRIx64 "\n",
+				     start, end - start);
+			}
+			AddFreeUnlocked(start, end - start);
+			m_owned.emplace_back(start, end - start);
+		}
+#endif
 #endif
 	}
 

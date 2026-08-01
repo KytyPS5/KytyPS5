@@ -148,7 +148,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 }
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
-	constexpr uint64_t thunk_size = 162;
+	constexpr uint64_t thunk_size = 165;
 
 	if (g_unresolved_stub_thunk_pages.empty() ||
 	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
@@ -254,6 +254,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	emit(0x41);
 	emit(0xff);
 	emit(0xe3); // jmp r11
+	// Match the integer fallback for floating-point return values.
+	emit(0x0f);
+	emit(0x57);
+	emit(0xc0); // xorps xmm0, xmm0
 	emit(0x31);
 	emit(0xc0); // xor eax, eax
 	emit(0xc3); // ret

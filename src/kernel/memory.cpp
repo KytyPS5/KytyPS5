@@ -858,6 +858,7 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
@@ -2709,6 +2710,21 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 		return KERNEL_ERROR_EAGAIN;
 	}
 
+	// Zero a *freshly allocated* physical range. The backing store is indexed by physical address
+	// and is deliberately never cleared on unmap, so that direct-memory contents survive
+	// unmap/remap (see the aliasing comment in KernelMapDirectMemory). The consequence is that a
+	// range released by one allocation and handed to the next still holds the previous
+	// allocation's bytes -- guest-visible data leaking across allocations, which hardware does not
+	// do. FlexibleMemory::Map already zeroes for exactly this reason; direct memory never did.
+	//
+	// Zeroing here rather than at map time keeps the aliasing invariant intact: map/unmap/remap of
+	// an already-allocated range still preserves its contents.
+	if (g_guest_address_space != nullptr) {
+		if (!g_guest_address_space->ZeroBacking(addr, len)) {
+			LOGF_COLOR(Log::Color::Red, "\t direct memory: failed to zero fresh allocation\n");
+		}
+	}
+
 	*phys_addr_out = static_cast<int64_t>(addr);
 
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
@@ -3880,6 +3896,12 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	                              static_cast<uint64_t>(search_end), len, effective_alignment,
 	                              &phys_addr, 0, true)) {
 		return KERNEL_ERROR_ENOMEM;
+	}
+
+	// Same reasoning as KernelAllocateDirectMemory: a freshly allocated pool expansion must not
+	// expose the bytes of whatever previously owned this physical range.
+	if (g_guest_address_space != nullptr) {
+		(void)g_guest_address_space->ZeroBacking(phys_addr, len);
 	}
 
 	g_pooled_memory->Expand(phys_addr, len);

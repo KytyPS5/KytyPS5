@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <vector>
 
@@ -67,6 +68,15 @@ public:
 		}
 		--it;
 		return it->first <= address && it->second >= end;
+	}
+
+	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.upper_bound(address);
+		if (it != m_ranges.begin() && std::prev(it)->second > address) {
+			return true;
+		}
+		return it != m_ranges.end() && it->first < end;
 	}
 
 	template <typename Func>

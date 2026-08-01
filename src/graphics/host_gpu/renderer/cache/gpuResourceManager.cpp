@@ -115,6 +115,32 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
+	const bool gpu_mapped = [&] {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		return m_mapped_ranges.Intersects(vaddr, size);
+	}();
+	// A range that never went through MapMemory has nothing cached the GPU could still
+	// reference, so skip the submission pause and full GPU drain (muro 40). Callers
+	// hold the global memory-operation mutex, and waiting for the GPU under it
+	// deadlocks against guest label writers the GPU is itself waiting on (three-way
+	// stall: memory op -> pause -> WaitRegMem -> guest writer blocked on the memory op).
+	if (!gpu_mapped) {
+		if (m_resource_mutex.IsOwnedByCurrentThread()) {
+			EXIT("cannot synchronously unmap from a resource transaction\n");
+		}
+		// The short path rests on "never MapMemory'd => nothing cached". Verify it and
+		// fail loud on a violation instead of silently re-creating the cross-thread
+		// wait this branch exists to avoid.
+		const bool cached = m_buffer_cache.HasPageOverlap(vaddr, size) ||
+		                    m_texture_cache.QueryRegion(vaddr, size).image_pages;
+		if (cached) {
+			EXIT("gpu-unmapped range still holds cached resources: addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     vaddr, size);
+		}
+		unmap();
+		return;
+	}
 	Gpu::SubmissionLock submissions(*m_gpu);
 	m_gpu->SendCommandSync(unmap);
 }

@@ -633,6 +633,15 @@ LIB_VERSION("LibcInternalExt", 1, "LibcInternal", 1, 1);
 static uint64_t g_mspace_atomic_id_mask = 0;
 static uint64_t g_mstate_table[64]      = {0};
 
+using thread_atexit_destructor_t = KYTY_SYSV_ABI void (*)(void*);
+
+struct ThreadAtexitDestructor {
+	thread_atexit_destructor_t destructor;
+	void*                      object;
+};
+
+static thread_local std::vector<ThreadAtexitDestructor> g_thread_atexit_destructors;
+
 struct Info {
 	uint64_t  size;
 	uint32_t  unknown1;
@@ -650,25 +659,29 @@ void KYTY_SYSV_ABI LibcHeapGetTraceInfo(Info* info) {
 	info->mstate_table          = g_mstate_table;
 }
 
-uint64_t KYTY_SYSV_ABI LibcInternalExtUnknownQBS714Jr3g(uint64_t arg0, uint64_t arg1, uint64_t arg2,
-                                                        uint64_t arg3, uint64_t arg4,
-                                                        uint64_t arg5) {
+int KYTY_SYSV_ABI LibcInternalExtCxaThreadAtexit(thread_atexit_destructor_t destructor, void* object,
+                                                 void* /*module_id*/) {
 	PRINT_NAME();
 
-	LOGF("\t arg0 = 0x%016" PRIx64 "\n"
-	     "\t arg1 = 0x%016" PRIx64 "\n"
-	     "\t arg2 = 0x%016" PRIx64 "\n"
-	     "\t arg3 = 0x%016" PRIx64 "\n"
-	     "\t arg4 = 0x%016" PRIx64 "\n"
-	     "\t arg5 = 0x%016" PRIx64 "\n",
-	     arg0, arg1, arg2, arg3, arg4, arg5);
+	g_thread_atexit_destructors.push_back({destructor, object});
 
 	return 0;
 }
 
+void RunThreadAtexitDestructors() {
+	while (!g_thread_atexit_destructors.empty()) {
+		auto destructor = g_thread_atexit_destructors.back();
+		g_thread_atexit_destructors.pop_back();
+
+		if (destructor.destructor != nullptr) {
+			destructor.destructor(destructor.object);
+		}
+	}
+}
+
 LIB_DEFINE(InitLibcInternalExt_1) {
 	LIB_FUNC("NWtTN10cJzE", LibcInternalExt::LibcHeapGetTraceInfo);
-	LIB_FUNC("qBS714-Jr3g", LibcInternalExt::LibcInternalExtUnknownQBS714Jr3g);
+	LIB_FUNC("qBS714-Jr3g", LibcInternalExt::LibcInternalExtCxaThreadAtexit);
 }
 
 } // namespace LibcInternalExt

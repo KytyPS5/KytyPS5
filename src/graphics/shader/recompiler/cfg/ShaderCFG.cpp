@@ -897,15 +897,50 @@ bool IsSyntheticMergeForwarder(const Graph& graph, uint32_t block_id, uint32_t m
 	       block->terminator.true_block == merge;
 }
 
-bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
-	return block_id != UINT32_MAX && block_id != loop.merge && block_id != loop.continue_block &&
-	       graph.Dominates(loop.header, block_id) &&
-	       (loop.merge == UINT32_MAX || !graph.Dominates(loop.merge, block_id));
+const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
+	const NaturalLoop* innermost = nullptr;
+	for (const auto& loop: graph.natural_loops) {
+		if (Contains(loop.body_blocks, block_id) &&
+		    (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
+			innermost = &loop;
+		}
+	}
+	return innermost;
 }
 
-bool SelectionMergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t merge) {
+bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
+	return block_id != UINT32_MAX && block_id != loop.merge && block_id != loop.continue_block &&
+	       graph.Dominates(loop.header, block_id) && !graph.Dominates(loop.merge, block_id);
+}
+
+bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& block) {
+	if (block.terminator.kind != TerminatorKind::ConditionalBranch) {
+		return false;
+	}
+	const auto* loop = FindInnermostContainingLoop(graph, block.id);
+	if (loop == nullptr || loop->merge == UINT32_MAX || loop->continue_block == UINT32_MAX) {
+		return false;
+	}
+	const auto true_target  = block.terminator.true_block;
+	const auto false_target = block.terminator.false_block;
+	if (block.id == loop->continue_block) {
+		const auto is_repeat_target = [&](uint32_t target) {
+			return target == loop->header || target == loop->merge;
+		};
+		return is_repeat_target(true_target) && is_repeat_target(false_target);
+	}
+	const auto is_control_target = [&](uint32_t target) {
+		return target == loop->merge || target == loop->continue_block;
+	};
+	return (is_control_target(true_target) &&
+	        (is_control_target(false_target) ||
+	         IsInsideLoopConstruct(graph, *loop, false_target))) ||
+	       (is_control_target(false_target) && IsInsideLoopConstruct(graph, *loop, true_target));
+}
+
+bool MergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t merge) {
 	for (const auto& loop: graph.natural_loops) {
-		if (IsInsideLoopConstruct(graph, loop, header) &&
+		if (loop.header != header && IsInsideLoopConstruct(graph, loop, header) &&
 		    !IsInsideLoopConstruct(graph, loop, merge)) {
 			return true;
 		}
@@ -980,7 +1015,9 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 bool SplitOneLoopMerge(Graph& graph) {
 	const auto& loops = graph.natural_loops;
 	for (const auto& loop: loops) {
-		if (SplitSharedMergeBlock(graph, loop.merge, loop.body_blocks)) {
+		const auto construct_blocks = DominatedBlocks(graph, loop.header, loop.merge);
+		const auto force_split      = MergeLeavesContainingLoop(graph, loop.header, loop.merge);
+		if (SplitSharedMergeBlock(graph, loop.merge, construct_blocks, force_split)) {
 			return true;
 		}
 	}
@@ -1001,11 +1038,14 @@ bool SplitOneSelectionMerge(Graph& graph) {
 		    Contains(loop_headers, block_id)) {
 			continue;
 		}
+		if (IsInnermostLoopControlConditional(graph, *block)) {
+			continue;
+		}
 
 		const auto merge = graph.FindNearestCommonPostDominator(block->terminator.true_block,
 		                                                        block->terminator.false_block);
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
-		const auto force_split      = SelectionMergeLeavesContainingLoop(graph, block_id, merge);
+		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);
 		if (SplitSharedMergeBlock(graph, merge, construct_blocks, force_split)) {
 			return true;
 		}
@@ -1393,6 +1433,9 @@ bool Structurize(Graph& graph, std::string* error) {
 	for (auto& block: graph.blocks) {
 		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
 		    block.terminator.loop_header) {
+			continue;
+		}
+		if (IsInnermostLoopControlConditional(graph, block)) {
 			continue;
 		}
 

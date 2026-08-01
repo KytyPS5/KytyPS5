@@ -5394,7 +5394,224 @@ void TestNewShaderRecompilerCfgSharedOuterAndLoopMerge() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges() {
+void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 4),         // loop exit -> end
+	    EncodeSopc(0x06, 1, 1),      // s_cmp_eq_u32 s1, s1
+	    EncodeSopp(0x04, 2),         // early break -> same loop end
+	    EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfffau),   // backedge -> loop header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "loop early-break CFG did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "loop early-break SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "loop early-break SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "loop early-break CFG unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 9),         // outer exit -> end
+	    EncodeSopc(0x0a, 1, 129),    // inner loop: s_cmp_lt_u32 s1, 1
+	    EncodeSopp(0x04, 5),         // inner exit -> outer continue
+	    EncodeSopc(0x06, 2, 2),      // s_cmp_eq_u32 s2, s2
+	    EncodeSopp(0x05, 5),         // nonlocal exit -> outer end
+	    EncodeSMovB32(3, 129),       // inner work
+	    EncodeSop2(0x00, 1, 1, 129), // s_add_u32 s1, s1, 1
+	    EncodeSopp(0x02, 0xfff9u),   // inner backedge
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff5u),   // outer backedge
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
+	      "nested-loop nonlocal exit did not select dispatcher fallback");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
+	      "nested-loop nonlocal exit dispatcher SPIR-V lacks OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 6),         // outer exit -> end
+	    EncodeSopc(0x0a, 1, 129),    // inner loop: s_cmp_lt_u32 s1, 1
+	    EncodeSopp(0x04, 2),         // inner exit -> outer continue
+	    EncodeSMovB32(2, 129),       // inner work
+	    EncodeSopp(0x02, 0xfffcu),   // inner backedge
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff8u),   // outer backedge
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "nested local loop exit did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) >= 2,
+	      "nested local loop exit SPIR-V lacks both OpLoopMerge instructions");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "nested local loop exit SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "nested local loop exit unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 11),        // outer exit -> end
+	    EncodeSopc(0x06, 1, 1),      // inner loop first exit condition
+	    EncodeSopp(0x05, 3),         // first inner exit -> tail A
+	    EncodeSopc(0x06, 2, 2),      // inner loop second exit condition
+	    EncodeSopp(0x05, 3),         // second inner exit -> tail B
+	    EncodeSopp(0x02, 0xfffbu),   // inner backedge
+	    EncodeSMovB32(3, 129),       // tail A
+	    EncodeSopp(0x02, 2),         // tail A -> outer continue
+	    EncodeSMovB32(4, 129),       // tail B
+	    EncodeSopp(0x02, 0),         // tail B -> outer continue
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff3u),   // outer backedge
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::Decoder::Program program;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, program, &error),
+	      error.c_str());
+
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(program, graph, &error), error.c_str());
+	const auto original_block_count = graph.blocks.size();
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	Check(graph.blocks.size() > original_block_count,
+	      "nested loop exit tails did not create a private inner merge");
+
+	const auto* outer_header = graph.FindBlockByPc(0);
+	const auto* inner_header = graph.FindBlockByPc(8);
+	Check(outer_header != nullptr && inner_header != nullptr &&
+	          outer_header->terminator.loop_header && inner_header->terminator.loop_header,
+	      "nested loop exit-tail fixture did not retain both loop headers");
+	Check(inner_header->terminator.merge_block != outer_header->terminator.continue_block,
+	      "inner loop merge still aliases the outer continue target");
+	const auto* inner_merge = graph.FindBlock(inner_header->terminator.merge_block);
+	Check(inner_merge != nullptr && inner_merge->inst_begin == inner_merge->inst_end &&
+	          inner_merge->terminator.kind == ShaderRecompiler::CFG::TerminatorKind::Branch &&
+	          inner_merge->terminator.true_block == outer_header->terminator.continue_block,
+	      "private inner merge does not forward to the outer continue target");
+}
+
+void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x06, 7, 7),      // entry branch bypasses loop -> exit X
+	    EncodeSopp(0x05, 5),         // entry -> X
+	    EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 5),         // loop exit -> Y
+	    EncodeSopc(0x06, 1, 1),      // inner condition
+	    EncodeSopp(0x05, 1),         // nonmerge exit -> X, else continue
+	    EncodeSopp(0x02, 0xfffbu),   // loop backedge
+	    EncodeSMovB32(2, 129),       // X
+	    EncodeSopp(0x02, 2),         // X -> end
+	    EncodeSMovB32(3, 129),       // Y
+	    EncodeSopp(0x02, 0),         // Y -> end
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
+	      "mixed continue/nonmerge exit did not select dispatcher fallback");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
+	      "mixed continue/nonmerge exit dispatcher SPIR-V lacks OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgConditionalLatchNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopp(0x02, 0),       // loop header -> conditional block
+	    EncodeSopc(0x06, 0, 0),    // s_cmp_eq_u32 s0, s0
+	    EncodeSopp(0x05, 1),       // loop exit -> end
+	    EncodeSopp(0x02, 0xfffcu), // separate latch -> loop header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "conditional latch did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "conditional latch SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "conditional latch SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "conditional latch unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopp(0x02, 0),       // loop header -> conditional latch
+	    EncodeSopc(0x06, 0, 0),    // s_cmp_eq_u32 s0, s0
+	    EncodeSopp(0x05, 0xfffdu), // direct latch backedge -> loop header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "direct conditional latch did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "direct conditional latch SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "direct conditional latch SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "direct conditional latch unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
 	const uint32_t shader[] = {
 	    EncodeSMovB32(0, 128),       // s0 = 0
 	    EncodeSopc(0x0a, 0, 130),    // loop: s_cmp_lt_u32 s0, 2
@@ -5419,15 +5636,13 @@ void TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges() {
 	std::string                     error;
 	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
 	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
-	      "shared loop continue selections should stay on structured path");
-	Check(!Common::ContainsStr(result.ir_dump, "duplicate structured merge block"),
-	      "shared loop continue selections were not split before structurization");
-	Check(SpirvContainsOpcode(result.spirv, 246),
-	      "shared loop continue selections SPIR-V lacks OpLoopMerge");
-	Check(SpirvContainsOpcode(result.spirv, 247),
-	      "shared loop continue selections SPIR-V lacks OpSelectionMerge");
-	Check(!SpirvContainsOpcode(result.spirv, 251),
-	      "shared loop continue selections unexpectedly used dispatcher OpSwitch");
+	      "loop early continues should stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "loop early continues SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "loop early continues SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "loop early continues unexpectedly used dispatcher OpSwitch");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7014,7 +7229,6 @@ int main() {
 	using namespace Libs::Graphics;
 
 	EnsureConfigInitialized();
-
 	TestResourceDescriptorClassification();
 	TestNativeShaderResourceDependencies();
 	TestNormalizedImageContracts();
@@ -7086,7 +7300,14 @@ int main() {
 	TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
 	TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeDispatcher();
 	TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
-	TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges();
+	TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
+	TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
+	TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
+	TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
+	TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
+	TestNewShaderRecompilerCfgConditionalLatchNoSelection();
+	TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
+	TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
 	TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
 	TestNewShaderRecompilerCfgIrreducibleDispatcher();
 	TestNewShaderRecompilerExecMaskHelpers();

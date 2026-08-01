@@ -364,7 +364,12 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	if (blocking) {
-		const auto min_queued_size = queue_size * 2u;
+		constexpr uint64_t target_latency_us = 40000;
+		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+		const auto buffers =
+		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
+		                   : 2u;
+		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
@@ -511,7 +516,16 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		max_wait_time      = (wait_time > max_wait_time ? wait_time : max_wait_time);
 	}
 
-	if (blocking && max_wait_time != 0) {
+	bool all_ports_have_device = true;
+	for (uint32_t i = 0; i < num; i++) {
+		if (m_out_ports[params[i].handle.GetId()].audio_device == 0) {
+			all_ports_have_device = false;
+			break;
+		}
+	}
+
+	// Device-backed ports are paced by the SDL queue above.
+	if (blocking && max_wait_time != 0 && !all_ports_have_device) {
 		Common::Thread::SleepMicro(max_wait_time);
 	}
 

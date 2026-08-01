@@ -1,8 +1,10 @@
+#include "common/threads.h"
 #include "common/abi.h"
 #include "libs/audio.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <unordered_map>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -145,6 +147,7 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("4dq2rblWlg0", AudioOut2::AudioOut2ContextSetAttributes);
 	LIB_FUNC("PE2zHMqLSHs", AudioOut2::AudioOut2ContextAdvance);
 	LIB_FUNC("aII9h5nli9U", AudioOut2::AudioOut2ContextPush);
+	LIB_FUNC("DxGyV8dtOR8", AudioOut2::AudioOut2ContextBedWrite);
 	LIB_FUNC("R7d0F1g2qsU", AudioOut2::AudioOut2ContextGetQueueLevel);
 	LIB_FUNC("JK2wamZPzwM", AudioOut2::AudioOut2PortCreate);
 	LIB_FUNC("cd+Rtw+D1x8", AudioOut2::AudioOut2PortDestroy);
@@ -1116,7 +1119,69 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 
 } // namespace LibNgs2
 
+// FMOD compatibility shim.
+//
+// This overrides an export of the *guest's own* libfmod.prx rather than a Sony library, which is
+// unusual for this codebase but is exactly what the failure needs: the PS5 build of FMOD arrives
+// with the "initialized" byte in its system object already set, before Unity has applied the
+// startup output configuration. FMOD Studio therefore skips its real core init -- it never spawns a
+// mixer thread and never loads a sound bank, which is why no title using it produced any sound
+// while every Sony-side audio call reported success.
+//
+// Clearing that marker in setOutput (while recording the requested output) lets Studio run the real
+// init. RuntimeLinker::Resolve checks the host symbol database before scanning guest module exports,
+// so registering the NID here is enough to take priority over libfmod.prx's own implementation.
+//
+// The offsets are specific to the FMOD build these titles ship. If a title's audio regresses, this
+// shim -- not the Sony audio layer -- is the first thing to suspect.
+namespace LibFmod {
+
+LIB_VERSION("libfmod", 1, "libfmod", 1, 1);
+
+namespace {
+
+constexpr uint64_t FMOD_SYSTEM_INITIALIZED_BYTE = 0x08;
+constexpr uint64_t FMOD_SYSTEM_OUTPUT_TYPE      = 0x116D0;
+constexpr uint64_t FMOD_SYSTEM_OUTPUT_STATE     = 0x116D4;
+
+Common::Mutex                       g_fmod_set_output_mutex;
+std::unordered_map<uint64_t, int>   g_fmod_set_output_calls;
+
+} // namespace
+
+static int KYTY_SYSV_ABI FmodSystemSetOutput(uint64_t system, int output) {
+	PRINT_NAME();
+
+	int calls = 0;
+	{
+		Common::LockGuard lock(g_fmod_set_output_mutex);
+		calls = ++g_fmod_set_output_calls[system];
+	}
+
+	// Only the startup configuration needs rescuing; later calls are ordinary output changes and
+	// must not have the initialized marker torn out from under them.
+	const bool reset_premature_init = (calls <= 2);
+
+	if (reset_premature_init && system != 0) {
+		*reinterpret_cast<uint8_t*>(system + FMOD_SYSTEM_INITIALIZED_BYTE)  = 0;
+		*reinterpret_cast<int32_t*>(system + FMOD_SYSTEM_OUTPUT_TYPE)       = output;
+		*reinterpret_cast<int32_t*>(system + FMOD_SYSTEM_OUTPUT_STATE)      = 0;
+	}
+
+	LOGF("\t system = 0x%016" PRIx64 ", output = %d, call = %d, reset_premature_init = %d\n", system,
+	     output, calls, reset_premature_init ? 1 : 0);
+
+	return 0;
+}
+
+LIB_DEFINE(InitAudio_1_Fmod) {
+	LIB_FUNC("uPLTdl3psGk", FmodSystemSetOutput);
+}
+
+} // namespace LibFmod
+
 LIB_DEFINE(InitAudio_1) {
+	LibFmod::InitAudio_1_Fmod(s);
 	LibAudioOut::InitAudio_1_AudioOut(s);
 	LibAudioOut2::InitAudio_1_AudioOut2(s);
 	LibAudioIn::InitAudio_1_AudioIn(s);

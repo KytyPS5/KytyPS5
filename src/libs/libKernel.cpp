@@ -2128,26 +2128,93 @@ uint64_t KYTY_SYSV_ABI cfwBSQyr5Ys(uint64_t a1, uint64_t a2, uint64_t a3, uint64
 	return 0;
 }
 
-uint64_t KYTY_SYSV_ABI KernelSyncOnAddressV1(uint64_t op, uint64_t address, uint64_t value,
-                                             uint64_t size, uint64_t timeout, uint64_t flags) {
-	static std::atomic_uint32_t log_count = 0;
-	const auto                  index     = log_count.fetch_add(1, std::memory_order_relaxed);
+// sceKernelSyncOnAddressWait / ...Wake are a futex pair. Both NIDs used to be bound to one stub
+// that took an invented six-argument signature, never compared the word, never blocked, never woke
+// anything and always returned success -- so a waiter was told its condition had been satisfied
+// when it had not. Unity's audio engine builds its mixer thread on this handshake and gave up when
+// it failed, which is why no title using it produced sound.
+//
+// Waiters use bounded slices and re-read the word each time, so a wake that races block
+// registration costs at most one slice instead of hanging: the condition, not the notification, is
+// the source of truth.
+namespace {
 
-	if (index < 16) {
-		LOGF("\t libkernel_sync_on_address_v1: op=0x%016" PRIx64 ", address=0x%016" PRIx64
-		     ", value=0x%016" PRIx64 ", size=0x%016" PRIx64 ", timeout=0x%016" PRIx64
-		     ", flags=0x%016" PRIx64 "\n",
-		     op, address, value, size, timeout, flags);
+constexpr size_t   SYNC_ADDRESS_BUCKETS = 64;
+constexpr uint32_t SYNC_ADDRESS_SLICE_US = 1000;
+
+struct SyncAddressBucket {
+	Common::Mutex   mutex;
+	Common::CondVar cond;
+};
+
+SyncAddressBucket& SyncAddressBucketFor(const void* address) {
+	static SyncAddressBucket buckets[SYNC_ADDRESS_BUCKETS];
+	const auto               key = reinterpret_cast<uintptr_t>(address) >> 2u;
+	return buckets[key % SYNC_ADDRESS_BUCKETS];
+}
+
+uint32_t ReadGuestWord(const uint32_t* address) {
+	return __atomic_load_n(address, __ATOMIC_ACQUIRE);
+}
+
+} // namespace
+
+int KYTY_SYSV_ABI KernelSyncOnAddressWait(uint32_t* address, uint32_t pattern,
+                                          const uint32_t* timeout_usec) {
+	if (address == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	if (op != 0 && address == 0 && value == 0 && size == 0) {
-		// This unsupported form is used as a yield/wait by some Unity jobs.
-		// SleepMicro() uses a sub-millisecond busy wait on Windows, which can
-		// pin every worker thread when the guest polls this path.
-		Common::Thread::Sleep(timeout == 0 ? 1 : 2);
+	// Futex contract: if the word already moved on from what the caller observed, report EAGAIN
+	// rather than blocking, so a wake racing the caller's own fast-path read can never be lost.
+	if (ReadGuestWord(address) != pattern) {
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
+		return LibKernel::KERNEL_ERROR_EAGAIN;
 	}
 
-	return 0;
+	const bool infinite  = (timeout_usec == nullptr);
+	uint64_t   remaining = infinite ? 0 : *timeout_usec;
+
+	auto& bucket = SyncAddressBucketFor(address);
+
+	for (;;) {
+		const auto slice = static_cast<uint32_t>(
+		    infinite ? SYNC_ADDRESS_SLICE_US
+		             : (remaining < SYNC_ADDRESS_SLICE_US ? remaining : SYNC_ADDRESS_SLICE_US));
+		{
+			Common::LockGuard lock(bucket.mutex);
+			if (ReadGuestWord(address) != pattern) {
+				return OK;
+			}
+			// WaitFor releases the guest mutex around its signal-dispatch poll, so a guest
+			// handler never runs while this bucket is held.
+			bucket.cond.WaitFor(&bucket.mutex, slice == 0 ? 1 : slice);
+		}
+
+		if (ReadGuestWord(address) != pattern) {
+			return OK;
+		}
+		if (!infinite) {
+			if (remaining <= slice) {
+				return LibKernel::KERNEL_ERROR_ETIMEDOUT;
+			}
+			remaining -= slice;
+		}
+	}
+}
+
+int KYTY_SYSV_ABI KernelSyncOnAddressWake(uint32_t* address, int count) {
+	if (address == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	// Buckets are shared between addresses, so wake everyone parked on this bucket and let each
+	// waiter re-check its own word; `count` cannot be honoured precisely without a per-address
+	// queue and over-waking is harmless here. A negative count means "all" in any case.
+	(void)count;
+	SyncAddressBucketFor(address).cond.SignalAll();
+
+	return OK;
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
@@ -3398,8 +3465,8 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);
-	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressV1);
-	LIB_FUNC("q2y-wDIVWZA", Posix::KernelSyncOnAddressV1);
+	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait);
+	LIB_FUNC("q2y-wDIVWZA", Posix::KernelSyncOnAddressWake);
 
 	AddLibkernelUnityFunc(s, "Qhv5ARAoOEc",
 	                      reinterpret_cast<uint64_t>(LibKernel::KernelRemoveExceptionHandler),

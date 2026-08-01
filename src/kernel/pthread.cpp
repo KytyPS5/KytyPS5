@@ -365,6 +365,10 @@ struct PthreadAttrPrivate {
 	uint64_t       stack_map_addr;
 	size_t         stack_map_size;
 	int            policy;
+	// Guest priority as the title set it. The host value cannot represent it (see
+	// PthreadAttrSetschedparam), so keep the guest's own number here and hand that back from
+	// PthreadAttrGetschedparam instead of reconstructing it from the clamped host value.
+	int            guest_priority;
 	int            inherit_sched;
 	int            solosched;
 	bool           detached;
@@ -2128,7 +2132,11 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 
 	int result = pthread_attr_getschedparam(&(*attr)->p, param);
 
-	if (param->sched_priority <= -2) {
+	// Hand back exactly what the guest set. The host value only carries three distinct levels, so
+	// reconstructing from it turned every priority into 767/256/700 and lost the original.
+	if ((*attr)->guest_priority != 0) {
+		param->sched_priority = (*attr)->guest_priority;
+	} else if (param->sched_priority <= -2) {
 		param->sched_priority = 767;
 	} else if (param->sched_priority >= +2) {
 		param->sched_priority = 256;
@@ -2298,6 +2306,8 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	attr_value->guest_priority = param->sched_priority;
+
 	KernelSchedParam pparam {};
 	if (param->sched_priority <= 478) {
 		pparam.sched_priority = +2;
@@ -2309,10 +2319,30 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 	int result = pthread_attr_setschedparam(&attr_value->p, &pparam);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (result == 0) {
 		return OK;
 	}
 	return KERNEL_ERROR_EINVAL;
+#else
+	// The attribute's policy is forced to SCHED_OTHER (see PthreadAttrSetschedpolicy), and glibc
+	// validates the priority against it: SCHED_OTHER allows only sched_priority 0, so the +2/-2
+	// values above are rejected with EINVAL. Failing the guest call over that is wrong -- the guest
+	// asked for a priority the host cannot honour under this policy, not for something invalid, and
+	// a title that treats the failure as fatal loses the thread entirely. FMOD asks for 256/260 for
+	// its mixer and output threads and abandons audio when this returns an error, which is why no
+	// Unity title had sound on Linux. winpthreads does not validate, so the Windows path above
+	// keeps its original behaviour.
+	if (result != 0) {
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true)) {
+			LOGF("PthreadAttrSetschedparam: host rejected priority %d (mapped to %d) under "
+			     "SCHED_OTHER: %d -- honouring the request as a no-op\n",
+			     param->sched_priority, pparam.sched_priority, result);
+		}
+	}
+	return OK;
+#endif
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
@@ -3691,7 +3721,22 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 		}
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return KERNEL_ERROR_EINVAL;
+#else
+	// Same as PthreadAttrSetschedparam: under SCHED_OTHER glibc only accepts sched_priority 0, so
+	// any priority outside 479..732 is rejected. Report success -- the priority is simply not
+	// honourable on this host, and a guest that treats the failure as fatal loses a working thread.
+	{
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true)) {
+			LOGF("PthreadSetprio: host rejected priority %d (mapped to %d): %d -- honouring the "
+			     "request as a no-op\n",
+			     prio, param.sched_priority, result);
+		}
+	}
+	return OK;
+#endif
 }
 
 void KYTY_SYSV_ABI PthreadTestcancel() {

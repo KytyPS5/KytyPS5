@@ -32,14 +32,39 @@ namespace AudioOut2 {
 
 LIB_NAME("AudioOut2", "AudioOut");
 
+// sceAudioOut2ContextParam. The first four words are the struct size followed by the audio format
+// the context runs at; the caller reads these back after ContextResetParam to decide whether the
+// configuration is usable. Getting the layout wrong is not a cosmetic issue -- a caller that reads
+// frequency = 0 and channels = 256 out of the wrong fields rejects the context and tears the port
+// down again, which is exactly what Unity/FMOD titles did here.
 struct AudioOut2ContextParam {
-	uint32_t max_ports;
-	uint32_t max_object_ports;
-	uint32_t guarantee_object_ports;
-	uint32_t queue_depth;
-	uint32_t num_grains;
-	uint32_t flags;
-	uint32_t reserved[10];
+	uint32_t size;      // sizeof(AudioOut2ContextParam)
+	uint32_t channels;  // 2
+	uint32_t frequency; // 48000
+	uint32_t grain;     // samples per grain, 0x400
+	uint32_t reserved[12];
+};
+
+static constexpr uint32_t AUDIO_OUT2_CONTEXT_PARAM_SIZE     = 0x40;
+static constexpr uint32_t AUDIO_OUT2_DEFAULT_CHANNELS       = 2;
+static constexpr uint32_t AUDIO_OUT2_DEFAULT_FREQUENCY      = 48000;
+// The guest writes grain * channels * sizeof(float) bytes per push. A spectral analysis of a
+// real capture settles the value: read as 8ch x 256 frames, 96% of the energy sits in the low
+// quarter of the band (a natural audio spectrum); read as 2ch x 1024 frames only 25% does, with
+// mirror images at SR/4 and Nyquist -- i.e. the same 8192 bytes played four times too fast,
+// audible as a high-pitched whistle over the game audio.
+static constexpr uint32_t AUDIO_OUT2_DEFAULT_GRAIN          = 256;
+static constexpr uint64_t AUDIO_OUT2_CONTEXT_MEMORY_SIZE    = 0x10000;
+static constexpr uint64_t AUDIO_OUT2_CONTEXT_MEMORY_ALIGN   = 0x10000;
+
+// sceAudioOut2ContextQueryMemory's second argument is a descriptor, not a bare size_t: the caller
+// needs the alignment as well as the size in order to allocate the block it then hands to
+// ContextCreate.
+struct AudioOut2ContextMemoryInfo {
+	uint64_t size;
+	uint64_t alignment;
+	uint64_t direct_size;
+	uint64_t direct_alignment;
 };
 
 struct AudioOut2PortParam {
@@ -174,7 +199,9 @@ struct AudioOut2ContextState {
 	AudioOut2ContextHandle handle      = 0;
 	uint32_t               queue_depth = 4;
 	uint32_t               queued      = 0;
-	uint32_t               num_grains  = 512;
+	uint32_t               channels    = AUDIO_OUT2_DEFAULT_CHANNELS;
+	uint32_t               frequency   = AUDIO_OUT2_DEFAULT_FREQUENCY;
+	uint32_t               num_grains  = AUDIO_OUT2_DEFAULT_GRAIN;
 	uint64_t               last_update = 0;
 };
 
@@ -186,6 +213,7 @@ struct AudioOut2PortStateEntry {
 	uint32_t               data_format   = 0;
 	uint32_t               sampling_freq = 48000;
 	uint32_t               samples_num   = 512;
+	uint32_t               channels_num  = 2;
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
 	const void*            pcm_data      = nullptr;
@@ -248,36 +276,66 @@ static uint8_t audioout2_data_format_channels(uint32_t data_format) {
 	return static_cast<uint8_t>(channels == 0 ? 2u : std::min(channels, 16u));
 }
 
-static AudioInternal::Format audioout2_data_format_to_audio_format(uint32_t data_format) {
-	const auto channels  = audioout2_data_format_channels(data_format);
+enum class AudioOut2FormatMatch {
+	Exact,
+	ChannelCountUnsupported,
+	SampleTypeUnsupported,
+};
+
+// Resolve the host format for a port.
+//
+// The channel count comes from the *context*, never from data_format. A capture of the bytes we hand
+// SDL, analysed per float index within the buffer, shows a sharp cliff at float 2048 for a context
+// advertising 2 channels with grain 1024: below it the data is finite and bounded (max |x| 0.0043),
+// above it are NaNs and values around 3e38. So the guest's buffer really is
+// grain * context_channels * sizeof(float), and reading the channel count out of data_format bits
+// 8-15 (which gives 8 for the observed data_format 0x800) made us read four times too much and drag
+// in unrelated process memory -- audible as static.
+//
+// AudioOut2ContextBedWrite prototype passes num_channels separately from data_format, which argues
+// the field carries no channel count at all. Only the sample-type bits are used below.
+//
+// The asymmetry matters on its own: guessing the count low truncates audio, guessing it high reads
+// past the end of a guest allocation.
+static AudioInternal::Format audioout2_resolve_audio_format(uint32_t data_format, uint32_t channels,
+                                                            AudioOut2FormatMatch* match) {
+	EXIT_IF(match == nullptr);
+
 	const auto data_type = data_format & 0x7fu;
 	const auto is_std    = (data_format & 0x80u) != 0;
 
-	switch (data_type) {
-		case 0:
-			switch (channels) {
-				case 1: return AudioInternal::Format::FloatMono;
-				case 2: return AudioInternal::Format::FloatStereo;
-				case 8:
-					return is_std ? AudioInternal::Format::Float8ChStd
-					              : AudioInternal::Format::Float8Ch;
-				default: break;
+	*match = AudioOut2FormatMatch::Exact;
+
+	// Approximate an unsupported channel count rather than refusing the port: silence is worse than
+	// an imperfect downmix, and the caller keeps the real count for its own sizing.
+	auto supported_channels = channels;
+	if (channels != 1 && channels != 2 && channels != 8) {
+		supported_channels = (channels == 0 ? 2u : (channels < 2 ? 1u : (channels < 8 ? 2u : 8u)));
+		*match             = AudioOut2FormatMatch::ChannelCountUnsupported;
+	}
+
+	if (data_type != 0 && data_type != 1) {
+		*match = AudioOut2FormatMatch::SampleTypeUnsupported;
+	}
+	const bool is_float = (data_type != 1);
+
+	switch (supported_channels) {
+		case 1: return is_float ? AudioInternal::Format::FloatMono : AudioInternal::Format::Signed16bitMono;
+		case 2:
+			return is_float ? AudioInternal::Format::FloatStereo
+			                : AudioInternal::Format::Signed16bitStereo;
+		case 8:
+			if (is_float) {
+				return is_std ? AudioInternal::Format::Float8ChStd : AudioInternal::Format::Float8Ch;
 			}
-			break;
-		case 1:
-			switch (channels) {
-				case 1: return AudioInternal::Format::Signed16bitMono;
-				case 2: return AudioInternal::Format::Signed16bitStereo;
-				case 8:
-					return is_std ? AudioInternal::Format::Signed16bit8ChStd
-					              : AudioInternal::Format::Signed16bit8Ch;
-				default: break;
-			}
-			break;
+			return is_std ? AudioInternal::Format::Signed16bit8ChStd
+			              : AudioInternal::Format::Signed16bit8Ch;
 		default: break;
 	}
 
-	return AudioInternal::Format::Unknown;
+	// Unreachable: supported_channels is forced to 1, 2 or 8 above.
+	*match = AudioOut2FormatMatch::ChannelCountUnsupported;
+	return AudioInternal::Format::FloatStereo;
 }
 
 static int audioout2_port_type_to_audio_out_type(uint16_t port_type) {
@@ -375,27 +433,34 @@ int KYTY_SYSV_ABI AudioOut2ContextResetParam(AudioOut2ContextParam* params) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 
 	std::memset(params, 0, sizeof(AudioOut2ContextParam));
-	params->max_ports              = 256;
-	params->max_object_ports       = 256;
-	params->guarantee_object_ports = 0;
-	params->queue_depth            = 4;
-	params->num_grains             = 512;
-	params->flags                  = 1;
+	params->size      = AUDIO_OUT2_CONTEXT_PARAM_SIZE;
+	params->channels  = AUDIO_OUT2_DEFAULT_CHANNELS;
+	params->frequency = AUDIO_OUT2_DEFAULT_FREQUENCY;
+	params->grain     = AUDIO_OUT2_DEFAULT_GRAIN;
+
+	LOGF("\t size = %" PRIu32 ", channels = %" PRIu32 ", frequency = %" PRIu32
+	     ", grain = %" PRIu32 "\n",
+	     params->size, params->channels, params->frequency, params->grain);
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* params,
-                                              size_t*                      memory_size) {
+                                              AudioOut2ContextMemoryInfo*  memory_info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(params == nullptr);
-	EXIT_NOT_IMPLEMENTED(memory_size == nullptr);
+	if (params == nullptr || memory_info == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
 
-	const auto queue_depth = (params->queue_depth == 0 ? 4u : params->queue_depth);
-	*memory_size           = 0x10000u + static_cast<size_t>(queue_depth) * 0x590u;
+	*memory_info                   = {};
+	memory_info->size              = AUDIO_OUT2_CONTEXT_MEMORY_SIZE;
+	memory_info->alignment         = AUDIO_OUT2_CONTEXT_MEMORY_ALIGN;
+	memory_info->direct_size       = AUDIO_OUT2_CONTEXT_MEMORY_SIZE;
+	memory_info->direct_alignment  = AUDIO_OUT2_CONTEXT_MEMORY_ALIGN;
 
-	LOGF("\t memory_size = 0x%016" PRIx64 "\n", static_cast<uint64_t>(*memory_size));
+	LOGF("\t size = 0x%016" PRIx64 ", alignment = 0x%016" PRIx64 "\n", memory_info->size,
+	     memory_info->alignment);
 
 	return OK;
 }
@@ -420,21 +485,34 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 		}
 	}
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
+	// Only accept values in a sane range; a caller is free to hand back a modified param block and
+	// the pacing maths downstream divides by the frequency.
+	const auto channels  = (params->channels >= 1 && params->channels <= 8) ? params->channels
+	                                                                       : AUDIO_OUT2_DEFAULT_CHANNELS;
+	const auto frequency = (params->frequency >= 8000 && params->frequency <= 192000)
+	                           ? params->frequency
+	                           : AUDIO_OUT2_DEFAULT_FREQUENCY;
+	const auto grain     = (params->grain >= 64 && params->grain <= 0x4000)
+	                           ? params->grain
+	                           : AUDIO_OUT2_DEFAULT_GRAIN;
+
 	*state             = AudioOut2ContextState {};
 	state->used        = true;
 	state->handle      = *ctx;
-	state->queue_depth = (params->queue_depth == 0 ? 4u : params->queue_depth);
+	state->queue_depth = 4;
 	state->queued      = 0;
-	state->num_grains  = (params->num_grains == 0 ? 512u : params->num_grains);
+	state->channels    = channels;
+	state->frequency   = frequency;
+	state->num_grains  = grain;
 	state->last_update = LibKernel::KernelGetProcessTime();
 	g_audioout2_context_mutex.Unlock();
 
 	LOGF("\t buffer      = 0x%016" PRIx64 "\n"
 	     "\t buffer_size = 0x%016" PRIx64 "\n"
 	     "\t ctx         = 0x%016" PRIx64 "\n"
-	     "\t queue_depth = %" PRIu32 ", num_grains = %" PRIu32 "\n",
-	     reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(buffer_size), *ctx,
-	     state->queue_depth, state->num_grains);
+	     "\t channels = %" PRIu32 ", frequency = %" PRIu32 ", grain = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(buffer_size), *ctx, channels,
+	     frequency, grain);
 
 	return OK;
 }
@@ -517,6 +595,31 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	}
 }
 
+// sceAudioOut2ContextBedWrite. Was not registered at all, so it resolved to the unresolved-import
+// thunk -- which happens to return 0, hence no visible failure, but the call was invisible to the
+// trace and logged as an unresolved stub. The bed is the context's main mix; it is submitted through
+// ContextPush, so accepting it here is enough.
+int KYTY_SYSV_ABI AudioOut2ContextBedWrite(AudioOut2ContextHandle ctx, uint32_t num_channels,
+                                           uint32_t data_format, const void* data) {
+	g_audioout2_context_mutex.Lock();
+	const bool known = (audioout2_find_context_locked(ctx) != nullptr);
+	g_audioout2_context_mutex.Unlock();
+
+	if (!known) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+
+	static std::atomic_bool logged = false;
+	if (!logged.exchange(true)) {
+		PRINT_NAME();
+		LOGF("\t ctx = 0x%016" PRIx64 ", num_channels = %" PRIu32 ", data_format = 0x%08" PRIx32
+		     ", data = 0x%016" PRIx64 "\n",
+		     ctx, num_channels, data_format, reinterpret_cast<uint64_t>(data));
+	}
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
 	if (queue_level != nullptr) {
@@ -547,9 +650,12 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 
-	const auto next_port    = g_audioout2_next_port.fetch_add(1, std::memory_order_relaxed);
-	const auto audio_format = audioout2_data_format_to_audio_format(params->data_format);
-	const auto audio_type   = audioout2_port_type_to_audio_out_type(params->port_type);
+	const auto next_port = g_audioout2_next_port.fetch_add(1, std::memory_order_relaxed);
+	auto       format_match  = AudioOut2FormatMatch::Exact;
+	const auto port_channels = audioout2_data_format_channels(params->data_format);
+	const auto audio_format =
+	    audioout2_resolve_audio_format(params->data_format, port_channels, &format_match);
+	const auto audio_type = audioout2_port_type_to_audio_out_type(params->port_type);
 
 	g_audioout2_context_mutex.Lock();
 	const auto* context_state = audioout2_find_context_locked(ctx);
@@ -558,6 +664,17 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
 	const auto samples_num = context_state->num_grains == 0 ? 512u : context_state->num_grains;
+	const auto context_channels =
+	    context_state->channels == 0 ? AUDIO_OUT2_DEFAULT_CHANNELS : context_state->channels;
+	const auto context_frequency =
+	    context_state->frequency == 0 ? AUDIO_OUT2_DEFAULT_FREQUENCY : context_state->frequency;
+
+	auto sampling_freq = params->sampling_freq;
+	if (sampling_freq < 8000 || sampling_freq > 192000) {
+		sampling_freq = context_frequency >= 8000 && context_frequency <= 192000
+		                    ? context_frequency
+		                    : AUDIO_OUT2_DEFAULT_FREQUENCY;
+	}
 
 	g_audioout2_port_mutex.Lock();
 	AudioOut2PortStateEntry* port_state = nullptr;
@@ -574,7 +691,8 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		port_state->context       = ctx;
 		port_state->port_type     = params->port_type;
 		port_state->data_format   = params->data_format;
-		port_state->sampling_freq = params->sampling_freq;
+		port_state->sampling_freq = sampling_freq;
+		port_state->channels_num  = port_channels;
 		port_state->samples_num   = samples_num;
 		port_state->audio_format  = audio_format;
 	}
@@ -585,12 +703,38 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		return AUDIO_OUT2_ERROR_PORT_FULL;
 	}
 
-	int audio_handle = 0;
+	// Report anything we had to approximate. This used to collapse into Format::Unknown and skip the
+	// device open with no log at all, which reads exactly like "the title has no audio" -- Log rather
+	// than LOGF because LOGF is suppressed under --printf-direction Silent, which is how regression
+	// runs are made.
+	if (format_match != AudioOut2FormatMatch::Exact) {
+		static Common::Mutex           report_mutex;
+		static std::vector<uint64_t>   reported;
+		const uint64_t                 key = (static_cast<uint64_t>(params->data_format) << 32u) |
+		                     static_cast<uint64_t>(context_channels);
 
-	if (audio_format != AudioInternal::Format::Unknown &&
-	    !audioout2_port_type_is_object(params->port_type)) {
-		audio_handle = AudioInternal::AudioOutOpen(audio_type, samples_num, params->sampling_freq,
-		                                           audio_format);
+		Common::LockGuard lock(report_mutex);
+		if (std::find(reported.begin(), reported.end(), key) == reported.end()) {
+			reported.push_back(key);
+			char text[512] = {};
+			std::snprintf(text, sizeof(text),
+			              "AudioOut2: approximating port format (%s): data_format=0x%08" PRIx32
+			              " port_type=%" PRIu16 " sampling_freq=%" PRIu32
+			              " | context channels=%" PRIu32 " grain=%" PRIu32 " | using format=%d\n",
+			              format_match == AudioOut2FormatMatch::ChannelCountUnsupported
+			                  ? "channel count"
+			                  : "sample type",
+			              params->data_format, params->port_type, params->sampling_freq,
+			              context_channels, samples_num,
+			              static_cast<int>(audio_format));
+			Log::WriteFatal(text);
+		}
+	}
+
+	int audio_handle = 0;
+	if (!audioout2_port_type_is_object(params->port_type)) {
+		audio_handle =
+		    AudioInternal::AudioOutOpen(audio_type, samples_num, sampling_freq, audio_format);
 	}
 
 	g_audioout2_port_mutex.Lock();

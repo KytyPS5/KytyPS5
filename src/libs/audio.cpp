@@ -243,8 +243,19 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	port->audio_spec = obtained;
 	SDL_PauseAudioDevice(port->audio_device, 0);
 
-	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x)\n", obtained.freq,
-	     obtained.channels, obtained.format);
+	// Report the backend SDL actually selected: it falls back through its driver list silently, so
+	// "the device opened" alone says nothing about which subsystem is carrying the audio. The
+	// device is opened as nullptr (the backend's default sink) and SDL2 offers no way to name that
+	// device, so do not try -- SDL_GetAudioDeviceName(0, 0) is the first *enumerated* device, which
+	// is a different thing and reporting it as the output is actively misleading.
+	// obtained.samples matters as much as the format: SDL_AUDIO_ALLOW_ANY_CHANGE lets the backend
+	// pick its own period size, and if it pulls a larger block than we queue per push, any shortfall
+	// leaves a gap on that period -- which is periodic, and periodic is a tone.
+	const char* driver = SDL_GetCurrentAudioDriver();
+	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x, samples=%u [asked %u]) "
+	     "driver=%s device=<default>\n",
+	     obtained.freq, obtained.channels, obtained.format, obtained.samples, desired.samples,
+	     driver != nullptr ? driver : "?");
 	return true;
 }
 
@@ -377,6 +388,35 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
+		}
+	}
+
+	// KYTY_AUDIO_STATS=1: quantify output health. An underrun (the device drained completely before
+	// we got here) is what choppiness sounds like, and a flush is an outright dropout; both are
+	// invisible otherwise.
+	static const bool stats_enabled = (::getenv("KYTY_AUDIO_STATS") != nullptr);
+	if (stats_enabled) {
+		static std::atomic_uint64_t submitted {0};
+		static std::atomic_uint64_t underruns {0};
+		static std::atomic_uint64_t deepest {0};
+
+		const auto queued = SDL_GetQueuedAudioSize(port->audio_device);
+		if (queued == 0) {
+			underruns.fetch_add(1, std::memory_order_relaxed);
+		}
+		auto seen = deepest.load(std::memory_order_relaxed);
+		while (queued > seen && !deepest.compare_exchange_weak(seen, queued)) {
+		}
+
+		const auto n = submitted.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((n % 500) == 0) {
+			const auto buffer_micros =
+			    (port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0);
+			LOGF("AudioOutStats: submitted=%" PRIu64 " underruns=%" PRIu64 " (%.2f%%) "
+			     "deepest_queue=%" PRIu64 "B buffer=%" PRIu64 "us\n",
+			     n, underruns.load(), 100.0 * static_cast<double>(underruns.load()) /
+			                              static_cast<double>(n),
+			     deepest.load(), buffer_micros);
 		}
 	}
 

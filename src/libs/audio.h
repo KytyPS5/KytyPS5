@@ -28,6 +28,7 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state);
 namespace AudioOut2 {
 
 struct AudioOut2ContextParam;
+struct AudioOut2ContextMemoryInfo;
 struct AudioOut2PortParam;
 struct AudioOut2Attribute;
 struct AudioOut2PortState;
@@ -45,7 +46,7 @@ using AudioOut2SpeakerArrayHandle = void*;
 
 int KYTY_SYSV_ABI AudioOut2Initialize();
 int KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* params,
-                                              size_t*                      memory_size);
+                                              AudioOut2ContextMemoryInfo*  memory_info);
 int KYTY_SYSV_ABI AudioOut2ContextResetParam(AudioOut2ContextParam* params);
 int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer,
                                          size_t buffer_size, AudioOut2ContextHandle* ctx);
@@ -54,6 +55,8 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
                                                 const AudioOut2Attribute* attributes, uint32_t num);
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx);
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking);
+int KYTY_SYSV_ABI AudioOut2ContextBedWrite(AudioOut2ContextHandle ctx, uint32_t num_channels,
+                                           uint32_t data_format, const void* data);
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues);
 int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,

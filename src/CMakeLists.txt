@@ -312,6 +312,9 @@ function(add_kyty_full_emulator_test target source)
 		target_link_libraries(${target} onecore)
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
+	# The macOS x86_64 guest address space needs its .zerofill segments anchored
+	# by linker flags, or the kernel kills the binary on load (posix_spawn EIO).
+	configure_macos_guest_address_space(${target})
 endfunction()
 
 function(configure_macos_guest_address_space target)
@@ -431,7 +434,6 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
-configure_macos_guest_address_space(virtual_memory_allocation_tests)
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)

@@ -5770,6 +5770,85 @@ void TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x06, 0, 0), // block 0
+	    EncodeSopp(0x04, 2),    // block 0 -> 2 or 1
+	    EncodeSopc(0x06, 1, 1), // block 1
+	    EncodeSopp(0x04, 6),    // block 1 -> 5 or 2
+	    EncodeSopc(0x06, 2, 2), // block 2
+	    EncodeSopp(0x04, 4),    // block 2 -> 5 or 3
+	    EncodeSopc(0x06, 3, 3), // block 3
+	    EncodeSopp(0x04, 2),    // block 3 -> 5 or 4
+	    EncodeSMovB32(4, 129),  // block 4
+	    0xbf810000u,             // block 4 -> 6
+	    EncodeSMovB32(5, 129),  // block 5
+	    0xbf810000u,             // block 5 -> 6
+	};
+
+	ShaderRecompiler::Decoder::Program decoded;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, decoded, &error),
+	      error.c_str());
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+	Check(graph.blocks.size() == 7u && graph.blocks[0].successors == std::vector<uint32_t>({1, 2}) &&
+	          graph.blocks[0].terminator.true_block == 2u &&
+	          graph.blocks[0].terminator.false_block == 1u &&
+	          graph.blocks[1].successors == std::vector<uint32_t>({2, 5}) &&
+	          graph.blocks[1].terminator.true_block == 5u &&
+	          graph.blocks[1].terminator.false_block == 2u &&
+	          graph.blocks[2].successors == std::vector<uint32_t>({3, 5}) &&
+	          graph.blocks[2].terminator.true_block == 5u &&
+	          graph.blocks[2].terminator.false_block == 3u &&
+	          graph.blocks[3].successors == std::vector<uint32_t>({4, 5}) &&
+	          graph.blocks[3].terminator.true_block == 5u &&
+	          graph.blocks[3].terminator.false_block == 4u &&
+	          graph.blocks[4].successors == std::vector<uint32_t>({6}) &&
+	          graph.blocks[5].successors == std::vector<uint32_t>({6}),
+	      "overlapping early-exit fixture does not match the observed shader CFG");
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	std::vector<bool>     reachable(graph.blocks.size());
+	std::vector<uint32_t> pending = {graph.entry_block};
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (reachable[block_id]) {
+			continue;
+		}
+		reachable[block_id] = true;
+		pending.insert(pending.end(), graph.blocks[block_id].successors.begin(),
+		               graph.blocks[block_id].successors.end());
+	}
+	Check(std::all_of(reachable.begin(), reachable.end(), [](bool value) { return value; }),
+	      "overlapping early-exit structurization left unreachable blocks");
+	std::vector<uint32_t> merges;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch) {
+			Check(block.terminator.merge_block != UINT32_MAX &&
+			          std::find(merges.begin(), merges.end(), block.terminator.merge_block) ==
+			              merges.end(),
+			      "overlapping early-exit structurization retained a shared merge");
+			merges.push_back(block.terminator.merge_block);
+		}
+	}
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Pixel;
+	options.dump_ir = true;
+	ShaderRecompiler::CompileResult result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "overlapping early-exit ladder did not stay on the structured path");
+	Check(!Common::ContainsStr(result.ir_dump, "duplicate structured merge block"),
+	      "overlapping early-exit ladder retained a shared merge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) >= 4u,
+	      "overlapping early-exit ladder lost its selections");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+	      "overlapping early-exit ladder used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
 	const uint32_t shader[] = {
 	    EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
@@ -7409,6 +7488,7 @@ int main() {
 	TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
 	TestNewShaderRecompilerCfgMultipleLoopLatches();
 	TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+	TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
 	TestNewShaderRecompilerCfgIrreducibleDispatcher();
 	TestNewShaderRecompilerExecMaskHelpers();
 	TestComputeShaderInputWaveSize();

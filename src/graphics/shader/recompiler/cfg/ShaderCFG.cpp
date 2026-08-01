@@ -1098,7 +1098,102 @@ bool SplitOneLoopMerge(Graph& graph) {
 	return false;
 }
 
-bool SplitOneSelectionMerge(Graph& graph) {
+std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& header,
+                                      uint32_t merge) {
+	std::vector<uint32_t> region;
+	std::vector<uint32_t> pending = {header.terminator.true_block,
+	                                 header.terminator.false_block};
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (block_id == merge || Contains(region, block_id)) {
+			continue;
+		}
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr) {
+			continue;
+		}
+		AddUnique(region, block_id);
+		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+	}
+	SortUnique(region);
+	return region;
+}
+
+bool DuplicateSelectionRegion(Graph& graph, uint32_t header_id, uint32_t merge,
+                              const std::vector<uint32_t>& region, uint32_t block_budget) {
+	std::vector<uint32_t> cloned_blocks;
+	for (auto block_id: region) {
+		if (!graph.Dominates(header_id, block_id)) {
+			cloned_blocks.push_back(block_id);
+		}
+	}
+	if (cloned_blocks.empty() || graph.FindBlock(header_id) == nullptr || header_id >= merge ||
+	    graph.blocks.size() + cloned_blocks.size() + 1u > block_budget) {
+		return false;
+	}
+
+	const auto first_clone = static_cast<uint32_t>(graph.blocks.size());
+	std::map<uint32_t, uint32_t> clones;
+	for (uint32_t i = 0; i < cloned_blocks.size(); i++) {
+		clones.emplace(cloned_blocks[i], first_clone + i);
+	}
+
+	for (auto block_id: cloned_blocks) {
+		BasicBlock clone = *graph.FindBlock(block_id);
+		clone.id         = clones.at(block_id);
+		clone.predecessors.clear();
+		clone.dominators.clear();
+		clone.post_dominators.clear();
+		graph.blocks.push_back(std::move(clone));
+	}
+
+	const auto remap_block = [&](BasicBlock& block) {
+		const auto remap_target = [&](uint32_t& target) {
+			if (const auto it = clones.find(target); it != clones.end()) {
+				target = it->second;
+			}
+		};
+		for (auto& successor: block.successors) {
+			remap_target(successor);
+		}
+		remap_target(block.terminator.true_block);
+		remap_target(block.terminator.false_block);
+		remap_target(block.terminator.merge_block);
+		remap_target(block.terminator.continue_block);
+		for (auto& target: block.terminator.indirect_targets) {
+			remap_target(target);
+		}
+	};
+	for (auto block_id: region) {
+		const auto owned_id = clones.contains(block_id) ? clones.at(block_id) : block_id;
+		remap_block(*graph.FindBlock(owned_id));
+	}
+
+	const auto private_merge = AppendSyntheticBranchBlock(graph, merge);
+	auto&      header        = *graph.FindBlock(header_id);
+	remap_block(header);
+
+	for (auto block_id: region) {
+		const auto owned_id = clones.contains(block_id) ? clones.at(block_id) : block_id;
+		auto*      block    = graph.FindBlock(owned_id);
+		if (block != nullptr) {
+			ReplaceValue(block->successors, merge, private_merge);
+			ReplaceTerminatorTarget(block->terminator, merge, private_merge);
+		}
+	}
+	ReplaceValue(header.successors, merge, private_merge);
+	ReplaceTerminatorTarget(header.terminator, merge, private_merge);
+
+	for (uint32_t i = 0; i <= cloned_blocks.size(); i++) {
+		MoveBlockBefore(graph, first_clone + i, merge + i);
+	}
+	RebuildPredecessors(graph);
+	RecomputeAnalyses(graph);
+	return true;
+}
+
+bool SplitOneSelectionMerge(Graph& graph, uint32_t block_budget) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
 	for (const auto& loop: graph.natural_loops) {
@@ -1118,6 +1213,18 @@ bool SplitOneSelectionMerge(Graph& graph) {
 
 		const auto merge = graph.FindNearestCommonPostDominator(block->terminator.true_block,
 		                                                        block->terminator.false_block);
+		if (merge == UINT32_MAX || graph.FindBlock(merge) == nullptr) {
+			continue;
+		}
+		const auto region = SelectionRegion(graph, *block, merge);
+		if (std::any_of(region.begin(), region.end(),
+		                [&](uint32_t member) { return !graph.Dominates(block_id, member); })) {
+			if (graph.natural_loops.empty() &&
+			    DuplicateSelectionRegion(graph, block_id, merge, region, block_budget)) {
+				return true;
+			}
+			continue;
+		}
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
 		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);
 		if (SplitSharedMergeBlock(graph, merge, construct_blocks, force_split)) {
@@ -1129,10 +1236,12 @@ bool SplitOneSelectionMerge(Graph& graph) {
 
 bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	const auto split_budget =
-	    std::max<uint32_t>(16u, std::min<uint32_t>(128u, original_block_count));
+	const auto split_budget = std::max<uint32_t>(
+	    16u, std::min<uint32_t>(128u, original_block_count * 4u));
+	const auto block_budget = std::max<uint32_t>(
+	    32u, std::min<uint32_t>(512u, original_block_count * 8u));
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
+		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph, block_budget)) {
 			return true;
 		}
 		RebuildPredecessors(graph);

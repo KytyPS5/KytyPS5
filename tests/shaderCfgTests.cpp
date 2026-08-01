@@ -5646,6 +5646,104 @@ void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgConditionalLoopHeaderSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x06, 0, 0),    // loop body selection condition
+	    EncodeSopp(0x05, 2),       // select path B
+	    EncodeSMovB32(1, 129),     // path A
+	    EncodeSopp(0x02, 1),       // path A -> join
+	    EncodeSMovB32(2, 129),     // path B
+	    EncodeSMovB32(3, 129),     // join
+	    EncodeSopc(0x06, 4, 4),    // repeat condition
+	    EncodeSopp(0x05, 0xfff8u), // repeat -> guest header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::Decoder::Program decoded;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, decoded, &error),
+	      error.c_str());
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+	const auto original_block_count = graph.blocks.size();
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	Check(graph.blocks.size() > original_block_count,
+	      "conditional guest loop header did not create a synthetic header");
+
+	uint32_t loop_headers      = 0;
+	uint32_t selection_headers = 0;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.loop_header) {
+			loop_headers++;
+			Check(block.inst_begin == block.inst_end &&
+			          block.terminator.kind == ShaderRecompiler::CFG::TerminatorKind::Branch,
+			      "canonical loop header is not an empty unconditional block");
+		} else if (block.terminator.kind ==
+		               ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch &&
+		           block.terminator.merge_block != UINT32_MAX) {
+			selection_headers++;
+		}
+	}
+	Check(loop_headers == 1u && selection_headers == 1u,
+	      "guest conditional was not separated from the loop header");
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage = ShaderType::Compute;
+	ShaderRecompiler::CompileResult result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
+	      "conditional loop-header SPIR-V has the wrong loop-merge count");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 1u,
+	      "conditional loop-header SPIR-V has the wrong selection-merge count");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+	      "conditional loop-header unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgMultipleLoopLatches() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),  // loop condition
+	    EncodeSopp(0x04, 5),       // loop exit -> end
+	    EncodeSopc(0x06, 1, 1),    // early repeat condition
+	    EncodeSopp(0x05, 0xfffcu), // early repeat -> header
+	    EncodeSMovB32(2, 129),     // body
+	    EncodeSMovB32(3, 129),     // body tail
+	    EncodeSopp(0x02, 0xfff9u), // ordinary latch -> header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::Decoder::Program decoded;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, decoded, &error),
+	      error.c_str());
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+	const auto original_block_count = graph.blocks.size();
+	Check(graph.back_edges.size() == 2u, "multiple-latch fixture lacks two native backedges");
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	Check(graph.blocks.size() == original_block_count + 1u,
+	      "multiple native latches did not create one synthetic continue");
+	Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
+	      "multiple native latches were not coalesced to one SPIR-V backedge");
+	const auto& loop           = graph.natural_loops.front();
+	const auto* continue_block = graph.FindBlock(loop.continue_block);
+	Check(continue_block != nullptr && continue_block->inst_begin == continue_block->inst_end &&
+	          continue_block->predecessors.size() == 2u,
+	      "canonical continue does not join both native latches");
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage = ShaderType::Compute;
+	ShaderRecompiler::CompileResult result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
+	      "multiple-latch SPIR-V has the wrong loop-merge count");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0u,
+	      "multiple-latch SPIR-V unexpectedly used a selection merge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+	      "multiple-latch SPIR-V unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit() {
 	const uint32_t shader[] = {
 	    EncodeSopc(0x06, 0, 0), // s_cmp_eq_u32 s0, s0
@@ -7308,6 +7406,8 @@ int main() {
 	TestNewShaderRecompilerCfgConditionalLatchNoSelection();
 	TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
 	TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
+	TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
+	TestNewShaderRecompilerCfgMultipleLoopLatches();
 	TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
 	TestNewShaderRecompilerCfgIrreducibleDispatcher();
 	TestNewShaderRecompilerExecMaskHelpers();

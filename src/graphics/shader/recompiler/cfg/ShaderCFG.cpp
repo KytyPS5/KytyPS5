@@ -871,19 +871,19 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 	return blocks;
 }
 
-uint32_t AppendSyntheticMergeBlock(Graph& graph, uint32_t old_merge) {
-	const auto* merge = graph.FindBlock(old_merge);
+uint32_t AppendSyntheticBranchBlock(Graph& graph, uint32_t target) {
+	const auto* target_block = graph.FindBlock(target);
 
 	BasicBlock block;
 	block.id                    = static_cast<uint32_t>(graph.blocks.size());
-	block.start_pc              = merge != nullptr ? merge->start_pc : 0u;
+	block.start_pc              = target_block != nullptr ? target_block->start_pc : 0u;
 	block.end_pc                = block.start_pc;
-	block.inst_begin            = merge != nullptr ? merge->inst_begin : 0u;
+	block.inst_begin            = target_block != nullptr ? target_block->inst_begin : 0u;
 	block.inst_end              = block.inst_begin;
-	block.successors            = {old_merge};
+	block.successors            = {target};
 	block.terminator.kind       = TerminatorKind::Branch;
 	block.terminator.condition  = BranchCondition::Always;
-	block.terminator.true_block = old_merge;
+	block.terminator.true_block = target;
 	graph.blocks.push_back(std::move(block));
 	return graph.blocks.back().id;
 }
@@ -948,6 +948,80 @@ bool MergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t mer
 	return false;
 }
 
+bool CanonicalizeNaturalLoops(Graph& graph, std::string* error) {
+	const auto rewrite_budget = graph.blocks.size() * 2u + 16u;
+	for (size_t rewrite = 0; rewrite < rewrite_budget; rewrite++) {
+		bool changed = false;
+		for (const auto& loop: graph.natural_loops) {
+			std::vector<uint32_t> latches;
+			for (const auto& edge: graph.back_edges) {
+				if (edge.to == loop.header) {
+					AddUnique(latches, edge.from);
+				}
+			}
+			if (latches.size() <= 1u) {
+				continue;
+			}
+
+			const auto continue_block = AppendSyntheticBranchBlock(graph, loop.header);
+			for (auto latch: latches) {
+				auto* block = graph.FindBlock(latch);
+				if (block != nullptr) {
+					ReplaceValue(block->successors, loop.header, continue_block);
+					ReplaceTerminatorTarget(block->terminator, loop.header, continue_block);
+				}
+			}
+			RebuildPredecessors(graph);
+			RecomputeAnalyses(graph);
+			changed = true;
+			break;
+		}
+		if (changed) {
+			continue;
+		}
+
+		for (const auto& loop: graph.natural_loops) {
+			const auto* header                 = graph.FindBlock(loop.header);
+			const auto  is_loop_control_target = [&](uint32_t target) {
+				return target == loop.merge || target == loop.continue_block;
+			};
+			if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
+			    is_loop_control_target(header->terminator.true_block) ||
+			    is_loop_control_target(header->terminator.false_block) ||
+			    !Contains(loop.body_blocks, header->terminator.true_block) ||
+			    !Contains(loop.body_blocks, header->terminator.false_block)) {
+				continue;
+			}
+
+			const auto old_header   = loop.header;
+			const auto predecessors = header->predecessors;
+			const auto new_header   = AppendSyntheticBranchBlock(graph, old_header);
+			for (auto pred: predecessors) {
+				auto* block = graph.FindBlock(pred);
+				if (block != nullptr) {
+					ReplaceValue(block->successors, old_header, new_header);
+					ReplaceTerminatorTarget(block->terminator, old_header, new_header);
+				}
+			}
+			if (graph.entry_block == old_header) {
+				graph.entry_block = new_header;
+			}
+			MoveBlockBefore(graph, new_header, old_header);
+			RebuildPredecessors(graph);
+			RecomputeAnalyses(graph);
+			changed = true;
+			break;
+		}
+		if (!changed) {
+			return true;
+		}
+	}
+
+	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+	           "CFG loop canonicalization exceeded rewrite budget", error);
+	return false;
+}
+
 bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
                            const std::vector<uint32_t>& construct_blocks,
                            bool                         force_split = false) {
@@ -983,7 +1057,7 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 		return false;
 	}
 
-	const auto synthetic_merge = AppendSyntheticMergeBlock(graph, merge);
+	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
 	auto*      synthetic_block = graph.FindBlock(synthetic_merge);
 	if (synthetic_block != nullptr) {
 		synthetic_block->predecessors = predecessors_to_split;
@@ -1393,6 +1467,9 @@ bool Structurize(Graph& graph, std::string* error) {
 		return false;
 	}
 
+	if (!CanonicalizeNaturalLoops(graph, error)) {
+		return false;
+	}
 	if (!SplitSharedMergeBlocks(graph, error)) {
 		return false;
 	}

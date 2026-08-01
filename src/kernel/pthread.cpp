@@ -3886,8 +3886,12 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
 	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
 #else
-	auto dt = Common::DateTime::FromSystemUTC();
-	sec_to_timeval(tp, dt.ToUnix());
+	struct timespec ts {};
+	result = ::clock_gettime(CLOCK_REALTIME, &ts);
+	if (result == 0) {
+		tp->tv_sec  = static_cast<int64_t>(ts.tv_sec);
+		tp->tv_usec = static_cast<int64_t>(ts.tv_nsec / 1000);
+	}
 #endif
 
 	if (result == 0) {

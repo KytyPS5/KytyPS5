@@ -365,6 +365,7 @@ struct PthreadAttrPrivate {
 	uint64_t       stack_map_addr;
 	size_t         stack_map_size;
 	int            policy;
+	int            guest_priority;
 	int            inherit_sched;
 	int            solosched;
 	bool           detached;
@@ -2128,13 +2129,8 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 
 	int result = pthread_attr_getschedparam(&(*attr)->p, param);
 
-	if (param->sched_priority <= -2) {
-		param->sched_priority = 767;
-	} else if (param->sched_priority >= +2) {
-		param->sched_priority = 256;
-	} else {
-		param->sched_priority = 700;
-	}
+	// Host priority mapping is lossy; return the exact guest value.
+	param->sched_priority = (*attr)->guest_priority;
 
 	if (result == 0) {
 		return OK;
@@ -2298,6 +2294,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		return KERNEL_ERROR_EINVAL;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
 	if (param->sched_priority <= 478) {
 		pparam.sched_priority = +2;
@@ -2307,12 +2304,13 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		pparam.sched_priority = 0;
 	}
 
-	int result = pthread_attr_setschedparam(&attr_value->p, &pparam);
-
-	if (result == 0) {
-		return OK;
+	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
-	return KERNEL_ERROR_EINVAL;
+#endif
+
+	attr_value->guest_priority = param->sched_priority;
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
@@ -3639,26 +3637,15 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	sched_param param {};
-	int         pol = 0;
-
-	int result = pthread_getschedparam(thread->p, &pol, &param);
-
-	if (result == 0) {
-		if (param.sched_priority <= -2) {
-			*prio = 767;
-		} else if (param.sched_priority >= +2) {
-			*prio = 256;
-		} else {
-			*prio = 700;
-		}
-
-		LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
-
-		return OK;
+	sched_param native_param {};
+	int         native_policy = 0;
+	if (pthread_getschedparam(thread->p, &native_policy, &native_param) != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	return KERNEL_ERROR_EINVAL;
+	*prio = thread->attr->guest_priority;
+	LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
@@ -3673,25 +3660,27 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 
 	int result = pthread_getschedparam(thread->p, &pol, &param);
 
-	if (result == 0) {
-		if (prio <= 478) {
-			param.sched_priority = +2;
-		} else if (prio >= 733) {
-			param.sched_priority = -2;
-		} else {
-			param.sched_priority = 0;
-		}
-
-		result = pthread_setschedparam(thread->p, pol, &param);
-
-		if (result == 0) {
-			LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
-
-			return OK;
-		}
+	if (result != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	return KERNEL_ERROR_EINVAL;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (prio <= 478) {
+		param.sched_priority = +2;
+	} else if (prio >= 733) {
+		param.sched_priority = -2;
+	} else {
+		param.sched_priority = 0;
+	}
+
+	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+#endif
+
+	thread->attr->guest_priority = prio;
+	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
+	return OK;
 }
 
 void KYTY_SYSV_ABI PthreadTestcancel() {

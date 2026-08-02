@@ -229,6 +229,17 @@ codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
 
 Release archives already include a signed `libMoltenVK.dylib`.
 
+### Regression tests
+
+Build every regression executable and run the registered tests with:
+
+```powershell
+cmake --build _Build/windows --target kyty_tests
+ctest --test-dir _Build/windows --output-on-failure
+```
+
+Use `_Build/linux` instead of `_Build/windows` for a Linux build.
+
 ### Visual Studio Code
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake

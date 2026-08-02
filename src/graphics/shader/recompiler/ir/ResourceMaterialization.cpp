@@ -200,12 +200,12 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension ||
 		    DescriptorIsCube(descriptor) != image.cube) {
 			if (error != nullptr) {
-				*error = fmt::format(
-				    "image descriptor {} no longer matches specialized dimension: "
-				    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
-				    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
-				    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
-				    descriptor.dwords[6], descriptor.dwords[7]);
+				*error =
+				    fmt::format("image descriptor {} no longer matches specialized dimension: "
+				                "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+				                i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
+				                descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+				                descriptor.dwords[6], descriptor.dwords[7]);
 			}
 			return false;
 		}
@@ -224,14 +224,17 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			const bool raw_sint_storage =
 			    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
 			    !image.read && !image.atomic;
-			const bool uint_descriptor =
-			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-			const auto uint_program = image.kind == ResourceKind::ImageUint ||
-			                          image.kind == ResourceKind::StorageImageUint;
+			const bool uint_descriptor = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+			const auto uint_program    = image.kind == ResourceKind::ImageUint ||
+			                             image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
 				if (error != nullptr) {
-					*error =
-					    fmt::format("image descriptor {} no longer matches specialized format", i);
+					*error = fmt::format(
+					    "image descriptor {} no longer matches specialized format: "
+					    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+					    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
+					    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+					    descriptor.dwords[6], descriptor.dwords[7]);
 				}
 				return false;
 			}

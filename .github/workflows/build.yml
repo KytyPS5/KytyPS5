@@ -73,7 +73,7 @@ jobs:
       - name: Configure
         shell: cmd
         run: |
-          cmake -S src -B _Build/windows ^
+          cmake -S . -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_C_COMPILER=clang-cl ^
@@ -147,7 +147,7 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          cmake -S src -B _Build/macos \
+          cmake -S . -B _Build/macos \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
@@ -270,7 +270,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p _Build
-          cmake -S src -B _Build/linux \
+          cmake -S . -B _Build/linux \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \

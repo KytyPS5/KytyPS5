@@ -141,7 +141,7 @@ git submodule update --init --recursive
 Configure the project. Replace the Qt path with the version installed on your system:
 
 ```powershell
-cmake -S src -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
+cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
 ```
 
 Build the launcher and stage a runnable installation:
@@ -174,7 +174,7 @@ Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution
 ```bash
 git submodule update --init --recursive
 
-cmake -S src -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_PREFIX_PATH="$Qt6_DIR"
 
@@ -188,7 +188,7 @@ The install step copies the Qt libraries and plugins next to the binaries, so
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.
 
-Note that the CMake source root is `src`, not the repository root.
+The CMake source root is the repository root.
 
 ### Building on macOS
 
@@ -207,7 +207,7 @@ Requirements:
 ```bash
 git submodule update --init --recursive
 
-cmake -S src -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=x86_64 \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_PREFIX_PATH="$Qt6_DIR"

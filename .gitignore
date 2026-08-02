@@ -4,3 +4,4 @@
 build/
 _Build/vscode-clang/
 _Build/
+cmake-build-debug/

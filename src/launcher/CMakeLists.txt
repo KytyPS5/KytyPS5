@@ -141,14 +141,14 @@ elseif(LINUX)
 endif()
 
 
-set(tidy_dirs "${CMAKE_SOURCE_DIR}/launcher/include") 
-set(iwyu_maps "${CMAKE_SOURCE_DIR}/launcher/utils/qt6_16.imp")
+set(tidy_dirs "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(iwyu_maps "${CMAKE_CURRENT_SOURCE_DIR}/utils/qt6_16.imp")
 
 get_property(inc_headers TARGET launcher PROPERTY INCLUDE_DIRECTORIES)
 
 list(APPEND inc_headers
-	${CMAKE_SOURCE_DIR}/launcher
-	${CMAKE_BINARY_DIR}/launcher/launcher_autogen/include
+	${CMAKE_CURRENT_SOURCE_DIR}
+	${CMAKE_CURRENT_BINARY_DIR}/launcher_autogen/include
 	${Qt6Widgets_INCLUDE_DIRS}
 	${Qt6Core_INCLUDE_DIRS}
 	${Qt6Gui_INCLUDE_DIRS}

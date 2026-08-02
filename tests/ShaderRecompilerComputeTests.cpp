@@ -39,6 +39,7 @@
 #include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
 #include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/BindingLayout.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "spirv-tools/libspirv.hpp"
@@ -769,6 +770,91 @@ void ValidateSpirv(const char* shader_name, const std::vector<u32>& spirv) {
 	if (!tools.Validate(spirv)) {
 		Fail(shader_name, "SPIR-V validation", messages);
 	}
+}
+
+size_t CountText(const std::string& text, const std::string& needle) {
+	size_t count = 0;
+	for (size_t offset = 0; (offset = text.find(needle, offset)) != std::string::npos;
+	     offset += needle.size()) {
+		count++;
+	}
+	return count;
+}
+
+void CheckRectListShaders() {
+	constexpr const char* name = "RectListShaders";
+
+	auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+	program->info.inputs.push_back(
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, "in_param_0"});
+	program->info.inputs.push_back(
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
+
+	ShaderVertexInputInfo vertex {};
+	vertex.param_export_mask = 1u;
+	ShaderPixelInputInfo pixel {};
+	pixel.input_num                = 2;
+	pixel.interpolator_settings[0] = 0x400u;
+	pixel.interpolator_settings[1] = 0;
+	pixel.stage.program            = program;
+	HW::PixelShaderInfo ps_regs {};
+	const auto          perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+	pixel.ps_no_perspective            = true;
+	const auto no_perspective_id       = ShaderGetIdPS(ps_regs, pixel, false);
+	pixel.ps_no_perspective            = false;
+	Require(name, "pipeline identity", perspective_id != no_perspective_id,
+	        "pixel interpolation mode must participate in the shader and pipeline key");
+
+	const std::array<uint32_t, 2> active_inputs = {0, 1};
+	Require(name, "duplicate mapping",
+	        ShaderPixelParameterLocation(pixel, active_inputs, 0) == 0 &&
+	            ShaderPixelParameterLocation(pixel, active_inputs, 1) == 1,
+	        "duplicate pixel mappings must receive distinct effective output locations");
+
+	const auto shaders = BuildRectListShaders(vertex, &pixel);
+	Require(name, "SPIR-V version",
+	        shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
+	            shaders.evaluation.size() > 1 && shaders.evaluation[1] == 0x00010500u,
+	        "shadPS4-compatible vector selection requires SPIR-V 1.5");
+	ValidateSpirv(name, shaders.control);
+	ValidateSpirv(name, shaders.evaluation);
+
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+	std::string          control_text;
+	std::string          evaluation_text;
+	Require(name, "control disassembly", tools.Disassemble(shaders.control, &control_text),
+	        "failed to disassemble rectangle-list tessellation control shader");
+	Require(name, "evaluation disassembly",
+	        tools.Disassemble(shaders.evaluation, &evaluation_text),
+	        "failed to disassemble rectangle-list tessellation evaluation shader");
+	Require(name, "control execution mode",
+	        control_text.find("TessellationControl") != std::string::npos &&
+	            control_text.find("OutputVertices 4") != std::string::npos,
+	        "rectangle-list control shader must produce four control points");
+	Require(name, "evaluation execution modes",
+	        evaluation_text.find("TessellationEvaluation") != std::string::npos &&
+	            evaluation_text.find("Quads") != std::string::npos &&
+	            evaluation_text.find("SpacingEqual") != std::string::npos &&
+	            evaluation_text.find("VertexOrderCw") != std::string::npos,
+	        "rectangle-list evaluation shader has the wrong patch modes");
+	Require(name, "no geometry stage",
+	        control_text.find("Geometry") == std::string::npos &&
+	            evaluation_text.find("Geometry") == std::string::npos,
+	        "rectangle-list expansion must not use geometry shaders");
+	Require(name, "flat broadcast",
+	        CountText(control_text, "OpVectorTimesScalar") == 6 &&
+	            CountText(control_text, "OpSelect %v4float") == 2,
+	        "flat parameters must use guest vertex zero instead of reconstructed values");
+	Require(name, "remapped interface",
+	        CountText(control_text, " Location 0") == 2 &&
+	            CountText(control_text, " Location 1") == 1 &&
+	            CountText(evaluation_text, " Location 0") == 2 &&
+	            CountText(evaluation_text, " Location 1") == 2,
+	        "duplicate pixel mappings must share one vertex input and keep distinct patch outputs");
+
+	const auto position_only = BuildRectListShaders(vertex, nullptr);
+	ValidateSpirv(name, position_only.control);
+	ValidateSpirv(name, position_only.evaluation);
 }
 
 void CheckSpirvText(const TestCase& test, const std::vector<u32>& spirv) {
@@ -17502,6 +17588,7 @@ int main(int argc, char** argv) {
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());
 	CheckEmbeddedFetchVertexOffset();
 	CheckEmbeddedFetchLaneSpill();
+	CheckRectListShaders();
 	CheckPs5GameExampleImageClearRuntimeShape();
 	vulkan.CheckSchedulerTimeline();
 	vulkan.CheckGpuMappedRangeLifecycle();

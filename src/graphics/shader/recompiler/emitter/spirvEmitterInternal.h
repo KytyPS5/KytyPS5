@@ -425,9 +425,6 @@ struct EmitterState {
 	std::map<uint32_t, uint32_t>                     float_constants;
 };
 
-constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
-constexpr uint32_t PsInputFlatShade  = 0x00000400u;
-
 enum class VertexInputScalarKind { Float, Sint, Uint };
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;

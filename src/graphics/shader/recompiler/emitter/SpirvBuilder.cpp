@@ -19,7 +19,7 @@ static void AppendInstructionWords(std::vector<uint32_t>& section, const uint32_
 	section.insert(section.end(), words + 1, words + words_num);
 }
 
-Builder::Builder() {
+Builder::Builder(uint32_t version): m_version(version) {
 	m_debug.reserve(InitialSpirvSectionReserve);
 	m_annotations.reserve(InitialSpirvSectionReserve);
 	m_types.reserve(InitialSpirvSectionReserve);
@@ -138,7 +138,7 @@ std::vector<uint32_t> Builder::Build() const {
 	               m_debug.size() + m_annotations.size() + m_types.size() + m_functions.size());
 
 	module.push_back(0x07230203u);
-	module.push_back(0x00010300u);
+	module.push_back(m_version);
 	module.push_back(0u);
 	module.push_back(m_next_id);
 	module.push_back(0u);

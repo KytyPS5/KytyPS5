@@ -78,19 +78,6 @@
            </property>
           </widget>
          </item>
-         <item row="2" column="0" colspan="2">
-          <widget class="QCheckBox" name="checkBox_ngg_rectlist_draw">
-           <property name="toolTip">
-            <string>Use the NGG 4-vertex path for rect-list DrawIndexAuto primitive 7</string>
-           </property>
-           <property name="text">
-            <string>Use NGG rect-list draw</string>
-           </property>
-           <property name="checked">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
         </layout>
        </widget>
       </item>

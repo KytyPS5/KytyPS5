@@ -216,7 +216,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	args << "--profiler-direction" << EnumToText(info.profiler_direction);
 	args << "--spirv-debug-printf" << "false";
-	args << "--ngg-rectlist-draw" << BoolArg(info.ngg_rectlist_draw_enabled);
 	if (info.renderdoc_enabled) {
 		args << "--rd";
 	}

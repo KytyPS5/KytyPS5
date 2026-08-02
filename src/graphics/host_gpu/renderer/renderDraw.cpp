@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -650,11 +649,9 @@ static bool ConsumeMetadataColorOperation(const RenderCommandBuffer& buffer) {
 }
 
 struct DrawEmitInfo {
-	bool     indexed           = false;
-	bool     draw_prim7_as_ngg = false;
-	uint32_t draw_vertex_count = 0;
-	int32_t  vertex_offset     = 0;
-	uint32_t first_vertex      = 0;
+	bool     indexed       = false;
+	int32_t  vertex_offset = 0;
+	uint32_t first_vertex  = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -767,7 +764,7 @@ static void SetDrawDebugPhase(RenderCommandBuffer& buffer, uint64_t submit_id,
 	                    draw.flags, draw.instance_count, draw.first_instance);
 }
 
-static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw, bool use_ngg_rectlist_draw,
+static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
                             vk::PrimitiveTopology& topology) {
 
 	topology = vk::PrimitiveTopology::ePointList;
@@ -791,8 +788,7 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw, bool use
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
 		case Prospero::PrimitiveType::kRectList:
-			topology = (auto_draw && use_ngg_rectlist_draw ? vk::PrimitiveTopology::eTriangleStrip
-			                                               : vk::PrimitiveTopology::eTriangleList);
+			topology = vk::PrimitiveTopology::ePatchList;
 			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
 			if (!auto_draw) {
@@ -991,20 +987,6 @@ static void LogDrawStateIfNeeded(const RenderCommandBuffer& buffer, const DrawCa
 	// LogDrawTextureState(draw.name, state.color_info[0], state.ps_input_info);
 }
 
-static bool IsHostExpandedRectListDrawSupported(const ShaderVertexInputInfo& vs_input_info,
-                                                const DrawCallInfo&          draw,
-                                                const DrawEmitInfo&          emit) {
-	if (!emit.draw_prim7_as_ngg) {
-		return true;
-	}
-
-	if (vs_input_info.buffers_num != 0) {
-		return false;
-	}
-
-	return draw.index_count == 3 || draw.index_count == emit.draw_vertex_count;
-}
-
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
                                const DrawEmitInfo& emit) {
@@ -1017,22 +999,12 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriList:
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
-			if (emit.indexed) {
-				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      draw.first_instance);
-			} else {
-				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
-				               draw.first_instance);
-			}
-			break;
 		case Prospero::PrimitiveType::kRectList:
 			if (emit.indexed) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      draw.first_instance);
 			} else {
-				EXIT_NOT_IMPLEMENTED(
-				    !IsHostExpandedRectListDrawSupported(vs_input_info, draw, emit));
-				vk_buffer.draw(emit.draw_vertex_count, draw.instance_count, emit.first_vertex,
+				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               draw.first_instance);
 			}
 			break;
@@ -1201,7 +1173,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	hw_check(buffer);
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, false, false, topology)) {
+	if (!GetDrawTopology(ucfg, false, topology)) {
 		return;
 	}
 
@@ -1337,20 +1309,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 		return;
 	}
 
-	vk::PrimitiveTopology topology              = vk::PrimitiveTopology::ePointList;
-	const bool            use_ngg_rectlist_draw = Config::NggRectlistDrawEnabled();
-
-	if (!GetDrawTopology(ucfg, true, use_ngg_rectlist_draw, topology)) {
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, true, topology)) {
 		ResetBindings();
 		return;
 	}
-	const bool draw_prim7_as_ngg =
-	    (use_ngg_rectlist_draw &&
-	     ucfg.GetPrimType() == Prospero::GpuEnumValue(Prospero::PrimitiveType::kRectList));
-
 	RefreshShaders(buffer, draw, false, state);
 
-	if (draw_prim7_as_ngg && state.vs_input_info.buffers_num == 0 &&
+	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
+	if (rect_list && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
@@ -1367,13 +1334,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	                         Prospero::GpuEnumValue(Prospero::PrimitiveType::kRectListLegacy),
 	                     0, nullptr);
 
-	const uint32_t draw_vertex_count = (draw_prim7_as_ngg ? 4u : index_count);
-	const auto     vertex_offset = ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
-	                               static_cast<int32_t>(first_vertex);
-	DrawEmitInfo   emit {};
-	emit.draw_prim7_as_ngg = draw_prim7_as_ngg;
-	emit.draw_vertex_count = draw_vertex_count;
-	emit.first_vertex      = static_cast<uint32_t>(vertex_offset);
+	const auto   vertex_offset = ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
+	                             static_cast<int32_t>(first_vertex);
+	DrawEmitInfo emit {};
+	emit.first_vertex = static_cast<uint32_t>(vertex_offset);
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,

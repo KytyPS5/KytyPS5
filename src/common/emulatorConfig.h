@@ -35,7 +35,6 @@ struct ConfigOptions {
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   ngg_rectlist_draw_enabled   = true;
 	bool                   readback_linear_images      = false;
 };
 
@@ -64,7 +63,6 @@ ProfilerDirection GetProfilerDirection();
 bool SpirvDebugPrintfEnabled();
 
 bool RenderDocEnabled();
-bool NggRectlistDrawEnabled();
 bool ReadbackLinearImagesEnabled();
 
 } // namespace Config

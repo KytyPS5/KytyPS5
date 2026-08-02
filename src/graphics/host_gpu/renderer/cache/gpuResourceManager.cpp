@@ -7,7 +7,8 @@
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, m_resource_mutex),
+    : m_scheduler(scheduler),
+      m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, m_resource_mutex),
       m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache, m_resource_mutex) {}
 
 GpuResourceManager::~GpuResourceManager() = default;
@@ -101,7 +102,22 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	if (m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("unsupported memory unmap from a pre-owned resource transaction, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
 	const auto unmap = [this, vaddr, size] {
+		if (m_scheduler.Active()) {
+			const auto tick = m_scheduler.CurrentTick();
+			m_scheduler.FinishCurrent();
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_page_manager.OnGpuUnmap(vaddr, size);
@@ -109,13 +125,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_mapped_ranges.Subtract(vaddr, size);
 	};
 	if (m_gpu == nullptr) {
-		if (m_resource_mutex.IsOwnedByCurrentThread()) {
-			EXIT("cannot synchronously unmap from a resource transaction\n");
-		}
 		unmap();
 		return;
 	}
-	Gpu::SubmissionLock submissions(*m_gpu);
 	m_gpu->SendCommandSync(unmap);
 }
 

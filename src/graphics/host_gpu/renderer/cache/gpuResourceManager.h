@@ -36,6 +36,7 @@ public:
 private:
 	PageManager               m_page_manager;
 	ResourceMutex             m_resource_mutex;
+	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;

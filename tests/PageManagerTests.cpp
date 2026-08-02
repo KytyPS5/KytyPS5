@@ -26,7 +26,9 @@
 namespace {
 
 using Libs::Graphics::PageManager;
-using Libs::Graphics::PageWatchMode;
+using Libs::Graphics::RegionBits;
+using Libs::Graphics::TRACKER_PAGE_SIZE;
+using Libs::Graphics::TRACKER_REGION_SIZE;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -113,6 +115,11 @@ bool IsWritable(const void *address) {
 }
 
 uint64_t g_protection_calls = 0;
+struct ProtectionCall {
+  uint64_t address;
+  uint64_t size;
+};
+std::vector<ProtectionCall> g_protection_ranges;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
@@ -124,6 +131,7 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
   }
   DWORD old_protection = 0;
   g_protection_calls++;
+  g_protection_ranges.push_back({vaddr, size});
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
@@ -155,12 +163,12 @@ void TestWatchAndUnwatch() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   manager.OnGpuMap(address, page_size * 2);
-  manager.UpdatePageWatchers(true, address, page_size);
+  manager.UpdatePageWatchers<true>(address, page_size);
   Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
         "write watch installed incorrect protections");
   Check(g_protection_calls != 0,
         "watch protection bypassed the address-space owner callback");
-  manager.UpdatePageWatchers(false, address, page_size);
+  manager.UpdatePageWatchers<false>(address, page_size);
   Check(IsWritable(memory), "write unwatch did not restore access");
   manager.OnGpuUnmap(address, page_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
@@ -173,35 +181,13 @@ void TestSharedWatcherCounts() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address + 8, 32);
-  manager.UpdatePageWatchers(true, address + 128, 64);
-  manager.UpdatePageWatchers(false, address + 8, 32);
+  manager.UpdatePageWatchers<true>(address + 8, 32);
+  manager.UpdatePageWatchers<true>(address + 128, 64);
+  manager.UpdatePageWatchers<false>(address + 8, 32);
   Check(Protection(memory) == PAGE_READONLY,
         "first unwatch released a shared watcher");
-  manager.UpdatePageWatchers(false, address + 128, 64);
+  manager.UpdatePageWatchers<false>(address + 128, 64);
   Check(IsWritable(memory), "last unwatch did not restore access");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestMixedWatcherModes() {
-  PageManager manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size, PageWatchMode::Write);
-  manager.UpdatePageWatchers(true, address, page_size,
-                             PageWatchMode::ReadWrite);
-  Check(Protection(memory) == PAGE_NOACCESS,
-        "read/write watcher did not deny access");
-  manager.UpdatePageWatchers(false, address, page_size, PageWatchMode::Write);
-  Check(Protection(memory) == PAGE_NOACCESS,
-        "write unwatch released a read/write watcher");
-  manager.UpdatePageWatchers(false, address, page_size,
-                             PageWatchMode::ReadWrite);
-  Check(IsWritable(memory), "read/write unwatch did not restore access");
   manager.OnGpuUnmap(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
@@ -218,11 +204,27 @@ void TestCrossRegionRange() {
         "test allocation does not contain a region boundary");
 
   manager.OnGpuMap(base, region_size * 2);
-  manager.UpdatePageWatchers(true, boundary - page_size, page_size * 2);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchers<true>(boundary - page_size, page_size * 2);
+  Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+            g_protection_ranges[0].address == boundary - page_size &&
+            g_protection_ranges[0].size == page_size &&
+            g_protection_ranges[1].address == boundary &&
+            g_protection_ranges[1].size == page_size,
+        "cross-region watch was not split only at the region boundary");
   Check(!IsWritable(reinterpret_cast<void *>(boundary - page_size)) &&
             !IsWritable(reinterpret_cast<void *>(boundary)),
         "cross-region watch did not protect both pages");
-  manager.UpdatePageWatchers(false, boundary - page_size, page_size * 2);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchers<false>(boundary - page_size, page_size * 2);
+  Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+            g_protection_ranges[0].address == boundary - page_size &&
+            g_protection_ranges[0].size == page_size &&
+            g_protection_ranges[1].address == boundary &&
+            g_protection_ranges[1].size == page_size,
+        "cross-region unwatch was not split only at the region boundary");
   Check(IsWritable(reinterpret_cast<void *>(boundary - page_size)) &&
             IsWritable(reinterpret_cast<void *>(boundary)),
         "cross-region unwatch did not restore both pages");
@@ -239,26 +241,26 @@ void TestBatchedWatcherRanges() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   manager.OnGpuMap(address, allocation_size);
-  manager.UpdatePageWatchers(true, address + page_size, page_size);
-  manager.UpdatePageWatchers(true, address + page_size * 3, page_size);
-  manager.UpdatePageWatchers(true, address, page_size * 5);
-  manager.UpdatePageWatchers(false, address, page_size * 5);
+  manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  manager.UpdatePageWatchers<true>(address + page_size * 3, page_size);
+  manager.UpdatePageWatchers<true>(address, page_size * 5);
+  manager.UpdatePageWatchers<false>(address, page_size * 5);
   Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
             IsWritable(memory + page_size * 2) &&
             Protection(memory + page_size * 3) == PAGE_READONLY &&
             IsWritable(memory + page_size * 4),
         "fragmented unwatch lost overlapping watcher counts");
-  manager.UpdatePageWatchers(false, address + page_size, page_size);
-  manager.UpdatePageWatchers(false, address + page_size * 3, page_size);
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  manager.UpdatePageWatchers<false>(address + page_size * 3, page_size);
 
   g_protection_calls = 0;
-  manager.UpdatePageWatchers(true, address, allocation_size);
+  manager.UpdatePageWatchers<true>(address, allocation_size);
   Check(g_protection_calls == 4 && Protection(memory) == PAGE_READONLY &&
             Protection(memory + region_size) == PAGE_READONLY &&
             Protection(memory + region_size * 2) == PAGE_READONLY &&
             Protection(memory + allocation_size - page_size) == PAGE_READONLY,
         "large watch was not batched and protected by tracking region");
-  manager.UpdatePageWatchers(false, address, allocation_size);
+  manager.UpdatePageWatchers<false>(address, allocation_size);
   Check(IsWritable(memory) && IsWritable(memory + region_size) &&
             IsWritable(memory + region_size * 2) &&
             IsWritable(memory + allocation_size - page_size),
@@ -268,20 +270,266 @@ void TestBatchedWatcherRanges() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestRegionMaskWatcherRanges() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(region_base + region_size <= allocation_base + region_size * 2,
+        "test allocation does not contain a complete tracking region");
+  manager.OnGpuMap(allocation_base, region_size * 2);
+
+  RegionBits full_mask;
+  full_mask.Fill();
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, full_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base &&
+            g_protection_ranges[0].size == region_size,
+        "full region mask did not use one protection span");
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false>(region_base, full_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base &&
+            g_protection_ranges[0].size == region_size,
+        "full region unmask did not use one protection span");
+
+  RegionBits sparse_mask;
+  sparse_mask.Set(1);
+  sparse_mask.Set(3);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, sparse_mask);
+  Check(g_protection_calls == 2 &&
+            Protection(reinterpret_cast<void *>(region_base + page_size)) ==
+                PAGE_READONLY &&
+            IsWritable(reinterpret_cast<void *>(region_base + page_size * 2)) &&
+            Protection(reinterpret_cast<void *>(region_base + page_size * 3)) ==
+                PAGE_READONLY,
+        "sparse region mask installed incorrect write watchers");
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false>(region_base, sparse_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base + page_size &&
+            g_protection_ranges[0].size == page_size * 3,
+        "sparse unmask did not bridge a compatible gap");
+
+  manager.UpdatePageWatchersForRegion<true>(region_base, sparse_mask);
+  g_protection_calls = 0;
+  manager.UpdatePageWatchersForRegion<true>(region_base, sparse_mask);
+  Check(g_protection_calls == 0,
+        "duplicate sparse watch changed an already protected range");
+  manager.UpdatePageWatchersForRegion<false>(region_base, sparse_mask);
+  Check(g_protection_calls == 0,
+        "first sparse unwatch released a duplicate watcher");
+  manager.UpdatePageWatchersForRegion<false>(region_base, sparse_mask);
+
+  manager.UpdatePageWatchers<true>(region_base + page_size * 2, page_size);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, sparse_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base + page_size &&
+            g_protection_ranges[0].size == page_size * 3,
+        "sparse mask did not bridge a compatible protected gap");
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false>(region_base, sparse_mask);
+  Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+            g_protection_ranges[0].address == region_base + page_size &&
+            g_protection_ranges[0].size == page_size &&
+            g_protection_ranges[1].address == region_base + page_size * 3 &&
+            g_protection_ranges[1].size == page_size,
+        "sparse unmask crossed an incompatible protected gap");
+  manager.UpdatePageWatchers<false>(region_base + page_size * 2, page_size);
+
+  g_protection_calls = 0;
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, sparse_mask);
+  Check(g_protection_calls == 2 &&
+            Protection(reinterpret_cast<void *>(region_base + page_size)) ==
+                PAGE_NOACCESS &&
+            Protection(reinterpret_cast<void *>(region_base + page_size * 3)) ==
+                PAGE_NOACCESS,
+        "sparse read mask did not deny access");
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, sparse_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].size == page_size * 3,
+        "sparse read unmask did not bridge a compatible gap");
+
+  manager.OnGpuUnmap(allocation_base, region_size * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestRegionEndpointBatching() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  constexpr auto last_page = region_size / page_size - 1;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(region_base + region_size <= allocation_base + region_size * 2,
+        "test allocation does not contain a complete tracking region");
+  manager.OnGpuMap(allocation_base, region_size * 2);
+
+  RegionBits endpoints;
+  endpoints.Set(0);
+  endpoints.Set(last_page);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, endpoints);
+  Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+            g_protection_ranges[0].address == region_base &&
+            g_protection_ranges[0].size == page_size &&
+            g_protection_ranges[1].address ==
+                region_base + region_size - page_size &&
+            g_protection_ranges[1].size == page_size,
+        "endpoint watch did not protect only the selected pages");
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false>(region_base, endpoints);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base &&
+            g_protection_ranges[0].size == region_size,
+        "endpoint unwatch did not coalesce the compatible 4 MiB span");
+
+  RegionBits full_mask;
+  full_mask.Fill();
+  manager.UpdatePageWatchersForRegion<true>(region_base, full_mask);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, full_mask);
+  Check(g_protection_calls == 0,
+        "duplicate full-region watch issued a redundant protection call");
+  manager.UpdatePageWatchersForRegion<false>(region_base, full_mask);
+  Check(g_protection_calls == 0,
+        "first full-region unwatch released overlapping watcher counts");
+  manager.UpdatePageWatchersForRegion<false>(region_base, full_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base &&
+            g_protection_ranges[0].size == region_size,
+        "last full-region unwatch did not use one 4 MiB protection call");
+
+  manager.OnGpuUnmap(allocation_base, region_size * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestReadWriteWatcherInteractions() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(region_base + region_size <= allocation_base + region_size * 2,
+        "test allocation does not contain a complete tracking region");
+  manager.OnGpuMap(allocation_base, region_size * 2);
+
+  RegionBits write_mask;
+  write_mask.SetRange(10, 15);
+  RegionBits read_mask;
+  read_mask.Set(11);
+  read_mask.Set(13);
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true>(region_base, write_mask);
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == region_base + page_size * 10 &&
+            g_protection_ranges[0].size == page_size * 5,
+        "contiguous write watch was not batched");
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, read_mask);
+  Check(
+      g_protection_calls == 2 &&
+          Protection(reinterpret_cast<void *>(region_base + page_size * 11)) ==
+              PAGE_NOACCESS &&
+          Protection(reinterpret_cast<void *>(region_base + page_size * 12)) ==
+              PAGE_READONLY &&
+          Protection(reinterpret_cast<void *>(region_base + page_size * 13)) ==
+              PAGE_NOACCESS,
+      "read watchers did not compose with write-only watchers");
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false>(region_base, write_mask);
+  Check(
+      g_protection_calls == 3 &&
+          IsWritable(reinterpret_cast<void *>(region_base + page_size * 10)) &&
+          Protection(reinterpret_cast<void *>(region_base + page_size * 11)) ==
+              PAGE_NOACCESS &&
+          IsWritable(reinterpret_cast<void *>(region_base + page_size * 12)) &&
+          Protection(reinterpret_cast<void *>(region_base + page_size * 13)) ==
+              PAGE_NOACCESS &&
+          IsWritable(reinterpret_cast<void *>(region_base + page_size * 14)),
+      "write unwatch changed pages still owned by read watchers");
+
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, read_mask);
+  Check(
+      g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+          g_protection_ranges[0].address == region_base + page_size * 11 &&
+          g_protection_ranges[0].size == page_size * 3 &&
+          IsWritable(reinterpret_cast<void *>(region_base + page_size * 11)) &&
+          IsWritable(reinterpret_cast<void *>(region_base + page_size * 13)),
+      "read unwatch did not coalesce through compatible writable state");
+
+  manager.OnGpuUnmap(allocation_base, region_size * 2);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
   if (std::strcmp(name, "invalid-range") == 0) {
-    manager.UpdatePageWatchers(true, (1ull << 40u) - 1, 2);
+    manager.UpdatePageWatchers<true>((1ull << 40u) - 1, 2);
   } else if (std::strcmp(name, "unknown-untrack") == 0) {
-    manager.UpdatePageWatchers(false, 0x1000, page_size);
+    manager.UpdatePageWatchers<false>(0x1000, page_size);
   } else if (std::strcmp(name, "destructor-watch") == 0) {
     auto doomed = std::make_unique<PageManager>();
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
     doomed->OnGpuMap(address, page_size);
-    doomed->UpdatePageWatchers(true, address, page_size);
+    doomed->UpdatePageWatchers<true>(address, page_size);
     doomed.reset();
+  } else if (std::strcmp(name, "known-write-underflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    manager.OnGpuMap(address, page_size);
+    manager.UpdatePageWatchers<true>(address, page_size);
+    manager.UpdatePageWatchers<false>(address, page_size);
+    manager.UpdatePageWatchers<false>(address, page_size);
+  } else if (std::strcmp(name, "read-overflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    manager.OnGpuMap(address, page_size);
+    RegionBits mask;
+    const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
+    const auto page = static_cast<size_t>((address - region_base) / page_size);
+    mask.Set(page);
+    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  } else if (std::strcmp(name, "write-overflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    manager.OnGpuMap(address, page_size);
+    for (uint32_t count = 0; count < 128; count++) {
+      manager.UpdatePageWatchers<true>(address, page_size);
+    }
   }
   std::_Exit(0x7f);
 }
@@ -328,7 +576,8 @@ void CheckDeathCase(const char *name) {
 
 void TestFatalPaths() {
   for (const char *name :
-       {"invalid-range", "unknown-untrack", "destructor-watch"}) {
+       {"invalid-range", "unknown-untrack", "destructor-watch",
+        "known-write-underflow", "read-overflow", "write-overflow"}) {
     CheckDeathCase(name);
   }
 }
@@ -350,9 +599,11 @@ int main(int argc, char **argv) {
   }
   TestWatchAndUnwatch();
   TestSharedWatcherCounts();
-  TestMixedWatcherModes();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
+  TestRegionMaskWatcherRanges();
+  TestRegionEndpointBatching();
+  TestReadWriteWatcherInteractions();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

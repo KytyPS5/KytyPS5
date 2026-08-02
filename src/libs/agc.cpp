@@ -221,57 +221,6 @@ static RegisterDefaults* get_internal_register_defaults(uint32_t ver) {
 	return get_register_defaults(g_agc_internal_reg_defaults_by_version[index], &storage[index]);
 }
 
-struct PendingGraphicsSegment {
-	uint32_t* start     = nullptr;
-	uint32_t* end       = nullptr;
-	uint32_t* range_end = nullptr;
-};
-
-static std::mutex             g_pending_graphics_segment_mutex;
-static PendingGraphicsSegment g_pending_graphics_segment;
-
-static void track_pending_graphics_segment_after_submit(uint32_t* dcb, uint32_t size_in_dwords) {
-	if (dcb == nullptr || size_in_dwords == 0) {
-		return;
-	}
-
-	auto* segment_start = dcb + size_in_dwords;
-	auto* range_end     = segment_start + 0xfffffu;
-
-	std::lock_guard lock(g_pending_graphics_segment_mutex);
-	g_pending_graphics_segment.start     = segment_start;
-	g_pending_graphics_segment.end       = segment_start;
-	g_pending_graphics_segment.range_end = range_end;
-}
-
-static void track_pending_graphics_allocation(uint32_t* cmd, uint32_t size_dw) {
-	if (cmd == nullptr || size_dw == 0) {
-		return;
-	}
-
-	std::lock_guard lock(g_pending_graphics_segment_mutex);
-	auto*           range_start = g_pending_graphics_segment.start;
-	auto*           range_end   = g_pending_graphics_segment.range_end;
-	if (range_start == nullptr || range_end == nullptr || cmd < range_start || cmd >= range_end) {
-		return;
-	}
-
-	auto* cmd_end = cmd + size_dw;
-	if (cmd > g_pending_graphics_segment.end) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
-			LOGF("\t pending graphics segment: ignoring non-contiguous allocation cmd = "
-			     "0x%016" PRIx64 ", tracked_end = 0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(cmd),
-			     reinterpret_cast<uint64_t>(g_pending_graphics_segment.end));
-		}
-		return;
-	}
-	if (cmd_end > g_pending_graphics_segment.end && cmd_end <= range_end) {
-		g_pending_graphics_segment.end = cmd_end;
-	}
-}
-
 struct CommandBuffer {
 	using Callback = KYTY_SYSV_ABI bool (*)(CommandBuffer*, uint32_t, void*);
 
@@ -370,7 +319,6 @@ struct CommandBuffer {
 		}
 		auto* ret_ptr = cursor_up;
 		cursor_up += size_dw;
-		track_pending_graphics_allocation(ret_ptr, size_dw);
 		return ret_ptr;
 	}
 };
@@ -830,6 +778,104 @@ int KYTY_SYSV_ABI GraphicsUnknownFuseShaderHalves(Shader* fused_result, const Sh
 	}
 
 	fused_result->user_data = nullptr;
+
+	return OK;
+}
+
+static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderRegister* src,
+                                            uint32_t shift, uint32_t mask) {
+	const auto dst_field = (dst->value >> shift) & mask;
+	const auto src_field = (src->value >> shift) & mask;
+	const auto field     = std::max(dst_field, src_field);
+
+	dst->value &= ~(mask << shift);
+	dst->value |= field << shift;
+}
+
+int KYTY_SYSV_ABI GraphicsUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+                                             const Shader* back, void* scratch_mem) {
+	PRINT_NAME();
+
+	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
+	     "\t front        = 0x%016" PRIx64 "\n"
+	     "\t back         = 0x%016" PRIx64 "\n"
+	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
+	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
+
+	const auto front_type = static_cast<Prospero::ShaderBinaryType>(front->type);
+	const auto is_gs      = front_type == Prospero::ShaderBinaryType::kGsFront;
+	const auto is_hs      = front_type == Prospero::ShaderBinaryType::kHsFront;
+	if ((!is_gs && !is_hs) ||
+	    (is_gs && back->type != static_cast<uint8_t>(Prospero::ShaderBinaryType::kGsBack)) ||
+	    (is_hs && back->type != static_cast<uint8_t>(Prospero::ShaderBinaryType::kHsBack))) {
+		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+	}
+
+	*fused_result      = *back;
+	fused_result->type = static_cast<uint8_t>(is_gs ? Prospero::ShaderBinaryType::kGs
+	                                                : Prospero::ShaderBinaryType::kHs);
+
+	const auto back_stages  = back->specials->vgt_shader_stages_en.value;
+	const auto front_stages = front->specials->vgt_shader_stages_en.value;
+	const auto mismatch_bit = is_gs ? (1u << 22u) : (1u << 21u);
+	if (((front_stages ^ back_stages) & mismatch_bit) != 0) {
+		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+	}
+
+	if (scratch_mem != nullptr) {
+		auto* sh_registers = static_cast<ShaderRegister*>(scratch_mem);
+		memcpy(sh_registers, back->sh_registers,
+		       static_cast<size_t>(back->num_sh_registers) * sizeof(ShaderRegister));
+		fused_result->sh_registers = sh_registers;
+	}
+
+	auto*      fused_regs      = fused_result->sh_registers;
+	const auto fused_reg_count = static_cast<uint32_t>(fused_result->num_sh_registers);
+	const auto front_reg_count = static_cast<uint32_t>(front->num_sh_registers);
+	const auto checksum_offset =
+	    is_gs ? Pm4::SPI_SHADER_PGM_CHKSUM_GS : Pm4::SPI_SHADER_PGM_CHKSUM_HS;
+	const auto* front_checksum0 =
+	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 0);
+	const auto* front_checksum1 =
+	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 1);
+	auto* fused_checksum0  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 0);
+	auto* fused_checksum1  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 1);
+	fused_checksum0->value = front_checksum0->value;
+	fused_checksum1->value = front_checksum1->value;
+
+	const auto  rsrc1_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC1_GS : Pm4::SPI_SHADER_PGM_RSRC1_HS;
+	const auto  rsrc2_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC2_GS : Pm4::SPI_SHADER_PGM_RSRC2_HS;
+	const auto* front_rsrc1 =
+	    find_shader_register(front->sh_registers, front_reg_count, rsrc1_offset);
+	const auto* front_rsrc2 =
+	    find_shader_register(front->sh_registers, front_reg_count, rsrc2_offset);
+	auto* fused_rsrc1 = find_shader_register(fused_regs, fused_reg_count, rsrc1_offset);
+	auto* fused_rsrc2 = find_shader_register(fused_regs, fused_reg_count, rsrc2_offset);
+
+	merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 0, 0x3fu);
+	merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 28, 0x0fu);
+	if (is_gs) {
+		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 29, 0x03u);
+		merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 16, 0x03u);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xfffbffffu) | (front_rsrc2->value & 0x00040000u);
+	} else {
+		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 28, 0x03u);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
+	}
+
+	const auto program_lo_offset = is_gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS;
+	auto*      program_lo = find_shader_register(fused_regs, fused_reg_count, program_lo_offset);
+	const auto address    = reinterpret_cast<uint64_t>(front->code);
+	program_lo->value     = static_cast<uint32_t>(address >> 8u);
+	(program_lo + 1)->value &= 0xffffff00u;
+	(program_lo + 1)->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
+
+	fused_result->user_data = front->user_data;
 
 	return OK;
 }
@@ -1347,7 +1393,7 @@ int KYTY_SYSV_ABI GraphicsWriteDataPatchSetAddressOrOffset(uint32_t* cmd,
 		return OK;
 	}
 
-	return static_cast<int>(0x8a6c000cu);
+	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
 int KYTY_SYSV_ABI GraphicsUnknownJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
@@ -1820,7 +1866,6 @@ uint32_t* KYTY_SYSV_ABI GraphicsCbReleaseMem(CommandBuffer* buf, uint8_t action,
 	cmd[5] = static_cast<uint32_t>(packet_data & 0xffffffffu);
 	cmd[6] = static_cast<uint32_t>((packet_data >> 32u) & 0xffffffffu);
 	cmd[7] = interrupt_ctx_id & 0x07ffffffu;
-
 	return cmd;
 }
 
@@ -2380,7 +2425,7 @@ int KYTY_SYSV_ABI GraphicsUnknownIkfdtRIqCE(uint32_t* cmd, uint64_t arg1,
 
 	auto op = (cmd[0] >> 8u) & 0xffu;
 	if (op != Pm4::IT_INDIRECT_BUFFER) {
-		return 0x8a6c000c;
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	auto vaddr        = reinterpret_cast<uint64_t>(target);
@@ -2800,6 +2845,10 @@ uint32_t KYTY_SYSV_ABI GraphicsAcbCondExecGetSize() {
 	return GraphicsDcbCondExecGetSize();
 }
 
+uint32_t KYTY_SYSV_ABI GraphicsAcbJumpGetSize() {
+	return 0x10u;
+}
+
 uint32_t* KYTY_SYSV_ABI GraphicsAcbWaitRegMem(CommandBuffer* buf, uint8_t size,
                                               uint8_t compare_function, uint8_t cache_policy,
                                               const volatile void* address, uint64_t reference,
@@ -3119,7 +3168,7 @@ int KYTY_SYSV_ABI GraphicsDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
 		return OK;
 	}
 
-	return static_cast<int>(0x8a6c000cu);
+	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
 int KYTY_SYSV_ABI GraphicsDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
@@ -3133,7 +3182,7 @@ int KYTY_SYSV_ABI GraphicsDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
 		return OK;
 	}
 
-	return static_cast<int>(0x8a6c000cu);
+	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
 uint32_t KYTY_SYSV_ABI GraphicsGetPacketSize(uint32_t* packet) {
@@ -3197,6 +3246,15 @@ int KYTY_SYSV_ABI GraphicsSetRangePredication(uint32_t* start, const volatile ui
 	return OK;
 }
 
+int KYTY_SYSV_ABI GraphicsRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_REWIND) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+
+	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(state) << 31u);
+	return OK;
+}
+
 int KYTY_SYSV_ABI GraphicsCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
 	PRINT_NAME();
 
@@ -3205,23 +3263,23 @@ int KYTY_SYSV_ABI GraphicsCondExecPatchSetEnd(uint32_t* cmd, const volatile uint
 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
 
 	if (cmd == nullptr || buffer == nullptr) {
-		return static_cast<int>(0x8a6c000cu);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	auto op = (cmd[0] >> 8u) & 0xffu;
 	if (op != Pm4::IT_COND_EXEC) {
-		return static_cast<int>(0x8a6c000cu);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	auto* packet_end = cmd + 5;
 	auto* range_end  = const_cast<uint32_t*>(reinterpret_cast<const volatile uint32_t*>(buffer));
 	if (range_end < packet_end) {
-		return static_cast<int>(0x8a6c000cu);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	auto num_dwords = static_cast<uint64_t>(range_end - packet_end);
 	if (num_dwords > 0x3fffu) {
-		return static_cast<int>(0x8a6c000cu);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	cmd[4] = (cmd[4] & ~0x3fffu) | static_cast<uint32_t>(num_dwords);
@@ -3237,12 +3295,12 @@ int KYTY_SYSV_ABI GraphicsCondExecPatchSetCommandAddress(uint32_t*              
 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
 
 	if (cmd == nullptr || command == nullptr) {
-		return static_cast<int>(0x8a6c000cu);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	auto op = (cmd[0] >> 8u) & 0xffu;
 	if (op != Pm4::IT_COND_EXEC || (reinterpret_cast<uintptr_t>(command) & 0x3u) != 0) {
-		return static_cast<int>(0x8a6c000cu);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	auto addr = reinterpret_cast<uint64_t>(command);
@@ -3704,150 +3762,6 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(dcb, size_in_dwords, nullptr, 0,
 	                            !dcb_has_queued_interrupt(dcb, size_in_dwords));
-	Gen5::track_pending_graphics_segment_after_submit(dcb, size_in_dwords);
-}
-
-static std::vector<uint64_t> collect_acb_wait_addresses(const uint32_t* acb,
-                                                        uint32_t        size_in_dwords) {
-	std::vector<uint64_t> addresses;
-
-	for (uint32_t offset = 0; offset < size_in_dwords;) {
-		auto cmd_id = acb[offset];
-		auto len    = KYTY_PM4_LEN(cmd_id);
-		if (len == 0 || len > size_in_dwords - offset) {
-			return addresses;
-		}
-
-		auto op = (cmd_id >> 8u) & 0xffu;
-		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_32 && len >= 7) {
-			auto address = static_cast<uint64_t>(acb[offset + 1]) |
-			               (static_cast<uint64_t>(acb[offset + 2]) << 32u);
-			if (address != 0) {
-				addresses.push_back(address);
-			}
-		} else if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_64 && len >= 9) {
-			auto address = static_cast<uint64_t>(acb[offset + 1]) |
-			               (static_cast<uint64_t>(acb[offset + 2]) << 32u);
-			if (address != 0) {
-				addresses.push_back(address);
-			}
-		}
-
-		offset += len;
-	}
-
-	return addresses;
-}
-
-static bool acb_waits_for_address(const std::vector<uint64_t>& wait_addresses,
-                                  uint64_t                     release_address) {
-	for (auto address: wait_addresses) {
-		if (address == release_address) {
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static void flush_pending_graphics_segment_before_acb(const uint32_t* acb,
-                                                      uint32_t        acb_size_in_dwords) {
-	uint32_t* dcb            = nullptr;
-	uint32_t  size_in_dwords = 0;
-	auto      wait_addresses = collect_acb_wait_addresses(acb, acb_size_in_dwords);
-
-	{
-		std::lock_guard lock(Gen5::g_pending_graphics_segment_mutex);
-		if (!wait_addresses.empty() && Gen5::g_pending_graphics_segment.start != nullptr) {
-			auto* scan        = Gen5::g_pending_graphics_segment.start;
-			auto* matched_end = Gen5::g_pending_graphics_segment.start;
-			while (scan < Gen5::g_pending_graphics_segment.end) {
-				auto cmd_id = *scan;
-				if (cmd_id == 0x80000000u) {
-					scan++;
-					continue;
-				}
-				if ((cmd_id & 0xC0000000u) != 0xC0000000u) {
-					break;
-				}
-
-				auto len = KYTY_PM4_LEN(cmd_id);
-				if (len == 0 ||
-				    len > static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end - scan)) {
-					break;
-				}
-
-				if (((cmd_id >> 8u) & 0xffu) == Pm4::IT_NOP &&
-				    KYTY_PM4_R(cmd_id) == Pm4::R_RELEASE_MEM && len >= 7) {
-					auto release_addr =
-					    static_cast<uint64_t>(scan[3]) | (static_cast<uint64_t>(scan[4]) << 32u);
-					if (acb_waits_for_address(wait_addresses, release_addr)) {
-						matched_end = scan + len;
-					}
-				}
-
-				scan += len;
-			}
-
-			if (matched_end > Gen5::g_pending_graphics_segment.start) {
-				Gen5::g_pending_graphics_segment.end = matched_end;
-			}
-		}
-
-		if (Gen5::g_pending_graphics_segment.start != nullptr &&
-		    Gen5::g_pending_graphics_segment.end > Gen5::g_pending_graphics_segment.start) {
-			auto* scan      = Gen5::g_pending_graphics_segment.start;
-			auto* valid_end = Gen5::g_pending_graphics_segment.start;
-			while (scan < Gen5::g_pending_graphics_segment.end) {
-				auto cmd_id = *scan;
-				if (cmd_id == 0x80000000u) {
-					scan++;
-					valid_end = scan;
-					continue;
-				}
-				if ((cmd_id & 0xC0000000u) != 0xC0000000u) {
-					break;
-				}
-
-				auto len = KYTY_PM4_LEN(cmd_id);
-				if (len == 0 ||
-				    len > static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end - scan)) {
-					break;
-				}
-
-				scan += len;
-				valid_end = scan;
-			}
-
-			if (valid_end < Gen5::g_pending_graphics_segment.end) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 64) {
-					LOGF("\t trimming pending graphics segment: addr = 0x%016" PRIx64
-					     ", old_dw = 0x%08" PRIx32 ", new_dw = 0x%08" PRIx32 "\n",
-					     reinterpret_cast<uint64_t>(Gen5::g_pending_graphics_segment.start),
-					     static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end -
-					                           Gen5::g_pending_graphics_segment.start),
-					     static_cast<uint32_t>(valid_end - Gen5::g_pending_graphics_segment.start));
-				}
-				Gen5::g_pending_graphics_segment.end = valid_end;
-			}
-		}
-
-		if (Gen5::g_pending_graphics_segment.start == nullptr ||
-		    Gen5::g_pending_graphics_segment.end <= Gen5::g_pending_graphics_segment.start) {
-			return;
-		}
-
-		dcb            = Gen5::g_pending_graphics_segment.start;
-		size_in_dwords = static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end -
-		                                       Gen5::g_pending_graphics_segment.start);
-	}
-
-	LOGF("\t flushing pending graphics segment before ACB: addr = 0x%016" PRIx64
-	     ", dw_num = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(dcb), size_in_dwords);
-
-	submit_dcb(dcb, size_in_dwords);
 }
 
 int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
@@ -3962,8 +3876,6 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	for (uint32_t i = 0; i < std::min<uint32_t>(size_in_dwords, 8); i++) {
 		LOGF("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
 	}
-
-	flush_pending_graphics_segment_before_acb(acb, size_in_dwords);
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 

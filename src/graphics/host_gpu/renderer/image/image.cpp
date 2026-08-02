@@ -105,6 +105,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    std::optional<ImageSubresourceRange> range) {
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
+	if (range && info.IsVolume()) {
+		range->base_layer  = 0;
+		range->layer_count = 1;
+	}
 
 	const bool partial =
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||

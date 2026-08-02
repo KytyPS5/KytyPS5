@@ -119,7 +119,18 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	uint32_t   pitch  = 0;
 	uint64_t   size   = 0;
 	bool       tile   = false;
-	const bool standard64 =
+	const bool volume = rt.attrib3.dimension == 2;
+	if (rt.attrib3.dimension != 1 && !volume) {
+		EXIT("unsupported render-target dimension: %u\n", rt.attrib3.dimension);
+	}
+	if (!volume && rt.attrib3.depth != 0) {
+		EXIT("2D render target has nonzero depth: %u\n", rt.attrib3.depth);
+	}
+	if (volume && samples != 1) {
+		EXIT("multisampled 3D render targets are unsupported\n");
+	}
+	const uint32_t depth = volume ? rt.attrib3.depth + 1u : 1u;
+	const bool     standard64 =
 	    rt.attrib3.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
 
 	switch (rt.attrib3.tile_mode) {
@@ -145,6 +156,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	if (bytes_per_element == 0) {
 		EXIT("render-target format has no valid element size\n");
 	}
+	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
 	if (standard64 &&
 	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || levels != 1 ||
 	     rt.view.current_mip_level != 0 || view.base_layer != 0 || view.image_layers != 1 ||
@@ -165,10 +177,14 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	if (rt.pitch.pitch_div8_minus1 != 0) {
 		pitch = (rt.pitch.pitch_div8_minus1 + 1u) << 3u;
 	} else if (tile) {
-		pitch = standard64
-		            ? TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
-		                                  width, levels, rt.attrib3.tile_mode)
-		            : TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
+		if (volume) {
+			pitch = TileGetTexturePitch(transfer_format, width, levels, rt.attrib3.tile_mode);
+		} else if (standard64) {
+			pitch = TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
+			                            width, levels, rt.attrib3.tile_mode);
+		} else {
+			pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
+		}
 		if (pitch == 0) {
 			EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
 		}
@@ -176,9 +192,19 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		pitch = width;
 	}
 
-	TileSizeOffset mip_sizes[16] {};
-	TilePaddedSize mip_padded[16] {};
-	if (tile) {
+	TileSizeOffset   mip_sizes[16] {};
+	TilePaddedSize   mip_padded[16] {};
+	TileVolumeLayout volume_layout {};
+	uint64_t         backing_size = 0;
+	if (volume) {
+		if (!tile || !TileGetTextureVolumeLayout(transfer_format, width, height, depth, levels,
+		                                         rt.attrib3.tile_mode, volume_layout)) {
+			EXIT("unsupported 3D render-target layout: %ux%ux%u levels=%u tile=%u\n", width, height,
+			     depth, levels, rt.attrib3.tile_mode);
+		}
+		size         = volume_layout.block_slice_size;
+		backing_size = volume_layout.total_size;
+	} else if (tile) {
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
 		if (standard64) {
@@ -203,12 +229,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 			mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
 			mip_padded[0] = {pitch, height};
 		}
-		if (rt.slice.slice_div64_minus1 != 0 &&
-		    (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u != size) {
-			EXIT("render-target slice span mismatch: encoded=0x%016" PRIx64 " derived=0x%016" PRIx64
-			     "\n",
-			     (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u, size);
-		}
 	} else {
 		size = static_cast<uint64_t>(pitch) * height * bytes_per_element * samples;
 		if (size > UINT32_MAX) {
@@ -217,40 +237,66 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
 		mip_padded[0] = {pitch, height};
 	}
-	if (size == 0 || size > UINT64_MAX / view.image_layers) {
+	if (rt.slice.slice_div64_minus1 != 0 &&
+	    (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u != size) {
+		EXIT("render-target slice span mismatch: encoded=0x%016" PRIx64 " derived=0x%016" PRIx64
+		     "\n",
+		     (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u, size);
+	}
+	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
 		EXIT("render-target memory footprint is invalid\n");
 	}
-	const auto backing_size = size * view.image_layers;
+	if (!volume) {
+		backing_size = size * view.image_layers;
+	}
+	if (backing_size == 0) {
+		EXIT("render-target backing is empty\n");
+	}
 	if (backing_size > TRACKER_ADDRESS_SIZE - rt.base.addr) {
 		EXIT("render-target backing range is invalid\n");
 	}
 
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
+	const uint32_t     view_depth  = std::max(depth >> rt.view.current_mip_level, 1u);
+	if (volume &&
+	    (view.base_layer >= view_depth || view.layer_count > view_depth - view.base_layer)) {
+		EXIT("3D render-target view exceeds mip depth: base=%u count=%u depth=%u mip=%u\n",
+		     view.base_layer, view.layer_count, view_depth, rt.view.current_mip_level);
+	}
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
 	if (decision_log_id < 128) {
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
-		     " extent=%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
+		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
-		     rt_slot, rt.base.addr, backing_size, width, height, rt.view.current_mip_level,
+		     rt_slot, rt.base.addr, backing_size, width, height, depth, rt.view.current_mip_level,
 		     view_extent.width, view_extent.height, levels, pitch, rt.info.format,
 		     rt.info.channel_type, rt.info.channel_order, samples, tile ? "tiled" : "linear");
 	}
 
 	TextureCache::ImageDesc desc {};
-	desc.type                 = TextureCache::BindingType::RenderTarget;
-	desc.info.data            = {rt.base.addr, backing_size};
-	desc.info.pixel_format    = target_format.format;
-	desc.info.guest_format    = ImageOps::RenderTargetTransferFormat(bytes_per_element);
-	desc.info.type            = Prospero::ImageType::kColor2D;
-	desc.info.extent          = {width, height, 1};
-	desc.info.resources       = {levels, view.image_layers};
-	desc.info.pitch           = pitch;
+	desc.type              = TextureCache::BindingType::RenderTarget;
+	desc.info.data         = {rt.base.addr, backing_size};
+	desc.info.pixel_format = target_format.format;
+	desc.info.guest_format = transfer_format;
+	desc.info.type         = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+	desc.info.extent       = {width, height, depth};
+	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
+	desc.info.pitch        = pitch;
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
 	for (uint32_t level = 0; level < levels; level++) {
+		if (volume) {
+			desc.info.mip_layout[level] = {
+			    volume_layout.level_offsets[level],
+			    volume_layout.level_sizes[level],
+			    volume_layout.level_widths[level],
+			    volume_layout.level_heights[level],
+			};
+			continue;
+		}
 		const auto level_offset =
 		    mip_sizes[level].src_size != 0 ? mip_sizes[level].src_offset : mip_sizes[level].offset;
 		const auto level_size =

@@ -96,9 +96,11 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	const auto& dc = hw.GetDepthControl();
 	const auto& sc = hw.GetStencilControl();
 	const auto& sm = hw.GetStencilMask();
-	const bool  depth_active =
+	const bool  has_stencil =
+	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
+	const bool depth_active =
 	    dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || rc.depth_clear_enable;
-	const bool stencil_active = dc.stencil_enable || rc.stencil_clear_enable;
+	const bool stencil_active = has_stencil && (dc.stencil_enable || rc.stencil_clear_enable);
 	if (!depth_active && !stencil_active) {
 		return;
 	}
@@ -139,8 +141,6 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		}
 		return;
 	}
-	const bool has_stencil =
-	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
 	const bool has_htile = z.z_info.htile_acceleration;
 	const auto samples   = render_sample_count(z.z_info.num_samples);
 	if (samples == 0) {
@@ -156,8 +156,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
-	if ((stencil_active && !has_stencil) || rc.resummarize_enable || rc.copy_centroid ||
-	    rc.copy_sample != 0 || z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
+	if (rc.resummarize_enable || rc.copy_centroid || rc.copy_sample != 0 ||
+	    z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
 	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
 	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
 	    z.depth_info.addr5_swizzle_mask != 0 || z.depth_info.array_mode != 0 ||
@@ -279,10 +279,10 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();
 	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
-	r.stencil_clear_enable = rc.stencil_clear_enable;
+	r.stencil_clear_enable = has_stencil && rc.stencil_clear_enable;
 	r.stencil_clear_value  = hw.GetStencilClearValue();
-	r.stencil_test_enable  = dc.stencil_enable;
-	if (dc.stencil_enable) {
+	r.stencil_test_enable  = has_stencil && dc.stencil_enable;
+	if (r.stencil_test_enable) {
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||

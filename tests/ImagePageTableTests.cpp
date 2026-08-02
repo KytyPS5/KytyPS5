@@ -117,12 +117,15 @@ void TestStrictByteFilteringAndPredicate() {
 	OwnerIndex index;
 	Check(index.Register(31, {{0x300100, 0x100}}), "first byte-disjoint owner registers");
 	Check(index.Register(32, {{0x300800, 0x100}}), "second byte-disjoint owner registers");
+	Check(index.Register(33, {{0x30f000, 0x100}}), "coarse-only owner registers");
 	Check(index.TrackingMembershipCount(0x300) == 2,
 	      "byte-disjoint owners share one tracking page");
+	Check(index.CoarseMembershipCount(3) == 3,
+	      "all owners share one coarse candidate bucket");
 	Check(index.Query(0x300400, 0x40).empty(), "page hit without byte overlap is filtered out");
 	const auto page_candidates = index.QueryCandidates(0x300400, 0x40);
 	Check(page_candidates.size() == 2,
-	      "fault candidate query retains byte-disjoint owners on the touched page");
+	      "fault candidate query retains touched-page owners and rejects coarse-only owners");
 	const auto first = index.Query(0x300180, 0x10);
 	Check(first.size() == 1 && first.front() == 31,
 	      "strict byte overlap selects only the matching owner");
@@ -130,6 +133,20 @@ void TestStrictByteFilteringAndPredicate() {
 	    index.Query(0x300000, 0x1000, [](uint32_t owner) { return owner == 32; });
 	Check(predicate_filtered.size() == 1 && predicate_filtered.front() == 32,
 	      "supplied predicate filters query owners");
+}
+
+void TestOwnerIndexAddressSpaceBoundary() {
+	OwnerIndex         index;
+	constexpr uint64_t last_byte = OwnerIndex::CoarseTable::kAddressSpaceSize - 1;
+	Check(index.Register(41, {{last_byte, 1}}), "final guest byte registers");
+	const auto exact = index.Query(last_byte, 1);
+	Check(exact.size() == 1 && exact.front() == 41,
+	      "strict query finds an exact overlap at the final guest byte");
+	Check(index.Query(last_byte - 1, 1).empty(),
+	      "strict query preserves half-open overlap boundaries");
+	const auto page_candidates = index.QueryCandidates(last_byte - 1, 1);
+	Check(page_candidates.size() == 1 && page_candidates.front() == 41,
+	      "page candidate query retains a byte-disjoint owner on the final tracking page");
 }
 
 } // namespace
@@ -142,6 +159,7 @@ int main() {
 	TestMultiRangeRegistrationDeduplicatesPages();
 	TestSharedPageUnregisterLifecycle();
 	TestStrictByteFilteringAndPredicate();
+	TestOwnerIndexAddressSpaceBoundary();
 	std::printf("ImagePageTableTests: all cases passed\n");
 	return 0;
 }

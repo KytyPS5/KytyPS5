@@ -248,6 +248,12 @@ struct RenderExecutorTestAccess {
 		executor.ResolveRenderDepthTarget(submit_id, buffer, depth);
 	}
 
+	static void ResolveRenderColorTarget(RenderExecutor& executor, uint64_t submit_id,
+	                                     RenderCommandBuffer& buffer, RenderColorInfo& color,
+	                                     uint32_t slot) {
+		executor.ResolveRenderColorTarget(submit_id, buffer, color, 0, slot);
+	}
+
 	static void BindRenderTarget(RenderExecutor& executor, ImageId id) {
 		executor.BindRenderTarget(id);
 	}
@@ -4748,6 +4754,155 @@ public:
 		    name, "release",
 		    Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
 		    "BGRA16 direct-memory release failed");
+		std::printf("[gpu]     %-32s ok\n", name);
+	}
+
+	void CheckRenderExecutorColorVolumeDiscovery() {
+		constexpr const char* name                 = "RenderExecutorColorVolumeDiscovery";
+		constexpr uintptr_t   base                 = 0x0000000203e00000ull;
+		constexpr uint64_t    allocation_size      = 0x200000;
+		constexpr uint64_t    allocation_alignment = 0x10000;
+		EnsureRuntimeContext();
+
+		int64_t direct_offset = -1;
+		Require(name, "direct allocation",
+		        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+		            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+		            allocation_alignment, 0, &direct_offset) == 0,
+		        "color-volume direct-memory allocation failed");
+		void* mapped = reinterpret_cast<void*>(base);
+		Require(name, "direct mapping",
+		        Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+		                                                       direct_offset,
+		                                                       allocation_alignment) == 0 &&
+		            mapped == reinterpret_cast<void*>(base),
+		        "color-volume fixed mapping failed");
+		std::memset(mapped, 0, allocation_size);
+		constexpr uint64_t slice_size = 0x10000;
+		std::memset(static_cast<uint8_t*>(mapped) + 31 * slice_size, 0x5a, slice_size);
+
+		{
+			RenderContext  context(m_runtime_context);
+			auto&          scheduler = context.GetCommandScheduler();
+			HW::Context    registers {};
+			HW::UserConfig user_config {};
+			HW::Shader     shaders {};
+			registers.SetColorBase(0, {.addr = base});
+			registers.SetColorInfo(
+			    0, {.format        = Prospero::GpuEnumValue(Prospero::ChannelLayout::k10_10_10_2),
+			        .channel_type  = Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+			        .channel_order = Prospero::GpuEnumValue(Prospero::ChannelOrder::kStandard)});
+			registers.SetColorAttrib2(0, {.height = 31, .width = 31});
+			registers.SetColorAttrib3(
+			    0, {.depth              = 31,
+			        .tile_mode          = Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget),
+			        .dimension          = 2,
+			        .cmask_pipe_aligned = true,
+			        .dcc_pipe_aligned   = true});
+			registers.SetRenderTargetMask(0x0f);
+			scheduler.Begin(registers, user_config, shaders);
+
+			auto& resources     = context.GetGpuResources();
+			auto& texture_cache = resources.GetTextureCache();
+			auto& executor      = context.GetRenderExecutor();
+			resources.MapMemory(base, allocation_size);
+
+			RenderColorInfo color {};
+			RenderExecutorTestAccess::ResolveRenderColorTarget(executor, 1, scheduler.Current(),
+			                                                   color, 0);
+			const auto  attachment = texture_cache.FindRenderTarget(color.image_id, color.desc);
+			const auto& image      = texture_cache.GetImage(color.image_id);
+			Require(name, "captured 3D target",
+			        color.image_id && attachment != nullptr &&
+			            color.desc.info.type == Prospero::ImageType::kColor3D &&
+			            color.desc.info.extent == vk::Extent3D {32, 32, 32} &&
+			            color.desc.info.resources == ImageSubresources {1, 1} &&
+			            color.desc.info.pitch == 128 &&
+			            color.desc.info.data.size == allocation_size &&
+			            color.desc.info.mip_layout[0].size == 0x10000 &&
+			            color.desc.view_info.type == vk::ImageViewType::e2D &&
+			            color.desc.view_info.layer_count == 1 &&
+			            image.backing.image_type == vk::ImageType::e3D &&
+			            static_cast<bool>(image.backing.flags &
+			                              vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+			            image.usage.render_target && image.IsGpuModified(),
+			        "dimension=2/depth=31 did not create the SDK-defined 32x32x32 "
+			        "backing and 2D "
+			        "attachment slice");
+
+			RenderExecutorTestAccess::ResetBindings(executor);
+			registers.SetColorView(
+			    0, {.base_array_slice_index = 7, .last_array_slice_index = 7});
+			RenderColorInfo sliced_color {};
+			RenderExecutorTestAccess::ResolveRenderColorTarget(
+			    executor, 2, scheduler.Current(), sliced_color, 0);
+			RenderDepthInfo no_depth {};
+			const auto      sliced_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+			    executor, scheduler.Current(), &sliced_color, 1, no_depth);
+			Require(name, "3D slice transition",
+			        sliced_color.image_id == color.image_id && sliced_color.image_view != nullptr &&
+			            sliced_color.desc.view_info.base_layer == 7 &&
+			            sliced_rendering.num_color_attachments == 1 && sliced_rendering.num_layers == 1,
+			        "a nonzero 3D attachment slice was treated as a Vulkan array layer");
+
+			auto storage_desc = color.desc;
+			storage_desc.type = BindingType::Storage;
+			storage_desc.info.guest_format =
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm);
+			storage_desc.view_info.type  = vk::ImageViewType::e3D;
+			storage_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+			const auto  storage_id       = texture_cache.FindImage(storage_desc);
+			const auto  storage_view     = texture_cache.FindTexture(storage_id, storage_desc);
+			const auto& shared_image     = texture_cache.GetImage(storage_id);
+			Require(name, "storage alias reuse",
+			        storage_id == color.image_id && storage_view != nullptr &&
+			            shared_image.IsGpuModified() && shared_image.usage.render_target,
+			        "the matching 3D storage binding did not reuse the live "
+			        "render-target image");
+
+			Require(name, "volume readback queue",
+			        TextureCacheTestAccess::TryDownload(texture_cache, storage_id),
+			        "the 3D render target could not be queued for guest-layout readback");
+			auto mirror = resources.GetBufferCache().ObtainBuffer(
+			    scheduler.Current(), base, allocation_size, false, true, true);
+			Require(name, "volume mirror",
+			        mirror.buffer != nullptr && mirror.owner != nullptr,
+			        "the 3D render-target readback has no BufferCache owner");
+			scheduler.Current().RetainResourceUntilFence(mirror.owner);
+			auto slice_probe =
+			    CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0});
+			const vk::BufferCopy copy {mirror.offset + 31 * slice_size, 0, 4};
+			scheduler.Current().Handle().copyBuffer(mirror.buffer, slice_probe.buffer, 1, &copy);
+			vk::BufferMemoryBarrier barrier {};
+			barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
+			barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer              = slice_probe.buffer;
+			barrier.size                = slice_probe.size;
+			scheduler.Current().Handle().pipelineBarrier(
+			    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+			    1, &barrier, 0, nullptr);
+			scheduler.Finish();
+			scheduler.DrainPriorityOperations();
+			Require(name, "volume Z transfer",
+			        ReadBuffer(name, slice_probe, 1) == std::vector<u32> {0x5a5a5a5a},
+			        "render-target upload/readback lost the final Z slice");
+			DestroyBuffer(&slice_probe);
+
+			RenderExecutorTestAccess::ResetBindings(executor);
+			resources.UnmapMemory(base, allocation_size);
+			scheduler.Finish();
+		}
+
+		Require(name, "unmap direct backing",
+		        Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+		        "color-volume direct mapping release failed");
+		Require(
+		    name, "release direct backing",
+		    Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+		    "color-volume direct-memory allocation release failed");
 		std::printf("[gpu]     %-32s ok\n", name);
 	}
 
@@ -17075,6 +17230,7 @@ int main(int argc, char** argv) {
 		CheckDepthAttachmentWrites();
 		CheckDynamicRenderingState();
 		VulkanHarness vulkan;
+		vulkan.CheckRenderExecutorColorVolumeDiscovery();
 		vulkan.CheckRenderExecutorStencilBindingDiscovery();
 		vulkan.CheckUnifiedTextureCacheFlow();
 		vulkan.CheckBgra16Readback();
@@ -17215,6 +17371,7 @@ int main(int argc, char** argv) {
 	vulkan.CheckCommandPoolGrowth();
 	vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	vulkan.CheckRenderExecutorColorVolumeDiscovery();
 	vulkan.CheckRenderExecutorStencilBindingDiscovery();
 	vulkan.CheckUnifiedTextureCacheFlow();
 	vulkan.CheckBgra16Readback();

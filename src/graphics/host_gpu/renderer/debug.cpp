@@ -359,29 +359,11 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		if (rt.attrib3.depth != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 color target depth_minus1=0x%08" PRIx32
-				     "\n",
-				     rt.attrib3.depth);
-				logged = true;
-			}
-		}
 		if (!RenderIsColorTileMode(rt.attrib3.tile_mode)) {
 			EXIT("unknown PS5 render-target tile mode: 0x%08" PRIx32 "\n", rt.attrib3.tile_mode);
 		}
 		if (!RenderIsColorDimension(rt.attrib3.dimension)) {
 			EXIT("unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);
-		}
-		if (rt.attrib3.dimension != 0x00000001) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: using 2D fallback for PS5 color "
-				     "dimension=0x%08" PRIx32 "\n",
-				     rt.attrib3.dimension);
-				logged = true;
-			}
 		}
 		if (!rt.attrib3.cmask_pipe_aligned) {
 			static bool logged = false;

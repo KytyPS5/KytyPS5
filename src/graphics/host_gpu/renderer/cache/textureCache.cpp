@@ -867,22 +867,28 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 			case BindingType::Texture: break;
 			case BindingType::Storage: owner = "StorageTextureCache"; break;
 			case BindingType::RenderTarget:
+				if (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
+				    info.samples != 1 || image.backing.samples != 1) {
+					EXIT("TextureCache: invalid color-attachment upload\n");
+				}
+				format           = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
+				allow_depth_tile = false;
+				plan.swap_bgra16 = info.bgra16;
+				owner            = "RenderTarget";
+				break;
 			case BindingType::VideoOut:
 				if (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 				    info.samples != 1 || image.backing.samples != 1 ||
-				    (binding == BindingType::VideoOut &&
-				     info.metadata.compression != VideoOutCompression::Uncompressed)) {
+				    info.metadata.compression != VideoOutCompression::Uncompressed) {
 					EXIT("TextureCache: invalid color-attachment upload\n");
 				}
-				format           = binding == BindingType::RenderTarget
-				                       ? ImageOps::RenderTargetTransferFormat(info.bytes_per_block)
-				                       : info.guest_format;
+				format           = info.guest_format;
 				layers           = info.resources.layers;
 				volume           = false;
 				layered          = layers > 1;
 				allow_depth_tile = false;
 				plan.swap_bgra16 = info.bgra16;
-				owner = binding == BindingType::RenderTarget ? "RenderTarget" : "VideoOut";
+				owner            = "VideoOut";
 				break;
 			case BindingType::DepthTarget: return plan;
 		}

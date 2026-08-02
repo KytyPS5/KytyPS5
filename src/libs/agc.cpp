@@ -834,6 +834,104 @@ int KYTY_SYSV_ABI GraphicsUnknownFuseShaderHalves(Shader* fused_result, const Sh
 	return OK;
 }
 
+static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderRegister* src,
+                                            uint32_t shift, uint32_t mask) {
+	const auto dst_field = (dst->value >> shift) & mask;
+	const auto src_field = (src->value >> shift) & mask;
+	const auto field     = std::max(dst_field, src_field);
+
+	dst->value &= ~(mask << shift);
+	dst->value |= field << shift;
+}
+
+int KYTY_SYSV_ABI GraphicsUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+                                             const Shader* back, void* scratch_mem) {
+	PRINT_NAME();
+
+	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
+	     "\t front        = 0x%016" PRIx64 "\n"
+	     "\t back         = 0x%016" PRIx64 "\n"
+	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
+	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
+
+	const auto front_type = static_cast<Prospero::ShaderBinaryType>(front->type);
+	const auto is_gs      = front_type == Prospero::ShaderBinaryType::kGsFront;
+	const auto is_hs      = front_type == Prospero::ShaderBinaryType::kHsFront;
+	if ((!is_gs && !is_hs) ||
+	    (is_gs && back->type != static_cast<uint8_t>(Prospero::ShaderBinaryType::kGsBack)) ||
+	    (is_hs && back->type != static_cast<uint8_t>(Prospero::ShaderBinaryType::kHsBack))) {
+		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+	}
+
+	*fused_result      = *back;
+	fused_result->type = static_cast<uint8_t>(is_gs ? Prospero::ShaderBinaryType::kGs
+	                                                : Prospero::ShaderBinaryType::kHs);
+
+	const auto back_stages  = back->specials->vgt_shader_stages_en.value;
+	const auto front_stages = front->specials->vgt_shader_stages_en.value;
+	const auto mismatch_bit = is_gs ? (1u << 22u) : (1u << 21u);
+	if (((front_stages ^ back_stages) & mismatch_bit) != 0) {
+		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+	}
+
+	if (scratch_mem != nullptr) {
+		auto* sh_registers = static_cast<ShaderRegister*>(scratch_mem);
+		memcpy(sh_registers, back->sh_registers,
+		       static_cast<size_t>(back->num_sh_registers) * sizeof(ShaderRegister));
+		fused_result->sh_registers = sh_registers;
+	}
+
+	auto*      fused_regs      = fused_result->sh_registers;
+	const auto fused_reg_count = static_cast<uint32_t>(fused_result->num_sh_registers);
+	const auto front_reg_count = static_cast<uint32_t>(front->num_sh_registers);
+	const auto checksum_offset =
+	    is_gs ? Pm4::SPI_SHADER_PGM_CHKSUM_GS : Pm4::SPI_SHADER_PGM_CHKSUM_HS;
+	const auto* front_checksum0 =
+	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 0);
+	const auto* front_checksum1 =
+	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 1);
+	auto* fused_checksum0  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 0);
+	auto* fused_checksum1  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 1);
+	fused_checksum0->value = front_checksum0->value;
+	fused_checksum1->value = front_checksum1->value;
+
+	const auto  rsrc1_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC1_GS : Pm4::SPI_SHADER_PGM_RSRC1_HS;
+	const auto  rsrc2_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC2_GS : Pm4::SPI_SHADER_PGM_RSRC2_HS;
+	const auto* front_rsrc1 =
+	    find_shader_register(front->sh_registers, front_reg_count, rsrc1_offset);
+	const auto* front_rsrc2 =
+	    find_shader_register(front->sh_registers, front_reg_count, rsrc2_offset);
+	auto* fused_rsrc1 = find_shader_register(fused_regs, fused_reg_count, rsrc1_offset);
+	auto* fused_rsrc2 = find_shader_register(fused_regs, fused_reg_count, rsrc2_offset);
+
+	merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 0, 0x3fu);
+	merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 28, 0x0fu);
+	if (is_gs) {
+		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 29, 0x03u);
+		merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 16, 0x03u);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xfffbffffu) | (front_rsrc2->value & 0x00040000u);
+	} else {
+		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 28, 0x03u);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
+	}
+
+	const auto program_lo_offset = is_gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS;
+	auto*      program_lo = find_shader_register(fused_regs, fused_reg_count, program_lo_offset);
+	const auto address    = reinterpret_cast<uint64_t>(front->code);
+	program_lo->value     = static_cast<uint32_t>(address >> 8u);
+	(program_lo + 1)->value &= 0xffffff00u;
+	(program_lo + 1)->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
+
+	fused_result->user_data = front->user_data;
+
+	return OK;
+}
+
 static constexpr int GRAPHICS5_ERROR_INVALID_PACKET = static_cast<int>(0x8a6c000cu);
 
 enum class RegIndirectPacket : uint32_t {

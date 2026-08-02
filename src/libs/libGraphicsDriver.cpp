@@ -159,6 +159,7 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("f3dg2CSgRKY", Gen5::GraphicsCreateShader);
 	LIB_FUNC("dolOmWH+huQ", Gen5::GraphicsUnknownGetFusedShaderSize);
 	LIB_FUNC("fd5Bp5tGTgo", Gen5::GraphicsUnknownFuseShaderHalves);
+	LIB_FUNC("nApJjpKNBl4", Gen5::GraphicsUnknownNApJjpKNBl4);
 	LIB_FUNC("vcmNN+AAXnY", Gen5::GraphicsSetCxRegIndirectPatchSetAddress);
 	LIB_FUNC("Qrj4c+61z4A", Gen5::GraphicsSetShRegIndirectPatchSetAddress);
 	LIB_FUNC("6lNcCp+fxi4", Gen5::GraphicsSetUcRegIndirectPatchSetAddress);

@@ -38,6 +38,8 @@ int KYTY_SYSV_ABI   GraphicsUnknownGetFusedShaderSize(SizeAlign* dst, const Shad
                                                       const Shader* back);
 int KYTY_SYSV_ABI   GraphicsUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
                                                     const Shader* back, void* scratch_mem);
+int KYTY_SYSV_ABI   GraphicsUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+                                               const Shader* back, void* scratch_mem);
 int KYTY_SYSV_ABI   GraphicsSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
                                                             const volatile ShaderRegister* regs);
 int KYTY_SYSV_ABI   GraphicsSetShRegIndirectPatchSetAddress(uint32_t*                      cmd,

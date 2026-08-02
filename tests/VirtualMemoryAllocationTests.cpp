@@ -1356,6 +1356,135 @@ void TestLargeDirectMapAliasesAcrossChunks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestHintlessDirectMapUsesCanonicalGuestBase() {
+	// Mirrors the allocation Sony's libc.prx makes for its internal heap: 4 MiB of
+	// direct memory, 2 MiB aligned, mapped with no address hint. The PS5 kernel never
+	// places hint-less user mappings below 0x200000000 and guest code relies on that
+	// (libc fails its mspace setup for a lower heap address, and the first malloc then
+	// dereferences a null mspace). Writes through the mapping must also stick.
+	const char* test = "HintlessDirectMapUsesCanonicalGuestBase";
+
+	constexpr uint64_t Len   = 0x400000;
+	constexpr uint64_t Align = 0x200000;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(0, 0x260000000ull, Len, Align, 12,
+	                                                            &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, Len, SceKernelProtCpuRw,
+	                                                            0, phys_addr, Align, "libc_heap"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	{
+		char message[128] = {};
+		std::snprintf(message, sizeof(message),
+		              "hint-less direct map landed below the PS5 base: 0x%016" PRIx64, base);
+		Check(test, base >= 0x200000000ull, message);
+	}
+
+	auto* header = reinterpret_cast<uint64_t*>(base);
+	header[0]    = 0x4d53504143453030ull; // "MSPACE00"
+	header[7]    = 0x58585858ull;         // magic at +0x38, like the libc mspace
+	*reinterpret_cast<uint64_t*>(base + Len - 8) = 0x454e444d41524bull;
+
+	Check(test, header[0] == 0x4d53504143453030ull, "immediate readback of header[0] failed");
+	Check(test, header[7] == 0x58585858ull, "immediate readback of header[7] failed");
+	Check(test, *reinterpret_cast<const uint64_t*>(base + Len - 8) == 0x454e444d41524bull,
+	      "immediate readback of tail failed");
+
+	uint64_t backing = 0;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(base + 0x38, &backing, sizeof(backing)),
+	      "TryReadBacking(header+0x38)");
+	Check(test, backing == 0x58585858ull, "backing store does not see the guest write at +0x38");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, Len), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, Len),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectMemoryContentPersistsAcrossRemap() {
+	const char* test = "DirectMemoryContentPersistsAcrossRemap";
+
+	constexpr uint64_t MapSize = SceKernelPageSize * 4;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            MapSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	// Direct memory is physical: contents must survive unmapping and remapping, including
+	// a remap of a sub-range at a nonzero physical offset.
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, MapSize,
+	                                                            SceKernelProtCpuRw, 0, phys_addr,
+	                                                            SceKernelPageSize, "persist_a"),
+	        "KernelMapNamedDirectMemory(first)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	for (uint64_t offset = 0; offset < MapSize; offset += sizeof(uint64_t)) {
+		*reinterpret_cast<uint64_t*>(base + offset) = offset ^ 0x4b5954595045525aull; // "KYTYPERZ"
+	}
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, MapSize), "KernelMunmap(first)");
+
+	void* remap = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&remap, MapSize,
+	                                                            SceKernelProtCpuRw, 0, phys_addr,
+	                                                            SceKernelPageSize, "persist_b"),
+	        "KernelMapNamedDirectMemory(remap)");
+	const auto remap_base = reinterpret_cast<uint64_t>(remap);
+	for (uint64_t offset = 0; offset < MapSize; offset += sizeof(uint64_t)) {
+		const auto expected = offset ^ 0x4b5954595045525aull;
+		const auto actual   = *reinterpret_cast<const uint64_t*>(remap_base + offset);
+		if (actual != expected) {
+			char message[160] = {};
+			std::snprintf(message, sizeof(message),
+			              "content lost across remap at offset 0x%" PRIx64 ": expected 0x%016" PRIx64
+			              ", read 0x%016" PRIx64,
+			              offset, expected, actual);
+			Fail(test, message);
+		}
+	}
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(remap_base, MapSize), "KernelMunmap(remap)");
+
+	// Sub-range remap at a nonzero physical offset: page 2 of the original allocation.
+	void* partial = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &partial, SceKernelPageSize, SceKernelProtCpuRw, 0,
+	            phys_addr + static_cast<int64_t>(SceKernelPageSize * 2), SceKernelPageSize,
+	            "persist_c"),
+	        "KernelMapNamedDirectMemory(partial)");
+	const auto partial_base = reinterpret_cast<uint64_t>(partial);
+	for (uint64_t offset = 0; offset < SceKernelPageSize; offset += sizeof(uint64_t)) {
+		const auto expected = (SceKernelPageSize * 2 + offset) ^ 0x4b5954595045525aull;
+		const auto actual   = *reinterpret_cast<const uint64_t*>(partial_base + offset);
+		if (actual != expected) {
+			char message[160] = {};
+			std::snprintf(message, sizeof(message),
+			              "content lost in partial remap at offset 0x%" PRIx64
+			              ": expected 0x%016" PRIx64 ", read 0x%016" PRIx64,
+			              offset, expected, actual);
+			Fail(test, message);
+		}
+	}
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(partial_base, SceKernelPageSize),
+	        "KernelMunmap(partial)");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, MapSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectMapUnmapReusesHostAddress() {
 	const char* test = "DirectMapUnmapReusesHostAddress";
 
@@ -2150,6 +2279,8 @@ int main() {
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
+	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
+	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);

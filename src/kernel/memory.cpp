@@ -818,6 +818,11 @@ static void                               MemoryPoolSubtractCommitted(uint64_t l
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+// The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
+// assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
+// heap below it), so hint-less searches must not fall back to the low system-managed range.
+static constexpr uint64_t GUEST_DEFAULT_MAP_BASE = 0x200000000ull;
+
 static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t alignment) {
 	EXIT_IF(g_guest_address_space == nullptr || g_virtual_ranges == nullptr);
 
@@ -845,8 +850,11 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	if (search_addr != 0) {
 		return find_in(search_addr, HOST_USER_MAX + 1u);
 	}
-	auto addr = find_in(HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u);
-	return addr != 0 ? addr : find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
+	auto addr = find_in(GUEST_DEFAULT_MAP_BASE, HOST_SYSTEM_MANAGED_MAX + 1u);
+	if (addr == 0) {
+		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
+	}
+	return addr;
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {

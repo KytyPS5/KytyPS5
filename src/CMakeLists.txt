@@ -515,7 +515,12 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
-	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "/DYNAMICBASE:NO /DEBUG:FULL /PDB:${KYTY_EMULATOR_PDB_LINK_PATH} /lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}")
+	target_link_options(kyty_emulator PRIVATE
+		"/DYNAMICBASE:NO"
+		"/DEBUG:FULL"
+		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
+		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
+	)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")

@@ -13,7 +13,7 @@ endif()
 add_library(common STATIC ${common_src} ${common_headers})
 
 target_include_directories(common
-	PUBLIC ${PROJECT_SOURCE_DIR}
+	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE
 		${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 )

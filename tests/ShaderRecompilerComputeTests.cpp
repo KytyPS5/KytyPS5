@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -1450,22 +1451,91 @@ public:
 		uint32_t              ordered_suffix = 0;
 		std::jthread          ordered([&] {
 			ordered_started.release();
-			Gpu::SubmissionLock submissions(gpu);
-			gpu.SendCommandSync([&] {
-				ordered_suffix   = suffix;
-				ordered_finished = true;
-			});
+			gpu.Done();
+			ordered_suffix   = suffix;
+			ordered_finished = true;
 		});
 		ordered_started.acquire();
 		gpu.SendCommandSync([&] {
-			Require("GpuCommandLane", "ordered barrier", !ordered_finished.load(),
-			        "ordered host command overtook a queued submission");
+			Require("GpuCommandLane", "submit done barrier", !ordered_finished.load(),
+			        "submit done returned before a queued submission");
 			label = 1;
 		});
 		ordered.join();
 		Require("GpuCommandLane", "ordered completion",
 		        prefix == 11 && suffix == 22 && ordered_suffix == 22 && ordered_finished.load(),
-		        "submission barrier did not drain prior PM4 work");
+		        "submit done did not drain prior PM4 work");
+
+		auto&              resources         = context.GetGpuResources();
+		constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
+		constexpr uint64_t empty_unmap_size = 0x4000;
+		resources.MapMemory(empty_unmap_base, empty_unmap_size);
+		label  = 0;
+		prefix = 0;
+		suffix = 0;
+		gpu.Submit(commands.data(), static_cast<uint32_t>(commands.size()), nullptr, 0);
+
+		std::binary_semaphore unmap_complete {0};
+		std::jthread unmap_thread([&] {
+			resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+			unmap_complete.release();
+		});
+		const bool unmap_returned = unmap_complete.try_acquire_for(std::chrono::seconds(2));
+		gpu.SendCommandSync([&] { label = 1; });
+		if (!unmap_returned) {
+			unmap_complete.acquire();
+		}
+		unmap_thread.join();
+		gpu.Done();
+		Require("GpuCommandLane", "unmap queue progress",
+		        unmap_returned && !resources.IsMapped(empty_unmap_base, empty_unmap_size) &&
+		            prefix == 11 && suffix == 22,
+		        "an unrelated unmap waited for a blocked PM4 submission");
+
+		auto&                 scheduler = context.GetCommandScheduler();
+		std::atomic<bool>      normal_completed {false};
+		gpu.SendCommandSync(
+		    [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
+		resources.MapMemory(empty_unmap_base, empty_unmap_size);
+		resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+		Require("GpuCommandLane", "unmap native completion",
+		        normal_completed.load() &&
+		            !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+		        "unmap returned before an earlier native guest-memory callback");
+
+		std::binary_semaphore priority_entered {0};
+		std::binary_semaphore release_priority {0};
+		gpu.SendCommandSync([&] {
+			scheduler.DeferPriorityOperation([&] {
+				priority_entered.release();
+				release_priority.acquire();
+			});
+			scheduler.Flush();
+		});
+		priority_entered.acquire();
+		resources.MapMemory(empty_unmap_base, empty_unmap_size);
+
+		std::binary_semaphore priority_unmap_entered {0};
+		std::binary_semaphore priority_unmap_complete {0};
+		std::jthread priority_unmap_thread([&] {
+			gpu.SendCommandSync([&] {
+				priority_unmap_entered.release();
+				resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+			});
+			priority_unmap_complete.release();
+		});
+		priority_unmap_entered.acquire();
+		const bool unmap_overtook_priority =
+		    priority_unmap_complete.try_acquire_for(std::chrono::seconds(1));
+		release_priority.release();
+		if (!unmap_overtook_priority) {
+			priority_unmap_complete.acquire();
+		}
+		priority_unmap_thread.join();
+		Require("GpuCommandLane", "unmap priority ordering",
+		        !unmap_overtook_priority &&
+		            !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+		        "unmap returned before an earlier guest-memory callback");
 
 		constexpr uintptr_t fault_base          = 0x0000000200500000ull;
 		constexpr uint64_t  fault_size          = 0x10000;
@@ -1483,7 +1553,6 @@ public:
 		Require("GpuCommandLane", "processor fault allocation",
 		        fault_memory == reinterpret_cast<void*>(fault_base),
 		        "fixed processor-fault allocation failed");
-		auto& resources = context.GetGpuResources();
 		resources.MapMemory(fault_base, fault_size);
 
 		constexpr uint64_t                immediate_dst         = fault_base + 0x1000;
@@ -1530,9 +1599,7 @@ public:
 		Require("GpuCommandLane", "DMA_DATA packet assembly", dma_cursor == dma_commands.size(),
 		        "DMA_DATA GDS packet stream has the wrong size");
 		gpu.Submit(dma_commands.data(), static_cast<uint32_t>(dma_commands.size()), nullptr, 0);
-		{
-			Gpu::SubmissionLock submissions(gpu);
-		}
+		gpu.Done();
 		constexpr uint32_t clean_fill_value = 0xdecafbad;
 		gpu.SendCommandSyncWithProcessor([&](CommandProcessor&) {
 			auto& buffer_cache = resources.GetBufferCache();

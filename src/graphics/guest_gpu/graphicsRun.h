@@ -35,25 +35,8 @@ public:
 
 	[[nodiscard]] static bool              IsCommandProcessorThread() noexcept;
 	[[nodiscard]] static CommandProcessor* CurrentCommandProcessor() noexcept;
-	[[nodiscard]] static bool              SubmissionLockHeld() noexcept;
-	[[nodiscard]] static bool              MutexHeld() noexcept;
-
-	class SubmissionLock final {
-	public:
-		explicit SubmissionLock(Gpu& gpu);
-		~SubmissionLock();
-		KYTY_CLASS_NO_COPY(SubmissionLock);
-
-	private:
-		Gpu& m_gpu;
-	};
 
 private:
-	friend class SubmissionLock;
-
-	void PauseSubmissions();
-	void ResumeSubmissions();
-
 	std::unique_ptr<GpuState> m_state;
 };
 } // namespace Libs::Graphics

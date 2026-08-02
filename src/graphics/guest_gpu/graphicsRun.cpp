@@ -32,11 +32,10 @@
 
 namespace Libs::Graphics {
 
-static thread_local CommandProcessor* g_current_processor      = nullptr;
-static thread_local Pm4Execution*     g_current_execution      = nullptr;
-static thread_local uint32_t          g_submission_pause_depth = 0;
-static thread_local bool              g_gpu_mutex_owned        = false;
-static thread_local bool              g_gpu_thread             = false;
+static thread_local CommandProcessor* g_current_processor = nullptr;
+static thread_local Pm4Execution*     g_current_execution = nullptr;
+static thread_local bool              g_gpu_mutex_owned   = false;
+static thread_local bool              g_gpu_thread        = false;
 
 class GpuMutexLock final {
 public:
@@ -98,8 +97,6 @@ public:
 	                   bool trigger_agc_interrupt_on_done);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void Done();
-	void PauseSubmissions();
-	void ResumeSubmissions();
 	void Shutdown();
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
@@ -407,7 +404,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
                                  uint32_t write_control) {
 	const uint32_t dst_sel      = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const uint32_t cache_policy = (write_control >> 25u) & 0x3u;
-	const uint32_t increment     = (write_control >> 16u) & 0x1u;
+	const uint32_t increment    = (write_control >> 16u) & 0x1u;
 	const uint32_t write_confirm = (write_control >> 20u) & 0x1u;
 
 	switch (dst_sel) {
@@ -694,26 +691,6 @@ bool GpuState::Process(Submission& submission) {
 	}
 
 	return complete;
-}
-
-void GpuState::PauseSubmissions() {
-	if (g_gpu_mutex_owned) {
-		EXIT("GPU submissions are already paused by this thread\n");
-	}
-	g_gpu_mutex_owned = true;
-	m_submission_mutex.Lock();
-	if (!IsGpuThread()) {
-		WaitLocked();
-	}
-	m_renderer.GetCommandScheduler().DrainPriorityOperations();
-}
-
-void GpuState::ResumeSubmissions() {
-	if (!g_gpu_mutex_owned) {
-		EXIT("GPU submissions resumed without an active pause\n");
-	}
-	m_submission_mutex.Unlock();
-	g_gpu_mutex_owned = false;
 }
 
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution& execution, uint32_t* buffer,
@@ -1693,46 +1670,12 @@ int Gpu::GetFrameNum() const {
 	return m_state->GetFrameNum();
 }
 
-void Gpu::PauseSubmissions() {
-	m_state->PauseSubmissions();
-}
-
-void Gpu::ResumeSubmissions() {
-	m_state->ResumeSubmissions();
-}
-
-Gpu::SubmissionLock::SubmissionLock(Gpu& gpu): m_gpu(gpu) {
-	if (g_current_processor != nullptr || g_submission_pause_depth == UINT32_MAX) {
-		EXIT("cannot acquire GPU submission lock in the current state\n");
-	}
-	if (g_submission_pause_depth++ == 0) {
-		m_gpu.PauseSubmissions();
-	}
-}
-
-Gpu::SubmissionLock::~SubmissionLock() {
-	if (g_submission_pause_depth == 0) {
-		EXIT("GPU submission lock released without ownership\n");
-	}
-	if (--g_submission_pause_depth == 0) {
-		m_gpu.ResumeSubmissions();
-	}
-}
-
 bool Gpu::IsCommandProcessorThread() noexcept {
 	return g_current_processor != nullptr;
 }
 
 CommandProcessor* Gpu::CurrentCommandProcessor() noexcept {
 	return g_current_processor;
-}
-
-bool Gpu::SubmissionLockHeld() noexcept {
-	return g_submission_pause_depth != 0;
-}
-
-bool Gpu::MutexHeld() noexcept {
-	return g_gpu_mutex_owned;
 }
 
 } // namespace Libs::Graphics

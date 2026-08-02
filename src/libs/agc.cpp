@@ -221,57 +221,6 @@ static RegisterDefaults* get_internal_register_defaults(uint32_t ver) {
 	return get_register_defaults(g_agc_internal_reg_defaults_by_version[index], &storage[index]);
 }
 
-struct PendingGraphicsSegment {
-	uint32_t* start     = nullptr;
-	uint32_t* end       = nullptr;
-	uint32_t* range_end = nullptr;
-};
-
-static std::mutex             g_pending_graphics_segment_mutex;
-static PendingGraphicsSegment g_pending_graphics_segment;
-
-static void track_pending_graphics_segment_after_submit(uint32_t* dcb, uint32_t size_in_dwords) {
-	if (dcb == nullptr || size_in_dwords == 0) {
-		return;
-	}
-
-	auto* segment_start = dcb + size_in_dwords;
-	auto* range_end     = segment_start + 0xfffffu;
-
-	std::lock_guard lock(g_pending_graphics_segment_mutex);
-	g_pending_graphics_segment.start     = segment_start;
-	g_pending_graphics_segment.end       = segment_start;
-	g_pending_graphics_segment.range_end = range_end;
-}
-
-static void track_pending_graphics_allocation(uint32_t* cmd, uint32_t size_dw) {
-	if (cmd == nullptr || size_dw == 0) {
-		return;
-	}
-
-	std::lock_guard lock(g_pending_graphics_segment_mutex);
-	auto*           range_start = g_pending_graphics_segment.start;
-	auto*           range_end   = g_pending_graphics_segment.range_end;
-	if (range_start == nullptr || range_end == nullptr || cmd < range_start || cmd >= range_end) {
-		return;
-	}
-
-	auto* cmd_end = cmd + size_dw;
-	if (cmd > g_pending_graphics_segment.end) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
-			LOGF("\t pending graphics segment: ignoring non-contiguous allocation cmd = "
-			     "0x%016" PRIx64 ", tracked_end = 0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(cmd),
-			     reinterpret_cast<uint64_t>(g_pending_graphics_segment.end));
-		}
-		return;
-	}
-	if (cmd_end > g_pending_graphics_segment.end && cmd_end <= range_end) {
-		g_pending_graphics_segment.end = cmd_end;
-	}
-}
-
 struct CommandBuffer {
 	using Callback = KYTY_SYSV_ABI bool (*)(CommandBuffer*, uint32_t, void*);
 
@@ -370,7 +319,6 @@ struct CommandBuffer {
 		}
 		auto* ret_ptr = cursor_up;
 		cursor_up += size_dw;
-		track_pending_graphics_allocation(ret_ptr, size_dw);
 		return ret_ptr;
 	}
 };
@@ -1918,7 +1866,6 @@ uint32_t* KYTY_SYSV_ABI GraphicsCbReleaseMem(CommandBuffer* buf, uint8_t action,
 	cmd[5] = static_cast<uint32_t>(packet_data & 0xffffffffu);
 	cmd[6] = static_cast<uint32_t>((packet_data >> 32u) & 0xffffffffu);
 	cmd[7] = interrupt_ctx_id & 0x07ffffffu;
-
 	return cmd;
 }
 
@@ -3815,150 +3762,6 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(dcb, size_in_dwords, nullptr, 0,
 	                            !dcb_has_queued_interrupt(dcb, size_in_dwords));
-	Gen5::track_pending_graphics_segment_after_submit(dcb, size_in_dwords);
-}
-
-static std::vector<uint64_t> collect_acb_wait_addresses(const uint32_t* acb,
-                                                        uint32_t        size_in_dwords) {
-	std::vector<uint64_t> addresses;
-
-	for (uint32_t offset = 0; offset < size_in_dwords;) {
-		auto cmd_id = acb[offset];
-		auto len    = KYTY_PM4_LEN(cmd_id);
-		if (len == 0 || len > size_in_dwords - offset) {
-			return addresses;
-		}
-
-		auto op = (cmd_id >> 8u) & 0xffu;
-		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_32 && len >= 7) {
-			auto address = static_cast<uint64_t>(acb[offset + 1]) |
-			               (static_cast<uint64_t>(acb[offset + 2]) << 32u);
-			if (address != 0) {
-				addresses.push_back(address);
-			}
-		} else if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_64 && len >= 9) {
-			auto address = static_cast<uint64_t>(acb[offset + 1]) |
-			               (static_cast<uint64_t>(acb[offset + 2]) << 32u);
-			if (address != 0) {
-				addresses.push_back(address);
-			}
-		}
-
-		offset += len;
-	}
-
-	return addresses;
-}
-
-static bool acb_waits_for_address(const std::vector<uint64_t>& wait_addresses,
-                                  uint64_t                     release_address) {
-	for (auto address: wait_addresses) {
-		if (address == release_address) {
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static void flush_pending_graphics_segment_before_acb(const uint32_t* acb,
-                                                      uint32_t        acb_size_in_dwords) {
-	uint32_t* dcb            = nullptr;
-	uint32_t  size_in_dwords = 0;
-	auto      wait_addresses = collect_acb_wait_addresses(acb, acb_size_in_dwords);
-
-	{
-		std::lock_guard lock(Gen5::g_pending_graphics_segment_mutex);
-		if (!wait_addresses.empty() && Gen5::g_pending_graphics_segment.start != nullptr) {
-			auto* scan        = Gen5::g_pending_graphics_segment.start;
-			auto* matched_end = Gen5::g_pending_graphics_segment.start;
-			while (scan < Gen5::g_pending_graphics_segment.end) {
-				auto cmd_id = *scan;
-				if (cmd_id == 0x80000000u) {
-					scan++;
-					continue;
-				}
-				if ((cmd_id & 0xC0000000u) != 0xC0000000u) {
-					break;
-				}
-
-				auto len = KYTY_PM4_LEN(cmd_id);
-				if (len == 0 ||
-				    len > static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end - scan)) {
-					break;
-				}
-
-				if (((cmd_id >> 8u) & 0xffu) == Pm4::IT_NOP &&
-				    KYTY_PM4_R(cmd_id) == Pm4::R_RELEASE_MEM && len >= 7) {
-					auto release_addr =
-					    static_cast<uint64_t>(scan[3]) | (static_cast<uint64_t>(scan[4]) << 32u);
-					if (acb_waits_for_address(wait_addresses, release_addr)) {
-						matched_end = scan + len;
-					}
-				}
-
-				scan += len;
-			}
-
-			if (matched_end > Gen5::g_pending_graphics_segment.start) {
-				Gen5::g_pending_graphics_segment.end = matched_end;
-			}
-		}
-
-		if (Gen5::g_pending_graphics_segment.start != nullptr &&
-		    Gen5::g_pending_graphics_segment.end > Gen5::g_pending_graphics_segment.start) {
-			auto* scan      = Gen5::g_pending_graphics_segment.start;
-			auto* valid_end = Gen5::g_pending_graphics_segment.start;
-			while (scan < Gen5::g_pending_graphics_segment.end) {
-				auto cmd_id = *scan;
-				if (cmd_id == 0x80000000u) {
-					scan++;
-					valid_end = scan;
-					continue;
-				}
-				if ((cmd_id & 0xC0000000u) != 0xC0000000u) {
-					break;
-				}
-
-				auto len = KYTY_PM4_LEN(cmd_id);
-				if (len == 0 ||
-				    len > static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end - scan)) {
-					break;
-				}
-
-				scan += len;
-				valid_end = scan;
-			}
-
-			if (valid_end < Gen5::g_pending_graphics_segment.end) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 64) {
-					LOGF("\t trimming pending graphics segment: addr = 0x%016" PRIx64
-					     ", old_dw = 0x%08" PRIx32 ", new_dw = 0x%08" PRIx32 "\n",
-					     reinterpret_cast<uint64_t>(Gen5::g_pending_graphics_segment.start),
-					     static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end -
-					                           Gen5::g_pending_graphics_segment.start),
-					     static_cast<uint32_t>(valid_end - Gen5::g_pending_graphics_segment.start));
-				}
-				Gen5::g_pending_graphics_segment.end = valid_end;
-			}
-		}
-
-		if (Gen5::g_pending_graphics_segment.start == nullptr ||
-		    Gen5::g_pending_graphics_segment.end <= Gen5::g_pending_graphics_segment.start) {
-			return;
-		}
-
-		dcb            = Gen5::g_pending_graphics_segment.start;
-		size_in_dwords = static_cast<uint32_t>(Gen5::g_pending_graphics_segment.end -
-		                                       Gen5::g_pending_graphics_segment.start);
-	}
-
-	LOGF("\t flushing pending graphics segment before ACB: addr = 0x%016" PRIx64
-	     ", dw_num = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(dcb), size_in_dwords);
-
-	submit_dcb(dcb, size_in_dwords);
 }
 
 int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
@@ -4073,8 +3876,6 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	for (uint32_t i = 0; i < std::min<uint32_t>(size_in_dwords, 8); i++) {
 		LOGF("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
 	}
-
-	flush_pending_graphics_segment_before_acb(acb, size_in_dwords);
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 

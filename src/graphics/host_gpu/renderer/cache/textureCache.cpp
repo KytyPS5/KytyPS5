@@ -956,7 +956,15 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 
 	if (desc.type != BindingType::DepthTarget) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
-		EXIT_NOT_IMPLEMENTED(!plan.valid);
+		if (!plan.valid) {
+			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
+			     "pitch=%u levels=%u layers=%u samples=%u\n",
+			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
+			     info.guest_format, info.tile_mode, static_cast<uint32_t>(plan.layout.tile_family),
+			     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
+			     info.resources.levels, info.resources.layers, info.samples);
+		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
 			linear = m_tiler->Detile(source.Handle(), source_offset, info.data.size, info.data.size,

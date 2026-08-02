@@ -7279,26 +7279,30 @@ public:
 		}
 
 		u32  case_index       = 0;
-		auto check_round_trip = [&](const char* stage, uint64_t size,
+		auto check_round_trip = [&](const char* stage, uint64_t tiled_size,
 		                            std::span<const GpuTileInfo> infos) {
-			std::vector<uint8_t> tiled(size);
-			std::vector<uint8_t> cpu(size, 0);
-			std::vector<uint8_t> gpu(size, 0xab);
+			uint64_t linear_size = 0;
+			for (const auto& info: infos) {
+				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+			}
+			std::vector<uint8_t> tiled(tiled_size);
+			std::vector<uint8_t> cpu(linear_size, 0);
+			std::vector<uint8_t> gpu(linear_size, 0xab);
 			fill(&tiled, ++case_index);
 			for (const auto& info: infos) {
 				convert_reference(false, &cpu, tiled, info);
 			}
-			gpu_detile(tiled, &gpu, size, size, infos);
+			gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
 			compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
 
-			std::vector<uint8_t> linear(size);
-			std::vector<uint8_t> cpu_tiled(size, 0xab);
-			std::vector<uint8_t> gpu_tiled(size, 0xab);
+			std::vector<uint8_t> linear(linear_size);
+			std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
+			std::vector<uint8_t> gpu_tiled(tiled_size, 0xab);
 			fill(&linear, 0x280u + case_index);
 			for (const auto& info: infos) {
 				convert_reference(true, &cpu_tiled, linear, info);
 			}
-			gpu_tile(linear, &gpu_tiled, size, size, infos);
+			gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, infos);
 			compare((std::string(stage) + " tile bytes").c_str(), cpu_tiled, gpu_tiled);
 		};
 		for (const auto family: families) {
@@ -7435,6 +7439,32 @@ public:
 		}
 		Require(name, "format coverage", format_cases != 0,
 		        "no CPU-supported standard formats were tested");
+
+		{
+			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc1UNorm);
+			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+			constexpr u32 width = 256, height = 256, levels = 9;
+			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
+			TileSizeAlign total {};
+			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			                   nullptr);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
+			                                            tile, total.size, false, false, name);
+			const auto regions =
+			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			std::vector<GpuTileInfo> infos;
+			const bool built =
+			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos);
+			uint64_t linear_size = 0;
+			for (const auto& info: infos) {
+				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+			}
+			Require(name, "BC1 mip-tail capacities",
+			        built && total.size == 0x10000 && layout.first_tail_level == 0 &&
+			            linear_size == 0x15560 && linear_size > total.size,
+			        "BC1 mip tail conflated tiled and linear capacities");
+			check_round_trip("BC1 mip tail", total.size, infos);
+		}
 
 		{
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);

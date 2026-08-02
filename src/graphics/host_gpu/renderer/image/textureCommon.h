@@ -44,7 +44,7 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
                                                          uint32_t width, uint32_t height,
                                                          uint32_t depth, uint64_t levels,
                                                          bool array_texture, bool volume_texture);
-bool TextureBuildGpuTileInfos(uint64_t size, const std::vector<vk::BufferImageCopy>& regions,
+bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t fmt, uint32_t depth,
                               uint64_t levels, std::vector<GpuTileInfo>& infos);
 

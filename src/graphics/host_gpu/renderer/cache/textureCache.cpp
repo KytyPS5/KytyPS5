@@ -838,10 +838,19 @@ struct TextureCache::ColorTransferPlan {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
+	uint64_t                         linear_size = 0;
 	bool                             tiled       = false;
 	bool                             swap_bgra16 = false;
 	bool                             valid       = false;
 };
+
+static uint64_t GetLinearSize(std::span<const GpuTileInfo> tiles) {
+	uint64_t size = 0;
+	for (const auto& tile: tiles) {
+		size = std::max(size, tile.linear_offset + tile.linear_size);
+	}
+	return size;
+}
 
 struct TextureCache::DownloadPlan {
 	ColorTransferPlan color;
@@ -919,6 +928,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 		                              info.resources.levels, plan.tiles)) {
 			return plan;
 		}
+		plan.linear_size = GetLinearSize(plan.tiles);
 	}
 	plan.valid = true;
 	return plan;
@@ -967,8 +977,8 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
-			linear = m_tiler->Detile(source.Handle(), source_offset, info.data.size, info.data.size,
-			                         plan.tiles);
+			linear = m_tiler->Detile(source.Handle(), source_offset, info.data.size,
+			                         plan.linear_size, plan.tiles);
 		}
 		if (plan.swap_bgra16) {
 			linear = m_tiler->SwapBgra16(linear);
@@ -1574,7 +1584,7 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	}
 
 	m_tiler->TileImage(image, color.regions, destination.Handle(), destination_offset,
-	                   destination_size, destination_size, color.tiles, transform);
+	                   destination_size, color.linear_size, color.tiles, transform);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1667,6 +1677,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			                              image.info.TransferLayers(), levels, color.tiles)) {
 				return false;
 			}
+			color.linear_size = GetLinearSize(color.tiles);
 		}
 	}
 	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));

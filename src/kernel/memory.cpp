@@ -853,7 +853,7 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	if (addr == 0) {
 		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
 	}
-	return addr != 0 ? addr : find_in(HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u);
+	return addr;
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {

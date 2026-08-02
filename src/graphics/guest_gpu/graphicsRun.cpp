@@ -983,8 +983,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 				     args.start_vertex_location, args.start_instance_location);
 			}
 		}
-		DrawIndexAuto(args.vertex_count_per_instance, 0, 0, args.instance_count,
-		              args.start_vertex_location, args.start_instance_location);
+		m_num_instances = args.instance_count;
+		SubmitNonIndexedDraw(args.vertex_count_per_instance, 0, 0, args.start_vertex_location,
+		                     args.start_instance_location);
 		return;
 	}
 
@@ -1024,6 +1025,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		}
 	}
 
+	m_num_instances = args.instance_count;
 	DrawIndex(index_count, index_addr, 0, 1, args.instance_count, nullptr, 0,
 	          static_cast<int32_t>(args.base_vertex_location), args.start_instance_location);
 }
@@ -1081,8 +1083,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 					     args->start_vertex_location, args->start_instance_location);
 				}
 			}
-			DrawIndexAuto(args->vertex_count_per_instance, 0, 0, args->instance_count,
-			              args->start_vertex_location, args->start_instance_location);
+			m_num_instances = args->instance_count;
+			SubmitNonIndexedDraw(args->vertex_count_per_instance, 0, 0, args->start_vertex_location,
+			                     args->start_instance_location);
 			continue;
 		}
 
@@ -1123,6 +1126,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			}
 		}
 
+		m_num_instances = args->instance_count;
 		DrawIndex(index_count, index_addr, 0, 1, args->instance_count, nullptr, 0,
 		          static_cast<int32_t>(args->base_vertex_location), args->start_instance_location);
 	}
@@ -1214,12 +1218,17 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(uint32_t index_count, uint32_t flags,
-                                     uint32_t render_target_slice_offset, uint32_t instance_count,
-                                     uint32_t first_vertex, uint32_t first_instance) {
+                                     uint32_t render_target_slice_offset) {
+	SubmitNonIndexedDraw(index_count, flags, render_target_slice_offset, 0, 0);
+}
+
+void CommandProcessor::SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,
+                                            uint32_t render_target_slice_offset,
+                                            uint32_t first_vertex, uint32_t first_instance) {
 	CheckBuffer();
 
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), index_count, flags,
-	                                        render_target_slice_offset, instance_count,
+	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), vertex_count, flags,
+	                                        render_target_slice_offset, m_num_instances,
 	                                        first_vertex, first_instance);
 }
 

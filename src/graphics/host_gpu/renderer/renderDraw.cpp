@@ -1159,7 +1159,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (index_count == 0) {
+	if (index_count == 0 || instance_count == 0) {
 		return;
 	}
 
@@ -1229,10 +1229,6 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 
 	EXIT_NOT_IMPLEMENTED(flags != 0);
 	EXIT_NOT_IMPLEMENTED(type != 1);
-	if (instance_count == 0) {
-		instance_count = 1;
-	}
-
 	const DrawCallInfo    draw {"DrawIndex",    CommandBufferDebugOp::DrawIndex,
 	                            index_count,    flags,
 	                            instance_count, first_instance};
@@ -1292,7 +1288,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	                    index_count, flags, first_vertex, instance_count, first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (index_count == 0) {
+	if (index_count == 0 || instance_count == 0) {
 		return;
 	}
 
@@ -1330,10 +1326,6 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	hw_check(buffer);
 
 	EXIT_NOT_IMPLEMENTED(flags != 0);
-	if (instance_count == 0) {
-		instance_count = 1;
-	}
-
 	const DrawCallInfo draw {"DrawIndexAuto", CommandBufferDebugOp::DrawIndexAuto,
 	                         index_count,     flags,
 	                         instance_count,  first_instance};

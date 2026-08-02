@@ -15989,11 +15989,6 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
 		resource   = BasicArrayStorageTextureResource();
 		descriptor = BasicArrayStorageTextureDescriptor();
 		descriptor.fields[4] |= 1u << 16u;
-	} else if (std::strcmp(kind, "array-mip-view") == 0) {
-		resource   = BasicArrayStorageTextureResource();
-		descriptor = BasicArrayStorageTextureDescriptor();
-		descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
-		descriptor.fields[5] |= 1u << 4u;
 	} else if (std::strcmp(kind, "reserved") == 0) {
 		descriptor.fields[1] |= 1u << 29u;
 	} else if (std::strcmp(kind, "uint-format") == 0) {
@@ -16169,6 +16164,16 @@ void CheckBasicStorageTextureDescriptor() {
 	            array.DstSelXYZW() == DstSel(6, 5, 4, 7),
 	        "PPSA21268 2D-array storage descriptor fixture is malformed");
 	ValidateStorageTexture(BasicArrayStorageTextureResource(), array, 0x10000);
+	const ShaderTextureResource mip_array {{0x20268d00u, 0xc4700000u, 0x001fc01fu,
+	                                        0xd1b11facu, 0x00000000u, 0x00700070u,
+	                                        0x00000000u, 0x00000000u}};
+	Require("BasicStorageTexture", "PPSA14457 mip-one 2D-array descriptor",
+	        mip_array.BaseLevel() == 1 && mip_array.LastLevel() == 1 &&
+	            mip_array.MaxMip() == 7 &&
+	            mip_array.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+	            mip_array.Depth() == 0 && mip_array.BaseArray5() == 0,
+	        "PPSA14457 mip-one 2D-array storage descriptor fixture is malformed");
+	ValidateStorageTexture(BasicArrayStorageTextureResource(), mip_array, 0x30000);
 
 	const auto uint_array = BasicUintArrayStorageTextureDescriptor();
 	Require("BasicStorageTexture", "uint 2D-array descriptor",
@@ -16329,7 +16334,6 @@ void CheckBasicStorageTextureDescriptor() {
 	                        "yzwx-read",
 	                        "reserved-swizzle",
 	                        "array-base-out-of-range",
-	                        "array-mip-view",
 	                        "reserved",
 	                        "uint-format",
 	                        "uint-resource-float-format",

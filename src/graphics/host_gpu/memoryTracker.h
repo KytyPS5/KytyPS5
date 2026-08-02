@@ -71,10 +71,15 @@ public:
 			EXIT("memory invalidation retained GPU-owned pages\n");
 		}
 	}
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
 	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                               const char* operation);
+#else
+	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
+	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
+#endif
 
 	template <bool clear, typename Preflight, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {

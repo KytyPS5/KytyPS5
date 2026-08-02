@@ -21,6 +21,7 @@ MemoryTracker::MemoryTracker(PageManager& page_manager, PageWatchMode gpu_watch_
 
 MemoryTracker::~MemoryTracker() = default;
 
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                           const char* operation) const noexcept {
 	if (vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
@@ -58,6 +59,7 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 		}
 	}
 }
+#endif
 
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||

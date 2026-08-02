@@ -137,7 +137,9 @@ private:
 	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
 	                                                   TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
-	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
+	// Returns true if the upload was performed, false if it was deferred/not supported
+	// (keeps guest buffer ownership / buffer-modified state).
+	bool UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

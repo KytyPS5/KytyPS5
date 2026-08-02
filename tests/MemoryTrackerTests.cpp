@@ -27,7 +27,6 @@ namespace {
 
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
-using Libs::Graphics::PageWatchMode;
 using Libs::Graphics::RangeSet;
 
 void Check(bool value, const char *text) {
@@ -127,6 +126,21 @@ bool IsWritable(const void *address) {
   return Protection(address) == PAGE_READWRITE;
 }
 
+uint64_t g_protection_calls = 0;
+
+struct ProtectionCall {
+  uint64_t address;
+  uint64_t size;
+  Common::VirtualMemory::Mode mode;
+};
+
+std::vector<ProtectionCall> g_protection_log;
+
+void ResetProtectionLog() {
+  g_protection_calls = 0;
+  g_protection_log.clear();
+}
+
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
   uint32_t protection = PAGE_NOACCESS;
@@ -136,14 +150,14 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
+  g_protection_calls++;
+  g_protection_log.push_back({vaddr, size, mode});
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
 
 struct TrackerHarness {
-  explicit TrackerHarness(
-      PageWatchMode gpu_watch_mode = PageWatchMode::ReadWrite)
-      : tracker(page_manager, gpu_watch_mode) {}
+  TrackerHarness() : tracker(page_manager) {}
 
   PageManager page_manager;
   MemoryTracker tracker;
@@ -287,6 +301,124 @@ void TestGpuDirtyBits() {
   Release(page_manager, memory, page_size * 2);
 }
 
+void TestExactDirtyIntervalsSharingTrackerPage() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  RangeSet exact_dirty;
+  exact_dirty.Add(address + 64, 16);
+  exact_dirty.Add(address + 192, 32);
+
+  ResetProtectionLog();
+  tracker.MarkRegionAsGpuModified(address + 64, 16);
+  tracker.MarkRegionAsGpuModified(address + 192, 32);
+  Check(g_protection_calls == 1 &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_NOACCESS,
+        "disjoint byte dirtiness duplicated the page watcher");
+
+  exact_dirty.Subtract(address + 64, 16);
+  if (exact_dirty.Intersections(address, page_size).empty()) {
+    tracker.UnmarkRegionAsGpuModified(address, page_size);
+  }
+  Check(g_protection_calls == 1 &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_NOACCESS,
+        "draining one exact interval prematurely released its shared page");
+
+  exact_dirty.Subtract(address + 192, 32);
+  if (exact_dirty.Intersections(address, page_size).empty()) {
+    tracker.UnmarkRegionAsGpuModified(address, page_size);
+  }
+  Check(g_protection_calls == 2 &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "draining the final exact interval did not release its tracker page");
+
+  tracker.UntrackMemory(address, page_size);
+  Release(page_manager, memory, page_size);
+}
+
+void TestGpuDownloadProtectionMirrors() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsGpuModified(address + 16, 32);
+  tracker.MarkRegionAsGpuModified(address + page_size * 2 + 16, 32);
+
+  std::vector<RangeSet::Range> visited;
+  ResetProtectionLog();
+  tracker.ForEachDownloadRange<false>(
+      address, page_size * 3,
+      [&](uint64_t range_address, uint64_t range_size) noexcept {
+        visited.push_back({range_address, range_size});
+      });
+  Check(visited.size() == 2 && visited[0].address == address &&
+            visited[0].size == page_size &&
+            visited[1].address == address + page_size * 2 &&
+            visited[1].size == page_size && g_protection_calls == 0 &&
+            tracker.IsRegionGpuModified(address, page_size * 3),
+        "non-clearing download changed protection or lost sparse ranges");
+
+  visited.clear();
+  tracker.ForEachDownloadRange<true>(
+      address + 16, 32,
+      [&](uint64_t range_address, uint64_t range_size) noexcept {
+        visited.push_back({range_address, range_size});
+      });
+  Check(visited.size() == 1 && visited[0].address == address &&
+            visited[0].size == page_size && g_protection_log.size() == 1 &&
+            g_protection_log[0].address == address &&
+            g_protection_log[0].size == page_size &&
+            g_protection_log[0].mode == Common::VirtualMemory::Mode::Read &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            tracker.IsRegionGpuModified(address + page_size * 2, page_size) &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "partial download did not preserve the CPU/GPU protection mirrors");
+
+  visited.clear();
+  ResetProtectionLog();
+  tracker.ForEachDownloadRange<true>(
+      address + 16, 32,
+      [&](uint64_t range_address, uint64_t range_size) noexcept {
+        visited.push_back({range_address, range_size});
+      });
+  Check(visited.empty() && g_protection_calls == 0 &&
+            tracker.IsRegionGpuModified(address + page_size * 2, page_size),
+        "idempotent partial download disturbed another GPU-owned page");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  Check(!tracker.IsRegionGpuModified(address, page_size * 3) &&
+            Protection(memory + page_size * 2) == PAGE_READONLY,
+        "broad final unmark did not restore write-only tracking");
+  ResetProtectionLog();
+  tracker.MarkRegionAsCpuModified(address + 16, 32);
+  Check(
+      g_protection_log.size() == 1 && g_protection_log[0].address == address &&
+          g_protection_log[0].size == page_size &&
+          g_protection_log[0].mode == Common::VirtualMemory::Mode::ReadWrite &&
+          IsWritable(memory) && !IsWritable(memory + page_size),
+      "CPU-dirty transition did not release only its write watcher");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(page_manager, memory, page_size * 4);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -315,35 +447,106 @@ void TestCrossRegionUpload() {
   Release(page_manager, memory, region_size * 2);
 }
 
-void TestBackingWritePublication() {
+void TestGpuUnmarkUsesRegionMask() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
-  auto *memory = Allocate(page_manager, 1);
-  const auto address = reinterpret_cast<uint64_t>(memory);
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(region_base + region_size + page_size <=
+            allocation_base + region_size * 2,
+        "test allocation does not span two complete tracker regions");
+
+  const auto sparse_begin = region_base + page_size;
+  tracker.ForEachUploadRange(
+      sparse_begin, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsGpuModified(sparse_begin, page_size);
+  tracker.MarkRegionAsGpuModified(sparse_begin + page_size * 2, page_size);
+  ResetProtectionLog();
+  tracker.UnmarkRegionAsGpuModified(sparse_begin, page_size * 3);
+  Check(
+      g_protection_calls == 1 && g_protection_log.size() == 1 &&
+          g_protection_log[0].address == sparse_begin &&
+          g_protection_log[0].size == page_size * 3 &&
+          g_protection_log[0].mode == Common::VirtualMemory::Mode::Read &&
+          !tracker.IsRegionGpuModified(sparse_begin, page_size * 3) &&
+          Protection(reinterpret_cast<void *>(sparse_begin)) == PAGE_READONLY &&
+          Protection(reinterpret_cast<void *>(sparse_begin + page_size)) ==
+              PAGE_READONLY &&
+          Protection(reinterpret_cast<void *>(sparse_begin + page_size * 2)) ==
+              PAGE_READONLY,
+      "GPU unmark did not coalesce a sparse 4 MiB region mask");
+  ResetProtectionLog();
+  tracker.UnmarkRegionAsGpuModified(sparse_begin, page_size * 3);
+  Check(g_protection_calls == 0,
+        "idempotent GPU unmark performed a protection call");
+
+  const auto boundary = region_base + region_size;
+  const auto cross_begin = boundary - page_size;
+  tracker.ForEachUploadRange(
+      cross_begin, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkRegionAsGpuModified(cross_begin, page_size * 2);
+  ResetProtectionLog();
+  tracker.UnmarkRegionAsGpuModified(cross_begin, page_size * 2);
+  Check(g_protection_calls == 2 && g_protection_log.size() == 2 &&
+            g_protection_log[0].address == cross_begin &&
+            g_protection_log[0].size == page_size &&
+            g_protection_log[0].mode == Common::VirtualMemory::Mode::Read &&
+            g_protection_log[1].address == boundary &&
+            g_protection_log[1].size == page_size &&
+            g_protection_log[1].mode == Common::VirtualMemory::Mode::Read &&
+            !tracker.IsRegionGpuModified(cross_begin, page_size * 2),
+        "cross-region GPU unmark did not use one update per 4 MiB region");
+
+  tracker.UntrackMemory(allocation_base, region_size * 2);
+  Release(page_manager, memory, region_size * 2);
+}
+
+void TestFullRegionGpuUnmarkBatching() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  Check(region_base + region_size <= allocation_base + region_size * 2,
+        "test allocation does not contain a complete tracker region");
 
   tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      region_base, region_size, false, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
-  Check(tracker.IsRegionGpuModified(address, page_size) &&
-            Protection(memory) == PAGE_NOACCESS,
-        "backing publication setup did not establish GPU ownership");
-  std::vector<RangeSet::Range> dirty{{address, page_size}};
-  auto writes = page_manager.ReserveBackingWrites(dirty);
-  Check(writes.size() == 1 && Protection(memory) == PAGE_NOACCESS,
-        "backing reservation exposed protected guest memory");
-  uint32_t downloads = 0;
-  tracker.ForEachDownloadRange<true>(
-      address, page_size, [&](uint64_t, uint64_t) noexcept { downloads++; });
-  tracker.MarkRegionAsCpuModified(address, page_size);
-  writes.clear();
-  Check(downloads == 1 && !tracker.IsRegionGpuModified(address, page_size) &&
-            tracker.IsRegionCpuModified(address, page_size) &&
-            IsWritable(memory),
-        "backing publication did not restore CPU ownership");
-  tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  tracker.MarkRegionAsGpuModified(region_base, region_size);
+  Check(tracker.IsRegionGpuModified(region_base, region_size) &&
+            Protection(reinterpret_cast<void *>(region_base)) ==
+                PAGE_NOACCESS &&
+            Protection(reinterpret_cast<void *>(region_base + region_size -
+                                                page_size)) == PAGE_NOACCESS,
+        "full-region setup did not establish GPU read protection");
+
+  ResetProtectionLog();
+  tracker.UnmarkRegionAsGpuModified(region_base, region_size);
+  Check(
+      g_protection_log.size() == 1 &&
+          g_protection_log[0].address == region_base &&
+          g_protection_log[0].size == region_size &&
+          g_protection_log[0].mode == Common::VirtualMemory::Mode::Read &&
+          !tracker.IsRegionGpuModified(region_base, region_size) &&
+          Protection(reinterpret_cast<void *>(region_base)) == PAGE_READONLY &&
+          Protection(reinterpret_cast<void *>(region_base + region_size -
+                                              page_size)) == PAGE_READONLY,
+      "full-region GPU unmark did not use one exact 4 MiB protection request");
+
+  tracker.UntrackMemory(allocation_base, region_size * 2);
+  Release(page_manager, memory, region_size * 2);
 }
 
 [[noreturn]] void RunDeathCase(const char *name) {
@@ -433,8 +636,11 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestRangeInvalidation();
   TestGpuDirtyBits();
+  TestExactDirtyIntervalsSharingTrackerPage();
+  TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
-  TestBackingWritePublication();
+  TestGpuUnmarkUsesRegionMask();
+  TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;

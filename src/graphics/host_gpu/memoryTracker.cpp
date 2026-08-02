@@ -6,13 +6,7 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-MemoryTracker::MemoryTracker(PageManager& page_manager, PageWatchMode gpu_watch_mode)
-    : m_page_manager(page_manager), m_gpu_watch_mode(gpu_watch_mode) {
-	switch (m_gpu_watch_mode) {
-		case PageWatchMode::Write:
-		case PageWatchMode::ReadWrite: break;
-		default: EXIT("unsupported memory tracker GPU page-watch mode\n");
-	}
+MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	for (size_t i = 0; i < REGION_COUNT; i++) {
 		m_regions[i].store(nullptr, std::memory_order_relaxed);
@@ -106,34 +100,25 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	std::lock_guard access(m_access_mutex);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		const auto       changed =
-		    manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
-		manager->ApplyProtection(changed, false);
+		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		const auto       changed =
-		    manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);
-		manager->ApplyGpuProtection(changed, true, m_gpu_watch_mode);
+		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::lock_guard access(m_access_mutex);
-	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		if (!manager->IsFullyModified<DirtySource::Gpu>(offset, bytes)) {
-			EXIT("cannot clear partially GPU-dirty tracking range\n");
-		}
-		const auto changed =
-		    manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
-		manager->ApplyGpuProtection(changed, false, m_gpu_watch_mode);
+		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
 	});
 }
 
@@ -156,9 +141,7 @@ void MemoryTracker::UntrackMemoryLocked(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		const auto changed =
-		    manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
-		manager->ApplyProtection(changed, false);
+		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 	locks.clear();
 }

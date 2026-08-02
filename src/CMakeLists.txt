@@ -345,6 +345,11 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(bit_array_tests EXCLUDE_FROM_ALL
+	../tests/BitArrayTests.cpp
+)
+target_include_directories(bit_array_tests PRIVATE ${inc_headers})
+
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	../tests/MemoryTrackerTests.cpp
 	graphics/host_gpu/pageManager.cpp
@@ -457,6 +462,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -502,6 +508,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		bit_array_tests
 		shader_vertex_metadata_tests
 		shader_stage_runtime_tests
 		resource_tracking_tests

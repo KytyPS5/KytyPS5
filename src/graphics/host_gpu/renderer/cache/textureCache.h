@@ -66,7 +66,6 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	[[nodiscard]] bool SynchronizeImageToBuffer(uint64_t address, uint64_t size);
 	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 	                                           bool formatted_buffer_write = false);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
@@ -140,7 +139,7 @@ private:
 	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
-	                       DownloadPlan plan);
+	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	void PrepareImageCopy(Image& image);
@@ -155,7 +154,6 @@ private:
 	void InvalidateCpuAliases(uint64_t address, uint64_t size);
 	void ClearGpuModified(ImageId id);
 
-	[[nodiscard]] bool                          SynchronizeImageToBuffer(ImageId id);
 	void                                        DownloadImage(ImageId id);
 	[[nodiscard]] bool                          TryDownloadImage(ImageId id);
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapDownload(uint64_t size, uint64_t alignment);
@@ -184,6 +182,7 @@ private:
 	bool     m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
+	friend class BufferCache;
 	friend class RenderExecutor;
 };
 

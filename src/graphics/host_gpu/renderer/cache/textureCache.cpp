@@ -323,7 +323,7 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
-		m_page_manager.UpdatePageWatchers(true, image_begin, image.info.data.size);
+		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
 		return;
 	}
 	if (image_begin < image.track_addr) {
@@ -348,7 +348,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	}
 	const auto size  = image.track_addr - image_begin;
 	image.track_addr = image_begin;
-	m_page_manager.UpdatePageWatchers(true, image_begin, size);
+	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
 }
 
 void TextureCache::TrackImageTail(ImageId id) {
@@ -366,7 +366,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	const auto address   = image.track_addr_end;
 	const auto size      = image_end - address;
 	image.track_addr_end = image_end;
-	m_page_manager.UpdatePageWatchers(true, address, size);
+	m_page_manager.UpdatePageWatchers<true>(address, size);
 }
 
 void TextureCache::UntrackImage(ImageId id) {
@@ -379,7 +379,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
 	if (size != 0) {
-		m_page_manager.UpdatePageWatchers(false, address, size);
+		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
 }
 
@@ -400,7 +400,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 		UntrackImage(id);
 	}
 	if (size != 0) {
-		m_page_manager.UpdatePageWatchers(false, begin, size);
+		m_page_manager.UpdatePageWatchers<false>(begin, size);
 	}
 }
 
@@ -421,7 +421,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 		UntrackImage(id);
 	}
 	if (size != 0) {
-		m_page_manager.UpdatePageWatchers(false, address, size);
+		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
 }
 
@@ -1038,24 +1038,19 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	if (image.info.samples > 1) {
 		return;
 	}
-	bool       data_gpu_owned = false;
-	bool       data_imported  = false;
-	const bool upload         = image.IsBufferModified() || image.IsCpuDirty();
+	bool       data_imported = false;
+	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
 		const auto source =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source.buffer == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		data_gpu_owned |= source.gpu_owned;
 		data_imported = true;
 		UploadImage(image, desc, *source.buffer, source.offset);
 	}
 	if (data_imported) {
 		image.ClearBufferModified();
-	}
-	if (data_gpu_owned) {
-		image.MarkGpuModified();
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -1131,8 +1126,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 
 	ImageId result {};
-	bool    replacement_buffer = false;
-	bool    inserted_new       = false;
+	bool    inserted_new = false;
 	{
 		std::lock_guard            transaction(m_resource_mutex);
 		CacheLock                  lock(*this, m_lock);
@@ -1174,23 +1168,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				ImageDesc refresh {
-				    .info = resolved.info, .view_info = {}, .type = UploadBinding(resolved)};
-				RefreshImage(result, refresh);
-				if (resolved.IsGpuModified() && !SynchronizeImageToBuffer(result)) {
-					EXIT("TextureCache: cannot preserve an unsupported replacement image\n");
-				}
-				replacement_buffer = resolved.IsBufferModified();
-				DeleteImage(result);
-				result = {};
+				result = ExpandImage(desc.info, result);
 			}
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
 			inserted_new   = true;
 			auto& inserted = ResolveImage(result);
-			if (replacement_buffer || m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                                          inserted.info.data.size)) {
+			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
+			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
 		}
@@ -1360,11 +1346,6 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.depth_id || image.backing.image == nullptr) {
 		EXIT("TextureCache: stencil association cannot own image contents\n");
 	}
-	const auto range = image.info.data;
-	if (m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
-		m_buffer_cache.DiscardGpuDirtyBytes(range.address, range.size);
-	}
-	m_buffer_cache.InvalidateImageAliases(range.address, range.size);
 	image.ClearBufferModified();
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -1428,9 +1409,6 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
 			return false;
 		}
-	}
-	if (m_buffer_cache.HasGpuDirtyBytes(address, size)) {
-		m_buffer_cache.DiscardGpuDirtyBytes(address, size);
 	}
 	if (image.IsBufferModified() || image.IsCpuDirty()) {
 		ImageDesc refresh {.info = image.info, .view_info = {}, .type = UploadBinding(image)};
@@ -1551,11 +1529,14 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 }
 
 void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
-                                     DownloadPlan plan) {
+                                     uint64_t destination_size, DownloadPlan plan) {
 	if (!plan.valid) {
 		EXIT("TextureCache: invalid image download plan\n");
 	}
 	if (plan.depth) {
+		if (destination_size != image.info.data.size) {
+			EXIT("TextureCache: partial depth image download is unsupported\n");
+		}
 		DownloadDepth(image, destination, destination_offset);
 		return;
 	}
@@ -1565,22 +1546,118 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	                                         : TileManager::ColorTransform::None;
 	if (!color.tiled) {
 		if (transform == TileManager::ColorTransform::SwapBgra16) {
-			auto linear = m_tiler->GetScratchBuffer(image.info.data.size);
+			auto linear = m_tiler->GetScratchBuffer(destination_size);
 			image.Download(color.regions, linear.buffer, 0, linear.size);
 			m_tiler->SwapBgra16(linear,
-			                    {destination.Handle(), destination_offset, image.info.data.size});
+			                    {destination.Handle(), destination_offset, destination_size});
 			return;
 		}
 		for (auto& copy: color.regions) {
 			copy.bufferOffset += destination_offset;
 		}
-		image.Download(color.regions, destination.Handle(), destination_offset,
-		               image.info.data.size);
+		image.Download(color.regions, destination.Handle(), destination_offset, destination_size);
 		return;
 	}
 
 	m_tiler->TileImage(image, color.regions, destination.Handle(), destination_offset,
-	                   image.info.data.size, image.info.data.size, color.tiles, transform);
+	                   destination_size, destination_size, color.tiles, transform);
+}
+
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	CacheLock            lock(m_texture_cache, m_texture_cache.m_lock);
+	std::vector<ImageId> matches;
+	for (const auto id: m_texture_cache.FindImagesInRegion(vaddr, size, false)) {
+		auto owner = m_texture_cache.ResolveOwner(id);
+		if (owner == nullptr || owner->info.data.address != vaddr) {
+			continue;
+		}
+		if (owner->depth_id) {
+			owner = m_texture_cache.ResolveOwner(owner->depth_id);
+		}
+		if (owner != nullptr && owner->SafeToDownload()) {
+			matches.push_back(id);
+		}
+	}
+
+	ImageId selected {};
+	if (matches.size() == 1) {
+		selected = matches.front();
+	} else {
+		for (const auto id: matches) {
+			const auto& image = m_texture_cache.ResolveImage(id);
+			if (image.info.data.size == size) {
+				selected = id;
+				break;
+			}
+		}
+	}
+	if (!selected) {
+		return false;
+	}
+	if (const auto owner = m_texture_cache.ResolveOwner(selected);
+	    owner != nullptr && owner->depth_id) {
+		selected = owner->depth_id;
+	}
+
+	auto& image = m_texture_cache.ResolveImage(selected);
+	if (!buffer.IsInBounds(image.info.data.address, 1)) {
+		return false;
+	}
+	const auto buf_offset = buffer.Offset(image.info.data.address);
+	const auto available  = buffer.Size() - buf_offset;
+	uint32_t   levels     = 0;
+	uint64_t   copy_size  = 0;
+	if (image.info.IsVolume()) {
+		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
+		// every retained slice fits. Keep volume synchronization whole-image only.
+		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+			return false;
+		}
+		levels    = image.info.resources.levels;
+		copy_size = image.info.data.size;
+	} else {
+		for (; levels < image.info.resources.levels; ++levels) {
+			const auto& mip = image.info.mip_layout[levels];
+			if (mip.size == 0 || mip.offset > available || mip.size > available - mip.offset) {
+				break;
+			}
+			copy_size = std::max(copy_size, mip.offset + mip.size);
+		}
+	}
+	if (copy_size == 0) {
+		return false;
+	}
+	auto plan = m_texture_cache.BuildDownload(image);
+	if (!plan.valid) {
+		return false;
+	}
+	if (plan.depth && copy_size != image.info.data.size) {
+		return false;
+	}
+	if (!plan.depth && levels < image.info.resources.levels) {
+		auto& color = plan.color;
+		std::erase_if(color.regions, [levels](const vk::BufferImageCopy& region) {
+			return region.imageSubresource.mipLevel >= levels;
+		});
+		if (color.regions.empty()) {
+			return false;
+		}
+		if (color.tiled) {
+			const auto binding = m_texture_cache.UploadBinding(image);
+			const auto format =
+			    binding == TextureCache::BindingType::RenderTarget
+			        ? ImageOps::RenderTargetTransferFormat(image.info.bytes_per_block)
+			        : image.info.guest_format;
+			color.tiles.clear();
+			if (!TextureBuildGpuTileInfos(copy_size, color.regions, color.layout, format,
+			                              image.info.TransferLayers(), levels, color.tiles)) {
+				return false;
+			}
+		}
+	}
+	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));
+	m_texture_cache.RetainImage(m_scheduler.Current(), selected);
+	return true;
 }
 
 std::pair<uint8_t*, uint64_t> TextureCache::MapDownload(uint64_t size, uint64_t alignment) {
@@ -1612,12 +1689,9 @@ void TextureCache::QueueDownload(GuestRange range, StreamBuffer& download, uint8
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	const auto tick = m_scheduler.CurrentTick();
-	m_buffer_cache.BeginBackingPublication(range.address, range.size, tick);
-	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tick] {
+	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-		m_buffer_cache.CompleteBackingPublication(range.address, range.size, tick);
 	});
 }
 
@@ -1638,7 +1712,7 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImageData(image, download, offset, std::move(plan));
+	DownloadImageData(image, download, offset, range.size, std::move(plan));
 
 	QueueDownload(range, download, mapped, offset);
 	return true;
@@ -1650,62 +1724,6 @@ void TextureCache::DownloadImage(ImageId id) {
 	}
 	m_scheduler.FinishCurrent();
 	m_scheduler.DrainPriorityOperations();
-}
-
-bool TextureCache::SynchronizeImageToBuffer(ImageId id) {
-	auto& image = ResolveImage(id);
-	if (image.depth_id) {
-		return true;
-	}
-	auto plan = BuildDownload(image);
-	if (!plan.valid) {
-		return false;
-	}
-	const auto range = image.info.data;
-	if (image.IsCpuDirty()) {
-		RefreshImage(id,
-		             ImageDesc {.info = image.info, .view_info = {}, .type = UploadBinding(image)});
-	}
-	if (!image.IsGpuModified()) {
-		return true;
-	}
-	if (image.IsDefinitelyCpuDirty() || image.IsBufferModified()) {
-		EXIT("TextureCache: image mirror source is not native-current\n");
-	}
-	auto [destination, offset] =
-	    m_buffer_cache.ObtainBufferForImageWrite(range.address, range.size);
-	if (destination == nullptr) {
-		EXIT("TextureCache: failed to allocate image mirror\n");
-	}
-	DownloadImageData(image, *destination, offset, std::move(plan));
-	m_scheduler.Current().RetainResourceUntilFence(destination);
-	m_buffer_cache.PublishImageBuffer(range.address, range.size);
-	image.MarkBufferModified();
-	RetainImage(m_scheduler.Current(), id);
-	ClearGpuModified(id);
-	return true;
-}
-
-bool TextureCache::SynchronizeImageToBuffer(uint64_t address, uint64_t size) {
-	if (!GuestRange {address, size}.Valid()) {
-		return false;
-	}
-	CacheLock lock(*this, m_lock);
-	ImageId   selected {};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
-		auto owner = ResolveOwner(id);
-		if (owner == nullptr || !owner->GpuOverlaps(address, size)) {
-			continue;
-		}
-		if (selected) {
-			EXIT("TextureCache: ambiguous image-to-buffer synchronization\n");
-		}
-		selected = id;
-	}
-	if (!selected) {
-		return false;
-	}
-	return SynchronizeImageToBuffer(selected);
 }
 
 bool TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,

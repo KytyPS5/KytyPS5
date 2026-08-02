@@ -76,8 +76,9 @@ public:
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
-		m_cpu_dirty.set();
-		m_writable.set();
+		m_cpu_dirty.Fill();
+		m_writable.Fill();
+		m_readable.Fill();
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -87,106 +88,81 @@ public:
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		const auto& bits        = GetBits<source>();
-		for (auto page = start; page < end; page++) {
-			if (bits.test(page)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	template <DirtySource source>
-	[[nodiscard]] bool IsFullyModified(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		for (auto page = start; page < end; page++) {
-			if (!bits.test(page)) {
-				return false;
-			}
-		}
-		return true;
+		return RegionBits(bits, start, end).Any();
 	}
 
 	template <DirtySource source, bool enable>
-	RegionBits ChangeState(uint64_t vaddr, uint64_t size) {
+	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			for (auto page = start; page < end; page++) {
-				if (m_gpu_dirty.test(page)) {
-					EXIT("CPU dirty state conflicts with GPU dirty state\n");
-				}
+			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			for (auto page = start; page < end; page++) {
-				if (m_cpu_dirty.test(page)) {
-					EXIT("GPU dirty state conflicts with CPU dirty state\n");
-				}
+			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
-		auto& bits    = GetBits<source>();
-		auto  changed = bits;
-		for (auto page = start; page < end; page++) {
-			bits.set(page, enable);
+		auto& bits = GetBits<source>();
+		if constexpr (enable) {
+			bits.SetRange(start, end);
+		} else {
+			bits.UnsetRange(start, end);
 		}
-		changed ^= bits;
 		if constexpr (source == DirtySource::Cpu) {
-			changed    = m_cpu_dirty ^ m_writable;
-			m_writable = m_cpu_dirty;
+			UpdateCpuProtection<!enable>();
+		} else {
+			UpdateGpuProtection<enable>();
 		}
-		return changed;
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	RegionBits ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		auto mask               = GetBits<source>();
-		for (auto page = 0u; page < start; page++) {
-			mask.reset(page);
-		}
-		for (auto page = end; page < TRACKER_REGION_PAGES; page++) {
-			mask.reset(page);
-		}
+		RegionBits mask(GetBits<source>(), start, end);
 		if constexpr (clear) {
-			auto& bits = GetBits<source>();
-			for (auto page = start; page < end; page++) {
-				if (mask.test(page)) {
-					bits.reset(page);
-				}
-			}
+			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
-			auto changed = m_cpu_dirty ^ m_writable;
-			m_writable   = m_cpu_dirty;
-			ApplyProtection(changed, true);
+			UpdateCpuProtection<true>();
 			ForEachRange(mask, std::forward<Func>(func));
-			return changed;
+			return;
+		}
+		if constexpr (source == DirtySource::Gpu && clear) {
+			UpdateGpuProtection<false>();
 		}
 		ForEachRange(mask, std::forward<Func>(func));
-		if constexpr (clear) {
-			return mask;
-		}
-		return {};
-	}
-
-	void ApplyProtection(const RegionBits& changed, bool track) {
-		ForEachRange(changed, [this, track](uint64_t vaddr, uint64_t size) {
-			m_page_manager.UpdatePageWatchers(track, vaddr, size);
-		});
-	}
-
-	void ApplyGpuProtection(const RegionBits& changed, bool track, PageWatchMode mode) {
-		if (mode != PageWatchMode::Write && mode != PageWatchMode::ReadWrite) {
-			EXIT("unsupported GPU page-watch mode\n");
-		}
-		ForEachRange(changed, [this, track, mode](uint64_t vaddr, uint64_t size) {
-			m_page_manager.UpdatePageWatchers(track, vaddr, size, mode);
-		});
 	}
 
 	TrackingSpinLock lock;
 
 private:
+	template <bool track>
+	void UpdateCpuProtection() {
+		auto mask  = m_cpu_dirty ^ m_writable;
+		m_writable = m_cpu_dirty;
+		if (mask.None()) {
+			return;
+		}
+		m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask);
+	}
+
+	template <bool track>
+	void UpdateGpuProtection() {
+		auto readable = ~m_gpu_dirty;
+		auto mask     = readable ^ m_readable;
+		m_readable    = readable;
+		if (mask.None()) {
+			return;
+		}
+		if constexpr (track) {
+			m_page_manager.UpdatePageWatchersForRegion<true, true>(m_cpu_addr, mask);
+		} else {
+			m_page_manager.UpdatePageWatchersForRegion<false, true>(m_cpu_addr, mask);
+		}
+	}
+
 	template <DirtySource source>
 	RegionBits& GetBits() {
 		if constexpr (source == DirtySource::Cpu) {
@@ -217,18 +193,8 @@ private:
 
 	template <typename Func>
 	void ForEachRange(const RegionBits& bits, Func&& func) const {
-		size_t page = 0;
-		while (page < TRACKER_REGION_PAGES) {
-			while (page < TRACKER_REGION_PAGES && !bits.test(page)) {
-				page++;
-			}
-			const auto start = page;
-			while (page < TRACKER_REGION_PAGES && bits.test(page)) {
-				page++;
-			}
-			if (start != page) {
-				func(m_cpu_addr + start * TRACKER_PAGE_SIZE, (page - start) * TRACKER_PAGE_SIZE);
-			}
+		for (const auto [start, end]: bits) {
+			func(m_cpu_addr + start * TRACKER_PAGE_SIZE, (end - start) * TRACKER_PAGE_SIZE);
 		}
 	}
 
@@ -237,6 +203,7 @@ private:
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
+	RegionBits   m_readable;
 };
 
 } // namespace Libs::Graphics

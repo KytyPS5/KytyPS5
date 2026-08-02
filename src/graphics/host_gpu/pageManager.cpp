@@ -9,7 +9,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -22,13 +21,9 @@
 #undef min
 #undef max
 #elif defined(__APPLE__)
-#include <pthread.h>
-#include <sys/mman.h>
 #include <unistd.h>
 #else
 #include <execinfo.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
@@ -41,9 +36,8 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-// The tracker reuses Win32 memory-protection tags as internal page-state values (on
-// Windows they come from <windows.h> and are what VirtualQuery returns). Mirror the
-// canonical Win32 numeric values so the shared state-machine logic is identical.
+// The tracker reuses Win32 memory-protection tags as internal page-state values.
+// Mirror their canonical numeric values so the shared state-machine logic is identical.
 constexpr uint32_t PAGE_NOACCESS  = 0x01;
 constexpr uint32_t PAGE_READONLY  = 0x02;
 constexpr uint32_t PAGE_READWRITE = 0x04;
@@ -53,8 +47,6 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 constexpr uint32_t NO_ACCESS_PROTECTION  = PAGE_NOACCESS;
 constexpr uint32_t READ_ONLY_PROTECTION  = PAGE_READONLY;
 constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
-// Zero is the unknown protection sentinel.
-constexpr uint32_t UNKNOWN_PROTECTION = 0;
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
@@ -102,25 +94,6 @@ Common::VirtualMemory::Mode ToMemoryMode(uint32_t protection) {
 	}
 }
 
-uint32_t CurrentThread() noexcept {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	return GetCurrentThreadId();
-#elif defined(__APPLE__)
-	return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
-#elif defined(__linux__)
-	static thread_local const uint32_t tid = [] {
-		const auto raw = static_cast<uint32_t>(::syscall(SYS_gettid));
-		if (raw == 0) {
-			FailFast("gettid returned the reserved zero owner token");
-		}
-		return raw;
-	}();
-	return tid;
-#else
-	FailFast("page tracking thread identity is unsupported on this platform");
-#endif
-}
-
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
@@ -154,38 +127,58 @@ uint64_t PageEnd(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		std::atomic_flag lock                = ATOMIC_FLAG_INIT;
-		uint32_t         write_watchers      = 0;
-		uint32_t         access_watchers     = 0;
-		uint32_t         original_protection = 0;
-		uint32_t         backing_writer      = 0;
-		// Shadow the protection applied through Protect().
-		uint32_t current_protection = UNKNOWN_PROTECTION;
-		bool     resolving          = false;
-	};
+		uint8_t write_watchers  : 7 = 0;
+		uint8_t access_watchers : 1 = 0;
 
-	struct Region {
-		std::array<PageState, REGION_PAGES> pages;
-	};
+		[[nodiscard]] uint32_t Perms() const noexcept {
+			if (access_watchers != 0) {
+				return NO_ACCESS_PROTECTION;
+			}
+			if (write_watchers != 0) {
+				return READ_ONLY_PROTECTION;
+			}
+			return READ_WRITE_PROTECTION;
+		}
 
-	class PageRangeGuard final {
-	public:
-		explicit PageRangeGuard(std::span<PageState*> pages): m_pages(pages) {
-			for (auto* page: m_pages) {
-				while (page->lock.test_and_set(std::memory_order_acquire)) {
-					std::atomic_signal_fence(std::memory_order_seq_cst);
+		template <int delta, bool is_read>
+		uint32_t AddDelta(uint64_t address) {
+			static_assert(delta >= -1 && delta <= 1);
+			if constexpr (is_read) {
+				if constexpr (delta == 1) {
+					if (access_watchers != 0) {
+						Fatal("read-watcher overflow at 0x%016" PRIx64, address);
+					}
+					return ++access_watchers;
+				} else if constexpr (delta == -1) {
+					if (access_watchers == 0) {
+						Fatal("read-watcher underflow at 0x%016" PRIx64, address);
+					}
+					return --access_watchers;
+				} else {
+					return access_watchers;
+				}
+			} else {
+				if constexpr (delta == 1) {
+					if (write_watchers == 0x7f) {
+						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
+					}
+					return ++write_watchers;
+				} else if constexpr (delta == -1) {
+					if (write_watchers == 0) {
+						Fatal("write-watcher underflow at 0x%016" PRIx64, address);
+					}
+					return --write_watchers;
+				} else {
+					return write_watchers;
 				}
 			}
 		}
-		~PageRangeGuard() {
-			for (auto it = m_pages.rbegin(); it != m_pages.rend(); ++it) {
-				(*it)->lock.clear(std::memory_order_release);
-			}
-		}
-		KYTY_CLASS_NO_COPY(PageRangeGuard);
+	};
+	static_assert(sizeof(PageState) == 1);
 
-	private:
-		std::span<PageState*> m_pages;
+	struct Region {
+		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
+		std::array<PageState, REGION_PAGES> pages;
 	};
 
 	Impl() {
@@ -215,10 +208,9 @@ struct PageManager::Impl {
 
 	~Impl() {
 		for (const auto& region: region_storage) {
+			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
-				SpinGuard lock(page.lock);
-				if (page.write_watchers != 0 || page.access_watchers != 0 ||
-				    page.backing_writer != 0 || page.resolving) {
+				if (page.write_watchers != 0 || page.access_watchers != 0) {
 					FailFast("PageManager destroyed with live page state");
 				}
 			}
@@ -246,56 +238,81 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
-	PageState& GetPage(Region& region, uint64_t vaddr) const {
-		return region.pages[(vaddr % REGION_SIZE) / PAGE_SIZE];
-	}
-
-	static uint32_t WatcherProtection(const PageState& page) {
-		if (page.access_watchers != 0) {
-			return NO_ACCESS_PROTECTION;
-		}
-		if (page.write_watchers != 0) {
-			return READ_ONLY_PROTECTION;
-		}
-		return page.original_protection;
-	}
-
-	static void InitializeProtection(std::span<PageState*> pages) {
-		for (auto* page: pages) {
-			page->original_protection = READ_WRITE_PROTECTION;
-			page->current_protection  = READ_WRITE_PROTECTION;
-		}
-	}
-
-	void ProtectRange(std::span<PageState*> pages, uint64_t vaddr, uint32_t protection,
-	                  std::span<const uint32_t> expected_old) noexcept {
-		const auto size = pages.size() * PAGE_SIZE;
-		if (pages.size() != expected_old.size()) {
-			FailFast("protection range state size mismatch");
-		}
-		for (size_t i = 0; i < pages.size(); i++) {
-			const auto actual = pages[i]->current_protection;
-			if (actual != UNKNOWN_PROTECTION && actual != expected_old[i]) {
-				Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
-				      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
-				      vaddr + i * PAGE_SIZE, actual, expected_old[i], protection);
-			}
-		}
+	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
 			      protection);
 		}
-		for (auto* page: pages) {
-			page->current_protection = protection;
-		}
 	}
 
-	void Protect(PageState& page, uint64_t vaddr, uint32_t protection,
-	             uint32_t expected_old) noexcept {
-		PageState* pages[]    = {&page};
-		uint32_t   expected[] = {expected_old};
-		ProtectRange(pages, vaddr, protection, expected);
+	template <bool track, bool is_read, bool masked>
+	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
+	                          const RegionBits* mask = nullptr) {
+		SpinGuard lock(region.lock);
+		auto      perms                 = region.pages[first].Perms();
+		uint64_t  range_begin           = 0;
+		uint64_t  range_bytes           = 0;
+		uint64_t  potential_range_bytes = 0;
+
+		const auto release_pending = [&] {
+			if (range_bytes != 0) {
+				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				range_bytes           = 0;
+				potential_range_bytes = 0;
+			}
+		};
+
+		for (size_t page_index = first; page_index < last; page_index++) {
+			auto&      page    = region.pages[page_index];
+			const auto address = base_addr + page_index * PAGE_SIZE;
+			const bool update  = !masked || mask->Get(page_index);
+
+			const auto old_perms = page.Perms();
+			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
+			                              : page.AddDelta<0, is_read>(address);
+			const auto new_perms = page.Perms();
+
+			if (new_perms != perms) [[unlikely]] {
+				release_pending();
+				perms = new_perms;
+			} else if (range_bytes != 0) {
+				potential_range_bytes += PAGE_SIZE;
+			}
+
+			if (!update) {
+				continue;
+			}
+
+			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if (watcher_edge && old_perms != new_perms) {
+				if (range_bytes == 0) {
+					range_begin           = page_index;
+					potential_range_bytes = PAGE_SIZE;
+				}
+				range_bytes = potential_range_bytes;
+			}
+		}
+
+		release_pending();
+	}
+
+	template <bool track, bool is_read>
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+		const auto begin = PageStart(vaddr);
+		const auto end   = PageEnd(vaddr, size);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, (chunk_begin / REGION_SIZE + 1) * REGION_SIZE);
+			const auto region_base = chunk_begin / REGION_SIZE * REGION_SIZE;
+			auto*      region = track ? GetOrCreateRegion(chunk_begin) : FindRegion(chunk_begin);
+			if (region == nullptr) {
+				Fatal("untracking unknown page 0x%016" PRIx64, chunk_begin);
+			}
+			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			chunk_begin = chunk_end;
+		}
 	}
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
@@ -313,212 +330,48 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
-void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
-                                     PageWatchMode mode) {
-	if (mode != PageWatchMode::Write && mode != PageWatchMode::ReadWrite) {
-		Fatal("invalid watcher mode");
-	}
-	const auto begin = PageStart(vaddr);
-	const auto end   = PageEnd(vaddr, size);
-	for (auto chunk_begin = begin; chunk_begin < end;) {
-		const auto chunk_end = std::min(end, (chunk_begin / REGION_SIZE + 1) * REGION_SIZE);
-		auto*      region =
-		    track ? m_impl->GetOrCreateRegion(chunk_begin) : m_impl->FindRegion(chunk_begin);
-		if (region == nullptr) {
-			Fatal("untracking unknown page 0x%016" PRIx64, chunk_begin);
-		}
-
-		const auto page_count = static_cast<size_t>((chunk_end - chunk_begin) / PAGE_SIZE);
-		std::vector<Impl::PageState*> pages;
-		pages.reserve(page_count);
-		for (auto address = chunk_begin; address < chunk_end; address += PAGE_SIZE) {
-			pages.push_back(&m_impl->GetPage(*region, address));
-		}
-		Impl::PageRangeGuard lock(pages);
-
-		std::vector<uint8_t> first_watchers(page_count);
-		for (size_t i = 0; i < page_count; i++) {
-			auto&      page    = *pages[i];
-			const auto address = chunk_begin + i * PAGE_SIZE;
-			if (page.resolving && track) {
-				FailFast("new page watcher raced active fault resolution");
-			}
-			auto& watchers =
-			    (mode == PageWatchMode::ReadWrite ? page.access_watchers : page.write_watchers);
-			if (track) {
-				if (watchers == std::numeric_limits<uint32_t>::max()) {
-					Fatal("watcher overflow at 0x%016" PRIx64, address);
-				}
-				first_watchers[i] = page.write_watchers == 0 && page.access_watchers == 0;
-			} else {
-				if (watchers == 0) {
-					Fatal("watcher underflow at 0x%016" PRIx64, address);
-				}
-				if (page.backing_writer != 0 && page.backing_writer != CurrentThread()) {
-					Fatal("backing write ownership changed at 0x%016" PRIx64, address);
-				}
-			}
-		}
-
-		if (track) {
-			for (size_t first = 0; first < page_count;) {
-				while (first < page_count && first_watchers[first] == 0) {
-					first++;
-				}
-				auto last = first;
-				while (last < page_count && first_watchers[last] != 0) {
-					last++;
-				}
-				if (first != last) {
-					Impl::InitializeProtection(std::span {pages}.subspan(first, last - first));
-				}
-				first = last;
-			}
-		}
-
-		std::vector<uint32_t> old_protections(page_count);
-		std::vector<uint32_t> new_protections(page_count);
-		std::vector<uint8_t>  transitions(page_count);
-		for (size_t i = 0; i < page_count; i++) {
-			auto& page = *pages[i];
-			auto& watchers =
-			    (mode == PageWatchMode::ReadWrite ? page.access_watchers : page.write_watchers);
-			const auto old_protection = Impl::WatcherProtection(page);
-			if (track) {
-				watchers++;
-			} else {
-				watchers--;
-			}
-			const auto new_protection = Impl::WatcherProtection(page);
-			old_protections[i]        = old_protection;
-			new_protections[i]        = new_protection;
-			if (new_protection != old_protection && (track || page.backing_writer == 0)) {
-				transitions[i] = 1;
-			}
-		}
-
-		for (size_t first = 0; first < page_count;) {
-			while (first < page_count && transitions[first] == 0) {
-				first++;
-			}
-			if (first == page_count) {
-				break;
-			}
-			const auto protection = new_protections[first];
-			auto       current    = first + 1;
-			auto       last       = current;
-			for (; current < page_count && new_protections[current] == protection; current++) {
-				if (old_protections[current] != new_protections[current] &&
-				    transitions[current] == 0) {
-					break;
-				}
-				if (transitions[current] != 0) {
-					last = current + 1;
-				}
-			}
-			m_impl->ProtectRange(std::span {pages}.subspan(first, last - first),
-			                     chunk_begin + first * PAGE_SIZE, protection,
-			                     std::span {old_protections}.subspan(first, last - first));
-			first = current;
-		}
-
-		for (auto* page: pages) {
-			if (!track && page->backing_writer == 0 && page->write_watchers == 0 &&
-			    page->access_watchers == 0) {
-				page->original_protection = 0;
-			}
-		}
-		chunk_begin = chunk_end;
-	}
+template <bool track>
+void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
 }
+
+template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+
+template <bool track, bool is_read>
+void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
+	    REGION_SIZE > ADDRESS_SIZE - base_addr) {
+		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);
+	}
+
+	const auto start_range = mask.FirstRange();
+	const auto end_range   = mask.LastRange();
+	if (start_range.first == REGION_PAGES) {
+		FailFast("empty region watcher mask");
+	}
+	const auto first = start_range.first;
+	const auto last  = end_range.second;
+	if (start_range.second == end_range.second) {
+		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
+		                                           (last - first) * PAGE_SIZE);
+		return;
+	}
+
+	auto* region = track ? m_impl->GetOrCreateRegion(base_addr) : m_impl->FindRegion(base_addr);
+	if (region == nullptr) {
+		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
+	}
+	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+}
+
+template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
+template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
+template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
+template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
 
 void PageManager::OnGpuMap(uint64_t, uint64_t) {}
 
 void PageManager::OnGpuUnmap(uint64_t, uint64_t) {}
-
-PageManager::BackingWrite::BackingWrite(PageManager& manager, uint64_t vaddr,
-                                        uint64_t size) noexcept
-    : m_manager(manager), m_vaddr(vaddr), m_size(size) {
-	m_manager.BeginBackingWrite(vaddr, size);
-}
-
-PageManager::BackingWrite::~BackingWrite() {
-	m_manager.EndBackingWrite(m_vaddr, m_size);
-}
-
-std::vector<std::unique_ptr<PageManager::BackingWrite>>
-PageManager::ReserveBackingWrites(std::span<const RangeSet::Range> ranges) {
-	if (ranges.empty()) {
-		Fatal("cannot reserve empty backing-write ranges");
-	}
-	std::vector<std::unique_ptr<BackingWrite>> writes;
-	writes.reserve(ranges.size());
-	uint64_t begin = 0;
-	uint64_t end   = 0;
-	for (const auto& range: ranges) {
-		if (range.address == 0 || range.size == 0 || range.size > UINT64_MAX - range.address ||
-		    range.address + range.size > UINT64_MAX - (PAGE_SIZE - 1)) {
-			Fatal("invalid backing-write range");
-		}
-		const auto page_begin = PageStart(range.address);
-		const auto page_end   = PageStart(range.address + range.size + PAGE_SIZE - 1);
-		if (begin != 0 && page_begin > end) {
-			writes.push_back(std::make_unique<BackingWrite>(*this, begin, end - begin));
-			begin = 0;
-		}
-		if (begin == 0) {
-			begin = page_begin;
-			end   = page_end;
-		} else {
-			end = std::max(end, page_end);
-		}
-	}
-	writes.push_back(std::make_unique<BackingWrite>(*this, begin, end - begin));
-	return writes;
-}
-
-void PageManager::BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
-	const auto end    = PageEnd(vaddr, size);
-	const auto writer = CurrentThread();
-	for (auto address = PageStart(vaddr); address < end; address += PAGE_SIZE) {
-		auto* region = m_impl->FindRegion(address);
-		if (region == nullptr) {
-			Fatal("backing write reserves an unknown page at 0x%016" PRIx64, address);
-		}
-		auto&     page = m_impl->GetPage(*region, address);
-		SpinGuard lock(page.lock);
-		if (page.resolving || page.backing_writer != 0 || page.access_watchers == 0) {
-			Fatal("backing write races page resolution at 0x%016" PRIx64, address);
-		}
-		page.resolving      = true;
-		page.backing_writer = writer;
-	}
-}
-
-void PageManager::EndBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
-	const auto end    = PageEnd(vaddr, size);
-	const auto writer = CurrentThread();
-	for (auto address = PageStart(vaddr); address < end; address += PAGE_SIZE) {
-		auto* region = m_impl->FindRegion(address);
-		if (region == nullptr) {
-			FailFast("backing write ended for an unknown page");
-		}
-		auto&     page = m_impl->GetPage(*region, address);
-		SpinGuard lock(page.lock);
-		if (!page.resolving || page.backing_writer != writer) {
-			FailFast("backing write ended without matching owner and resolving state");
-		}
-		const auto old_protection = NO_ACCESS_PROTECTION;
-		const auto new_protection = Impl::WatcherProtection(page);
-		if (new_protection != old_protection) {
-			m_impl->Protect(page, address, new_protection, old_protection);
-		}
-		if (page.write_watchers == 0 && page.access_watchers == 0) {
-			page.original_protection = 0;
-		}
-		page.backing_writer = 0;
-		page.resolving      = false;
-	}
-}
 
 } // namespace Libs::Graphics

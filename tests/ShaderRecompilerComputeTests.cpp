@@ -91,6 +91,26 @@ template <typename Cache>
 concept HasGetDownloadBuffer = requires(Cache& cache) { cache.GetDownloadBuffer(uint64_t {1}); };
 static_assert(!HasGetDownloadBuffer<BufferCache>);
 
+template <typename Cache>
+concept HasSynchronizeImageToBuffer =
+    requires(Cache& cache) { cache.SynchronizeImageToBuffer(uint64_t {1}, uint64_t {1}); };
+template <typename Cache>
+concept HasObtainBufferForImageCopy =
+    requires(Cache& cache) { cache.ObtainBufferForImageCopy(uint64_t {1}, uint64_t {1}); };
+template <typename Cache>
+concept HasObtainBufferForImageWrite =
+    requires(Cache& cache) { cache.ObtainBufferForImageWrite(uint64_t {1}, uint64_t {1}); };
+template <typename Cache>
+concept HasDiscardGpuDirtyBytes =
+    requires(Cache& cache) { cache.DiscardGpuDirtyBytes(uint64_t {1}, uint64_t {1}); };
+template <typename Source>
+concept HasGpuOwnedImageSource = requires(Source& source) { source.gpu_owned; };
+static_assert(!HasSynchronizeImageToBuffer<TextureCache>);
+static_assert(!HasObtainBufferForImageCopy<BufferCache>);
+static_assert(!HasObtainBufferForImageWrite<BufferCache>);
+static_assert(!HasDiscardGpuDirtyBytes<BufferCache>);
+static_assert(!HasGpuOwnedImageSource<ImageBufferSource>);
+
 template <typename Backing>
 concept HasLegacyImageLayout = requires(Backing& backing) { backing.layout; };
 static_assert(!HasLegacyImageLayout<VulkanImage>);
@@ -111,6 +131,11 @@ struct BufferCacheTestAccess {
 	}
 
 	static StreamBuffer& DownloadBuffer(BufferCache& cache) { return cache.m_download_buffer; }
+
+	static bool SynchronizeBufferFromImage(BufferCache& cache, Buffer& buffer, uint64_t address,
+	                                       uint64_t size) {
+		return cache.SynchronizeBufferFromImage(buffer, address, size);
+	}
 };
 
 struct StreamBufferTestAccess {
@@ -1858,21 +1883,6 @@ public:
 			MarkGpuWrite(base + second_offset, sizeof(second_value));
 			cache.FillBuffer(base + first_offset, sizeof(first_value), first_value);
 			cache.FillBuffer(base + second_offset, sizeof(second_value), second_value);
-			cache.DiscardGpuDirtyBytes(base + first_offset, sizeof(first_value));
-			Require(name, "exact dirty discard",
-			        !cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
-			            cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)) &&
-			            cache.IsRegionGpuModified(base, TRACKER_PAGE_SIZE),
-			        "discarding one exact range released its dirty page sibling");
-			cache.DiscardGpuDirtyBytes(base + second_offset, sizeof(second_value));
-			Require(name, "last dirty discard",
-			        !cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)) &&
-			            !cache.IsRegionGpuModified(base, TRACKER_PAGE_SIZE),
-			        "discarding the last exact range retained page ownership");
-			MarkGpuWrite(base + first_offset, sizeof(first_value));
-			MarkGpuWrite(base + second_offset, sizeof(second_value));
-			cache.FillBuffer(base + first_offset, sizeof(first_value), first_value);
-			cache.FillBuffer(base + second_offset, sizeof(second_value), second_value);
 			auto&      download              = BufferCacheTestAccess::DownloadBuffer(cache);
 			auto*      fixed_download        = &download;
 			const auto fixed_download_handle = download.Handle();
@@ -1930,7 +1940,8 @@ public:
 			const auto gc_submission_tick = scheduler.CurrentTick();
 			cache.RunGarbageCollector();
 			Require(name, "dirty retirement", !cache.HasPageOverlap(base, allocation_size),
-			        "aged GPU-dirty buffer survived pressured collection");
+			        "aged GPU-dirty buffer survived pressured "
+			        "collection");
 
 			uint32_t first_before_completion  = 0;
 			uint32_t second_before_completion = 0;
@@ -1941,11 +1952,14 @@ public:
 			Require(name, "deferred dirty retirement",
 			        first_before_completion == first_stale &&
 			            second_before_completion == second_stale &&
+			            cache.IsRegionGpuModified(base + first_offset, sizeof(first_value)) &&
+			            cache.IsRegionGpuModified(base + second_offset, sizeof(second_value)) &&
+			            cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
+			            cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)) &&
 			            scheduler.CurrentTick() == gc_submission_tick,
-			        "buffer GC synchronously submitted or published its download");
-			Require(name, "publication-gated CPU fault",
-			        resources.HandleFault(PageFaultAccess::Read, base + first_offset),
-			        "CPU fault did not wait for the deferred buffer publication");
+			        "buffer GC published bytes or cleared dirty "
+			        "ownership before GPU completion");
+			scheduler.FinishCurrent();
 
 			uint32_t first_backing  = 0;
 			uint32_t second_backing = 0;
@@ -1955,8 +1969,13 @@ public:
 			std::memcpy(&clean_backing, memory + clean_offset, sizeof(clean_backing));
 			Require(name, "downloaded contents",
 			        first_backing == first_value && second_backing == second_value &&
-			            clean_backing == clean_value,
-			        "dirty GC did not publish exact buffer ranges");
+			            clean_backing == clean_value &&
+			            !cache.IsRegionGpuModified(base + first_offset, sizeof(first_value)) &&
+			            !cache.IsRegionGpuModified(base + second_offset, sizeof(second_value)) &&
+			            !cache.HasGpuDirtyBytes(base + first_offset, sizeof(first_value)) &&
+			            !cache.HasGpuDirtyBytes(base + second_offset, sizeof(second_value)),
+			        "dirty GC did not publish exact ranges before "
+			        "clearing broad page ownership");
 
 			auto unmap_allocation = cache.ObtainBuffer(scheduler.Current(), base + unmap_offset,
 			                                           sizeof(unmap_value), true, false);
@@ -1969,7 +1988,8 @@ public:
 			std::memcpy(&unmap_backing, memory + unmap_offset, sizeof(unmap_backing));
 			Require(name, "direct-unmap contents",
 			        unmap_backing == unmap_value && !cache.HasPageOverlap(base + 0x4000, 0x4000),
-			        "direct dirty unmap cleared tracking before publishing bytes");
+			        "direct dirty unmap cleared tracking before "
+			        "publishing bytes");
 
 			auto partial_unmap_allocation =
 			    cache.ObtainBuffer(scheduler.Current(), base + 0x8000, 0x8000, true, false);
@@ -1981,18 +2001,21 @@ public:
 			cache.FillBuffer(base + partial_unmap_survivor_offset,
 			                 sizeof(partial_unmap_survivor_value), partial_unmap_survivor_value);
 			cache.UnmapMemory(base + 0x8000, 0x4000);
-			auto [survivor, survivor_offset] = cache.ObtainBufferForImageWrite(
-			    base + partial_unmap_survivor_offset, sizeof(partial_unmap_survivor_value));
-			Require(name, "partial-unmap survivor", survivor != nullptr,
+			auto survivor =
+			    cache.ObtainBuffer(scheduler.Current(), base + partial_unmap_survivor_offset,
+			                       sizeof(partial_unmap_survivor_value), false, true);
+			Require(name, "partial-unmap survivor", survivor.buffer != nullptr,
 			        "still-mapped cached-buffer remainder could not be recreated");
-			scheduler.Current().RetainResourceUntilFence(survivor);
+			if (survivor.owner != nullptr) {
+				scheduler.Current().RetainResourceUntilFence(survivor.owner);
+			}
 			auto partial_unmap_readback =
 			    CreateHostBuffer(name, sizeof(partial_unmap_survivor_value),
 			                     vk::BufferUsageFlagBits::eTransferDst, {0});
-			const vk::BufferCopy survivor_copy {survivor_offset, 0,
+			const vk::BufferCopy survivor_copy {survivor.offset, 0,
 			                                    sizeof(partial_unmap_survivor_value)};
-			scheduler.Current().Handle().copyBuffer(
-			    survivor->Handle(), partial_unmap_readback.buffer, 1, &survivor_copy);
+			scheduler.Current().Handle().copyBuffer(survivor.buffer, partial_unmap_readback.buffer,
+			                                        1, &survivor_copy);
 			vk::BufferMemoryBarrier survivor_barrier {};
 			survivor_barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
 			survivor_barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
@@ -2037,9 +2060,10 @@ public:
 			Require(name, "near-capacity backing remained deferred",
 			        large_before_completion == large_stale,
 			        "near-capacity Buffer GC published before its scheduler tick");
+			scheduler.FinishCurrent();
 			const auto large_image_source =
 			    cache.ObtainBufferForImage(base + large_offset, sizeof(large_value));
-			Require(name, "fixed download during Buffer publication",
+			Require(name, "fixed download after Buffer retirement",
 			        large_image_source.buffer != nullptr &&
 			            &BufferCacheTestAccess::DownloadBuffer(cache) == fixed_download &&
 			            fixed_download->Handle() == fixed_download_handle &&
@@ -2134,23 +2158,22 @@ public:
 			Require(name, "disjoint retirement remained deferred",
 			        disjoint_before_unmap == disjoint_stale,
 			        "whole-owner Buffer publication completed before synchronization");
+			scheduler.FinishCurrent();
 			cache.UnmapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
 			uint32_t disjoint_after_unmap = 0;
 			Libs::LibKernel::Memory::TryReadBacking(
 			    base + disjoint_dirty_offset, &disjoint_after_unmap, sizeof(disjoint_after_unmap));
 			Require(
-			    name, "disjoint publication-gated unmap",
+			    name, "disjoint synchronized unmap",
 			    disjoint_after_unmap == disjoint_value &&
 			        !cache.HasGpuDirtyBytes(base + disjoint_dirty_offset, sizeof(disjoint_value)),
-			    "disjoint unmap did not wait for the pending whole-owner "
-			    "publication");
+			    "disjoint unmap lost the completed whole-owner publication");
 			auto disjoint_new_owner =
 			    cache.ObtainBuffer(scheduler.Current(), base + disjoint_new_owner_offset,
 			                       sizeof(disjoint_value), true, false);
-			Require(name, "disjoint publication-gated reacquire",
+			Require(name, "disjoint post-publication reacquire",
 			        disjoint_new_owner.owner != nullptr,
-			        "disjoint acquisition did not wait for whole-owner "
-			        "publication");
+			        "disjoint acquisition failed after whole-owner publication");
 			scheduler.Current().RetainResourceUntilFence(disjoint_new_owner.owner);
 			uint32_t disjoint_backing = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + disjoint_dirty_offset, &disjoint_backing,
@@ -2158,7 +2181,7 @@ public:
 			Require(name, "disjoint retirement contents", disjoint_backing == disjoint_value,
 			        "old retirement callback lost dirty bytes or retained ownership "
 			        "after a disjoint reacquire");
-			cache.DiscardGpuDirtyBytes(base + disjoint_new_owner_offset, sizeof(disjoint_value));
+			cache.ReadMemory(base + disjoint_new_owner_offset, sizeof(disjoint_value));
 
 			constexpr uint64_t reacquire_owner_offset    = 0x2200000;
 			constexpr uint64_t reacquire_owner_size      = 0x8000;
@@ -2193,13 +2216,13 @@ public:
 			Require(name, "reacquire publication remained deferred",
 			        reacquire_before == reacquire_stale,
 			        "fresh whole-owner publication completed before reacquisition");
+			scheduler.FinishCurrent();
 			auto reacquired =
 			    cache.ObtainBuffer(scheduler.Current(), base + reacquire_disjoint_offset,
 			                       sizeof(reacquire_value), true, false);
-			Require(name, "independent disjoint publication-gated reacquire",
+			Require(name, "independent disjoint post-publication reacquire",
 			        reacquired.owner != nullptr,
-			        "clean disjoint-half acquisition did not synchronize the "
-			        "pending whole-owner publication");
+			        "clean disjoint-half acquisition failed after publication");
 			scheduler.Current().RetainResourceUntilFence(reacquired.owner);
 			uint32_t reacquire_after = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + reacquire_dirty_offset, &reacquire_after,
@@ -2210,7 +2233,7 @@ public:
 			        !cache.HasGpuDirtyBytes(base + reacquire_dirty_offset, sizeof(reacquire_value)),
 			    "disjoint-half acquisition failed to publish the retired "
 			    "owner's dirty prefix");
-			cache.DiscardGpuDirtyBytes(base + reacquire_disjoint_offset, sizeof(reacquire_value));
+			cache.ReadMemory(base + reacquire_disjoint_offset, sizeof(reacquire_value));
 
 			resources.SetGpu(nullptr);
 			resources.UnmapMemory(base, allocation_size);
@@ -2421,6 +2444,111 @@ public:
 				                                             vk::PipelineStageFlagBits::eHost, {},
 				                                             0, nullptr, 1, &barrier, 0, nullptr);
 			};
+			const auto TransferReadBarrier = [&](vk::Buffer buffer, uint64_t size) {
+				vk::BufferMemoryBarrier barrier {};
+				barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
+				barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+				barrier.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+				barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				barrier.buffer              = buffer;
+				barrier.offset              = 0;
+				barrier.size                = size;
+				scheduler.Current().Handle().pipelineBarrier(
+				    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {},
+				    0, nullptr, 1, &barrier, 0, nullptr);
+			};
+
+			// A formatted Buffer read must use the private
+			// shadPS4-shaped image-copy path. Use a request larger
+			// than the stream shortcut and poison guest backing
+			// after upload so stale CPU staging cannot accidentally
+			// satisfy the content check.
+			constexpr uint64_t mip_prefix_offset = 0x2740000;
+			constexpr uint32_t mip_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt);
+			constexpr uint32_t mip_tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+			constexpr uint32_t mip_width  = 4097;
+			constexpr uint32_t mip_height = 1;
+			constexpr uint32_t mip_levels = 1;
+			const uint32_t     mip_pitch =
+			    TileGetTexturePitch(mip_format, mip_width, mip_levels, mip_tile);
+			TileSizeAlign                  mip_total {};
+			std::array<TileSizeOffset, 16> mip_sizes {};
+			std::array<TilePaddedSize, 16> mip_padded {};
+			TileGetTextureSize(mip_format, mip_width, mip_height, mip_pitch, mip_levels, mip_tile,
+			                   &mip_total, mip_sizes.data(), mip_padded.data());
+			const uint64_t mip_prefix_size = mip_sizes[0].offset + mip_sizes[0].size;
+			const uint64_t mip_guest_size  = mip_total.size + 256;
+			Require(name, "formatted mip fixture",
+			        mip_sizes[0].offset == 0 && mip_prefix_size > BufferCache::CACHING_PAGE_SIZE &&
+			            mip_prefix_size < mip_guest_size && mip_guest_size % sizeof(uint32_t) == 0,
+			        "single-mip fixture did not expose a cache-sized fitting backing prefix");
+			std::vector<uint32_t> mip_native(mip_guest_size / sizeof(uint32_t));
+			std::iota(mip_native.begin(), mip_native.end(), 0x61000000u);
+			std::memcpy(memory + mip_prefix_offset, mip_native.data(), mip_guest_size);
+			auto mip_desc = MakeLinearDesc(
+			    base + mip_prefix_offset, mip_guest_size, vk::Format::eR32Uint, mip_format,
+			    Prospero::ImageType::kColor2D, {mip_width, mip_height, 1}, 1, sizeof(uint32_t), 1);
+			mip_desc.info.resources.levels = mip_levels;
+			mip_desc.info.pitch            = mip_pitch;
+			mip_desc.view_info.level_count = mip_levels;
+			for (uint32_t level = 0; level < mip_levels; level++) {
+				mip_desc.info.mip_layout[level] = {mip_sizes[level].offset, mip_sizes[level].size,
+				                                   mip_padded[level].width,
+				                                   mip_padded[level].height};
+			}
+			const auto mip_image = texture_cache.FindImage(mip_desc);
+			texture_cache.MarkGpuWritten(mip_image);
+			std::vector<uint32_t> mip_stale(mip_native.size(), 0xdeadbeefu);
+			Libs::LibKernel::Memory::WriteBacking(base + mip_prefix_offset, mip_stale.data(),
+			                                      mip_guest_size);
+
+			Libs::Graphics::Buffer mip_insufficient(
+			    m_runtime_context, scheduler, MemoryUsage::DeviceLocal, mip_desc.info.data.address,
+			    AllFlags, mip_prefix_size - 1);
+			Libs::Graphics::Buffer mip_prefix(m_runtime_context, scheduler,
+			                                  MemoryUsage::DeviceLocal, mip_desc.info.data.address,
+			                                  AllFlags, mip_prefix_size);
+			Require(name, "formatted mip containment",
+			        !BufferCacheTestAccess::SynchronizeBufferFromImage(
+			            resources.GetBufferCache(), mip_insufficient, mip_desc.info.data.address,
+			            mip_prefix_size - 1) &&
+			            BufferCacheTestAccess::SynchronizeBufferFromImage(
+			                resources.GetBufferCache(), mip_prefix, mip_desc.info.data.address,
+			                mip_prefix_size) &&
+			            texture_cache.GetImage(mip_image).IsGpuModified(),
+			        "image synchronization accepted a partial first "
+			        "mip, rejected a fitting mip "
+			        "prefix, or transferred ownership");
+
+			auto mip_formatted = resources.GetBufferCache().ObtainBuffer(
+			    command, mip_desc.info.data.address, mip_desc.info.data.size, false, true, true);
+			Require(name, "formatted Buffer path",
+			        mip_formatted.owner != nullptr && mip_formatted.buffer != nullptr &&
+			            texture_cache.GetImage(mip_image).IsGpuModified(),
+			        "formatted read bypassed the cached image-copy "
+			        "path or transferred ownership");
+			command.RetainResourceUntilFence(mip_formatted.owner);
+			auto mip_prefix_readback =
+			    CreateHostBuffer(name, mip_prefix_size, vk::BufferUsageFlagBits::eTransferDst,
+			                     std::vector<u32>(mip_prefix_size / sizeof(uint32_t), 0));
+			auto mip_formatted_readback =
+			    CreateHostBuffer(name, mip_guest_size, vk::BufferUsageFlagBits::eTransferDst,
+			                     std::vector<u32>(mip_guest_size / sizeof(uint32_t), 0));
+			TransferReadBarrier(mip_prefix.Handle(), mip_prefix_size);
+			const vk::BufferCopy mip_prefix_copy {0, 0, mip_prefix_size};
+			command.Handle().copyBuffer(mip_prefix.Handle(), mip_prefix_readback.buffer, 1,
+			                            &mip_prefix_copy);
+			TransferReadBarrier(mip_formatted.buffer, mip_guest_size);
+			const vk::BufferCopy mip_formatted_copy {mip_formatted.offset, 0, mip_guest_size};
+			command.Handle().copyBuffer(mip_formatted.buffer, mip_formatted_readback.buffer, 1,
+			                            &mip_formatted_copy);
+			HostReadBarrier(mip_prefix_readback.buffer, mip_prefix_readback.size,
+			                vk::PipelineStageFlagBits::eTransfer,
+			                vk::AccessFlagBits::eTransferWrite);
+			HostReadBarrier(mip_formatted_readback.buffer, mip_formatted_readback.size,
+			                vk::PipelineStageFlagBits::eTransfer,
+			                vk::AccessFlagBits::eTransferWrite);
 			const std::array<uint32_t, 2> volume_values {0x10203040u, 0x50607080u};
 			std::memcpy(memory + 0x1000, volume_values.data(), sizeof(volume_values));
 			auto array_desc =
@@ -2441,7 +2569,68 @@ public:
 			            texture_cache.GetImage(volume_image).backing.image_type ==
 			                vk::ImageType::e3D &&
 			            texture_cache.GetImage(volume_image).IsGpuModified(),
-			        "array-to-volume expansion lost slices or GPU ownership");
+			        "array-to-volume expansion lost slices or GPU "
+			        "ownership");
+
+			constexpr uint64_t unique_volume_offset = 0x27b0000;
+			std::memcpy(memory + unique_volume_offset, volume_values.data(), sizeof(volume_values));
+			auto unique_volume_desc = MakeLinearDesc(
+			    base + unique_volume_offset, sizeof(volume_values), vk::Format::eR32Uint,
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
+			    Prospero::ImageType::kColor3D, {1, 1, 2}, 1, sizeof(uint32_t), 1);
+			const auto unique_volume_image = texture_cache.FindImage(unique_volume_desc);
+			texture_cache.MarkGpuWritten(unique_volume_image);
+			Libs::Graphics::Buffer partial_volume(
+			    m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+			    unique_volume_desc.info.data.address, AllFlags,
+			    unique_volume_desc.info.data.size - sizeof(uint32_t));
+			Libs::Graphics::Buffer full_volume(
+			    m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+			    unique_volume_desc.info.data.address, AllFlags, unique_volume_desc.info.data.size);
+			Require(name, "formatted volume containment",
+			        !BufferCacheTestAccess::SynchronizeBufferFromImage(
+			            resources.GetBufferCache(), partial_volume,
+			            unique_volume_desc.info.data.address,
+			            unique_volume_desc.info.data.size - sizeof(uint32_t)) &&
+			            BufferCacheTestAccess::SynchronizeBufferFromImage(
+			                resources.GetBufferCache(), full_volume,
+			                unique_volume_desc.info.data.address,
+			                unique_volume_desc.info.data.size) &&
+			            texture_cache.GetImage(unique_volume_image).IsGpuModified(),
+			        "partial 3D synchronization was accepted, "
+			        "full-volume synchronization was "
+			        "rejected, or ownership changed");
+
+			constexpr uint64_t             depth_containment_offset = 0x27c0000;
+			constexpr std::array<float, 3> depth_containment_values {0.25f, 0.75f, 0.5f};
+			std::memcpy(memory + depth_containment_offset, depth_containment_values.data(),
+			            sizeof(depth_containment_values));
+			auto depth_containment = MakeLinearDesc(
+			    base + depth_containment_offset, sizeof(depth_containment_values),
+			    vk::Format::eD32Sfloat, Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
+			    Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(float), 1);
+			depth_containment.type                  = BindingType::DepthTarget;
+			depth_containment.info.resources.levels = 2;
+			depth_containment.info.mip_layout[0]    = {0, 2 * sizeof(float), 2, 1};
+			depth_containment.info.mip_layout[1]    = {2 * sizeof(float), sizeof(float), 1, 1};
+			depth_containment.view_info.format      = vk::Format::eD32Sfloat;
+			depth_containment.view_info.aspect      = vk::ImageAspectFlagBits::eDepth;
+			depth_containment.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+			depth_containment.view_info.level_count = 2;
+			const auto depth_containment_image      = texture_cache.FindImage(depth_containment);
+			texture_cache.MarkGpuWritten(depth_containment_image);
+			Libs::Graphics::Buffer partial_depth(m_runtime_context, scheduler,
+			                                     MemoryUsage::DeviceLocal,
+			                                     depth_containment.info.data.address, AllFlags,
+			                                     depth_containment.info.mip_layout[0].size);
+			Require(name, "formatted depth containment",
+			        !BufferCacheTestAccess::SynchronizeBufferFromImage(
+			            resources.GetBufferCache(), partial_depth,
+			            depth_containment.info.data.address,
+			            depth_containment.info.mip_layout[0].size) &&
+			            texture_cache.GetImage(depth_containment_image).IsGpuModified(),
+			        "partial depth synchronization was accepted or "
+			        "transferred ownership");
 
 			auto native_array_info  = array_desc.info;
 			native_array_info.data  = {};
@@ -2458,7 +2647,8 @@ public:
 			            native_array.backing.state.layout == vk::ImageLayout::eGeneral &&
 			            native_array.backing.state.access_mask ==
 			                (vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead),
-			        "Image::CopyImage did not retain pinned source/destination states");
+			        "Image::CopyImage did not retain pinned "
+			        "source/destination states");
 
 			constexpr uint64_t                block_alias_offset = 0x23000;
 			constexpr std::array<uint32_t, 4> block_alias_data {0x01234567u, 0x89abcdefu,
@@ -2540,13 +2730,11 @@ public:
 			            sizeof(refreshed_multisample_source));
 			constexpr uint64_t ms_stencil_offset = 0x80000;
 			constexpr uint64_t ms_stencil_size   = 0x10000;
-			auto [ms_stencil_owner, ms_stencil_owner_offset] =
-			    resources.GetBufferCache().ObtainBufferForImageWrite(base + ms_stencil_offset,
-			                                                         ms_stencil_size);
-			(void)ms_stencil_owner_offset;
-			Require(name, "MS stencil buffer allocation", ms_stencil_owner != nullptr,
+			auto               ms_stencil_owner  = resources.GetBufferCache().ObtainBuffer(
+			    command, base + ms_stencil_offset, ms_stencil_size, false, true);
+			Require(name, "MS stencil buffer allocation", ms_stencil_owner.owner != nullptr,
 			        "failed to create an unequal-sample stencil source");
-			command.RetainResourceUntilFence(ms_stencil_owner);
+			command.RetainResourceUntilFence(ms_stencil_owner.owner);
 			resources.GetBufferCache().FillBuffer(base + ms_stencil_offset, ms_stencil_size,
 			                                      0x41414141u);
 			auto ms_depth_desc              = color_desc;
@@ -2599,11 +2787,9 @@ public:
 			oversized_ms.info.data.size = (32ull << 20) + 4;
 			const bool oversized_ms_readback =
 			    !TextureCacheTestAccess::TryDownload(texture_cache, ms_depth_image);
-			const bool oversized_ms_mirror = !texture_cache.SynchronizeImageToBuffer(
-			    ms_depth_desc.info.data.address, ms_data_size);
 			oversized_ms.info.data.size = ms_data_size;
 			Require(name, "oversized multisample download rejection",
-			        oversized_ms_readback && oversized_ms_mirror && oversized_ms.IsGpuModified() &&
+			        oversized_ms_readback && oversized_ms.IsGpuModified() &&
 			            !oversized_ms.IsBufferModified() &&
 			            !resources.GetBufferCache().HasGpuDirtyBytes(
 			                ms_depth_desc.info.data.address, ms_data_size),
@@ -2742,17 +2928,15 @@ public:
 			        resources.HandleFault(PageFaultAccess::Write, mirror_desc.info.data.address),
 			        "GPU image did not accept a CPU write before Buffer mirroring");
 			std::memcpy(memory + 0x5000, &mirror_cpu_value, sizeof(mirror_cpu_value));
-			Require(name, "image-to-buffer mirror",
-			        texture_cache.SynchronizeImageToBuffer(base + 0x5000, sizeof(mirror_value)) &&
-			            texture_cache.GetImage(mirror_image).IsBufferModified() &&
-			            !texture_cache.GetImage(mirror_image).IsGpuModified(),
-			        "image-to-buffer synchronization did not transfer ownership");
 			auto mirror_binding = resources.GetBufferCache().ObtainBuffer(
-			    command, base + 0x5000, sizeof(mirror_value), false, true);
+			    command, base + 0x5000, sizeof(mirror_value), false, true, true);
 			Require(name, "CPU-dirty formatted mirror source",
-			        mirror_binding.buffer != nullptr && mirror_binding.owner != nullptr,
-			        "formatted mirror did not expose its native Buffer source");
-			command.RetainResourceUntilFence(mirror_binding.owner);
+			        mirror_binding.buffer != nullptr &&
+			            !texture_cache.GetImage(mirror_image).IsBufferModified(),
+			        "formatted mirror did not expose a readable Buffer source");
+			if (mirror_binding.owner != nullptr) {
+				command.RetainResourceUntilFence(mirror_binding.owner);
+			}
 			auto mirror_cpu_readback =
 			    CreateHostBuffer(name, sizeof(mirror_cpu_value),
 			                     vk::BufferUsageFlagBits::eTransferDst, std::vector<u32> {0});
@@ -2767,10 +2951,9 @@ public:
 			const auto mirror_refresh      = texture_cache.FindImage(mirror_refresh_desc);
 			Require(name, "buffer-to-image ownership",
 			        mirror_refresh == mirror_image &&
-			            !texture_cache.GetImage(mirror_refresh).IsBufferModified() &&
-			            texture_cache.GetImage(mirror_refresh).IsGpuModified(),
-			        "buffer-backed refresh did not atomically reclaim image "
-			        "ownership");
+			            !texture_cache.GetImage(mirror_refresh).IsBufferModified(),
+			        "buffer-backed refresh incorrectly transferred dirty ownership "
+			        "to the image");
 			texture_cache.MarkGpuWritten(mirror_refresh);
 
 			constexpr uint64_t exact_buffer_offset = 0x90000;
@@ -2783,11 +2966,17 @@ public:
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto exact_buffer_image = texture_cache.FindImage(exact_buffer_desc);
 			texture_cache.MarkGpuWritten(exact_buffer_image);
-			Require(name, "exact replacement Buffer publication",
-			        texture_cache.SynchronizeImageToBuffer(exact_buffer_desc.info.data.address,
-			                                               exact_buffer_desc.info.data.size) &&
-			            texture_cache.GetImage(exact_buffer_image).IsBufferModified(),
-			        "exact replacement source did not transfer to Buffer ownership");
+			auto exact_buffer_binding = resources.GetBufferCache().ObtainBuffer(
+			    command, exact_buffer_desc.info.data.address, exact_buffer_desc.info.data.size,
+			    false, true, true);
+			Require(name, "exact replacement Buffer synchronization",
+			        exact_buffer_binding.buffer != nullptr &&
+			            !texture_cache.GetImage(exact_buffer_image).IsBufferModified() &&
+			            texture_cache.GetImage(exact_buffer_image).IsGpuModified(),
+			        "exact replacement copy transferred cache ownership");
+			if (exact_buffer_binding.owner != nullptr) {
+				command.RetainResourceUntilFence(exact_buffer_binding.owner);
+			}
 			auto exact_float_desc              = exact_buffer_desc;
 			exact_float_desc.info.pixel_format = vk::Format::eR32Sfloat;
 			exact_float_desc.info.guest_format =
@@ -2797,11 +2986,11 @@ public:
 			Require(name, "Buffer-superseded exact coexistence",
 			        exact_float_image != exact_buffer_image &&
 			            TextureCacheTestAccess::Contains(texture_cache, exact_buffer_image) &&
-			            texture_cache.GetImage(exact_buffer_image).IsBufferModified() &&
+			            texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
 			            !texture_cache.GetImage(exact_float_image).IsBufferModified() &&
-			            texture_cache.GetImage(exact_float_image).IsGpuModified(),
-			        "exact-format lookup retired its old record or failed to import "
-			        "the shared Buffer source");
+			            !texture_cache.GetImage(exact_float_image).IsGpuModified(),
+			        "exact-format lookup retired its old record or transferred Buffer "
+			        "ownership");
 			auto exact_buffer_readback =
 			    CreateHostBuffer(name, sizeof(exact_buffer_value),
 			                     vk::BufferUsageFlagBits::eTransferDst, std::vector<u32> {0});
@@ -2870,23 +3059,21 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto partial_image = texture_cache.FindImage(partial_desc);
-			Require(name, "partial-page image ownership",
-			        texture_cache.GetImage(partial_image).IsGpuModified(),
-			        "image did not consume its exact GPU-owned buffer bytes");
+			Require(name, "partial-page image upload",
+			        !texture_cache.GetImage(partial_image).IsGpuModified(),
+			        "image upload incorrectly consumed buffer dirty ownership");
 			auto partial_image_mirror = resources.GetBufferCache().ObtainBuffer(
 			    command, base + partial_image_offset, sizeof(partial_image_value), false, true,
 			    true);
 			Require(name, "partial-page image mirror",
 			        partial_image_mirror.buffer != nullptr &&
 			            partial_image_mirror.owner != nullptr &&
-			            texture_cache.GetImage(partial_image).IsBufferModified() &&
 			            !texture_cache.GetImage(partial_image).IsGpuModified(),
-			        "same-page image bytes did not transfer back to their buffer");
+			        "same-page image upload lost its buffer source");
 			command.RetainResourceUntilFence(partial_image_mirror.owner);
 			const auto partial_clean_source = resources.GetBufferCache().ObtainBufferForImage(
 			    base + partial_clean_offset, sizeof(partial_clean_value));
-			Require(name, "partial-page clean source",
-			        partial_clean_source.buffer != nullptr && !partial_clean_source.gpu_owned,
+			Require(name, "partial-page clean source", partial_clean_source.buffer != nullptr,
 			        "clean same-page bytes inherited unrelated buffer ownership");
 			Require(name, "partial-page remaining fault",
 			        resources.HandleFault(PageFaultAccess::Read, base + partial_buffer_offset),
@@ -2910,8 +3097,7 @@ public:
 			const auto partial_cpu_refresh_source = resources.GetBufferCache().ObtainBufferForImage(
 			    base + partial_clean_offset, sizeof(partial_cpu_refresh_value));
 			Require(name, "partial-page CPU refresh source",
-			        partial_cpu_refresh_source.buffer != nullptr &&
-			            !partial_cpu_refresh_source.gpu_owned,
+			        partial_cpu_refresh_source.buffer != nullptr,
 			        "CPU-dirty same-page bytes did not resolve through the cached "
 			        "buffer");
 			auto partial_cpu_refresh_readback =
@@ -2972,20 +3158,25 @@ public:
 			            texture_cache.GetImage(fault_a_image).IsMaybeCpuDirty() &&
 			            texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty(),
 			        "a byte-disjoint CPU write discarded authoritative images");
-			const auto retracked_a = texture_cache.FindImage(fault_a_desc);
-			const auto retracked_b = texture_cache.FindImage(fault_b_desc);
+			const auto retracked_a    = texture_cache.FindImage(fault_a_desc);
+			const auto retracked_b    = texture_cache.FindImage(fault_b_desc);
+			auto       fault_a_mirror = resources.GetBufferCache().ObtainBuffer(
+			    command, base + 0x8000, sizeof(fault_a), false, true, true);
+			if (fault_a_mirror.owner != nullptr) {
+				command.RetainResourceUntilFence(fault_a_mirror.owner);
+			}
 			Require(name, "same-page image re-track",
 			        retracked_a == fault_a_image && retracked_b == fault_b_image &&
 			            texture_cache.GetImage(fault_a_image).IsTracked() &&
 			            texture_cache.GetImage(fault_b_image).IsTracked() &&
 			            !texture_cache.GetImage(fault_a_image).IsCpuDirty() &&
 			            !texture_cache.GetImage(fault_b_image).IsCpuDirty() &&
-			            texture_cache.SynchronizeImageToBuffer(base + 0x8000, sizeof(fault_a)) &&
+			            fault_a_mirror.buffer != nullptr &&
 			            texture_cache.GetImage(fault_a_image).IsTracked() &&
 			            texture_cache.GetImage(fault_b_image).IsTracked() &&
-			            !texture_cache.GetImage(fault_a_image).IsGpuModified() &&
+			            texture_cache.GetImage(fault_a_image).IsGpuModified() &&
 			            texture_cache.GetImage(fault_b_image).IsGpuModified(),
-			        "retiring one same-page image lost the surviving owner");
+			        "copying one same-page image lost an authoritative owner");
 			Require(name, "same-page survivor write fault",
 			        resources.HandleFault(PageFaultAccess::Write, base + 0x8010) &&
 			            texture_cache.GetImage(fault_b_image).IsGpuModified() &&
@@ -3011,13 +3202,6 @@ public:
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto publish_image = texture_cache.FindImage(publish_image_desc);
 			texture_cache.MarkGpuWritten(publish_image);
-			auto [publish_buffer_owner, publish_buffer_native_offset] =
-			    resources.GetBufferCache().ObtainBufferForImageWrite(base + publish_buffer_offset,
-			                                                         sizeof(publish_buffer_value));
-			(void)publish_buffer_native_offset;
-			Require(name, "exact-disjoint buffer allocation", publish_buffer_owner != nullptr,
-			        "failed to create the neighboring native buffer owner");
-			command.RetainResourceUntilFence(publish_buffer_owner);
 			resources.GetBufferCache().FillBuffer(
 			    base + publish_buffer_offset, sizeof(publish_buffer_value), publish_buffer_value);
 			auto publish_replacement_desc              = publish_image_desc;
@@ -3286,8 +3470,6 @@ public:
 			        "compressed image incorrectly claimed a CPU read fault");
 			Require(name, "compressed download rejection",
 			        !TextureCacheTestAccess::TryDownload(texture_cache, compressed_image) &&
-			            !texture_cache.SynchronizeImageToBuffer(compressed_desc.info.data.address,
-			                                                    compressed_desc.info.data.size) &&
 			            texture_cache.GetImage(compressed_image).IsGpuModified() &&
 			            !texture_cache.GetImage(compressed_image).IsBufferModified(),
 			        "a compressed image escaped the unified download guard");
@@ -3309,13 +3491,11 @@ public:
 			constexpr uint32_t mixed_source_width  = 1025;
 			constexpr uint32_t mixed_cpu_value     = 0x1234abcdu;
 			constexpr uint32_t mixed_gpu_value     = 0x9876fedcu;
-			auto [mixed_owner, mixed_owner_offset] =
-			    resources.GetBufferCache().ObtainBufferForImageWrite(base + mixed_source_offset,
-			                                                         mixed_source_size);
-			(void)mixed_owner_offset;
-			Require(name, "mixed-page source allocation", mixed_owner != nullptr,
+			auto               mixed_owner         = resources.GetBufferCache().ObtainBuffer(
+			    command, base + mixed_source_offset, mixed_source_size, true, true);
+			Require(name, "mixed-page source allocation", mixed_owner.owner != nullptr,
 			        "mixed CPU/GPU image source did not create a containing buffer");
-			command.RetainResourceUntilFence(mixed_owner);
+			command.RetainResourceUntilFence(mixed_owner.owner);
 			Require(name, "mixed-page CPU write fault",
 			        resources.HandleFault(PageFaultAccess::Write, base + mixed_source_offset),
 			        "mixed image source could not dirty its first page");
@@ -3362,18 +3542,13 @@ public:
 			auto byte_mirror = resources.GetBufferCache().ObtainBuffer(
 			    command, base + byte_mirror_offset, 1, false, true, true);
 			Require(name, "byte image mirror",
-			        byte_mirror.owner != nullptr && byte_mirror.buffer != nullptr &&
-			            texture_cache.GetImage(byte_mirror_image).IsBufferModified(),
-			        "one-byte image did not transfer exact ownership to BufferCache");
-			command.RetainResourceUntilFence(byte_mirror.owner);
-			Require(name, "byte image fault",
-			        resources.HandleFault(PageFaultAccess::Read, base + byte_mirror_offset),
-			        "one-byte image mirror could not be downloaded");
-			std::array<uint8_t, 4> byte_mirror_backing {};
-			std::memcpy(byte_mirror_backing.data(), memory + byte_mirror_page_offset,
-			            byte_mirror_backing.size());
-			Require(name, "byte image fault contents", byte_mirror_backing == byte_mirror_guest,
-			        "aligned one-byte download changed neighboring guest sentinels");
+			        byte_mirror.buffer != nullptr &&
+			            !texture_cache.GetImage(byte_mirror_image).IsBufferModified() &&
+			            texture_cache.GetImage(byte_mirror_image).IsGpuModified(),
+			        "one-byte image copy transferred cache ownership");
+			if (byte_mirror.owner != nullptr) {
+				command.RetainResourceUntilFence(byte_mirror.owner);
+			}
 
 			const std::array<uint16_t, 4> bgra16_guest {0x3c00u, 0x4000u, 0x4200u, 0x4400u};
 			std::memcpy(memory + 0xb000, bgra16_guest.data(), sizeof(bgra16_guest));
@@ -3557,23 +3732,42 @@ public:
 
 			scheduler.Finish();
 
+			const auto mip_prefix_words =
+			    ReadBuffer(name, mip_prefix_readback, mip_prefix_size / sizeof(uint32_t));
+			const auto mip_formatted_words =
+			    ReadBuffer(name, mip_formatted_readback, mip_guest_size / sizeof(uint32_t));
+			const auto mip0_word = mip_sizes[0].offset / sizeof(uint32_t);
+			Require(name, "formatted mip prefix content",
+			        mip0_word < mip_prefix_words.size() && mip0_word < mip_native.size() &&
+			            mip_prefix_words[mip0_word] == mip_native[mip0_word],
+			        "fitting mip-prefix synchronization copied "
+			        "stale guest backing");
+			Require(name, "formatted Buffer content",
+			        mip0_word < mip_formatted_words.size() && mip0_word < mip_native.size() &&
+			            mip_formatted_words[mip0_word] == mip_native[mip0_word],
+			        "formatted Buffer read bypassed authoritative "
+			        "native image mip data");
 			Require(name, "CPU-dirty formatted mirror content",
 			        ReadBuffer(name, mirror_cpu_readback, 1) == std::vector<u32> {mirror_cpu_value},
-			        "formatted Buffer mirror published stale native image bytes");
+			        "formatted Buffer mirror published stale "
+			        "native image bytes");
 			Require(name, "Buffer-superseded exact content",
 			        ReadBuffer(name, exact_buffer_readback, 1) ==
 			            std::vector<u32> {exact_buffer_value},
-			        "exact-format recreation initialized from stale guest bytes");
+			        "exact-format recreation initialized from "
+			        "stale guest bytes");
 			Require(name, "partial-page CPU refresh content",
 			        ReadBuffer(name, partial_cpu_refresh_readback, 1) ==
 			            std::vector<u32> {partial_cpu_refresh_value},
-			        "cached buffer uploaded bytes outside the exact staged guest range");
+			        "cached buffer uploaded bytes outside the exact "
+			        "staged guest range");
 			const auto mixed_source_words =
 			    ReadBuffer(name, mixed_source_readback, mixed_source_size / sizeof(u32));
 			Require(name, "mixed-page image content",
 			        mixed_source_words.front() == mixed_cpu_value &&
 			            mixed_source_words[0x1000 / sizeof(u32)] == mixed_gpu_value,
-			        "mixed CPU/GPU source upload lost one ownership domain");
+			        "mixed CPU/GPU source upload lost one "
+			        "ownership domain");
 			Require(name, "BGRA16 content",
 			        ReadBuffer(name, bgra16_readback, 2) ==
 			            std::vector<u32> {0x40004200u, 0x44003c00u},
@@ -3666,8 +3860,8 @@ public:
 			            texture_cache.GetImage(exact_image).IsGpuModified(),
 			        "image ownership discarded or conflicted with disjoint dirty "
 			        "Buffer bytes on the same tracker page");
-			resources.GetBufferCache().DiscardGpuDirtyBytes(base + dirty_sibling_offset,
-			                                                sizeof(dirty_sibling_value));
+			resources.GetBufferCache().ReadMemory(base + dirty_sibling_offset,
+			                                      sizeof(dirty_sibling_value));
 
 			constexpr std::array<uint64_t, 2> gc_image_offsets {0x330000, 0x332000};
 			constexpr std::array<uint32_t, 2> gc_image_values {0x76543210u, 0x89abcdefu};
@@ -3689,8 +3883,8 @@ public:
 			        clean_buffer_alias.owner != nullptr && clean_buffer_alias.buffer != nullptr,
 			        "failed to create the clean cached Buffer alias");
 			scheduler.Current().RetainResourceUntilFence(clean_buffer_alias.owner);
-			resources.GetBufferCache().DiscardGpuDirtyBytes(gc_image_desc_a.info.data.address,
-			                                                gc_image_desc_a.info.data.size);
+			resources.GetBufferCache().ReadMemory(gc_image_desc_a.info.data.address,
+			                                      gc_image_desc_a.info.data.size);
 			const std::array gc_images {texture_cache.FindImage(gc_image_desc_a),
 			                            texture_cache.FindImage(gc_image_desc_b)};
 			Require(name, "non-GPU image range validity",
@@ -3746,12 +3940,14 @@ public:
 			            gc_before_completion == gc_stale_values,
 			        "GC submitted per image or published a readback before GPU "
 			        "completion");
+			scheduler.FinishCurrent();
+			scheduler.DrainPriorityOperations();
 			auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
 			    scheduler.Current(), gc_image_desc_a.info.data.address,
 			    gc_image_desc_a.info.data.size, false, true);
-			Require(name, "publication-gated Buffer reacquire",
+			Require(name, "post-publication Buffer reacquire",
 			        refreshed_buffer_alias.buffer != nullptr,
-			        "Buffer lookup did not wait for the retired image publication");
+			        "Buffer lookup failed after the retired image publication");
 			if (refreshed_buffer_alias.owner != nullptr) {
 				scheduler.Current().RetainResourceUntilFence(refreshed_buffer_alias.owner);
 			}
@@ -4373,32 +4569,47 @@ public:
 			auto       repeated_standard_4kb_alias = standard_4kb_alias;
 			const auto repeated_standard_4kb_alias_image =
 			    texture_cache.FindImage(repeated_standard_4kb_alias);
-			Require(name, "equal-size tile-mode alias",
-			        render_target_alias_image && standard_4kb_alias_image &&
-			            standard_4kb_alias_image != render_target_alias_image &&
-			            repeated_standard_4kb_alias_image == standard_4kb_alias_image &&
-			            texture_cache.GetImage(render_target_alias_image).info.tile_mode ==
-			                Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-			            texture_cache.GetImage(standard_4kb_alias_image).info.tile_mode ==
-			                Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB),
-			        "equal address/size lookup reused an incompatible tiled backing");
+                        Require(
+                            name, "equal-size tile-mode alias",
+                            render_target_alias_image &&
+                                standard_4kb_alias_image &&
+                                standard_4kb_alias_image !=
+                                    render_target_alias_image &&
+                                repeated_standard_4kb_alias_image ==
+                                    standard_4kb_alias_image &&
+                                texture_cache
+                                        .GetImage(render_target_alias_image)
+                                        .info.tile_mode ==
+                                    Prospero::GpuEnumValue(
+                                        Prospero::TileMode::kRenderTarget) &&
+                                texture_cache.GetImage(standard_4kb_alias_image)
+                                        .info.tile_mode ==
+                                    Prospero::GpuEnumValue(
+                                        Prospero::TileMode::kStandard4KB),
+                            "equal address/size lookup reused an incompatible "
+                            "tiled backing");
 
-			for (auto& output: ms_observer_outputs) {
-				DestroyBuffer(&output);
-			}
-			DestroyBuffer(&layered_readback);
-			DestroyBuffer(&bgra16_readback);
-			DestroyBuffer(&mixed_source_readback);
-			DestroyBuffer(&partial_cpu_refresh_readback);
-			DestroyBuffer(&mirror_cpu_readback);
-			DestroyBuffer(&exact_buffer_readback);
-			m_device.destroyDescriptorPool(observer_pool, nullptr);
-			m_device.destroyPipeline(observer_depth_pipeline, nullptr);
-			m_device.destroyPipelineLayout(observer_pipeline_layout, nullptr);
-			m_device.destroyDescriptorSetLayout(observer_set_layout, nullptr);
-			m_device.destroyShaderModule(ms_depth_module, nullptr);
+                        for (auto &output : ms_observer_outputs) {
+                          DestroyBuffer(&output);
+                        }
+                        DestroyBuffer(&layered_readback);
+                        DestroyBuffer(&bgra16_readback);
+                        DestroyBuffer(&mixed_source_readback);
+                        DestroyBuffer(&mip_formatted_readback);
+                        DestroyBuffer(&mip_prefix_readback);
+                        DestroyBuffer(&partial_cpu_refresh_readback);
+                        DestroyBuffer(&mirror_cpu_readback);
+                        DestroyBuffer(&exact_buffer_readback);
+                        m_device.destroyDescriptorPool(observer_pool, nullptr);
+                        m_device.destroyPipeline(observer_depth_pipeline,
+                                                 nullptr);
+                        m_device.destroyPipelineLayout(observer_pipeline_layout,
+                                                       nullptr);
+                        m_device.destroyDescriptorSetLayout(observer_set_layout,
+                                                            nullptr);
+                        m_device.destroyShaderModule(ms_depth_module, nullptr);
 
-			resources.SetGpu(nullptr);
+                        resources.SetGpu(nullptr);
 			resources.UnmapMemory(base, allocation_size);
 			scheduler.Finish();
 		}
@@ -4487,11 +4698,8 @@ public:
 			cache.MarkGpuWritten(id);
 			Require(name, "guest readback queue", TextureCacheTestAccess::TryDownload(cache, id),
 			        "tiled BGRA16 guest readback was rejected");
-			Require(name, "Buffer mirror", cache.SynchronizeImageToBuffer(base, total.size),
-			        "tiled BGRA16 Buffer mirror was rejected");
-
-			auto mirror =
-			    resources.GetBufferCache().ObtainBuffer(scheduler.Current(), base, 8, false, true);
+			auto mirror = resources.GetBufferCache().ObtainBuffer(scheduler.Current(), base,
+			                                                      total.size, false, true, true);
 			Require(name, "mirror owner", mirror.buffer != nullptr && mirror.owner != nullptr,
 			        "tiled BGRA16 mirror has no BufferCache owner");
 			scheduler.Current().RetainResourceUntilFence(mirror.owner);
@@ -4730,9 +4938,9 @@ public:
 			        "storage descriptor did not preserve its sRGB backing and "
 			        "select an UNORM Vulkan view");
 
-			ShaderTextureResource sint_storage {{0x01514b00u, 0xc1500000u, 0x000bc00bu,
-			                                     0x91b00204u, 0x00000000u, 0x00700000u,
-			                                     0x102b0000u, 0x0001514au}};
+			ShaderTextureResource sint_storage {{0x01514b00u, 0xc1500000u, 0x000bc00bu, 0x91b00204u,
+			                                     0x00000000u, 0x00700000u, 0x102b0000u,
+			                                     0x0001514au}};
 			Require(name, "PPSA06888 R32 SINT descriptor",
 			        sint_storage.Base40() == 0x1514b0000ull && sint_storage.Width5() + 1u == 48 &&
 			            sint_storage.Height5() + 1u == 48 && sint_storage.Depth() + 1u == 1 &&
@@ -4743,20 +4951,20 @@ public:
 			            sint_storage.TileMode() ==
 			                Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
 			            sint_storage.DstSelXYZW() == DstSel(4, 0, 0, 1),
-			        "captured write-only signed storage descriptor was decoded incorrectly");
-			const uint64_t mapped_sint_address = base + 0xe0000;
+			        "captured write-only signed storage descriptor was decoded "
+			        "incorrectly");
+			const uint64_t mapped_sint_address  = base + 0xe0000;
 			const auto     encoded_sint_address = mapped_sint_address >> 8u;
-			sint_storage.fields[0] = static_cast<uint32_t>(encoded_sint_address);
-			sint_storage.fields[1] =
-			    (sint_storage.fields[1] & ~0xffu) |
-			    static_cast<uint32_t>(encoded_sint_address >> 32u);
+			sint_storage.fields[0]              = static_cast<uint32_t>(encoded_sint_address);
+			sint_storage.fields[1] = (sint_storage.fields[1] & ~0xffu) |
+			                         static_cast<uint32_t>(encoded_sint_address >> 32u);
 			ShaderRecompiler::IR::DescriptorValue sint_storage_descriptor {};
 			std::copy(std::begin(sint_storage.fields), std::end(sint_storage.fields),
 			          sint_storage_descriptor.dwords.begin());
 			sint_storage_descriptor.dword_count = 8;
-			auto sint_storage_resource           = srgb_storage_resource;
-			sint_storage_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-			const auto sint_storage_binding      = RenderExecutorTestAccess::ResolveTexture(
+			auto sint_storage_resource          = srgb_storage_resource;
+			sint_storage_resource.kind      = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+			const auto sint_storage_binding = RenderExecutorTestAccess::ResolveTexture(
 			    executor, sint_storage_resource, sint_storage_descriptor);
 			const auto sint_storage_view =
 			    texture_cache.FindTexture(sint_storage_binding.image_id, sint_storage_binding.desc);
@@ -4767,7 +4975,8 @@ public:
 			            sint_storage_binding.desc.view_info.format == vk::Format::eR32Uint &&
 			            texture_cache.GetImage(sint_storage_binding.image_id).backing.format ==
 			                vk::Format::eR32Sint,
-			        "write-only R32 SINT storage did not select a bit-compatible uint view");
+			        "write-only R32 SINT storage did not select a bit-compatible "
+			        "uint view");
 
 			auto               narrowed_storage         = storage;
 			constexpr uint64_t narrowed_storage_address = base + 0xd0000;
@@ -5929,7 +6138,8 @@ public:
 		            Count(Kind::Storage2DArray) == 0 && Count(Kind::Storage3D) == 0 &&
 		            Count(Kind::StorageUint1D) == 0 && Count(Kind::StorageUint1DArray) == 0 &&
 		            Count(Kind::StorageUint2DArray) == 0 && Count(Kind::StorageUint3D) == 0,
-		        "unsupported array/3D image cases must provide matching Vulkan test views "
+		        "unsupported array/3D image cases must provide matching Vulkan test "
+		        "views "
 		        "before dispatch");
 
 		vk::ShaderModuleCreateInfo module_info {};
@@ -13388,7 +13598,8 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
 	using O = ShaderOpcode;
 
 	std::vector<u32> code;
-	AppendVMovU32(&code, 20, 1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+	AppendVMovU32(&code, 20,
+	              1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
 	AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
 	AppendVMovU32(&code, 22, 0);
 	code.push_back(EncodeMimg0(0x30, 0xf));
@@ -14465,8 +14676,8 @@ void CheckEmbeddedFetchVertexOffset() {
 void CheckRenderTargetFormatContract() {
 	const auto rgb565 = TextureGetRenderTargetFormat(16u, 0u, 0u);
 	Require("RenderTargetFormat", "RGB565 UNorm",
-	        rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
-	            rgb565.bytes_per_element == 2u && rgb565.export_mapping.IsIdentity(),
+	        rgb565.format == vk::Format::eB5G6R5UnormPack16 && rgb565.bytes_per_element == 2u &&
+	            rgb565.export_mapping.IsIdentity(),
 	        "RGB565 UNorm render-target tuple was rejected");
 
 	const auto uint_format = TextureGetRenderTargetFormat(12u, 4u, 0u);
@@ -15195,10 +15406,16 @@ void CheckSampledDepthDescriptor(RenderContext& renderer) {
 	        "normalized depth image rejected a valid padded descriptor");
 
 	const ShaderTextureResource uncompressed_msaa {{
-	    0x00705d00u, 0xc1600000u, 0x010dc1dfu, 0xe1810924u,
-	    0x00000000u, 0x00700010u, 0x00000000u, 0x00000000u,
+	    0x00705d00u,
+	    0xc1600000u,
+	    0x010dc1dfu,
+	    0xe1810924u,
+	    0x00000000u,
+	    0x00700010u,
+	    0x00000000u,
+	    0x00000000u,
 	}};
-	auto msaa_info =
+	auto                        msaa_info =
 	    make_info(1920, 1080, 1920, 1, vk::Format::eD32Sfloat, Prospero::ImageType::kColor2D, 2);
 	msaa_info.mip_layout[0] = {0, 0x010e0000, 1920, 1152};
 	Image msaa_image(context, scheduler, msaa_info);
@@ -15206,7 +15423,8 @@ void CheckSampledDepthDescriptor(RenderContext& renderer) {
 	Require("SampledDepthDescriptor", "uncompressed 2x MSAA depth",
 	        IsSupportedDepthTargetDescriptor(uncompressed_msaa, msaa_image) &&
 	            IsSupportedDepthTextureEncoding(uncompressed_msaa, msaa_image),
-	        "valid uncompressed MSAA depth descriptor required an HTILE compatibility flag");
+	        "valid uncompressed MSAA depth descriptor required an HTILE "
+	        "compatibility flag");
 
 	descriptor.fields[3] = (descriptor.fields[3] & ~(0xfu << 28u)) |
 	                       (Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u);

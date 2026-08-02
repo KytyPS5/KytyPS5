@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
@@ -24,37 +25,6 @@ namespace SystemService {
 [[maybe_unused]] constexpr int PARAM_ID_GAME_PARENTAL_LEVEL = 7;
 [[maybe_unused]] constexpr int PARAM_ID_SCREEN_READER       = 208;
 [[maybe_unused]] constexpr int PARAM_ID_ENTER_BUTTON_ASSIGN = 1000;
-
-[[maybe_unused]] constexpr int PARAM_LANG_JAPANESE      = 0;
-[[maybe_unused]] constexpr int PARAM_LANG_ENGLISH_US    = 1;
-[[maybe_unused]] constexpr int PARAM_LANG_FRENCH        = 2;
-[[maybe_unused]] constexpr int PARAM_LANG_SPANISH       = 3;
-[[maybe_unused]] constexpr int PARAM_LANG_GERMAN        = 4;
-[[maybe_unused]] constexpr int PARAM_LANG_ITALIAN       = 5;
-[[maybe_unused]] constexpr int PARAM_LANG_DUTCH         = 6;
-[[maybe_unused]] constexpr int PARAM_LANG_PORTUGUESE_PT = 7;
-[[maybe_unused]] constexpr int PARAM_LANG_RUSSIAN       = 8;
-[[maybe_unused]] constexpr int PARAM_LANG_KOREAN        = 9;
-[[maybe_unused]] constexpr int PARAM_LANG_CHINESE_T     = 10;
-[[maybe_unused]] constexpr int PARAM_LANG_CHINESE_S     = 11;
-[[maybe_unused]] constexpr int PARAM_LANG_FINNISH       = 12;
-[[maybe_unused]] constexpr int PARAM_LANG_SWEDISH       = 13;
-[[maybe_unused]] constexpr int PARAM_LANG_DANISH        = 14;
-[[maybe_unused]] constexpr int PARAM_LANG_NORWEGIAN     = 15;
-[[maybe_unused]] constexpr int PARAM_LANG_POLISH        = 16;
-[[maybe_unused]] constexpr int PARAM_LANG_PORTUGUESE_BR = 17;
-[[maybe_unused]] constexpr int PARAM_LANG_ENGLISH_GB    = 18;
-[[maybe_unused]] constexpr int PARAM_LANG_TURKISH       = 19;
-[[maybe_unused]] constexpr int PARAM_LANG_SPANISH_LA    = 20;
-[[maybe_unused]] constexpr int PARAM_LANG_ARABIC        = 21;
-[[maybe_unused]] constexpr int PARAM_LANG_FRENCH_CA     = 22;
-[[maybe_unused]] constexpr int PARAM_LANG_CZECH         = 23;
-[[maybe_unused]] constexpr int PARAM_LANG_HUNGARIAN     = 24;
-[[maybe_unused]] constexpr int PARAM_LANG_GREEK         = 25;
-[[maybe_unused]] constexpr int PARAM_LANG_ROMANIAN      = 26;
-[[maybe_unused]] constexpr int PARAM_LANG_THAI          = 27;
-[[maybe_unused]] constexpr int PARAM_LANG_VIETNAMESE    = 28;
-[[maybe_unused]] constexpr int PARAM_LANG_INDONESIAN    = 29;
 
 [[maybe_unused]] constexpr int PARAM_DATE_FORMAT_YYYYMMDD = 0;
 [[maybe_unused]] constexpr int PARAM_DATE_FORMAT_DDMMYYYY = 1;
@@ -121,7 +91,7 @@ static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 	int v = 0;
 
 	switch (param_id) {
-		case PARAM_ID_LANG: v = PARAM_LANG_ENGLISH_US; break;
+		case PARAM_ID_LANG: v = static_cast<int>(Config::GetConsoleLanguage()); break;
 		case PARAM_ID_DATE_FORMAT: v = PARAM_DATE_FORMAT_DDMMYYYY; break;
 		case PARAM_ID_TIME_FORMAT: v = PARAM_TIME_FORMAT_24HOUR; break;
 		case PARAM_ID_TIME_ZONE: v = +180; break;

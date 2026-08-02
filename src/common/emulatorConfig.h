@@ -18,10 +18,14 @@ enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
 
+constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
+constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
+
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
 	uint32_t               vblank_frequency            = 60;
+	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
@@ -43,6 +47,7 @@ void Load(const ConfigOptions& cfg);
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 uint32_t GetVblankFrequency();
+uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();

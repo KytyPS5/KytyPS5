@@ -205,6 +205,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
+	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
 	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);

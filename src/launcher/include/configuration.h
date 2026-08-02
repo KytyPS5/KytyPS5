@@ -48,6 +48,9 @@ class Configuration: public QObject {
 	Q_OBJECT
 
 public:
+	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
+	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
+
 	enum class Resolution {
 		R1280X720,
 		R1920X1080,
@@ -83,6 +86,7 @@ public:
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	int                    vblank_frequency            = 60;
+	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = true;
 	bool                   shader_validation_enabled   = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
@@ -100,6 +104,7 @@ public:
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
 		vblank_frequency            = other.vblank_frequency;
+		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
 		shader_optimization_type    = other.shader_optimization_type;
@@ -134,6 +139,7 @@ public:
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
 		KYTY_CFG_SET(vblank_frequency);
+		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
 		KYTY_CFG_SET(shader_validation_enabled);
 		KYTY_CFG_SET(shader_optimization_type);
@@ -155,6 +161,10 @@ public:
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
+		console_language = s->value("console_language", console_language).toInt();
+		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
+			console_language = DEFAULT_CONSOLE_LANGUAGE;
+		}
 		KYTY_CFG_GET(vulkan_validation_enabled);
 		KYTY_CFG_GET(shader_validation_enabled);
 		KYTY_CFG_GET(shader_optimization_type);

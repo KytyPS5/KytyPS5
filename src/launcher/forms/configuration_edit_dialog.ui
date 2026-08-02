@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>560</width>
-    <height>420</height>
+    <height>450</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -119,41 +119,55 @@
        </widget>
       </item>
       <item row="3" column="0">
+       <widget class="QLabel" name="label_console_language">
+        <property name="text">
+         <string>Console language:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QComboBox" name="comboBox_console_language">
+        <property name="toolTip">
+         <string>Language</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
        <widget class="QLabel" name="label_20">
         <property name="text">
          <string>Shader optimization type:</string>
         </property>
        </widget>
       </item>
-      <item row="3" column="1">
+      <item row="4" column="1">
        <widget class="QComboBox" name="comboBox_shader_optimization_type">
         <property name="toolTip">
          <string>Optimize shaders for code size or performance</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="0">
+      <item row="5" column="0">
        <widget class="QLabel" name="label_21">
         <property name="text">
          <string>Shader log direction:</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="1">
+      <item row="5" column="1">
        <widget class="QComboBox" name="comboBox_shader_log_direction">
         <property name="toolTip">
          <string>Dump shaders to file or console window. If enabled may decrease emulator performance</string>
         </property>
        </widget>
       </item>
-      <item row="5" column="0">
+      <item row="6" column="0">
        <widget class="QLabel" name="label_22">
         <property name="text">
          <string>Shader log folder:</string>
         </property>
        </widget>
       </item>
-      <item row="5" column="1">
+      <item row="6" column="1">
        <widget class="MandatoryLineEdit" name="lineEdit_shader_log_folder">
         <property name="toolTip">
          <string>Specify directory to dump shaders</string>
@@ -163,14 +177,14 @@
         </property>
        </widget>
       </item>
-      <item row="6" column="0">
+      <item row="7" column="0">
        <widget class="QLabel" name="label_24">
         <property name="text">
          <string>Command buffer dump folder:</string>
         </property>
        </widget>
       </item>
-      <item row="6" column="1">
+      <item row="7" column="1">
        <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
         <property name="toolTip">
          <string>Specify directory to dump command buffers</string>
@@ -180,28 +194,28 @@
         </property>
        </widget>
       </item>
-      <item row="7" column="0">
+      <item row="8" column="0">
        <widget class="QLabel" name="label_25">
         <property name="text">
          <string>Printf direction:</string>
         </property>
        </widget>
       </item>
-      <item row="7" column="1">
+      <item row="8" column="1">
        <widget class="QComboBox" name="comboBox_printf_direction">
         <property name="toolTip">
          <string>Print logs to file or console window. If enabled may decrease emulator performance</string>
         </property>
        </widget>
       </item>
-      <item row="8" column="0">
+      <item row="9" column="0">
        <widget class="QLabel" name="label_26">
         <property name="text">
          <string>Printf output file:</string>
         </property>
        </widget>
       </item>
-      <item row="8" column="1">
+      <item row="9" column="1">
        <widget class="MandatoryLineEdit" name="lineEdit_printf_file">
         <property name="toolTip">
          <string>Specify file to dump logs</string>
@@ -211,14 +225,14 @@
         </property>
        </widget>
       </item>
-      <item row="9" column="0">
+      <item row="10" column="0">
        <widget class="QLabel" name="label_27">
         <property name="text">
          <string>Profiler direction:</string>
         </property>
        </widget>
       </item>
-      <item row="9" column="1">
+      <item row="10" column="1">
        <widget class="QComboBox" name="comboBox_profiler_direction">
         <property name="toolTip">
          <string>Enable or disable profiler. If enabled may decrease emulator performance</string>

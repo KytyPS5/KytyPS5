@@ -30,6 +30,39 @@ constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
 constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
 constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 560;
 
+const QStringList CONSOLE_LANGUAGE_NAMES = {
+    "Japanese",
+    "English (United States)",
+    "French (France)",
+    "Spanish (Spain)",
+    "German",
+    "Italian",
+    "Dutch",
+    "Portuguese (Portugal)",
+    "Russian",
+    "Korean",
+    "Chinese (Traditional)",
+    "Chinese (Simplified)",
+    "Finnish",
+    "Swedish",
+    "Danish",
+    "Norwegian",
+    "Polish",
+    "Portuguese (Brazil)",
+    "English (United Kingdom)",
+    "Turkish",
+    "Spanish (Latin America)",
+    "Arabic",
+    "French (Canada)",
+    "Czech",
+    "Hungarian",
+    "Greek",
+    "Romanian",
+    "Thai",
+    "Vietnamese",
+    "Indonesian",
+};
+
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
 	if (trimmed.isEmpty()) {
@@ -121,6 +154,12 @@ static void ListInit(QComboBox* combo, T value) {
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
+	m_ui->comboBox_console_language->clear();
+	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
+	m_ui->comboBox_console_language->setCurrentIndex(
+	    info.console_language >= 0 && info.console_language < CONSOLE_LANGUAGE_NAMES.size()
+	        ? info.console_language
+	        : Configuration::DEFAULT_CONSOLE_LANGUAGE);
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
@@ -241,6 +280,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
+	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();

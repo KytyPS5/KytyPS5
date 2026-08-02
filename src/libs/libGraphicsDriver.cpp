@@ -208,6 +208,7 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("ewobAQeMo5k", Gen5::GraphicsAcbAcquireMemGetSize);
 	LIB_FUNC("qyM2bxYFPAk", Gen5::GraphicsAcbCondExec);
 	LIB_FUNC("ozKzBP4aki4", Gen5::GraphicsAcbCondExecGetSize);
+	LIB_FUNC("b-oySn+G2tE", Gen5::GraphicsAcbJumpGetSize);
 	LIB_FUNC("htn36gPnBk4", Gen5::GraphicsAcbWaitRegMem);
 	LIB_FUNC("-RnpfpxIhec", Gen5::GraphicsAcbDmaData);
 	LIB_FUNC("qzMN2XKGA4k", Gen5::GraphicsAcbCopyData);
@@ -283,6 +284,7 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("YWTKOju587o", Gen5::GraphicsCondExecPatchSetCommandAddress);
 	LIB_FUNC("k-JpyR2dYAM", Gen5::GraphicsCondExecPatchSetEnd);
 	LIB_FUNC("3ZWa3AoyWZQ", Gen5::GraphicsCondExecPatchSetCommandAddress);
+	LIB_FUNC("ziVA3whp3p4", Gen5::GraphicsRewindPatchSetRewindState);
 	LIB_FUNC("YUeqkyT7mEQ", Gen5::GraphicsDcbSetFlip);
 }
 

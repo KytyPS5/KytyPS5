@@ -185,6 +185,7 @@ uint32_t KYTY_SYSV_ABI  GraphicsAcbAcquireMemGetSize();
 uint32_t* KYTY_SYSV_ABI GraphicsAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                             uint32_t num_dwords);
 uint32_t KYTY_SYSV_ABI  GraphicsAcbCondExecGetSize();
+uint32_t KYTY_SYSV_ABI  GraphicsAcbJumpGetSize();
 uint32_t* KYTY_SYSV_ABI GraphicsAcbWaitRegMem(CommandBuffer* buf, uint8_t size,
                                               uint8_t compare_function, uint8_t cache_policy,
                                               const volatile void* address, uint64_t reference,
@@ -243,6 +244,7 @@ uint32_t KYTY_SYSV_ABI  GraphicsGetPacketSize(uint32_t* packet);
 int KYTY_SYSV_ABI       GraphicsSetPacketPredication(uint32_t* packet, uint32_t predication);
 int KYTY_SYSV_ABI       GraphicsSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                                     uint32_t predication);
+int KYTY_SYSV_ABI       GraphicsRewindPatchSetRewindState(uint32_t* cmd, uint8_t state);
 int KYTY_SYSV_ABI       GraphicsCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer);
 int KYTY_SYSV_ABI       GraphicsCondExecPatchSetCommandAddress(uint32_t*                cmd,
                                                                const volatile uint32_t* command);

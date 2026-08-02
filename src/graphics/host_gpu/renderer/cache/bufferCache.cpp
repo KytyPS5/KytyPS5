@@ -612,9 +612,21 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	if (is_read && !is_written && size <= CACHING_PAGE_SIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
-		std::vector<uint8_t> data(size);
-		if (Libs::LibKernel::Memory::TryReadBacking(vaddr, data.data(), size)) {
-			return UploadTransient(data.data(), size, 16);
+		const auto alignment = std::max<uint64_t>(
+		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		if (auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		    mapped != nullptr) {
+			if (Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
+				m_stream_buffer.Commit();
+				return {{}, m_stream_buffer.Handle(), offset};
+			}
+		} else {
+			auto owner = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+			                                      AllFlags, size);
+			if (Libs::LibKernel::Memory::TryReadBacking(vaddr, owner->Mapped().data(), size)) {
+				owner->Flush(0, size);
+				return {owner, owner->Handle(), 0};
+			}
 		}
 	}
 

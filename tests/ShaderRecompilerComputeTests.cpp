@@ -5520,6 +5520,43 @@ public:
 			    "state at the final acquisition boundary");
 			RenderExecutorTestAccess::ResetBindings(executor);
 
+			constexpr uint64_t depth_only_address = base + 0x140000;
+			HW::DepthRenderTarget depth_only_target {};
+			depth_only_target.z_info.format =
+			    Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F);
+			depth_only_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
+			depth_only_target.stencil_info.htile_stencil_disabled = true;
+			depth_only_target.z_read_base_addr                    = depth_only_address;
+			depth_only_target.z_write_base_addr                   = depth_only_address;
+			depth_only_target.size                                = {63, 63, true};
+			registers.SetDepthRenderTarget(depth_only_target);
+			HW::DepthControl depth_only_control {};
+			depth_only_control.stencil_enable = true;
+			depth_only_control.z_enable       = true;
+			depth_only_control.z_write_enable = true;
+			depth_only_control.zfunc          = static_cast<uint8_t>(vk::CompareOp::eAlways);
+			registers.SetDepthControl(depth_only_control);
+			HW::RenderControl depth_only_render_control {};
+			depth_only_render_control.depth_clear_enable   = true;
+			depth_only_render_control.stencil_clear_enable = true;
+			registers.SetRenderControl(depth_only_render_control);
+			RenderDepthInfo depth_only {};
+			RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, 1, scheduler.Current(),
+			                                                   depth_only);
+			Require(
+			    name, "depth-only target with stale stencil state",
+			    depth_only.image_id && depth_only.format == vk::Format::eD32Sfloat &&
+			        depth_only.depth_test_enable && depth_only.depth_write_enable &&
+			        depth_only.depth_clear_enable && !depth_only.stencil_test_enable &&
+			        !depth_only.stencil_clear_enable && depth_only.stencil_buffer_vaddr == 0 &&
+			        depth_only.stencil_buffer_size == 0 && depth_only.desc.info.stencil.Empty() &&
+			        depth_only.depth_buffer_size != 0 &&
+			        depth_only_address + depth_only.depth_buffer_size <= base + allocation_size &&
+			        depth_only.vaddr_num == 1 &&
+			        depth_only.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eDepth,
+			    "raw stencil test or clear state leaked into a depth-only attachment");
+			RenderExecutorTestAccess::ResetBindings(executor);
+
 			auto video_subresource = make_target_desc(base + 0x20000, target_mip_size, {1, 1, 1});
 			video_subresource.type = BindingType::VideoOut;
 			video_subresource.info.pixel_format = vk::Format::eR8G8B8A8Srgb;

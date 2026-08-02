@@ -1159,8 +1159,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				if (owner == nullptr) {
 					continue;
 				}
-				const auto merged_info = result ? ResolveImage(result).info : desc.info;
-				const auto overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				const auto& merged_info = result ? ResolveImage(result).info : desc.info;
+				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;

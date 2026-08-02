@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -463,8 +464,12 @@ void CreatePipelineInternal(
     uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active) {
 	EXIT_IF(ps_active && ps_input_info == nullptr);
 
-	vk::ShaderModule vert_shader_module = nullptr;
-	vk::ShaderModule frag_shader_module = nullptr;
+	const bool rect_list = static_params.topology == vk::PrimitiveTopology::ePatchList;
+
+	vk::ShaderModule vert_shader_module         = nullptr;
+	vk::ShaderModule tess_control_shader_module = nullptr;
+	vk::ShaderModule tess_eval_shader_module    = nullptr;
+	vk::ShaderModule frag_shader_module         = nullptr;
 
 	vk::ShaderModuleCreateInfo create_info {};
 
@@ -491,8 +496,33 @@ void CreatePipelineInternal(
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
+	if (rect_list) {
+		const auto shaders =
+		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
+		create_info.codeSize = shaders.control.size() * 4;
+		create_info.pCode    = shaders.control.data();
+		result =
+		    graphics.device.createShaderModule(&create_info, nullptr, &tess_control_shader_module);
+		if (graphics_debug_dump_enabled()) {
+			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done result=%s module=%p\n",
+			     VulkanToString(result).c_str(), static_cast<void*>(tess_control_shader_module));
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+		create_info.codeSize = shaders.evaluation.size() * 4;
+		create_info.pCode    = shaders.evaluation.data();
+		result =
+		    graphics.device.createShaderModule(&create_info, nullptr, &tess_eval_shader_module);
+		if (graphics_debug_dump_enabled()) {
+			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done result=%s module=%p\n",
+			     VulkanToString(result).c_str(), static_cast<void*>(tess_eval_shader_module));
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	}
 
 	EXIT_NOT_IMPLEMENTED(vert_shader_module == nullptr);
+	EXIT_NOT_IMPLEMENTED(
+	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 	EXIT_NOT_IMPLEMENTED(ps_active && frag_shader_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     vert_shader_stage_info {};
@@ -525,9 +555,28 @@ void CreatePipelineInternal(
 		                      frag_shader_stage_info);
 	}
 
-	vk::PipelineShaderStageCreateInfo shader_stages[]    = {vert_shader_stage_info,
-	                                                        frag_shader_stage_info};
-	const uint32_t                    shader_stage_count = ps_active ? 2u : 1u;
+	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
+	tess_control_shader_stage_info.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
+	tess_control_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationControl;
+	tess_control_shader_stage_info.module = tess_control_shader_module;
+	tess_control_shader_stage_info.pName  = "main";
+
+	vk::PipelineShaderStageCreateInfo tess_eval_shader_stage_info {};
+	tess_eval_shader_stage_info.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
+	tess_eval_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationEvaluation;
+	tess_eval_shader_stage_info.module = tess_eval_shader_module;
+	tess_eval_shader_stage_info.pName  = "main";
+
+	vk::PipelineShaderStageCreateInfo shader_stages[4]   = {};
+	uint32_t                          shader_stage_count = 0;
+	shader_stages[shader_stage_count++]                  = vert_shader_stage_info;
+	if (rect_list) {
+		shader_stages[shader_stage_count++] = tess_control_shader_stage_info;
+		shader_stages[shader_stage_count++] = tess_eval_shader_stage_info;
+	}
+	if (ps_active) {
+		shader_stages[shader_stage_count++] = frag_shader_stage_info;
+	}
 
 	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX];
 	vk::VertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX];
@@ -929,10 +978,13 @@ void CreatePipelineInternal(
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = &vertex_input_info;
 	pipeline_info.pInputAssemblyState      = &input_assembly;
-	pipeline_info.pTessellationState       = nullptr;
-	pipeline_info.pViewportState           = &viewport_state;
-	pipeline_info.pRasterizationState      = &rasterizer;
-	pipeline_info.pMultisampleState        = &multisampling;
+	vk::PipelineTessellationStateCreateInfo tessellation_state {};
+	tessellation_state.sType              = vk::StructureType::ePipelineTessellationStateCreateInfo;
+	tessellation_state.patchControlPoints = 3;
+	pipeline_info.pTessellationState      = (rect_list ? &tessellation_state : nullptr);
+	pipeline_info.pViewportState          = &viewport_state;
+	pipeline_info.pRasterizationState     = &rasterizer;
+	pipeline_info.pMultisampleState       = &multisampling;
 	pipeline_info.pDepthStencilState = (static_params.with_depth ? &depth_stencil_info : nullptr);
 	pipeline_info.pColorBlendState   = &color_blending;
 	pipeline_info.pDynamicState      = &dynamic_state;
@@ -967,6 +1019,12 @@ void CreatePipelineInternal(
 
 	if (frag_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(frag_shader_module, nullptr);
+	}
+	if (tess_control_shader_module != nullptr) {
+		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+	}
+	if (tess_eval_shader_module != nullptr) {
+		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
 	graphics.device.destroyShaderModule(vert_shader_module, nullptr);
 }

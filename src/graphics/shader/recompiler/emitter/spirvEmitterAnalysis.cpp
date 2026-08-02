@@ -7,51 +7,30 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr) {
 	const auto* ps = state.pixel_input_info;
-	if (state.stage != ShaderType::Pixel || ps == nullptr || attr >= ps->input_num) {
+	if (state.stage != ShaderType::Pixel || ps == nullptr) {
 		return attr;
 	}
-	// VINTRP ATTR selects the PS input slot. SPI_PS_INPUT_CNTL maps that slot to a
-	// VS parameter export, which is the SPIR-V location we must link against.
-	return ps->interpolator_settings[attr] & PsInputOffsetMask;
+	return ShaderPixelParameterMappedLocation(*ps, attr);
 }
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
-	bool used_locations[32] = {};
-
+	std::array<uint32_t, 32> active_inputs {};
+	uint32_t                 active_count = 0;
 	for (const auto& input: state.inputs) {
-		if (input.kind != IR::StageInputKind::Parameter) {
-			continue;
-		}
-
-		auto location = PixelParameterMappedLocation(state, input.location);
-		if (location < std::size(used_locations) && used_locations[location]) {
-			auto fallback_location = input.location;
-			while (fallback_location < std::size(used_locations) &&
-			       used_locations[fallback_location]) {
-				fallback_location++;
-			}
-			EXIT_NOT_IMPLEMENTED(fallback_location >= std::size(used_locations));
-			location = fallback_location;
-		}
-
-		if (input.location == attr) {
-			return location;
-		}
-
-		if (location < std::size(used_locations)) {
-			used_locations[location] = true;
+		if (input.kind == IR::StageInputKind::Parameter) {
+			active_inputs[active_count++] = input.location;
 		}
 	}
-
-	return PixelParameterMappedLocation(state, attr);
+	return state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr
+	           ? ShaderPixelParameterLocation(*state.pixel_input_info,
+	                                          {active_inputs.data(), active_count}, attr)
+	           : attr;
 }
 
 bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr) {
 	const auto* ps = state.pixel_input_info;
-	if (state.stage != ShaderType::Pixel || ps == nullptr || attr >= ps->input_num) {
-		return false;
-	}
-	return (ps->interpolator_settings[attr] & PsInputFlatShade) != 0;
+	return state.stage == ShaderType::Pixel && ps != nullptr &&
+	       ShaderPixelParameterIsFlat(*ps, attr);
 }
 
 void SetError(std::string* error, const char* message) {

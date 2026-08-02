@@ -122,6 +122,11 @@ struct ShaderPixelInputInfo {
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
 
+uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
+uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
+                                      std::span<const uint32_t> active_inputs, uint32_t input);
+bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
+
 struct ShaderSharp {
 	uint16_t offset_dw : 15;
 	uint16_t size      : 1;

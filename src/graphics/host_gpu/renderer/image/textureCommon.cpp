@@ -482,10 +482,10 @@ static bool SetGpuTileSize(uint64_t offset, uint64_t length, uint64_t capacity, 
 	return true;
 }
 
-bool TextureBuildGpuTileInfos(uint64_t size, const std::vector<vk::BufferImageCopy>& regions,
+bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t fmt, uint32_t depth,
                               uint64_t levels, std::vector<GpuTileInfo>& out_infos) {
-	if (size == 0 || levels == 0 || levels > 16 || depth == 0 ||
+	if (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 ||
 	    regions.size() != GetTextureRegionCount(depth, levels, layout.volume_texture) ||
 	    Prospero::IsFmaskTextureFormat(fmt)) {
 		return false;
@@ -538,8 +538,9 @@ bool TextureBuildGpuTileInfos(uint64_t size, const std::vector<vk::BufferImageCo
 				const uint64_t linear_span =
 				    static_cast<uint64_t>(copy_depth - 1u) * linear_stride +
 				    layout.level_sizes[level].size;
-				if (!SetGpuTileSize(info.linear_offset, linear_span, size, info.linear_size) ||
-				    !SetGpuTileSize(info.tiled_offset, volume.level_sizes[level], size,
+				if (!SetGpuTileSize(info.linear_offset, linear_span, UINT64_MAX,
+				                    info.linear_size) ||
+				    !SetGpuTileSize(info.tiled_offset, volume.level_sizes[level], tiled_size,
 				                    info.tiled_size)) {
 					return false;
 				}
@@ -588,8 +589,9 @@ bool TextureBuildGpuTileInfos(uint64_t size, const std::vector<vk::BufferImageCo
 				info.bytes_per_element = block.bytes_per_element;
 				info.linear_offset     = region.bufferOffset;
 				info.tiled_offset      = TextureUploadSliceSourceOffset(layout, level, z);
-				if (!SetGpuTileSize(info.linear_offset, level_size.size, size, info.linear_size) ||
-				    !SetGpuTileSize(info.tiled_offset, GetLevelSrcSize(level_size), size,
+				if (!SetGpuTileSize(info.linear_offset, level_size.size, UINT64_MAX,
+				                    info.linear_size) ||
+				    !SetGpuTileSize(info.tiled_offset, GetLevelSrcSize(level_size), tiled_size,
 				                    info.tiled_size)) {
 					return false;
 				}

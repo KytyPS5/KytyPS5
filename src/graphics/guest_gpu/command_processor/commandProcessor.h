@@ -83,8 +83,7 @@ public:
 	               uint32_t first_instance = 0);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count, uint32_t flags);
 	void DrawIndexAuto(uint32_t index_count, uint32_t flags,
-	                   uint32_t render_target_slice_offset = 0, uint32_t instance_count = 1,
-	                   uint32_t first_vertex = 0, uint32_t first_instance = 0);
+	                   uint32_t render_target_slice_offset = 0);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
@@ -152,6 +151,9 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
+	void SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,
+	                          uint32_t render_target_slice_offset, uint32_t first_vertex,
+	                          uint32_t first_instance);
 
 	CommandScheduler&    GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	RenderCommandBuffer& CurrentBuffer() { return GetScheduler().Current(); }
@@ -168,7 +170,8 @@ private:
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
-	uint32_t         m_num_instances                    = 1;
+	// Persistent draw state: indirect draws update it for subsequent draws.
+	uint32_t m_num_instances = 1;
 
 	uint32_t m_de_count        = 0;
 	uint32_t m_ce_count        = 0;

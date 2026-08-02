@@ -39,6 +39,7 @@
 #include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
 #include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/BindingLayout.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "spirv-tools/libspirv.hpp"
@@ -769,6 +770,91 @@ void ValidateSpirv(const char* shader_name, const std::vector<u32>& spirv) {
 	if (!tools.Validate(spirv)) {
 		Fail(shader_name, "SPIR-V validation", messages);
 	}
+}
+
+size_t CountText(const std::string& text, const std::string& needle) {
+	size_t count = 0;
+	for (size_t offset = 0; (offset = text.find(needle, offset)) != std::string::npos;
+	     offset += needle.size()) {
+		count++;
+	}
+	return count;
+}
+
+void CheckRectListShaders() {
+	constexpr const char* name = "RectListShaders";
+
+	auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+	program->info.inputs.push_back(
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, "in_param_0"});
+	program->info.inputs.push_back(
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
+
+	ShaderVertexInputInfo vertex {};
+	vertex.param_export_mask = 1u;
+	ShaderPixelInputInfo pixel {};
+	pixel.input_num                = 2;
+	pixel.interpolator_settings[0] = 0x400u;
+	pixel.interpolator_settings[1] = 0;
+	pixel.stage.program            = program;
+	HW::PixelShaderInfo ps_regs {};
+	const auto          perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+	pixel.ps_no_perspective            = true;
+	const auto no_perspective_id       = ShaderGetIdPS(ps_regs, pixel, false);
+	pixel.ps_no_perspective            = false;
+	Require(name, "pipeline identity", perspective_id != no_perspective_id,
+	        "pixel interpolation mode must participate in the shader and pipeline key");
+
+	const std::array<uint32_t, 2> active_inputs = {0, 1};
+	Require(name, "duplicate mapping",
+	        ShaderPixelParameterLocation(pixel, active_inputs, 0) == 0 &&
+	            ShaderPixelParameterLocation(pixel, active_inputs, 1) == 1,
+	        "duplicate pixel mappings must receive distinct effective output locations");
+
+	const auto shaders = BuildRectListShaders(vertex, &pixel);
+	Require(name, "SPIR-V version",
+	        shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
+	            shaders.evaluation.size() > 1 && shaders.evaluation[1] == 0x00010500u,
+	        "shadPS4-compatible vector selection requires SPIR-V 1.5");
+	ValidateSpirv(name, shaders.control);
+	ValidateSpirv(name, shaders.evaluation);
+
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+	std::string          control_text;
+	std::string          evaluation_text;
+	Require(name, "control disassembly", tools.Disassemble(shaders.control, &control_text),
+	        "failed to disassemble rectangle-list tessellation control shader");
+	Require(name, "evaluation disassembly",
+	        tools.Disassemble(shaders.evaluation, &evaluation_text),
+	        "failed to disassemble rectangle-list tessellation evaluation shader");
+	Require(name, "control execution mode",
+	        control_text.find("TessellationControl") != std::string::npos &&
+	            control_text.find("OutputVertices 4") != std::string::npos,
+	        "rectangle-list control shader must produce four control points");
+	Require(name, "evaluation execution modes",
+	        evaluation_text.find("TessellationEvaluation") != std::string::npos &&
+	            evaluation_text.find("Quads") != std::string::npos &&
+	            evaluation_text.find("SpacingEqual") != std::string::npos &&
+	            evaluation_text.find("VertexOrderCw") != std::string::npos,
+	        "rectangle-list evaluation shader has the wrong patch modes");
+	Require(name, "no geometry stage",
+	        control_text.find("Geometry") == std::string::npos &&
+	            evaluation_text.find("Geometry") == std::string::npos,
+	        "rectangle-list expansion must not use geometry shaders");
+	Require(name, "flat broadcast",
+	        CountText(control_text, "OpVectorTimesScalar") == 6 &&
+	            CountText(control_text, "OpSelect %v4float") == 2,
+	        "flat parameters must use guest vertex zero instead of reconstructed values");
+	Require(name, "remapped interface",
+	        CountText(control_text, " Location 0") == 2 &&
+	            CountText(control_text, " Location 1") == 1 &&
+	            CountText(evaluation_text, " Location 0") == 2 &&
+	            CountText(evaluation_text, " Location 1") == 2,
+	        "duplicate pixel mappings must share one vertex input and keep distinct patch outputs");
+
+	const auto position_only = BuildRectListShaders(vertex, nullptr);
+	ValidateSpirv(name, position_only.control);
+	ValidateSpirv(name, position_only.evaluation);
 }
 
 void CheckSpirvText(const TestCase& test, const std::vector<u32>& spirv) {
@@ -7279,26 +7365,30 @@ public:
 		}
 
 		u32  case_index       = 0;
-		auto check_round_trip = [&](const char* stage, uint64_t size,
+		auto check_round_trip = [&](const char* stage, uint64_t tiled_size,
 		                            std::span<const GpuTileInfo> infos) {
-			std::vector<uint8_t> tiled(size);
-			std::vector<uint8_t> cpu(size, 0);
-			std::vector<uint8_t> gpu(size, 0xab);
+			uint64_t linear_size = 0;
+			for (const auto& info: infos) {
+				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+			}
+			std::vector<uint8_t> tiled(tiled_size);
+			std::vector<uint8_t> cpu(linear_size, 0);
+			std::vector<uint8_t> gpu(linear_size, 0xab);
 			fill(&tiled, ++case_index);
 			for (const auto& info: infos) {
 				convert_reference(false, &cpu, tiled, info);
 			}
-			gpu_detile(tiled, &gpu, size, size, infos);
+			gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
 			compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
 
-			std::vector<uint8_t> linear(size);
-			std::vector<uint8_t> cpu_tiled(size, 0xab);
-			std::vector<uint8_t> gpu_tiled(size, 0xab);
+			std::vector<uint8_t> linear(linear_size);
+			std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
+			std::vector<uint8_t> gpu_tiled(tiled_size, 0xab);
 			fill(&linear, 0x280u + case_index);
 			for (const auto& info: infos) {
 				convert_reference(true, &cpu_tiled, linear, info);
 			}
-			gpu_tile(linear, &gpu_tiled, size, size, infos);
+			gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, infos);
 			compare((std::string(stage) + " tile bytes").c_str(), cpu_tiled, gpu_tiled);
 		};
 		for (const auto family: families) {
@@ -7435,6 +7525,32 @@ public:
 		}
 		Require(name, "format coverage", format_cases != 0,
 		        "no CPU-supported standard formats were tested");
+
+		{
+			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc1UNorm);
+			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+			constexpr u32 width = 256, height = 256, levels = 9;
+			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
+			TileSizeAlign total {};
+			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			                   nullptr);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
+			                                            tile, total.size, false, false, name);
+			const auto regions =
+			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			std::vector<GpuTileInfo> infos;
+			const bool built =
+			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos);
+			uint64_t linear_size = 0;
+			for (const auto& info: infos) {
+				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+			}
+			Require(name, "BC1 mip-tail capacities",
+			        built && total.size == 0x10000 && layout.first_tail_level == 0 &&
+			            linear_size == 0x15560 && linear_size > total.size,
+			        "BC1 mip tail conflated tiled and linear capacities");
+			check_round_trip("BC1 mip tail", total.size, infos);
+		}
 
 		{
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
@@ -15959,11 +16075,6 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
 		resource   = BasicArrayStorageTextureResource();
 		descriptor = BasicArrayStorageTextureDescriptor();
 		descriptor.fields[4] |= 1u << 16u;
-	} else if (std::strcmp(kind, "array-mip-view") == 0) {
-		resource   = BasicArrayStorageTextureResource();
-		descriptor = BasicArrayStorageTextureDescriptor();
-		descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
-		descriptor.fields[5] |= 1u << 4u;
 	} else if (std::strcmp(kind, "reserved") == 0) {
 		descriptor.fields[1] |= 1u << 29u;
 	} else if (std::strcmp(kind, "uint-format") == 0) {
@@ -16139,6 +16250,16 @@ void CheckBasicStorageTextureDescriptor() {
 	            array.DstSelXYZW() == DstSel(6, 5, 4, 7),
 	        "PPSA21268 2D-array storage descriptor fixture is malformed");
 	ValidateStorageTexture(BasicArrayStorageTextureResource(), array, 0x10000);
+	const ShaderTextureResource mip_array {{0x20268d00u, 0xc4700000u, 0x001fc01fu,
+	                                        0xd1b11facu, 0x00000000u, 0x00700070u,
+	                                        0x00000000u, 0x00000000u}};
+	Require("BasicStorageTexture", "PPSA14457 mip-one 2D-array descriptor",
+	        mip_array.BaseLevel() == 1 && mip_array.LastLevel() == 1 &&
+	            mip_array.MaxMip() == 7 &&
+	            mip_array.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+	            mip_array.Depth() == 0 && mip_array.BaseArray5() == 0,
+	        "PPSA14457 mip-one 2D-array storage descriptor fixture is malformed");
+	ValidateStorageTexture(BasicArrayStorageTextureResource(), mip_array, 0x30000);
 
 	const auto uint_array = BasicUintArrayStorageTextureDescriptor();
 	Require("BasicStorageTexture", "uint 2D-array descriptor",
@@ -16299,7 +16420,6 @@ void CheckBasicStorageTextureDescriptor() {
 	                        "yzwx-read",
 	                        "reserved-swizzle",
 	                        "array-base-out-of-range",
-	                        "array-mip-view",
 	                        "reserved",
 	                        "uint-format",
 	                        "uint-resource-float-format",
@@ -17468,6 +17588,7 @@ int main(int argc, char** argv) {
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());
 	CheckEmbeddedFetchVertexOffset();
 	CheckEmbeddedFetchLaneSpill();
+	CheckRectListShaders();
 	CheckPs5GameExampleImageClearRuntimeShape();
 	vulkan.CheckSchedulerTimeline();
 	vulkan.CheckGpuMappedRangeLifecycle();

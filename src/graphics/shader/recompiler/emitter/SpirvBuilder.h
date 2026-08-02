@@ -10,7 +10,7 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 class Builder {
 public:
-	Builder();
+	explicit Builder(uint32_t version = 0x00010300u);
 	~Builder() = default;
 	KYTY_CLASS_DEFAULT_COPY(Builder);
 
@@ -39,6 +39,7 @@ private:
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
 	uint32_t              m_next_id = 1;
+	uint32_t              m_version = 0;
 	std::vector<uint32_t> m_capabilities;
 	std::vector<uint32_t> m_extensions;
 	std::vector<uint32_t> m_ext_inst_imports;

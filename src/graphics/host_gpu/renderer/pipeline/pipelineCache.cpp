@@ -154,8 +154,9 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
 		static_params.color_mask[i] = color_mask[i];
 	}
-	static_params.cull_back  = mc.cull_back;
-	static_params.cull_front = mc.cull_front;
+	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList;
+	static_params.cull_back  = !rect_list && mc.cull_back;
+	static_params.cull_front = !rect_list && mc.cull_front;
 	static_params.face       = mc.face;
 
 	for (uint32_t i = 0; i < color_count; i++) {

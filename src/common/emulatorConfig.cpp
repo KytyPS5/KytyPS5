@@ -37,6 +37,10 @@ uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
 
+uint32_t GetConsoleLanguage() {
+	return g_config->console_language;
+}
+
 bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
 }
@@ -87,10 +91,6 @@ bool SpirvDebugPrintfEnabled() {
 
 bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
-}
-
-bool NggRectlistDrawEnabled() {
-	return g_config->ngg_rectlist_draw_enabled;
 }
 
 bool ReadbackLinearImagesEnabled() {

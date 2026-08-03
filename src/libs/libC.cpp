@@ -192,7 +192,8 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 
 	uint64_t rbp = 0;
 	uint64_t rsp = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// This assembly is x86-64-specific, not Windows-specific.
+#if defined(__x86_64__) || defined(_M_X64)
 	asm volatile("movq %%rbp, %0" : "=r"(rbp));
 	asm volatile("movq %%rsp, %0" : "=r"(rsp));
 #endif
@@ -419,7 +420,15 @@ static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* f
 		return 0;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// Guest-created tm values do not initialize glibc's tm_zone pointer.
+	std::tm sanitized = *timeptr;
+	sanitized.tm_zone = nullptr;
+
+	return std::strftime(str, count, format, &sanitized);
+#else
 	return std::strftime(str, count, format, timeptr);
+#endif
 }
 
 static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
@@ -624,6 +633,15 @@ LIB_VERSION("LibcInternalExt", 1, "LibcInternal", 1, 1);
 static uint64_t g_mspace_atomic_id_mask = 0;
 static uint64_t g_mstate_table[64]      = {0};
 
+using thread_atexit_destructor_t = KYTY_SYSV_ABI void (*)(void*);
+
+struct ThreadAtexitDestructor {
+	thread_atexit_destructor_t destructor;
+	void*                      object;
+};
+
+static thread_local std::vector<ThreadAtexitDestructor> g_thread_atexit_destructors;
+
 struct Info {
 	uint64_t  size;
 	uint32_t  unknown1;
@@ -641,25 +659,29 @@ void KYTY_SYSV_ABI LibcHeapGetTraceInfo(Info* info) {
 	info->mstate_table          = g_mstate_table;
 }
 
-uint64_t KYTY_SYSV_ABI LibcInternalExtUnknownQBS714Jr3g(uint64_t arg0, uint64_t arg1, uint64_t arg2,
-                                                        uint64_t arg3, uint64_t arg4,
-                                                        uint64_t arg5) {
+int KYTY_SYSV_ABI LibcInternalExtCxaThreadAtexit(thread_atexit_destructor_t destructor, void* object,
+                                                 void* /*module_id*/) {
 	PRINT_NAME();
 
-	LOGF("\t arg0 = 0x%016" PRIx64 "\n"
-	     "\t arg1 = 0x%016" PRIx64 "\n"
-	     "\t arg2 = 0x%016" PRIx64 "\n"
-	     "\t arg3 = 0x%016" PRIx64 "\n"
-	     "\t arg4 = 0x%016" PRIx64 "\n"
-	     "\t arg5 = 0x%016" PRIx64 "\n",
-	     arg0, arg1, arg2, arg3, arg4, arg5);
+	g_thread_atexit_destructors.push_back({destructor, object});
 
 	return 0;
 }
 
+void RunThreadAtexitDestructors() {
+	while (!g_thread_atexit_destructors.empty()) {
+		auto destructor = g_thread_atexit_destructors.back();
+		g_thread_atexit_destructors.pop_back();
+
+		if (destructor.destructor != nullptr) {
+			destructor.destructor(destructor.object);
+		}
+	}
+}
+
 LIB_DEFINE(InitLibcInternalExt_1) {
 	LIB_FUNC("NWtTN10cJzE", LibcInternalExt::LibcHeapGetTraceInfo);
-	LIB_FUNC("qBS714-Jr3g", LibcInternalExt::LibcInternalExtUnknownQBS714Jr3g);
+	LIB_FUNC("qBS714-Jr3g", LibcInternalExt::LibcInternalExtCxaThreadAtexit);
 }
 
 } // namespace LibcInternalExt

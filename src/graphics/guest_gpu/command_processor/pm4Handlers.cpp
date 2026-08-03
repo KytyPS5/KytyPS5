@@ -65,9 +65,22 @@ constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0V
                                               GcrGl2Writeback | GcrOrder012 | GcrOrder210;
 constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
-uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
-	return (raw_offset & ~RegisterSelectorMask);
+constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
+	return raw_offset & ~RegisterSelectorMask;
 }
+
+// Indirect Cx descriptors retain their selector. Selector 1 offsets 0..31 address the
+// SPI_PS_INPUT_CNTL register bank; ordinary context-register offsets remain unchanged.
+constexpr uint32_t DecodeIndirectCxRegisterOffset(uint32_t raw_offset) {
+	const auto offset = NormalizeRegisterOffset(raw_offset);
+	return (raw_offset & RegisterSelectorMask) == Pm4::CX_PS_SHADER_USAGE_BASE && offset < 32u
+	           ? Pm4::SPI_PS_INPUT_CNTL_0 + offset
+	           : offset;
+}
+
+static_assert(DecodeIndirectCxRegisterOffset(Pm4::CX_PS_SHADER_USAGE_BASE + 2u) ==
+              Pm4::SPI_PS_INPUT_CNTL_0 + 2u);
+static_assert(DecodeIndirectCxRegisterOffset(Pm4::DB_Z_INFO) == Pm4::DB_Z_INFO);
 
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
 	return eop_event_type != 0x28u ||
@@ -1904,17 +1917,23 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(6, Pm4::IT_COPY_DATA, 0u));
 
-	const uint32_t control       = buffer[0];
-	const uint32_t src_sel       = ((control & 0xfu) << 1u) | ((control >> 30u) & 0x1u);
-	const uint32_t dst_sel       = ((control >> 8u) & 0xfu) << 1u;
-	const uint8_t  src_cache     = static_cast<uint8_t>((control >> 13u) & 0x3u);
-	const uint8_t  dst_cache     = static_cast<uint8_t>((control >> 25u) & 0x3u);
-	const uint8_t  write_confirm = static_cast<uint8_t>((control >> 20u) & 0x1u);
-	const uint32_t num_bytes     = ((control >> 16u) & 0x1u) != 0 ? 8u : 4u;
-	const uint64_t src           = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
-	const uint64_t dst           = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
-	if (src_sel == (9u << 1u)) {
-		if (dst_sel != (2u << 1u) || dst == 0 || (dst & (num_bytes - 1u)) != 0) {
+	const uint32_t control             = buffer[0];
+	const uint32_t src_sel             = ((control & 0xfu) << 1u) | ((control >> 30u) & 0x1u);
+	const uint32_t dst_sel             = ((control >> 8u) & 0xfu) << 1u;
+	const uint8_t  src_cache           = static_cast<uint8_t>((control >> 13u) & 0x3u);
+	const uint8_t  dst_cache           = static_cast<uint8_t>((control >> 25u) & 0x3u);
+	const uint8_t  write_confirm       = static_cast<uint8_t>((control >> 20u) & 0x1u);
+	const uint32_t num_bytes           = ((control >> 16u) & 0x1u) != 0 ? 8u : 4u;
+	const uint64_t src                 = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	const uint64_t dst                 = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	uint32_t       reference_clock_dst = 0;
+	switch (src_sel) {
+		case 9u: reference_clock_dst = 2u; break;
+		case 18u: reference_clock_dst = 4u; break;
+		default: break;
+	}
+	if (reference_clock_dst != 0) {
+		if (dst_sel != reference_clock_dst || dst == 0 || (dst & (num_bytes - 1u)) != 0) {
 			EXIT("unsupported reference-clock copyData, src_sel=0x%02" PRIx32
 			     " dst_sel=0x%02" PRIx32 " dst=0x%016" PRIx64 " size=%u\n",
 			     src_sel, dst_sel, dst, num_bytes);
@@ -2321,14 +2340,18 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto cmd_offset = indirect_buffer[0];
-		auto value      = indirect_buffer[1];
+		// Keep the encoded offset for packet control values, and use the decoded offset only
+		// for register dispatch.
+		auto raw_cmd_offset = indirect_buffer[0];
+		auto cmd_offset     = DecodeIndirectCxRegisterOffset(raw_cmd_offset);
+		auto value          = indirect_buffer[1];
 
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
 			continue;
 		}
 
-		if (cmd_offset == 0xffffffffu) {
+		// The sentinel is an encoded descriptor value and must be checked before normalization.
+		if (raw_cmd_offset == 0xffffffffu) {
 			static bool logged = false;
 			if (!logged) {
 				LOGF("\t temporary: skipping indirect CX sentinel pair offset = 0xffffffff, value "
@@ -3373,6 +3396,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::DB_COUNT_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreDepthMetadataRegister(cmd_offset, value);
 	};
+	for (auto cmd_offset = Pm4::DB_SRESULTS_COMPARE_STATE0;
+	     cmd_offset <= Pm4::DB_SRESULTS_COMPARE_STATE1; cmd_offset++) {
+		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			HwCtxIgnoreDepthMetadataRegister(cmd_offset, value);
+		};
+	}
 	g_hw_ctx_indirect_func[Pm4::DB_RENDER_OVERRIDE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreDepthMetadataRegister(cmd_offset, value);
 	};

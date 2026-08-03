@@ -27,7 +27,9 @@ struct SysFileTimeStruct {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	FILETIME time;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// Nanoseconds preserve sub-second file timestamps.
 	time_t time;
+	long   nanos;
 #endif
 	bool is_invalid;
 };
@@ -139,7 +141,7 @@ inline void SysFileToSystemTimeUtc(const SysFileTimeStruct& f, SysTimeStruct& t)
 	t.Hour         = i.tm_hour;
 	t.Minute       = i.tm_min;
 	t.Second       = (i.tm_sec == 60 ? 59 : i.tm_sec);
-	t.Milliseconds = 0;
+	t.Milliseconds = static_cast<uint16_t>((f.nanos / 1000000) % 1000);
 }
 
 inline void SysTimeTToSystem(time_t t, SysTimeStruct& s) {
@@ -168,10 +170,11 @@ inline void SysSystemToFileTimeUtc(const SysTimeStruct& f, SysFileTimeStruct& t)
 
 // Retrieves the current local date and time.
 inline void SysGetSystemTime(SysTimeStruct& t) {
-	time_t    st {};
+	// Preserve millisecond precision.
+	timespec  now {};
 	struct tm i {};
 
-	if (time(&st) == static_cast<time_t>(-1) || localtime_r(&st, &i) == nullptr) {
+	if (clock_gettime(CLOCK_REALTIME, &now) != 0 || localtime_r(&now.tv_sec, &i) == nullptr) {
 		t.is_invalid = true;
 		return;
 	}
@@ -183,15 +186,16 @@ inline void SysGetSystemTime(SysTimeStruct& t) {
 	t.Hour         = i.tm_hour;
 	t.Minute       = i.tm_min;
 	t.Second       = (i.tm_sec == 60 ? 59 : i.tm_sec);
-	t.Milliseconds = 0;
+	t.Milliseconds = static_cast<uint16_t>((now.tv_nsec / 1000000) % 1000);
 }
 
 // Retrieves the current system date and time in Coordinated Universal Time (UTC).
 inline void SysGetSystemTimeUtc(SysTimeStruct& t) {
-	time_t    st {};
+	// Preserve millisecond precision.
+	timespec  now {};
 	struct tm i {};
 
-	if (time(&st) == static_cast<time_t>(-1) || gmtime_r(&st, &i) == nullptr) {
+	if (clock_gettime(CLOCK_REALTIME, &now) != 0 || gmtime_r(&now.tv_sec, &i) == nullptr) {
 		t.is_invalid = true;
 		return;
 	}
@@ -203,7 +207,7 @@ inline void SysGetSystemTimeUtc(SysTimeStruct& t) {
 	t.Hour         = i.tm_hour;
 	t.Minute       = i.tm_min;
 	t.Second       = (i.tm_sec == 60 ? 59 : i.tm_sec);
-	t.Milliseconds = 0;
+	t.Milliseconds = static_cast<uint16_t>((now.tv_nsec / 1000000) % 1000);
 }
 
 inline void SysQueryPerformanceFrequency(uint64_t* freq) {

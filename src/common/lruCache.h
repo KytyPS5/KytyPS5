@@ -19,10 +19,10 @@ class LeastRecentlyUsedCache {
 
 public:
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
-		const auto id = Build();
+		const auto id   = Build();
 		auto&      item = m_items[id];
-		item.object = std::move(object);
-		item.tick   = tick;
+		item.object     = std::move(object);
+		item.tick       = tick;
 		Attach(item);
 		return id;
 	}
@@ -49,8 +49,7 @@ public:
 
 	template <typename Function>
 	void ForEachItemBelow(Tick tick, Function&& function) {
-		constexpr bool ReturnsBool =
-		    std::is_same_v<std::invoke_result_t<Function, Object>, bool>;
+		constexpr bool ReturnsBool = std::is_same_v<std::invoke_result_t<Function, Object>, bool>;
 		for (auto* item = m_first; item != nullptr;) {
 			if (item->tick > tick) {
 				return;
@@ -87,10 +86,10 @@ private:
 			m_last = &item;
 			return;
 		}
-		item.prev   = m_last;
+		item.prev    = m_last;
 		m_last->next = &item;
-		item.next   = nullptr;
-		m_last      = &item;
+		item.next    = nullptr;
+		m_last       = &item;
 	}
 
 	void Detach(Item& item) {

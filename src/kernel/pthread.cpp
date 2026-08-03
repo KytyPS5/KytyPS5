@@ -46,6 +46,17 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <fmt/format.h>
 #include <pthread_time.h>
+#elif !defined(__APPLE__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <csignal> // pthread_kill is declared here, not in <pthread.h>
+#endif
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+#include <x86intrin.h>
 #endif
 
 #ifdef pthread_attr_getguardsize
@@ -54,20 +65,30 @@
 
 namespace Libs {
 
+namespace LibcInternalExt {
+void RunThreadAtexitDestructors();
+} // namespace LibcInternalExt
+
 namespace LibKernel {
 
 LIB_NAME("libkernel", "libkernel");
 
-constexpr int      KEYS_MAX                  = 256;
-constexpr int      DESTRUCTOR_ITERATIONS     = 4;
-constexpr size_t   PTHREAD_STACK_DEFAULT     = 0x100000;
-constexpr size_t   GUEST_PTHREAD_STACK_MIN   = 0x4000;
-constexpr size_t   PTHREAD_STACK_PAGE        = 0x4000;
-constexpr size_t   PTHREAD_STACK_GRANULARITY = 0x10000;
-constexpr size_t   PTHREAD_STACK_INITIAL     = 0x200000;
-constexpr size_t   PTHREAD_STACK_EXTRA       = 0x100000;
-constexpr uint64_t PTHREAD_STACK_TOP         = 0x7efff8000ull;
-constexpr uint32_t SIGNAL_APC_POLL_MICROS    = 10000;
+// macOS's <pthread.h>/<limits.h> define PTHREAD_STACK_MIN as a macro; the emulator
+// wants its own guest-side value with the same name, so drop the host macro here.
+#ifdef PTHREAD_STACK_MIN
+#undef PTHREAD_STACK_MIN
+#endif
+
+constexpr int      KEYS_MAX                = 256;
+constexpr int      DESTRUCTOR_ITERATIONS   = 4;
+constexpr size_t   PTHREAD_STACK_DEFAULT   = 0x100000;
+constexpr size_t   GUEST_PTHREAD_STACK_MIN = 0x4000;
+constexpr size_t   PTHREAD_STACK_PAGE      = 0x4000;
+constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
+constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
+constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
+constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
+constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
 static constexpr KernelClockid KERNEL_CLOCK_VIRTUAL           = 1;
@@ -93,8 +114,21 @@ static constexpr int KERNEL_PTHREAD_MUTEX_RECURSIVE  = 2;
 static constexpr int KERNEL_PTHREAD_MUTEX_NORMAL     = 3;
 static constexpr int KERNEL_PTHREAD_MUTEX_ADAPTIVE   = 4;
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// OS-level thread id reported to the guest.
+static uint64_t GetHostThreadId() {
+#if defined(__APPLE__)
+	uint64_t tid = 0;
+	pthread_threadid_np(nullptr, &tid);
+	return tid;
+#else
+	return static_cast<uint64_t>(::syscall(SYS_gettid));
+#endif
+}
+#endif
+
 static uint64_t KernelReadTscNative() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_M_X64) || defined(__x86_64__)
 	return __rdtsc();
 #else
 	return Common::Timer::QueryPerformanceCounter();
@@ -103,7 +137,7 @@ static uint64_t KernelReadTscNative() {
 
 static uint64_t KernelGetTscFrequencyNative() {
 	static const uint64_t frequency = [] {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(_M_X64) || defined(__x86_64__))
+#if defined(_M_X64) || defined(__x86_64__)
 		const auto host_frequency = Common::Timer::QueryPerformanceFrequency();
 		if (host_frequency == 0) {
 			return uint64_t {1000000000};
@@ -331,6 +365,7 @@ struct PthreadAttrPrivate {
 	uint64_t       stack_map_addr;
 	size_t         stack_map_size;
 	int            policy;
+	int            guest_priority;
 	int            inherit_sched;
 	int            solosched;
 	bool           detached;
@@ -667,14 +702,15 @@ static std::atomic<int32_t> g_pthread_thread_id      = 0;
 
 static Common::Mutex g_guest_stack_mutex;
 static uint64_t      g_guest_stack_last = 0;
+struct CachedGuestStack {
+	uint64_t address;
+	size_t   map_size;
+	size_t   guard_size;
+};
+static std::vector<CachedGuestStack> g_guest_stack_cache;
 
 static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
-}
-
-static size_t RoundStackMappingSize(size_t size) {
-	return ((size + PTHREAD_STACK_GRANULARITY - 1) / PTHREAD_STACK_GRANULARITY) *
-	       PTHREAD_STACK_GRANULARITY;
 }
 
 static int CreateGuestStack(PthreadAttr attr) {
@@ -692,34 +728,41 @@ static int CreateGuestStack(PthreadAttr attr) {
 
 	const auto stack_size = RoundStackSize(attr->stack_size);
 	const auto guard_size = RoundStackSize(attr->guard_size);
-	const auto map_size   = RoundStackMappingSize(stack_size + guard_size);
+	const auto map_size   = stack_size + guard_size;
 
 	uint64_t stack_addr = 0;
+	bool     cached     = false;
 	{
 		Common::LockGuard lock(g_guest_stack_mutex);
 
-		if (g_guest_stack_last == 0) {
-			g_guest_stack_last = (PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE) &
-			                     ~(static_cast<uint64_t>(PTHREAD_STACK_GRANULARITY) - 1);
+		auto cached_stack =
+		    std::find_if(g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
+		                 [map_size, guard_size](const auto& stack) {
+			                 return stack.map_size == map_size && stack.guard_size == guard_size;
+		                 });
+		if (cached_stack != g_guest_stack_cache.end()) {
+			stack_addr = cached_stack->address;
+			g_guest_stack_cache.erase(cached_stack);
+			cached = true;
+		} else {
+			if (g_guest_stack_last == 0) {
+				g_guest_stack_last = PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE;
+			}
+			if (map_size > g_guest_stack_last - PTHREAD_STACK_BOTTOM) {
+				return KERNEL_ERROR_EAGAIN;
+			}
+			stack_addr = g_guest_stack_last - map_size;
+			g_guest_stack_last -= map_size;
 		}
-
-		stack_addr = g_guest_stack_last - map_size;
-		g_guest_stack_last -= map_size;
 	}
 
-	void* mapped_addr = reinterpret_cast<void*>(stack_addr);
-
-	constexpr int GUEST_PROT_READ_WRITE = 0x03;
-	constexpr int GUEST_MAP_PRIVATE     = 0x02;
-	constexpr int GUEST_MAP_FIXED       = 0x10;
-	constexpr int GUEST_MAP_STACK       = 0x400;
-	constexpr int GUEST_MAP_ANON        = 0x1000;
-
-	int result = Memory::KernelMapNamedFlexibleMemory(
-	    &mapped_addr, map_size, GUEST_PROT_READ_WRITE,
-	    GUEST_MAP_PRIVATE | GUEST_MAP_FIXED | GUEST_MAP_STACK | GUEST_MAP_ANON, "stack");
-	if (result != OK) {
-		return KERNEL_ERROR_EAGAIN;
+	int result = OK;
+	if (!cached) {
+		stack_addr = Memory::AllocateGuestStackMemory(
+		    stack_addr, map_size, Common::VirtualMemory::Mode::ReadWrite, "stack");
+		if (stack_addr == 0) {
+			return KERNEL_ERROR_EAGAIN;
+		}
 	}
 
 	if (guard_size != 0) {
@@ -731,7 +774,7 @@ static int CreateGuestStack(PthreadAttr attr) {
 	}
 
 	attr->stack_addr     = reinterpret_cast<void*>(stack_addr + guard_size);
-	attr->stack_size     = map_size - guard_size;
+	attr->stack_size     = stack_size;
 	attr->stack_user     = false;
 	attr->stack_map_addr = stack_addr;
 	attr->stack_map_size = map_size;
@@ -747,18 +790,97 @@ static void FreeGuestStack(PthreadAttr attr) {
 		return;
 	}
 
-	Memory::KernelMunmap(attr->stack_map_addr, attr->stack_map_size);
+	const auto guard_size = attr->stack_map_size - attr->stack_size;
+	{
+		Common::LockGuard lock(g_guest_stack_mutex);
+		g_guest_stack_cache.push_back({attr->stack_map_addr, attr->stack_map_size, guard_size});
+	}
 
 	attr->stack_addr     = nullptr;
 	attr->stack_map_addr = 0;
 	attr->stack_map_size = 0;
 }
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
+                                  uint64_t* map_size) {
+	if (first_address == nullptr || second_address == nullptr || map_size == nullptr) {
+		return false;
+	}
+
+	size_t flexible_before = 0;
+	if (Memory::KernelAvailableFlexibleMemorySize(&flexible_before) != OK) {
+		return false;
+	}
+
+	PthreadAttr attr = nullptr;
+	if (PthreadAttrInit(&attr) != OK) {
+		return false;
+	}
+	if (CreateGuestStack(attr) != OK) {
+		PthreadAttrDestroy(&attr);
+		return false;
+	}
+	*first_address = attr->stack_map_addr;
+	*map_size      = attr->stack_map_size;
+	const bool first_owned =
+	    Memory::TestGuestAddressRangeIsOwned(*first_address, static_cast<uint64_t>(*map_size));
+	uint64_t   backing_value = 0;
+	const bool first_private =
+	    !Memory::TryReadBacking(*first_address, &backing_value, sizeof(backing_value));
+	size_t     flexible_during_first = 0;
+	const bool first_capacity_unchanged =
+	    Memory::KernelAvailableFlexibleMemorySize(&flexible_during_first) == OK &&
+	    flexible_during_first == flexible_before;
+	FreeGuestStack(attr);
+
+	if (CreateGuestStack(attr) != OK) {
+		PthreadAttrDestroy(&attr);
+		return false;
+	}
+	*second_address = attr->stack_map_addr;
+	const bool second_owned =
+	    Memory::TestGuestAddressRangeIsOwned(*second_address, static_cast<uint64_t>(*map_size));
+	const bool second_private =
+	    !Memory::TryReadBacking(*second_address, &backing_value, sizeof(backing_value));
+	size_t     flexible_during_second = 0;
+	const bool second_capacity_unchanged =
+	    Memory::KernelAvailableFlexibleMemorySize(&flexible_during_second) == OK &&
+	    flexible_during_second == flexible_before;
+	FreeGuestStack(attr);
+
+	CachedGuestStack cached {};
+	bool             found = false;
+	{
+		Common::LockGuard lock(g_guest_stack_mutex);
+		const auto        entry = std::find_if(
+		    g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
+		    [second_address](const auto& stack) { return stack.address == *second_address; });
+		if (entry != g_guest_stack_cache.end()) {
+			cached = *entry;
+			g_guest_stack_cache.erase(entry);
+			found = true;
+		}
+	}
+
+	const bool unmapped = found && Memory::KernelMunmap(cached.address, cached.map_size) == OK;
+	size_t     flexible_after = 0;
+	const bool final_capacity_unchanged =
+	    Memory::KernelAvailableFlexibleMemorySize(&flexible_after) == OK &&
+	    flexible_after == flexible_before;
+	return PthreadAttrDestroy(&attr) == OK && first_owned && first_private &&
+	       first_capacity_unchanged && second_owned && second_private &&
+	       second_capacity_unchanged && unmapped && final_capacity_unchanged;
+}
+#endif
+
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
-	void*      ret       = nullptr;
-	const auto guest_rsp = reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
-	const auto guest_rbp = guest_rsp - 4u * sizeof(uint64_t);
+	void*      ret = nullptr;
+	const auto aligned_stack_top =
+	    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
+	const auto guest_rsp = aligned_stack_top - 2u * sizeof(uintptr_t);
+	const auto guest_rbp = guest_rsp;
 
 	auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
 	guest_root_frame[0]    = 0;
@@ -778,7 +900,11 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 
 	if (g_pthread_self != nullptr) {
 		g_pthread_self->guest_host_rbx = host_rbx;
+#if defined(__APPLE__)
 		g_pthread_self->guest_host_rsp = host_rsp - (2u * sizeof(uint64_t));
+#else
+		g_pthread_self->guest_host_rsp = host_rsp - (4u * sizeof(uint64_t));
+#endif
 		g_pthread_self->guest_host_rbp = host_rbp;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		uintptr_t host_gs8  = 0;
@@ -788,18 +914,39 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 		             : "=r"(host_gs8), "=r"(host_gs10)
 		             :
 		             : "memory");
-		g_pthread_self->guest_host_rsp -= 2u * sizeof(uint64_t);
 		g_pthread_self->guest_host_gs8  = host_gs8;
 		g_pthread_self->guest_host_gs10 = host_gs10;
 #endif
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
+#if defined(__APPLE__)
+	// Keep inputs out of r12/r13.
+	register uintptr_t guest_rsp_reg asm("r14") = guest_rsp;
+	register uintptr_t guest_rbp_reg asm("r15") = guest_rbp;
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             "movq %%rsp, %%r12\n\t"
+	             "movq %%rbp, %%r13\n\t"
+	             "movq %[guest_rsp], %%rsp\n\t"
+	             "movq %[guest_rbp], %%rbp\n\t"
+	             "callq *%%rsi\n\t"
+	             "movq %%r13, %%rbp\n\t"
+	             "movq %%r12, %%rsp\n\t"
+	             "popq %%r13\n\t"
+	             "popq %%r12\n\t"
+	             : "=a"(ret), "+D"(arg), "+S"(func)
+	             : [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
+	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
+	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+	               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+	// PthreadExit resumes at this frame, so all four saved registers stay on the host stack.
+	asm volatile("pushq %%r12\n\t"
+	             "pushq %%r13\n\t"
 	             "pushq %%r14\n\t"
 	             "pushq %%r15\n\t"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
 	             "xorq %%rcx, %%rcx\n\t"
@@ -816,16 +963,23 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%r14, %%gs:0x08\n\t"
 	             "movq %%r15, %%gs:0x10\n\t"
+#endif
 	             "popq %%r15\n\t"
 	             "popq %%r14\n\t"
-#endif
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
 	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "xmm0",
+	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
+	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
+#endif
 
 	g_guest_entry_return_rsp = 0;
 	if (g_pthread_self != nullptr) {
@@ -859,6 +1013,29 @@ static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 		(*attr)->stack_addr = reinterpret_cast<void*>(low);
 		(*attr)->stack_size = high - low;
 		(*attr)->stack_user = true;
+	}
+#elif defined(__APPLE__)
+	// macOS reports a stack top and size.
+	void*        top  = pthread_get_stackaddr_np(pthread_self());
+	const size_t size = pthread_get_stacksize_np(pthread_self());
+
+	if (top != nullptr && size != 0) {
+		(*attr)->stack_addr = static_cast<void*>(static_cast<uint8_t*>(top) - size);
+		(*attr)->stack_size = size;
+		(*attr)->stack_user = true;
+	}
+#else
+	// Record the main thread's stack bounds.
+	pthread_attr_t self_attr {};
+	if (pthread_getattr_np(pthread_self(), &self_attr) == 0) {
+		void*  base = nullptr;
+		size_t size = 0;
+		if (pthread_attr_getstack(&self_attr, &base, &size) == 0 && base != nullptr && size != 0) {
+			(*attr)->stack_addr = base;
+			(*attr)->stack_size = size;
+			(*attr)->stack_user = true;
+		}
+		pthread_attr_destroy(&self_attr);
 	}
 #endif
 }
@@ -900,6 +1077,8 @@ void PthreadInitSelfForMainThread() {
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
+#else
+	os_thread_id = GetHostThreadId();
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
@@ -1952,13 +2131,8 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 
 	int result = pthread_attr_getschedparam(&(*attr)->p, param);
 
-	if (param->sched_priority <= -2) {
-		param->sched_priority = 767;
-	} else if (param->sched_priority >= +2) {
-		param->sched_priority = 256;
-	} else {
-		param->sched_priority = 700;
-	}
+	// Host priority mapping is lossy; return the exact guest value.
+	param->sched_priority = (*attr)->guest_priority;
 
 	if (result == 0) {
 		return OK;
@@ -2122,6 +2296,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		return KERNEL_ERROR_EINVAL;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
 	if (param->sched_priority <= 478) {
 		pparam.sched_priority = +2;
@@ -2131,12 +2306,13 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		pparam.sched_priority = 0;
 	}
 
-	int result = pthread_attr_setschedparam(&attr_value->p, &pparam);
-
-	if (result == 0) {
-		return OK;
+	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
-	return KERNEL_ERROR_EINVAL;
+#endif
+
+	attr_value->guest_priority = param->sched_priority;
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
@@ -3092,6 +3268,17 @@ uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// Raise a host signal on another guest thread.
+bool PthreadKillHost(Pthread thread, int host_signal) {
+	if (thread == nullptr || thread->free) {
+		return false;
+	}
+
+	return ::pthread_kill(thread->p, host_signal) == 0;
+}
+#endif
+
 void PthreadQueuePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
 		return;
@@ -3164,6 +3351,8 @@ int PthreadGetCurrentPriorityForKernel() {
 static void CleanupThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 
+	LibcInternalExt::RunThreadAtexitDestructors();
+
 	auto thread_dtors = g_pthread_context->GetThreadDtors();
 
 	if (thread_dtors != nullptr) {
@@ -3189,6 +3378,8 @@ static void* RunThread(void* arg) {
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
+#else
+	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
 
@@ -3448,26 +3639,15 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	sched_param param {};
-	int         pol = 0;
-
-	int result = pthread_getschedparam(thread->p, &pol, &param);
-
-	if (result == 0) {
-		if (param.sched_priority <= -2) {
-			*prio = 767;
-		} else if (param.sched_priority >= +2) {
-			*prio = 256;
-		} else {
-			*prio = 700;
-		}
-
-		LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
-
-		return OK;
+	sched_param native_param {};
+	int         native_policy = 0;
+	if (pthread_getschedparam(thread->p, &native_policy, &native_param) != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	return KERNEL_ERROR_EINVAL;
+	*prio = thread->attr->guest_priority;
+	LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
@@ -3482,25 +3662,27 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 
 	int result = pthread_getschedparam(thread->p, &pol, &param);
 
-	if (result == 0) {
-		if (prio <= 478) {
-			param.sched_priority = +2;
-		} else if (prio >= 733) {
-			param.sched_priority = -2;
-		} else {
-			param.sched_priority = 0;
-		}
-
-		result = pthread_setschedparam(thread->p, pol, &param);
-
-		if (result == 0) {
-			LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
-
-			return OK;
-		}
+	if (result != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	return KERNEL_ERROR_EINVAL;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (prio <= 478) {
+		param.sched_priority = +2;
+	} else if (prio >= 733) {
+		param.sched_priority = -2;
+	} else {
+		param.sched_priority = 0;
+	}
+
+	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+#endif
+
+	thread->attr->guest_priority = prio;
+	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
+	return OK;
 }
 
 void KYTY_SYSV_ABI PthreadTestcancel() {
@@ -3695,8 +3877,12 @@ int KYTY_SYSV_ABI KernelGettimeofday(KernelTimeval* tp) {
 	tp->tv_sec  = static_cast<int64_t>(ticks / 1000000);
 	tp->tv_usec = static_cast<int64_t>(ticks % 1000000);
 #else
-	auto dt = Common::DateTime::FromSystemUTC();
-	sec_to_timeval(tp, dt.ToUnix());
+	struct timespec ts {};
+	result = ::clock_gettime(CLOCK_REALTIME, &ts);
+	if (result == 0) {
+		tp->tv_sec  = static_cast<int64_t>(ts.tv_sec);
+		tp->tv_usec = static_cast<int64_t>(ts.tv_nsec / 1000);
+	}
 #endif
 
 	if (result == 0) {

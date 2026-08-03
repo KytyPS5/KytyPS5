@@ -60,19 +60,19 @@ struct VulkanImage {
 	VulkanImage() = default;
 	KYTY_CLASS_NO_COPY(VulkanImage);
 
-	vk::Format             format      = vk::Format::eUndefined;
-	vk::ImageType          image_type  = vk::ImageType::e2D;
-	vk::Extent3D           extent      = {1, 1, 1};
-	uint32_t               guest_pitch = 0;
-	uint32_t               layers      = 1;
-	uint32_t               mip_levels  = 1;
-	uint32_t               samples     = 1;
-	vk::ImageUsageFlags    usage       = {};
-	vk::ImageCreateFlags   flags       = {};
-	vk::Image              image       = nullptr;
-	VulkanImageState       state;
+	vk::Format                    format      = vk::Format::eUndefined;
+	vk::ImageType                 image_type  = vk::ImageType::e2D;
+	vk::Extent3D                  extent      = {1, 1, 1};
+	uint32_t                      guest_pitch = 0;
+	uint32_t                      layers      = 1;
+	uint32_t                      mip_levels  = 1;
+	uint32_t                      samples     = 1;
+	vk::ImageUsageFlags           usage       = {};
+	vk::ImageCreateFlags          flags       = {};
+	vk::Image                     image       = nullptr;
+	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
-	Graphics::VulkanMemory memory;
+	Graphics::VulkanMemory        memory;
 };
 
 struct VulkanBuffer {

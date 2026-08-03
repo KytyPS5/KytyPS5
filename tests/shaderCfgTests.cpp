@@ -4,22 +4,22 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
-#include "graphics/host_gpu/objects/textureCommon.h"
-#include "graphics/host_gpu/renderer/imageView.h"
-#include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
-#include "graphics/host_gpu/renderer/shaderSubgroup.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/shader/recompiler/ExecMask.h"
-#include "graphics/shader/recompiler/ResourceTracking.h"
-#include "graphics/shader/recompiler/ScalarProvenance.h"
-#include "graphics/shader/recompiler/ShaderCFG.h"
-#include "graphics/shader/recompiler/ShaderDecoder.h"
-#include "graphics/shader/recompiler/ShaderIR.h"
-#include "graphics/shader/recompiler/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/SpirvEmitter.h"
-#include "graphics/shader/recompiler/SrtPatcher.h"
-#include "graphics/shader/recompiler/SrtWalker.h"
-#include "graphics/shader/recompiler/spirvEmitter/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
+#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
+#include "graphics/shader/recompiler/emitter/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/ScalarProvenance.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/SrtPatcher.h"
+#include "graphics/shader/recompiler/ir/SrtWalker.h"
 #include "graphics/shader/shader.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
@@ -221,7 +221,7 @@ uint32_t SpirvExtInstCount(const std::vector<uint32_t>& binary, uint32_t ext_ins
 }
 
 bool SpirvContainsTypeImage(const std::vector<uint32_t>& binary, uint32_t dim, uint32_t arrayed,
-                            uint32_t sampled) {
+                            uint32_t sampled, uint32_t multisampled = 0) {
 	for (size_t i = 5; i < binary.size();) {
 		const uint32_t word       = binary[i];
 		const uint32_t opcode     = word & 0xffffu;
@@ -230,7 +230,7 @@ bool SpirvContainsTypeImage(const std::vector<uint32_t>& binary, uint32_t dim, u
 			return false;
 		}
 		if (opcode == 25u && word_count >= 9u && binary[i + 3] == dim && binary[i + 5] == arrayed &&
-		    binary[i + 7] == sampled) {
+		    binary[i + 6] == multisampled && binary[i + 7] == sampled) {
 			return true;
 		}
 		i += word_count;
@@ -411,9 +411,9 @@ constexpr uint32_t EncodeSopp(uint32_t opcode, uint32_t simm = 0) {
 }
 
 void TestNativeShaderResourceDependencies() {
-	const auto stages = ShaderPipelineStages(
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment |
-	    vk::ShaderStageFlagBits::eCompute);
+	const auto stages =
+	    ShaderPipelineStages(vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment |
+	                         vk::ShaderStageFlagBits::eCompute);
 	Check(stages == (vk::PipelineStageFlagBits::eVertexShader |
 	                 vk::PipelineStageFlagBits::eFragmentShader |
 	                 vk::PipelineStageFlagBits::eComputeShader),
@@ -463,8 +463,7 @@ void TestNormalizedImageContracts() {
 	ImageInfo container {};
 	container.data            = {0x10000, 0x15000};
 	container.pixel_format    = vk::Format::eR8G8B8A8Unorm;
-	container.guest_format =
-	    Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+	container.guest_format    = Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
 	container.type            = Prospero::ImageType::kColor2D;
 	container.extent          = {64, 64, 1};
 	container.resources       = {3, 4};
@@ -476,38 +475,34 @@ void TestNormalizedImageContracts() {
 	container.mip_layout[1]   = {0x10000, 0x4000, 32, 32};
 	container.mip_layout[2]   = {0x14000, 0x1000, 16, 16};
 
-	ImageInfo subresource = container;
-	subresource.data      = {0x22000, 0x1000};
-	subresource.extent    = {32, 32, 1};
-	subresource.resources = {1, 1};
-	subresource.pitch     = 32;
-	subresource.mip_layout = {};
+	ImageInfo subresource     = container;
+	subresource.data          = {0x22000, 0x1000};
+	subresource.extent        = {32, 32, 1};
+	subresource.resources     = {1, 1};
+	subresource.pitch         = 32;
+	subresource.mip_layout    = {};
 	subresource.mip_layout[0] = {0, 0x1000, 32, 32};
 
 	Check(container.BlockExtent() == vk::Extent2D {64, 64},
 	      "normalized image block extent changed");
 	Check(subresource.IsCompatible(container), "normalized compatible image was rejected");
 	Check(subresource.MipOf(container) == 1, "normalized mip lookup missed a subresource");
-	Check(subresource.SliceOf(container, 1) == 2,
-	      "normalized slice lookup missed a subresource");
+	Check(subresource.SliceOf(container, 1) == 2, "normalized slice lookup missed a subresource");
 
-	auto incompatible = subresource;
+	auto incompatible    = subresource;
 	incompatible.samples = 2;
 	Check(!incompatible.IsCompatible(container) && incompatible.MipOf(container) == -1,
 	      "sample-count mismatch was accepted as a compatible image");
 
-	auto compressed             = container;
-	compressed.guest_format =
-	    Prospero::GpuEnumValue(Prospero::BufferFormat::kBc3UNorm);
-	compressed.pitch            = 128;
-	compressed.extent.height    = 64;
+	auto compressed          = container;
+	compressed.guest_format  = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc3UNorm);
+	compressed.pitch         = 128;
+	compressed.extent.height = 64;
 	Check(compressed.BlockExtent() == vk::Extent2D {32, 16},
 	      "block-compressed extent was not expressed in blocks");
 
-	Check(ImageViewOps::FormatsCompatible(vk::Format::eR8G8B8A8Unorm,
-	                                      vk::Format::eR8G8B8A8Uint) &&
-	          !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat,
-	                                           vk::Format::eR32Sfloat) &&
+	Check(ImageViewOps::FormatsCompatible(vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Uint) &&
+	          !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat, vk::Format::eR32Sfloat) &&
 	          ImageViewOps::FormatsCompatible(vk::Format::eBc3UnormBlock,
 	                                          vk::Format::eR32G32B32A32Uint),
 	      "Vulkan image-view compatibility classes diverged from production");
@@ -524,20 +519,19 @@ void TestNativeSubgroupPolicy() {
 	safe.wave_size      = 32;
 	safe.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eVertex, safe).mode ==
-	          ShaderSubgroupMode::Natural,
+	                              vk::ShaderStageFlagBits::eVertex, safe)
+	              .mode == ShaderSubgroupMode::Natural,
 	      "native wave32 policy changed");
 	safe.wave_size = 64;
-	Check(SelectGraphicsLaneMaskMode(safe.wave_size) ==
-	              ShaderLaneMaskMode::PerInvocation &&
+	Check(SelectGraphicsLaneMaskMode(safe.wave_size) == ShaderLaneMaskMode::PerInvocation &&
 	          ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                                  vk::ShaderStageFlagBits::eVertex, safe).mode ==
-	              ShaderSubgroupMode::Unsupported,
+	                                  vk::ShaderStageFlagBits::eVertex, safe)
+	                  .mode == ShaderSubgroupMode::Unsupported,
 	      "wave64 graphics mismatch accepted native-wave mask lowering");
 	safe.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eVertex, safe).mode ==
-	          ShaderSubgroupMode::PerInvocationGraphics,
+	                              vk::ShaderStageFlagBits::eVertex, safe)
+	              .mode == ShaderSubgroupMode::PerInvocationGraphics,
 	      "wave64 graphics mismatch did not select per-invocation masks");
 
 	ShaderRecompiler::IR::Program cross_lane = safe;
@@ -545,14 +539,14 @@ void TestNativeSubgroupPolicy() {
 	    ShaderRecompiler::IR::Opcode::ReadLaneU32;
 	Check(ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(cross_lane) &&
 	          ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                                  vk::ShaderStageFlagBits::eVertex, cross_lane).mode ==
-	              ShaderSubgroupMode::PerInvocationGraphics,
+	                                  vk::ShaderStageFlagBits::eVertex, cross_lane)
+	                  .mode == ShaderSubgroupMode::PerInvocationGraphics,
 	      "graphics mismatch did not select per-invocation masks");
 	auto cross_lane_compute           = cross_lane;
 	cross_lane_compute.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "cross-lane compute mismatch bypassed the exact subgroup requirement");
 
 	ShaderRecompiler::IR::Program zero_exec = safe;
@@ -568,8 +562,8 @@ void TestNativeSubgroupPolicy() {
 	zero_bfm.scalar_sources[0] = 2;
 	Check(!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(zero_exec) &&
 	          ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                                  vk::ShaderStageFlagBits::eCompute, zero_exec).mode ==
-	              ShaderSubgroupMode::FlattenedMasks,
+	                                  vk::ShaderStageFlagBits::eCompute, zero_exec)
+	                  .mode == ShaderSubgroupMode::FlattenedMasks,
 	      "compile-time uniform-zero EXEC write did not stay on the mask-free path");
 
 	ShaderRecompiler::IR::Program selective_exec = safe;
@@ -600,8 +594,8 @@ void TestNativeSubgroupPolicy() {
 	ds_partial.blocks.emplace_back().instructions.emplace_back().op =
 	    ShaderRecompiler::IR::Opcode::DsAppend;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eCompute, ds_partial).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eCompute, ds_partial)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "partial wave64 DS append bypassed the exact subgroup requirement");
 	context.max_subgroup_size = 64;
 	const auto controlled =
@@ -614,17 +608,18 @@ void TestNativeSubgroupPolicy() {
 	cross_lane.wave_size                  = 32;
 	cross_lane.lane_mask_mode             = ShaderLaneMaskMode::PerInvocation;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eFragment, cross_lane).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eFragment, cross_lane)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "inverse graphics mismatch was accepted as one guest wave");
 	cross_lane_compute.wave_size = 32;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
-	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute).mode ==
-	          ShaderSubgroupMode::Unsupported,
+	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute)
+	              .mode == ShaderSubgroupMode::Unsupported,
 	      "inverse cross-lane compute mismatch was accepted");
 }
 
-std::array<uint32_t, 64> ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
+std::array<uint32_t, 64>
+ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
 	std::array<uint32_t, 64> data {};
 	for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
 		data[start]      = 0x1000u + start * 0x100u;
@@ -2972,7 +2967,6 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
 	Check(SpirvContainsOpcode(result.spirv, 61), "SPIR-V binary does not contain OpLoad");
 	Check(SpirvContainsOpcode(result.spirv, 62), "SPIR-V binary does not contain OpStore");
 	Check(SpirvContainsOpcode(result.spirv, 95), "SPIR-V binary does not contain OpImageFetch");
-	Check(SpirvContainsOpcode(result.spirv, 100), "SPIR-V binary does not contain OpImage");
 	Check(SpirvContainsOpcode(result.spirv, 103),
 	      "SPIR-V binary does not contain OpImageQuerySizeLod");
 	Check(SpirvContainsOpcode(result.spirv, 88),
@@ -3017,6 +3011,37 @@ void TestNewShaderRecompilerImageQueryLowering() {
 	      "SPIR-V binary does not request compute derivative group capability");
 	Check(std::find(result.spirv.begin(), result.spirv.end(), 5289u) != result.spirv.end(),
 	      "SPIR-V binary does not request compute derivative group execution mode");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCubeSampleCoordinates() {
+	constexpr uint32_t MimgDimCube = 3;
+	const uint32_t     shader[]    = {
+	    EncodeMimg0(0x20, 0xf, false, MimgDimCube),
+	    EncodeMimg1(0, 0, 1, 0), // image_sample cube
+	    EncodeMimg0(0x60, 0x3, false, MimgDimCube),
+	    EncodeMimg1(8, 0, 1, 4), // image_get_lod cube
+	    0xbf810000u,
+	};
+
+	auto                             user_data = ImageTestUserData(Prospero::ImageType::kCube);
+	ShaderRecompiler::CompileOptions options;
+	options.stage     = ShaderType::Compute;
+	options.user_data = user_data.data();
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(result.program.info.images.size() == 1 && result.program.info.images[0].cube,
+	      "cube descriptor identity was not preserved through compilation");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 131) == 4,
+	      "cube sample/get-lod did not remove the RDNA2 S/T bias");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 109) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 112) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 194) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 196) == 1 &&
+	          SpirvInstructionOpcodeCount(result.spirv, 130) == 1,
+	      "cube sample did not repack its face ID exactly once, or get-lod used an array layer");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -3495,10 +3520,8 @@ void TestNewShaderRecompilerImageViewDimensions() {
 	      "SPIR-V binary does not contain sampled 2D-array image type");
 	Check(SpirvContainsTypeImage(result.spirv, SpirvDim3D, 0, 1),
 	      "SPIR-V binary does not contain sampled 3D image type");
-	Check(SpirvContainsCapability(result.spirv, 43),
-	      "SPIR-V binary does not request Sampled1D");
-	Check(SpirvContainsCapability(result.spirv, 44),
-	      "SPIR-V binary does not request Image1D");
+	Check(SpirvContainsCapability(result.spirv, 43), "SPIR-V binary does not request Sampled1D");
+	Check(SpirvContainsCapability(result.spirv, 44), "SPIR-V binary does not request Image1D");
 	Check(SpirvContainsOpcode(result.spirv, 95),
 	      "SPIR-V binary does not contain array image fetch");
 	CheckSpirvBinaryValidates(result.spirv);
@@ -3587,7 +3610,7 @@ void TestNewShaderRecompilerRejectsOneDimensionalGather() {
 		    EncodeMimg1(0, 0, 1, 0),
 		    0xbf810000u,
 		};
-		auto user_data = ImageTestUserData(type);
+		auto                             user_data = ImageTestUserData(type);
 		ShaderRecompiler::CompileOptions options;
 		options.stage     = ShaderType::Compute;
 		options.user_data = user_data.data();
@@ -3733,6 +3756,50 @@ void TestNewShaderRecompilerImageLoadVariants() {
 	Check(SpirvContainsOpcode(result.spirv, 124),
 	      "SPIR-V binary does not contain OpBitcast for image-load result bits");
 	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerImageLoad2DMsaa() {
+	const uint32_t shader[] = {
+	    0xf0000130u, // image_load v3, v[5:7], s[0:7] dmask:x dim:2d_msaa
+	    0x00000305u,
+	    0xbf810000u,
+	};
+
+	auto user_data = ImageTestUserData(Prospero::ImageType::kColor2DMsaa);
+	user_data[3] |= 2u << 16u;
+	user_data[5] |= 2u << 4u;
+	user_data[6] |= 1u << 10u;
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage     = ShaderType::Pixel;
+	options.dump_ir   = true;
+	options.user_data = user_data.data();
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.decoded_dump, "image_dim=2d_msaa") &&
+	          Common::ContainsStr(result.ir_dump, "image_dim=2d_msaa") &&
+	          Common::ContainsStr(result.ir_dump, "image_addr=3 image_mip=0"),
+	      "RDNA2 2D-MSAA load did not preserve x, y, and fragment ID");
+	Check(result.program.info.images.size() == 1 &&
+	          result.program.info.images[0].dimension ==
+	              ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa,
+	      "2D-MSAA descriptor specialization lost the multisample dimension");
+	Check(ShaderRecompiler::IR::FindBinding(
+	          result.program.bindings,
+	          ShaderRecompiler::IR::DescriptorBindingKind::Sampled2DMsaa) != nullptr,
+	      "2D-MSAA image did not receive a multisampled descriptor binding");
+	Check(SpirvContainsTypeImage(result.spirv, 1, 0, 1, 1),
+	      "SPIR-V binary does not contain a multisampled 2D image type");
+	CheckSpirvBinaryValidates(result.spirv);
+	const auto source = DisassembleSpirvBinary(result.spirv);
+	Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "sampled_2d_msaa"),
+	      "2D-MSAA load did not access its multisampled descriptor");
+	Check(SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Sample "),
+	      "2D-MSAA load did not emit the fragment ID as a SPIR-V Sample operand");
+	Check(!SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Lod "),
+	      "2D-MSAA load incorrectly emitted its fragment ID as a mip level");
 }
 
 void TestNewShaderRecompilerImageStoreLowering() {
@@ -4042,8 +4109,7 @@ void TestNewShaderRecompilerVintrpLowering() {
 	options.pixel_input_info = &flat_ps_info;
 
 	ShaderRecompiler::CompileResult flat_result;
-	Check(ShaderRecompiler::TryRecompile(flat_shader, options, flat_result, &error),
-	      error.c_str());
+	Check(ShaderRecompiler::TryRecompile(flat_shader, options, flat_result, &error), error.c_str());
 	Check(SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
 	      "flat VINTRP input did not emit a Flat decoration");
 	Check(!SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 13u),
@@ -4069,13 +4135,22 @@ void TestNewShaderRecompilerVintrpLowering() {
 	CheckSpirvBinaryValidates(no_perspective_result.spirv);
 }
 
+void TestPsInputCountRegisterDecode() {
+	HW::Context context;
+	// NUM_INTERP is 3 while bit 14 is an independent control flag that must be preserved.
+	context.SetPsInControl(0x00004003u);
+	const auto ps_in_control = context.GetShaderRegisters().ps_in_control;
+	Check(ps_in_control == 0x00004003u, "SPI_PS_IN_CONTROL flags were not preserved");
+	Check((ps_in_control & 0x3fu) == 3, "SPI_PS_IN_CONTROL NUM_INTERP decoding failed");
+}
+
 void TestGraphicsCreateInterpolantMapping() {
 	ShaderRegister regs[32] = {};
 
 	Check(Gen5::GraphicsCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
 	      "null pixel shader interpolant mapping failed");
 	for (uint32_t i = 0; i < 32u; i++) {
-		Check(regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
+		Check(regs[i].offset == Pm4::CX_PS_SHADER_USAGE_BASE + i,
 		      "identity interpolant register offset was unexpected");
 		Check(regs[i].value == i, "identity interpolant register value was unexpected");
 	}
@@ -4117,7 +4192,7 @@ void TestGraphicsCreateInterpolantMapping() {
 	Check(regs[1].value == 0x00000220u, "missing interpolant mapping did not use PS default value");
 	Check(regs[2].value == 0x0000052cu, "flat/custom interpolant mapping bits were unexpected");
 	Check(regs[3].value == 0x01580304u, "f16 interpolant mapping bits were unexpected");
-	Check(regs[4].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 4u && regs[4].value == 4u,
+	Check(regs[4].offset == Pm4::CX_PS_SHADER_USAGE_BASE + 4u && regs[4].value == 4u,
 	      "interpolant identity tail was not filled");
 }
 
@@ -5319,7 +5394,224 @@ void TestNewShaderRecompilerCfgSharedOuterAndLoopMerge() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges() {
+void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 4),         // loop exit -> end
+	    EncodeSopc(0x06, 1, 1),      // s_cmp_eq_u32 s1, s1
+	    EncodeSopp(0x04, 2),         // early break -> same loop end
+	    EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfffau),   // backedge -> loop header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "loop early-break CFG did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "loop early-break SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "loop early-break SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "loop early-break CFG unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 9),         // outer exit -> end
+	    EncodeSopc(0x0a, 1, 129),    // inner loop: s_cmp_lt_u32 s1, 1
+	    EncodeSopp(0x04, 5),         // inner exit -> outer continue
+	    EncodeSopc(0x06, 2, 2),      // s_cmp_eq_u32 s2, s2
+	    EncodeSopp(0x05, 5),         // nonlocal exit -> outer end
+	    EncodeSMovB32(3, 129),       // inner work
+	    EncodeSop2(0x00, 1, 1, 129), // s_add_u32 s1, s1, 1
+	    EncodeSopp(0x02, 0xfff9u),   // inner backedge
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff5u),   // outer backedge
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
+	      "nested-loop nonlocal exit did not select dispatcher fallback");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
+	      "nested-loop nonlocal exit dispatcher SPIR-V lacks OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 6),         // outer exit -> end
+	    EncodeSopc(0x0a, 1, 129),    // inner loop: s_cmp_lt_u32 s1, 1
+	    EncodeSopp(0x04, 2),         // inner exit -> outer continue
+	    EncodeSMovB32(2, 129),       // inner work
+	    EncodeSopp(0x02, 0xfffcu),   // inner backedge
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff8u),   // outer backedge
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "nested local loop exit did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) >= 2,
+	      "nested local loop exit SPIR-V lacks both OpLoopMerge instructions");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "nested local loop exit SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "nested local loop exit unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 11),        // outer exit -> end
+	    EncodeSopc(0x06, 1, 1),      // inner loop first exit condition
+	    EncodeSopp(0x05, 3),         // first inner exit -> tail A
+	    EncodeSopc(0x06, 2, 2),      // inner loop second exit condition
+	    EncodeSopp(0x05, 3),         // second inner exit -> tail B
+	    EncodeSopp(0x02, 0xfffbu),   // inner backedge
+	    EncodeSMovB32(3, 129),       // tail A
+	    EncodeSopp(0x02, 2),         // tail A -> outer continue
+	    EncodeSMovB32(4, 129),       // tail B
+	    EncodeSopp(0x02, 0),         // tail B -> outer continue
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff3u),   // outer backedge
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::Decoder::Program program;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, program, &error),
+	      error.c_str());
+
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(program, graph, &error), error.c_str());
+	const auto original_block_count = graph.blocks.size();
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	Check(graph.blocks.size() > original_block_count,
+	      "nested loop exit tails did not create a private inner merge");
+
+	const auto* outer_header = graph.FindBlockByPc(0);
+	const auto* inner_header = graph.FindBlockByPc(8);
+	Check(outer_header != nullptr && inner_header != nullptr &&
+	          outer_header->terminator.loop_header && inner_header->terminator.loop_header,
+	      "nested loop exit-tail fixture did not retain both loop headers");
+	Check(inner_header->terminator.merge_block != outer_header->terminator.continue_block,
+	      "inner loop merge still aliases the outer continue target");
+	const auto* inner_merge = graph.FindBlock(inner_header->terminator.merge_block);
+	Check(inner_merge != nullptr && inner_merge->inst_begin == inner_merge->inst_end &&
+	          inner_merge->terminator.kind == ShaderRecompiler::CFG::TerminatorKind::Branch &&
+	          inner_merge->terminator.true_block == outer_header->terminator.continue_block,
+	      "private inner merge does not forward to the outer continue target");
+}
+
+void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x06, 7, 7),      // entry branch bypasses loop -> exit X
+	    EncodeSopp(0x05, 5),         // entry -> X
+	    EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 5),         // loop exit -> Y
+	    EncodeSopc(0x06, 1, 1),      // inner condition
+	    EncodeSopp(0x05, 1),         // nonmerge exit -> X, else continue
+	    EncodeSopp(0x02, 0xfffbu),   // loop backedge
+	    EncodeSMovB32(2, 129),       // X
+	    EncodeSopp(0x02, 2),         // X -> end
+	    EncodeSMovB32(3, 129),       // Y
+	    EncodeSopp(0x02, 0),         // Y -> end
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
+	      "mixed continue/nonmerge exit did not select dispatcher fallback");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
+	      "mixed continue/nonmerge exit dispatcher SPIR-V lacks OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgConditionalLatchNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopp(0x02, 0),       // loop header -> conditional block
+	    EncodeSopc(0x06, 0, 0),    // s_cmp_eq_u32 s0, s0
+	    EncodeSopp(0x05, 1),       // loop exit -> end
+	    EncodeSopp(0x02, 0xfffcu), // separate latch -> loop header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "conditional latch did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "conditional latch SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "conditional latch SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "conditional latch unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopp(0x02, 0),       // loop header -> conditional latch
+	    EncodeSopc(0x06, 0, 0),    // s_cmp_eq_u32 s0, s0
+	    EncodeSopp(0x05, 0xfffdu), // direct latch backedge -> loop header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "direct conditional latch did not stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "direct conditional latch SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "direct conditional latch SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "direct conditional latch unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
 	const uint32_t shader[] = {
 	    EncodeSMovB32(0, 128),       // s0 = 0
 	    EncodeSopc(0x0a, 0, 130),    // loop: s_cmp_lt_u32 s0, 2
@@ -5344,15 +5636,111 @@ void TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges() {
 	std::string                     error;
 	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
 	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
-	      "shared loop continue selections should stay on structured path");
-	Check(!Common::ContainsStr(result.ir_dump, "duplicate structured merge block"),
-	      "shared loop continue selections were not split before structurization");
-	Check(SpirvContainsOpcode(result.spirv, 246),
-	      "shared loop continue selections SPIR-V lacks OpLoopMerge");
-	Check(SpirvContainsOpcode(result.spirv, 247),
-	      "shared loop continue selections SPIR-V lacks OpSelectionMerge");
-	Check(!SpirvContainsOpcode(result.spirv, 251),
-	      "shared loop continue selections unexpectedly used dispatcher OpSwitch");
+	      "loop early continues should stay on structured path");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+	      "loop early continues SPIR-V lacks OpLoopMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
+	      "loop early continues SPIR-V unexpectedly used OpSelectionMerge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+	      "loop early continues unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgConditionalLoopHeaderSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x06, 0, 0),    // loop body selection condition
+	    EncodeSopp(0x05, 2),       // select path B
+	    EncodeSMovB32(1, 129),     // path A
+	    EncodeSopp(0x02, 1),       // path A -> join
+	    EncodeSMovB32(2, 129),     // path B
+	    EncodeSMovB32(3, 129),     // join
+	    EncodeSopc(0x06, 4, 4),    // repeat condition
+	    EncodeSopp(0x05, 0xfff8u), // repeat -> guest header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::Decoder::Program decoded;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, decoded, &error),
+	      error.c_str());
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+	const auto original_block_count = graph.blocks.size();
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	Check(graph.blocks.size() > original_block_count,
+	      "conditional guest loop header did not create a synthetic header");
+
+	uint32_t loop_headers      = 0;
+	uint32_t selection_headers = 0;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.loop_header) {
+			loop_headers++;
+			Check(block.inst_begin == block.inst_end &&
+			          block.terminator.kind == ShaderRecompiler::CFG::TerminatorKind::Branch,
+			      "canonical loop header is not an empty unconditional block");
+		} else if (block.terminator.kind ==
+		               ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch &&
+		           block.terminator.merge_block != UINT32_MAX) {
+			selection_headers++;
+		}
+	}
+	Check(loop_headers == 1u && selection_headers == 1u,
+	      "guest conditional was not separated from the loop header");
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage = ShaderType::Compute;
+	ShaderRecompiler::CompileResult result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
+	      "conditional loop-header SPIR-V has the wrong loop-merge count");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 1u,
+	      "conditional loop-header SPIR-V has the wrong selection-merge count");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+	      "conditional loop-header unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgMultipleLoopLatches() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),  // loop condition
+	    EncodeSopp(0x04, 5),       // loop exit -> end
+	    EncodeSopc(0x06, 1, 1),    // early repeat condition
+	    EncodeSopp(0x05, 0xfffcu), // early repeat -> header
+	    EncodeSMovB32(2, 129),     // body
+	    EncodeSMovB32(3, 129),     // body tail
+	    EncodeSopp(0x02, 0xfff9u), // ordinary latch -> header
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::Decoder::Program decoded;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, decoded, &error),
+	      error.c_str());
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+	const auto original_block_count = graph.blocks.size();
+	Check(graph.back_edges.size() == 2u, "multiple-latch fixture lacks two native backedges");
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	Check(graph.blocks.size() == original_block_count + 1u,
+	      "multiple native latches did not create one synthetic continue");
+	Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
+	      "multiple native latches were not coalesced to one SPIR-V backedge");
+	const auto& loop           = graph.natural_loops.front();
+	const auto* continue_block = graph.FindBlock(loop.continue_block);
+	Check(continue_block != nullptr && continue_block->inst_begin == continue_block->inst_end &&
+	          continue_block->predecessors.size() == 2u,
+	      "canonical continue does not join both native latches");
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage = ShaderType::Compute;
+	ShaderRecompiler::CompileResult result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
+	      "multiple-latch SPIR-V has the wrong loop-merge count");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0u,
+	      "multiple-latch SPIR-V unexpectedly used a selection merge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+	      "multiple-latch SPIR-V unexpectedly used dispatcher OpSwitch");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -5379,6 +5767,85 @@ void TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit() {
 	Check(SpirvContainsOpcode(result.spirv, 247), "duplicate merge SPIR-V lacks OpSelectionMerge");
 	Check(!SpirvContainsOpcode(result.spirv, 251),
 	      "duplicate merge CFG unexpectedly used dispatcher OpSwitch");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x06, 0, 0), // block 0
+	    EncodeSopp(0x04, 2),    // block 0 -> 2 or 1
+	    EncodeSopc(0x06, 1, 1), // block 1
+	    EncodeSopp(0x04, 6),    // block 1 -> 5 or 2
+	    EncodeSopc(0x06, 2, 2), // block 2
+	    EncodeSopp(0x04, 4),    // block 2 -> 5 or 3
+	    EncodeSopc(0x06, 3, 3), // block 3
+	    EncodeSopp(0x04, 2),    // block 3 -> 5 or 4
+	    EncodeSMovB32(4, 129),  // block 4
+	    0xbf810000u,             // block 4 -> 6
+	    EncodeSMovB32(5, 129),  // block 5
+	    0xbf810000u,             // block 5 -> 6
+	};
+
+	ShaderRecompiler::Decoder::Program decoded;
+	std::string                        error;
+	Check(ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, decoded, &error),
+	      error.c_str());
+	ShaderRecompiler::CFG::Graph graph;
+	Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error), error.c_str());
+	Check(graph.blocks.size() == 7u && graph.blocks[0].successors == std::vector<uint32_t>({1, 2}) &&
+	          graph.blocks[0].terminator.true_block == 2u &&
+	          graph.blocks[0].terminator.false_block == 1u &&
+	          graph.blocks[1].successors == std::vector<uint32_t>({2, 5}) &&
+	          graph.blocks[1].terminator.true_block == 5u &&
+	          graph.blocks[1].terminator.false_block == 2u &&
+	          graph.blocks[2].successors == std::vector<uint32_t>({3, 5}) &&
+	          graph.blocks[2].terminator.true_block == 5u &&
+	          graph.blocks[2].terminator.false_block == 3u &&
+	          graph.blocks[3].successors == std::vector<uint32_t>({4, 5}) &&
+	          graph.blocks[3].terminator.true_block == 5u &&
+	          graph.blocks[3].terminator.false_block == 4u &&
+	          graph.blocks[4].successors == std::vector<uint32_t>({6}) &&
+	          graph.blocks[5].successors == std::vector<uint32_t>({6}),
+	      "overlapping early-exit fixture does not match the observed shader CFG");
+	Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+	std::vector<bool>     reachable(graph.blocks.size());
+	std::vector<uint32_t> pending = {graph.entry_block};
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (reachable[block_id]) {
+			continue;
+		}
+		reachable[block_id] = true;
+		pending.insert(pending.end(), graph.blocks[block_id].successors.begin(),
+		               graph.blocks[block_id].successors.end());
+	}
+	Check(std::all_of(reachable.begin(), reachable.end(), [](bool value) { return value; }),
+	      "overlapping early-exit structurization left unreachable blocks");
+	std::vector<uint32_t> merges;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch) {
+			Check(block.terminator.merge_block != UINT32_MAX &&
+			          std::find(merges.begin(), merges.end(), block.terminator.merge_block) ==
+			              merges.end(),
+			      "overlapping early-exit structurization retained a shared merge");
+			merges.push_back(block.terminator.merge_block);
+		}
+	}
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Pixel;
+	options.dump_ir = true;
+	ShaderRecompiler::CompileResult result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
+	      "overlapping early-exit ladder did not stay on the structured path");
+	Check(!Common::ContainsStr(result.ir_dump, "duplicate structured merge block"),
+	      "overlapping early-exit ladder retained a shared merge");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 247) >= 4u,
+	      "overlapping early-exit ladder lost its selections");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+	      "overlapping early-exit ladder used dispatcher OpSwitch");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -5910,6 +6377,22 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 	Check(SpirvContainsOpcode(result.spirv, 81),
 	      "compressed pixel export SPIR-V lacks OpCompositeExtract");
 	CheckSpirvBinaryValidates(result.spirv);
+
+	ShaderPixelInputInfo uint16_info;
+	uint16_info.target_output_mode[0] = 7;
+	options.pixel_input_info          = &uint16_info;
+	ShaderRecompiler::CompileResult uint16_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, uint16_result, &error), error.c_str());
+	const auto uint16_source = DisassembleSpirvBinary(uint16_result.spirv);
+	Check(Common::ContainsStr(uint16_source, "OpVariable %_ptr_Output_v4uint Output"),
+	      "UINT16 MRT export did not use an unsigned integer output");
+	Check(CountSourceOccurrences(uint16_source, "OpBitFieldUExtract") == 4u &&
+	          Common::ContainsStr(uint16_source, "%uint_0 %uint_16") &&
+	          Common::ContainsStr(uint16_source, "%uint_16 %uint_16"),
+	      "compressed UINT16 MRT export did not extract all low/high 16-bit lanes");
+	Check(!SpirvContainsExtInst(uint16_result.spirv, 62),
+	      "compressed UINT16 MRT export was incorrectly decoded as FP16");
+	CheckSpirvBinaryValidates(uint16_result.spirv);
 }
 
 void TestRenderTargetReverseFloat16ExportMapping() {
@@ -5928,10 +6411,10 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	          format.export_mapping.ApplyMask(0xfu) == 0xfu,
 	      "reverse RGBA16F render-target export or write-mask mapping is "
 	      "incorrect");
-	const auto legacy_alt = TextureGetRenderTargetFormat(
-	    Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
-	    Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
-	    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
+	const auto legacy_alt =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
 	Check(legacy_alt.format == vk::Format::eB8G8R8A8Unorm && legacy_alt.export_mapping.IsIdentity(),
 	      "legacy BGRA render target acquired a duplicate shader export mapping");
 
@@ -5961,8 +6444,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	CheckSpirvBinaryValidates(reversed_result.spirv);
 
 	HW::PixelShaderInfo regs {};
-	Check(ShaderGetIdPS(regs, identity_info, false) !=
-	          ShaderGetIdPS(regs, reversed_info, false),
+	Check(ShaderGetIdPS(regs, identity_info, false) != ShaderGetIdPS(regs, reversed_info, false),
 	      "pixel shader cache identity omitted the render-target export mapping");
 
 	regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
@@ -5970,7 +6452,7 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	ShaderMappedData mapped {};
 	mapped.code_size_bytes = sizeof(shader);
 	ShaderMapUserData(regs.ps_regs.data_addr, mapped);
-	HW::ShaderRegisters sh {};
+	HW::ShaderRegisters   sh {};
 	ShaderVertexInputInfo vs_info {};
 	vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 	std::array<Prospero::ColorComponentMapping, 8> mappings {};
@@ -6802,8 +7284,8 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 			ShaderVertexInputInfo vs_info {};
 			vs_info.stage.program = std::move(vs_program);
 			const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
-			ShaderPixelInputInfo      ps_info {};
-			std::span<const uint32_t> spirv;
+			ShaderPixelInputInfo                                 ps_info {};
+			std::span<const uint32_t>                            spirv;
 			Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave, vs_info,
 			                          identity_mappings, ps_info, spirv),
 			      "pixel program-cache transition failed to compile");
@@ -6830,8 +7312,8 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 		ShaderVertexInputInfo vs_info {};
 		vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 		const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
-		ShaderPixelInputInfo      ps_info {};
-		std::span<const uint32_t> spirv;
+		ShaderPixelInputInfo                                 ps_info {};
+		std::span<const uint32_t>                            spirv;
 		Check(ShaderCompileInfoPS(mask_regs, sh, mode, vs_info, identity_mappings, ps_info, spirv),
 		      "pixel lane-mask cache transition failed to compile");
 		Check(ps_info.stage.program != nullptr && ps_info.stage.program->lane_mask_mode == mode,
@@ -6907,8 +7389,7 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
 	options.flat_memory_base = 0;
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
-	const bool                      compiled =
-	    ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
+	const bool compiled = ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
 	Check(compiled, error.c_str());
 	Check(result.program.info.addresses.size() == 2,
 	      "segmented address resources were not tracked independently");
@@ -6925,7 +7406,6 @@ int main() {
 	using namespace Libs::Graphics;
 
 	EnsureConfigInitialized();
-
 	TestResourceDescriptorClassification();
 	TestNativeShaderResourceDependencies();
 	TestNormalizedImageContracts();
@@ -6948,6 +7428,7 @@ int main() {
 	TestNewShaderRecompilerScalarBitfieldAlu();
 	TestNewShaderRecompilerMemoryFamilyLowering();
 	TestNewShaderRecompilerImageQueryLowering();
+	TestNewShaderRecompilerCubeSampleCoordinates();
 	TestNewShaderRecompilerImageSampleVariants();
 	TestNewShaderRecompilerImageSampleA16SamplerCoords();
 	TestNewShaderRecompilerImageSampleOpcodeAliases();
@@ -6961,11 +7442,13 @@ int main() {
 	TestNewShaderRecompilerImageGatherVariants();
 	TestNewShaderRecompilerImageLoadA16UintCoords();
 	TestNewShaderRecompilerImageLoadVariants();
+	TestNewShaderRecompilerImageLoad2DMsaa();
 	TestNewShaderRecompilerImageStoreLowering();
 	TestNewShaderRecompilerStorageImage3DDescriptorVariant();
 	TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D();
 	TestNewShaderRecompilerImageAtomicLowering();
 	TestNewShaderRecompilerVintrpLowering();
+	TestPsInputCountRegisterDecode();
 	TestNewShaderRecompilerWideMemoryLowering();
 	TestNewShaderRecompilerBufferSignedLoadLowering();
 	TestNewShaderRecompilerBufferSubDwordStoreLowering();
@@ -6994,8 +7477,18 @@ int main() {
 	TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
 	TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeDispatcher();
 	TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
-	TestNewShaderRecompilerCfgLoopSharedContinueSelectionMerges();
+	TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
+	TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
+	TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
+	TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
+	TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
+	TestNewShaderRecompilerCfgConditionalLatchNoSelection();
+	TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
+	TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
+	TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
+	TestNewShaderRecompilerCfgMultipleLoopLatches();
 	TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+	TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
 	TestNewShaderRecompilerCfgIrreducibleDispatcher();
 	TestNewShaderRecompilerExecMaskHelpers();
 	TestComputeShaderInputWaveSize();

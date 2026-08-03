@@ -336,18 +336,6 @@ static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle p
 	return nullptr;
 }
 
-static uint32_t audioout2_context_grains(AudioOut2ContextHandle ctx) {
-	uint32_t samples_num = 512;
-
-	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		samples_num = (state->num_grains == 0 ? 512u : state->num_grains);
-	}
-	g_audioout2_context_mutex.Unlock();
-
-	return samples_num;
-}
-
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
@@ -455,6 +443,12 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
 
+	g_audioout2_context_mutex.Lock();
+	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+		*state = AudioOut2ContextState {};
+	}
+	g_audioout2_context_mutex.Unlock();
+
 	std::array<int, 256> audio_handles {};
 	size_t               audio_handles_num = 0;
 
@@ -472,12 +466,6 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	for (size_t i = 0; i < audio_handles_num; i++) {
 		audioout2_close_audio_handle(audio_handles[i]);
 	}
-
-	g_audioout2_context_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		*state = AudioOut2ContextState {};
-	}
-	g_audioout2_context_mutex.Unlock();
 
 	return OK;
 }
@@ -559,30 +547,45 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 
-	const auto next_port = g_audioout2_next_port.fetch_add(1, std::memory_order_relaxed);
+	const auto next_port    = g_audioout2_next_port.fetch_add(1, std::memory_order_relaxed);
+	const auto audio_format = audioout2_data_format_to_audio_format(params->data_format);
+	const auto audio_type   = audioout2_port_type_to_audio_out_type(params->port_type);
+
+	g_audioout2_context_mutex.Lock();
+	const auto* context_state = audioout2_find_context_locked(ctx);
+	if (context_state == nullptr) {
+		g_audioout2_context_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	const auto samples_num = context_state->num_grains == 0 ? 512u : context_state->num_grains;
 
 	g_audioout2_port_mutex.Lock();
-	auto* port_state = audioout2_find_port_locked(0);
-	if (port_state == nullptr) {
-		for (auto& candidate: g_audioout2_ports) {
-			if (!candidate.used) {
-				port_state = &candidate;
-				break;
-			}
+	AudioOut2PortStateEntry* port_state = nullptr;
+	for (auto& candidate: g_audioout2_ports) {
+		if (!candidate.used) {
+			port_state = &candidate;
+			break;
 		}
 	}
+	if (port_state != nullptr) {
+		*port_state               = AudioOut2PortStateEntry {};
+		port_state->used          = true;
+		port_state->handle        = next_port;
+		port_state->context       = ctx;
+		port_state->port_type     = params->port_type;
+		port_state->data_format   = params->data_format;
+		port_state->sampling_freq = params->sampling_freq;
+		port_state->samples_num   = samples_num;
+		port_state->audio_format  = audio_format;
+	}
 	g_audioout2_port_mutex.Unlock();
+	g_audioout2_context_mutex.Unlock();
 
-	if (next_port > g_audioout2_ports.size() || port_state == nullptr) {
+	if (port_state == nullptr) {
 		return AUDIO_OUT2_ERROR_PORT_FULL;
 	}
 
-	*port = next_port;
-
-	const auto samples_num  = audioout2_context_grains(ctx);
-	const auto audio_format = audioout2_data_format_to_audio_format(params->data_format);
-	const auto audio_type   = audioout2_port_type_to_audio_out_type(params->port_type);
-	int        audio_handle = 0;
+	int audio_handle = 0;
 
 	if (audio_format != AudioInternal::Format::Unknown &&
 	    !audioout2_port_type_is_object(params->port_type)) {
@@ -591,17 +594,17 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	}
 
 	g_audioout2_port_mutex.Lock();
-	*port_state               = AudioOut2PortStateEntry {};
-	port_state->used          = true;
-	port_state->handle        = *port;
-	port_state->context       = ctx;
-	port_state->port_type     = params->port_type;
-	port_state->data_format   = params->data_format;
-	port_state->sampling_freq = params->sampling_freq;
-	port_state->samples_num   = samples_num;
-	port_state->audio_format  = audio_format;
-	port_state->audio_handle  = audio_handle;
+	const bool reserved = port_state->used && port_state->handle == next_port;
+	if (reserved) {
+		port_state->audio_handle = audio_handle;
+	}
 	g_audioout2_port_mutex.Unlock();
+	if (!reserved) {
+		audioout2_close_audio_handle(audio_handle);
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+
+	*port = next_port;
 
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();

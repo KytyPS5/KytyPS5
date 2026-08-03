@@ -126,10 +126,8 @@ int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point,
-                                                            size_t* available_space_kb) {
-	PRINT_NAME();
-
+static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
+                               size_t*                     available_space_kb) {
 	LOGF("\t mount_point        = 0x%016" PRIx64 "\n"
 	     "\t available_space_kb = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(mount_point), reinterpret_cast<uint64_t>(available_space_kb));
@@ -155,6 +153,12 @@ int KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMoun
 	LOGF("\t available_space_kb = %" PRIu64 "\n", static_cast<uint64_t>(*available_space_kb));
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point,
+                                                            size_t* available_space_kb) {
+	PRINT_NAME();
+	return GetAvailableSpaceKb(mount_point, available_space_kb);
 }
 
 int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         service_label,
@@ -233,11 +237,18 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoin
 	return OK;
 }
 
+static int KYTY_SYSV_ABI AppContentTemporaryDataGetAvailableSpaceKb(
+    const AppContentMountPoint* mount_point, size_t* available_space_kb) {
+	PRINT_NAME();
+	return AppContent::GetAvailableSpaceKb(mount_point, available_space_kb);
+}
+
 } // namespace AppContentTemporary
 
 LIB_DEFINE(InitAppContent_1_Temporary) {
 	LIB_FUNC("buYbeLOGWmA", AppContentTemporary::AppContentTemporaryDataMount2);
 	LIB_FUNC("a5N7lAG0y2Q", AppContentTemporary::AppContentTemporaryDataFormat);
+	LIB_FUNC("SaKib2Ug0yI", AppContentTemporary::AppContentTemporaryDataGetAvailableSpaceKb);
 }
 
 } // namespace LibAppContentTemporary

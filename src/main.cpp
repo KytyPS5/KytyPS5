@@ -10,6 +10,7 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
 
@@ -47,6 +48,7 @@ static void PrintUsage() {
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -59,8 +61,6 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
-	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
-	         "4-vertex path.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -101,6 +101,17 @@ static bool ParseEnum(const std::string& value, E& out) {
 	}
 
 	out = enum_value.value();
+	return true;
+}
+
+static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
+	uint32_t language = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), language);
+	if (error != std::errc {} || end != value.data() + value.size() ||
+	    language > Config::MAX_CONSOLE_LANGUAGE) {
+		return false;
+	}
+	out = language;
 	return true;
 }
 
@@ -170,6 +181,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
 			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+		} else if (arg == "--console-language") {
+			if (!ParseConsoleLanguage(value, options.config.console_language)) {
+				::printf("invalid console language: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -218,11 +234,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--ngg-rectlist-draw") {
-			if (!ParseBool(value, options.config.ngg_rectlist_draw_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

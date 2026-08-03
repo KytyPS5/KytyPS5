@@ -60,7 +60,11 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfds,
                          const void* timeout);
 int64_t KYTY_SYSV_ABI Send(int s, const void* buf, uint64_t len, int flags);
+int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, const void* addr,
+                             uint32_t addrlen);
 int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags);
+int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* addr,
+                               uint32_t* addrlen);
 
 } // namespace Net
 
@@ -180,6 +184,7 @@ int KYTY_SYSV_ABI  NpCheckPremium(int req_id, const NpCheckPremiumParameter* par
                                   NpCheckPremiumResult* result);
 int KYTY_SYSV_ABI  NpGetState(int user_id, uint32_t* state);
 int KYTY_SYSV_ABI  NpGetNpReachabilityState(int user_id, uint32_t* state);
+int KYTY_SYSV_ABI  NpHasSignedUp(int user_id, bool* has_signed_up);
 
 } // namespace NpManager
 

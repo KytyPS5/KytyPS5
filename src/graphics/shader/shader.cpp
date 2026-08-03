@@ -13,8 +13,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
@@ -44,6 +44,42 @@
 #endif
 
 namespace Libs::Graphics {
+
+namespace {
+
+constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
+constexpr uint32_t PsInputFlatShade  = 0x00000400u;
+
+} // namespace
+
+uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input) {
+	return input < info.input_num ? info.interpolator_settings[input] & PsInputOffsetMask : input;
+}
+
+uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
+                                      std::span<const uint32_t> active_inputs, uint32_t input) {
+	std::array<bool, 32> used_locations {};
+	for (const auto active_input: active_inputs) {
+		auto location = ShaderPixelParameterMappedLocation(info, active_input);
+		if (location < used_locations.size() && used_locations[location]) {
+			location = active_input;
+			while (location < used_locations.size() && used_locations[location]) {
+				location++;
+			}
+			EXIT_NOT_IMPLEMENTED(location >= used_locations.size());
+		}
+
+		if (active_input == input) {
+			return location;
+		}
+		used_locations[location] = true;
+	}
+	return ShaderPixelParameterMappedLocation(info, input);
+}
+
+bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input) {
+	return input < info.input_num && (info.interpolator_settings[input] & PsInputFlatShade) != 0;
+}
 
 struct ShaderBinaryInfo {
 	uint8_t  signature[7];
@@ -798,7 +834,9 @@ static void ShaderGetStaticInputInfoPS(
 
 	ps_info = {};
 
-	ps_info.input_num                    = sh.ps_in_control;
+	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
+	// flags in the hardware state and extract only the input count here.
+	ps_info.input_num                    = sh.ps_in_control & 0x3fu;
 	ps_info.ps_system_input_base         = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs         = sh.ps_input_ena & sh.ps_input_addr;
 	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
@@ -826,11 +864,10 @@ static void ShaderGetStaticInputInfoPS(
 	    vs_info.stage.program != nullptr && !vs_info.stage.program->bindings.descriptors.empty()
 	        ? 1
 	        : 0;
-	ps_info.push_constant_offset =
-	    vs_info.stage.program != nullptr
-	        ? vs_info.stage.program->bindings.push_constant_offset +
-	              vs_info.stage.program->bindings.push_constant_size
-	        : 0;
+	ps_info.push_constant_offset = vs_info.stage.program != nullptr
+	                                   ? vs_info.stage.program->bindings.push_constant_offset +
+	                                         vs_info.stage.program->bindings.push_constant_size
+	                                   : 0;
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
@@ -1292,9 +1329,8 @@ static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
 
 	static std::atomic_int id = 0;
 
-	const auto base_name =
-	    Config::GetShaderLogFolder() /
-	    fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
+	const auto base_name = Config::GetShaderLogFolder() /
+	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
 	Common::File spv_file;
@@ -1343,9 +1379,8 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 
 	static std::atomic_int id = 0;
 
-	const auto base_name =
-	    Config::GetShaderLogFolder() / "original" /
-	    fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
+	const auto base_name = Config::GetShaderLogFolder() / "original" /
+	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
 	Common::File bin_file;
@@ -1607,6 +1642,7 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_z));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_w));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_front_face));
+	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_no_perspective));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pixel_kill_enable));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_sample_mask_export_enable));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_early_z));

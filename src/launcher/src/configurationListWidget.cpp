@@ -1,6 +1,5 @@
 #include "configurationListWidget.h"
 
-#include "patchesDialog.h"
 #include "common.h"
 #include "compatibilityDatabase.h"
 #include "configuration.h"
@@ -8,6 +7,7 @@
 #include "configurationItem.h"
 #include "gameListTreeWidget.h"
 #include "mainDialog.h"
+#include "patchesDialog.h"
 #include "trophyViewerDialog.h"
 
 #include <QAbstractItemModel>

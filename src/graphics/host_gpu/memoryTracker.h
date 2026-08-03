@@ -18,8 +18,7 @@ namespace Libs::Graphics {
 
 class MemoryTracker final {
 public:
-	explicit MemoryTracker(PageManager&  page_manager,
-	                       PageWatchMode gpu_watch_mode = PageWatchMode::ReadWrite);
+	explicit MemoryTracker(PageManager& page_manager);
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -30,28 +29,62 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] CpuFaultAction
-	                   BeginCpuFault(uint64_t vaddr, uint64_t size,
-	                                 PageFaultAccess access = PageFaultAccess::Write) noexcept;
-	[[nodiscard]] bool CompleteCpuFault(uint64_t vaddr, uint64_t size, PageFaultAccess access,
-	                                    bool downloaded) noexcept;
-	[[nodiscard]] bool InvalidateRegion(uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
-	[[nodiscard]] bool InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr,
-	                                             uint64_t size, PageFaultPhase phase) noexcept;
+	template <typename Flush>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
+		static_assert(std::is_invocable_v<Flush&>);
+		CheckNotInUploadCallback();
+		ValidateRange(vaddr, size);
+
+		const auto update_cpu_state = [this, vaddr, size] {
+			std::lock_guard             access(m_access_mutex);
+			std::vector<RegionManager*> managers;
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
+				managers.push_back(manager);
+			});
+			std::vector<std::unique_lock<TrackingSpinLock>> locks;
+			locks.reserve(managers.size());
+			for (auto* manager: managers) {
+				locks.emplace_back(manager->lock);
+			}
+			const bool gpu_modified = Iterate<false>(
+			    vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				    return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+			    });
+			if (gpu_modified) {
+				return true;
+			}
+			Iterate<false>(vaddr, size,
+			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               manager->ChangeState<DirtySource::Cpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes);
+			               });
+			return false;
+		};
+
+		if (!update_cpu_state()) {
+			return;
+		}
+		std::forward<Flush>(on_flush)();
+		if (update_cpu_state()) {
+			EXIT("memory invalidation retained GPU-owned pages\n");
+		}
+	}
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
 	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                               const char* operation);
+#else
+	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
+	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
+#endif
 
 	template <bool clear, typename Preflight, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-		std::lock_guard access(m_access_mutex);
-		RequireMapped(vaddr, size);
+		std::lock_guard             access(m_access_mutex);
 		std::vector<RegionManager*> managers;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
 			managers.push_back(manager);
@@ -63,9 +96,6 @@ public:
 		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const auto address = manager->GetCpuAddr() + offset;
-			if (manager->HasPendingFault(address, bytes)) {
-				EXIT("GPU download synchronization raced a pending CPU fault\n");
-			}
 			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes,
 			                                                                preflight);
 		});
@@ -77,10 +107,8 @@ public:
 			Iterate<false>(vaddr, size,
 			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				               const auto address = manager->GetCpuAddr() + offset;
-				               const auto changed =
-				                   manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
-				                       address, bytes, [](uint64_t, uint64_t) noexcept {});
-				               manager->ApplyGpuProtection(changed, false, m_gpu_watch_mode);
+				               manager->template ForEachModifiedRange<DirtySource::Gpu, true>(
+				                   address, bytes, [](uint64_t, uint64_t) noexcept {});
 			               });
 		}
 	}
@@ -91,11 +119,6 @@ public:
 		    vaddr, size, [](uint64_t, uint64_t) noexcept {}, std::forward<Func>(func));
 	}
 
-#if defined(KYTY_MEMORY_TRACKER_TESTS)
-	using UnmapContentionHook = void (*)() noexcept;
-	static void SetUnmapContentionHook(UnmapContentionHook hook) noexcept;
-#endif
-
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
@@ -103,12 +126,10 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		std::unique_lock access(m_access_mutex);
-		RequireMapped(vaddr, size);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->Track(manager->GetCpuAddr() + offset, bytes);
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {
@@ -117,13 +138,12 @@ public:
 		});
 		upload_func();
 		if (is_written) {
-			Iterate<false>(
-			    vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				    const auto changed = manager->template ChangeState<DirtySource::Gpu, true>(
-				        manager->GetCpuAddr() + offset, bytes);
-				    manager->ApplyGpuProtection(changed, true, m_gpu_watch_mode);
-				    manager->lock.unlock();
-			    });
+			Iterate<false>(vaddr, size,
+			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               manager->template ChangeState<DirtySource::Gpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes);
+				               manager->lock.unlock();
+			               });
 		}
 		s_upload_owner = previous_upload_owner;
 	}
@@ -168,16 +188,8 @@ private:
 		return false;
 	}
 
-	static void ValidateRange(uint64_t vaddr, uint64_t size);
-	void        UntrackMemoryLocked(uint64_t vaddr, uint64_t size);
-	void        RequireMapped(uint64_t vaddr, uint64_t size) const {
-		ValidateRange(vaddr, size);
-		if (!m_page_manager.IsMapped(vaddr, size)) {
-			EXIT("memory tracker range [0x%llx, 0x%llx) is not mapped\n",
-			     static_cast<unsigned long long>(vaddr),
-			     static_cast<unsigned long long>(vaddr + size));
-		}
-	}
+	static void    ValidateRange(uint64_t vaddr, uint64_t size);
+	void           UntrackMemoryLocked(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
@@ -185,7 +197,6 @@ private:
 	std::mutex                                     m_region_mutex;
 	std::mutex                                     m_access_mutex;
 	PageManager&                                   m_page_manager;
-	PageWatchMode                                  m_gpu_watch_mode = PageWatchMode::ReadWrite;
 };
 
 } // namespace Libs::Graphics

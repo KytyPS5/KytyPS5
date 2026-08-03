@@ -135,11 +135,8 @@ static void KYTY_SYSV_ABI asan_init() {
 	sys_dbg_stack_info_t s {};
 	SysStackUsage(s);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	AllocShadow(s.addr, reinterpret_cast<uintptr_t>(&s));
-#else
+	// Cover the full stack reservation.
 	AllocShadow(s.reserved_addr, reinterpret_cast<uintptr_t>(&s));
-#endif
 
 	LibKernel::Memory::RegisterCallbacks(KernelAlloc, KernelFree);
 }

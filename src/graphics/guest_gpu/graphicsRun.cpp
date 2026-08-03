@@ -32,11 +32,10 @@
 
 namespace Libs::Graphics {
 
-static thread_local CommandProcessor* g_current_processor      = nullptr;
-static thread_local Pm4Execution*     g_current_execution      = nullptr;
-static thread_local uint32_t          g_submission_pause_depth = 0;
-static thread_local bool              g_gpu_mutex_owned        = false;
-static thread_local bool              g_gpu_thread             = false;
+static thread_local CommandProcessor* g_current_processor = nullptr;
+static thread_local Pm4Execution*     g_current_execution = nullptr;
+static thread_local bool              g_gpu_mutex_owned   = false;
+static thread_local bool              g_gpu_thread        = false;
 
 class GpuMutexLock final {
 public:
@@ -98,8 +97,6 @@ public:
 	                   bool trigger_agc_interrupt_on_done);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void Done();
-	void PauseSubmissions();
-	void ResumeSubmissions();
 	void Shutdown();
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
@@ -410,8 +407,13 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	const uint32_t increment    = (write_control >> 16u) & 0x1u;
 	const uint32_t write_confirm = (write_control >> 20u) & 0x1u;
 
-	if (dst_sel != 0 && dst_sel != 2 && dst_sel != 4 && dst_sel != 5) {
-		EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
+	switch (dst_sel) {
+		case 0:
+		case 2:
+		case 4:
+		case 5:
+		case 6: break;
+		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
 	EXIT_NOT_IMPLEMENTED(increment != 0);
 
@@ -691,26 +693,6 @@ bool GpuState::Process(Submission& submission) {
 	return complete;
 }
 
-void GpuState::PauseSubmissions() {
-	if (g_gpu_mutex_owned) {
-		EXIT("GPU submissions are already paused by this thread\n");
-	}
-	g_gpu_mutex_owned = true;
-	m_submission_mutex.Lock();
-	if (!IsGpuThread()) {
-		WaitLocked();
-	}
-	m_renderer.GetCommandScheduler().DrainPriorityOperations();
-}
-
-void GpuState::ResumeSubmissions() {
-	if (!g_gpu_mutex_owned) {
-		EXIT("GPU submissions resumed without an active pause\n");
-	}
-	m_submission_mutex.Unlock();
-	g_gpu_mutex_owned = false;
-}
-
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution& execution, uint32_t* buffer,
                                            uint32_t size_dw) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
@@ -962,9 +944,8 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	auto* index_addr = reinterpret_cast<const void*>(
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(),
-	                                             m_index_type_and_size, index_count, index_addr,
-	                                             flags, 1, m_num_instances);
+	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size,
+	                                         index_count, index_addr, flags, 1, m_num_instances);
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
@@ -1002,8 +983,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 				     args.start_vertex_location, args.start_instance_location);
 			}
 		}
-		DrawIndexAuto(args.vertex_count_per_instance, 0, 0, args.instance_count,
-		              args.start_vertex_location, args.start_instance_location);
+		m_num_instances = args.instance_count;
+		SubmitNonIndexedDraw(args.vertex_count_per_instance, 0, 0, args.start_vertex_location,
+		                     args.start_instance_location);
 		return;
 	}
 
@@ -1043,6 +1025,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		}
 	}
 
+	m_num_instances = args.instance_count;
 	DrawIndex(index_count, index_addr, 0, 1, args.instance_count, nullptr, 0,
 	          static_cast<int32_t>(args.base_vertex_location), args.start_instance_location);
 }
@@ -1100,8 +1083,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 					     args->start_vertex_location, args->start_instance_location);
 				}
 			}
-			DrawIndexAuto(args->vertex_count_per_instance, 0, 0, args->instance_count,
-			              args->start_vertex_location, args->start_instance_location);
+			m_num_instances = args->instance_count;
+			SubmitNonIndexedDraw(args->vertex_count_per_instance, 0, 0, args->start_vertex_location,
+			                     args->start_instance_location);
 			continue;
 		}
 
@@ -1142,6 +1126,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			}
 		}
 
+		m_num_instances = args->instance_count;
 		DrawIndex(index_count, index_addr, 0, 1, args->instance_count, nullptr, 0,
 		          static_cast<int32_t>(args->base_vertex_location), args->start_instance_location);
 	}
@@ -1190,8 +1175,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		m_renderer.GetRenderExecutor().DispatchDirect(
-		    m_submit_id, CurrentBuffer(), thread_group_x, thread_group_y, thread_group_z, mode);
+		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		                                              thread_group_y, thread_group_z, mode);
 	}
 
 	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1233,20 +1218,25 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(uint32_t index_count, uint32_t flags,
-                                     uint32_t render_target_slice_offset, uint32_t instance_count,
-                                     uint32_t first_vertex, uint32_t first_instance) {
+                                     uint32_t render_target_slice_offset) {
+	SubmitNonIndexedDraw(index_count, flags, render_target_slice_offset, 0, 0);
+}
+
+void CommandProcessor::SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,
+                                            uint32_t render_target_slice_offset,
+                                            uint32_t first_vertex, uint32_t first_instance) {
 	CheckBuffer();
 
-	m_renderer.GetRenderExecutor().DrawAuto(
-	    m_submit_id, CurrentBuffer(), index_count, flags, render_target_slice_offset,
-	    instance_count, first_vertex, first_instance);
+	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), vertex_count, flags,
+	                                        render_target_slice_offset, m_num_instances,
+	                                        first_vertex, first_instance);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                              static_cast<int>(display_buffer_index));
+	                                      static_cast<int>(display_buffer_index));
 }
 
 template <typename T>
@@ -1317,8 +1307,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
-					Sync::ReadGds(m_renderer.GetBufferCache().GetGdsBuffer(), dst,
-					              value & 0xffffu, value >> 16u);
+					Sync::ReadGds(m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
+					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,
 					                            value >> 16u);
 					return;
@@ -1486,8 +1476,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
 	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask =
-	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
@@ -1690,46 +1679,12 @@ int Gpu::GetFrameNum() const {
 	return m_state->GetFrameNum();
 }
 
-void Gpu::PauseSubmissions() {
-	m_state->PauseSubmissions();
-}
-
-void Gpu::ResumeSubmissions() {
-	m_state->ResumeSubmissions();
-}
-
-Gpu::SubmissionLock::SubmissionLock(Gpu& gpu): m_gpu(gpu) {
-	if (g_current_processor != nullptr || g_submission_pause_depth == UINT32_MAX) {
-		EXIT("cannot acquire GPU submission lock in the current state\n");
-	}
-	if (g_submission_pause_depth++ == 0) {
-		m_gpu.PauseSubmissions();
-	}
-}
-
-Gpu::SubmissionLock::~SubmissionLock() {
-	if (g_submission_pause_depth == 0) {
-		EXIT("GPU submission lock released without ownership\n");
-	}
-	if (--g_submission_pause_depth == 0) {
-		m_gpu.ResumeSubmissions();
-	}
-}
-
 bool Gpu::IsCommandProcessorThread() noexcept {
 	return g_current_processor != nullptr;
 }
 
 CommandProcessor* Gpu::CurrentCommandProcessor() noexcept {
 	return g_current_processor;
-}
-
-bool Gpu::SubmissionLockHeld() noexcept {
-	return g_submission_pause_depth != 0;
-}
-
-bool Gpu::MutexHeld() noexcept {
-	return g_gpu_mutex_owned;
 }
 
 } // namespace Libs::Graphics

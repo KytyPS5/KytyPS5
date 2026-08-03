@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <utility>
@@ -6,8 +6,8 @@
 namespace Libs::Graphics {
 
 bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::Program> program,
-	                               std::span<const uint32_t> user_data, uint64_t shader_base,
-	                               ShaderStageRuntime& stage, std::string* error) {
+                                   std::span<const uint32_t> user_data, uint64_t shader_base,
+                                   ShaderStageRuntime& stage, std::string* error) {
 	if (program == nullptr) {
 		if (error != nullptr) {
 			*error = "missing native shader plan";

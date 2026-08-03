@@ -17,7 +17,7 @@ bool Fail(std::string* error, const char* message) {
 } // namespace
 
 bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
-	                          ShaderVertexMetadata& metadata, std::string* error) {
+                              ShaderVertexMetadata& metadata, std::string* error) {
 	if (data.user_data == nullptr) {
 		return Fail(error, "missing AGC user-data header");
 	}

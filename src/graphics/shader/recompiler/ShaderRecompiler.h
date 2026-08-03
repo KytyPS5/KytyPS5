@@ -3,7 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
-#include "graphics/shader/recompiler/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <optional>
@@ -44,7 +44,7 @@ struct CompileResult {
 };
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
-	              CompileResult& result, std::string* error);
+                  CompileResult& result, std::string* error);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

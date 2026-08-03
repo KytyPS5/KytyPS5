@@ -33,8 +33,8 @@ static uint64_t MonotonicTimeNs() {
 }
 
 static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
-static Common::Mutex                                    g_equeues_mutex;
-static uint64_t                                         g_next_equeue = 1;
+static Common::Mutex                                     g_equeues_mutex;
+static uint64_t                                          g_next_equeue = 1;
 
 class KernelEqueuePrivate {
 public:
@@ -459,8 +459,7 @@ int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id) {
 int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t user event edge add: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
-	     id);
+	LOGF("\t user event edge add: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	KernelEqueueEvent event {};
 	event.event.ident         = static_cast<uintptr_t>(id);
@@ -485,7 +484,7 @@ int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 }
 
 int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
-	int                        triggered = 0;
+	int                          triggered = 0;
 	std::vector<KernelEqueueRef> queues;
 
 	{
@@ -507,8 +506,7 @@ int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t user event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
-	     id);
+	LOGF("\t user event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
 }
@@ -577,8 +575,7 @@ int KYTY_SYSV_ABI KernelAddAmprSystemEvent(KernelEqueue eq, int id, void* udata)
 int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
-	     id);
+	LOGF("\t AMPR event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq), id);
 
 	if (eq != KERNEL_EQUEUE_INVALID) {
 		(void)KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
@@ -590,8 +587,8 @@ int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id) {
 int KYTY_SYSV_ABI KernelDeleteAmprSystemEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
-	LOGF("\t AMPR system event delete: eq = 0x%016" PRIx64 ", id = %d\n",
-	     static_cast<uint64_t>(eq), id);
+	LOGF("\t AMPR system event delete: eq = 0x%016" PRIx64 ", id = %d\n", static_cast<uint64_t>(eq),
+	     id);
 
 	return KernelDeleteAmprEvent(eq, id);
 }

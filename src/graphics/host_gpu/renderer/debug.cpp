@@ -359,29 +359,11 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		if (rt.attrib3.depth != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 color target depth_minus1=0x%08" PRIx32
-				     "\n",
-				     rt.attrib3.depth);
-				logged = true;
-			}
-		}
 		if (!RenderIsColorTileMode(rt.attrib3.tile_mode)) {
 			EXIT("unknown PS5 render-target tile mode: 0x%08" PRIx32 "\n", rt.attrib3.tile_mode);
 		}
 		if (!RenderIsColorDimension(rt.attrib3.dimension)) {
 			EXIT("unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);
-		}
-		if (rt.attrib3.dimension != 0x00000001) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: using 2D fallback for PS5 color "
-				     "dimension=0x%08" PRIx32 "\n",
-				     rt.attrib3.dimension);
-				logged = true;
-			}
 		}
 		if (!rt.attrib3.cmask_pipe_aligned) {
 			static bool logged = false;
@@ -497,7 +479,15 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static void ZCheck(const HW::DepthRenderTarget& z) {
+static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
+                   const HW::RenderControl& rc) {
+	const bool depth_active =
+	    dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || rc.depth_clear_enable;
+	const bool stencil_active = dc.stencil_enable || rc.stencil_clear_enable;
+	if (!depth_active && !stencil_active) {
+		return;
+	}
+
 	EXIT_NOT_IMPLEMENTED(!z.z_info.HasValidTextureCompatibility());
 	EXIT_NOT_IMPLEMENTED(!z.stencil_info.HasValidTextureCompatibility());
 	if (z.z_info.format == 0) {
@@ -548,14 +538,6 @@ static void ZCheck(const HW::DepthRenderTarget& z) {
 		EXIT_NOT_IMPLEMENTED(z.htile_surface.prefetch_height != 0x00000000);
 		EXIT_NOT_IMPLEMENTED(z.htile_surface.dst_outside_zero_to_one != 0x00000000);
 
-		if (z.depth_view.slice_start != 0x00000000 || z.depth_view.slice_max != 0x00000000) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DepthTarget: temporary: ignoring PS5 array slice view start=0x%08" PRIx32
-				     ", max=0x%08" PRIx32 "\n",
-				     z.depth_view.slice_start, z.depth_view.slice_max);
-			}
-		}
 		if (z.depth_view.current_mip_level != 0x00000000) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -1214,7 +1196,7 @@ void hw_check(const RenderCommandBuffer& buffer) {
 	log_phase("vp");
 	VpCheck(vp, smc);
 	log_phase("z");
-	ZCheck(z);
+	ZCheck(z, d, rc);
 	log_phase("clip");
 	ClipCheck(c);
 	log_phase("rc");

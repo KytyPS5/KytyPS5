@@ -5,7 +5,7 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -251,9 +251,9 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
                              int64_t flip_arg) {
 	for (;;) {
 		uint64_t   request_id = 0;
-		auto&      video_out = buffer.GetContext().GetVideoOut();
-		const auto result = video_out.SubmitFlipFromGpu(
-		    buffer, handle, index, flip_mode, flip_arg, request_id);
+		auto&      video_out  = buffer.GetContext().GetVideoOut();
+		const auto result =
+		    video_out.SubmitFlipFromGpu(buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
 			return request_id;

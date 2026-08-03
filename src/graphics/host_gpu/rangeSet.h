@@ -59,6 +59,16 @@ public:
 		return result;
 	}
 
+	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return false;
+		}
+		--it;
+		return it->first <= address && it->second >= end;
+	}
+
 	template <typename Func>
 	void ForEachIntersection(uint64_t address, uint64_t size, Func&& func) const {
 		const auto end = End(address, size);

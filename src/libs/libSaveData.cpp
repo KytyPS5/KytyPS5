@@ -4,9 +4,11 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/saveDataMountSlots.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
@@ -23,7 +25,6 @@ namespace SaveData {
 
 // TODO(): specify dir at launcher
 static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
-static constexpr char     SAVE_DATA_POINT[]    = "/savedata0";
 static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
 
 struct SceSaveDataDirName {
@@ -234,6 +235,8 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
 static std::vector<uint8_t>      g_save_data_memory(0x10000);
 static int32_t                   g_next_transaction_resource = 1;
 static std::deque<SaveDataEvent> g_save_data_events;
+static SaveDataMountSlots        g_mount_slots;
+static Common::Mutex             g_mount_mutex;
 
 static std::string get_title_id() {
 	std::string title_id;
@@ -291,6 +294,18 @@ static bool dir_name_match(const char* str, const char* pattern) {
 	return *str == '\0' && *pattern == '\0';
 }
 
+static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
+                           uint32_t status, SaveDataMountResult* result) {
+	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
+	LibKernel::FileSystem::Mount(directory, mount_point);
+	g_mount_slots.Mount(static_cast<size_t>(slot), dir_name);
+	std::snprintf(result->mount_point.data, sizeof(result->mount_point.data), "%s",
+	              mount_point.c_str());
+	result->required_blocks = 0;
+	result->mount_status    = status;
+	return OK;
+}
+
 int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 	PRINT_NAME();
 
@@ -302,6 +317,10 @@ int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 int KYTY_SYSV_ABI SaveDataTerminate() {
 	PRINT_NAME();
 
+	Common::LockGuard lock(g_mount_mutex);
+	if (!g_mount_slots.Empty()) {
+		return SAVE_DATA_ERROR_BUSY;
+	}
 	g_save_data_events.clear();
 
 	return OK;
@@ -356,7 +375,8 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
-			if (!entry.is_file && !Common::StartsWith(entry.name, "sce_")) {
+			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
+			    !Common::StartsWith(entry.name, "sce_")) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -418,12 +438,21 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	*mount_result = {};
 
-	std::string mount_dir   = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
-	                          std::string(mount->dir_name->data);
-	std::string mount_point = SAVE_DATA_POINT;
-	bool        create      = ((mount->mount_mode & 4u) != 0);
-	bool        create2     = ((mount->mount_mode & 32u) != 0);
-	bool        open        = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string dir_name = mount->dir_name->data;
+	const std::string mount_dir =
+	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
+	const bool create  = ((mount->mount_mode & 4u) != 0);
+	const bool create2 = ((mount->mount_mode & 32u) != 0);
+	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
+
+	const int slot = g_mount_slots.FindAvailable(dir_name);
+	if (slot == SaveDataMountSlots::BUSY) {
+		return SAVE_DATA_ERROR_BUSY;
+	}
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_MOUNT_FULL;
+	}
 
 	if (!create && !create2 && !open) {
 		EXIT("unknown mount mode: %u", mount->mount_mode);
@@ -445,16 +474,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
-	LibKernel::FileSystem::Mount(mount_dir, mount_point);
-
-	int s = snprintf(mount_result->mount_point.data, 16, "%s", mount_point.c_str());
-
-	EXIT_NOT_IMPLEMENTED(s >= 16);
-
-	mount_result->required_blocks = 0;
-	mount_result->mount_status    = (created ? 1 : 0);
-
-	return OK;
+	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
@@ -575,24 +595,23 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 
 	*mount_result = {};
 
-	std::string mount_dir   = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
-	                          std::string(mount->dir_name->data);
-	std::string mount_point = SAVE_DATA_POINT;
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string dir_name = mount->dir_name->data;
+	const std::string mount_dir =
+	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
+	const int slot = g_mount_slots.FindAvailable(dir_name);
+	if (slot == SaveDataMountSlots::BUSY) {
+		return SAVE_DATA_ERROR_BUSY;
+	}
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_MOUNT_FULL;
+	}
 
 	if (!Common::File::IsDirectoryExisting(mount_dir)) {
 		Common::File::CreateDirectories(mount_dir);
 	}
 
-	LibKernel::FileSystem::Mount(mount_dir, mount_point);
-
-	int s = snprintf(mount_result->mount_point.data, 16, "%s", mount_point.c_str());
-
-	EXIT_NOT_IMPLEMENTED(s >= 16);
-
-	mount_result->required_blocks = 0;
-	mount_result->mount_status    = 1;
-
-	return OK;
+	return mount_save_data(slot, dir_name, mount_dir, 1, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
@@ -606,11 +625,18 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 	     "\t mount_point = %s\n",
 	     mode, mount_point->data);
 
+	Common::LockGuard lock(g_mount_mutex);
+	const std::string point = mount_point->data;
+	const int         slot  = g_mount_slots.Find(point);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_FOUND;
+	}
+
 	if ((mode & SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}
-
-	LibKernel::FileSystem::Umount(std::string(mount_point->data));
+	LibKernel::FileSystem::Umount(point);
+	g_mount_slots.Release(static_cast<size_t>(slot));
 
 	return OK;
 }

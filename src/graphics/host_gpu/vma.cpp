@@ -122,9 +122,9 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
 	uint64_t usage = 0;
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
-		const bool device_local = static_cast<bool>(
-		    physical_device_memory_properties.memoryHeaps[heap].flags &
-		    vk::MemoryHeapFlagBits::eDeviceLocal);
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
 		if (!discrete || device_local) {
 			usage += budgets[heap].usage;
 		}
@@ -144,7 +144,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	uint64_t local  = 0;
 	uint64_t usage  = 0;
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
-		const auto& properties   = physical_device_memory_properties.memoryHeaps[heap];
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
 		const bool  device_local =
 		    static_cast<bool>(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal);
 		if (device_local) {
@@ -159,9 +159,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
 	}
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
-	const auto available = budget > usage ? budget - usage : uint64_t {0};
-	return std::max(local,
-	                available > system_reserve ? available - system_reserve : uint64_t {0});
+	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
+	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
 void GraphicContext::CreateBuffer(uint64_t size, VulkanBuffer& buffer) {

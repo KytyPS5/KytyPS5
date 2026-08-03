@@ -34,7 +34,8 @@ namespace LibNet {
 
 LIB_VERSION("Net", 1, "Net", 1, 1);
 
-static thread_local int g_net_errno = 0;
+static thread_local int   g_net_errno = 0;
+static constexpr uint32_t g_in6addr_any[4] {};
 
 namespace Net = Network::Net;
 
@@ -94,6 +95,10 @@ int KYTY_SYSV_ABI NetListen(int s, int backlog) {
 
 int KYTY_SYSV_ABI NetShutdown(int s, int how) {
 	return FinishSocketCall(Net::Shutdown(s, how));
+}
+
+int KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
+	return FinishSocketCall(Net::Getsockname(s, addr, addrlen));
 }
 
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
@@ -180,6 +185,8 @@ uint16_t KYTY_SYSV_ABI NetNtohs(uint16_t net16) {
 }
 
 LIB_DEFINE(InitNet_1_Net) {
+	LIB_OBJECT("ZRAJo-A-ukc", &LibNet::g_in6addr_any);
+
 	LIB_FUNC("Nlev7Lg8k3A", LibNet::NetInit);
 	LIB_FUNC("HQOwnfMGipQ", LibNet::GetNetErrorAddr);
 	LIB_FUNC("PIWqhn9oSxc", LibNet::NetAccept);
@@ -193,6 +200,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);
 	LIB_FUNC("6Oc0bLsIYe0", LibNet::NetGetMacAddress);
 	LIB_FUNC("hLuXdjHnhiI", LibNet::NetGetSockInfo);
+	LIB_FUNC("hoOAofhhRvE", LibNet::NetGetsockname);
 	LIB_FUNC("SF47kB2MNTo", LibNet::NetEpollCreate);
 	LIB_FUNC("ZVw46bsasAk", LibNet::NetEpollControl);
 	LIB_FUNC("drjIbDbA7UQ", LibNet::NetEpollWait);
@@ -651,6 +659,8 @@ namespace LibHttp2 {
 LIB_VERSION("Http2", 1, "Http2", 1, 1);
 
 constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
+constexpr int HTTP2_ERROR_BEFORE_SEND  = -2122641307; /* 0x817B1065 */
+constexpr int HTTP2_ERROR_TIMEOUT      = -2122641304; /* 0x817B1068 */
 constexpr int HTTP2_ERROR_NULL_POINTER = -2122640859; /* 0x817B1225 */
 
 struct Http2Options {
@@ -691,14 +701,14 @@ struct Http2Request {
 	std::string                                      url;
 	uint64_t                                         content_length = 0;
 	std::vector<std::pair<std::string, std::string>> headers;
-	bool                                             sent        = false;
-	int                                              status_code = 204;
-	std::string  response_headers                                = "HTTP/2 204 No Content\r\n\r\n";
-	std::string  response_body;
-	size_t       read_offset  = 0;
-	int          async_result = 0;
-	int          async_event  = 0;
-	Http2Options options;
+	int                                              send_result = HTTP2_ERROR_BEFORE_SEND;
+	int                                              status_code = 0;
+	std::string                                      response_headers;
+	std::string                                      response_body;
+	size_t                                           read_offset  = 0;
+	int                                              async_result = HTTP2_ERROR_BEFORE_SEND;
+	int                                              async_event  = 0;
+	Http2Options                                     options;
 };
 
 struct Http2AsyncResult {
@@ -1111,9 +1121,9 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	request->second.sent = true;
+	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
-	return 0;
+	return request->second.send_result;
 }
 
 static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
@@ -1133,8 +1143,8 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	request->second.sent         = true;
-	request->second.async_result = 0;
+	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
+	request->second.async_result = request->second.send_result;
 	request->second.async_event  = 0;
 
 	return 0;
@@ -1156,11 +1166,10 @@ static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, ui
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	request->second.sent = true;
-	*result              = {};
-	result->event_type   = request->second.async_event;
-	result->req_id       = req_id;
-	result->result       = request->second.async_result;
+	*result            = {};
+	result->event_type = request->second.async_event;
+	result->req_id     = req_id;
+	result->result     = request->second.async_result;
 
 	return 0;
 }
@@ -1175,13 +1184,19 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	*status_code = 0;
+
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	*status_code = request->second.status_code;
+	const int send_result = request->second.send_result;
+	if (send_result != 0) {
+		return send_result;
+	}
 
+	*status_code = request->second.status_code;
 	return 0;
 }
 
@@ -1197,14 +1212,21 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	*result         = 0;
+	*content_length = 0;
+
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	*result         = 0; // SCE_HTTP2_CONTENTLEN_EXIST
-	*content_length = request->second.response_body.size();
+	const int send_result = request->second.send_result;
+	if (send_result != 0) {
+		*result = -1;
+		return send_result;
+	}
 
+	*content_length = request->second.response_body.size();
 	return 0;
 }
 
@@ -1220,14 +1242,21 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 		return HTTP2_ERROR_NULL_POINTER;
 	}
 
+	*header      = nullptr;
+	*header_size = 0;
+
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	const int send_result = request->second.send_result;
+	if (send_result != 0) {
+		return send_result;
+	}
+
 	*header      = const_cast<char*>(request->second.response_headers.c_str());
 	*header_size = request->second.response_headers.size();
-
 	return 0;
 }
 
@@ -1245,6 +1274,11 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	const int send_result = request->second.send_result;
+	if (send_result != 0) {
+		return send_result;
 	}
 
 	const auto& body = request->second.response_body;
@@ -1275,6 +1309,13 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	const int send_result = request->second.send_result;
+	if (send_result != 0) {
+		request->second.async_result = send_result;
+		request->second.async_event  = 1;
+		return 0;
 	}
 
 	const auto& body = request->second.response_body;
@@ -1395,6 +1436,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("O80NrhUOPGY", NpManager::NpCheckPremium);
 	LIB_FUNC("eQH7nWPcAgc", NpManager::NpGetState);
 	LIB_FUNC("e-ZuhGEoeC4", NpManager::NpGetNpReachabilityState);
+	LIB_FUNC("Oad3rvY-NJQ", NpManager::NpHasSignedUp);
 }
 
 } // namespace LibNpManager

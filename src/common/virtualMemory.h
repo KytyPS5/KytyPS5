@@ -37,7 +37,6 @@ bool     Free(uint64_t address);
 bool     FreeRange(uint64_t address, uint64_t size);
 bool     Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nullptr);
 bool     FlushInstructionCache(uint64_t address, uint64_t size);
-bool     PatchReplace(uint64_t vaddr, uint64_t value);
 
 } // namespace VirtualMemory
 

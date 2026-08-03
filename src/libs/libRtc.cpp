@@ -4,6 +4,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -247,20 +248,12 @@ static int KYTY_SYSV_ABI RtcGetCurrentTick(RtcTick* tick) {
 		return RTC_ERROR_DATETIME_UNINITIALIZED;
 	}
 
-	const auto now  = Common::DateTime::FromSystemUTC();
-	const auto date = now.GetDate();
-	const auto tod  = now.GetTime();
-
-	RtcDateTime time {};
-	time.year        = static_cast<uint16_t>(date.Year());
-	time.month       = static_cast<uint16_t>(date.Month());
-	time.day         = static_cast<uint16_t>(date.Day());
-	time.hour        = static_cast<uint16_t>(tod.Hour24());
-	time.minute      = static_cast<uint16_t>(tod.Minute());
-	time.second      = static_cast<uint16_t>(tod.Second());
-	time.microsecond = static_cast<uint32_t>(tod.Msec() * 1000);
-
-	return RtcGetTick(&time, tick);
+	const auto now_us =
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                              std::chrono::system_clock::now().time_since_epoch())
+	                              .count());
+	tick->tick = RTC_UNIX_EPOCH_TICKS + now_us;
+	return OK;
 }
 
 static int KYTY_SYSV_ABI RtcGetCurrentNetworkTick(RtcTick* tick) {

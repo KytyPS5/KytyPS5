@@ -1,5 +1,6 @@
-#include "graphics/shader/recompiler/ScalarProvenance.h"
-#include "graphics/shader/recompiler/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/ReadLaneElimination.h"
+#include "graphics/shader/recompiler/ir/ScalarProvenance.h"
+#include "graphics/shader/recompiler/ir/SrtWalker.h"
 
 #include <cstring>
 #include <iostream>
@@ -184,6 +185,39 @@ void TestCfgPhi() {
 	          program.srt.dynamic_sources[0] ==
 	              program.blocks[3].instructions[0].memory.resource_source,
 	      "acyclic control-flow descriptor phi was not classified dynamic");
+}
+
+void TestNestedLoopPhiConvergence() {
+	Program program;
+	program.blocks.resize(4);
+	program.blocks[0].predecessors = {1};
+	program.blocks[0].successors   = {1};
+	program.blocks[1].predecessors = {0, 3};
+	program.blocks[1].successors   = {0, 2};
+	program.blocks[2].predecessors = {1};
+	program.blocks[2].successors   = {3};
+	program.blocks[3].predecessors = {2};
+	program.blocks[3].successors   = {1};
+	Instruction increment;
+	increment.op                   = Opcode::IAddU32;
+	increment.dst                  = Sgpr(0);
+	increment.src[0]               = Sgpr(0);
+	increment.src[1]               = Imm(1);
+	increment.src_count            = 2;
+	program.blocks[0].instructions = {increment};
+	program.blocks[2].instructions = {BufferUse(4, 0)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto* source =
+	    GetDescriptorSource(program, program.blocks[2].instructions[0].memory.resource_source);
+	Check(source != nullptr, "nested-loop descriptor source was not attached");
+	const auto  value_id = source->dwords[0];
+	const auto& phi      = Value(program, value_id);
+	Check(phi.op == ScalarValueOp::Phi && phi.phi_args.size() == 2 &&
+	          ((phi.phi_args[0] == value_id && phi.phi_args[1] != value_id) ||
+	           (phi.phi_args[1] == value_id && phi.phi_args[0] != value_id)),
+	      "nested loop did not retain its recursive scalar provenance phi");
 }
 
 void TestDiamondReadPathsAreDynamic() {
@@ -409,19 +443,19 @@ void TestReadLaneDescriptorSpill() {
 	program.blocks[0].instructions.push_back(MoveImmediate(0xb0, 84, 0));
 	program.blocks[0].instructions.push_back(ReadLane(0x510, 0, 11, 0));
 	Instruction sample;
-	sample.pc                     = 0x868;
-	sample.op                     = Opcode::ImageSample;
-	sample.memory.kind            = ResourceKind::Image;
-	sample.memory.resource        = 0;
-	sample.memory.sampler         = 4;
+	sample.pc              = 0x868;
+	sample.op              = Opcode::ImageSample;
+	sample.memory.kind     = ResourceKind::Image;
+	sample.memory.resource = 0;
+	sample.memory.sampler  = 4;
 	sample.memory.image_dimension =
 	    Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D;
 	program.blocks[0].instructions.push_back(sample);
 
 	std::string error;
 	Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error), error.c_str());
-	const auto source_id = program.blocks[0].instructions.back().memory.resource_source;
-	const auto* source   = GetDescriptorSource(program, source_id);
+	const auto  source_id = program.blocks[0].instructions.back().memory.resource_source;
+	const auto* source    = GetDescriptorSource(program, source_id);
 	Check(source != nullptr && DescriptorSourceResolved(program, source_id),
 	      "readlane descriptor spill was not resolved");
 	Check(Value(program, source->dwords[0]).op == ScalarValueOp::ReadConstBuffer,
@@ -429,7 +463,7 @@ void TestReadLaneDescriptorSpill() {
 	std::vector<uint32_t> user_data(28);
 	SetPointer(&user_data, 24, table.data());
 	user_data[26] = sizeof(table);
-	DescriptorValue descriptor;
+	DescriptorValue  descriptor;
 	const SrtRuntime runtime {user_data, 0, ReadHostMemory, nullptr};
 	Check(EvaluateDescriptorSource(program, source_id, sample.pc, runtime, descriptor, &error),
 	      error.c_str());
@@ -443,13 +477,13 @@ void TestReadLaneVectorOverwriteInvalidatesSpill() {
 	program.user_data_count = 8;
 	program.blocks.resize(1);
 	Instruction overwrite;
-	overwrite.pc        = 4;
-	overwrite.op        = Opcode::MoveU32;
-	overwrite.dst       = Vgpr(11);
-	overwrite.src[0]    = Imm(0);
-	overwrite.src_count = 1;
-	program.blocks[0].instructions = {WriteLane(0, 11, 4, 0), overwrite,
-	                                  ReadLane(8, 0, 11, 0), BufferUse(12, 0)};
+	overwrite.pc                   = 4;
+	overwrite.op                   = Opcode::MoveU32;
+	overwrite.dst                  = Vgpr(11);
+	overwrite.src[0]               = Imm(0);
+	overwrite.src_count            = 1;
+	program.blocks[0].instructions = {WriteLane(0, 11, 4, 0), overwrite, ReadLane(8, 0, 11, 0),
+	                                  BufferUse(12, 0)};
 
 	std::string error;
 	Check(BuildScalarProvenance(program, &error), error.c_str());
@@ -511,13 +545,13 @@ void TestReadLaneWideAndRelativeWritesInvalidateSpill() {
 		program.user_data_count = 8;
 		program.blocks.resize(1);
 		Instruction overwrite;
-		overwrite.pc        = 4;
-		overwrite.op        = op;
-		overwrite.dst       = Vgpr(11);
-		overwrite.src[0]    = Imm(0);
-		overwrite.src_count = 1;
-		program.blocks[0].instructions = {WriteLane(0, 12, 4, 0), overwrite,
-		                                  ReadLane(8, 0, 12, 0), BufferUse(12, 0)};
+		overwrite.pc                   = 4;
+		overwrite.op                   = op;
+		overwrite.dst                  = Vgpr(11);
+		overwrite.src[0]               = Imm(0);
+		overwrite.src_count            = 1;
+		program.blocks[0].instructions = {WriteLane(0, 12, 4, 0), overwrite, ReadLane(8, 0, 12, 0),
+		                                  BufferUse(12, 0)};
 
 		std::string error;
 		Check(BuildScalarProvenance(program, &error), error.c_str());
@@ -551,13 +585,127 @@ void TestReadLaneModuloAndDynamicLane() {
 	dynamic.wave_size       = 64;
 	dynamic.user_data_count = 8;
 	dynamic.blocks.resize(1);
-	auto write    = WriteLane(0, 11, 4, 0);
-	write.src[1]  = Sgpr(7);
+	auto write                     = WriteLane(0, 11, 4, 0);
+	write.src[1]                   = Sgpr(7);
 	dynamic.blocks[0].instructions = {write, ReadLane(4, 0, 11, 0), BufferUse(8, 0)};
 	Check(BuildScalarProvenance(dynamic, &error), error.c_str());
-	Check(!DescriptorSourceResolved(
-	          dynamic, dynamic.blocks[0].instructions.back().memory.resource_source),
+	Check(!DescriptorSourceResolved(dynamic,
+	                                dynamic.blocks[0].instructions.back().memory.resource_source),
 	      "dynamic writelane selector retained unsafe lane provenance");
+}
+
+void TestReadLaneEliminationSnapshotsWriteValue() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(1);
+	program.blocks[0].instructions = {MoveImmediate(0, 4, 0x12345678u), WriteLane(4, 11, 4, 4),
+	                                  MoveImmediate(8, 4, 0xdeadbeefu), ReadLane(12, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 1 && stats.shadow_writes == 1,
+	      "fixed readlane was not rewritten through a writelane shadow");
+	const auto& instructions = program.blocks[0].instructions;
+	Check(instructions.size() == 5 && instructions[2].op == Opcode::MoveU32 &&
+	          instructions[2].dst.kind == OperandKind::Register &&
+	          instructions[2].dst.reg.file == RegisterFile::Scalar &&
+	          instructions[2].dst.reg.index >= 128 && instructions[2].src[0] == Sgpr(4),
+	      "writelane did not snapshot its source into a temporary scalar");
+	Check(instructions[4].op == Opcode::MoveU32 && instructions[4].dst == Sgpr(0) &&
+	          instructions[4].src[0] == instructions[2].dst,
+	      "readlane did not consume the writelane snapshot");
+}
+
+void TestReadLaneEliminationMergesControlFlowWrites() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(4);
+	program.blocks[0].successors   = {1, 2};
+	program.blocks[1].predecessors = {0};
+	program.blocks[1].successors   = {3};
+	program.blocks[2].predecessors = {0};
+	program.blocks[2].successors   = {3};
+	program.blocks[3].predecessors = {1, 2};
+	program.blocks[1].instructions = {WriteLane(0, 11, 4, 4)};
+	program.blocks[2].instructions = {WriteLane(4, 11, 5, 4)};
+	program.blocks[3].instructions = {ReadLane(8, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 1 && stats.shadow_writes == 2,
+	      "readlane merge did not shadow both reaching writelane definitions");
+	const auto branch_a_temp = program.blocks[1].instructions[1].dst;
+	const auto branch_b_temp = program.blocks[2].instructions[1].dst;
+	Check(branch_a_temp == branch_b_temp &&
+	          program.blocks[3].instructions[0].op == Opcode::MoveU32 &&
+	          program.blocks[3].instructions[0].src[0] == branch_a_temp,
+	      "control-flow writelanes did not merge through one shadow register");
+}
+
+void TestReadLaneEliminationRequiresWriteOnEveryPath() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(4);
+	program.blocks[0].successors   = {1, 2};
+	program.blocks[1].predecessors = {0};
+	program.blocks[1].successors   = {3};
+	program.blocks[2].predecessors = {0};
+	program.blocks[2].successors   = {3};
+	program.blocks[3].predecessors = {1, 2};
+	program.blocks[1].instructions = {WriteLane(0, 11, 4, 4)};
+	program.blocks[3].instructions = {ReadLane(4, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 0 && stats.shadow_writes == 0 &&
+	          program.blocks[3].instructions[0].op == Opcode::ReadLaneU32,
+	      "readlane without a definition on every path was unsafely rewritten");
+}
+
+void TestReadLaneEliminationHonorsVectorInvalidation() {
+	Program program;
+	program.wave_size       = 64;
+	program.user_data_count = 8;
+	program.blocks.resize(1);
+	Instruction overwrite;
+	overwrite.pc                   = 4;
+	overwrite.op                   = Opcode::MoveU32;
+	overwrite.dst                  = Vgpr(11);
+	overwrite.src[0]               = Imm(0);
+	overwrite.src_count            = 1;
+	program.blocks[0].instructions = {WriteLane(0, 11, 4, 4), overwrite, ReadLane(8, 0, 11, 4)};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 0 && stats.shadow_writes == 0 &&
+	          program.blocks[0].instructions.back().op == Opcode::ReadLaneU32,
+	      "readlane was rewritten across an intervening vector overwrite");
+}
+
+void TestReadLaneEliminationFoldsScalarLaneSelector() {
+	Program program;
+	program.wave_size       = 32;
+	program.user_data_count = 8;
+	program.blocks.resize(1);
+	auto write                     = WriteLane(4, 11, 4, 0);
+	write.src[1]                   = Sgpr(7);
+	auto read                      = ReadLane(8, 0, 11, 0);
+	read.src[1]                    = Sgpr(7);
+	program.blocks[0].instructions = {MoveImmediate(0, 7, 33), write, read};
+
+	std::string error;
+	Check(BuildScalarProvenance(program, &error), error.c_str());
+	const auto stats = EliminateReadLane(program);
+	Check(stats.rewritten_reads == 1 && stats.shadow_writes == 1 &&
+	          program.blocks[0].instructions.back().op == Opcode::MoveU32,
+	      "constant scalar lane selector was not folded modulo wave32");
 }
 
 void TestUnresolvedSourceIsMarked() {
@@ -690,8 +838,7 @@ void TestDynamicReadIsNotFlattened() {
 	DescriptorValue  descriptor;
 	const auto       source = program.blocks[0].instructions[1].memory.resource_source;
 	const SrtRuntime runtime {user_data, 0, ReadHostMemory, nullptr};
-	Check(EvaluateDescriptorSource(program, source, 4, runtime, descriptor, &error),
-	      error.c_str());
+	Check(EvaluateDescriptorSource(program, source, 4, runtime, descriptor, &error), error.c_str());
 	Check(descriptor.dwords[0] == table[1], "dynamic ReadConst evaluated the wrong dword");
 }
 
@@ -994,46 +1141,43 @@ void TestCommonScalarPointerOps() {
 void TestBitFieldMaskDescriptor() {
 	Program program;
 	program.blocks.resize(1);
-	auto mask      = MoveImmediate(4, 29, 0);
-	mask.op        = Opcode::BitFieldMaskU32;
-	mask.src[0]    = Imm(12);
-	mask.src[1]    = Imm(12);
-	mask.src_count = 2;
-	auto high      = MoveImmediate(8, 30, 0x05500000u);
-	high.op        = Opcode::MoveU64;
-	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x92u), mask, high,
-	                                  BufferUse(12, 28)};
+	auto mask                      = MoveImmediate(4, 29, 0);
+	mask.op                        = Opcode::BitFieldMaskU32;
+	mask.src[0]                    = Imm(12);
+	mask.src[1]                    = Imm(12);
+	mask.src_count                 = 2;
+	auto high                      = MoveImmediate(8, 30, 0x05500000u);
+	high.op                        = Opcode::MoveU64;
+	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x92u), mask, high, BufferUse(12, 28)};
 
 	std::string error;
 	Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error), error.c_str());
-	DescriptorValue descriptor;
+	DescriptorValue  descriptor;
 	const SrtRuntime runtime {{}, 0, nullptr, nullptr};
 	Check(EvaluateDescriptorSource(program,
-	                               program.blocks[0].instructions.back().memory.resource_source,
-	                               16, runtime, descriptor, &error),
+	                               program.blocks[0].instructions.back().memory.resource_source, 16,
+	                               runtime, descriptor, &error),
 	      error.c_str());
 	Check(descriptor.dwords[0] == 0x92u && descriptor.dwords[1] == 0x00fff000u &&
 	          descriptor.dwords[2] == 0x05500000u && descriptor.dwords[3] == 0,
 	      "production sampler bit-field mask evaluated incorrectly");
 
-	mask.src[0] = Imm(0);
-	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x92u), mask, high,
-	                                  BufferUse(12, 28)};
+	mask.src[0]                    = Imm(0);
+	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x92u), mask, high, BufferUse(12, 28)};
 	Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error), error.c_str());
 	Check(EvaluateDescriptorSource(program,
-	                               program.blocks[0].instructions.back().memory.resource_source,
-	                               12, runtime, descriptor, &error),
+	                               program.blocks[0].instructions.back().memory.resource_source, 12,
+	                               runtime, descriptor, &error),
 	      error.c_str());
 	Check(descriptor.dwords[1] == 0, "zero-width bit-field mask was not zero");
 
-	mask.src[0] = Imm(31);
-	mask.src[1] = Imm(31);
-	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x92u), mask, high,
-	                                  BufferUse(12, 28)};
+	mask.src[0]                    = Imm(31);
+	mask.src[1]                    = Imm(31);
+	program.blocks[0].instructions = {MoveImmediate(0, 28, 0x92u), mask, high, BufferUse(12, 28)};
 	Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error), error.c_str());
 	Check(EvaluateDescriptorSource(program,
-	                               program.blocks[0].instructions.back().memory.resource_source,
-	                               12, runtime, descriptor, &error),
+	                               program.blocks[0].instructions.back().memory.resource_source, 12,
+	                               runtime, descriptor, &error),
 	      error.c_str());
 	Check(descriptor.dwords[1] == 0x80000000u,
 	      "maximum bit-field mask count/offset evaluated incorrectly");
@@ -1045,6 +1189,7 @@ int main() {
 	try {
 		TestPerUseDescriptorDefinitions();
 		TestCfgPhi();
+		TestNestedLoopPhiConvergence();
 		TestDiamondReadPathsAreDynamic();
 		TestEquivalentConstantPhiIsStatic();
 		TestWideMoveInvalidatesAndCopiesBothDwords();
@@ -1057,6 +1202,11 @@ int main() {
 		TestReadLaneLoopConvergence();
 		TestReadLaneWideAndRelativeWritesInvalidateSpill();
 		TestReadLaneModuloAndDynamicLane();
+		TestReadLaneEliminationSnapshotsWriteValue();
+		TestReadLaneEliminationMergesControlFlowWrites();
+		TestReadLaneEliminationRequiresWriteOnEveryPath();
+		TestReadLaneEliminationHonorsVectorInvalidation();
+		TestReadLaneEliminationFoldsScalarLaneSelector();
 		TestUnresolvedSourceIsMarked();
 		TestUnsupportedWideWriteInvalidatesBothDwords();
 		TestCyclicPhiIsUnresolved();

@@ -2,6 +2,7 @@
 
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
+#include "kernel/memory.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
@@ -153,18 +154,6 @@ bool ValidateTarget(const Plan& plan, const Program* program, std::string* error
 	return true;
 }
 
-Common::VirtualMemory::Mode ReadableMode(Elf64_Word flags) {
-	const bool executable = (flags & PF_X) != 0;
-	const bool writable   = (flags & PF_W) != 0;
-	if (executable && writable) {
-		return Common::VirtualMemory::Mode::ExecuteReadWrite;
-	}
-	if (executable) {
-		return Common::VirtualMemory::Mode::ExecuteRead;
-	}
-	return writable ? Common::VirtualMemory::Mode::ReadWrite : Common::VirtualMemory::Mode::Read;
-}
-
 bool ResolveWrite(const Program& program, Write* write, std::string* error) {
 	const auto* ehdr = program.elf->GetEhdr();
 	const auto* phdr = program.elf->GetPhdr();
@@ -178,16 +167,9 @@ bool ResolveWrite(const Program& program, Write* write, std::string* error) {
 			continue;
 		}
 
-		const auto                  segment_address = program.base_vaddr + segment.p_vaddr;
-		const bool                  add_read        = (segment.p_flags & PF_R) == 0;
-		Common::VirtualMemory::Mode old_mode {};
-		if (add_read && !Common::VirtualMemory::Protect(segment_address, segment.p_memsz,
-		                                                ReadableMode(segment.p_flags), &old_mode)) {
-			return Fail(error, "could not read a loaded executable segment");
-		}
-
-		const auto* begin = reinterpret_cast<const uint8_t*>(segment_address);
-		const auto* end   = begin + segment.p_filesz;
+		const auto  segment_address = program.base_vaddr + segment.p_vaddr;
+		const auto* begin           = reinterpret_cast<const uint8_t*>(segment_address);
+		const auto* end             = begin + segment.p_filesz;
 		for (auto* current = begin; current < end;) {
 			const auto* found =
 			    std::search(current, end, write->expected.begin(), write->expected.end());
@@ -202,15 +184,9 @@ bool ResolveWrite(const Program& program, Write* write, std::string* error) {
 			match_count++;
 			current = found + 1;
 		}
-
-		if (add_read &&
-		    !Common::VirtualMemory::Protect(segment_address, segment.p_memsz, old_mode)) {
-			return Fail(error, "could not restore executable segment protection");
-		}
 	}
 
-	::printf("Game patch: found %zu entries for '%s'\n", match_count,
-	         write->patch_name.c_str());
+	::printf("Game patch: found %zu entries for '%s'\n", match_count, write->patch_name.c_str());
 	if (match == 0) {
 		return Fail(error, "original bytes not found for '" + write->patch_name + "'");
 	}
@@ -229,16 +205,9 @@ bool PrepareWrites(Plan* plan, const Program& program, std::string* error) {
 
 bool ApplyWrites(Plan* plan, std::string* error) {
 	for (auto& write: plan->writes) {
-		Common::VirtualMemory::Mode old_mode {};
-		const auto                  size = write.replacement.size();
-		if (!Common::VirtualMemory::Protect(
-		        write.address, size, Common::VirtualMemory::Mode::ExecuteReadWrite, &old_mode)) {
-			return Fail(error, "could not make patch memory writable");
-		}
-
+		const auto size = write.replacement.size();
 		std::memcpy(reinterpret_cast<void*>(write.address), write.replacement.data(), size);
-		if (!Common::VirtualMemory::Protect(write.address, size, old_mode) ||
-		    !Common::VirtualMemory::FlushInstructionCache(write.address, size)) {
+		if (!Common::VirtualMemory::FlushInstructionCache(write.address, size)) {
 			return Fail(error, "could not finalize patch");
 		}
 	}

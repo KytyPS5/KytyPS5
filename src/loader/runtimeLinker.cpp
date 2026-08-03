@@ -36,6 +36,15 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 #endif
 
 namespace Libs::LibKernel {
@@ -56,14 +65,16 @@ static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 	if (block->free_func != nullptr) {
 		block->free_func(block->ptr);
 	} else if (block->vm_alloc) {
-		Common::VirtualMemory::Free(reinterpret_cast<uint64_t>(block->ptr));
+		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
+		                                                  block->alloc_size));
 	} else {
 		delete[] block->ptr;
 	}
 
-	block->ptr       = nullptr;
-	block->free_func = nullptr;
-	block->vm_alloc  = false;
+	block->ptr        = nullptr;
+	block->free_func  = nullptr;
+	block->vm_alloc   = false;
+	block->alloc_size = 0;
 }
 
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
@@ -125,17 +136,25 @@ static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
+static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
 
 static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
 
+static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
+	auto* ptr     = reinterpret_cast<uint64_t*>(vaddr);
+	bool  changed = (*ptr != value);
+	std::memcpy(ptr, &value, sizeof(value));
+	return changed;
+}
+
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
-	constexpr uint64_t page_size  = 4096;
-	constexpr uint64_t thunk_size = 162;
+	constexpr uint64_t thunk_size = 165;
 
 	if (g_unresolved_stub_thunk_pages.empty() ||
-	    g_unresolved_stub_thunk_offset + thunk_size > page_size) {
-		auto page = Common::VirtualMemory::Alloc(0, page_size,
-		                                         Common::VirtualMemory::Mode::ExecuteReadWrite);
+	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
+		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+		    "unresolved_import_thunk");
 		EXIT_NOT_IMPLEMENTED(page == 0);
 		g_unresolved_stub_thunk_pages.push_back(page);
 		g_unresolved_stub_thunk_offset = 0;
@@ -235,6 +254,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	emit(0x41);
 	emit(0xff);
 	emit(0xe3); // jmp r11
+	// Match the integer fallback for floating-point return values.
+	emit(0x0f);
+	emit(0x57);
+	emit(0xc0); // xorps xmm0, xmm0
 	emit(0x31);
 	emit(0xc0); // xor eax, eax
 	emit(0xc3); // ret
@@ -292,7 +315,7 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 			     resolved.name.c_str(), resolved.vaddr);
 
 			if (record.patch_vaddr != 0) {
-				*reinterpret_cast<uint64_t*>(record.patch_vaddr) = resolved.vaddr;
+				PatchGuestMemory64(record.patch_vaddr, resolved.vaddr);
 			}
 
 			return resolved.vaddr;
@@ -337,16 +360,58 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
 	if (stack_top != nullptr) {
-		const auto guest_rsp =
+		const auto aligned_stack_top =
 		    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
-		const auto guest_rbp = guest_rsp - 4u * sizeof(uint64_t);
+		const auto guest_rsp = aligned_stack_top - 2u * sizeof(uintptr_t);
+		const auto guest_rbp = guest_rsp;
 
 		auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
+#if defined(__APPLE__)
+		// Clang on macOS can allocate plain "r" inputs to r12/r13, which the template
+		// clobbers before consuming them. Pin the inputs to registers the SysV guest
+		// preserves without changing register allocation on Windows or Linux.
+		register entry_func_t func_reg asm("rbx")      = func;
+		register uintptr_t    guest_rsp_reg asm("r14") = guest_rsp;
+		register uintptr_t    guest_rbp_reg asm("r15") = guest_rbp;
+#endif
+
+#if defined(__APPLE__)
+		asm volatile(
+		    "pushq %%r12\n\t"
+		    "pushq %%r13\n\t"
+		    "movq %%rsp, %%r12\n\t"
+		    "movq %%rbp, %%r13\n\t"
+		    "movq %[guest_rsp], %%rsp\n\t"
+		    "movq %[guest_rbp], %%rbp\n\t"
+		    "callq *%[func]\n\t"
+		    "movq %%r13, %%rbp\n\t"
+		    "movq %%r12, %%rsp\n\t"
+		    "popq %%r13\n\t"
+		    "popq %%r12\n\t"
+		    :
+		    : [func] "r"(func_reg), "D"(params),
+		      "S"(atexit_func), [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
+		    : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
+		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+		      "xmm13", "xmm14", "xmm15");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Windows stack probes use the TEB stack limits during the guest stack switch.
+		// bounds, which describe the host stack and are invalid while RSP is in guest memory.
+		register entry_func_t func_reg asm("rbx")     = func;
+		register uintptr_t    guest_rsp_reg asm("r8") = guest_rsp;
+		register uintptr_t    guest_rbp_reg asm("r9") = guest_rbp;
 		asm volatile("pushq %%r12\n\t"
 		             "pushq %%r13\n\t"
+		             "pushq %%r14\n\t"
+		             "pushq %%r15\n\t"
+		             "movq %%gs:0x08, %%r14\n\t"
+		             "movq %%gs:0x10, %%r15\n\t"
+		             "xorq %%rcx, %%rcx\n\t"
+		             "movq %%rcx, %%gs:0x08\n\t"
+		             "movq %%rcx, %%gs:0x10\n\t"
 		             "movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
 		             "movq %[guest_rsp], %%rsp\n\t"
@@ -354,19 +419,44 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "callq *%[func]\n\t"
 		             "movq %%r13, %%rbp\n\t"
 		             "movq %%r12, %%rsp\n\t"
+		             "movq %%r14, %%gs:0x08\n\t"
+		             "movq %%r15, %%gs:0x10\n\t"
+		             "popq %%r15\n\t"
+		             "popq %%r14\n\t"
 		             "popq %%r13\n\t"
 		             "popq %%r12\n\t"
+		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
+		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func)
+		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
+		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+		               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+		// Clobbers prevent inputs from being allocated to r12/r13.
+		asm volatile("movq %%rsp, %%r12\n\t"
+		             "movq %%rbp, %%r13\n\t"
+		             "movq %[guest_rsp], %%rsp\n\t"
+		             "movq %[guest_rbp], %%rbp\n\t"
+		             "callq *%[func]\n\t"
+		             "movq %%r13, %%rbp\n\t"
+		             "movq %%r12, %%rsp\n\t"
 		             :
 		             : [func] "r"(func), "D"(params),
 		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
-		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
-		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
+		               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
+		               "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 		return;
 	}
 
 	uintptr_t guest_root_frame[2] = {};
 
+#if defined(__APPLE__)
+	register entry_func_t func_reg asm("rbx")      = func;
+	register uintptr_t    guest_rbp_reg asm("r14") = reinterpret_cast<uintptr_t>(guest_root_frame);
+#endif
+
+#if defined(__APPLE__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "movq %%rbp, %%r12\n\t"
@@ -376,16 +466,148 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             :
+#if defined(__APPLE__)
+	             : [func] "r"(func_reg), "D"(params),
+	               "S"(atexit_func), [guest_rbp] "r"(guest_rbp_reg)
+#else
 	             : [func] "r"(func), "D"(params),
 	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
+#endif
 	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
 	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
+#else
+	// Keep inputs out of r12.
+	asm volatile("movq %%rbp, %%r12\n\t"
+	             "movq %[guest_rbp], %%rbp\n\t"
+	             "callq *%[func]\n\t"
+	             "movq %%r12, %%rbp\n\t"
+	             :
+	             : [func] "r"(func), "D"(params),
+	               "S"(atexit_func), [guest_rbp] "r"(guest_root_frame)
+	             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "xmm0",
+	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
+	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+#endif
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
 #endif
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+struct MainEntryStackTestState {
+	bool      called = false;
+	uintptr_t rsp    = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uintptr_t teb_stack_base  = UINTPTR_MAX;
+	uintptr_t teb_stack_limit = UINTPTR_MAX;
+#endif
+};
+
+static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
+                                                     atexit_func_t /*atexit_func*/) {
+	auto* state = reinterpret_cast<MainEntryStackTestState*>(const_cast<char*>(params->argv[0]));
+	asm volatile("pushq %%r15\n\t"
+	             "pushq %%r14\n\t"
+	             "popq %%r14\n\t"
+	             "popq %%r15\n\t"
+	             :
+	             :
+	             : "memory");
+	asm volatile("movq %%rsp, %0" : "=r"(state->rsp) : : "memory");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(state->teb_stack_base), "=r"(state->teb_stack_limit)
+	             :
+	             : "memory");
+#endif
+	state->called = true;
+}
+
+bool TestMainEntryUsesGuestStack() {
+	constexpr uint64_t stack_size = 0x10000;
+	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "main_entry_stack_test");
+	if (stack_base == 0) {
+		return false;
+	}
+
+	MainEntryStackTestState state {};
+	EntryParams             params {};
+	params.argv[0] = reinterpret_cast<const char*>(&state);
+	std::memset(reinterpret_cast<void*>(stack_base), 0xcd, stack_size);
+	auto* root_frame = reinterpret_cast<const uintptr_t*>(stack_base + stack_size) - 2;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uintptr_t original_teb_stack_base  = 0;
+	uintptr_t original_teb_stack_limit = 0;
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(original_teb_stack_base), "=r"(original_teb_stack_limit)
+	             :
+	             : "memory");
+#endif
+
+	RunEntry(reinterpret_cast<uint64_t>(TestMainEntryStackCallback), &params, nullptr,
+	         reinterpret_cast<void*>(stack_base + stack_size));
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uintptr_t restored_teb_stack_base  = 0;
+	uintptr_t restored_teb_stack_limit = 0;
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
+	             :
+	             : "memory");
+	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
+	                    restored_teb_stack_base == original_teb_stack_base &&
+	                    restored_teb_stack_limit == original_teb_stack_limit;
+#else
+	constexpr bool teb_ok = true;
+#endif
+
+	const bool rsp_ok  = state.rsp >= stack_base && state.rsp < stack_base + stack_size;
+	const bool root_ok = root_frame[0] == 0 && root_frame[1] == 0;
+	const bool freed   = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
+	return state.called && rsp_ok && root_ok && teb_ok && freed;
+}
+
+bool TestModuleRelocationUsesWritableHostMapping() {
+	constexpr uint64_t page_size = 0x4000;
+	constexpr uint64_t value     = 0x4b59545950415443;
+	const auto         base      = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0, page_size, Common::VirtualMemory::Mode::ReadWrite, "host_only_patch_test");
+	if (base == 0) {
+		return false;
+	}
+	Libs::LibKernel::Memory::SetProgramMemoryProtection(base, page_size,
+	                                                    Common::VirtualMemory::Mode::Read);
+
+	Libs::LibKernel::Memory::VirtualQueryInfo before {};
+	Libs::LibKernel::Memory::VirtualQueryInfo after {};
+	const bool                                before_ok =
+	    Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(base), 0, &before,
+	                                                sizeof(before)) == 0;
+	const bool changed  = PatchGuestMemory64(base, value);
+	const bool after_ok = Libs::LibKernel::Memory::KernelVirtualQuery(
+	                          reinterpret_cast<const void*>(base), 0, &after, sizeof(after)) == 0;
+	const bool value_ok = *reinterpret_cast<const uint64_t*>(base) == value;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION mbi {};
+	const bool               host_mode_ok =
+	    VirtualQuery(reinterpret_cast<const void*>(base), &mbi, sizeof(mbi)) != 0 &&
+	    mbi.Protect == PAGE_READWRITE;
+#else
+	constexpr bool host_mode_ok = true;
+#endif
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(base, page_size);
+
+	return before_ok && after_ok && changed && value_ok && host_mode_ok && freed &&
+	       before.protection == after.protection;
+}
+#endif
 
 static uint64_t GetAlignedSize(const Elf64_Phdr* p) {
 	return (p->p_align != 0 ? (p->p_memsz + (p->p_align - 1)) & ~(p->p_align - 1) : p->p_memsz);
@@ -493,6 +715,88 @@ void KYTY_SYSV_ABI SysStackWalkX86(uint64_t rbp, void** stack, int* depth) {
 	SysStackWalkX86(rbp, rbp, stack, depth);
 }
 
+// Probe diagnostic ranges without raising another fault.
+static bool IsReadableRange(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0) {
+		return false;
+	}
+
+	const uint64_t end = addr + size;
+	if (end < addr) {
+		return false;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t current = addr;
+	while (current < end) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
+		    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			return false;
+		}
+		const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		if (region_end <= current) {
+			return false;
+		}
+		current = std::min(region_end, end);
+	}
+#elif defined(__APPLE__)
+	// Walk the Mach regions covering the range and require read permission. The fatal
+	// report dumps memory behind raw register values, and a fault inside the reporter
+	// re-enters the signal handler and wedges the reporting thread.
+	uint64_t current = addr;
+	while (current < end) {
+		mach_vm_address_t              region_addr = current;
+		mach_vm_size_t                 region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t                    object_name = MACH_PORT_NULL;
+		if (mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+		                   reinterpret_cast<vm_region_info_t>(&info), &count,
+		                   &object_name) != KERN_SUCCESS ||
+		    region_addr > current || (info.protection & VM_PROT_READ) == 0) {
+			return false;
+		}
+		current = region_addr + region_size;
+	}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	const auto page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+	if (page_size == 0) {
+		return false;
+	}
+
+	for (uint64_t current = addr; current < end;) {
+		uint8_t probe = 0;
+
+		iovec local {&probe, sizeof(probe)};
+		iovec remote {reinterpret_cast<void*>(current), sizeof(probe)};
+
+		if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
+		    static_cast<ssize_t>(sizeof(probe))) {
+			return false;
+		}
+
+		const uint64_t next = (current & ~(page_size - 1)) + page_size;
+		if (next <= current) { // wrapped at the top of the address space
+			break;
+		}
+		current = next;
+	}
+#else
+	(void)end;
+#endif
+	return true;
+}
+
+static bool IsDumpableRange(uint64_t addr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	return IsReadableRange(addr, size);
+#else
+	(void)size;
+	return addr != 0;
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -538,6 +842,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF("exception module: %s\n", module_name);
 		}
 	}
+#else
+	Dl_info module_info {};
+	if (::dladdr(reinterpret_cast<void*>(info->exception_address), &module_info) != 0 &&
+	    module_info.dli_fname != nullptr) {
+		LOGF("exception module: %s\n", module_info.dli_fname);
+	}
 #endif
 	if (info->exception_address != 0) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -561,12 +871,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF("code-32: unavailable\n");
 		}
 #else
-		LOGF("code-32:");
-		for (uint64_t i = 0; i < 64; i++) {
-			LOGF(" %02" PRIx32, static_cast<uint32_t>(*reinterpret_cast<const uint8_t*>(
-			                        info->exception_address + i - 32)));
+		const auto fault_addr = info->exception_address;
+		const auto dump_start = (fault_addr >= 32 ? fault_addr - 32 : fault_addr);
+		if (IsReadableRange(dump_start, 64)) {
+			auto* dump_ptr = reinterpret_cast<const uint8_t*>(dump_start);
+			LOGF("code-32:");
+			for (uint32_t i = 0; i < 64; i++) {
+				LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
+			}
+			LOGF("\n");
+		} else {
+			LOGF("code-32: unavailable\n");
 		}
-		LOGF("\n");
 #endif
 	} else {
 		LOGF("code: unavailable\n");
@@ -584,36 +900,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
 	     info->r12, info->r13, info->r14, info->r15);
 
-	auto is_readable_range = [](uint64_t addr, uint64_t size) {
-		if (addr == 0 || size == 0) {
-			return false;
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		uint64_t current = addr;
-		uint64_t end     = addr + size;
-		if (end < addr) {
-			return false;
-		}
-		while (current < end) {
-			MEMORY_BASIC_INFORMATION mbi {};
-			if (VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0 ||
-			    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-				return false;
-			}
-			const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-			if (region_end <= current) {
-				return false;
-			}
-			current = std::min(region_end, end);
-		}
-#else
-		(void)addr;
-		(void)size;
-#endif
-		return true;
-	};
-
-	if (is_readable_range(info->rsp, 16u * sizeof(uint64_t))) {
+	if (IsReadableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		LOGF("stack:");
 		for (uint64_t i = 0; i < 16; i++) {
@@ -644,6 +931,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 #else
 		auto*      dump_ptr  = reinterpret_cast<const uint8_t*>(addr >= 16 ? addr - 16 : addr);
 		const auto dump_size = 32u;
+		if (!IsReadableRange(reinterpret_cast<uint64_t>(dump_ptr), dump_size)) {
+			return;
+		}
 #endif
 
 		LOGF("%s code: addr=%016" PRIx64 ", off=%016" PRIx64 ", module=%s:", name, addr,
@@ -659,7 +949,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
 	dump_guest_code("guest rsi[0]", info->rsi);
-	if (info->rsp != 0) {
+	if (IsDumpableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		for (uint64_t i = 0; i < 16; i++) {
 			char name[32] {};
@@ -688,7 +978,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 
-		auto dump_guest_qwords = [&is_readable_range](const char* name, uint64_t addr) {
+		auto dump_guest_qwords = [](const char* name, uint64_t addr) {
 			if (addr == 0) {
 				LOGF("%s = 0\n", name);
 				return;
@@ -703,7 +993,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 #endif
 
-			if (!is_readable_range(addr, 8u * sizeof(uint64_t))) {
+			if (!IsReadableRange(addr, 8u * sizeof(uint64_t))) {
 				LOGF("%s = %016" PRIx64 " (unmapped)\n", name, addr);
 				return;
 			}
@@ -728,7 +1018,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
 
-		if (info->exception_address == 0x000000090064364e && info->rbx != 0) {
+		if (info->exception_address == 0x000000090064364e &&
+		    IsDumpableRange(info->rbx, sizeof(uint64_t))) {
 			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
 			dump_guest_qwords("vorbis obj", local[0]);
 			dump_guest_qwords("vorbis len", info->rcx);
@@ -926,7 +1217,7 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	// KYTY_PROFILER_BLOCK("patch");
 
 	if (ri.resolved) {
-		patched = Common::VirtualMemory::PatchReplace(ri.vaddr, ri.value);
+		patched = PatchGuestMemory64(ri.vaddr, ri.value);
 	} else {
 		uint64_t value = 0;
 		bool     weak  = (ri.bind == BindType::Weak || !program->fail_if_global_not_resolved);
@@ -944,7 +1235,7 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		}
 
 		if (value != 0) {
-			patched = Common::VirtualMemory::PatchReplace(ri.vaddr, value);
+			patched = PatchGuestMemory64(ri.vaddr, value);
 		} else {
 			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
 			                           ri.name.c_str(), Common::EnumName(ri.type).c_str(),
@@ -967,7 +1258,7 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			}
 
 			if (value != 0) {
-				patched = Common::VirtualMemory::PatchReplace(ri.vaddr, value);
+				patched = PatchGuestMemory64(ri.vaddr, value);
 			}
 		}
 	}
@@ -1347,6 +1638,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	PreloadAdjacentPrograms();
 	RelocateAll();
+
 	if (!game_patch.empty()) {
 		GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front());
 	}
@@ -1377,6 +1669,21 @@ void RuntimeLinker::Clear() {
 		DeleteProgram(p);
 	}
 	m_programs.clear();
+	for (const auto page: g_unresolved_stub_thunk_pages) {
+		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(page, UNRESOLVED_STUB_PAGE_SIZE));
+	}
+	g_unresolved_stub_thunk_pages.clear();
+	g_unresolved_stub_thunk_offset = 0;
+	g_stubbed_imports.clear();
+	g_unresolved_stub_call_log_count.store(0);
+	if (g_invalid_memory != 0) {
+		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
+		g_invalid_memory = 0;
+	}
+	g_tls_main_program        = nullptr;
+	g_tls_cached_main_program = nullptr;
+	g_tls_cached_main_tcb     = nullptr;
+	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 	m_relocated = false;
 }
@@ -1814,10 +2121,11 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		const auto tcb_offset =
 		    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
 		const auto alloc_size = AlignUp(tcb_offset, TCB_ALIGN) + TCB_SIZE;
-		tls.ptr               = reinterpret_cast<uint8_t*>(
-		    Common::VirtualMemory::Alloc(0, alloc_size, Common::VirtualMemory::Mode::ReadWrite));
-		tls.free_func = nullptr;
-		tls.vm_alloc  = true;
+		tls.ptr        = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, alloc_size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
+		tls.free_func  = nullptr;
+		tls.vm_alloc   = true;
+		tls.alloc_size = alloc_size;
 
 		EXIT_IF(tls.ptr == nullptr);
 
@@ -1894,8 +2202,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
 
-	program->base_vaddr = Common::VirtualMemory::Alloc(
-	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite);
+	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    Common::PathToString(program->file_name.filename()).c_str());
 
 	if (!is_shared) {
 		program->tls.handler_vaddr = program->base_vaddr + program->base_size_aligned;
@@ -1905,10 +2214,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(program->base_vaddr == 0);
 	EXIT_IF(program->base_size_aligned < program->base_size);
-	Libs::LibKernel::Memory::RegisterProgramMemory(
-	    program->base_vaddr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
-	    Common::PathToString(program->file_name.filename()).c_str());
-
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
 	     "base_size_aligned      = 0x%016" PRIx64 "\n"
@@ -1948,11 +2253,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			}
 
 			if (!skip_protect) {
-				if (!Common::VirtualMemory::Protect(segment_addr, segment_memory_size, mode)) {
-					EXIT("failed to protect ELF segment %u\n", static_cast<unsigned>(i));
-				}
-				Libs::LibKernel::Memory::UpdateProgramMemoryProtection(segment_addr,
-				                                                       segment_memory_size, mode);
+				Libs::LibKernel::Memory::SetProgramMemoryProtection(segment_addr,
+				                                                    segment_memory_size, mode);
 
 				if (Common::VirtualMemory::IsExecute(mode)) {
 					Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_memory_size);
@@ -1993,15 +2295,29 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 void RuntimeLinker::DeleteProgram(Program* p) {
 	auto program = std::unique_ptr<Program>(p);
+	if (g_tls_main_program == program.get()) {
+		g_tls_main_program = nullptr;
+	}
+	if (g_tls_cached_main_program == program.get()) {
+		g_tls_cached_main_program = nullptr;
+		g_tls_cached_main_tcb     = nullptr;
+	}
+	for (auto& record: g_stubbed_imports) {
+		if (record.patch_vaddr >= program->base_vaddr &&
+		    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
+			record.patch_vaddr = 0;
+		}
+	}
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
-		Libs::LibKernel::Memory::UnregisterProgramMemory(program->base_vaddr, program->mapped_size);
-		EXIT_IF(!Common::VirtualMemory::Free(program->base_vaddr));
+		EXIT_IF(
+		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
 	}
 
 	if (program->custom_call_plt_vaddr != 0 || program->custom_call_plt_num != 0) {
-		Common::VirtualMemory::Free(program->custom_call_plt_vaddr);
+		const auto size = Jit::CallPlt::GetSize(program->custom_call_plt_num);
+		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(program->custom_call_plt_vaddr, size));
 	}
 }
 
@@ -2125,13 +2441,13 @@ static void InstallRelocateHandler(Program* program) {
 	void**   pltgot       = reinterpret_cast<void**>(pltgot_vaddr);
 
 	Common::VirtualMemory::Mode old_mode {};
-	Common::VirtualMemory::Protect(pltgot_vaddr, pltgot_size, Common::VirtualMemory::Mode::Write,
-	                               &old_mode);
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+	    pltgot_vaddr, pltgot_size, Common::VirtualMemory::Mode::Write, &old_mode));
 
 	pltgot[1] = program;
 	pltgot[2] = reinterpret_cast<void*>(RelocateHandler);
 
-	Common::VirtualMemory::Protect(pltgot_vaddr, pltgot_size, old_mode);
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(pltgot_vaddr, pltgot_size, old_mode));
 
 	if (Common::VirtualMemory::IsExecute(old_mode)) {
 		Common::VirtualMemory::FlushInstructionCache(pltgot_vaddr, pltgot_size);
@@ -2141,15 +2457,15 @@ static void InstallRelocateHandler(Program* program) {
 	if (program->custom_call_plt_vaddr == 0) {
 		program->custom_call_plt_num =
 		    program->dynamic_info->jmprela_table_size / sizeof(Elf64_Rela);
-		auto size = Jit::CallPlt::GetSize(program->custom_call_plt_num);
-		program->custom_call_plt_vaddr =
-		    Common::VirtualMemory::Alloc(SYSTEM_RESERVED, size, Common::VirtualMemory::Mode::Write);
+		auto size                      = Jit::CallPlt::GetSize(program->custom_call_plt_num);
+		program->custom_call_plt_vaddr = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    SYSTEM_RESERVED, size, Common::VirtualMemory::Mode::Write, "custom_call_plt");
 		EXIT_NOT_IMPLEMENTED(program->custom_call_plt_vaddr == 0);
 		auto* code = new (reinterpret_cast<void*>(program->custom_call_plt_vaddr))
 		    Jit::CallPlt(program->custom_call_plt_num);
 		code->SetPltGot(pltgot_vaddr);
-		Common::VirtualMemory::Protect(program->custom_call_plt_vaddr, size,
-		                               Common::VirtualMemory::Mode::Execute);
+		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->custom_call_plt_vaddr, size,
+		                                                     Common::VirtualMemory::Mode::Execute));
 		Common::VirtualMemory::FlushInstructionCache(program->custom_call_plt_vaddr, size);
 	}
 }
@@ -2160,8 +2476,8 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_IF(program == nullptr);
 
 	if (g_invalid_memory == 0) {
-		g_invalid_memory = Common::VirtualMemory::Alloc(INVALID_MEMORY, 4096,
-		                                                Common::VirtualMemory::Mode::NoAccess);
+		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory", true);
 		EXIT_NOT_IMPLEMENTED(g_invalid_memory == 0);
 	}
 
@@ -2335,12 +2651,9 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 		stub->SetOutputReg(reg);
 	}
 
-	if (!Common::VirtualMemory::Protect(program->tls.handler_vaddr, Jit::SafeCall::GetSize(),
-	                                    Common::VirtualMemory::Mode::Execute)) {
-		EXIT("failed to protect program TLS handler\n");
-	}
-	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(
-	    program->tls.handler_vaddr, Jit::SafeCall::GetSize(), Common::VirtualMemory::Mode::Execute);
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,
+	                                                     Jit::SafeCall::GetSize(),
+	                                                     Common::VirtualMemory::Mode::Execute));
 	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
 	                                             Jit::SafeCall::GetSize());
 }

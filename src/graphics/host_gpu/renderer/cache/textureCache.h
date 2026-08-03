@@ -172,7 +172,11 @@ private:
 	std::vector<Slot>                                 m_slots;
 	std::vector<uint32_t>                             m_free_slots;
 	ImagePageTable                                    m_image_page_table;
-	std::map<vk::Format, ImageId>                     m_null_images;
+	// Keyed on shape as well as format: a null image also stands in for a depth-comparable
+	// texture, and those are bound through array views that a 1x1 single-layer 2D image
+	// cannot satisfy.
+	using NullImageKey = std::tuple<vk::Format, Prospero::ImageType, uint32_t>;
+	std::map<NullImageKey, ImageId>                   m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::set<ImageId>                                 m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

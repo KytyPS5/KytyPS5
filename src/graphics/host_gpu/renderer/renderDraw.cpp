@@ -402,9 +402,14 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 	for (uint32_t i = 0; i < dynamic_params.color_write_count; i++) {
 		enable[i] = (dynamic_params.color_write_enable[i] ? VK_TRUE : VK_FALSE);
 	}
-	if (dynamic_params.color_write_count != 0) {
-		vk_buffer.setColorWriteEnableEXT(dynamic_params.color_write_count, enable);
-	}
+	// The pipeline declares eColorWriteEnableEXT dynamic unconditionally, so the state has to be
+	// set for every draw -- including a depth-only pass with no colour attachments, which would
+	// otherwise leave it unset and make the draw invalid. vkCmdSetColorWriteEnableEXT itself
+	// requires attachmentCount > 0, so submit one disabled attachment in that case; entries past
+	// the pipeline's colour attachment count are ignored.
+	const uint32_t color_write_count =
+	    dynamic_params.color_write_count != 0 ? dynamic_params.color_write_count : 1u;
+	vk_buffer.setColorWriteEnableEXT(color_write_count, enable);
 #endif
 }
 
@@ -497,6 +502,12 @@ struct DrawCallInfo {
 	uint32_t             first_instance = 0;
 };
 
+// Extent of a mip level as Vulkan defines it. The guest rounds level sizes up, so for odd
+// dimensions its idea of a level is one pixel larger than the image view actually is.
+static vk::Extent2D ImageLevelExtent(const vk::Extent3D& extent, uint32_t level) {
+	return {std::max(1u, extent.width >> level), std::max(1u, extent.height >> level)};
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -537,8 +548,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width             = std::min(state.width, target.extent.width);
-		state.height            = std::min(state.height, target.extent.height);
+		// Clamp to the extent the image view really has, not just the guest extent. When a
+		// render target is a mip of a larger surface the two disagree for odd widths: the guest
+		// rounds the level size up, Vulkan defines it as max(1, floor(size >> level)). A render
+		// area even one pixel wider than its attachment is an invalid draw.
+		const auto view_extent  = ImageLevelExtent(image.info.extent, view.base_level);
+		state.width             = std::min({state.width, target.extent.width, view_extent.width});
+		state.height            = std::min({state.height, target.extent.height, view_extent.height});
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = target.image_view;
@@ -582,8 +598,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.width);
-		state.height              = std::min(state.height, depth.height);
+		// Same clamp as the colour attachments above.
+		const auto depth_extent   = ImageLevelExtent(image.info.extent, view.base_level);
+		state.width               = std::min({state.width, depth.width, depth_extent.width});
+		state.height              = std::min({state.height, depth.height, depth_extent.height});
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.format);
 		auto&      attachment     = state.depth_stencil_attachment;

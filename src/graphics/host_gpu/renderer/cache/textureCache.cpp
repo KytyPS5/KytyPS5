@@ -505,24 +505,25 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	auto&      command = m_scheduler.Current();
-	const auto format  = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	const auto layers  = std::max(desc.info.resources.layers, 1u);
+	const NullImageKey key {desc.info.pixel_format, desc.info.type, layers};
+	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		RetainImage(command, found->second);
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = desc.info.type;
 	info.extent          = {1, 1, 1};
-	info.resources       = {1, 1};
+	info.resources       = {1, layers};
 	info.pitch           = 1;
 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
 	info.samples         = 1;
 	info.tile_mode       = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	m_null_images.emplace(key, id);
 	RetainImage(command, id);
 	return id;
 }

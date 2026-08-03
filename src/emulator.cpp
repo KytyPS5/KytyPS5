@@ -5,6 +5,7 @@
 #include "common/commonSubsystem.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -191,6 +192,8 @@ void Run(const RunOptions& options) {
 
 	const auto param_json = options.app0_dir / "sce_sys" / "param.json";
 	Init(options.config, param_json);
+
+	Common::HleTrace::Start();
 
 	ClearDebugTextureFolder();
 

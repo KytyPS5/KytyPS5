@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hash.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -369,6 +370,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	if constexpr (Common::HleTrace::ENABLED) {
+		Common::HleTrace::Note("open", path);
+	}
+
 	auto flags_u = static_cast<uint32_t>(flags);
 
 	LOGF("\t path = %s\n"
@@ -437,6 +442,9 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
+		if constexpr (Common::HleTrace::ENABLED) {
+			Common::HleTrace::Note("open ENOENT", path);
+		}
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
 	}

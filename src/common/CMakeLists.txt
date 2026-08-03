@@ -12,6 +12,10 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
+if(KYTY_ENABLE_HLE_TRACE)
+	target_compile_definitions(common PUBLIC KYTY_HLE_TRACE)
+endif()
+
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE

@@ -3300,6 +3300,15 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 	return (thread->pending_signal_mask.load(std::memory_order_acquire) & mask) != 0;
 }
 
+// The dispatcher runs on every wait and sleep exit, so keep its common no-signal path to a
+// single atomic load rather than one read-modify-write per signal number.
+bool PthreadHasAnyPendingSignal(Pthread thread) {
+	if (thread == nullptr) {
+		return false;
+	}
+	return thread->pending_signal_mask.load(std::memory_order_acquire) != 0;
+}
+
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
 		return false;

@@ -991,16 +991,30 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 
 		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
-				handler(signum, &ctx);
-				ApplySignalUcontextToHost(host_ctx, ctx);
-			} else {
-				// Do not expose or restore a host frame.
-				SanitizeNonGuestSignalUcontext(&ctx, current);
-				handler(signum, &ctx);
+			auto ctx = CreateSignalUcontextFromHost(host_ctx);
+			if (!IsGuestCodeAddress(ctx.uc_mcontext.mc_rip) || Common::InHleCriticalSection()) {
+				// Interrupted inside host code, which for a guest thread means it is parked
+				// in an HLE wait. Running the guest handler here would run it nested inside
+				// that wait, and a handler that blocks (IL2CPP's GC suspend handler waits
+				// on an event flag until the collection ends) then never lets the wait
+				// unwind. That strands the internal state the wait holds: glibc keeps a
+				// group reference on a condition variable for the whole of
+				// pthread_cond_wait, and a stranded one makes every later
+				// pthread_cond_broadcast on that variable block forever, which deadlocks
+				// every thread using it.
+				//
+				// Leave the signal pending instead. The wait-poll callback installed
+				// through CondVar::SetWaitPollCallback, and the sleep paths, dispatch it
+				// from KernelDispatchPendingSignalForCurrentThread once the host frame has
+				// unwound. Nothing depends on delivery being synchronous: the sender's
+				// WaitForSignalDispatch already gives up after DISPATCH_WAIT_MAX.
+				QueuePendingSignal(current, signum);
+				return;
 			}
+
+			SignalDispatchScope scope;
+			handler(signum, &ctx);
+			ApplySignalUcontextToHost(host_ctx, ctx);
 		}
 		return;
 	}
@@ -1077,6 +1091,19 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 void KernelDispatchPendingSignalForCurrentThread() {
 	Pthread current = PthreadSelfOrNull();
 	if (current == nullptr) {
+		return;
+	}
+
+	// Called from every wait and sleep exit, so keep the common no-signal case to one load.
+	if (!PthreadHasAnyPendingSignal(current)) {
+		return;
+	}
+
+	// A handler may block for an unbounded time. Running one while this thread holds an
+	// emulator-global lock -- the memory-operation mutex, the GPU submission mutex -- deadlocks
+	// every guest thread that needs it, which is exactly what a stop-the-world collection does.
+	// Leave the signal queued; the next dispatch after the scope unwinds will deliver it.
+	if (Common::InHleCriticalSection()) {
 		return;
 	}
 

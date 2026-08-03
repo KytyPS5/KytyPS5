@@ -1034,13 +1034,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
 
-		if (info->exception_address == 0x000000090064364e &&
-		    IsDumpableRange(info->rbx, sizeof(uint64_t))) {
-			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
-			dump_guest_qwords("vorbis obj", local[0]);
-			dump_guest_qwords("vorbis len", info->rcx);
-		}
-
 		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
 		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,
 		     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)" : ""));

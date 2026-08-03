@@ -84,7 +84,12 @@ public:
 	KYTY_CLASS_NO_COPY(CondVar);
 
 private:
-	std::unique_ptr<CondVarPrivate> m_cond_var;
+	// Shared rather than unique: SignalThread collects its targets under the waiter-registry
+	// lock and wakes them with it released (waking while holding it deadlocks the waker
+	// against the waiters it is retiring). Between the two, a waiter can return, unregister,
+	// and have its owning CondVar destroyed -- so the registry has to keep the private object
+	// alive across that gap.
+	std::shared_ptr<CondVarPrivate> m_cond_var;
 };
 
 class LockGuard {

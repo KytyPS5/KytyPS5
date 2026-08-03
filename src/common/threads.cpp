@@ -195,7 +195,8 @@ struct CondVarPrivate {
 };
 
 static std::recursive_mutex                         g_cond_waiters_mutex;
-static std::vector<std::pair<int, CondVarPrivate*>> g_cond_waiters;
+// Holds a strong reference; see CondVar::m_cond_var.
+static std::vector<std::pair<int, std::shared_ptr<CondVarPrivate>>> g_cond_waiters;
 static wait_poll_func_t                             g_cond_wait_poll_callback = nullptr;
 
 static void WakeCondVar(CondVarPrivate* cond_var) {
@@ -208,18 +209,18 @@ static void WakeCondVar(CondVarPrivate* cond_var) {
 #endif
 }
 
-static void RegisterCondWaiter(CondVarPrivate* cond_var) {
+static void RegisterCondWaiter(const std::shared_ptr<CondVarPrivate>& cond_var) {
 	std::lock_guard lock(g_cond_waiters_mutex);
 	g_cond_waiters.emplace_back(Thread::GetThreadIdUnique(), cond_var);
 }
 
-static void UnregisterCondWaiter(CondVarPrivate* cond_var) {
+static void UnregisterCondWaiter(const CondVarPrivate* cond_var) {
 	const auto      thread_id = Thread::GetThreadIdUnique();
 	std::lock_guard lock(g_cond_waiters_mutex);
 
 	const auto it = std::find_if(g_cond_waiters.begin(), g_cond_waiters.end(),
 	                             [thread_id, cond_var](const auto& waiter) {
-		                             return waiter.first == thread_id && waiter.second == cond_var;
+		                             return waiter.first == thread_id && waiter.second.get() == cond_var;
 	                             });
 	if (it != g_cond_waiters.end()) {
 		g_cond_waiters.erase(it);
@@ -359,14 +360,14 @@ bool Mutex::TryLock() {
 #endif
 }
 
-CondVar::CondVar(): m_cond_var(std::make_unique<CondVarPrivate>()) {}
+CondVar::CondVar(): m_cond_var(std::make_shared<CondVarPrivate>()) {}
 
 CondVar::~CondVar() {
 	m_cond_var.reset();
 }
 
 void CondVar::Wait(Mutex* mutex) {
-	RegisterCondWaiter(m_cond_var.get());
+	RegisterCondWaiter(m_cond_var);
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -416,7 +417,7 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
-	RegisterCondWaiter(m_cond_var.get());
+	RegisterCondWaiter(m_cond_var);
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -464,7 +465,9 @@ void CondVar::SignalThread(int thread_id) {
 	// through UnregisterCondWaiter, which needs this same mutex. Waking while holding
 	// it therefore deadlocks the waker against every waiter it is trying to wake.
 	// Signal() and SignalAll() already wake without holding the registry lock.
-	std::vector<CondVarPrivate*> targets;
+	// The collected shared_ptrs keep each target alive across the gap, even if its waiter
+	// returns and its owning CondVar is destroyed before the wake below.
+	std::vector<std::shared_ptr<CondVarPrivate>> targets;
 	{
 		std::lock_guard lock(g_cond_waiters_mutex);
 		for (const auto& waiter: g_cond_waiters) {
@@ -473,8 +476,8 @@ void CondVar::SignalThread(int thread_id) {
 			}
 		}
 	}
-	for (auto* cond_var: targets) {
-		WakeCondVar(cond_var);
+	for (const auto& cond_var: targets) {
+		WakeCondVar(cond_var.get());
 	}
 }
 

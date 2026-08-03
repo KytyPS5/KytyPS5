@@ -6,9 +6,27 @@ on:
     branches: [ main, master ]
   pull_request:
 
+env:
+  KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
+  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+
 jobs:
+  metadata:
+    name: Prepare build metadata
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.value }}
+
+    steps:
+      - name: Generate release tag
+        id: release_tag
+        shell: bash
+        run: |
+          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
   windows:
     name: Build KytyPS5 (Windows)
+    needs: metadata
     runs-on: windows-2022
 
     steps:
@@ -76,6 +94,9 @@ jobs:
           cmake -S . -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
+            -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
+            -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
+            -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
@@ -104,6 +125,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    needs: metadata
     runs-on: macos-15
 
     steps:
@@ -150,6 +172,9 @@ jobs:
           cmake -S . -B _Build/macos \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
+            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
@@ -213,6 +238,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    needs: metadata
     runs-on: ubuntu-24.04
 
     steps:
@@ -273,6 +299,9 @@ jobs:
           cmake -S . -B _Build/linux \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
+            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
@@ -342,21 +371,18 @@ jobs:
   release:
     name: Release KytyPS5
     if: github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5'
-    needs: [windows, macos, linux]
+    needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
 
     steps:
       - name: Download builds
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Set release name
-        shell: bash
-        run: |
-          echo "RELEASE_NAME=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: Package builds
         shell: bash

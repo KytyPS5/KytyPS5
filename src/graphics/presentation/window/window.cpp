@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -937,6 +938,22 @@ void WindowContext::UpdateTitle() {
 	static uint64_t fps_frames  = 0;
 	static double   current_fps = 0.0;
 
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	static constexpr auto build_type = "Debug";
+#elif KYTY_BUILD == KYTY_BUILD_RELEASE
+	static constexpr auto build_type = "Release";
+#else
+	static constexpr auto build_type = "Unknown";
+#endif
+
+#if defined(KYTY_OFFICIAL_BUILD)
+	static constexpr auto build_label = "Official build " KYTY_RELEASE_TAG;
+#elif defined(KYTY_FORK_BUILD)
+	static constexpr auto build_label = "Fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH;
+#else
+	static constexpr auto build_label = "Source build " KYTY_GIT_HASH;
+#endif
+
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
@@ -948,11 +965,11 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps =
-	    fmt::format("{}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", (has_title ? title : ""),
-	                (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	                (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
-	                (has_app_ver ? " " : ""), device_name, processor_name, frame_num, current_fps);
+	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", build_label,
+	                       build_type, (has_title ? title : ""), (has_title ? ", " : ""),
+	                       (has_title_id ? title_id : ""), (has_title_id ? ", " : ""),
+	                       (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""), device_name,
+	                       processor_name, frame_num, current_fps);
 
 #if defined(__APPLE__)
 	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.

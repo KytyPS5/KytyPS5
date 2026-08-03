@@ -28,6 +28,29 @@ include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
 
+set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
+set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
+if(NOT KYTY_BUILD_ORIGIN STREQUAL "Source" AND NOT KYTY_BUILD_ORIGIN STREQUAL "Official" AND
+   NOT KYTY_BUILD_ORIGIN STREQUAL "Fork")
+	message(FATAL_ERROR "KYTY_BUILD_ORIGIN must be Source, Official, or Fork")
+endif()
+
+set(KYTY_RELEASE_TAG "" CACHE STRING "Release tag embedded in official builds")
+set(KYTY_BUILD_REPOSITORY "" CACHE STRING "GitHub repository embedded in fork builds")
+set(KYTY_OFFICIAL_BUILD OFF)
+set(KYTY_FORK_BUILD OFF)
+if(KYTY_BUILD_ORIGIN STREQUAL "Official")
+	if(KYTY_RELEASE_TAG STREQUAL "")
+		message(FATAL_ERROR "Official builds require KYTY_RELEASE_TAG")
+	endif()
+	set(KYTY_OFFICIAL_BUILD ON)
+elseif(KYTY_BUILD_ORIGIN STREQUAL "Fork")
+	if(KYTY_BUILD_REPOSITORY STREQUAL "")
+		message(FATAL_ERROR "Fork builds require KYTY_BUILD_REPOSITORY")
+	endif()
+	set(KYTY_FORK_BUILD ON)
+endif()
+
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 include(TestBigEndian)
@@ -117,15 +140,19 @@ configure_file(
 
 find_package(Git)
 
-add_custom_target( KytyGitVersion
-    COMMAND ${CMAKE_COMMAND}
-	-D INPUT_FILE=${KYTY_SOURCE_DIR}/kytyGitVersion.h.in
-	-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyGitVersion.h
-	-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
-	-D GIT_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
-	-P ${KYTY_SOURCE_DIR}/generate_version.cmake
+add_custom_target(KytyGitVersion
+	COMMAND ${CMAKE_COMMAND}
+		-D INPUT_FILE=${KYTY_SOURCE_DIR}/kytyGitVersion.h.in
+		-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyGitVersion.h
+		-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
+		-D GIT_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
+		-P ${KYTY_SOURCE_DIR}/generate_version.cmake
+	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyGitVersion.h
 	COMMENT "Generate kytyGitVersion.h"
 )
+
+add_library(kyty_git_version INTERFACE)
+add_dependencies(kyty_git_version KytyGitVersion)
 
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
@@ -259,7 +286,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version)
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)
@@ -562,8 +589,6 @@ if(KYTY_CLANG_CL)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
-
-add_dependencies(kyty_emulator KytyGitVersion)
 
 if(APPLE)
 	# The emulator writes x86-64 trampolines/PLT stubs into memory and executes them, and

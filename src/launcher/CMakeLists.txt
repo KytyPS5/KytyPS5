@@ -37,7 +37,6 @@ elseif(LINUX)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 endif()
 
-add_dependencies(launcher KytyGitVersion)  
 add_dependencies(launcher kyty_emulator)
 
 if(KYTY_CLANG_CL)

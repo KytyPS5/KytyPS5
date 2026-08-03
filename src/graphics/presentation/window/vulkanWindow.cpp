@@ -754,10 +754,14 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
-	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
-	}
+	// Report, do not abort.
+	//
+	// --vulkan-validation decides whether validation runs; it should not also decide whether a
+	// spec violation ends the process, because those are separate questions. Failing fast
+	// suits working on the emulator, but it makes the option unusable for anyone who wants the
+	// diagnostics: a single violation ends the session, and the launcher enables validation by
+	// default. Errors are never skipped below, so the message still reaches the log.
+	(void)error;
 
 	if (!skip) {
 		LOGF_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,

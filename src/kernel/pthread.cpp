@@ -876,9 +876,11 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
-	void*      ret       = nullptr;
-	const auto guest_rsp = reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
-	const auto guest_rbp = guest_rsp - 4u * sizeof(uint64_t);
+	void*      ret = nullptr;
+	const auto aligned_stack_top =
+	    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
+	const auto guest_rsp = aligned_stack_top - 2u * sizeof(uintptr_t);
+	const auto guest_rbp = guest_rsp;
 
 	auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
 	guest_root_frame[0]    = 0;

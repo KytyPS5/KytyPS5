@@ -360,9 +360,10 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
 	if (stack_top != nullptr) {
-		const auto guest_rsp =
+		const auto aligned_stack_top =
 		    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
-		const auto guest_rbp = guest_rsp - 4u * sizeof(uint64_t);
+		const auto guest_rsp = aligned_stack_top - 2u * sizeof(uintptr_t);
+		const auto guest_rbp = guest_rsp;
 
 		auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
 		guest_root_frame[0]    = 0;
@@ -507,6 +508,13 @@ struct MainEntryStackTestState {
 static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
                                                      atexit_func_t /*atexit_func*/) {
 	auto* state = reinterpret_cast<MainEntryStackTestState*>(const_cast<char*>(params->argv[0]));
+	asm volatile("pushq %%r15\n\t"
+	             "pushq %%r14\n\t"
+	             "popq %%r14\n\t"
+	             "popq %%r15\n\t"
+	             :
+	             :
+	             : "memory");
 	asm volatile("movq %%rsp, %0" : "=r"(state->rsp) : : "memory");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	asm volatile("movq %%gs:0x08, %0\n\t"
@@ -529,6 +537,8 @@ bool TestMainEntryUsesGuestStack() {
 	MainEntryStackTestState state {};
 	EntryParams             params {};
 	params.argv[0] = reinterpret_cast<const char*>(&state);
+	std::memset(reinterpret_cast<void*>(stack_base), 0xcd, stack_size);
+	auto* root_frame = reinterpret_cast<const uintptr_t*>(stack_base + stack_size) - 2;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t original_teb_stack_base  = 0;
@@ -558,9 +568,10 @@ bool TestMainEntryUsesGuestStack() {
 	constexpr bool teb_ok = true;
 #endif
 
-	const bool rsp_ok = state.rsp >= stack_base && state.rsp < stack_base + stack_size;
-	const bool freed  = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
-	return state.called && rsp_ok && teb_ok && freed;
+	const bool rsp_ok  = state.rsp >= stack_base && state.rsp < stack_base + stack_size;
+	const bool root_ok = root_frame[0] == 0 && root_frame[1] == 0;
+	const bool freed   = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
+	return state.called && rsp_ok && root_ok && teb_ok && freed;
 }
 
 bool TestModuleRelocationUsesWritableHostMapping() {

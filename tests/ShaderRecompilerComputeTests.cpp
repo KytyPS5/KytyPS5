@@ -163,6 +163,10 @@ struct TileManagerTestAccess {
 };
 
 struct TextureCacheTestAccess {
+	static_assert(TextureCache::ImagePageTable::kPageBits == 20);
+	static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
+	static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
+
 	static void ConfigureGarbageCollection(TextureCache& cache, std::span<const ImageId> oldest,
 	                                       uint64_t tick, uint64_t pressure) {
 		cache.m_trigger_gc_memory  = 0;
@@ -195,6 +199,75 @@ struct TextureCacheTestAccess {
 	static bool Contains(const TextureCache& cache, ImageId id) {
 		const auto owner = cache.ResolveOwner(id);
 		return owner != nullptr && owner->registered;
+	}
+
+	static std::vector<ImageId> FindImages(TextureCache& cache, uint64_t address, uint64_t size,
+	                                       bool page_overlap) {
+		std::lock_guard      lock(cache.m_lock);
+		const auto           found = cache.FindImagesInRegion(address, size, page_overlap);
+		std::vector<ImageId> result;
+		result.reserve(found.size());
+		for (const auto id: found) {
+			result.push_back(id);
+		}
+		return result;
+	}
+
+	static size_t PageOwnerCount(TextureCache& cache, uint64_t address) {
+		std::lock_guard lock(cache.m_lock);
+		const auto*     owners = cache.m_image_page_table.Find(
+		    static_cast<size_t>(address >> TextureCache::ImagePageTable::kPageBits));
+		return owners == nullptr ? 0 : owners->size();
+	}
+
+	static size_t OwnedPageCount(TextureCache& cache, uint64_t address, uint64_t size, ImageId id) {
+		std::lock_guard                  lock(cache.m_lock);
+		TextureCache::ImagePageTable::PageRange pages {};
+		if (!TextureCache::ImagePageTable::TryGetPageRange(address, size, pages)) {
+			return 0;
+		}
+		size_t count = 0;
+		for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+			const auto* owners = cache.m_image_page_table.Find(page);
+			count += owners != nullptr && owners->Contains(id) ? 1 : 0;
+		}
+		return count;
+	}
+
+	static void AddPageOwner(TextureCache& cache, uint64_t address, ImageId id) {
+		std::lock_guard lock(cache.m_lock);
+		cache.m_image_page_table[static_cast<size_t>(
+		    address >> TextureCache::ImagePageTable::kPageBits)]
+		    .push_back(id);
+	}
+
+	static bool RemovePageOwner(TextureCache& cache, uint64_t address, ImageId id) {
+		std::lock_guard lock(cache.m_lock);
+		auto*           owners = cache.m_image_page_table.Find(
+		    static_cast<size_t>(address >> TextureCache::ImagePageTable::kPageBits));
+		return owners != nullptr && owners->Erase(id);
+	}
+
+	static void SetQueryEpoch(TextureCache& cache, uint32_t epoch) {
+		std::lock_guard lock(cache.m_lock);
+		cache.m_image_query_epoch = epoch;
+	}
+
+	static uint32_t QueryEpoch(TextureCache& cache) {
+		std::lock_guard lock(cache.m_lock);
+		return cache.m_image_query_epoch;
+	}
+
+	static ImageId InsertImage(TextureCache& cache, const ImageInfo& info) {
+		std::lock_guard transaction(cache.m_resource_mutex);
+		std::lock_guard lock(cache.m_lock);
+		return cache.InsertImage(info);
+	}
+
+	static void DeleteImage(TextureCache& cache, ImageId id) {
+		std::lock_guard transaction(cache.m_resource_mutex);
+		std::lock_guard lock(cache.m_lock);
+		cache.DeleteImage(id);
 	}
 
 	static std::shared_ptr<Image> Owner(const TextureCache& cache, ImageId id) {
@@ -2487,6 +2560,110 @@ public:
 			            texture_cache.GetImage(first).info.pixel_format ==
 			                vk::Format::eR8G8B8A8Srgb,
 			        "registered compatible backing did not reuse one ImageId");
+
+			const auto IsOnlyImage = [](const std::vector<ImageId>& ids, ImageId expected) {
+				return ids.size() == 1 && ids.front() == expected;
+			};
+			const auto exact_byte_miss =
+			    TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1, false);
+			const auto touched_page_hit =
+			    TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1, true);
+			const auto next_page_miss =
+			    TextureCacheTestAccess::FindImages(texture_cache, base + 0x1000, 1, true);
+			Require(name, "exact and 4-KiB page filtering",
+			        exact_byte_miss.empty() && IsOnlyImage(touched_page_hit, first) &&
+			            next_page_miss.empty(),
+			        "coarse candidates did not preserve exact-byte and touched-page semantics");
+
+			const auto MakeOwnershipInfo = [](uint64_t address, uint64_t size) {
+				ImageInfo info {};
+				info.data      = {address, size};
+				info.extent    = {1, 1, 1};
+				info.resources = {1, 1};
+				info.samples   = 1;
+				return info;
+			};
+			const auto spanning_info = MakeOwnershipInfo(base + 0x1ff000, 0x2000);
+			const auto spanning = TextureCacheTestAccess::InsertImage(texture_cache, spanning_info);
+			const auto spanning_results = TextureCacheTestAccess::FindImages(
+			    texture_cache, spanning_info.data.address, spanning_info.data.size, false);
+			Require(name, "one-MiB cross-page deduplication",
+			        spanning && IsOnlyImage(spanning_results, spanning) &&
+			            TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                                       spanning_info.data.address) == 1 &&
+			            TextureCacheTestAccess::PageOwnerCount(
+			                texture_cache, spanning_info.data.End() - 1) == 1,
+			        "an image spanning two coarse pages was missing or returned more than once");
+			TextureCacheTestAccess::DeleteImage(texture_cache, spanning);
+			Require(name, "cross-page owner cleanup",
+			        TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                               spanning_info.data.address) == 0 &&
+			            TextureCacheTestAccess::PageOwnerCount(
+			                texture_cache, spanning_info.data.End() - 1) == 0 &&
+			            TextureCacheTestAccess::FindImages(texture_cache,
+			                                               spanning_info.data.address,
+			                                               spanning_info.data.size, false)
+			                .empty(),
+			        "cross-page unregister left a stale coarse-page membership");
+
+			const auto shared_info = MakeOwnershipInfo(base + 0x500100, 0x100);
+			const auto shared_first =
+			    TextureCacheTestAccess::InsertImage(texture_cache, shared_info);
+			const auto shared_second =
+			    TextureCacheTestAccess::InsertImage(texture_cache, shared_info);
+			const auto shared_results = TextureCacheTestAccess::FindImages(
+			    texture_cache, shared_info.data.address, shared_info.data.size, false);
+			Require(name, "shared coarse-page registration",
+			        shared_results.size() == 2 &&
+			            std::find(shared_results.begin(), shared_results.end(), shared_first) !=
+			                shared_results.end() &&
+			            std::find(shared_results.begin(), shared_results.end(), shared_second) !=
+			                shared_results.end(),
+			        "two registered owners were not retained in one coarse page");
+			TextureCacheTestAccess::DeleteImage(texture_cache, shared_first);
+			const auto shared_survivor = TextureCacheTestAccess::FindImages(
+			    texture_cache, shared_info.data.address, shared_info.data.size, false);
+			Require(name, "shared coarse-page unregister",
+			        IsOnlyImage(shared_survivor, shared_second) &&
+			            TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                                       shared_info.data.address) == 1,
+			        "unregistering one owner removed its coarse-page neighbor");
+			TextureCacheTestAccess::DeleteImage(texture_cache, shared_second);
+			Require(name, "final shared coarse-page unregister",
+			        TextureCacheTestAccess::PageOwnerCount(texture_cache,
+			                                               shared_info.data.address) == 0,
+			        "the final shared owner remained registered");
+
+			constexpr uint64_t large_owner_size = 64ull * 1024 * 1024;
+			const auto large_info = MakeOwnershipInfo(base + 0x800000, large_owner_size);
+			const auto large_owner =
+			    TextureCacheTestAccess::InsertImage(texture_cache, large_info);
+			Require(name, "production one-MiB registration granularity",
+			        TextureCacheTestAccess::OwnedPageCount(
+			            texture_cache, large_info.data.address, large_info.data.size, large_owner) == 64,
+			        "64 MiB image registration did not create exactly 64 coarse memberships");
+			TextureCacheTestAccess::DeleteImage(texture_cache, large_owner);
+			Require(name, "production one-MiB unregister granularity",
+			        TextureCacheTestAccess::OwnedPageCount(
+			            texture_cache, large_info.data.address, large_info.data.size, large_owner) == 0,
+			        "large image unregister left coarse memberships behind");
+
+			const ImageId stale {first.index, first.generation + 1};
+			TextureCacheTestAccess::AddPageOwner(texture_cache, base, stale);
+			const auto stale_filtered =
+			    TextureCacheTestAccess::FindImages(texture_cache, base, sizeof(initial), false);
+			Require(name, "stale page owner filtering",
+			        IsOnlyImage(stale_filtered, first) &&
+			            TextureCacheTestAccess::RemovePageOwner(texture_cache, base, stale),
+			        "a stale generation escaped the direct page-owner lookup");
+
+			TextureCacheTestAccess::SetQueryEpoch(texture_cache, UINT32_MAX);
+			const auto wrap_results =
+			    TextureCacheTestAccess::FindImages(texture_cache, base, sizeof(initial), false);
+			Require(name, "page-owner query epoch wrap",
+			        IsOnlyImage(wrap_results, first) &&
+			            TextureCacheTestAccess::QueryEpoch(texture_cache) == 1,
+			        "query deduplication failed while wrapping its epoch");
 
 			auto&              image               = texture_cache.GetImage(first);
 			constexpr uint32_t final_sampled_value = 0x88776655u;

@@ -99,7 +99,8 @@ private:
 		int32_t layer = -1;
 	};
 
-	using ImageOwnerIndex = MultiRangePageOwnerIndex<ImageId>;
+	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
+	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
 
 	[[nodiscard]] Image&                 ResolveImage(ImageId id);
 	[[nodiscard]] const Image&           ResolveImage(ImageId id) const;
@@ -125,8 +126,9 @@ private:
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
-	[[nodiscard]] std::vector<ImageId> FindImagesInRegion(uint64_t address, uint64_t size,
-	                                                      bool page_overlap) const;
+	// Caller holds m_lock; it also serializes the per-image query epoch.
+	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
+	                                               bool page_overlap) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -169,7 +171,7 @@ private:
 	ResourceMutex&                                    m_resource_mutex;
 	std::vector<Slot>                                 m_slots;
 	std::vector<uint32_t>                             m_free_slots;
-	ImageOwnerIndex                                   m_image_owner_index;
+	ImagePageTable                                    m_image_page_table;
 	std::map<vk::Format, ImageId>                     m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::set<ImageId>                                 m_download_images;
@@ -177,9 +179,10 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t m_gc_tick                = 0;
-	bool     m_readback_linear_images = false;
+	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t         m_gc_tick                = 0;
+	mutable uint32_t m_image_query_epoch      = 0;
+	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

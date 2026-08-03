@@ -195,10 +195,12 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
-	std::vector<ImageOwnerIndex::ByteRange> ranges;
-	ranges.push_back({image.info.data.address, image.info.data.size});
-	if (!m_image_owner_index.Register(id, ranges)) {
-		EXIT("TextureCache: duplicate or invalid image registration\n");
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+		EXIT("TextureCache: image registration is outside the guest address space\n");
+	}
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		m_image_page_table[page].push_back(id);
 	}
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -211,9 +213,15 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	UntrackImage(id);
-	std::vector<ImageOwnerIndex::ByteRange> releases;
-	if (!m_image_owner_index.Unregister(id, releases)) {
-		EXIT("TextureCache: image missing from owner index\n");
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+		EXIT("TextureCache: registered image is outside the guest address space\n");
+	}
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr || !owners->Erase(id)) {
+			EXIT("TextureCache: image missing from page owner index\n");
+		}
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -451,10 +459,48 @@ const Image& TextureCache::GetImage(ImageId id) const {
 	return ResolveImage(id);
 }
 
-std::vector<ImageId> TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
-                                                      bool page_overlap) const {
-	return page_overlap ? m_image_owner_index.QueryCandidates(address, size)
-	                    : m_image_owner_index.Query(address, size);
+TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
+                                                        bool page_overlap) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return {};
+	}
+
+	uint32_t query_epoch = ++m_image_query_epoch;
+	if (query_epoch == 0) {
+		for (const auto& slot: m_slots) {
+			if (slot.image != nullptr) {
+				slot.image->query_epoch = 0;
+			}
+		}
+		query_epoch = ++m_image_query_epoch;
+	}
+
+	ImageIds result;
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr) {
+			continue;
+		}
+		owners->ForEach([&](ImageId id) {
+			if (!id || id.index >= m_slots.size()) {
+				return;
+			}
+			const auto& slot = m_slots[id.index];
+			if (slot.generation != id.generation || slot.image == nullptr) {
+				return;
+			}
+			auto& image = *slot.image;
+			if (image.query_epoch == query_epoch) {
+				return;
+			}
+			image.query_epoch = query_epoch;
+			if (image.Overlaps(address, size, page_overlap)) {
+				result.push_back(id);
+			}
+		});
+	}
+	return result;
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
@@ -1152,9 +1198,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	bool    inserted_new = false;
 	{
-		std::lock_guard            transaction(m_resource_mutex);
-		CacheLock                  lock(*this, m_lock);
-		const std::vector<ImageId> candidates =
+		std::lock_guard transaction(m_resource_mutex);
+		CacheLock       lock(*this, m_lock);
+		const auto      candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {

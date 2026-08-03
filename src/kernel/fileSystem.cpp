@@ -64,6 +64,7 @@ struct File {
 	std::filesystem::path               real_name;
 	std::atomic_bool                    opened;
 	std::atomic_bool                    directory;
+	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
 	SpecialFile                         special;
@@ -129,6 +130,7 @@ int FileDescriptors::CreateDescriptor() {
 	auto* file        = new File {};
 	file->opened      = false;
 	file->directory   = false;
+	file->writable    = false;
 	file->append      = false;
 	file->sync_writes = false;
 	file->special     = SpecialFile::None;
@@ -408,6 +410,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
 	file->name        = path;
+	file->writable    = rw_mode != Common::File::Mode::Read;
 	file->append      = append;
 	file->sync_writes = fsync || sync || dsync;
 
@@ -949,6 +952,47 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	stat.st_ctim     = stat.st_atim;
 	stat.st_birthtim = stat.st_mtim;
 	*sb              = stat;
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto* file = g_files->GetFile(d);
+
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (!file->writable) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (file->directory || file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	Common::LockGuard lock(file->mutex);
+
+	if (file->f.IsInvalid() || !file->f.Truncate(static_cast<uint64_t>(length))) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
+	     Common::PathToString(file->real_name).c_str());
 
 	return OK;
 }

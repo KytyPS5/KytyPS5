@@ -429,6 +429,14 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 #else
 	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
 	      std::cv_status::no_timeout);
+	// Wait() polls through its 10 ms timeout, but this one can be given an arbitrarily long
+	// timeout, so a guest signal left pending by the host signal handler would sit here
+	// undelivered for all of it. Dispatch with the guest mutex released, as Wait() does.
+	if (auto* callback = g_cond_wait_poll_callback; callback != nullptr) {
+		cpp_lock.unlock();
+		callback();
+		cpp_lock.lock();
+	}
 	cpp_lock.release();
 #endif
 	UnregisterCondWaiter(m_cond_var.get());
@@ -450,12 +458,39 @@ void CondVar::SignalAll() {
 }
 
 void CondVar::SignalThread(int thread_id) {
-	std::lock_guard lock(g_cond_waiters_mutex);
-	for (const auto& waiter: g_cond_waiters) {
-		if (waiter.first == thread_id) {
-			WakeCondVar(waiter.second);
+	// Collect the targets under the registry lock, then wake them with it released.
+	// Waking is not guaranteed to be non-blocking: a condition-variable broadcast can
+	// block until the waiters it is retiring have left the variable, and they leave
+	// through UnregisterCondWaiter, which needs this same mutex. Waking while holding
+	// it therefore deadlocks the waker against every waiter it is trying to wake.
+	// Signal() and SignalAll() already wake without holding the registry lock.
+	std::vector<CondVarPrivate*> targets;
+	{
+		std::lock_guard lock(g_cond_waiters_mutex);
+		for (const auto& waiter: g_cond_waiters) {
+			if (waiter.first == thread_id) {
+				targets.push_back(waiter.second);
+			}
 		}
 	}
+	for (auto* cond_var: targets) {
+		WakeCondVar(cond_var);
+	}
+}
+
+static thread_local uint32_t g_hle_critical_depth = 0;
+
+HleCriticalSection::HleCriticalSection() {
+	g_hle_critical_depth++;
+}
+
+HleCriticalSection::~HleCriticalSection() {
+	EXIT_IF(g_hle_critical_depth == 0);
+	g_hle_critical_depth--;
+}
+
+bool InHleCriticalSection() {
+	return g_hle_critical_depth != 0;
 }
 
 int Thread::GetThreadIdUnique() {

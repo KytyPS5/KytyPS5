@@ -102,6 +102,21 @@ private:
 	mutex_type& m_mutex;
 };
 
+// A guest exception handler can block for an unbounded time -- IL2CPP's garbage collector parks
+// every managed thread in one until the collection finishes -- so one must never run while this
+// thread holds a lock that another guest thread needs to make progress. Scopes that take an
+// emulator-global lock declare themselves here, and pending-signal dispatch refuses to run a
+// handler inside one, leaving the signal queued until the scope unwinds.
+class HleCriticalSection {
+public:
+	HleCriticalSection();
+	~HleCriticalSection();
+
+	KYTY_CLASS_NO_COPY(HleCriticalSection);
+};
+
+[[nodiscard]] bool InHleCriticalSection();
+
 } // namespace Common
 
 #endif /* KYTY_COMMON_THREADS_H_ */

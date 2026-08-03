@@ -664,12 +664,10 @@ struct DrawIndexBufferSource {
 
 struct PreparedIndexBuffer {
 	std::shared_ptr<void> owner;
-	vk::Buffer            buffer   = nullptr;
-	uint64_t              address  = 0;
-	uint64_t              size     = 0;
-	vk::DeviceSize        offset   = 0;
-	vk::IndexType         type     = vk::IndexType::eUint16;
-	bool                  streamed = false;
+	vk::Buffer            buffer = nullptr;
+	uint64_t              size   = 0;
+	vk::DeviceSize        offset = 0;
+	vk::IndexType         type   = vk::IndexType::eUint16;
 };
 
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer) {
@@ -896,12 +894,6 @@ static std::vector<BufferBinding> PrepareVertexBuffers(uint64_t                 
 	return AcquireVertexBuffers(buffer, vs_input_info);
 }
 
-static void RebindVertexBuffers(RenderCommandBuffer&         buffer,
-                                const ShaderVertexInputInfo& vs_input_info,
-                                std::vector<BufferBinding>&  bindings) {
-	bindings = AcquireVertexBuffers(buffer, vs_input_info);
-}
-
 static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffer,
                                               const DrawIndexBufferSource& source) {
 	PreparedIndexBuffer prepared;
@@ -909,16 +901,14 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 		return prepared;
 	}
 	EXIT_IF(source.size == 0);
-	prepared.address = source.address;
-	prepared.size    = source.size;
-	prepared.type    = source.type;
+	prepared.size = source.size;
+	prepared.type = source.type;
 	if (source.host_data != nullptr) {
 		auto binding =
 		    buffer.GetContext().GetBufferCache().UploadTransient(source.host_data, source.size, 16);
-		prepared.owner    = std::move(binding.owner);
-		prepared.buffer   = binding.buffer;
-		prepared.offset   = binding.offset;
-		prepared.streamed = true;
+		prepared.owner  = std::move(binding.owner);
+		prepared.buffer = binding.buffer;
+		prepared.offset = binding.offset;
 	} else {
 		auto binding =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(buffer, source.address, source.size);
@@ -927,17 +917,6 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 		prepared.offset = binding.offset;
 	}
 	return prepared;
-}
-
-static void RebindIndexBuffer(RenderCommandBuffer& buffer, PreparedIndexBuffer& prepared) {
-	if (prepared.size == 0 || prepared.streamed) {
-		return;
-	}
-	auto binding =
-	    buffer.GetContext().GetBufferCache().ObtainBuffer(buffer, prepared.address, prepared.size);
-	prepared.owner  = std::move(binding.owner);
-	prepared.buffer = binding.buffer;
-	prepared.offset = binding.offset;
 }
 
 static void CommitVertexBuffers(RenderCommandBuffer& buffer, vk::CommandBuffer vk_buffer,
@@ -1046,8 +1025,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	                                               state.ps_input_info.stage, state.ps_active);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
-	RebindVertexBuffers(buffer, state.vs_input_info, vertex_bindings);
-	RebindIndexBuffer(buffer, index_binding);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
 

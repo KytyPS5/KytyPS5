@@ -49,6 +49,15 @@ public:
 		return "/savedata" + std::to_string(slot);
 	}
 
+	// Directory name a slot is mounted from, so a mount point can be mapped back to the save
+	// directory that holds its parameters.
+	[[nodiscard]] std::optional<std::string> Directory(size_t slot) const {
+		if (slot >= m_directories.size()) {
+			return std::nullopt;
+		}
+		return m_directories[slot];
+	}
+
 	[[nodiscard]] bool Empty() const {
 		for (const auto& directory: m_directories) {
 			if (directory.has_value()) {

@@ -68,6 +68,10 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_DownloadData/" + title_id, "/download0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp0");
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
+	// The devkit log directory. Unity titles write their player log to /devlog/app/debug.log, and
+	// with nothing mounted there the open fails and every managed-side message -- including the
+	// exceptions a title logs when its own subsystems fail to start -- is silently discarded.
+	MountOrCreateDir("_DevLog/" + title_id, "/devlog");
 }
 
 static bool ClearDirectoryContents(const std::filesystem::path& dir) {

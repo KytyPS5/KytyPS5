@@ -820,6 +820,7 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	EXIT_NOT_IMPLEMENTED(whence != 0);
 
 	if (offset < 0) {
+		file->mutex.Unlock();
 		return KERNEL_ERROR_EINVAL;
 	}
 

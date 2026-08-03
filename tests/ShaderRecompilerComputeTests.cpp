@@ -58,6 +58,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
@@ -1372,12 +1373,14 @@ public:
 
 	void CheckGpuMappedRangeLifecycle() {
 		EnsureRuntimeContext();
-		CommandScheduler scheduler(Renderer(), m_runtime_context);
+		auto&            context = Renderer();
+		CommandScheduler scheduler(context, m_runtime_context);
 		HW::Context      registers {};
 		HW::UserConfig   user_config {};
 		HW::Shader       shaders {};
 		scheduler.Begin(registers, user_config, shaders);
-		Gpu                gpu(Renderer());
+		context.InitializeGpu(nullptr);
+		auto&              gpu = context.GetGpu();
 		GpuResourceManager resources(m_runtime_context, scheduler);
 		resources.SetGpu(&gpu);
 
@@ -1416,6 +1419,7 @@ public:
 
 		resources.SetGpu(nullptr);
 		scheduler.Finish();
+		context.ShutdownGpu();
 		std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
 	}
 
@@ -1567,20 +1571,72 @@ public:
 			gpu_thread = std::this_thread::get_id();
 			Require("GpuCommandLane", "FIFO", order == 1,
 			        "synchronous command overtook an older host command");
-			Require("GpuCommandLane", "generic context",
-			        !Gpu::IsCommandProcessorThread() && Gpu::CurrentCommandProcessor() == nullptr,
-			        "generic host command manufactured a PM4 processor context");
+			Require("GpuCommandLane", "GPU context", Gpu::IsGpuThread(),
+			        "host command did not run on the GPU thread");
 			gpu.SendCommandSync([&nested_thread] { nested_thread = std::this_thread::get_id(); });
 			order = 2;
-		});
-		gpu.SendCommandSyncWithProcessor([&](CommandProcessor& processor) {
-			Require("GpuCommandLane", "processor context",
-			        Gpu::IsCommandProcessorThread() && Gpu::CurrentCommandProcessor() == &processor,
-			        "resource command did not receive its explicit processor context");
 		});
 		Require("GpuCommandLane", "dispatch thread",
 		        order == 2 && gpu_thread != caller_thread && nested_thread == gpu_thread,
 		        "host command did not run on the GPU thread or nested sync deadlocked");
+
+		alignas(uint32_t) uint32_t packet_marker_a = 0;
+		alignas(uint32_t) uint32_t packet_marker_b = 0;
+		const auto write_packet = [](uint32_t* packet, uint32_t* destination, uint32_t value) {
+			const auto destination_address = reinterpret_cast<uint64_t>(destination);
+			packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+			packet[1] = 0;
+			packet[2] = static_cast<uint32_t>(destination_address);
+			packet[3] = static_cast<uint32_t>(destination_address >> 32u);
+			packet[4] = value;
+		};
+		std::array<uint32_t, 1024> polling_loop {};
+		for (size_t i = 0; i < polling_loop.size() - 4; i += 2) {
+			polling_loop[i]     = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
+			polling_loop[i + 1] = 0;
+		}
+		const auto loop_address = reinterpret_cast<uint64_t>(polling_loop.data());
+		polling_loop[1020] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+		polling_loop[1021] = static_cast<uint32_t>(loop_address);
+		polling_loop[1022] = static_cast<uint32_t>(loop_address >> 32u);
+		polling_loop[1023] = 0x0f200000u | static_cast<uint32_t>(polling_loop.size());
+
+		std::array<uint32_t, 14> polling_commands {};
+		write_packet(polling_commands.data(), &packet_marker_a, 11);
+		polling_commands[5] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+		polling_commands[6] = static_cast<uint32_t>(loop_address);
+		polling_commands[7] = static_cast<uint32_t>(loop_address >> 32u);
+		polling_commands[8] = 0x0f200000u | static_cast<uint32_t>(polling_loop.size());
+		write_packet(polling_commands.data() + 9, &packet_marker_b, 22);
+		std::binary_semaphore stream_gate_entered {0};
+		std::binary_semaphore stream_gate_release {0};
+		gpu.SendCommand([&] {
+			stream_gate_entered.release();
+			stream_gate_release.acquire();
+		});
+		gpu.Submit(polling_commands.data(), polling_commands.size(), nullptr, 0);
+		stream_gate_entered.acquire();
+		stream_gate_release.release();
+		uint32_t packet_marker_a_at_callback = UINT32_MAX;
+		uint32_t packet_marker_b_at_callback = UINT32_MAX;
+		for (uint32_t attempt = 0; attempt < 8 && packet_marker_a_at_callback != 11; attempt++) {
+			gpu.SendCommandSync([&] {
+				if (packet_marker_a == 11 && packet_marker_b == 0) {
+					packet_marker_a_at_callback = packet_marker_a;
+					packet_marker_b_at_callback = packet_marker_b;
+					polling_loop[1020] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
+					polling_loop[1021] = 0;
+					polling_loop[1022] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
+					polling_loop[1023] = 0;
+				}
+			});
+			std::this_thread::yield();
+		}
+		gpu.Done();
+		Require("GpuCommandLane", "packet-boundary command polling",
+		        packet_marker_a_at_callback == 11 && packet_marker_b_at_callback == 0 &&
+		            packet_marker_a == 11 && packet_marker_b == 22,
+		        "host command waited for an entire non-suspended PM4 stream");
 
 		uint32_t   label   = 0;
 		uint32_t   prefix  = 0;
@@ -1760,7 +1816,7 @@ public:
 		gpu.Submit(dma_commands.data(), static_cast<uint32_t>(dma_commands.size()), nullptr, 0);
 		gpu.Done();
 		constexpr uint32_t clean_fill_value = 0xdecafbad;
-		gpu.SendCommandSyncWithProcessor([&](CommandProcessor&) {
+		gpu.SendCommandSync([&] {
 			auto& buffer_cache = resources.GetBufferCache();
 			Require("GpuCommandLane", "clean cached setup",
 			        buffer_cache.HasPageOverlap(clean_cached_fill, sizeof(source_words)) &&
@@ -1840,14 +1896,116 @@ public:
 		                                                       clean_copy_words[1]},
 		        "host-memory fill/copy did not update the clean cached mirror");
 
-		gpu.SendCommandSyncWithProcessor([&](CommandProcessor& processor) {
-			Require("GpuCommandLane", "processor fault context",
-			        Gpu::CurrentCommandProcessor() == &processor,
-			        "processor resource test lost its command context");
-			Require("GpuCommandLane", "processor memory invalidation",
+		gpu.SendCommandSync([&] {
+			Require("GpuCommandLane", "GPU memory invalidation",
 			        resources.InvalidateMemory(fault_base, sizeof(uint32_t)),
-			        "processor memory invalidation did not find its mapped range");
+			        "GPU memory invalidation did not find its mapped range");
 		});
+
+		auto& buffer_cache = resources.GetBufferCache();
+		Require("GpuCommandLane", "clean tracked fault setup",
+		        buffer_cache.HasPageOverlap(immediate_dst, sizeof(uint32_t)) &&
+		            !buffer_cache.HasGpuDirtyBytes(immediate_dst, sizeof(uint32_t)),
+		        "clean write-fault test address is not backed by a clean cached Buffer");
+		constexpr uint64_t dirty_fault_address = fault_base + 0xd000;
+		constexpr uint32_t dirty_fault_value   = 0x5a17c0deu;
+		constexpr uint32_t dirty_fault_stale   = 0x0ddba11u;
+		std::memcpy(reinterpret_cast<void*>(dirty_fault_address), &dirty_fault_stale,
+		            sizeof(dirty_fault_stale));
+		gpu.SendCommandSync([&] {
+			auto dirty = buffer_cache.ObtainBuffer(scheduler.Current(), dirty_fault_address,
+			                                       sizeof(dirty_fault_value), true, false);
+			Require("GpuCommandLane", "dirty tracked fault setup", dirty.owner != nullptr,
+			        "dirty write-fault test could not create a cached Buffer");
+			scheduler.Current().RetainResourceUntilFence(dirty.owner);
+			buffer_cache.FillBuffer(dirty_fault_address, sizeof(dirty_fault_value),
+			                        dirty_fault_value);
+		});
+		Require("GpuCommandLane", "dirty tracked fault ownership",
+		        buffer_cache.HasGpuDirtyBytes(dirty_fault_address, sizeof(dirty_fault_value)),
+		        "dirty write-fault test address did not acquire GPU ownership");
+
+		std::binary_semaphore block_entered {0};
+		std::binary_semaphore block_release {0};
+		std::binary_semaphore clean_fault_complete {0};
+		bool                  clean_fault_handled = false;
+		gpu.SendCommand([&] {
+			block_entered.release();
+			block_release.acquire();
+		});
+		block_entered.acquire();
+		std::jthread clean_fault_thread([&] {
+			clean_fault_handled = resources.HandleFault(PageFaultAccess::Write, immediate_dst);
+			clean_fault_complete.release();
+		});
+		const bool clean_fault_was_direct =
+		    clean_fault_complete.try_acquire_for(std::chrono::seconds(1));
+		if (!clean_fault_was_direct) {
+			block_release.release();
+			clean_fault_complete.acquire();
+		}
+		clean_fault_thread.join();
+		Require("GpuCommandLane", "clean fault direct path",
+		        clean_fault_was_direct && clean_fault_handled,
+		        "a clean CPU write fault waited for the blocked GPU command lane");
+
+		std::binary_semaphore dirty_fault_complete {0};
+		bool                  dirty_fault_handled = false;
+		std::jthread dirty_fault_thread([&] {
+			dirty_fault_handled =
+			    resources.HandleFault(PageFaultAccess::Write, dirty_fault_address);
+			dirty_fault_complete.release();
+		});
+		const bool dirty_fault_bypassed_lane =
+		    dirty_fault_complete.try_acquire_for(std::chrono::milliseconds(200));
+		block_release.release();
+		if (!dirty_fault_bypassed_lane) {
+			dirty_fault_complete.acquire();
+		}
+		dirty_fault_thread.join();
+		uint32_t dirty_fault_backing = 0;
+		std::memcpy(&dirty_fault_backing, reinterpret_cast<const void*>(dirty_fault_address),
+		            sizeof(dirty_fault_backing));
+		Require("GpuCommandLane", "dirty fault synchronization",
+		        !dirty_fault_bypassed_lane && dirty_fault_handled &&
+		            dirty_fault_backing == dirty_fault_value &&
+		            !buffer_cache.HasGpuDirtyBytes(dirty_fault_address, sizeof(dirty_fault_value)),
+		        "a GPU-dirty write fault bypassed synchronization or lost the published bytes");
+
+		constexpr uint64_t empty_copy_fault_address = fault_base + 0xe000;
+		constexpr uint32_t empty_copy_fault_value   = 0x6b28d1efu;
+		gpu.SendCommandSync([&] {
+			auto dirty = buffer_cache.ObtainBuffer(scheduler.Current(), empty_copy_fault_address,
+			                                       sizeof(empty_copy_fault_value), true, false);
+			Require("GpuCommandLane", "empty-copy write setup", dirty.owner != nullptr,
+			        "empty-copy write test could not create a cached Buffer");
+			scheduler.Current().RetainResourceUntilFence(dirty.owner);
+			buffer_cache.FillBuffer(empty_copy_fault_address, sizeof(empty_copy_fault_value),
+			                        empty_copy_fault_value);
+			buffer_cache.ReadMemory(empty_copy_fault_address, sizeof(empty_copy_fault_value));
+			const bool gpu_owned = buffer_cache.IsRegionGpuModified(
+			    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+			const bool cpu_owned = buffer_cache.IsRegionCpuModified(
+			    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+			Require("GpuCommandLane", "empty-copy read ownership",
+			        !gpu_owned && !cpu_owned,
+			        "readback did not leave clean ownership for the queued write invalidation");
+			buffer_cache.ReadMemory(empty_copy_fault_address, sizeof(empty_copy_fault_value), true);
+		});
+		uint32_t empty_copy_fault_backing = 0;
+		std::memcpy(&empty_copy_fault_backing, reinterpret_cast<const void*>(empty_copy_fault_address),
+		            sizeof(empty_copy_fault_backing));
+		const bool empty_copy_cpu_owned = buffer_cache.IsRegionCpuModified(
+		    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+		const bool empty_copy_gpu_owned = buffer_cache.IsRegionGpuModified(
+		    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+		const bool empty_copy_dirty =
+		    buffer_cache.HasGpuDirtyBytes(empty_copy_fault_address, sizeof(empty_copy_fault_value));
+		Require("GpuCommandLane", "empty-copy write ownership",
+		        empty_copy_fault_backing == empty_copy_fault_value &&
+		            empty_copy_cpu_owned && !empty_copy_gpu_owned && !empty_copy_dirty,
+		        "write invalidation without a remaining copy did not establish CPU ownership");
+
 		resources.UnmapMemory(fault_base, fault_size);
 		Require("GpuCommandLane", "processor fault unmap",
 		        Libs::LibKernel::Memory::KernelMunmap(fault_base, fault_size) == 0,
@@ -2073,12 +2231,14 @@ public:
 		constexpr uint32_t    ring_fault_second_value       = 0x4e5f6071u;
 
 		EnsureRuntimeContext();
-		CommandScheduler scheduler(Renderer(), m_runtime_context);
+		auto&            context = Renderer();
+		CommandScheduler scheduler(context, m_runtime_context);
 		HW::Context      registers {};
 		HW::UserConfig   user_config {};
 		HW::Shader       shaders {};
 		scheduler.Begin(registers, user_config, shaders);
-		Gpu gpu(Renderer());
+		context.InitializeGpu(nullptr);
+		auto& gpu = context.GetGpu();
 
 		int64_t direct_offset = -1;
 		Require(name, "direct allocation",
@@ -2471,7 +2631,7 @@ public:
 			resources.UnmapMemory(base, allocation_size);
 			scheduler.Finish();
 		}
-		gpu.Shutdown();
+		context.ShutdownGpu();
 		Require(name, "unmap direct backing",
 		        Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
 		        "dirty-GC direct-memory mapping release failed");
@@ -2488,12 +2648,14 @@ public:
 		constexpr uint64_t    allocation_size      = 0x2800000;
 		constexpr uint64_t    allocation_alignment = 0x200000;
 		EnsureRuntimeContext();
-		CommandScheduler scheduler(Renderer(), m_runtime_context);
+		auto&            context = Renderer();
+		CommandScheduler scheduler(context, m_runtime_context);
 		HW::Context      registers {};
 		HW::UserConfig   user_config {};
 		HW::Shader       shaders {};
 		scheduler.Begin(registers, user_config, shaders);
-		Gpu     gpu(Renderer());
+		context.InitializeGpu(nullptr);
+		auto&   gpu = context.GetGpu();
 		int64_t direct_offset = -1;
 		Require(name, "direct allocation",
 		        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -4949,7 +5111,7 @@ public:
 			resources.UnmapMemory(base, allocation_size);
 			scheduler.Finish();
 		}
-		gpu.Shutdown();
+		context.ShutdownGpu();
 		Require(name, "unmap direct backing",
 		        Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
 		        "cache direct-memory mapping release failed");

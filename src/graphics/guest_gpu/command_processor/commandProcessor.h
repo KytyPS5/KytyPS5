@@ -50,23 +50,10 @@ public:
 
 	void Reset();
 
-	void BufferInit();
-	void BufferFlush();
-	void BufferFlushAndWait();
-	void BufferWait();
-	void BeginReadbackTransaction() {
-		if (m_readback_active) {
-			EXIT("nested command-processor readback transaction\n");
-		}
-		m_readback_active = true;
-	}
-	void EndReadbackTransaction() {
-		if (!m_readback_active) {
-			EXIT("command-processor readback transaction is not active\n");
-		}
-		m_readback_active = false;
-	}
-
+	void            BufferInit();
+	void            BufferFlush();
+	void            BufferFlushAndWait();
+	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -173,10 +160,9 @@ private:
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
 
-	uint32_t m_de_count        = 0;
-	uint32_t m_ce_count        = 0;
-	bool     m_ce_complete     = false;
-	bool     m_readback_active = false;
+	uint32_t m_de_count    = 0;
+	uint32_t m_ce_count    = 0;
+	bool     m_ce_complete = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
 

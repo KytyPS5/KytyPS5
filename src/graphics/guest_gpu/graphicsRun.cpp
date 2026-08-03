@@ -36,6 +36,7 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
+static thread_local GpuState*         g_gpu_state         = nullptr;
 
 class GpuMutexLock final {
 public:
@@ -98,11 +99,10 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	void Done();
 	void Shutdown();
-	[[nodiscard]] bool IsStopping();
-	void               SendCommand(Common::UniqueFunction<void>&& command);
-	void               SendCommandSync(Common::UniqueFunction<void>&& command);
-	void SendCommandSyncWithProcessor(Common::UniqueFunction<void, CommandProcessor&>&& command);
-	int  GetFrameNum();
+	[[nodiscard]] bool        IsStopping();
+	void                      SendCommand(Common::UniqueFunction<void>&& command);
+	void                      SendCommandSync(Common::UniqueFunction<void>&& command);
+	int                       GetFrameNum();
 	[[nodiscard]] static bool IsGpuThread() noexcept { return g_gpu_thread; }
 
 private:
@@ -127,6 +127,7 @@ private:
 	void              WaitLocked();
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
@@ -139,6 +140,7 @@ private:
 	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
+	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
@@ -153,6 +155,8 @@ private:
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
+
+	friend class CommandProcessor;
 };
 
 static bool GraphicsRunDebugDumpEnabled() {
@@ -195,7 +199,23 @@ void GpuState::SendCommand(Common::UniqueFunction<void>&& command) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
+}
+
+void GpuState::ProcessCommands() {
+	EXIT_IF(!IsGpuThread());
+	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		Common::UniqueFunction<void> command;
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			EXIT_IF(m_commands.empty());
+			command = std::move(m_commands.front());
+			m_commands.pop_front();
+			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+		}
+		command();
+	}
 }
 
 void GpuState::SendCommandSync(Common::UniqueFunction<void>&& command) {
@@ -210,17 +230,6 @@ void GpuState::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		done.release();
 	});
 	done.acquire();
-}
-
-void GpuState::SendCommandSyncWithProcessor(
-    Common::UniqueFunction<void, CommandProcessor&>&& command) {
-	EXIT_IF(!command);
-	SendCommandSync([this, operation = std::move(command)]() mutable {
-		EXIT_IF(g_current_processor != nullptr);
-		g_current_processor = m_gfx_cp.get();
-		operation(*m_gfx_cp);
-		g_current_processor = nullptr;
-	});
 }
 
 void GpuState::Submit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t* cmd_const_buffer,
@@ -509,6 +518,7 @@ void GpuState::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
+	g_gpu_state  = gpu;
 
 	for (;;) {
 		Submission                   submission;
@@ -529,6 +539,7 @@ void GpuState::ThreadRun(void* data) {
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
+				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
 				int selected_queue = -1;
@@ -560,6 +571,7 @@ void GpuState::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
+			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
 		}
@@ -741,6 +753,9 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->ProcessCommands();
+		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
 		if (cursor.deferred_advance_dw != 0) {
@@ -1650,10 +1665,6 @@ void Gpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	m_state->SendCommandSync(std::move(command));
 }
 
-void Gpu::SendCommandSyncWithProcessor(Common::UniqueFunction<void, CommandProcessor&>&& command) {
-	m_state->SendCommandSyncWithProcessor(std::move(command));
-}
-
 void Gpu::Submit(uint32_t* draw_commands, uint32_t draw_size_dw, uint32_t* constant_commands,
                  uint32_t constant_size_dw, bool trigger_agc_interrupt_on_done) {
 	EXIT_IF(draw_commands == nullptr || draw_size_dw == 0);
@@ -1679,12 +1690,8 @@ int Gpu::GetFrameNum() const {
 	return m_state->GetFrameNum();
 }
 
-bool Gpu::IsCommandProcessorThread() noexcept {
-	return g_current_processor != nullptr;
-}
-
-CommandProcessor* Gpu::CurrentCommandProcessor() noexcept {
-	return g_current_processor;
+bool Gpu::IsGpuThread() noexcept {
+	return GpuState::IsGpuThread();
 }
 
 } // namespace Libs::Graphics

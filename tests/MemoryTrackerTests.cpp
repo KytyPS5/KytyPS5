@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <semaphore>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -265,6 +267,7 @@ void TestRangeInvalidation() {
     flushes++;
     tracker.ForEachDownloadRange<true>(address + 16, size - 32,
                                        [](uint64_t, uint64_t) noexcept {});
+    tracker.MarkRegionAsCpuModified(address + 16, size - 32);
   });
   Check(flushes == 1 && !tracker.IsRegionGpuModified(address, size) &&
             tracker.IsRegionCpuModified(address, size) && IsWritable(memory) &&
@@ -275,6 +278,53 @@ void TestRangeInvalidation() {
         "clean range invalidation unnecessarily requested a GPU flush");
   tracker.UntrackMemory(address, size);
   Release(page_manager, memory, size);
+}
+
+void TestGpuReacquisitionAfterInvalidation() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size),
+        "reacquisition setup did not establish GPU ownership");
+
+  uint32_t flushes = 0;
+  uint32_t uploads = 0;
+  std::binary_semaphore reacquire{0};
+  std::binary_semaphore reacquired{0};
+  std::jthread publisher([&] {
+    reacquire.acquire();
+    tracker.ForEachUploadRange(
+        address + 16, 32, true,
+        [&](uint64_t, uint64_t) noexcept { uploads++; }, []() noexcept {});
+    reacquired.release();
+  });
+  tracker.InvalidateRegion(address + 16, 32, [&] {
+    flushes++;
+    tracker.ForEachDownloadRange<true>(address + 16, 32,
+                                       [](uint64_t, uint64_t) noexcept {});
+    tracker.MarkRegionAsCpuModified(address + 16, 32);
+    reacquire.release();
+    reacquired.acquire();
+  });
+  publisher.join();
+  Check(flushes == 1 && uploads == 1 &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size) &&
+            !IsWritable(memory),
+        "invalidation rejected a new generation of GPU ownership");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size);
+  Release(page_manager, memory, page_size);
 }
 
 void TestGpuDirtyBits() {
@@ -635,6 +685,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestCpuDirtyUpload();
   TestRangeInvalidation();
+  TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();

@@ -46,7 +46,7 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                        InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                        ReadMemory(uint64_t vaddr, uint64_t size);
+	void                        ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	void                        UnmapMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,
@@ -97,6 +97,7 @@ private:
 	void PublishDownloads(std::span<const DownloadRange> downloads);
 	void QueueGarbageDownload(std::span<const DownloadCopy> copies, RetiredBuffer retire);
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
+	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

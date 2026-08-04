@@ -11593,6 +11593,33 @@ TestCase VectorVop3CompareNeU64OnGpu() {
 	         O::SEndpgm}};
 }
 
+TestCase VectorVop3CompareEqI64OnGpu() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+	code.push_back(EncodeSop1(0x04, 4, 126)); // s_mov_b64 s[4:5], exec
+
+	code.push_back(0xd4a2006au);
+	code.push_back(0x0000087eu); // v_cmp_eq_i64 vcc, exec, s[4:5]
+	code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+	AppendStoreVgpr(&code, 2, 0);
+
+	AppendSMovLiteral(&code, 4, 0);
+	code.push_back(0xd4a2006au);
+	code.push_back(0x0000087eu); // low dword mismatch
+	code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+	AppendStoreVgpr(&code, 3, 1);
+	AppendEnd(&code);
+
+	return {"VectorVop3CompareEqI64OnGpu",
+	        code,
+	        {},
+	        {1, 0},
+	        {O::VMovB32, O::SMovB64, O::VCmpEqI64, O::VCndmaskB32, O::SMovB32,
+	         O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase VectorCompareClassF32() {
 	using O = ShaderOpcode;
 
@@ -15060,6 +15087,7 @@ std::vector<TestCase> MakeCases() {
 	AddCase(VectorSpecialF32FlushesDenormalInputs);
 	AddCase(VectorSinCosMaxFiniteSpecialCases);
 	AddCase(VectorCompareOps);
+	AddCase(VectorVop3CompareEqI64OnGpu);
 	AddCase(VectorVop3CompareNeU64OnGpu);
 	AddCase(VectorCompareClassF32);
 	AddCase(VectorCompareF16Ops);

@@ -1486,17 +1486,19 @@ void EmitBitCompareB32(EmitterState& state, const IR::Instruction& inst, bool bi
 	EmitStoreU32(state, inst.dst, ret);
 }
 
-void EmitCompareNeU64(EmitterState& state, const IR::Instruction& inst) {
-	const auto lhs_low  = EmitSequentialValueLoad(state, inst.src[0], 0);
-	const auto lhs_high = EmitSequentialValueLoad(state, inst.src[0], 1);
-	const auto rhs_low  = EmitSequentialValueLoad(state, inst.src[1], 0);
-	const auto rhs_high = EmitSequentialValueLoad(state, inst.src[1], 1);
-	const auto ne_low   = state.builder.AllocateId();
-	const auto ne_high  = state.builder.AllocateId();
-	const auto cond     = state.builder.AllocateId();
-	state.builder.AddFunction({OpINotEqual, state.bool_type, ne_low, lhs_low, rhs_low});
-	state.builder.AddFunction({OpINotEqual, state.bool_type, ne_high, lhs_high, rhs_high});
-	state.builder.AddFunction({OpLogicalOr, state.bool_type, cond, ne_low, ne_high});
+void EmitCompareU64(EmitterState& state, const IR::Instruction& inst, bool equal) {
+	const auto lhs_low    = EmitSequentialValueLoad(state, inst.src[0], 0);
+	const auto lhs_high   = EmitSequentialValueLoad(state, inst.src[0], 1);
+	const auto rhs_low    = EmitSequentialValueLoad(state, inst.src[1], 0);
+	const auto rhs_high   = EmitSequentialValueLoad(state, inst.src[1], 1);
+	const auto low        = state.builder.AllocateId();
+	const auto high       = state.builder.AllocateId();
+	const auto cond       = state.builder.AllocateId();
+	const auto compare_op = equal ? OpIEqual : OpINotEqual;
+	state.builder.AddFunction({compare_op, state.bool_type, low, lhs_low, rhs_low});
+	state.builder.AddFunction({compare_op, state.bool_type, high, lhs_high, rhs_high});
+	state.builder.AddFunction(
+	    {equal ? OpLogicalAnd : OpLogicalOr, state.bool_type, cond, low, high});
 	EmitCompareResult(state, inst.dst, cond);
 }
 

@@ -88,7 +88,7 @@ public:
 	bool                   fullscreen_enabled          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
-	bool                   vulkan_validation_enabled   = true;
+	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;

@@ -596,7 +596,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		// as a per-pass load-clear request: clearing again at every render-state change
 		// discards the depth earlier draws accumulated and erases the world. Only the
 		// depth-only clear rect (no colour attachments) is the actual clear.
-		attachment.depth_clear    = depth.depth_load_clear_enable && color_count == 0;
+		// Two different things ask for a load-clear here and only one of them is a per-frame
+		// register. DEPTH_CLEAR_ENABLE is left set for a whole frame by titles that clear once
+		// with a depth-only rect, so honouring it on every render-state change throws away the
+		// depth those draws accumulated. The HTILE meta clear is not like that: it is consumed
+		// once, and a title can raise it on a draw that has colour attachments.
+		//
+		// Gate only the register. STORY OF SEASONS shows clear=1 meta=0 on every draw and needs
+		// the gate; Double Dragon Gaiden shows clear=0 throughout with meta=1 on a colour draw,
+		// and suppressing that clear leaves stale depth its floor then fails against.
+		attachment.depth_clear = depth.depth_meta_clear_enable ||
+		                         (depth.depth_clear_enable && color_count == 0);
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
 	}

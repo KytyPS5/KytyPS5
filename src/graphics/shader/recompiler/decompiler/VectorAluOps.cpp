@@ -834,7 +834,7 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {Opcode::VXorB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
     {Opcode::VXnorB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
     {Opcode::VAddNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {Opcode::VSubNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
+    {Opcode::VSubNcU32, SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {Opcode::VSubrevNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
 };
 

@@ -10116,6 +10116,48 @@ TestCase VectorIntegerOps() {
 	         O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase Vop2SdwaSubNcExactByte2Destination() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 11, 2);
+	code.push_back(0x4c1616f9u);
+	code.push_back(0x0686128du);
+	AppendStoreVgpr(&code, 11, 0);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name           = "Vop2SdwaSubNcExactByte2Destination";
+	test.code           = code;
+	test.expected       = {0x000b0002u};
+	test.opcodes        = {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm};
+	test.required_spirv = {"OpISub", "OpShiftLeftLogical", "OpBitwiseOr"};
+	return test;
+}
+
+TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 0, 3);
+	for (u32 dst = 10; dst <= 15; dst++) {
+		AppendVMovLiteral(&code, dst, 0xa1b2c3d4u);
+	}
+	for (u32 sel = 0; sel <= 5; sel++) {
+		code.push_back(EncodeVop2(0x26, 10 + sel, 249, 0));
+		code.push_back(EncodeVop2Sdwa(InlineU32(20), sel, 2, 6, 6, 0, 0, 0, 0, 0, 0, 1));
+		AppendStoreVgpr(&code, 10 + sel, sel);
+	}
+	AppendEnd(&code);
+
+	return {"Vop2SdwaSubNcPreservesByteAndWordDestinations",
+	        code,
+	        {},
+	        {0xa1b2c311u, 0xa1b211d4u, 0xa111c3d4u, 0x11b2c3d4u, 0xa1b20011u,
+	         0x0011c3d4u},
+	        {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase VectorShiftCountsMaskLowBits() {
 	using O = ShaderOpcode;
 
@@ -15050,6 +15092,8 @@ std::vector<TestCase> MakeCases() {
 	AddCase(VectorMoves);
 	AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
 	AddCase(VectorIntegerOps);
+	AddCase(Vop2SdwaSubNcExactByte2Destination);
+	AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
 	AddCase(VectorShiftCountsMaskLowBits);
 	AddCase(VectorVop3IntegerOps);
 	AddCase(VectorBfeI32ArithmeticShiftMasksField);

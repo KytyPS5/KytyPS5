@@ -15520,6 +15520,15 @@ void CheckEmbeddedFetchVertexOffset() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
+	const auto r8_uint =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k8),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUInt),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kStandard));
+	Require("RenderTargetFormat", "R8 uint",
+	        r8_uint.format == vk::Format::eR8Uint && r8_uint.bytes_per_element == 1u &&
+	            r8_uint.export_mapping.IsIdentity(),
+	        "R8 uint render-target tuple was rejected");
+
 	const auto rgb565 = TextureGetRenderTargetFormat(16u, 0u, 0u);
 	Require("RenderTargetFormat", "RGB565 UNorm",
 	        rgb565.format == vk::Format::eB5G6R5UnormPack16 && rgb565.bytes_per_element == 2u &&

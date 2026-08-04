@@ -22,6 +22,10 @@ struct RenderTargetFormatMapping {
 };
 
 constexpr RenderTargetFormatMapping kRenderTargetFormats[] = {
+    {Prospero::ChannelLayout::k8,
+     Prospero::ChannelType::kUInt,
+     Prospero::ChannelOrder::kStandard,
+     {vk::Format::eR8Uint, 1}},
     {Prospero::ChannelLayout::k8_8,
      Prospero::ChannelType::kUNorm,
      Prospero::ChannelOrder::kStandard,

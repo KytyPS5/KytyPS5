@@ -13,6 +13,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
+#include "kernel/syncOnAddress.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -2134,26 +2135,37 @@ uint64_t KYTY_SYSV_ABI cfwBSQyr5Ys(uint64_t a1, uint64_t a2, uint64_t a3, uint64
 	return 0;
 }
 
-uint64_t KYTY_SYSV_ABI KernelSyncOnAddressV1(uint64_t op, uint64_t address, uint64_t value,
-                                             uint64_t size, uint64_t timeout, uint64_t flags) {
-	static std::atomic_uint32_t log_count = 0;
-	const auto                  index     = log_count.fetch_add(1, std::memory_order_relaxed);
-
-	if (index < 16) {
-		LOGF("\t libkernel_sync_on_address_v1: op=0x%016" PRIx64 ", address=0x%016" PRIx64
-		     ", value=0x%016" PRIx64 ", size=0x%016" PRIx64 ", timeout=0x%016" PRIx64
-		     ", flags=0x%016" PRIx64 "\n",
-		     op, address, value, size, timeout, flags);
+static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* function_name) {
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		::printf("WARNING: %s is experimental\n", function_name);
+		LOGF("WARNING: %s is experimental\n", function_name);
 	}
+}
 
-	if (op != 0 && address == 0 && value == 0 && size == 0) {
-		// This unsupported form is used as a yield/wait by some Unity jobs.
-		// SleepMicro() uses a sub-millisecond busy wait on Windows, which can
-		// pin every worker thread when the guest polls this path.
-		Common::Thread::Sleep(timeout == 0 ? 1 : 2);
-	}
+int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
+                                          const uint32_t* timeout_micros) {
+	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
+	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+}
 
-	return 0;
+int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
+                                            const uint32_t* timeout_micros) {
+	static std::atomic_bool logged {false};
+	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
+	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
+	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+}
+
+int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected,
+                                            const uint32_t* timeout_micros) {
+	static std::atomic_bool logged {false};
+	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
+	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,
+	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+}
+
+int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count) {
+	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
@@ -3405,8 +3417,10 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);
-	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressV1);
-	LIB_FUNC("q2y-wDIVWZA", Posix::KernelSyncOnAddressV1);
+	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait);
+	LIB_FUNC("B2n8aDorSH4", Posix::KernelSyncOnAddressWait32);
+	LIB_FUNC("PZQhiiLXRFs", Posix::KernelSyncOnAddressWait64);
+	LIB_FUNC("q2y-wDIVWZA", Posix::KernelSyncOnAddressWake);
 
 	AddLibkernelUnityFunc(s, "Qhv5ARAoOEc",
 	                      reinterpret_cast<uint64_t>(LibKernel::KernelRemoveExceptionHandler),

@@ -450,6 +450,13 @@ add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
 target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
+add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+)
+target_link_libraries(sync_on_address_tests common)
+target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -503,6 +510,7 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME resource_mutex COMMAND $<TARGET_FILE:resource_mutex_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
+	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME virtual_memory_allocation
@@ -551,6 +559,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		resource_mutex_tests
 		event_queue_lifetime_tests
+		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 	)

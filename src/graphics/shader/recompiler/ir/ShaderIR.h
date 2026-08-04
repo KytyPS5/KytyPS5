@@ -604,6 +604,14 @@ struct ImageResource {
 	Decoder::ImageDimension dimension       = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode        = ImageMipMode::None;
 	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
+	// Set when the bound descriptor names a guest sRGB format the host image cannot carry,
+	// so the emitter has to decode the sampled texels itself. It is a specialisation fact
+	// rather than a tracking fact: the resource-tracking pass leaves it false and
+	// SpecializeResources fills it in from the runtime descriptor. The defaulted operator==
+	// below does NOT carry it into any cache key - nothing calls that operator. It reaches
+	// the keys by hand, through ValidateResourceSpecialization and
+	// ShaderAppendNativeSpecialization. Change one and you must change the others.
+	bool                    srgb_decode     = false;
 	bool                    read            = false;
 	bool                    written         = false;
 	bool                    atomic          = false;

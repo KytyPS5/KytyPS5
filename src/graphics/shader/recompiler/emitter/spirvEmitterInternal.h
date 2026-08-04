@@ -1412,6 +1412,7 @@ uint32_t EmitFSelectValue(EmitterState& state, uint32_t cond, uint32_t true_valu
                           uint32_t false_value);
 
 uint32_t EmitFMulConstant(EmitterState& state, uint32_t value, uint32_t bits);
+uint32_t EmitSrgbToLinearF32(EmitterState& state, uint32_t value);
 
 CubeF32Values EmitCubeF32Values(EmitterState& state, const IR::Instruction& inst);
 

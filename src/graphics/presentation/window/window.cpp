@@ -799,6 +799,9 @@ static void WindowCreate(WindowContext& context) {
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
 	uint32_t window_flags = KYTY_SDL_WINDOW_FLAGS;
+	if (Config::FullscreenEnabled()) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	}
 #if defined(__APPLE__)
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A

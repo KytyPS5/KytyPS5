@@ -33,6 +33,10 @@ uint32_t GetScreenHeight() {
 	return g_config->screen_height;
 }
 
+bool FullscreenEnabled() {
+	return g_config->fullscreen_enabled;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

@@ -204,6 +204,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
+	if (info.fullscreen_enabled) {
+		args << "--fullscreen";
+	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);

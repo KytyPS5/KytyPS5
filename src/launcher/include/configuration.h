@@ -85,6 +85,7 @@ public:
 	QString    game_comment;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
+	bool                   fullscreen_enabled          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = true;
@@ -103,6 +104,7 @@ public:
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
+		fullscreen_enabled          = other.fullscreen_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -138,6 +140,7 @@ public:
 		KYTY_CFG_SET(game_path);
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
+		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -160,6 +163,7 @@ public:
 		KYTY_CFG_GET(game_path);
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
+		KYTY_CFG_GET(fullscreen_enabled);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

@@ -101,4 +101,8 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+const Keymap& GetKeymap() {
+	return g_config->keymap;
+}
+
 } // namespace Config

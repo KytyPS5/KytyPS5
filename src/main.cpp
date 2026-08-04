@@ -64,6 +64,7 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --keymap <Pad=Key>                   DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -247,6 +248,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--keymap") {
+			const auto split = value.find('=');
+			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
+				::printf("invalid keymap: %s\n", value.c_str());
+				return false;
+			}
+			options.config.keymap.push_back(value);
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;

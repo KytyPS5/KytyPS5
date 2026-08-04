@@ -16,6 +16,7 @@ file(GLOB launcher_forms
 add_executable(launcher WIN32
 	${launcher_src}
 	${launcher_forms}
+	resources.qrc
 )
 
 

@@ -77,6 +77,16 @@ std::string FormatBinary(const Instruction& inst) {
 	return text;
 }
 
+std::string FormatSources(const Instruction& inst) {
+	std::string    text      = fmt::format("0x{:08x}: {}", inst.pc, OpcodeToString(inst.opcode));
+	const Operand* sources[] = {&inst.src0, &inst.src1, &inst.src2, &inst.src3};
+	for (uint32_t i = 0; i < inst.src_count && i < 4u; i++) {
+		text += i == 0 ? " " : ", ";
+		text += OperandToString(*sources[i]);
+	}
+	return text;
+}
+
 std::string FormatMemory(const Instruction& inst) {
 	std::string text = fmt::format("0x{:08x}: {} {}", inst.pc, OpcodeToString(inst.opcode).c_str(),
 	                               OperandToString(inst.dst).c_str());
@@ -985,6 +995,9 @@ std::string InstructionToString(const Instruction& inst) {
 		                   inst.pc, FamilyToString(inst.family).c_str(), inst.opcode_id,
 		                   RawWordsToString(inst).c_str(), inst.unsupported_reason.c_str());
 	}
+	if (inst.family == Family::SOPC) {
+		return WithUnsupportedReason(inst, FormatSources(inst));
+	}
 
 	switch (inst.opcode) {
 		case Opcode::SMovB32:
@@ -1173,26 +1186,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DsWriteB128:
 		case Opcode::DsWriteAddtidB32:
 		case Opcode::DsReadAddtidB32: return WithUnsupportedReason(inst, FormatMemory(inst));
-		case Opcode::SCmpEqU32:
-		case Opcode::SCmpEqI32:
-		case Opcode::SCmpLgU32:
-		case Opcode::SCmpLgI32:
-		case Opcode::SCmpGtU32:
-		case Opcode::SCmpGtI32:
-		case Opcode::SCmpGeU32:
-		case Opcode::SCmpGeI32:
-		case Opcode::SCmpLtU32:
-		case Opcode::SCmpLtI32:
-		case Opcode::SCmpLeU32:
-		case Opcode::SCmpLeI32:
-		case Opcode::SBitcmp0B32:
-		case Opcode::SBitcmp1B32:
-		case Opcode::SCmpEqU64:
-		case Opcode::SCmpLgU64:
-			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
-			                                               OpcodeToString(inst.opcode).c_str(),
-			                                               OperandToString(inst.src0).c_str(),
-			                                               OperandToString(inst.src1).c_str()));
 		default: return WithUnsupportedReason(inst, FormatBinary(inst));
 	}
 }

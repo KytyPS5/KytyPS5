@@ -1,42 +1,90 @@
 #include "graphics/shader/recompiler/decompiler/VectorAluOps.h"
 
+#include "graphics/shader/recompiler/decompiler/OpcodeTable.h"
+
 #include <fmt/format.h>
-#include <iterator>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
-struct OpcodeMap {
-	uint32_t opcode = 0;
-	Opcode   ir     = Opcode::Unknown;
+using Detail::OpcodeMap;
+
+// These profiles describe the selectors that the current lowering implements. They are not
+// architectural SDWA legality classes.
+enum class Vop2SdwaProfile {
+	None,
+	Cndmask,
+	Float32,
+	Float16,
+	IntegerFullDestination,
+	IntegerPartialDestination,
+	ReverseLogicalRight,
+	ReverseLogicalLeft,
+	Bitwise,
+	Count,
 };
 
-constexpr OpcodeMap VOP2_OPS[] = {
-    {0x01u, Opcode::VCndmaskB32},    {0x02u, Opcode::VDot2cF32F16},
-    {0x03u, Opcode::VAddF32},        {0x04u, Opcode::VSubF32},
-    {0x05u, Opcode::VSubrevF32},     {0x08u, Opcode::VMulF32},
-    {0x09u, Opcode::VMulI32I24},     {0x0bu, Opcode::VMulU32U24},
-    {0x0fu, Opcode::VMinF32},        {0x10u, Opcode::VMaxF32},
-    {0x11u, Opcode::VMinI32},        {0x12u, Opcode::VMaxI32},
-    {0x13u, Opcode::VMinU32},        {0x14u, Opcode::VMaxU32},
-    {0x15u, Opcode::VLshrB32},       {0x16u, Opcode::VLshrrevB32},
-    {0x17u, Opcode::VAshrI32},       {0x18u, Opcode::VAshrrevI32},
-    {0x19u, Opcode::VLshlB32},       {0x1au, Opcode::VLshlrevB32},
-    {0x1bu, Opcode::VAndB32},        {0x1cu, Opcode::VOrB32},
-    {0x1du, Opcode::VXorB32},        {0x1eu, Opcode::VXnorB32},
-    {0x1fu, Opcode::VMacF32},        {0x20u, Opcode::VMadmkF32},
-    {0x21u, Opcode::VMadakF32},      {0x22u, Opcode::VBcntU32B32},
-    {0x23u, Opcode::VMbcntLoU32B32}, {0x24u, Opcode::VMbcntHiU32B32},
-    {0x25u, Opcode::VAddNcU32},      {0x28u, Opcode::VAddcU32},
-    {0x26u, Opcode::VSubNcU32},      {0x27u, Opcode::VSubrevNcU32},
-    {0x2bu, Opcode::VMacF32},        {0x2cu, Opcode::VMadmkF32},
-    {0x2du, Opcode::VMadakF32},      {0x2fu, Opcode::VCvtPkrtzF16F32},
-    {0x32u, Opcode::VAddF16},        {0x33u, Opcode::VSubF16},
-    {0x34u, Opcode::VSubrevF16},     {0x35u, Opcode::VMulF16},
-    {0x36u, Opcode::VFmacF16},       {0x37u, Opcode::VFmamkF16},
-    {0x38u, Opcode::VFmaakF16},      {0x39u, Opcode::VMaxF16},
-    {0x3au, Opcode::VMinF16},        {0x3cu, Opcode::VPkFmacF16},
+struct Vop2OpcodeInfo {
+	uint32_t        encoding     = 0;
+	Opcode          decoded      = Opcode::Unknown;
+	Vop2SdwaProfile sdwa_profile = Vop2SdwaProfile::None;
 };
+
+constexpr Vop2OpcodeInfo VOP2_OPS[] = {
+    {0x01u, Opcode::VCndmaskB32, Vop2SdwaProfile::Cndmask},
+    {0x02u, Opcode::VDot2cF32F16},
+    {0x03u, Opcode::VAddF32, Vop2SdwaProfile::Float32},
+    {0x04u, Opcode::VSubF32, Vop2SdwaProfile::Float32},
+    {0x05u, Opcode::VSubrevF32},
+    {0x08u, Opcode::VMulF32, Vop2SdwaProfile::Float32},
+    {0x09u, Opcode::VMulI32I24, Vop2SdwaProfile::IntegerFullDestination},
+    {0x0bu, Opcode::VMulU32U24, Vop2SdwaProfile::IntegerFullDestination},
+    {0x0fu, Opcode::VMinF32},
+    {0x10u, Opcode::VMaxF32},
+    {0x11u, Opcode::VMinI32},
+    {0x12u, Opcode::VMaxI32},
+    {0x13u, Opcode::VMinU32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x14u, Opcode::VMaxU32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x15u, Opcode::VLshrB32},
+    {0x16u, Opcode::VLshrrevB32, Vop2SdwaProfile::ReverseLogicalRight},
+    {0x17u, Opcode::VAshrI32},
+    {0x18u, Opcode::VAshrrevI32},
+    {0x19u, Opcode::VLshlB32},
+    {0x1au, Opcode::VLshlrevB32, Vop2SdwaProfile::ReverseLogicalLeft},
+    {0x1bu, Opcode::VAndB32, Vop2SdwaProfile::Bitwise},
+    {0x1cu, Opcode::VOrB32, Vop2SdwaProfile::Bitwise},
+    {0x1du, Opcode::VXorB32, Vop2SdwaProfile::Bitwise},
+    {0x1eu, Opcode::VXnorB32, Vop2SdwaProfile::Bitwise},
+    {0x1fu, Opcode::VMacF32},
+    {0x20u, Opcode::VMadmkF32},
+    {0x21u, Opcode::VMadakF32},
+    {0x22u, Opcode::VBcntU32B32},
+    {0x23u, Opcode::VMbcntLoU32B32},
+    {0x24u, Opcode::VMbcntHiU32B32},
+    {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x28u, Opcode::VAddcU32},
+    {0x26u, Opcode::VSubNcU32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x27u, Opcode::VSubrevNcU32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x2bu, Opcode::VMacF32},
+    {0x2cu, Opcode::VMadmkF32},
+    {0x2du, Opcode::VMadakF32},
+    {0x2fu, Opcode::VCvtPkrtzF16F32},
+    {0x32u, Opcode::VAddF16, Vop2SdwaProfile::Float16},
+    {0x33u, Opcode::VSubF16, Vop2SdwaProfile::Float16},
+    {0x34u, Opcode::VSubrevF16, Vop2SdwaProfile::Float16},
+    {0x35u, Opcode::VMulF16, Vop2SdwaProfile::Float16},
+    {0x36u, Opcode::VFmacF16},
+    {0x37u, Opcode::VFmamkF16},
+    {0x38u, Opcode::VFmaakF16},
+    {0x39u, Opcode::VMaxF16, Vop2SdwaProfile::Float16},
+    {0x3au, Opcode::VMinF16, Vop2SdwaProfile::Float16},
+    {0x3cu, Opcode::VPkFmacF16},
+};
+static_assert(Detail::HasUniqueEncodings(VOP2_OPS));
+
+constexpr Opcode LookupVop2Opcode(uint32_t encoding) {
+	return Detail::LookupOpcode(VOP2_OPS, encoding);
+}
 
 constexpr OpcodeMap VOP1_OPS[] = {
     {0x00u, Opcode::VNop},
@@ -135,37 +183,58 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPS[] = {
     {0x5eu, Opcode::VRndneF16},
 };
 
-constexpr OpcodeMap VOPC_OPS[] = {
-    {0x00u, Opcode::VCmpFF32},     {0x01u, Opcode::VCmpLtF32},   {0x02u, Opcode::VCmpEqF32},
-    {0x03u, Opcode::VCmpLeF32},    {0x04u, Opcode::VCmpGtF32},   {0x05u, Opcode::VCmpLgF32},
-    {0x06u, Opcode::VCmpGeF32},    {0x07u, Opcode::VCmpOF32},    {0x08u, Opcode::VCmpUF32},
-    {0x09u, Opcode::VCmpNgeF32},   {0x0au, Opcode::VCmpNlgF32},  {0x0bu, Opcode::VCmpNgtF32},
-    {0x0cu, Opcode::VCmpNleF32},   {0x0du, Opcode::VCmpNeqF32},  {0x0eu, Opcode::VCmpNltF32},
-    {0x0fu, Opcode::VCmpTruF32},   {0x11u, Opcode::VCmpxLtF32},  {0x12u, Opcode::VCmpxEqF32},
-    {0x13u, Opcode::VCmpxLeF32},   {0x14u, Opcode::VCmpxGtF32},  {0x15u, Opcode::VCmpxLgF32},
-    {0x16u, Opcode::VCmpxGeF32},   {0x19u, Opcode::VCmpxNgeF32}, {0x1au, Opcode::VCmpxNlgF32},
-    {0x1bu, Opcode::VCmpxNgtF32},  {0x1cu, Opcode::VCmpxNleF32}, {0x1du, Opcode::VCmpxNeqF32},
-    {0x1eu, Opcode::VCmpxNltF32},  {0x80u, Opcode::VCmpFI32},    {0x81u, Opcode::VCmpLtI32},
-    {0x82u, Opcode::VCmpEqI32},    {0x83u, Opcode::VCmpLeI32},   {0x84u, Opcode::VCmpGtI32},
-    {0x85u, Opcode::VCmpNeI32},    {0x86u, Opcode::VCmpGeI32},   {0x87u, Opcode::VCmpTI32},
-    {0x88u, Opcode::VCmpClassF32}, {0x89u, Opcode::VCmpLtI16},   {0x8au, Opcode::VCmpEqI16},
-    {0x8bu, Opcode::VCmpLeI16},    {0x8cu, Opcode::VCmpGtI16},   {0x8du, Opcode::VCmpNeI16},
-    {0x8eu, Opcode::VCmpGeI16},    {0x91u, Opcode::VCmpxLtI32},  {0x92u, Opcode::VCmpxEqI32},
-    {0x93u, Opcode::VCmpxLeI32},   {0x94u, Opcode::VCmpxGtI32},  {0x95u, Opcode::VCmpxNeI32},
-    {0x96u, Opcode::VCmpxGeI32},   {0xa9u, Opcode::VCmpLtU16},   {0xaau, Opcode::VCmpEqU16},
-    {0xabu, Opcode::VCmpLeU16},    {0xacu, Opcode::VCmpGtU16},   {0xadu, Opcode::VCmpNeU16},
-    {0xaeu, Opcode::VCmpGeU16},    {0xc0u, Opcode::VCmpFU32},    {0xc1u, Opcode::VCmpLtU32},
-    {0xc2u, Opcode::VCmpEqU32},    {0xc3u, Opcode::VCmpLeU32},   {0xc4u, Opcode::VCmpGtU32},
-    {0xc5u, Opcode::VCmpNeU32},    {0xc6u, Opcode::VCmpGeU32},   {0xc7u, Opcode::VCmpTU32},
-    {0xa2u, Opcode::VCmpEqI64},    {0xd1u, Opcode::VCmpxLtU32},  {0xd2u, Opcode::VCmpxEqU32},
-    {0xd3u, Opcode::VCmpxLeU32},   {0xd4u, Opcode::VCmpxGtU32},  {0xd5u, Opcode::VCmpxNeU32},
-    {0xd6u, Opcode::VCmpxGeU32},   {0xe5u, Opcode::VCmpNeU64},   {0xc9u, Opcode::VCmpLtF16},
-    {0xcau, Opcode::VCmpEqF16},    {0xcbu, Opcode::VCmpLeF16},   {0xccu, Opcode::VCmpGtF16},
-    {0xcdu, Opcode::VCmpLgF16},    {0xceu, Opcode::VCmpGeF16},   {0xedu, Opcode::VCmpNeqF16},
-    {0xd9u, Opcode::VCmpxLtF16},   {0xdau, Opcode::VCmpxEqF16},  {0xdbu, Opcode::VCmpxLeF16},
-    {0xdcu, Opcode::VCmpxGtF16},   {0xdeu, Opcode::VCmpxGeF16},  {0xfdu, Opcode::VCmpxNeqF16},
+struct VopcOpcodeInfo {
+	uint32_t encoding     = 0;
+	Opcode   decoded      = Opcode::Unknown;
+	bool     supports_dpp = true;
+};
+
+constexpr VopcOpcodeInfo VOPC_OPS[] = {
+    {0x00u, Opcode::VCmpFF32},         {0x01u, Opcode::VCmpLtF32},
+    {0x02u, Opcode::VCmpEqF32},        {0x03u, Opcode::VCmpLeF32},
+    {0x04u, Opcode::VCmpGtF32},        {0x05u, Opcode::VCmpLgF32},
+    {0x06u, Opcode::VCmpGeF32},        {0x07u, Opcode::VCmpOF32},
+    {0x08u, Opcode::VCmpUF32},         {0x09u, Opcode::VCmpNgeF32},
+    {0x0au, Opcode::VCmpNlgF32},       {0x0bu, Opcode::VCmpNgtF32},
+    {0x0cu, Opcode::VCmpNleF32},       {0x0du, Opcode::VCmpNeqF32},
+    {0x0eu, Opcode::VCmpNltF32},       {0x0fu, Opcode::VCmpTruF32},
+    {0x11u, Opcode::VCmpxLtF32},       {0x12u, Opcode::VCmpxEqF32},
+    {0x13u, Opcode::VCmpxLeF32},       {0x14u, Opcode::VCmpxGtF32},
+    {0x15u, Opcode::VCmpxLgF32},       {0x16u, Opcode::VCmpxGeF32},
+    {0x19u, Opcode::VCmpxNgeF32},      {0x1au, Opcode::VCmpxNlgF32},
+    {0x1bu, Opcode::VCmpxNgtF32},      {0x1cu, Opcode::VCmpxNleF32},
+    {0x1du, Opcode::VCmpxNeqF32},      {0x1eu, Opcode::VCmpxNltF32},
+    {0x80u, Opcode::VCmpFI32},         {0x81u, Opcode::VCmpLtI32},
+    {0x82u, Opcode::VCmpEqI32},        {0x83u, Opcode::VCmpLeI32},
+    {0x84u, Opcode::VCmpGtI32},        {0x85u, Opcode::VCmpNeI32},
+    {0x86u, Opcode::VCmpGeI32},        {0x87u, Opcode::VCmpTI32},
+    {0x88u, Opcode::VCmpClassF32},     {0x89u, Opcode::VCmpLtI16},
+    {0x8au, Opcode::VCmpEqI16},        {0x8bu, Opcode::VCmpLeI16},
+    {0x8cu, Opcode::VCmpGtI16},        {0x8du, Opcode::VCmpNeI16},
+    {0x8eu, Opcode::VCmpGeI16},        {0x91u, Opcode::VCmpxLtI32},
+    {0x92u, Opcode::VCmpxEqI32},       {0x93u, Opcode::VCmpxLeI32},
+    {0x94u, Opcode::VCmpxGtI32},       {0x95u, Opcode::VCmpxNeI32},
+    {0x96u, Opcode::VCmpxGeI32},       {0xa9u, Opcode::VCmpLtU16},
+    {0xaau, Opcode::VCmpEqU16},        {0xabu, Opcode::VCmpLeU16},
+    {0xacu, Opcode::VCmpGtU16},        {0xadu, Opcode::VCmpNeU16},
+    {0xaeu, Opcode::VCmpGeU16},        {0xc0u, Opcode::VCmpFU32},
+    {0xc1u, Opcode::VCmpLtU32},        {0xc2u, Opcode::VCmpEqU32},
+    {0xc3u, Opcode::VCmpLeU32},        {0xc4u, Opcode::VCmpGtU32},
+    {0xc5u, Opcode::VCmpNeU32},        {0xc6u, Opcode::VCmpGeU32},
+    {0xc7u, Opcode::VCmpTU32},         {0xa2u, Opcode::VCmpEqI64, false},
+    {0xd1u, Opcode::VCmpxLtU32},       {0xd2u, Opcode::VCmpxEqU32},
+    {0xd3u, Opcode::VCmpxLeU32},       {0xd4u, Opcode::VCmpxGtU32},
+    {0xd5u, Opcode::VCmpxNeU32},       {0xd6u, Opcode::VCmpxGeU32},
+    {0xe5u, Opcode::VCmpNeU64, false}, {0xc9u, Opcode::VCmpLtF16},
+    {0xcau, Opcode::VCmpEqF16},        {0xcbu, Opcode::VCmpLeF16},
+    {0xccu, Opcode::VCmpGtF16},        {0xcdu, Opcode::VCmpLgF16},
+    {0xceu, Opcode::VCmpGeF16},        {0xedu, Opcode::VCmpNeqF16},
+    {0xd9u, Opcode::VCmpxLtF16},       {0xdau, Opcode::VCmpxEqF16},
+    {0xdbu, Opcode::VCmpxLeF16},       {0xdcu, Opcode::VCmpxGtF16},
+    {0xdeu, Opcode::VCmpxGeF16},       {0xfdu, Opcode::VCmpxNeqF16},
     {0xfeu, Opcode::VCmpxNltF16},
 };
+static_assert(Detail::HasUniqueEncodings(VOPC_OPS));
 
 constexpr OpcodeMap VOP3_OPS[] = {
     {0x141u, Opcode::VMadF32},          {0x142u, Opcode::VMadI32I24},
@@ -215,16 +284,6 @@ constexpr OpcodeMap VOP3P_OPS[] = {
     {0x22u, Opcode::VMadMixhiF16},
 };
 
-Opcode Lookup(const OpcodeMap* ops, uint32_t count, uint32_t opcode) {
-	for (uint32_t i = 0; i < count; i++) {
-		const auto& op = ops[i];
-		if (op.opcode == opcode) {
-			return op.ir;
-		}
-	}
-	return Opcode::Unsupported;
-}
-
 bool IsVop2LiteralMadOpcode(uint32_t opcode) {
 	return opcode == 0x20u || opcode == 0x21u || opcode == 0x2cu || opcode == 0x2du;
 }
@@ -235,24 +294,23 @@ bool IsUnsupportedVop3EncodedVop2Alias(uint32_t opcode) {
 }
 
 Opcode LookupVop3Opcode(uint32_t opcode) {
-	const auto direct = Lookup(VOP3_OPS, static_cast<uint32_t>(std::size(VOP3_OPS)), opcode);
+	const auto direct = Detail::LookupOpcode(VOP3_OPS, opcode);
 	if (direct != Opcode::Unsupported) {
 		return direct;
 	}
 	if (opcode <= 0xffu) {
-		return Lookup(VOPC_OPS, static_cast<uint32_t>(std::size(VOPC_OPS)), opcode);
+		return Detail::LookupOpcode(VOPC_OPS, opcode);
 	}
 	if (opcode >= 0x100u && opcode <= 0x13fu) {
 		if (IsUnsupportedVop3EncodedVop2Alias(opcode - 0x100u)) {
 			return Opcode::Unsupported;
 		}
-		return Lookup(VOP2_OPS, static_cast<uint32_t>(std::size(VOP2_OPS)), opcode - 0x100u);
+		return LookupVop2Opcode(opcode - 0x100u);
 	}
 	if (opcode >= 0x180u && opcode <= 0x1ffu) {
-		return Lookup(VOP3_ENCODED_VOP1_OPS,
-		              static_cast<uint32_t>(std::size(VOP3_ENCODED_VOP1_OPS)), opcode - 0x180u);
+		return Detail::LookupOpcode(VOP3_ENCODED_VOP1_OPS, opcode - 0x180u);
 	}
-	return Lookup(VOP3_OPS, static_cast<uint32_t>(std::size(VOP3_OPS)), opcode);
+	return Detail::LookupOpcode(VOP3_OPS, opcode);
 }
 
 bool IsVop3EncodedVopc(uint32_t opcode) {
@@ -792,7 +850,6 @@ Vop2SdwaFields DecodeVop2SdwaFields(uint32_t modifier) {
 }
 
 struct Vop2SdwaRule {
-	Opcode   opcode           = Opcode::Unknown;
 	uint32_t dst_selectors    = SdwaSelFull();
 	uint32_t src0_selectors   = SdwaSelFull();
 	uint32_t src1_selectors   = SdwaSelFull();
@@ -805,46 +862,27 @@ constexpr uint32_t SdwaSelAll() {
 }
 
 constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
-    {Opcode::VCndmaskB32, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, false},
-    {Opcode::VAddF32, SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},
-    {Opcode::VSubF32, SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},
-    {Opcode::VMulF32, SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},
-    {Opcode::VAddF16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, true},
-    {Opcode::VSubF16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, true},
-    {Opcode::VSubrevF16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, true},
-    {Opcode::VMulF16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, true},
-    {Opcode::VMaxF16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, true},
-    {Opcode::VMinF16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     SdwaSelWords() | SdwaSelFull(), true, true},
-    {Opcode::VMulI32I24, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {Opcode::VMulU32U24, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {Opcode::VMinU32, SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {Opcode::VMaxU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {Opcode::VLshrrevB32, SdwaSelFull(), SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), false,
-     false},
-    {Opcode::VLshlrevB32, SdwaSelFull(), SdwaSelFull(), SdwaSelAll(), false, false},
-    {Opcode::VAndB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {Opcode::VOrB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {Opcode::VXorB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {Opcode::VXnorB32, SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {Opcode::VAddNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {Opcode::VSubNcU32, SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {Opcode::VSubrevNcU32, SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
+    {},
+    {SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
+     true, false},
+    {SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},
+    {SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
+     true, true},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
+    {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
+    {SdwaSelFull(), SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), false, false},
+    {SdwaSelFull(), SdwaSelFull(), SdwaSelAll(), false, false},
+    {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
+static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
+              static_cast<size_t>(Vop2SdwaProfile::Count));
 
-const Vop2SdwaRule* FindVop2SdwaRule(Opcode opcode) {
-	for (const auto& rule: VOP2_SDWA_RULES) {
-		if (rule.opcode == opcode) {
-			return &rule;
-		}
+const Vop2SdwaRule* FindVop2SdwaRule(uint32_t encoding) {
+	const auto* info = Detail::FindOpcode(VOP2_OPS, encoding);
+	if (info == nullptr || info->sdwa_profile == Vop2SdwaProfile::None) {
+		return nullptr;
 	}
-	return nullptr;
+	return &VOP2_SDWA_RULES[static_cast<size_t>(info->sdwa_profile)];
 }
 
 bool IsVop2SdwaDestinationSupported(const Vop2SdwaRule& rule, const Vop2SdwaFields& fields) {
@@ -882,7 +920,7 @@ bool ValidateVop2Sdwa(Instruction& inst, uint32_t opcode, const Vop2SdwaFields& 
 		return true;
 	}
 
-	const auto* rule = FindVop2SdwaRule(inst.opcode);
+	const auto* rule = FindVop2SdwaRule(opcode);
 	if (rule == nullptr) {
 		SetUnsupported(inst, Family::VOP2, opcode,
 		               "VOP2 SDWA modifier is not supported for opcode");
@@ -1134,6 +1172,11 @@ bool DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::Unsupported) {
 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
+		return true;
+	}
+	const auto* info = Detail::FindOpcode(VOPC_OPS, opcode);
+	if (info == nullptr || !info->supports_dpp) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC DPP modifier is not supported for opcode");
 		return true;
 	}
 	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error) ||
@@ -1428,7 +1471,7 @@ bool DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word      = word;
 	inst.family    = Family::VOP2;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(VOP2_OPS, static_cast<uint32_t>(std::size(VOP2_OPS)), opcode);
+	inst.opcode    = LookupVop2Opcode(opcode);
 	SetRawWords(inst, code, word_index, 1);
 
 	switch (opcode) {
@@ -1469,7 +1512,7 @@ bool DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word      = word;
 	inst.family    = Family::VOP1;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(VOP1_OPS, static_cast<uint32_t>(std::size(VOP1_OPS)), opcode);
+	inst.opcode    = Detail::LookupOpcode(VOP1_OPS, opcode);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::Unsupported) {
@@ -1510,7 +1553,7 @@ bool DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.word      = word;
 	inst.family    = Family::VOPC;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(VOPC_OPS, static_cast<uint32_t>(std::size(VOPC_OPS)), opcode);
+	inst.opcode    = Detail::LookupOpcode(VOPC_OPS, opcode);
 	inst.dst.kind  = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
 	SetRawWords(inst, code, word_index, 1);
 
@@ -1724,7 +1767,7 @@ bool DecodeVop3p(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.word      = word0;
 	inst.family    = Family::VOP3P;
 	inst.opcode_id = opcode;
-	inst.opcode    = Lookup(VOP3P_OPS, static_cast<uint32_t>(std::size(VOP3P_OPS)), opcode);
+	inst.opcode    = Detail::LookupOpcode(VOP3P_OPS, opcode);
 	SetRawWords(inst, code, word_index, 2);
 
 	if (inst.opcode == Opcode::Unsupported) {

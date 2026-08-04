@@ -1486,7 +1486,8 @@ void EmitBitCompareB32(EmitterState& state, const IR::Instruction& inst, bool bi
 	EmitStoreU32(state, inst.dst, ret);
 }
 
-void EmitCompareU64(EmitterState& state, const IR::Instruction& inst, bool equal) {
+void EmitCompareU64(EmitterState& state, const IR::Instruction& inst) {
+	const bool equal      = inst.op == IR::Opcode::CompareEqU64;
 	const auto lhs_low    = EmitSequentialValueLoad(state, inst.src[0], 0);
 	const auto lhs_high   = EmitSequentialValueLoad(state, inst.src[0], 1);
 	const auto rhs_low    = EmitSequentialValueLoad(state, inst.src[1], 0);

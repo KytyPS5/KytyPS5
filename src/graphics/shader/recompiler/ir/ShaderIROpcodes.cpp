@@ -434,22 +434,13 @@ void SetError(std::string* error, const char* message) {
 	}
 }
 
-Opcode LookupIrOpcode(Decoder::Opcode opcode) {
+std::optional<Opcode> LookupIrOpcode(Decoder::Opcode opcode) {
 	for (const auto& op: LOWER_OPS) {
 		if (op.decoded == opcode) {
 			return op.ir;
 		}
 	}
-	return Opcode::MoveU32;
-}
-
-bool IsImplemented(Decoder::Opcode opcode) {
-	for (const auto& op: LOWER_OPS) {
-		if (op.decoded == opcode) {
-			return true;
-		}
-	}
-	return false;
+	return std::nullopt;
 }
 
 bool IsReversedBinary(Decoder::Opcode opcode) {

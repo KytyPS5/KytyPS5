@@ -611,8 +611,6 @@ bool IsMaskRegisterFile(IR::RegisterFile file);
 
 bool IsSccOperand(const IR::Operand& operand);
 
-bool IsCompareOpcode(IR::Opcode op);
-
 void CollectMaskStateRegisters(std::vector<RegisterBinding>& registers);
 
 void CollectSequentialRegisters(std::vector<RegisterBinding>& registers, const IR::Operand& base,
@@ -650,8 +648,6 @@ bool InstructionHasDppSource(const IR::Instruction& inst);
 bool ProgramNeedsSubgroupBallot(const IR::Program& program);
 
 bool ProgramNeedsSubgroupShuffle(const IR::Program& program);
-
-bool IsCompareOpcode(IR::Opcode op);
 
 bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program);
 
@@ -1345,7 +1341,7 @@ void EmitCompareI16(EmitterState& state, const IR::Instruction& inst, uint32_t o
 
 void EmitBitCompareB32(EmitterState& state, const IR::Instruction& inst, bool bit_set);
 
-void EmitCompareU64(EmitterState& state, const IR::Instruction& inst, bool equal);
+void EmitCompareU64(EmitterState& state, const IR::Instruction& inst);
 
 void EmitCompareConstant(EmitterState& state, const IR::Instruction& inst, bool value);
 

@@ -2915,6 +2915,52 @@ void CheckNewDecoderUnsupported(const uint32_t* shader, uint32_t words, const ch
 	      "unsupported lowering error was not explicit");
 }
 
+void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
+	const uint32_t opcodes[] = {0xa2u, 0xe5u}; // v_cmp_eq_i64, v_cmp_ne_u64
+	for (const auto opcode: opcodes) {
+		const uint32_t shader[] = {
+		    EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
+		    EncodeVop2Dpp(0u),
+		    0xbf810000u,
+		};
+
+		ShaderRecompiler::Decoder::Program program;
+		std::string                        error;
+		Check(ShaderRecompiler::Decoder::DecodeProgram(shader, program, &error), error.c_str());
+		Check(program.instructions.size() == 2u,
+		      "64-bit VOPC DPP decode did not consume its modifier word");
+		const auto& compare = program.instructions.front();
+		Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::Unsupported,
+		      "64-bit VOPC illegally accepted a DPP modifier");
+		Check(Common::ContainsStr(compare.unsupported_reason,
+		                          "VOPC DPP modifier is not supported for opcode"),
+		      "64-bit VOPC DPP rejection reason was not explicit");
+	}
+}
+
+void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::Instruction missing;
+	missing.pc     = 0u;
+	missing.family = ShaderRecompiler::Decoder::Family::VOP1;
+	missing.opcode = ShaderRecompiler::Decoder::Opcode::Unknown;
+	decoded.instructions.push_back(missing);
+
+	ShaderRecompiler::CFG::Graph cfg;
+	ShaderRecompiler::CFG::BasicBlock block;
+	block.inst_end = 1u;
+	cfg.blocks.push_back(block);
+	cfg.entry_block = 0u;
+
+	ShaderRecompiler::IR::Program ir;
+	std::string                   error;
+	Check(!ShaderRecompiler::IR::LowerProgram(decoded, cfg, ShaderType::Compute, 64u, ir, &error),
+	      "missing decoder-to-IR mapping unexpectedly lowered as an instruction");
+	Check(Common::ContainsStr(error, "no IR lowering"),
+	      "missing decoder-to-IR mapping did not report an explicit error");
+	Check(ir.blocks.empty(), "missing decoder-to-IR mapping emitted a fallback IR block");
+}
+
 void TestNewShaderRecompilerMemoryFamilyLowering() {
 	const uint32_t shader[] = {
 	    EncodeSmem0(0x00, 0, 4),
@@ -7437,6 +7483,8 @@ int main() {
 	TestNewShaderRecompilerScalarVectorAlu();
 	TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 	TestNewShaderRecompilerMoreAluFamilies();
+	TestNewShaderRecompilerRejectsDppOn64BitCompares();
+	TestNewShaderRecompilerIrLookupMissFailsExplicitly();
 	TestNewShaderRecompilerExpandedAluBatch();
 	TestNewShaderRecompilerVop3pPackedF16();
 	TestNewShaderRecompilerStagedShaderOps();

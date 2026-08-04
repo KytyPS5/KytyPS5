@@ -490,13 +490,26 @@ bool IsScalarMinMaxOpcode(Decoder::Opcode opcode) {
 	}
 }
 
+bool ResolveIrOpcode(Decoder::Opcode decoded, Opcode& lowered, std::string* error) {
+	const auto opcode = LookupIrOpcode(decoded);
+	if (!opcode.has_value()) {
+		if (error != nullptr) {
+			*error = fmt::format("decoded opcode has no IR lowering: {}",
+			                     Decoder::OpcodeToString(decoded));
+		}
+		return false;
+	}
+	lowered = *opcode;
+	return true;
+}
+
 bool LowerScalarMinMaxWithScc(const Decoder::Instruction& decoded, BasicBlock& block,
                               std::string* error) {
 	Instruction result;
 	result.pc        = decoded.pc;
-	result.op        = LookupIrOpcode(decoded.opcode);
 	result.src_count = 2;
-	if (!LowerRegisterOperand(decoded.dst, result.dst, error) ||
+	if (!ResolveIrOpcode(decoded.opcode, result.op, error) ||
+	    !LowerRegisterOperand(decoded.dst, result.dst, error) ||
 	    !LowerSourceOperand(decoded.src0, result.src[0], error) ||
 	    !LowerSourceOperand(decoded.src1, result.src[1], error)) {
 		return false;
@@ -1116,23 +1129,16 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 	if (VectorByteConvertIndex(inst.opcode) <= 3u) {
 		return LowerVectorByteConvert(inst, block, error);
 	}
-	if (!IsImplemented(inst.opcode)) {
-		if (error != nullptr) {
-			*error = fmt::format("decoded opcode has no IR lowering yet: {}",
-			                     Decoder::InstructionToString(inst).c_str());
-		}
-		return false;
-	}
 	return LowerImplemented(inst, block, error);
 }
 
 bool LowerImplemented(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
 	Instruction inst;
 	inst.pc        = decoded.pc;
-	inst.op        = LookupIrOpcode(decoded.opcode);
 	inst.src_count = decoded.src_count;
 
-	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
+	if (!ResolveIrOpcode(decoded.opcode, inst.op, error) ||
+	    !LowerRegisterOperand(decoded.dst, inst.dst, error)) {
 		return false;
 	}
 	ApplyDppDestinationMask(decoded, inst.dst);

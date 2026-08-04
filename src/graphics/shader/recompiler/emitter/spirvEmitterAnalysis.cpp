@@ -75,8 +75,6 @@ bool IsSccOperand(const IR::Operand& operand) {
 	return operand.kind == IR::OperandKind::Register && operand.reg.file == IR::RegisterFile::Scc;
 }
 
-bool IsCompareOpcode(IR::Opcode op);
-
 void CollectMaskStateRegisters(std::vector<RegisterBinding>& registers) {
 	CollectRegister(registers, {IR::RegisterFile::Exec, 0});
 	CollectRegister(registers, {IR::RegisterFile::Exec, 1});
@@ -189,11 +187,11 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 			if (inst.op == IR::Opcode::BitCountU64 || inst.op == IR::Opcode::FindMsbFromHighU64) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 			}
-			if (inst.op == IR::Opcode::CompareEqU64 || inst.op == IR::Opcode::CompareNeU64) {
+			if (IR::IsCompare64Opcode(inst.op)) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 				CollectSequentialRegisters(registers, inst.src[1], 2);
 			}
-			if (IsCompareOpcode(inst.op) && inst.dst.kind == IR::OperandKind::Register &&
+			if (IR::IsCompareOpcode(inst.op) && inst.dst.kind == IR::OperandKind::Register &&
 			    inst.dst.reg.file != IR::RegisterFile::Scc) {
 				CollectSequentialRegisters(registers, inst.dst, 2);
 			}
@@ -384,94 +382,6 @@ bool ProgramNeedsSubgroupShuffle(const IR::Program& program) {
 	return false;
 }
 
-bool IsCompareOpcode(IR::Opcode op) {
-	switch (op) {
-		case IR::Opcode::CompareFalse:
-		case IR::Opcode::CompareTrue:
-		case IR::Opcode::CompareEqU32:
-		case IR::Opcode::CompareNeU32:
-		case IR::Opcode::CompareGtU32:
-		case IR::Opcode::CompareGeU32:
-		case IR::Opcode::CompareLtU32:
-		case IR::Opcode::CompareLeU32:
-		case IR::Opcode::CompareEqU64:
-		case IR::Opcode::CompareNeU64:
-		case IR::Opcode::CompareMaskEqU32:
-		case IR::Opcode::CompareMaskNeU32:
-		case IR::Opcode::CompareMaskGtU32:
-		case IR::Opcode::CompareMaskGeU32:
-		case IR::Opcode::CompareMaskLtU32:
-		case IR::Opcode::CompareMaskLeU32:
-		case IR::Opcode::CompareEqI32:
-		case IR::Opcode::CompareNeI32:
-		case IR::Opcode::CompareGtI32:
-		case IR::Opcode::CompareGeI32:
-		case IR::Opcode::CompareLtI32:
-		case IR::Opcode::CompareLeI32:
-		case IR::Opcode::CompareEqI16:
-		case IR::Opcode::CompareNeI16:
-		case IR::Opcode::CompareGtI16:
-		case IR::Opcode::CompareGeI16:
-		case IR::Opcode::CompareLtI16:
-		case IR::Opcode::CompareLeI16:
-		case IR::Opcode::CompareMaskEqI32:
-		case IR::Opcode::CompareMaskNeI32:
-		case IR::Opcode::CompareMaskGtI32:
-		case IR::Opcode::CompareMaskGeI32:
-		case IR::Opcode::CompareMaskLtI32:
-		case IR::Opcode::CompareMaskLeI32:
-		case IR::Opcode::CompareEqU16:
-		case IR::Opcode::CompareNeU16:
-		case IR::Opcode::CompareGtU16:
-		case IR::Opcode::CompareGeU16:
-		case IR::Opcode::CompareLtU16:
-		case IR::Opcode::CompareLeU16:
-		case IR::Opcode::CompareEqF32:
-		case IR::Opcode::CompareNeF32:
-		case IR::Opcode::CompareGtF32:
-		case IR::Opcode::CompareGeF32:
-		case IR::Opcode::CompareLtF32:
-		case IR::Opcode::CompareLeF32:
-		case IR::Opcode::CompareOrderedF32:
-		case IR::Opcode::CompareUnorderedF32:
-		case IR::Opcode::CompareUnordEqF32:
-		case IR::Opcode::CompareUnordNeF32:
-		case IR::Opcode::CompareUnordGtF32:
-		case IR::Opcode::CompareUnordGeF32:
-		case IR::Opcode::CompareUnordLtF32:
-		case IR::Opcode::CompareUnordLeF32:
-		case IR::Opcode::CompareClassF32:
-		case IR::Opcode::CompareEqF16:
-		case IR::Opcode::CompareNeF16:
-		case IR::Opcode::CompareGtF16:
-		case IR::Opcode::CompareGeF16:
-		case IR::Opcode::CompareLtF16:
-		case IR::Opcode::CompareLeF16:
-		case IR::Opcode::CompareUnordNeF16:
-		case IR::Opcode::CompareMaskEqF16:
-		case IR::Opcode::CompareMaskNeF16:
-		case IR::Opcode::CompareMaskGtF16:
-		case IR::Opcode::CompareMaskGeF16:
-		case IR::Opcode::CompareMaskLtF16:
-		case IR::Opcode::CompareMaskLeF16:
-		case IR::Opcode::CompareMaskUnordNeF16:
-		case IR::Opcode::CompareMaskUnordGeF16:
-		case IR::Opcode::CompareMaskEqF32:
-		case IR::Opcode::CompareMaskNeF32:
-		case IR::Opcode::CompareMaskGtF32:
-		case IR::Opcode::CompareMaskGeF32:
-		case IR::Opcode::CompareMaskLtF32:
-		case IR::Opcode::CompareMaskLeF32:
-		case IR::Opcode::CompareMaskUnordEqF32:
-		case IR::Opcode::CompareMaskUnordNeF32:
-		case IR::Opcode::CompareMaskUnordGtF32:
-		case IR::Opcode::CompareMaskUnordGeF32:
-		case IR::Opcode::CompareMaskUnordLtF32:
-		case IR::Opcode::CompareMaskUnordLeF32: return true;
-		default: return false;
-	}
-}
-
 bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program) {
 	for (const auto& block: program.blocks) {
 		for (const auto& inst: block.instructions) {
@@ -482,7 +392,7 @@ bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program) {
 			    InstructionHasDppSource(inst)) {
 				return true;
 			}
-			if (IsCompareOpcode(inst.op)) {
+			if (IR::IsCompareOpcode(inst.op)) {
 				return true;
 			}
 			if (inst.dst.kind == IR::OperandKind::Register &&

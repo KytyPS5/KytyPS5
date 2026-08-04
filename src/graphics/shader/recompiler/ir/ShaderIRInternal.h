@@ -3,16 +3,17 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <optional>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void SetError(std::string* error, const char* message);
 
-Opcode LookupIrOpcode(Decoder::Opcode opcode);
-bool   IsImplemented(Decoder::Opcode opcode);
-bool   IsReversedBinary(Decoder::Opcode opcode);
-bool   IsVectorCarryOutOpcode(Decoder::Opcode opcode);
-bool   ScalarResultWritesSccNonZero(Decoder::Opcode opcode);
-bool   ScalarResultIs64Bit(Decoder::Opcode opcode);
+std::optional<Opcode> LookupIrOpcode(Decoder::Opcode opcode);
+bool                  IsReversedBinary(Decoder::Opcode opcode);
+bool                  IsVectorCarryOutOpcode(Decoder::Opcode opcode);
+bool                  ScalarResultWritesSccNonZero(Decoder::Opcode opcode);
+bool                  ScalarResultIs64Bit(Decoder::Opcode opcode);
 
 Operand  MakeSccOperand();
 Operand  MakeImmediateU32(uint32_t value);

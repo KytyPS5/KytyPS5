@@ -389,7 +389,7 @@ bool ProgramRequiresExactSubgroupSize(const IR::Program& program) {
 			if (Emitter::InstructionHasDppSource(inst)) {
 				return true;
 			}
-			if (Emitter::IsCompareOpcode(inst.op) && !Emitter::IsSccOperand(inst.dst)) {
+			if (IR::IsCompareOpcode(inst.op) && !Emitter::IsSccOperand(inst.dst)) {
 				return true;
 			}
 			if ((IsExecDestination(inst.dst) || IsExecDestination(inst.dst2)) &&

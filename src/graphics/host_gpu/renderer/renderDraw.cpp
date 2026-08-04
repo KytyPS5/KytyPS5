@@ -592,7 +592,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		// Titles leave DEPTH_CLEAR_ENABLE set for the whole frame, so the bit cannot be read
+		// as a per-pass load-clear request: clearing again at every render-state change
+		// discards the depth earlier draws accumulated and erases the world. Only the
+		// depth-only clear rect (no colour attachments) is the actual clear.
+		attachment.depth_clear    = depth.depth_load_clear_enable && color_count == 0;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
 	}

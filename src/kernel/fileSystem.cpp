@@ -276,6 +276,10 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 
 	return resolved;
 }
+#else
+static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
+	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
+}
 #endif
 
 std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_file_name) {
@@ -295,6 +299,10 @@ std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_fi
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
+			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
+			         mounted_file_name.c_str());
+		}
 		return p.dir / rel_path;
 #else
 		return ResolvePathIgnoringCase(p.dir / rel_path);

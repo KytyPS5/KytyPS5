@@ -42,6 +42,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
@@ -17653,6 +17654,136 @@ void CheckPm4StencilInfoValueLane(RenderContext& renderer) {
 	std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
 }
 
+void CheckPm4ContextStateOperations(RenderContext& renderer) {
+	GraphicsInitJmpTables();
+	CommandProcessor processor(renderer);
+	struct AgcCommandBufferLayout {
+		using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer*, uint32_t, void*);
+
+		uint32_t* bottom;
+		uint32_t* top;
+		uint32_t* cursor_up;
+		uint32_t* cursor_down;
+		Callback  callback;
+		void*     user_data;
+		uint32_t  reserved_dw;
+	};
+	static_assert(offsetof(AgcCommandBufferLayout, cursor_up) == 0x10);
+	static_assert(offsetof(AgcCommandBufferLayout, reserved_dw) == 0x30);
+
+	HW::RenderControl original_control {};
+	original_control.depth_clear_enable   = true;
+	original_control.stencil_clear_enable = true;
+	processor.GetCtx().SetRenderControl(original_control);
+	processor.GetCtx().SetRenderTargetMask(0x1234abcd);
+	processor.GetUcfg().SetPrimitiveType(0x35);
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_PS](processor, Pm4::SPI_SHADER_PGM_LO_PS,
+	                                                 0x00123456);
+	const auto shader_address = processor.GetShCtx().GetPs().ps_regs.data_addr;
+	const auto invoke = [&](ContextStateOperation operation) {
+		std::array<uint32_t, 32> packet {};
+		std::array<uint32_t, 6>  segment_sizes {};
+		AgcCommandBufferLayout   dcb {packet.data(), packet.data() + packet.size(), packet.data(),
+		                              packet.data() + packet.size(), nullptr, nullptr, 0};
+		const auto operation_value = static_cast<uint32_t>(operation);
+		size_t     segment_count  = 0;
+		switch (operation) {
+			case ContextStateOperation::Clear: segment_sizes = {5}; segment_count = 1; break;
+			case ContextStateOperation::Push:
+				segment_sizes = {5, 8, 9, 3, 2};
+				segment_count = 5;
+				break;
+			case ContextStateOperation::Pop:
+				segment_sizes = {3, 5, 8, 9, 2};
+				segment_count = 5;
+				break;
+			case ContextStateOperation::PushClear:
+				segment_sizes = {5, 8, 9, 3, 2, 5};
+				segment_count = 6;
+				break;
+		}
+		const auto size_dw =
+		    static_cast<size_t>(Gen5::GraphicsDcbContextStateOpGetSize(operation_value) / 4);
+		auto* emitted = Gen5::GraphicsDcbContextStateOp(
+		    reinterpret_cast<Gen5::CommandBuffer*>(&dcb), operation_value);
+		bool   packet_matches = true;
+		size_t segment_offset = 0;
+		for (size_t i = 0; i < segment_count; i++) {
+			const auto segment_size = segment_sizes[i];
+			const auto selector = (i == 0 ? Pm4::R_CONTEXT_STATE : Pm4::R_ZERO);
+			packet_matches &=
+			    packet[segment_offset] == KYTY_PM4(segment_size, Pm4::IT_NOP, selector);
+			for (size_t j = 1; j < segment_size; j++) {
+				packet_matches &= packet[segment_offset + j] ==
+				                  (i == 0 && j == 1 ? operation_value : 0u);
+			}
+			segment_offset += segment_size;
+		}
+		Require("Pm4ContextState", "HLE packet",
+		        emitted == packet.data() && dcb.cursor_up == packet.data() + size_dw &&
+		            segment_offset == size_dw && packet_matches,
+		        "context-state HLE packet does not match its real allocation size");
+		Pm4Execution execution;
+		return processor.Process(execution, packet.data(), size_dw);
+	};
+
+	Require("Pm4ContextState", "push-clear",
+	        invoke(ContextStateOperation::PushClear) == Pm4ProcessResult::Complete &&
+	            !processor.GetCtx().GetRenderControl().depth_clear_enable &&
+	            !processor.GetCtx().GetRenderControl().stencil_clear_enable &&
+	            processor.GetCtx().GetRenderTargetMask() == HW::Context {}.GetRenderTargetMask() &&
+	            processor.GetUcfg().GetPrimType() == 0x35 &&
+	            processor.GetShCtx().GetPs().ps_regs.data_addr == shader_address,
+	        "push-clear did not save and clear only Cx state");
+
+	processor.GetCtx().SetRenderTargetMask(0x55aa55aa);
+	Require("Pm4ContextState", "pop",
+	        invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderControl().depth_clear_enable &&
+	            processor.GetCtx().GetRenderControl().stencil_clear_enable &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+	        "pop did not restore the complete saved Cx state");
+
+	Require("Pm4ContextState", "push",
+	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+	        "push changed live Cx state");
+	processor.GetCtx().SetRenderTargetMask(0x01020304);
+	Require("Pm4ContextState", "push-pop restore",
+	        invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+	        "ordinary push/pop did not restore Cx state");
+
+	Require("Pm4ContextState", "clear",
+	        invoke(ContextStateOperation::Clear) == Pm4ProcessResult::Complete &&
+	            !processor.GetCtx().GetRenderControl().depth_clear_enable &&
+	            processor.GetCtx().GetRenderTargetMask() == HW::Context {}.GetRenderTargetMask() &&
+	            processor.GetUcfg().GetPrimType() == 0x35 &&
+	            processor.GetShCtx().GetPs().ps_regs.data_addr == shader_address,
+	        "clear reset state outside the Cx register domain");
+
+	processor.GetCtx().SetRenderTargetMask(0xabcdef01);
+	Require("Pm4ContextState", "push before processor reset",
+	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete,
+	        "push before reset failed");
+	processor.Reset();
+	processor.GetCtx().SetRenderTargetMask(0x76543210);
+	Require("Pm4ContextState", "processor reset discards push",
+	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete &&
+	            invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x76543210,
+	        "processor reset retained an invalid saved Cx state");
+
+	Require("Pm4ContextState", "HLE packet size",
+	        Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
+	        "context-state HLE sizes do not match libSceAgc");
+	std::printf("[host]    %-32s ok\n", "Pm4ContextState");
+}
+
 void CheckPm4WaitResume(RenderContext& renderer) {
 	GraphicsInitJmpTables();
 	CommandProcessor processor(renderer);
@@ -17789,6 +17920,11 @@ int main(int argc, char** argv) {
 		vulkan.CheckGpuCommandLane();
 		return 0;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
+		VulkanHarness vulkan;
+		CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+		return 0;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
 		CheckDepthAttachmentWrites();
 		CheckDynamicRenderingState();
@@ -17923,6 +18059,7 @@ int main(int argc, char** argv) {
 	CheckVulkan13FeatureRequirements();
 	CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
 	CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+	CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
 	CheckPm4WaitResume(vulkan.RuntimeRenderer());
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());
 	CheckEmbeddedFetchVertexOffset();

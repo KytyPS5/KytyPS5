@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1444,29 +1445,72 @@ int KYTY_SYSV_ABI GraphicsSuspendPoint() {
 	return OK;
 }
 
-uint32_t* KYTY_SYSV_ABI GraphicsUnknownQj7QZpgr9Uw(CommandBuffer* buf, uint32_t mode,
-                                                   uint32_t value) {
-	PRINT_NAME();
-	// ResetContextState?
-	LOGF("\t mode  = 0x%08" PRIx32 "\n"
-	     "\t value = 0x%08" PRIx32 "\n",
-	     mode, value);
+[[nodiscard]] static constexpr uint32_t context_state_op_size_dw(uint32_t operation) {
+	switch (static_cast<ContextStateOperation>(operation)) {
+		case ContextStateOperation::Clear: return 5;
+		case ContextStateOperation::Push:
+		case ContextStateOperation::Pop: return 27;
+		case ContextStateOperation::PushClear: return 32;
+		default: return 0;
+	}
+}
 
-	if (buf == nullptr) {
+uint32_t* KYTY_SYSV_ABI GraphicsDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
+	PRINT_NAME();
+	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
+
+	const auto size_dw = context_state_op_size_dw(operation);
+	if (buf == nullptr || size_dw == 0) {
 		return nullptr;
 	}
 
 	buf->DbgDump();
 
-	auto* cmd = buf->AllocateDW(1);
+	uint32_t* first = nullptr;
+	const auto append = [&](uint32_t segment_size_dw) {
+		auto* segment = buf->AllocateDW(segment_size_dw);
+		if (segment == nullptr) {
+			return false;
+		}
+		std::fill_n(segment, segment_size_dw, 0u);
+		if (first == nullptr) {
+			first      = segment;
+			segment[0] = KYTY_PM4(segment_size_dw, Pm4::IT_NOP, Pm4::R_CONTEXT_STATE);
+			segment[1] = operation;
+		} else {
+			segment[0] = KYTY_PM4(segment_size_dw, Pm4::IT_NOP, Pm4::R_ZERO);
+		}
+		return true;
+	};
+	const auto append_save_restore = [&] {
+		// The native helper reserves 22 dwords, then emits 5-, 8-, and 9-dword packets.
+		return buf->ReserveDW(22) && append(5) && append(8) && append(9);
+	};
 
-	if (cmd == nullptr) {
-		return nullptr;
+	// Preserve native packet sizes, allocation boundaries, Push/Pop ordering, and
+	// returned first-packet address. The native packets reference process-private state buffers,
+	// so their net Cx operation is represented by the first HLE packet and type-3 NOPs.
+	bool complete = false;
+	switch (static_cast<ContextStateOperation>(operation)) {
+		case ContextStateOperation::Clear: complete = append(5); break;
+		case ContextStateOperation::Push:
+			complete = append_save_restore() && append(3) && append(2);
+			break;
+		case ContextStateOperation::Pop:
+			complete = append(3) && append_save_restore() && append(2);
+			break;
+		case ContextStateOperation::PushClear:
+			complete = append_save_restore() && append(3) && append(2) && append(5);
+			break;
+		default: break;
 	}
 
-	cmd[0] = 0x80000000u;
+	return complete ? first : nullptr;
+}
 
-	return cmd;
+uint64_t KYTY_SYSV_ABI GraphicsDcbContextStateOpGetSize(uint32_t operation) {
+	PRINT_NAME();
+	return static_cast<uint64_t>(context_state_op_size_dw(operation)) * sizeof(uint32_t);
 }
 
 uint64_t KYTY_SYSV_ABI GraphicsGetIsTrinityMode() {

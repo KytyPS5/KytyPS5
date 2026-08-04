@@ -15,6 +15,13 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
+enum class ContextStateOperation : uint32_t {
+	Clear     = 0,
+	Push      = 1,
+	Pop       = 2,
+	PushClear = 3,
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -49,6 +56,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
 	void            BufferFlush();
@@ -149,6 +157,8 @@ private:
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
+	HW::Context      m_saved_ctx;
+	bool             m_context_state_pushed = false;
 	HW::UserConfig   m_ucfg;
 	HW::Shader       m_sh_ctx;
 	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;

@@ -30,6 +30,7 @@ constexpr auto MakeRegisterNames() {
 	names[R_FLIP]           = "R_FLIP";
 	names[R_RELEASE_MEM]    = "R_RELEASE_MEM";
 	names[R_DMA_DATA]       = "R_DMA_DATA";
+	names[R_CONTEXT_STATE]  = "R_CONTEXT_STATE";
 	return names;
 }
 

@@ -312,6 +312,8 @@ void CommandProcessor::Reset() {
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
+	m_saved_ctx.Reset();
+	m_context_state_pushed = false;
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
@@ -319,6 +321,30 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+}
+
+void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
+	switch (operation) {
+		case ContextStateOperation::Clear: m_ctx.Reset(); break;
+		case ContextStateOperation::Push:
+			EXIT_IF(m_context_state_pushed);
+			m_saved_ctx            = m_ctx;
+			m_context_state_pushed = true;
+			break;
+		case ContextStateOperation::Pop:
+			EXIT_IF(!m_context_state_pushed);
+			m_ctx                  = m_saved_ctx;
+			m_saved_ctx            = {};
+			m_context_state_pushed = false;
+			break;
+		case ContextStateOperation::PushClear:
+			EXIT_IF(m_context_state_pushed);
+			m_saved_ctx            = m_ctx;
+			m_context_state_pushed = true;
+			m_ctx.Reset();
+			break;
+		default: EXIT("unknown context state operation: %u\n", static_cast<uint32_t>(operation));
+	}
 }
 
 void CommandProcessor::BufferInit() {

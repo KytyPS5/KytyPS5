@@ -67,8 +67,8 @@ int KYTY_SYSV_ABI GraphicsUnknownJumpPatchSetTarget(uint32_t* cmd, const volatil
 int KYTY_SYSV_ABI GraphicsJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
                                              uint32_t size_in_dwords);
 int KYTY_SYSV_ABI GraphicsSuspendPoint();
-uint32_t* KYTY_SYSV_ABI GraphicsUnknownQj7QZpgr9Uw(CommandBuffer* buf, uint32_t mode,
-                                                   uint32_t value);
+uint32_t* KYTY_SYSV_ABI GraphicsDcbContextStateOp(CommandBuffer* buf, uint32_t operation);
+uint64_t KYTY_SYSV_ABI  GraphicsDcbContextStateOpGetSize(uint32_t operation);
 uint64_t KYTY_SYSV_ABI  GraphicsGetIsTrinityMode();
 
 uint32_t KYTY_SYSV_ABI GraphicsDriverGetDefaultOwner();

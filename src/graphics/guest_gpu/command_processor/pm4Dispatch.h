@@ -121,6 +121,7 @@ uint32_t HwUcSetGeIndexOffset(CommandProcessor&, uint32_t, uint32_t, const uint3
 uint32_t HwUcSetGdsOaRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 
 uint32_t CpOpNop(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpContextState(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetBase(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpClearState(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndexBase(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

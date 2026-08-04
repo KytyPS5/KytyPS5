@@ -805,7 +805,7 @@ constexpr uint32_t SdwaSelAll() {
 }
 
 constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
-    {Opcode::VCndmaskB32, SdwaSelWords(), SdwaSelWords() | SdwaSelFull(),
+    {Opcode::VCndmaskB32, SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
      SdwaSelWords() | SdwaSelFull(), true, false},
     {Opcode::VAddF32, SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},
     {Opcode::VSubF32, SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},

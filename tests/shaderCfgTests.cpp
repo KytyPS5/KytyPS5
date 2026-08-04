@@ -1170,6 +1170,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	    EncodeVop2Sdwa(5, 6, 0, 4, 5),
 	    0x025e6af9u,
 	    0x16060635u, // v_cndmask_b32 v47, v53, -v53
+	    0x020e02f9u,
+	    0x06040600u, // v_cndmask_b32 v7, v0.lo, v1; full-width destination
 	    0x100490f9u,
 	    0x86860600u, // v_mul_f32 v2, s0, s72 (SDWA full)
 	    EncodeVop2(0x35, 9, 249, 1),
@@ -1396,6 +1398,9 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v47, v53,") &&
 	          Common::ContainsStr(result.decoded_dump, "v53.neg"),
 	      "new decoder did not decode V_CNDMASK_B32 SDWA source modifier");
+	Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v7, v0.sdwa(sel=4") &&
+	          Common::ContainsStr(result.decoded_dump, "v1"),
+	      "new decoder did not decode full-destination V_CNDMASK_B32 with SDWA source");
 	Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v125, v5.dpp"),
 	      "new decoder did not decode VOP2 DPP source metadata");
 	Check(!Common::ContainsStr(result.decoded_dump, "VOP2 SDWA/DPP modifiers are not implemented"),
@@ -1700,6 +1705,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	Check(Common::ContainsStr(result.ir_dump, "SelectMaskF32Bits v47, vcc_lo, v53.neg, v53") &&
 	          Common::ContainsStr(result.ir_dump, "v53.neg"),
 	      "V_CNDMASK_B32 SDWA source modifier did not lower to float-bit select IR");
+	Check(Common::ContainsStr(result.ir_dump, "SelectMaskU32 v7, vcc_lo, v1, v0.sdwa(sel=4"),
+	      "full-destination V_CNDMASK_B32 with SDWA source did not lower to integer select IR");
 	Check(Common::ContainsStr(result.ir_dump, "FAddF32 v125.dpp") &&
 	          Common::ContainsStr(result.ir_dump, "v5.dpp"),
 	      "VOP2 DPP source/destination did not lower to IR metadata");

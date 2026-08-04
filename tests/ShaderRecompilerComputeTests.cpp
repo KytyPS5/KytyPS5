@@ -11783,6 +11783,32 @@ TestCase Vop2SdwaCndmaskSourceModifier() {
 	        {O::VMovB32, O::VCmpTU32, O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 0, 0xabcd1234u);
+	AppendVMovLiteral(&code, 1, 0x55667788u);
+	code.push_back(EncodeVopc(0xc0, Vgpr(0), 0)); // v_cmp_f_u32
+	code.push_back(0x020e02f9u);
+	code.push_back(0x06040600u);
+	AppendStoreVgpr(&code, 7, 0);
+	code.push_back(EncodeVopc(0xc7, Vgpr(0), 0)); // v_cmp_t_u32
+	code.push_back(0x020e02f9u);
+	code.push_back(0x06040600u);
+	AppendStoreVgpr(&code, 7, 1);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name           = "Vop2SdwaCndmaskFullDestinationWithSubDwordSource";
+	test.code           = code;
+	test.expected       = {0x00001234u, 0x55667788u};
+	test.opcodes        = {O::VMovB32, O::VCmpFU32, O::VCmpTU32, O::VCndmaskB32,
+	                       O::BufferStoreDword, O::SEndpgm};
+	test.required_spirv = {"OpBitFieldUExtract", "OpSelect"};
+	return test;
+}
+
 TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
 	using O = ShaderOpcode;
 
@@ -15142,6 +15168,7 @@ std::vector<TestCase> MakeCases() {
 	AddCase(VectorCompareClassF32);
 	AddCase(VectorCompareF16Ops);
 	AddCase(Vop2SdwaCndmaskSourceModifier);
+	AddCase(Vop2SdwaCndmaskFullDestinationWithSubDwordSource);
 	AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
 	AddCase(Vop3CndmaskAllowsDataSourceModifier);
 	AddCase(VectorCompareExecOps);

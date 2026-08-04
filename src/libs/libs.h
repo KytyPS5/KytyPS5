@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_
 
 #include "common/abi.h"
+#include "common/hleTrace.h" // IWYU pragma: keep
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -56,7 +57,7 @@
 #define LIB_FUNC(n, f) LIB_ADD(n, f, Loader::SymbolType::Func)
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define PRINT_NAME()                                                                               \
+#define PRINT_NAME_LOG()                                                                           \
 	if (PRINT_NAME_ENABLED) {                                                                      \
 		if (Log::GetDirection() != Log::Direction::Silent) {                                       \
 			const auto print_name_time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");      \
@@ -65,6 +66,18 @@
 			           g_module, __func__);                                                        \
 		}                                                                                          \
 	}
+
+#ifdef KYTY_HLE_TRACE
+// The breadcrumb object must outlive the call, so PRINT_NAME() becomes a declaration. Every
+// existing call site is a plain `PRINT_NAME();` statement, which stays valid.
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define PRINT_NAME()                                                                               \
+	PRINT_NAME_LOG();                                                                              \
+	Common::HleTrace::ScopedCall print_name_trace_scope(g_module, __func__)
+#else
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define PRINT_NAME() PRINT_NAME_LOG()
+#endif
 
 namespace Loader {
 class SymbolDatabase;

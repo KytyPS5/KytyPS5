@@ -3,6 +3,7 @@
 #include "SDL.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -763,6 +764,11 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 
 int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr) {
 	// EXIT_NOT_IMPLEMENTED(ptr == nullptr);
+	// Deliberately not PRINT_NAME(): this is the per-buffer submission call and logging it would
+	// flood. TRACE_NAME() still records the breadcrumb, so "is the guest submitting any audio at
+	// all?" is answerable -- without it the function is invisible to the trace and its absence
+	// from a snapshot means nothing.
+	TRACE_NAME();
 
 	Audio::OutputParam params[1];
 

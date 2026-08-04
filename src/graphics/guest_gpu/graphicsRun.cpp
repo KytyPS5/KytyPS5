@@ -57,6 +57,9 @@ public:
 
 private:
 	Common::Mutex& m_mutex;
+	// Holding this lock blocks every other guest thread's submissions, so a guest signal
+	// handler must not run while it is held.
+	Common::HleCriticalSection m_critical;
 };
 
 struct OwnedCmdBuffer {

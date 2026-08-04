@@ -110,6 +110,7 @@ uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
+bool                  PthreadHasAnyPendingSignal(Pthread thread);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

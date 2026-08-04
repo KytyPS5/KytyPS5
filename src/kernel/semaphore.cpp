@@ -1,6 +1,7 @@
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
+#include "common/hleTrace.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -290,6 +291,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	TRACE_NAME();
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -334,6 +336,7 @@ int KYTY_SYSV_ABI KernelPollSema(KernelSema sem, int need) {
 }
 
 int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
+	TRACE_NAME();
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}

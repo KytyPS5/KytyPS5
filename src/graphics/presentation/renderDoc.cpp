@@ -108,7 +108,16 @@ static RenderDocDevicePointer GetRenderDocDevicePointer(vk::Instance instance) {
 		return nullptr;
 	}
 
-	return VulkanHandleToPointer(instance);
+	// RenderDoc wants the Vulkan *dispatch key*, not the handle: its own header defines
+	//     RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(inst) == (*((void **)(inst)))
+	// i.e. the first pointer inside the dispatchable object. Passing the VkInstance handle
+	// itself makes StartFrameCapture silently do nothing ("StartFrameCapture returned, but
+	// RenderDoc is not capturing"), so no capture is ever produced.
+	auto* dispatchable = static_cast<void*>(VulkanHandleToPointer(instance));
+	if (dispatchable == nullptr) {
+		return nullptr;
+	}
+	return *reinterpret_cast<void**>(dispatchable);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -200,6 +209,29 @@ static RenderDocWindowHandle GetRenderDocWindowHandle(SDL_Window* window) {
 		// RenderDoc takes the raw xlib Window id in the pointer slot, not a Display*.
 		return reinterpret_cast<RenderDocWindowHandle>(
 		    static_cast<uintptr_t>(info.info.x11.window));
+	}
+#else
+	if (info.subsystem == SDL_SYSWM_X11) {
+		// SDL_VIDEO_DRIVER_X11 is not visible here: the source-tree SDL_config.h shadows the
+		// generated one on the include path, so SDL_SysWMinfo::info has no x11 member at
+		// compile time even though the SDL we link against was built with X11. Without this
+		// branch every X11 session is misreported as Wayland and RenderDoc capture is refused
+		// outright ("StartFrameCapture returned, but RenderDoc is not capturing").
+		//
+		// The union is padded to a fixed 64 bytes (SDL_syswm.h: `Uint8 dummy[64]`) and the
+		// x11 member is `{ Display* display; Window window; }` at its start, so the window id
+		// can be read positionally without the declaration.
+		struct X11InfoLayout {
+			void*         display;
+			unsigned long window;
+		};
+		static_assert(sizeof(X11InfoLayout) <= sizeof(info.info),
+		              "SDL_SysWMinfo union smaller than the X11 layout");
+		X11InfoLayout x11 {};
+		std::memcpy(&x11, &info.info, sizeof(x11));
+		if (x11.window != 0) {
+			return reinterpret_cast<RenderDocWindowHandle>(static_cast<uintptr_t>(x11.window));
+		}
 	}
 #endif
 
@@ -352,8 +384,13 @@ void RenderDocOnPresent() {
 		case RenderDocState::Idle: return;
 		case RenderDocState::Requested:
 			if (g_api->IsFrameCapturing() != 0) {
-				LOGF("RenderDoc: capture request ignored because RenderDoc is already capturing\n");
-				g_state.store(RenderDocState::Idle);
+				// A capture is already open -- RenderDoc can begin one itself depending on how
+				// the layer was activated. Dropping the request to Idle here means nothing ever
+				// calls EndFrameCapture, so the capture stays open forever and no file is
+				// written. Adopt it instead and let the next present close it out.
+				LOGF("RenderDoc: a capture was already in progress; adopting it and ending it on "
+				     "the next present\n");
+				g_state.store(RenderDocState::Capturing);
 				return;
 			}
 

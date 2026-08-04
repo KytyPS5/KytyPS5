@@ -23,6 +23,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -322,8 +323,23 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 		}
 	}
 
+	// Log the first call per symbol rather than the first 1024 calls overall: a single hot
+	// unresolved import used to exhaust the budget and hide every other one, so the *set* of
+	// unresolved imports -- which is what tells you whether a stubbed function is on a path that
+	// matters -- was never visible.
+	// Lock-free: this runs on every call to an unresolved import, which can be hot, and the record
+	// vector is copied on push_back so it cannot hold an atomic member.
+	static std::array<std::atomic_uint64_t, 1024> logged_bits {};
+
+	bool first_for_symbol = false;
+	if (record_id < logged_bits.size() * 64) {
+		auto&      word = logged_bits[record_id / 64];
+		const auto bit  = uint64_t {1} << (record_id % 64);
+		first_for_symbol = (word.fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+	}
+
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	if (first_for_symbol || log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
@@ -1017,13 +1033,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r13", info->r13);
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
-
-		if (info->exception_address == 0x000000090064364e &&
-		    IsDumpableRange(info->rbx, sizeof(uint64_t))) {
-			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
-			dump_guest_qwords("vorbis obj", local[0]);
-			dump_guest_qwords("vorbis len", info->rcx);
-		}
 
 		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
 		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,

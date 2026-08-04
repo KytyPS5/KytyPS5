@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/hleTrace.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -336,6 +337,16 @@ static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle p
 	return nullptr;
 }
 
+static bool audioout2_context_has_device(AudioOut2ContextHandle ctx) {
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	for (const auto& state: g_audioout2_ports) {
+		if (state.used && state.context == ctx && state.audio_handle > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
@@ -480,6 +491,7 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+	TRACE_NAME();
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
@@ -490,18 +502,32 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
-	uint32_t sleep_micros = audioout2_grain_micros(512);
+	TRACE_NAME();
+	uint32_t   sleep_micros = audioout2_grain_micros(512);
+	const bool has_device   = audioout2_context_has_device(ctx);
 
 	for (;;) {
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth) {
+			// The modelled queue drains on wall clock, so gating on it pins submission to
+			// exactly 1x realtime and no cushion can ever form. Titles ask for
+			// queue_depth = 1, which leaves a single grain of slack: measured at 98%
+			// device underruns with the queue never exceeding two buffers. AudioOutOutputs
+			// already blocks on the real device queue and targets ~40 ms, so where a port has
+			// a device that is the correct clock and this gate is a second, stricter rate
+			// limiter fighting it -- the same fault that was fixed by dropping the wall-clock
+			// sleep from AudioOutOutputs. Ports with no device (a failed open, or a vibration
+			// port) keep the gate, because nothing else would pace the guest there.
+			if (state->queued < state->queue_depth || has_device) {
 				if (state->queued == 0) {
 					state->last_update = LibKernel::KernelGetProcessTime();
 				}
-				state->queued++;
+				// Keep the count truthful for GetQueueLevel even when the gate is bypassed.
+				if (state->queued < state->queue_depth) {
+					state->queued++;
+				}
 				g_audioout2_context_mutex.Unlock();
 				audioout2_queue_context_audio(ctx, blocking != 0);
 				return OK;
@@ -519,6 +545,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	TRACE_NAME();
 	if (queue_level != nullptr) {
 		*queue_level = 0;
 	}

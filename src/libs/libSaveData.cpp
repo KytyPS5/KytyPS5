@@ -14,7 +14,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace Libs {
@@ -294,6 +297,70 @@ static bool dir_name_match(const char* str, const char* pattern) {
 	return *str == '\0' && *pattern == '\0';
 }
 
+// Save-data parameters (title / sub-title / detail / user param / mtime) have to survive across
+// mounts: a title populates its load menu from them, and blank parameters read back as a damaged
+// save. Persist them next to the save in sce_sys/, the same place the real system keeps them.
+static std::string save_data_dir(std::string_view dir_name) {
+	return std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + std::string(dir_name);
+}
+
+static std::string param_file_path(std::string_view dir_name) {
+	return save_data_dir(dir_name) + "/sce_sys/param.bin";
+}
+
+// Directory a mount point currently refers to, or empty if nothing is mounted there.
+static std::string mounted_dir_name(const char* mount_point) {
+	if (mount_point == nullptr) {
+		return {};
+	}
+	const int slot = g_mount_slots.Find(mount_point);
+	if (slot < 0) {
+		return {};
+	}
+	return g_mount_slots.Directory(static_cast<size_t>(slot)).value_or(std::string {});
+}
+
+static bool read_save_param(std::string_view dir_name, SaveDataParam* out) {
+	EXIT_IF(out == nullptr);
+	*out = {};
+	if (dir_name.empty()) {
+		return false;
+	}
+	const auto path = param_file_path(dir_name);
+	if (!Common::File::IsFileExisting(path) ||
+	    Common::File::Size(path) < static_cast<uint64_t>(sizeof(SaveDataParam))) {
+		return false;
+	}
+	Common::File file;
+	if (!file.Open(path, Common::File::Mode::Read) || file.IsInvalid()) {
+		return false;
+	}
+	uint32_t read = 0;
+	file.Read(out, static_cast<uint32_t>(sizeof(SaveDataParam)), &read);
+	file.Close();
+	if (read != sizeof(SaveDataParam)) {
+		*out = {};
+		return false;
+	}
+	return true;
+}
+
+static void write_save_param(std::string_view dir_name, const SaveDataParam& param) {
+	if (dir_name.empty()) {
+		return;
+	}
+	const auto directory = save_data_dir(dir_name) + "/sce_sys";
+	if (!Common::File::IsDirectoryExisting(directory)) {
+		Common::File::CreateDirectories(directory);
+	}
+	Common::File file;
+	if (!file.Create(param_file_path(dir_name)) || file.IsInvalid()) {
+		return;
+	}
+	file.Write(&param, static_cast<uint32_t>(sizeof(SaveDataParam)));
+	file.Close();
+}
+
 static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
@@ -386,16 +453,52 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 	}
 
-	std::sort(dir_list.begin(), dir_list.end(), [](const std::string& a, const std::string& b) {
-		return std::strcmp(a.c_str(), b.c_str()) < 0;
+	// Load each save's stored parameters up front: they decide both what the title displays and,
+	// for the Mtime/UserParam keys, the order it asks for.
+	std::vector<SaveDataParam> dir_params(dir_list.size());
+	for (size_t i = 0; i < dir_list.size(); i++) {
+		(void)read_save_param(dir_list[i], &dir_params[i]);
+	}
+
+	std::vector<size_t> order(dir_list.size());
+	for (size_t i = 0; i < order.size(); i++) {
+		order[i] = i;
+	}
+	std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+		switch (cond->key) {
+			case SaveDataSortKey::Mtime:
+				if (dir_params[a].mtime != dir_params[b].mtime) {
+					return dir_params[a].mtime < dir_params[b].mtime;
+				}
+				break;
+			case SaveDataSortKey::UserParam:
+				if (dir_params[a].user_param != dir_params[b].user_param) {
+					return dir_params[a].user_param < dir_params[b].user_param;
+				}
+				break;
+			default: break;
+		}
+		return std::strcmp(dir_list[a].c_str(), dir_list[b].c_str()) < 0;
 	});
 
-	if (cond->order == SaveDataSortOrder::Descent) {
-		std::vector<std::string> reversed;
-		for (size_t i = dir_list.size(); i > 0; i--) {
-			reversed.push_back(dir_list[i - 1]);
+	{
+		std::vector<std::string>   sorted_names;
+		std::vector<SaveDataParam> sorted_params;
+		sorted_names.reserve(order.size());
+		sorted_params.reserve(order.size());
+		for (const auto index: order) {
+			sorted_names.push_back(dir_list[index]);
+			sorted_params.push_back(dir_params[index]);
 		}
-		dir_list = reversed;
+		dir_list   = std::move(sorted_names);
+		dir_params = std::move(sorted_params);
+	}
+
+	if (cond->order == SaveDataSortOrder::Descent) {
+		// Names and parameters are parallel arrays; reversing one without the other would hand the
+		// title every save's metadata attached to the wrong directory.
+		std::reverse(dir_list.begin(), dir_list.end());
+		std::reverse(dir_params.begin(), dir_params.end());
 	}
 
 	auto max_count =
@@ -408,7 +511,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
 		              dir_list[i].c_str());
 		if (result->params != nullptr) {
-			result->params[i] = {};
+			result->params[i] = dir_params[i];
 		}
 		if (result->infos != nullptr) {
 			result->infos[i]             = {};
@@ -714,7 +817,12 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
-		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		Common::LockGuard lock(g_mount_mutex);
+		SaveDataParam     stored {};
+		// Absent parameters are not an error: a freshly created save has none until the title
+		// sets them, and zeroes are the correct answer there.
+		(void)read_save_param(mounted_dir_name(mount_point->data), &stored);
+		std::memcpy(param_buf, &stored, sizeof(SaveDataParam));
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -830,6 +938,9 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	     mount_point->data, param_type, param_buf_size);
 
 	if (param_type == 0) {
+		if (param_buf == nullptr || param_buf_size < sizeof(SaveDataParam)) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
 		const auto* p = static_cast<const SaveDataParam*>(param_buf);
 
 		LOGF("\t title      = %s\n"
@@ -837,6 +948,16 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+
+		Common::LockGuard lock(g_mount_mutex);
+		const auto        dir_name = mounted_dir_name(mount_point->data);
+		if (dir_name.empty()) {
+			return SAVE_DATA_ERROR_NOT_MOUNTED;
+		}
+		auto stored = *p;
+		// The system stamps the modification time; a title leaves it zero when setting params.
+		stored.mtime = static_cast<int64_t>(std::time(nullptr));
+		write_save_param(dir_name, stored);
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}

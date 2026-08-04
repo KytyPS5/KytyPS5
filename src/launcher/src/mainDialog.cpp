@@ -42,7 +42,9 @@ constexpr char EMULATOR_EXE[] = "kyty_emulator.exe";
 constexpr char EMULATOR_EXE[] = "kyty_emulator";
 #endif
 
-#if defined(__linux__)
+#if defined(_WIN32)
+constexpr char CMD_EXE[] = "cmd.exe";
+#elif defined(__linux__)
 constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
 #if defined(_WIN32)
@@ -360,6 +362,14 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 			process->setProgram(QStringLiteral("bash"));
 			process->setArguments({QStringLiteral("-c"), bash_file_name});
 		}
+	}
+#elif defined(_WIN32)
+	{
+		process->setProgram(CMD_EXE);
+		QStringList process_args;
+		process_args << QStringLiteral("/K") << interpreter;
+		process_args += args;
+		process->setArguments(process_args);
 	}
 #else
 	process->setProgram(interpreter);

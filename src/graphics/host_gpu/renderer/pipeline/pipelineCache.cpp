@@ -143,7 +143,15 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	}
 	static_params.with_depth         = with_depth;
 	static_params.depth_test_enable  = depth.depth_test_enable;
-	static_params.depth_write_enable = (depth.depth_write_enable && !depth.depth_clear_enable);
+	// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE makes the depth unit substitute DB_DEPTH_CLEAR for
+	// the fragment's own depth. Titles set it for the full-screen rect that clears depth and
+	// then leave it set, so suppressing depth writes for every draw while it is on erases the
+	// world: ordinary colour draws stop contributing depth and later geometry overwrites
+	// earlier geometry regardless of distance. Only the clear itself is depth-only
+	// (color_count == 0), so restrict the suppression to that case and let colour draws write
+	// real fragment depth.
+	static_params.depth_write_enable =
+	    depth.depth_write_enable && (color_count > 0 || !depth.depth_clear_enable);
 	static_params.depth_compare_op   = depth.depth_compare_op;
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;

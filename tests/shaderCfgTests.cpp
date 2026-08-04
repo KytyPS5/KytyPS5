@@ -623,6 +623,7 @@ ImageTestUserData(Prospero::ImageType type = Prospero::ImageType::kColor2D) {
 	std::array<uint32_t, 64> data {};
 	for (uint32_t start = 0; start + 3u < data.size(); start += 4u) {
 		data[start]      = 0x1000u + start * 0x100u;
+		data[start + 1u] = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
 		data[start + 2u] = UINT32_MAX;
 		data[start + 3u] = Prospero::GpuEnumValue(type) << 28u;
 	}

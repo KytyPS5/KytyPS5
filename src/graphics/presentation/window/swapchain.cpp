@@ -789,12 +789,14 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		    [&window] {
 			    window.UpdateIcon();
 			    SDL_ShowWindow(window.window);
+			    SDL_RaiseWindow(window.window);
 		    },
 		    true);
 #else
 		window.UpdateIcon();
 
 		SDL_ShowWindow(window.window);
+		SDL_RaiseWindow(window.window);
 #endif
 
 		window.window_hidden = false;

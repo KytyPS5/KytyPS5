@@ -178,7 +178,8 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("bxca0BK4FNg", Gen5::GraphicsUnknownJumpPatchSetTarget);
 	LIB_FUNC("2BS4EtAaF28", Gen5::GraphicsJumpPatchSetTarget);
 	LIB_FUNC("h9z6+0hEydk", Gen5::GraphicsSuspendPoint);
-	LIB_FUNC("qj7QZpgr9Uw", Gen5::GraphicsUnknownQj7QZpgr9Uw);
+	LIB_FUNC("qj7QZpgr9Uw", Gen5::GraphicsDcbContextStateOp);
+	LIB_FUNC("H6vHS5cidSA", Gen5::GraphicsDcbContextStateOpGetSize);
 	LIB_FUNC("BfBDZGbti7A", Gen5::GraphicsGetIsTrinityMode);
 	LIB_FUNC("dbOlWdppb4o", LibGen5::Graphics5UnknownDb);
 

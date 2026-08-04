@@ -85,8 +85,6 @@ private:
 
 static GameController* g_controller = nullptr;
 
-static constexpr int KEYBOARD_CONTROLLER_ID = -1000;
-
 static uint8_t pad_connected_count_to_u8(int connected_count) {
 	return static_cast<uint8_t>(connected_count > 255 ? 255 : connected_count);
 }
@@ -117,7 +115,7 @@ KYTY_SUBSYSTEM_INIT(Controller) {
 	EXIT_IF(g_controller != nullptr);
 
 	g_controller = new GameController;
-	g_controller->Connect(KEYBOARD_CONTROLLER_ID);
+	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
 }
 
 KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Controller) {}
@@ -155,7 +153,7 @@ void GameController::CheckActive() {
 	if (!m_connected_ids.empty()) {
 		new_active_id = m_connected_ids[0];
 		for (const auto id: m_connected_ids) {
-			if (id != KEYBOARD_CONTROLLER_ID) {
+			if (id != HOST_INPUT_CONTROLLER_ID) {
 				new_active_id = id;
 				break;
 			}

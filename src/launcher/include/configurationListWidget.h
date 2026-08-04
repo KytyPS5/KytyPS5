@@ -38,7 +38,10 @@ public:
 
 	[[nodiscard]] const QString&     GetSettingsFile() const { return m_settings_file; }
 	[[nodiscard]] const QStringList& GetGameDirectories() const { return m_game_dirs; }
-	[[nodiscard]] bool               CanViewSelectedTrophies() const;
+	[[nodiscard]] const QStringList& GetHostInputMapping() const {
+		return m_global_info.host_input_mapping;
+	}
+	[[nodiscard]] bool CanViewSelectedTrophies() const;
 
 	bool EnsureGameDirectory();
 	void ScanGameDirectory();
@@ -58,6 +61,7 @@ protected slots:
 	void edit_configuration();
 	void delete_configuartion();
 	void edit_global_settings();
+	void edit_input_mapping();
 	void run_configuration();
 	void list_currentItemChanged(QTreeWidgetItem* current, QTreeWidgetItem* previous);
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);

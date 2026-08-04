@@ -15,6 +15,13 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
+enum class ContextStateOperation : uint32_t {
+	Clear     = 0,
+	Push      = 1,
+	Pop       = 2,
+	PushClear = 3,
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -49,24 +56,12 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void ApplyContextStateOperation(ContextStateOperation operation);
 
-	void BufferInit();
-	void BufferFlush();
-	void BufferFlushAndWait();
-	void BufferWait();
-	void BeginReadbackTransaction() {
-		if (m_readback_active) {
-			EXIT("nested command-processor readback transaction\n");
-		}
-		m_readback_active = true;
-	}
-	void EndReadbackTransaction() {
-		if (!m_readback_active) {
-			EXIT("command-processor readback transaction is not active\n");
-		}
-		m_readback_active = false;
-	}
-
+	void            BufferInit();
+	void            BufferFlush();
+	void            BufferFlushAndWait();
+	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -162,6 +157,8 @@ private:
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
+	HW::Context      m_saved_ctx;
+	bool             m_context_state_pushed = false;
 	HW::UserConfig   m_ucfg;
 	HW::Shader       m_sh_ctx;
 	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;
@@ -173,10 +170,9 @@ private:
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
 
-	uint32_t m_de_count        = 0;
-	uint32_t m_ce_count        = 0;
-	bool     m_ce_complete     = false;
-	bool     m_readback_active = false;
+	uint32_t m_de_count    = 0;
+	uint32_t m_ce_count    = 0;
+	bool     m_ce_complete = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
 

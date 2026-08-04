@@ -29,45 +29,29 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
-	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
 		ValidateRange(vaddr, size);
 
-		const auto update_cpu_state = [this, vaddr, size] {
-			std::lock_guard             access(m_access_mutex);
-			std::vector<RegionManager*> managers;
-			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
-				managers.push_back(manager);
-			});
-			std::vector<std::unique_lock<TrackingSpinLock>> locks;
-			locks.reserve(managers.size());
-			for (auto* manager: managers) {
-				locks.emplace_back(manager->lock);
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const bool should_flush = [&] {
+				// Perform both the GPU modification check and CPU state change with the lock in
+				// case the GPU thread is racing to mark the page modified. If a flush is needed,
+				// on_flush performs the CPU state change.
+				std::scoped_lock lock(manager->lock);
+				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+					return true;
+				}
+				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				return false;
+			}();
+			if (should_flush) {
+				on_flush();
 			}
-			const bool gpu_modified = Iterate<false>(
-			    vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				    return manager->IsModified<DirtySource::Gpu>(offset, bytes);
-			    });
-			if (gpu_modified) {
-				return true;
-			}
-			Iterate<false>(vaddr, size,
-			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				               manager->ChangeState<DirtySource::Cpu, true>(
-				                   manager->GetCpuAddr() + offset, bytes);
-			               });
-			return false;
-		};
-
-		if (!update_cpu_state()) {
-			return;
-		}
-		std::forward<Flush>(on_flush)();
-		if (update_cpu_state()) {
-			EXIT("memory invalidation retained GPU-owned pages\n");
-		}
+		});
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,

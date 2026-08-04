@@ -6,6 +6,7 @@
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
 #include "gameListTreeWidget.h"
+#include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
 #include "trophyViewerDialog.h"
@@ -169,6 +170,7 @@ static void ApplyGameListStyle(Ui::ConfigurationListWidget* ui) {
 	    "QToolButton:disabled { background: transparent; }"));
 	ui->edit_button->setStyleSheet(ui->global_settings_button->styleSheet());
 	ui->delete_button->setStyleSheet(ui->global_settings_button->styleSheet());
+	ui->input_mapping_button->setStyleSheet(ui->global_settings_button->styleSheet());
 }
 
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
@@ -226,10 +228,12 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->setupUi(this);
 	ApplyGameListStyle(m_ui);
 
-	m_ui->global_settings_button->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+	m_ui->global_settings_button->setIcon(QIcon(QStringLiteral(":/icons/global-settings.svg")));
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
-	m_ui->edit_button->setIcon(style()->standardIcon(QStyle::SP_FileIcon));
-	m_ui->delete_button->setIcon(style()->standardIcon(QStyle::SP_DialogDiscardButton));
+	m_ui->input_mapping_button->setIcon(QIcon(QStringLiteral(":/icons/input-mapping.svg")));
+	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
+	m_ui->edit_button->setIcon(QIcon(QStringLiteral(":/icons/edit-configuration.svg")));
+	m_ui->delete_button->setIcon(QIcon(QStringLiteral(":/icons/remove-configuration.svg")));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
@@ -249,6 +253,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 
 	connect(m_ui->global_settings_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_global_settings);
+	connect(m_ui->input_mapping_button, &QToolButton::clicked, this,
+	        &ConfigurationListWidget::edit_input_mapping);
 	connect(m_ui->edit_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_configuration);
 	connect(m_ui->delete_button, &QToolButton::clicked, this,
@@ -714,6 +720,14 @@ void ConfigurationListWidget::edit_global_settings() {
 		m_game_dirs = NormalizeGameDirectories(dlg.GetGameDirectories());
 		WriteSettings();
 		ScanGameDirectory();
+	}
+}
+
+void ConfigurationListWidget::edit_input_mapping() {
+	InputMappingDialog dialog(m_global_info.host_input_mapping, this);
+	if (dialog.exec() == QDialog::Accepted) {
+		m_global_info.host_input_mapping = dialog.Mapping();
+		WriteSettings();
 	}
 }
 

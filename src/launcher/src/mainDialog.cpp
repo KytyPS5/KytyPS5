@@ -204,6 +204,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
+	if (info.fullscreen_enabled) {
+		args << "--fullscreen";
+	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
@@ -217,6 +220,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	args << "--profiler-direction" << EnumToText(info.profiler_direction);
 	args << "--spirv-debug-printf" << "false";
+	for (const auto& binding: info.host_input_mapping) {
+		args << "--keymap" << binding;
+	}
 	if (info.renderdoc_enabled) {
 		args << "--rd";
 	}
@@ -435,7 +441,10 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 
-	m_main_dialog->RunInterpreter(&m_process, m_running_item->GetInfo());
+	Configuration info;
+	info.CopyFrom(m_running_item->GetInfo());
+	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
+	m_main_dialog->RunInterpreter(&m_process, info);
 
 	Update();
 }

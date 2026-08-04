@@ -32,7 +32,9 @@
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
@@ -58,8 +60,6 @@
 
 namespace Libs::Graphics {
 
-constexpr int KEYBOARD_CONTROLLER_ID = -1000;
-
 struct EventKeyboard {
 	bool     down;
 	bool     up;
@@ -71,26 +71,6 @@ struct EventKeyboard {
 	uint16_t mod;
 	double   timestamp_seconds;
 };
-
-static uint32_t KeyboardKeyToPadButton(int key_code) {
-	switch (key_code) {
-		case SDLK_w: return Controller::PAD_BUTTON_UP;
-		case SDLK_a: return Controller::PAD_BUTTON_LEFT;
-		case SDLK_s: return Controller::PAD_BUTTON_DOWN;
-		case SDLK_d: return Controller::PAD_BUTTON_RIGHT;
-		case SDLK_j: return Controller::PAD_BUTTON_CROSS;
-		case SDLK_i: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDLK_k: return Controller::PAD_BUTTON_SQUARE;
-		case SDLK_l: return Controller::PAD_BUTTON_CIRCLE;
-		case SDLK_q: return Controller::PAD_BUTTON_L1;
-		case SDLK_e: return Controller::PAD_BUTTON_R1;
-		case SDLK_RETURN:
-		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
-		case SDLK_BACKSPACE:
-		case SDLK_TAB: return Controller::PAD_BUTTON_TOUCH_PAD;
-		default: return 0;
-	}
-}
 
 static uint32_t ControllerButtonToPadButton(int button) {
 	switch (button) {
@@ -260,16 +240,11 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 		}
 	}
 
-	const auto button = KeyboardKeyToPadButton(key.key_code);
-	if (button != 0 && (key.down || key.up) && !key.repeat) {
-		static bool keyboard_connected = false;
-		if (!keyboard_connected) {
-			Controller::ControllerConnect(KEYBOARD_CONTROLLER_ID);
-			keyboard_connected = true;
-		}
-		Controller::ControllerButton(KEYBOARD_CONTROLLER_ID, button, key.down);
-	}
 #endif
+
+	if ((key.down || key.up) && !key.repeat) {
+		HostInputKey(key.key_code, key.down);
+	}
 }
 
 static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
@@ -291,6 +266,23 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		     mb.x, mb.y);
 	}
 #endif
+
+	if (mb.down || mb.up) {
+		uint8_t mouse_button = 0;
+		if (mb.left) {
+			mouse_button = SDL_BUTTON_LEFT;
+		} else if (mb.middle) {
+			mouse_button = SDL_BUTTON_MIDDLE;
+		} else if (mb.right) {
+			mouse_button = SDL_BUTTON_RIGHT;
+		} else if (mb.x1) {
+			mouse_button = SDL_BUTTON_X1;
+		} else if (mb.x2) {
+			mouse_button = SDL_BUTTON_X2;
+		}
+
+		HostInputMouseButton(mouse_button, mb.down);
+	}
 }
 
 static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
@@ -794,10 +786,14 @@ static void WindowCreate(WindowContext& context) {
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}
+	HostInputInit();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
 	uint32_t window_flags = KYTY_SDL_WINDOW_FLAGS;
+	if (Config::FullscreenEnabled()) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	}
 #if defined(__APPLE__)
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
@@ -937,6 +933,22 @@ void WindowContext::UpdateTitle() {
 	static uint64_t fps_frames  = 0;
 	static double   current_fps = 0.0;
 
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	static constexpr auto build_type = "Debug";
+#elif KYTY_BUILD == KYTY_BUILD_RELEASE
+	static constexpr auto build_type = "Release";
+#else
+	static constexpr auto build_type = "Unknown";
+#endif
+
+#if defined(KYTY_OFFICIAL_BUILD)
+	static constexpr auto build_label = "Official build " KYTY_RELEASE_TAG;
+#elif defined(KYTY_FORK_BUILD)
+	static constexpr auto build_label = "Fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH;
+#else
+	static constexpr auto build_label = "Source build " KYTY_GIT_HASH;
+#endif
+
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
@@ -948,11 +960,11 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps =
-	    fmt::format("{}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", (has_title ? title : ""),
-	                (has_title ? ", " : ""), (has_title_id ? title_id : ""),
-	                (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""),
-	                (has_app_ver ? " " : ""), device_name, processor_name, frame_num, current_fps);
+	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", build_label,
+	                       build_type, (has_title ? title : ""), (has_title ? ", " : ""),
+	                       (has_title_id ? title_id : ""), (has_title_id ? ", " : ""),
+	                       (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""), device_name,
+	                       processor_name, frame_num, current_fps);
 
 #if defined(__APPLE__)
 	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.

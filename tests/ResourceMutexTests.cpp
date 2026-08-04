@@ -35,171 +35,50 @@ void YieldMany() {
 	}
 }
 
-void TestFaultBlocksPublisher() {
-	ResourceMutex    mutex;
-	std::atomic_bool publisher_started {false};
-	std::atomic_bool publisher_entered {false};
-	std::thread      publisher;
+void TestOwnership() {
+	ResourceMutex mutex;
+	Check(!mutex.IsOwnedByCurrentThread(), "fresh mutex reported an owner");
 	{
-		ResourceMutex::FaultScope fault(mutex);
-		publisher = std::thread([&] {
-			publisher_started.store(true, std::memory_order_release);
-			std::lock_guard lock(mutex);
-			publisher_entered.store(true, std::memory_order_release);
-		});
-		while (!publisher_started.load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-		}
-		YieldMany();
-		Check(!publisher_entered.load(std::memory_order_acquire),
-		      "publisher entered during active fault transaction");
+		std::lock_guard lock(mutex);
+		Check(mutex.IsOwnedByCurrentThread(), "owner tracking was not installed");
 	}
-	publisher.join();
-	Check(publisher_entered.load(std::memory_order_acquire),
-	      "publisher did not resume after fault transaction");
+	Check(!mutex.IsOwnedByCurrentThread(), "owner tracking survived unlock");
 }
 
-void TestFaultDrainsExistingOwner() {
+void TestSerializesTransactions() {
 	ResourceMutex    mutex;
 	std::unique_lock owner(mutex);
-	std::atomic_bool fault_started {false};
-	std::atomic_bool fault_entered {false};
-	std::atomic_bool release_fault {false};
-	std::atomic_bool publisher_started {false};
-	std::atomic_bool publisher_entered {false};
-	std::thread      fault([&] {
-		fault_started.store(true, std::memory_order_release);
-		ResourceMutex::FaultScope scope(mutex);
-		fault_entered.store(true, std::memory_order_release);
-		while (!release_fault.load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-		}
-	});
-	while (!fault_started.load(std::memory_order_acquire)) {
-		std::this_thread::yield();
-	}
-	YieldMany();
-	Check(!fault_entered.load(std::memory_order_acquire),
-	      "fault transaction did not wait for existing owner");
-	owner.unlock();
-	while (!fault_entered.load(std::memory_order_acquire)) {
-		std::this_thread::yield();
-	}
-	std::thread publisher([&] {
-		publisher_started.store(true, std::memory_order_release);
+	std::atomic_bool contender_started {false};
+	std::atomic_bool contender_entered {false};
+	std::thread      contender([&] {
+		contender_started.store(true, std::memory_order_release);
 		std::lock_guard lock(mutex);
-		publisher_entered.store(true, std::memory_order_release);
+		contender_entered.store(true, std::memory_order_release);
 	});
-	while (!publisher_started.load(std::memory_order_acquire)) {
+	while (!contender_started.load(std::memory_order_acquire)) {
 		std::this_thread::yield();
 	}
 	YieldMany();
-	Check(!publisher_entered.load(std::memory_order_acquire),
-	      "publisher entered before drained fault completed");
-	release_fault.store(true, std::memory_order_release);
-	fault.join();
-	publisher.join();
-	Check(publisher_entered.load(std::memory_order_acquire),
-	      "publisher did not resume after drained fault");
-}
-
-void TestFaultScopesSerialize() {
-	ResourceMutex    mutex;
-	std::atomic_bool first_entered {false};
-	std::atomic_bool second_started {false};
-	std::atomic_bool second_entered {false};
-	std::atomic_bool release_first {false};
-	std::atomic_bool release_second {false};
-	std::atomic_bool publisher_entered {false};
-	std::thread      first([&] {
-		ResourceMutex::FaultScope scope(mutex);
-		first_entered.store(true, std::memory_order_release);
-		while (!release_first.load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-		}
-	});
-	while (!first_entered.load(std::memory_order_acquire)) {
-		std::this_thread::yield();
-	}
-	std::thread second([&] {
-		second_started.store(true, std::memory_order_release);
-		ResourceMutex::FaultScope scope(mutex);
-		second_entered.store(true, std::memory_order_release);
-		while (!release_second.load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-		}
-	});
-	while (!second_started.load(std::memory_order_acquire)) {
-		std::this_thread::yield();
-	}
-	YieldMany();
-	Check(!second_entered.load(std::memory_order_acquire),
-	      "second fault transaction entered before first completed");
-	release_first.store(true, std::memory_order_release);
-	while (!second_entered.load(std::memory_order_acquire)) {
-		std::this_thread::yield();
-	}
-	std::thread publisher([&] {
-		std::lock_guard lock(mutex);
-		publisher_entered.store(true, std::memory_order_release);
-	});
-	YieldMany();
-	Check(!publisher_entered.load(std::memory_order_acquire),
-	      "publisher entered during second fault transaction");
-	release_second.store(true, std::memory_order_release);
-	first.join();
-	second.join();
-	publisher.join();
-	Check(publisher_entered.load(std::memory_order_acquire),
-	      "publisher did not resume after serialized faults");
-}
-
-void TestPreownedFaultKeepsResourceTransaction() {
-	ResourceMutex    mutex;
-	std::atomic_bool publisher_started {false};
-	std::atomic_bool publisher_entered {false};
-	std::thread      publisher;
-	std::unique_lock owner(mutex);
-	{
-		ResourceMutex::FaultScope fault(mutex);
-		publisher = std::thread([&] {
-			publisher_started.store(true, std::memory_order_release);
-			std::lock_guard lock(mutex);
-			publisher_entered.store(true, std::memory_order_release);
-		});
-		while (!publisher_started.load(std::memory_order_acquire)) {
-			std::this_thread::yield();
-		}
-		YieldMany();
-		Check(!publisher_entered.load(std::memory_order_acquire),
-		      "publisher entered during preowned fault transaction");
-	}
-	YieldMany();
-	Check(!publisher_entered.load(std::memory_order_acquire),
-	      "preowned fault released its outer resource transaction");
+	Check(!contender_entered.load(std::memory_order_acquire),
+	      "contender entered an active resource transaction");
 	owner.unlock();
-	publisher.join();
-	Check(publisher_entered.load(std::memory_order_acquire),
-	      "publisher did not resume after outer transaction");
+	contender.join();
+	Check(contender_entered.load(std::memory_order_acquire),
+	      "contender did not resume after resource transaction");
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-[[noreturn]] void RunDeathCase(const char* name) {
+[[noreturn]] void RunDeathCase() {
 	ResourceMutex mutex;
-	if (std::strcmp(name, "recursive-lock") == 0) {
-		std::lock_guard first(mutex);
-		std::lock_guard second(mutex);
-	} else if (std::strcmp(name, "nested-fault") == 0) {
-		ResourceMutex::FaultScope first(mutex);
-		ResourceMutex::FaultScope second(mutex);
-	}
+	std::lock_guard first(mutex);
+	std::lock_guard second(mutex);
 	std::_Exit(0x7f);
 }
 
-void CheckDeathCase(const char* name) {
+void CheckDeathCase() {
 	char path[MAX_PATH] {};
 	Check(GetModuleFileNameA(nullptr, path, MAX_PATH) != 0, "GetModuleFileName failed");
-	std::string       command = std::string("\"") + path + "\" --death " + name;
+	std::string       command = std::string("\"") + path + "\" --death";
 	std::vector<char> mutable_command(command.begin(), command.end());
 	mutable_command.push_back('\0');
 	STARTUPINFOA        startup {sizeof(startup)};
@@ -224,20 +103,17 @@ void CheckDeathCase(const char* name) {
 
 int main(int argc, char** argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
-		RunDeathCase(argv[2]);
+	if (argc == 2 && std::strcmp(argv[1], "--death") == 0) {
+		RunDeathCase();
 	}
 #else
 	(void)argc;
 	(void)argv;
 #endif
-	TestFaultBlocksPublisher();
-	TestFaultDrainsExistingOwner();
-	TestFaultScopesSerialize();
-	TestPreownedFaultKeepsResourceTransaction();
+	TestOwnership();
+	TestSerializesTransactions();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	CheckDeathCase("recursive-lock");
-	CheckDeathCase("nested-fault");
+	CheckDeathCase();
 #endif
 	std::puts("ResourceMutexTests: all cases passed");
 	return 0;

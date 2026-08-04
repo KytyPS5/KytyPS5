@@ -9,7 +9,6 @@
 
 namespace Libs::Graphics {
 
-class CommandProcessor;
 class GpuState;
 class RenderContext;
 
@@ -23,7 +22,6 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
-	void SendCommandSyncWithProcessor(Common::UniqueFunction<void, CommandProcessor&>&& command);
 
 	void Submit(uint32_t* draw_commands, uint32_t draw_size_dw, uint32_t* constant_commands,
 	            uint32_t constant_size_dw, bool trigger_agc_interrupt_on_done = false);
@@ -33,8 +31,7 @@ public:
 	void Done();
 	[[nodiscard]] int GetFrameNum() const;
 
-	[[nodiscard]] static bool              IsCommandProcessorThread() noexcept;
-	[[nodiscard]] static CommandProcessor* CurrentCommandProcessor() noexcept;
+	[[nodiscard]] static bool IsGpuThread() noexcept;
 
 private:
 	std::unique_ptr<GpuState> m_state;

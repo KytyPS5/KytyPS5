@@ -5,6 +5,8 @@
 #include "common/subsystems.h"
 
 #include <filesystem>
+#include <string>
+#include <vector>
 
 namespace Config {
 
@@ -18,12 +20,15 @@ enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
 
+using Keymap = std::vector<std::string>;
+
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
+	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -40,12 +45,14 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	Keymap                 keymap;
 };
 
 void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
+bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
@@ -69,6 +76,8 @@ bool SpirvDebugPrintfEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+
+const Keymap& GetKeymap();
 
 } // namespace Config
 

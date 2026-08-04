@@ -42,6 +42,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
@@ -58,6 +59,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
@@ -1372,12 +1374,14 @@ public:
 
 	void CheckGpuMappedRangeLifecycle() {
 		EnsureRuntimeContext();
-		CommandScheduler scheduler(Renderer(), m_runtime_context);
+		auto&            context = Renderer();
+		CommandScheduler scheduler(context, m_runtime_context);
 		HW::Context      registers {};
 		HW::UserConfig   user_config {};
 		HW::Shader       shaders {};
 		scheduler.Begin(registers, user_config, shaders);
-		Gpu                gpu(Renderer());
+		context.InitializeGpu(nullptr);
+		auto&              gpu = context.GetGpu();
 		GpuResourceManager resources(m_runtime_context, scheduler);
 		resources.SetGpu(&gpu);
 
@@ -1416,6 +1420,7 @@ public:
 
 		resources.SetGpu(nullptr);
 		scheduler.Finish();
+		context.ShutdownGpu();
 		std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
 	}
 
@@ -1567,20 +1572,72 @@ public:
 			gpu_thread = std::this_thread::get_id();
 			Require("GpuCommandLane", "FIFO", order == 1,
 			        "synchronous command overtook an older host command");
-			Require("GpuCommandLane", "generic context",
-			        !Gpu::IsCommandProcessorThread() && Gpu::CurrentCommandProcessor() == nullptr,
-			        "generic host command manufactured a PM4 processor context");
+			Require("GpuCommandLane", "GPU context", Gpu::IsGpuThread(),
+			        "host command did not run on the GPU thread");
 			gpu.SendCommandSync([&nested_thread] { nested_thread = std::this_thread::get_id(); });
 			order = 2;
-		});
-		gpu.SendCommandSyncWithProcessor([&](CommandProcessor& processor) {
-			Require("GpuCommandLane", "processor context",
-			        Gpu::IsCommandProcessorThread() && Gpu::CurrentCommandProcessor() == &processor,
-			        "resource command did not receive its explicit processor context");
 		});
 		Require("GpuCommandLane", "dispatch thread",
 		        order == 2 && gpu_thread != caller_thread && nested_thread == gpu_thread,
 		        "host command did not run on the GPU thread or nested sync deadlocked");
+
+		alignas(uint32_t) uint32_t packet_marker_a = 0;
+		alignas(uint32_t) uint32_t packet_marker_b = 0;
+		const auto write_packet = [](uint32_t* packet, uint32_t* destination, uint32_t value) {
+			const auto destination_address = reinterpret_cast<uint64_t>(destination);
+			packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+			packet[1] = 0;
+			packet[2] = static_cast<uint32_t>(destination_address);
+			packet[3] = static_cast<uint32_t>(destination_address >> 32u);
+			packet[4] = value;
+		};
+		std::array<uint32_t, 1024> polling_loop {};
+		for (size_t i = 0; i < polling_loop.size() - 4; i += 2) {
+			polling_loop[i]     = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
+			polling_loop[i + 1] = 0;
+		}
+		const auto loop_address = reinterpret_cast<uint64_t>(polling_loop.data());
+		polling_loop[1020] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+		polling_loop[1021] = static_cast<uint32_t>(loop_address);
+		polling_loop[1022] = static_cast<uint32_t>(loop_address >> 32u);
+		polling_loop[1023] = 0x0f200000u | static_cast<uint32_t>(polling_loop.size());
+
+		std::array<uint32_t, 14> polling_commands {};
+		write_packet(polling_commands.data(), &packet_marker_a, 11);
+		polling_commands[5] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+		polling_commands[6] = static_cast<uint32_t>(loop_address);
+		polling_commands[7] = static_cast<uint32_t>(loop_address >> 32u);
+		polling_commands[8] = 0x0f200000u | static_cast<uint32_t>(polling_loop.size());
+		write_packet(polling_commands.data() + 9, &packet_marker_b, 22);
+		std::binary_semaphore stream_gate_entered {0};
+		std::binary_semaphore stream_gate_release {0};
+		gpu.SendCommand([&] {
+			stream_gate_entered.release();
+			stream_gate_release.acquire();
+		});
+		gpu.Submit(polling_commands.data(), polling_commands.size(), nullptr, 0);
+		stream_gate_entered.acquire();
+		stream_gate_release.release();
+		uint32_t packet_marker_a_at_callback = UINT32_MAX;
+		uint32_t packet_marker_b_at_callback = UINT32_MAX;
+		for (uint32_t attempt = 0; attempt < 8 && packet_marker_a_at_callback != 11; attempt++) {
+			gpu.SendCommandSync([&] {
+				if (packet_marker_a == 11 && packet_marker_b == 0) {
+					packet_marker_a_at_callback = packet_marker_a;
+					packet_marker_b_at_callback = packet_marker_b;
+					polling_loop[1020] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
+					polling_loop[1021] = 0;
+					polling_loop[1022] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
+					polling_loop[1023] = 0;
+				}
+			});
+			std::this_thread::yield();
+		}
+		gpu.Done();
+		Require("GpuCommandLane", "packet-boundary command polling",
+		        packet_marker_a_at_callback == 11 && packet_marker_b_at_callback == 0 &&
+		            packet_marker_a == 11 && packet_marker_b == 22,
+		        "host command waited for an entire non-suspended PM4 stream");
 
 		uint32_t   label   = 0;
 		uint32_t   prefix  = 0;
@@ -1760,7 +1817,7 @@ public:
 		gpu.Submit(dma_commands.data(), static_cast<uint32_t>(dma_commands.size()), nullptr, 0);
 		gpu.Done();
 		constexpr uint32_t clean_fill_value = 0xdecafbad;
-		gpu.SendCommandSyncWithProcessor([&](CommandProcessor&) {
+		gpu.SendCommandSync([&] {
 			auto& buffer_cache = resources.GetBufferCache();
 			Require("GpuCommandLane", "clean cached setup",
 			        buffer_cache.HasPageOverlap(clean_cached_fill, sizeof(source_words)) &&
@@ -1840,14 +1897,116 @@ public:
 		                                                       clean_copy_words[1]},
 		        "host-memory fill/copy did not update the clean cached mirror");
 
-		gpu.SendCommandSyncWithProcessor([&](CommandProcessor& processor) {
-			Require("GpuCommandLane", "processor fault context",
-			        Gpu::CurrentCommandProcessor() == &processor,
-			        "processor resource test lost its command context");
-			Require("GpuCommandLane", "processor memory invalidation",
+		gpu.SendCommandSync([&] {
+			Require("GpuCommandLane", "GPU memory invalidation",
 			        resources.InvalidateMemory(fault_base, sizeof(uint32_t)),
-			        "processor memory invalidation did not find its mapped range");
+			        "GPU memory invalidation did not find its mapped range");
 		});
+
+		auto& buffer_cache = resources.GetBufferCache();
+		Require("GpuCommandLane", "clean tracked fault setup",
+		        buffer_cache.HasPageOverlap(immediate_dst, sizeof(uint32_t)) &&
+		            !buffer_cache.HasGpuDirtyBytes(immediate_dst, sizeof(uint32_t)),
+		        "clean write-fault test address is not backed by a clean cached Buffer");
+		constexpr uint64_t dirty_fault_address = fault_base + 0xd000;
+		constexpr uint32_t dirty_fault_value   = 0x5a17c0deu;
+		constexpr uint32_t dirty_fault_stale   = 0x0ddba11u;
+		std::memcpy(reinterpret_cast<void*>(dirty_fault_address), &dirty_fault_stale,
+		            sizeof(dirty_fault_stale));
+		gpu.SendCommandSync([&] {
+			auto dirty = buffer_cache.ObtainBuffer(scheduler.Current(), dirty_fault_address,
+			                                       sizeof(dirty_fault_value), true, false);
+			Require("GpuCommandLane", "dirty tracked fault setup", dirty.owner != nullptr,
+			        "dirty write-fault test could not create a cached Buffer");
+			scheduler.Current().RetainResourceUntilFence(dirty.owner);
+			buffer_cache.FillBuffer(dirty_fault_address, sizeof(dirty_fault_value),
+			                        dirty_fault_value);
+		});
+		Require("GpuCommandLane", "dirty tracked fault ownership",
+		        buffer_cache.HasGpuDirtyBytes(dirty_fault_address, sizeof(dirty_fault_value)),
+		        "dirty write-fault test address did not acquire GPU ownership");
+
+		std::binary_semaphore block_entered {0};
+		std::binary_semaphore block_release {0};
+		std::binary_semaphore clean_fault_complete {0};
+		bool                  clean_fault_handled = false;
+		gpu.SendCommand([&] {
+			block_entered.release();
+			block_release.acquire();
+		});
+		block_entered.acquire();
+		std::jthread clean_fault_thread([&] {
+			clean_fault_handled = resources.HandleFault(PageFaultAccess::Write, immediate_dst);
+			clean_fault_complete.release();
+		});
+		const bool clean_fault_was_direct =
+		    clean_fault_complete.try_acquire_for(std::chrono::seconds(1));
+		if (!clean_fault_was_direct) {
+			block_release.release();
+			clean_fault_complete.acquire();
+		}
+		clean_fault_thread.join();
+		Require("GpuCommandLane", "clean fault direct path",
+		        clean_fault_was_direct && clean_fault_handled,
+		        "a clean CPU write fault waited for the blocked GPU command lane");
+
+		std::binary_semaphore dirty_fault_complete {0};
+		bool                  dirty_fault_handled = false;
+		std::jthread dirty_fault_thread([&] {
+			dirty_fault_handled =
+			    resources.HandleFault(PageFaultAccess::Write, dirty_fault_address);
+			dirty_fault_complete.release();
+		});
+		const bool dirty_fault_bypassed_lane =
+		    dirty_fault_complete.try_acquire_for(std::chrono::milliseconds(200));
+		block_release.release();
+		if (!dirty_fault_bypassed_lane) {
+			dirty_fault_complete.acquire();
+		}
+		dirty_fault_thread.join();
+		uint32_t dirty_fault_backing = 0;
+		std::memcpy(&dirty_fault_backing, reinterpret_cast<const void*>(dirty_fault_address),
+		            sizeof(dirty_fault_backing));
+		Require("GpuCommandLane", "dirty fault synchronization",
+		        !dirty_fault_bypassed_lane && dirty_fault_handled &&
+		            dirty_fault_backing == dirty_fault_value &&
+		            !buffer_cache.HasGpuDirtyBytes(dirty_fault_address, sizeof(dirty_fault_value)),
+		        "a GPU-dirty write fault bypassed synchronization or lost the published bytes");
+
+		constexpr uint64_t empty_copy_fault_address = fault_base + 0xe000;
+		constexpr uint32_t empty_copy_fault_value   = 0x6b28d1efu;
+		gpu.SendCommandSync([&] {
+			auto dirty = buffer_cache.ObtainBuffer(scheduler.Current(), empty_copy_fault_address,
+			                                       sizeof(empty_copy_fault_value), true, false);
+			Require("GpuCommandLane", "empty-copy write setup", dirty.owner != nullptr,
+			        "empty-copy write test could not create a cached Buffer");
+			scheduler.Current().RetainResourceUntilFence(dirty.owner);
+			buffer_cache.FillBuffer(empty_copy_fault_address, sizeof(empty_copy_fault_value),
+			                        empty_copy_fault_value);
+			buffer_cache.ReadMemory(empty_copy_fault_address, sizeof(empty_copy_fault_value));
+			const bool gpu_owned = buffer_cache.IsRegionGpuModified(
+			    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+			const bool cpu_owned = buffer_cache.IsRegionCpuModified(
+			    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+			Require("GpuCommandLane", "empty-copy read ownership",
+			        !gpu_owned && !cpu_owned,
+			        "readback did not leave clean ownership for the queued write invalidation");
+			buffer_cache.ReadMemory(empty_copy_fault_address, sizeof(empty_copy_fault_value), true);
+		});
+		uint32_t empty_copy_fault_backing = 0;
+		std::memcpy(&empty_copy_fault_backing, reinterpret_cast<const void*>(empty_copy_fault_address),
+		            sizeof(empty_copy_fault_backing));
+		const bool empty_copy_cpu_owned = buffer_cache.IsRegionCpuModified(
+		    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+		const bool empty_copy_gpu_owned = buffer_cache.IsRegionGpuModified(
+		    empty_copy_fault_address, sizeof(empty_copy_fault_value));
+		const bool empty_copy_dirty =
+		    buffer_cache.HasGpuDirtyBytes(empty_copy_fault_address, sizeof(empty_copy_fault_value));
+		Require("GpuCommandLane", "empty-copy write ownership",
+		        empty_copy_fault_backing == empty_copy_fault_value &&
+		            empty_copy_cpu_owned && !empty_copy_gpu_owned && !empty_copy_dirty,
+		        "write invalidation without a remaining copy did not establish CPU ownership");
+
 		resources.UnmapMemory(fault_base, fault_size);
 		Require("GpuCommandLane", "processor fault unmap",
 		        Libs::LibKernel::Memory::KernelMunmap(fault_base, fault_size) == 0,
@@ -2073,12 +2232,14 @@ public:
 		constexpr uint32_t    ring_fault_second_value       = 0x4e5f6071u;
 
 		EnsureRuntimeContext();
-		CommandScheduler scheduler(Renderer(), m_runtime_context);
+		auto&            context = Renderer();
+		CommandScheduler scheduler(context, m_runtime_context);
 		HW::Context      registers {};
 		HW::UserConfig   user_config {};
 		HW::Shader       shaders {};
 		scheduler.Begin(registers, user_config, shaders);
-		Gpu gpu(Renderer());
+		context.InitializeGpu(nullptr);
+		auto& gpu = context.GetGpu();
 
 		int64_t direct_offset = -1;
 		Require(name, "direct allocation",
@@ -2471,7 +2632,7 @@ public:
 			resources.UnmapMemory(base, allocation_size);
 			scheduler.Finish();
 		}
-		gpu.Shutdown();
+		context.ShutdownGpu();
 		Require(name, "unmap direct backing",
 		        Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
 		        "dirty-GC direct-memory mapping release failed");
@@ -2488,12 +2649,14 @@ public:
 		constexpr uint64_t    allocation_size      = 0x2800000;
 		constexpr uint64_t    allocation_alignment = 0x200000;
 		EnsureRuntimeContext();
-		CommandScheduler scheduler(Renderer(), m_runtime_context);
+		auto&            context = Renderer();
+		CommandScheduler scheduler(context, m_runtime_context);
 		HW::Context      registers {};
 		HW::UserConfig   user_config {};
 		HW::Shader       shaders {};
 		scheduler.Begin(registers, user_config, shaders);
-		Gpu     gpu(Renderer());
+		context.InitializeGpu(nullptr);
+		auto&   gpu = context.GetGpu();
 		int64_t direct_offset = -1;
 		Require(name, "direct allocation",
 		        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -4949,7 +5112,7 @@ public:
 			resources.UnmapMemory(base, allocation_size);
 			scheduler.Finish();
 		}
-		gpu.Shutdown();
+		context.ShutdownGpu();
 		Require(name, "unmap direct backing",
 		        Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
 		        "cache direct-memory mapping release failed");
@@ -17491,6 +17654,136 @@ void CheckPm4StencilInfoValueLane(RenderContext& renderer) {
 	std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
 }
 
+void CheckPm4ContextStateOperations(RenderContext& renderer) {
+	GraphicsInitJmpTables();
+	CommandProcessor processor(renderer);
+	struct AgcCommandBufferLayout {
+		using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer*, uint32_t, void*);
+
+		uint32_t* bottom;
+		uint32_t* top;
+		uint32_t* cursor_up;
+		uint32_t* cursor_down;
+		Callback  callback;
+		void*     user_data;
+		uint32_t  reserved_dw;
+	};
+	static_assert(offsetof(AgcCommandBufferLayout, cursor_up) == 0x10);
+	static_assert(offsetof(AgcCommandBufferLayout, reserved_dw) == 0x30);
+
+	HW::RenderControl original_control {};
+	original_control.depth_clear_enable   = true;
+	original_control.stencil_clear_enable = true;
+	processor.GetCtx().SetRenderControl(original_control);
+	processor.GetCtx().SetRenderTargetMask(0x1234abcd);
+	processor.GetUcfg().SetPrimitiveType(0x35);
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_PS](processor, Pm4::SPI_SHADER_PGM_LO_PS,
+	                                                 0x00123456);
+	const auto shader_address = processor.GetShCtx().GetPs().ps_regs.data_addr;
+	const auto invoke = [&](ContextStateOperation operation) {
+		std::array<uint32_t, 32> packet {};
+		std::array<uint32_t, 6>  segment_sizes {};
+		AgcCommandBufferLayout   dcb {packet.data(), packet.data() + packet.size(), packet.data(),
+		                              packet.data() + packet.size(), nullptr, nullptr, 0};
+		const auto operation_value = static_cast<uint32_t>(operation);
+		size_t     segment_count  = 0;
+		switch (operation) {
+			case ContextStateOperation::Clear: segment_sizes = {5}; segment_count = 1; break;
+			case ContextStateOperation::Push:
+				segment_sizes = {5, 8, 9, 3, 2};
+				segment_count = 5;
+				break;
+			case ContextStateOperation::Pop:
+				segment_sizes = {3, 5, 8, 9, 2};
+				segment_count = 5;
+				break;
+			case ContextStateOperation::PushClear:
+				segment_sizes = {5, 8, 9, 3, 2, 5};
+				segment_count = 6;
+				break;
+		}
+		const auto size_dw =
+		    static_cast<size_t>(Gen5::GraphicsDcbContextStateOpGetSize(operation_value) / 4);
+		auto* emitted = Gen5::GraphicsDcbContextStateOp(
+		    reinterpret_cast<Gen5::CommandBuffer*>(&dcb), operation_value);
+		bool   packet_matches = true;
+		size_t segment_offset = 0;
+		for (size_t i = 0; i < segment_count; i++) {
+			const auto segment_size = segment_sizes[i];
+			const auto selector = (i == 0 ? Pm4::R_CONTEXT_STATE : Pm4::R_ZERO);
+			packet_matches &=
+			    packet[segment_offset] == KYTY_PM4(segment_size, Pm4::IT_NOP, selector);
+			for (size_t j = 1; j < segment_size; j++) {
+				packet_matches &= packet[segment_offset + j] ==
+				                  (i == 0 && j == 1 ? operation_value : 0u);
+			}
+			segment_offset += segment_size;
+		}
+		Require("Pm4ContextState", "HLE packet",
+		        emitted == packet.data() && dcb.cursor_up == packet.data() + size_dw &&
+		            segment_offset == size_dw && packet_matches,
+		        "context-state HLE packet does not match its real allocation size");
+		Pm4Execution execution;
+		return processor.Process(execution, packet.data(), size_dw);
+	};
+
+	Require("Pm4ContextState", "push-clear",
+	        invoke(ContextStateOperation::PushClear) == Pm4ProcessResult::Complete &&
+	            !processor.GetCtx().GetRenderControl().depth_clear_enable &&
+	            !processor.GetCtx().GetRenderControl().stencil_clear_enable &&
+	            processor.GetCtx().GetRenderTargetMask() == HW::Context {}.GetRenderTargetMask() &&
+	            processor.GetUcfg().GetPrimType() == 0x35 &&
+	            processor.GetShCtx().GetPs().ps_regs.data_addr == shader_address,
+	        "push-clear did not save and clear only Cx state");
+
+	processor.GetCtx().SetRenderTargetMask(0x55aa55aa);
+	Require("Pm4ContextState", "pop",
+	        invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderControl().depth_clear_enable &&
+	            processor.GetCtx().GetRenderControl().stencil_clear_enable &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+	        "pop did not restore the complete saved Cx state");
+
+	Require("Pm4ContextState", "push",
+	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+	        "push changed live Cx state");
+	processor.GetCtx().SetRenderTargetMask(0x01020304);
+	Require("Pm4ContextState", "push-pop restore",
+	        invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+	        "ordinary push/pop did not restore Cx state");
+
+	Require("Pm4ContextState", "clear",
+	        invoke(ContextStateOperation::Clear) == Pm4ProcessResult::Complete &&
+	            !processor.GetCtx().GetRenderControl().depth_clear_enable &&
+	            processor.GetCtx().GetRenderTargetMask() == HW::Context {}.GetRenderTargetMask() &&
+	            processor.GetUcfg().GetPrimType() == 0x35 &&
+	            processor.GetShCtx().GetPs().ps_regs.data_addr == shader_address,
+	        "clear reset state outside the Cx register domain");
+
+	processor.GetCtx().SetRenderTargetMask(0xabcdef01);
+	Require("Pm4ContextState", "push before processor reset",
+	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete,
+	        "push before reset failed");
+	processor.Reset();
+	processor.GetCtx().SetRenderTargetMask(0x76543210);
+	Require("Pm4ContextState", "processor reset discards push",
+	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete &&
+	            invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+	            processor.GetCtx().GetRenderTargetMask() == 0x76543210,
+	        "processor reset retained an invalid saved Cx state");
+
+	Require("Pm4ContextState", "HLE packet size",
+	        Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
+	            Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
+	        "context-state HLE sizes do not match libSceAgc");
+	std::printf("[host]    %-32s ok\n", "Pm4ContextState");
+}
+
 void CheckPm4WaitResume(RenderContext& renderer) {
 	GraphicsInitJmpTables();
 	CommandProcessor processor(renderer);
@@ -17627,6 +17920,11 @@ int main(int argc, char** argv) {
 		vulkan.CheckGpuCommandLane();
 		return 0;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
+		VulkanHarness vulkan;
+		CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+		return 0;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
 		CheckDepthAttachmentWrites();
 		CheckDynamicRenderingState();
@@ -17761,6 +18059,7 @@ int main(int argc, char** argv) {
 	CheckVulkan13FeatureRequirements();
 	CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
 	CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+	CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
 	CheckPm4WaitResume(vulkan.RuntimeRenderer());
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());
 	CheckEmbeddedFetchVertexOffset();

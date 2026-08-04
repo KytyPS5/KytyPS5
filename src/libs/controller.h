@@ -9,6 +9,8 @@ namespace Libs::Controller {
 
 KYTY_SUBSYSTEM_DEFINE(Controller);
 
+constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
+
 constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
 constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
 constexpr uint32_t PAD_BUTTON_OPTIONS   = 0x00000008;

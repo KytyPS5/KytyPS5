@@ -33,6 +33,10 @@ uint32_t GetScreenHeight() {
 	return g_config->screen_height;
 }
 
+bool FullscreenEnabled() {
+	return g_config->fullscreen_enabled;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
@@ -95,6 +99,10 @@ bool RenderDocEnabled() {
 
 bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
+}
+
+const Keymap& GetKeymap() {
+	return g_config->keymap;
 }
 
 } // namespace Config

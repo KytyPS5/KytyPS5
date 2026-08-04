@@ -3,15 +3,18 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -288,10 +291,29 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size); });
+	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	if (Gpu::IsGpuThread()) {
+		ReadMemoryOnGpu(vaddr, size, is_write);
+		return;
+	}
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	if (m_resource_mutex.IsOwnedByCurrentThread()) {
+		EXIT("unsupported buffer readback from a pre-owned resource transaction, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	m_scheduler.Context().GetGpu().SendCommandSync(
+	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
+}
+
+void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
 	std::vector<DownloadCopy> copies;
 	{
 		FaultSafeCacheLock lock(this, m_mutex);
@@ -322,9 +344,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size) {
 				    }
 			    }
 		    });
-	}
-	if (copies.empty()) {
-		return;
+		if (copies.empty()) {
+			if (!is_write) {
+				return;
+			}
+			// A preceding read fault can consume the last GPU-owned copy after this write
+			// invalidation has already chosen to flush. Complete the CPU ownership handoff even
+			// though this callback no longer has bytes to download.
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			return;
+		}
 	}
 	auto downloads = RecordDownloads(copies);
 	m_scheduler.FinishCurrent();
@@ -336,6 +365,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size) {
 		}
 		// The enumeration above covered whole dirty pages and every exact interval on them.
 		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
 	}
 }
 

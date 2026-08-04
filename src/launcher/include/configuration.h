@@ -85,9 +85,10 @@ public:
 	QString    game_comment;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
+	bool                   fullscreen_enabled          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
-	bool                   vulkan_validation_enabled   = true;
+	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
@@ -98,11 +99,13 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   renderdoc_enabled           = false;
+	QStringList            host_input_mapping;
 
 	QString elf = QStringLiteral("eboot.bin");
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
+		fullscreen_enabled          = other.fullscreen_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -116,6 +119,7 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_direction          = other.profiler_direction;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		host_input_mapping          = other.host_input_mapping;
 	}
 
 	void CopyFrom(const Configuration& other) {
@@ -138,6 +142,7 @@ public:
 		KYTY_CFG_SET(game_path);
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
+		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -151,6 +156,7 @@ public:
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_direction);
 		KYTY_CFG_SET(renderdoc_enabled);
+		s->setValue("host_input_mapping", host_input_mapping);
 		KYTY_CFG_SET(elf);
 	}
 
@@ -160,6 +166,7 @@ public:
 		KYTY_CFG_GET(game_path);
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
+		KYTY_CFG_GET(fullscreen_enabled);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -176,7 +183,8 @@ public:
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_direction);
 		KYTY_CFG_GET(renderdoc_enabled);
-		elf = s->value("elf", elf).toString();
+		host_input_mapping = s->value("host_input_mapping", host_input_mapping).toStringList();
+		elf                = s->value("elf", elf).toString();
 	}
 };
 

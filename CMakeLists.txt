@@ -4,6 +4,12 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
 endif()
 
+get_property(KYTY_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT KYTY_GENERATOR_IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build" FORCE)
+	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 project(Kyty)
 
 set(KYTY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -28,6 +34,29 @@ include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
 option(KYTY_ENABLE_HLE_TRACE "Instrument HLE calls with a guest-stall watchdog (diagnostic)" OFF)
+
+set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
+set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
+if(NOT KYTY_BUILD_ORIGIN STREQUAL "Source" AND NOT KYTY_BUILD_ORIGIN STREQUAL "Official" AND
+   NOT KYTY_BUILD_ORIGIN STREQUAL "Fork")
+	message(FATAL_ERROR "KYTY_BUILD_ORIGIN must be Source, Official, or Fork")
+endif()
+
+set(KYTY_RELEASE_TAG "" CACHE STRING "Release tag embedded in official builds")
+set(KYTY_BUILD_REPOSITORY "" CACHE STRING "GitHub repository embedded in fork builds")
+set(KYTY_OFFICIAL_BUILD OFF)
+set(KYTY_FORK_BUILD OFF)
+if(KYTY_BUILD_ORIGIN STREQUAL "Official")
+	if(KYTY_RELEASE_TAG STREQUAL "")
+		message(FATAL_ERROR "Official builds require KYTY_RELEASE_TAG")
+	endif()
+	set(KYTY_OFFICIAL_BUILD ON)
+elseif(KYTY_BUILD_ORIGIN STREQUAL "Fork")
+	if(KYTY_BUILD_REPOSITORY STREQUAL "")
+		message(FATAL_ERROR "Fork builds require KYTY_BUILD_REPOSITORY")
+	endif()
+	set(KYTY_FORK_BUILD ON)
+endif()
 
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
@@ -118,15 +147,19 @@ configure_file(
 
 find_package(Git)
 
-add_custom_target( KytyGitVersion
-    COMMAND ${CMAKE_COMMAND}
-	-D INPUT_FILE=${KYTY_SOURCE_DIR}/kytyGitVersion.h.in
-	-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyGitVersion.h
-	-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
-	-D GIT_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
-	-P ${KYTY_SOURCE_DIR}/generate_version.cmake
+add_custom_target(KytyGitVersion
+	COMMAND ${CMAKE_COMMAND}
+		-D INPUT_FILE=${KYTY_SOURCE_DIR}/kytyGitVersion.h.in
+		-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyGitVersion.h
+		-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
+		-D GIT_WORKING_DIRECTORY=${CMAKE_CURRENT_SOURCE_DIR}
+		-P ${KYTY_SOURCE_DIR}/generate_version.cmake
+	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyGitVersion.h
 	COMMENT "Generate kytyGitVersion.h"
 )
+
+add_library(kyty_git_version INTERFACE)
+add_dependencies(kyty_git_version KytyGitVersion)
 
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
@@ -260,7 +293,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version)
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)
@@ -424,6 +457,13 @@ add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
 target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
+add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+)
+target_link_libraries(sync_on_address_tests common)
+target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -478,6 +518,7 @@ if(BUILD_TESTING)
 	add_test(NAME resource_mutex COMMAND $<TARGET_FILE:resource_mutex_tests>)
 	add_test(NAME signal_safety COMMAND $<TARGET_FILE:signal_safety_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
+	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME virtual_memory_allocation
@@ -488,6 +529,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME pm4_context_state
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 
@@ -524,6 +567,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		resource_mutex_tests
 		event_queue_lifetime_tests
+		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 	)
@@ -570,8 +614,6 @@ if(KYTY_CLANG_CL)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
-
-add_dependencies(kyty_emulator KytyGitVersion)
 
 if(APPLE)
 	# The emulator writes x86-64 trampolines/PLT stubs into memory and executes them, and

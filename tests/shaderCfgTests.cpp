@@ -2426,6 +2426,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	    0x0d860688u, // v_add_nc_u32 v6, 8, sign-extended v6.hi
 	    0x4c1616f9u,
 	    0x0686128du, // v_sub_nc_u32 v11.byte2, 13, v11; preserve other destination bytes
+	    0x261418f9u,
+	    0x0686149fu, // v_min_u32 v10.word0, 31, v12; preserve upper destination word
 	    0xbf810000u,
 	};
 
@@ -2476,6 +2478,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	      "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended high word");
 	Check(Common::ContainsStr(result.decoded_dump, "v_sub_nc_u32 v11.sdwa(sel=2"),
 	      "new decoder did not decode V_SUB_NC_U32 SDWA byte-2 destination");
+	Check(Common::ContainsStr(result.decoded_dump, "v_min_u32 v10.sdwa(sel=4"),
+	      "new decoder did not decode V_MIN_U32 SDWA low-word destination");
 	Check(!Common::ContainsStr(result.decoded_dump, "unsupported family=VOP2 opcode=0x00"),
 	      "literal/SDWA extension words were decoded as phantom VOP2 instructions");
 	Check(!Common::ContainsStr(result.decoded_dump,
@@ -2511,6 +2515,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	      "V_ADD_NC_U32 SDWA sign-extended high word did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "ISubU32 v11.sdwa(sel=2"),
 	      "V_SUB_NC_U32 SDWA byte-2 destination did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "UMinU32 v10.sdwa(sel=4"),
+	      "V_MIN_U32 SDWA low-word destination did not lower to IR");
 	Check(SpirvContainsOpcode(result.spirv, 128),
 	      "SPIR-V binary does not contain OpIAdd for U16 operations");
 	Check(SpirvContainsOpcode(result.spirv, 202),

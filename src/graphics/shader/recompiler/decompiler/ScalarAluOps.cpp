@@ -58,7 +58,8 @@ constexpr OpcodeMap SOPC_OPS[] = {
     {0x03u, Opcode::SCmpGeI32},   {0x04u, Opcode::SCmpLtI32},   {0x05u, Opcode::SCmpLeI32},
     {0x06u, Opcode::SCmpEqU32},   {0x07u, Opcode::SCmpLgU32},   {0x08u, Opcode::SCmpGtU32},
     {0x09u, Opcode::SCmpGeU32},   {0x0au, Opcode::SCmpLtU32},   {0x0bu, Opcode::SCmpLeU32},
-    {0x0cu, Opcode::SBitcmp0B32}, {0x0du, Opcode::SBitcmp1B32}, {0x13u, Opcode::SCmpLgU64},
+    {0x0cu, Opcode::SBitcmp0B32}, {0x0du, Opcode::SBitcmp1B32}, {0x12u, Opcode::SCmpEqU64},
+    {0x13u, Opcode::SCmpLgU64},
 };
 
 constexpr OpcodeMap SOPK_OPS[] = {

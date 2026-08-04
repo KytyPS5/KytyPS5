@@ -82,6 +82,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::SCmpGeU32, Opcode::CompareGeU32},
     {Decoder::Opcode::SCmpLtU32, Opcode::CompareLtU32},
     {Decoder::Opcode::SCmpLeU32, Opcode::CompareLeU32},
+    {Decoder::Opcode::SCmpEqU64, Opcode::CompareEqU64},
     {Decoder::Opcode::SCmpLgU64, Opcode::CompareNeU64},
     {Decoder::Opcode::VReadfirstlaneB32, Opcode::ReadFirstLaneU32},
     {Decoder::Opcode::VReadlaneB32, Opcode::ReadLaneU32},

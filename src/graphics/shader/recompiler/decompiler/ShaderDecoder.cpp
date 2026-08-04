@@ -511,6 +511,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SCmpGeU32: return "s_cmp_ge_u32";
 		case Opcode::SCmpLtU32: return "s_cmp_lt_u32";
 		case Opcode::SCmpLeU32: return "s_cmp_le_u32";
+		case Opcode::SCmpEqU64: return "s_cmp_eq_u64";
 		case Opcode::SCmpLgU64: return "s_cmp_lg_u64";
 		case Opcode::VNop: return "v_nop";
 		case Opcode::VMovB32: return "v_mov_b32";
@@ -1186,6 +1187,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::SCmpLeI32:
 		case Opcode::SBitcmp0B32:
 		case Opcode::SBitcmp1B32:
+		case Opcode::SCmpEqU64:
 		case Opcode::SCmpLgU64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
 			                                               OpcodeToString(inst.opcode).c_str(),

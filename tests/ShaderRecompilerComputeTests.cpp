@@ -9580,6 +9580,8 @@ TestCase ScalarCompareOps() {
 	code.push_back(EncodeSMovB32(11, InlineU32(0)));
 	code.push_back(EncodeSMovB32(12, InlineU32(2)));
 	code.push_back(EncodeSMovB32(13, InlineU32(0)));
+	code.push_back(EncodeSMovB32(14, InlineU32(1)));
+	code.push_back(EncodeSMovB32(15, InlineU32(1)));
 
 	u32  dst            = 20;
 	auto append_compare = [&](u32 opcode, u32 src0, u32 src1) {
@@ -9597,9 +9599,13 @@ TestCase ScalarCompareOps() {
 	append_compare(0x08, 4, 3);
 	append_compare(0x09, 4, 4);
 	append_compare(0x0b, 3, 4);
+	append_compare(0x12, 10, 10);
+	append_compare(0x12, 10, 12);
+	append_compare(0x12, 10, 14);
 	append_compare(0x13, 10, 12);
+	append_compare(0x13, 10, 14);
 
-	for (u32 i = 0; i < 11u; i++) {
+	for (u32 i = 0; i < 15u; i++) {
 		AppendStoreSgpr(&code, 20u + i, i);
 	}
 	AppendEnd(&code);
@@ -9607,10 +9613,10 @@ TestCase ScalarCompareOps() {
 	return {"ScalarCompareOps",
 	        code,
 	        {},
-	        std::vector<u32>(11, 1),
+	        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1},
 	        {O::SMovB32, O::SCmpEqI32, O::SCmpLgI32, O::SCmpGtI32, O::SCmpGeI32, O::SCmpLtI32,
-	         O::SCmpLeI32, O::SCmpLgU32, O::SCmpGtU32, O::SCmpGeU32, O::SCmpLeU32, O::SCmpLgU64,
-	         O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+	         O::SCmpLeI32, O::SCmpLgU32, O::SCmpGtU32, O::SCmpGeU32, O::SCmpLeU32, O::SCmpEqU64,
+	         O::SCmpLgU64, O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
 TestCase ScalarShiftAddAndMaskOps() {

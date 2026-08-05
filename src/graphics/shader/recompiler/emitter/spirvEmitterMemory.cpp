@@ -640,8 +640,8 @@ void EmitMemoryStoreU32(EmitterState& state, const IR::Instruction& inst, IR::Re
 }
 
 template <typename Fn>
-void EmitAtomicUpdateU32(EmitterState& state, uint32_t pointer, IR::ResourceKind kind,
-                         Fn&& desired_value) {
+uint32_t EmitAtomicUpdateU32(EmitterState& state, uint32_t pointer, IR::ResourceKind kind,
+                             Fn&& desired_value) {
 	const auto scope          = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 	const auto memory         = kind == IR::ResourceKind::Lds ? MemorySemanticsWorkgroupMemory
 	                                                          : MemorySemanticsUniformMemory;
@@ -675,6 +675,7 @@ void EmitAtomicUpdateU32(EmitterState& state, uint32_t pointer, IR::ResourceKind
 	const auto semantics = MemorySemanticsAcquireRelease | memory;
 	state.builder.AddFunction(
 	    {OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, semantics)});
+	return observed;
 }
 
 void EmitMemoryStoreSubDwordU32(EmitterState& state, const IR::Instruction& inst,
@@ -1178,6 +1179,68 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 	    inst.memory.kind == IR::ResourceKind::Gds) {
 		EmitDeviceAtomicMemoryBarrier(state);
 	}
+	EmitStoreU32(state, inst.dst, old);
+}
+
+namespace {
+
+uint32_t EmitF32BitsOrderedLessThan(EmitterState& state, uint32_t lhs_bits, uint32_t rhs_bits) {
+	struct ClassifiedBits {
+		uint32_t nan  = 0;
+		uint32_t zero = 0;
+		uint32_t key  = 0;
+	};
+	const auto Classify = [&](uint32_t bits) {
+		ClassifiedBits cls;
+		const auto     abs_bits      = EmitAndConstant(state, bits, 0x7fffffffu);
+		const auto     exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
+		const auto     mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
+		const auto     exponent_max =
+		    EmitCompareU32Constant(state, OpIEqual, exponent_bits, 0x7f800000u);
+		const auto mantissa_nonzero = EmitCompareU32Constant(state, OpINotEqual, mantissa_bits, 0);
+		const auto negative = EmitCompareU32Constant(state, OpINotEqual,
+		                                             EmitAndConstant(state, bits, 0x80000000u), 0);
+		const auto negative_key = state.builder.AllocateId();
+		const auto positive_key = state.builder.AllocateId();
+		// Map all non-NaN IEEE-754 encodings to monotonically increasing unsigned keys.
+		state.builder.AddFunction({OpNot, state.uint_type, negative_key, bits});
+		state.builder.AddFunction(
+		    {OpBitwiseXor, state.uint_type, positive_key, bits, ConstantU32(state, 0x80000000u)});
+		cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
+		cls.zero = EmitCompareU32Constant(state, OpIEqual, abs_bits, 0);
+		cls.key  = EmitSelectValueU32(state, negative, negative_key, positive_key);
+		return cls;
+	};
+
+	const auto lhs     = Classify(lhs_bits);
+	const auto rhs     = Classify(rhs_bits);
+	const auto any_nan = EmitLogicalOrBool(state, lhs.nan, rhs.nan);
+	// The key transform orders -0 below +0, while the floating comparison treats them as equal.
+	const auto both_zero = EmitLogicalAndBool(state, lhs.zero, rhs.zero);
+	const auto ordered_nonzero =
+	    EmitLogicalNotBool(state, EmitLogicalOrBool(state, any_nan, both_zero));
+	const auto less = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThan, state.bool_type, less, lhs.key, rhs.key});
+	return EmitLogicalAndBool(state, ordered_nonzero, less);
+}
+
+} // namespace
+
+void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst) {
+	const auto index =
+	    EmitMemoryDwordIndex(state, inst, inst.memory, 1, AddressSourceCount(inst, 1));
+	const auto in_bounds = EmitStorageBufferElementInBounds(state, inst.memory, index, inst.pc);
+	const auto src_u32   = EmitValueLoad(state, inst.src[0]);
+	const auto old       = EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
+		const auto pointer = EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
+		return EmitAtomicUpdateU32(state, pointer, inst.memory.kind, [&](uint32_t old_u32) {
+			const auto replace_old = state.builder.AllocateId();
+			const auto less        = EmitF32BitsOrderedLessThan(state, src_u32, old_u32);
+			state.builder.AddFunction(
+			    {OpSelect, state.uint_type, replace_old, less, src_u32, old_u32});
+			return replace_old;
+		});
+	});
 	EmitStoreU32(state, inst.dst, old);
 }
 

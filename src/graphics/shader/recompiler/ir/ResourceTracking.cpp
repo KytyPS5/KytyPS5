@@ -30,7 +30,8 @@ bool IsAtomic(Opcode op) {
 		case Opcode::AtomicUMaxU32:
 		case Opcode::AtomicAndU32:
 		case Opcode::AtomicOrU32:
-		case Opcode::AtomicXorU32: return true;
+		case Opcode::AtomicXorU32:
+		case Opcode::AtomicFMinF32: return true;
 		default: return false;
 	}
 }

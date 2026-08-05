@@ -4788,6 +4788,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	    EncodeMubuf1(5, 0, 1), // buffer_atomic_or
 	    EncodeMubuf0(0x3b, 40, true, true),
 	    EncodeMubuf1(6, 0, 1), // buffer_atomic_xor
+	    0xe0fc0000u,
+	    0x80010000u, // exact buffer_atomic_fmin v0, s[4:7], 0 (GLC=0)
 	    EncodeDs0(0x00),
 	    EncodeDs1(0, 2, 1), // ds_add_u32
 	    EncodeDs0(0x01),
@@ -4842,6 +4844,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "new decoder did not decode buffer atomic signed max");
 	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_xor"),
 	      "new decoder did not decode buffer atomic xor");
+	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_fmin"),
+	      "new decoder did not decode buffer atomic float min");
 	Check(Common::ContainsStr(result.decoded_dump, "ds_add_u32"),
 	      "new decoder did not decode DS atomic add");
 	Check(Common::ContainsStr(result.decoded_dump, "ds_sub_u32"),
@@ -4874,6 +4878,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "buffer atomic or did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicXorU32 v6"),
 	      "buffer atomic xor did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "AtomicFMinF32 null, v0"),
+	      "buffer atomic float min did not lower to IR without a GLC return");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicAddU32 null, v2"),
 	      "DS no-return atomic add did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicSubU32 null, v10"),
@@ -4917,6 +4923,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	Check(SpirvContainsOpcode(result.spirv, 240), "SPIR-V binary does not contain OpAtomicAnd");
 	Check(SpirvContainsOpcode(result.spirv, 241), "SPIR-V binary does not contain OpAtomicOr");
 	Check(SpirvContainsOpcode(result.spirv, 242), "SPIR-V binary does not contain OpAtomicXor");
+	Check(SpirvContainsOpcode(result.spirv, 230),
+	      "SPIR-V binary does not contain OpAtomicCompareExchange for float min");
 	Check(SpirvContainsOpcode(result.spirv, 225),
 	      "buffer atomic SPIR-V binary does not contain OpMemoryBarrier");
 	CheckSpirvBinaryValidates(result.spirv);

@@ -84,6 +84,7 @@ bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
 		case IR::Opcode::AtomicAndU32:
 		case IR::Opcode::AtomicOrU32:
 		case IR::Opcode::AtomicXorU32:
+		case IR::Opcode::AtomicFMinF32:
 		case IR::Opcode::FlatLoadUbyte:
 		case IR::Opcode::FlatLoadSbyte:
 		case IR::Opcode::FlatLoadUshort:

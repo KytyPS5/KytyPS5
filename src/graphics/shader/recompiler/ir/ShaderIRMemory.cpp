@@ -569,6 +569,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicOrU32, error);
 		case Decoder::Opcode::BufferAtomicXor:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicXorU32, error);
+		case Decoder::Opcode::BufferAtomicFMin:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMinF32, error);
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:
@@ -729,6 +731,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::BufferAtomicAnd:
 		case Decoder::Opcode::BufferAtomicOr:
 		case Decoder::Opcode::BufferAtomicXor:
+		case Decoder::Opcode::BufferAtomicFMin:
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:

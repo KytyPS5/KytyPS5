@@ -9050,6 +9050,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode, const std::set<ShaderOpcode>& 
 		case Opcode::BufferAtomicAnd:
 		case Opcode::BufferAtomicOr:
 		case Opcode::BufferAtomicXor:
+		case Opcode::BufferAtomicFMin:
 		case Opcode::FlatLoadUbyte:
 		case Opcode::FlatLoadSbyte:
 		case Opcode::FlatLoadUshort:
@@ -13929,6 +13930,93 @@ TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
 	        {O::VMovB32, O::BufferAtomicAdd, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase BufferAtomicFMinExactRawGlcModes() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 0, 0x40000000u); // 2.0
+	code.push_back(0xe0fc0000u);
+	code.push_back(0x80010000u); // exact failing buffer_atomic_fmin, GLC=0
+	AppendStoreVgpr(&code, 0, 1);
+	AppendVMovLiteral(&code, 0, 0x3f800000u); // 1.0
+	code.push_back(0xe0fc4000u);
+	code.push_back(0x80010000u); // same instruction with GLC=1
+	AppendStoreVgpr(&code, 0, 2);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMinExactRawGlcModes";
+	test.code     = code;
+	test.initial  = {0x40800000u, 0, 0}; // 4.0
+	test.expected = {0x3f800000u, 0x40000000u, 0x40000000u};
+	test.opcodes  = {O::VMovB32, O::BufferAtomicFMin, O::BufferStoreDword, O::SEndpgm};
+	const auto descriptor =
+	    MakeStructuredStorageBufferData(0, static_cast<u32>(test.initial.size() * sizeof(u32)));
+	std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
+	test.user_data[50] = 1u << 20u;
+	test.has_user_data = true;
+	return test;
+}
+
+TestCase BufferAtomicFMinSpecialValues() {
+	using O = ShaderOpcode;
+
+	const u32 values[] = {
+	    0x40000000u, // 2.0
+	    0x7f800000u, // +infinity
+	    0xff800000u, // -infinity
+	    0x3f800000u, // 1.0
+	    0x7fc00000u, // quiet NaN
+	    0x00000000u, // +0.0
+	    0x80000000u, // -0.0
+	    0x00000000u, // +0.0
+	    0x80000001u, // smallest negative denorm
+	};
+	std::vector<u32> code;
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendVMovU32(&code, 20, i * 4u);
+		AppendVMovLiteral(&code, i, values[i]);
+		AppendBufferStoreOpcode(&code, 0x3f, i, 20, true);
+	}
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendStoreVgpr(&code, i, i + static_cast<u32>(std::size(values)));
+	}
+	AppendEnd(&code);
+
+	return {"BufferAtomicFMinSpecialValues",
+	        code,
+	        {0x40800000u, 0xbf800000u, 0x7f800000u, 0x7fc00000u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x00000001u, 0x00000000u, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	        {0x40000000u, 0xbf800000u, 0xff800000u, 0x7fc00000u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x00000000u, 0x80000001u, 0x40800000u,
+	         0xbf800000u, 0x7f800000u, 0x7fc00000u, 0x3f800000u, 0x80000000u,
+	         0x00000000u, 0x00000001u, 0x00000000u},
+	        {O::VMovB32, O::BufferAtomicFMin, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase BufferAtomicFMinContendedWorkgroup() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // v_cvt_f32_u32 v1, thread_id.x
+	AppendVMovU32(&code, 20, 0);
+	AppendBufferStoreOpcode(&code, 0x3f, 1, 20);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMinContendedWorkgroup";
+	test.code     = code;
+	test.initial  = {0x42c80000u}; // 100.0
+	test.expected = {0x00000000u}; // min(100.0, 0.0 .. 63.0)
+	test.opcodes  = {O::VCvtF32U32, O::VMovB32, O::BufferAtomicFMin, O::SEndpgm};
+	test.compute_info.threads_num[0] = 64;
+	test.compute_info.threads_num[1] = 1;
+	test.compute_info.threads_num[2] = 1;
+	test.compute_info.thread_ids_num = 1;
+	test.has_compute_info            = true;
+	return test;
+}
+
 std::vector<u32> MakeRgbaImage(u32 width, u32 height, u32 value = 0) {
 	return std::vector<u32>(static_cast<size_t>(width) * height * 4u, value);
 }
@@ -15279,6 +15367,9 @@ std::vector<TestCase> MakeCases() {
 	AddCase(DsSwizzleInvalidSourceLaneZero);
 	AddCase(BufferAtomicVariants);
 	AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
+	AddCase(BufferAtomicFMinExactRawGlcModes);
+	AddCase(BufferAtomicFMinSpecialValues);
+	AddCase(BufferAtomicFMinContendedWorkgroup);
 	AddCase(ImageLoadVariants);
 	AddCase(ImageLoadR32UintUsesIntegerSampledImage);
 	AddCase(ImageLoad1DUsesScalarCoordinate);

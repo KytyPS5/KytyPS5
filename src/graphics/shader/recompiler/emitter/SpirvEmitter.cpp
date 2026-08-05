@@ -131,7 +131,8 @@ bool IsAtomic(IR::Opcode op) {
 		case IR::Opcode::AtomicUMaxU32:
 		case IR::Opcode::AtomicAndU32:
 		case IR::Opcode::AtomicOrU32:
-		case IR::Opcode::AtomicXorU32: return true;
+		case IR::Opcode::AtomicXorU32:
+		case IR::Opcode::AtomicFMinF32: return true;
 		default: return false;
 	}
 }

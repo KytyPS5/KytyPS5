@@ -36,6 +36,22 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 	return barrier;
 }
 
+VulkanMemoryBarrier MakeShaderAccessDependency() {
+	VulkanMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	return barrier;
+}
+
+VulkanMemoryBarrier MakeShaderWriteHazardDependency() {
+	VulkanMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	return barrier;
+}
+
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	EXIT_IF(buffer == nullptr);
 
@@ -82,6 +98,21 @@ CollectShaderBufferWrites(const ShaderRecompiler::IR::Program&          program,
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
 	return !CollectShaderBufferWrites(*runtime.program, *runtime.resources).empty();
+}
+
+void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	EXIT_IF(vk_buffer == nullptr || !source_stages);
+	const auto barrier = MakeShaderAccessDependency();
+	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+                              vk::PipelineStageFlags destination_stages) {
+	EXIT_IF(vk_buffer == nullptr || !destination_stages);
+	const auto barrier = MakeShaderWriteHazardDependency();
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

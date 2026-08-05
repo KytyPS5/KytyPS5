@@ -18,12 +18,17 @@ struct ShaderBufferWriteRange {
 };
 
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
+VulkanMemoryBarrier     MakeShaderAccessDependency();
+VulkanMemoryBarrier     MakeShaderWriteHazardDependency();
 VulkanMemoryBarrier     MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 std::vector<ShaderBufferWriteRange>
 CollectShaderBufferWrites(const ShaderRecompiler::IR::Program&          program,
                           const ShaderRecompiler::IR::ResourceSnapshot& resources);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
+void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+                              vk::PipelineStageFlags destination_stages);
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
 
 } // namespace Libs::Graphics

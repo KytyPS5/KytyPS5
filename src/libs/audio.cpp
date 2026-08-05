@@ -82,6 +82,7 @@ public:
 	Id       AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format);
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
+	bool     AudioOutHasDevice(Id handle);
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
@@ -150,6 +151,10 @@ void AudioOutClose(int handle) {
 	if (g_audio != nullptr && handle > 0) {
 		(void)g_audio->AudioOutClose(Audio::Id(handle));
 	}
+}
+
+bool AudioOutHasDevice(int handle) {
+	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -451,6 +456,13 @@ bool Audio::AudioOutValid(Id handle) {
 	        m_out_ports[handle.GetId()].used);
 }
 
+bool Audio::AudioOutHasDevice(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
+	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].audio_device != 0);
+}
+
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
 	Common::LockGuard lock(m_mutex);
 
@@ -516,16 +528,18 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		max_wait_time      = (wait_time > max_wait_time ? wait_time : max_wait_time);
 	}
 
-	bool all_ports_have_device = true;
+	bool any_port_has_device = false;
 	for (uint32_t i = 0; i < num; i++) {
-		if (m_out_ports[params[i].handle.GetId()].audio_device == 0) {
-			all_ports_have_device = false;
+		if (m_out_ports[params[i].handle.GetId()].audio_device != 0) {
+			any_port_has_device = true;
 			break;
 		}
 	}
 
-	// Device-backed ports are paced by the SDL queue above.
-	if (blocking && max_wait_time != 0 && !all_ports_have_device) {
+	// One real output device is enough to pace the whole synchronized batch. Applying the fallback
+	// when a vibration port is present would rate-limit the device-backed ports to exactly 1x and
+	// prevent their SDL queues from building an underrun cushion.
+	if (blocking && max_wait_time != 0 && !any_port_has_device) {
 		Common::Thread::SleepMicro(max_wait_time);
 	}
 

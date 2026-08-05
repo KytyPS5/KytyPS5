@@ -336,6 +336,17 @@ static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle p
 	return nullptr;
 }
 
+static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	for (const auto& state: g_audioout2_ports) {
+		if (state.used && state.context == ctx && state.audio_handle > 0 &&
+		    state.pcm_data != nullptr && AudioInternal::AudioOutHasDevice(state.audio_handle)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
@@ -493,15 +504,23 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
+		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
+		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
+		// vibration/failed-open handle) has no downstream operation that can block this call.
+		const bool use_device_clock =
+		    blocking != 0 && audioout2_context_has_queueable_device(ctx);
+
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth) {
+			if (state->queued < state->queue_depth || use_device_clock) {
 				if (state->queued == 0) {
 					state->last_update = LibKernel::KernelGetProcessTime();
 				}
-				state->queued++;
+				if (state->queued < state->queue_depth) {
+					state->queued++;
+				}
 				g_audioout2_context_mutex.Unlock();
 				audioout2_queue_context_audio(ctx, blocking != 0);
 				return OK;

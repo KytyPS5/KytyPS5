@@ -817,7 +817,24 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		VblankBegin();
-		const bool presented = m_flip_queue.Flip(0);
+		bool presented = m_flip_queue.Flip(0);
+		if (!presented && m_presenter.NeedsImeRefresh()) {
+			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+				m_presenter.Present(*frame, true);
+				presented = true;
+			} else {
+				uint32_t width  = 0;
+				uint32_t height = 0;
+				{
+					Common::LockGuard lock(m_mutex);
+					width  = m_video_out_ctx[0].width;
+					height = m_video_out_ctx[0].height;
+				}
+				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
+				m_presenter.Present(blank);
+				presented = true;
+			}
+		}
 		if (!presented && total_wait < 0) {
 			bool     any_open = false;
 			uint32_t width    = 0;

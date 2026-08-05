@@ -12,12 +12,6 @@ int KYTY_SYSV_ABI CommonDialogInitialize();
 
 } // namespace CommonDialog
 
-namespace ImeDialog {
-
-int KYTY_SYSV_ABI ImeDialogGetStatus();
-
-} // namespace ImeDialog
-
 namespace LoginDialog {
 
 int KYTY_SYSV_ABI  LoginDialogInitialize();

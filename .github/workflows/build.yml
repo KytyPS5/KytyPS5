@@ -105,12 +105,12 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests virtual_memory_allocation_tests --parallel
+          cmake --build _Build/windows --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -186,14 +186,14 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -329,14 +329,14 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|page_manager|memory_tracker|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash

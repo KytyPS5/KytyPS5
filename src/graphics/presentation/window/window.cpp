@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/imeDialogOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -476,6 +477,9 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if (ProcessImeDialogInput(*event)) {
+		return;
+	}
 
 	switch (event->type) {
 		case SDL_QUIT: GameEventQuit(game); break;
@@ -787,6 +791,7 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
+	InitializeImeDialogInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 

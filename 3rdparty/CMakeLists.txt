@@ -11,6 +11,25 @@ target_include_directories(Vulkan-Headers INTERFACE
 	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
 )
 
+add_library(imgui STATIC
+	imgui/imgui.cpp
+	imgui/imgui_draw.cpp
+	imgui/imgui_tables.cpp
+	imgui/imgui_widgets.cpp
+	imgui/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui PUBLIC
+	"${CMAKE_CURRENT_SOURCE_DIR}/imgui"
+	"${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends"
+)
+target_compile_definitions(imgui PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+target_link_libraries(imgui PUBLIC Vulkan::Headers)
+if(MSVC)
+	target_compile_options(imgui PRIVATE /W0)
+else()
+	target_compile_options(imgui PRIVATE -w)
+endif()
+
 set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)

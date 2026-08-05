@@ -31,11 +31,13 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/imeDialogOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/controller.h"
+#include "libs/imeDialog.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -329,8 +331,9 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
-	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source);
-	void                 Submit(CommandBuffer& command);
+	[[nodiscard]] bool   PrepareImeOverlay();
+	void RecordPresentCommands(CommandBuffer& command, VulkanImage& source, bool draw_ime_overlay);
+	void Submit(CommandBuffer& command);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -342,16 +345,17 @@ private:
 	void Destroy();
 	void RefreshSurfaceSize();
 
-	WindowContext&             m_window;
-	vk::SwapchainKHR           m_handle = nullptr;
-	vk::Format                 m_format = vk::Format::eUndefined;
-	vk::Extent2D               m_extent {};
-	std::vector<vk::Image>     m_images;
-	std::vector<vk::ImageView> m_image_views;
-	std::vector<vk::Semaphore> m_image_acquired;
-	std::vector<vk::Semaphore> m_render_complete;
-	uint32_t                   m_image_index = static_cast<uint32_t>(-1);
-	uint32_t                   m_frame_index = 0;
+	WindowContext&                    m_window;
+	vk::SwapchainKHR                  m_handle = nullptr;
+	vk::Format                        m_format = vk::Format::eUndefined;
+	vk::Extent2D                      m_extent {};
+	std::vector<vk::Image>            m_images;
+	std::vector<vk::ImageView>        m_image_views;
+	std::vector<vk::Semaphore>        m_image_acquired;
+	std::vector<vk::Semaphore>        m_render_complete;
+	std::unique_ptr<ImeDialogOverlay> m_ime_overlay;
+	uint32_t                          m_image_index = static_cast<uint32_t>(-1);
+	uint32_t                          m_frame_index = 0;
 };
 
 struct Presenter::Impl {
@@ -389,11 +393,12 @@ struct Presenter::Impl {
 		return image;
 	}
 
-	RenderContext&   renderer;
-	WindowContext&   window;
-	Swapchain        swapchain;
-	CommandScheduler present_scheduler;
-	FramePool        frames;
+	RenderContext&        renderer;
+	WindowContext&        window;
+	Swapchain             swapchain;
+	CommandScheduler      present_scheduler;
+	FramePool             frames;
+	std::atomic<uint64_t> presented_ime_revision {0};
 };
 
 void Swapchain::Create() {
@@ -522,6 +527,9 @@ void Swapchain::Destroy() {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
+	if (m_ime_overlay != nullptr) {
+		m_ime_overlay->ReleaseVulkan();
+	}
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -606,7 +614,15 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 	return Status::Success;
 }
 
-void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source) {
+bool Swapchain::PrepareImeOverlay() {
+	if (m_ime_overlay == nullptr) {
+		m_ime_overlay = std::make_unique<ImeDialogOverlay>(m_window.graphic_ctx);
+	}
+	return m_ime_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+}
+
+void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
+                                      bool draw_ime_overlay) {
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
 		     static_cast<void*>(source.image), static_cast<int>(source.state.layout));
@@ -652,11 +668,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	                     vk::Filter::eLinear);
 
 	vk::ImageMemoryBarrier to_present {};
-	to_present.sType                           = vk::StructureType::eImageMemoryBarrier;
-	to_present.srcAccessMask                   = vk::AccessFlagBits::eTransferWrite;
-	to_present.dstAccessMask                   = vk::AccessFlagBits::eMemoryRead;
-	to_present.oldLayout                       = vk::ImageLayout::eTransferDstOptimal;
-	to_present.newLayout                       = vk::ImageLayout::ePresentSrcKHR;
+	to_present.sType         = vk::StructureType::eImageMemoryBarrier;
+	to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_present.dstAccessMask = draw_ime_overlay ? vk::AccessFlagBits::eColorAttachmentRead |
+	                                                  vk::AccessFlagBits::eColorAttachmentWrite
+	                                            : vk::AccessFlagBits::eMemoryRead;
+	to_present.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+	to_present.newLayout     = draw_ime_overlay ? vk::ImageLayout::eColorAttachmentOptimal
+	                                            : vk::ImageLayout::ePresentSrcKHR;
 	to_present.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_present.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_present.image                           = m_images[m_image_index];
@@ -665,9 +684,22 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(
-	    vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands,
-	    vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1, &to_present);
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                           draw_ime_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+	                                            : vk::PipelineStageFlagBits::eAllCommands,
+	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
+	                           &to_present);
+	if (draw_ime_overlay) {
+		m_ime_overlay->Record(vk_command, m_image_views[m_image_index]);
+		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
+		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
+		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                           vk::PipelineStageFlagBits::eAllCommands,
+		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
+		                           &to_present);
+	}
 	command.End();
 }
 
@@ -772,6 +804,12 @@ bool Presenter::IsGuestPaused() const noexcept {
 	return m_impl->window.loop.paused.load(std::memory_order_acquire);
 }
 
+bool Presenter::NeedsImeRefresh() const noexcept {
+	const auto visual = Dialog::ImeDialog::GetVisualState();
+	return visual.active ||
+	       visual.revision != m_impl->presented_ime_revision.load(std::memory_order_acquire);
+}
+
 RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
@@ -803,7 +841,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 
-	auto& swapchain = m_impl->swapchain;
+	const auto ime_visual = Dialog::ImeDialog::GetVisualState();
+	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
@@ -816,8 +855,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 			frame.present_commands->WaitForFenceAndReset();
-			auto& command = *frame.present_commands;
-			swapchain.RecordPresentCommands(command, frame.image);
+			auto&      command          = *frame.present_commands;
+			const bool draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
+			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
 			swapchain.Submit(command);
 		}
 		status = swapchain.Present();
@@ -827,6 +867,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 
 		RenderDocOnPresent();
+		m_impl->presented_ime_revision.store(ime_visual.revision, std::memory_order_release);
 		window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;

@@ -56,6 +56,7 @@ public:
 	void Disconnect(int id);
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
+	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
@@ -256,6 +257,15 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 	}
 }
 
+void GameController::ResetInputState() {
+	Common::LockGuard lock(m_mutex);
+	ControllerState   state {};
+	state.time    = LibKernel::KernelGetProcessTime();
+	m_states_num  = 0;
+	m_first_state = 0;
+	AddState(state);
+}
+
 void GameController::GetConnectionInfo(bool* flag, int* count) {
 	EXIT_IF(flag == nullptr);
 	EXIT_IF(count == nullptr);
@@ -332,6 +342,11 @@ void ControllerAxis(int id, Axis axis, int value) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->Axis(id, axis, value);
+}
+
+void ControllerResetInputState() {
+	EXIT_IF(g_controller == nullptr);
+	g_controller->ResetInputState();
 }
 
 int KYTY_SYSV_ABI PadInit() {

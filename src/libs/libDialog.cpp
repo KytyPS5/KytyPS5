@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "libs/dialog.h"
+#include "libs/imeDialog.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -24,7 +25,14 @@ LIB_VERSION("ImeDialog", 1, "ImeDialog", 1, 1);
 namespace ImeDialog = Dialog::ImeDialog;
 
 LIB_DEFINE(InitDialog_1_ImeDialog) {
+	LIB_FUNC("CRD+jSErEJQ", ImeDialog::ImeDialogGetPanelSizeExtended);
 	LIB_FUNC("IADmD4tScBY", ImeDialog::ImeDialogGetStatus);
+	LIB_FUNC("gyTyVn+bXMw", ImeDialog::ImeDialogTerm);
+	LIB_FUNC("x01jxu+vxlc", ImeDialog::ImeDialogGetResult);
+	LIB_FUNC("wqsJvRXwl58", ImeDialog::ImeDialogGetPanelSize);
+	LIB_FUNC("NUeBrN7hzf0", ImeDialog::ImeDialogInit);
+	LIB_FUNC("oBmw4xrmfKs", ImeDialog::ImeDialogAbort);
+	LIB_FUNC("8jqzzPioYl8", ImeDialog::ImeDialogGetPanelPositionAndForm);
 }
 
 } // namespace LibImeDialog

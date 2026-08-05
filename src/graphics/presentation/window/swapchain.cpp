@@ -387,9 +387,11 @@ struct Presenter::Impl {
 		desc.view_info.usage       = vk::ImageUsageFlagBits::eTransferSrc;
 		desc.type                  = TextureCache::BindingType::VideoOut;
 
-		auto& cache           = renderer.GetTextureCache();
-		auto& image           = cache.GetImage(cache.FindImage(desc));
+		auto&      cache      = renderer.GetTextureCache();
+		const auto image_id   = cache.FindImage(desc);
+		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
+		cache.UpdateImage(image_id);
 		return image;
 	}
 

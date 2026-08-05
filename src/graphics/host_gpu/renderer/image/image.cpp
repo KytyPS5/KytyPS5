@@ -663,7 +663,8 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
     : info(image_info), m_graphics(&graphics), m_scheduler(&scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
-	m_cpu_dirty = !info.data.Empty();
+	m_cpu_dirty =
+	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
 	if (info.pixel_format == vk::Format::eUndefined) {
 		return;
 	}

@@ -2997,6 +2997,7 @@ public:
 				                                   mip_padded[level].height};
 			}
 			const auto mip_image = texture_cache.FindImage(mip_desc);
+			(void)texture_cache.FindTexture(mip_image, mip_desc);
 			texture_cache.MarkGpuWritten(mip_image);
 			std::vector<uint32_t> mip_stale(mip_native.size(), 0xdeadbeefu);
 			Libs::LibKernel::Memory::WriteBacking(base + mip_prefix_offset, mip_stale.data(),
@@ -3055,6 +3056,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 2, 4, 1);
 			const auto array_image = texture_cache.FindImage(array_desc);
+			(void)texture_cache.FindTexture(array_image, array_desc);
 			texture_cache.MarkGpuWritten(array_image);
 			auto volume_desc                  = array_desc;
 			volume_desc.info.type             = Prospero::ImageType::kColor3D;
@@ -3078,6 +3080,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor3D, {1, 1, 2}, 1, sizeof(uint32_t), 1);
 			const auto unique_volume_image = texture_cache.FindImage(unique_volume_desc);
+			(void)texture_cache.FindTexture(unique_volume_image, unique_volume_desc);
 			texture_cache.MarkGpuWritten(unique_volume_image);
 			Libs::Graphics::Buffer partial_volume(
 			    m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
@@ -3117,6 +3120,7 @@ public:
 			depth_containment.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
 			depth_containment.view_info.level_count = 2;
 			const auto depth_containment_image      = texture_cache.FindImage(depth_containment);
+			(void)texture_cache.FindDepthTarget(depth_containment_image, depth_containment);
 			texture_cache.MarkGpuWritten(depth_containment_image);
 			Libs::Graphics::Buffer partial_depth(m_runtime_context, scheduler,
 			                                     MemoryUsage::DeviceLocal,
@@ -3159,6 +3163,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 16, 1);
 			const auto uncompressed_block_image = texture_cache.FindImage(uncompressed_block);
+			(void)texture_cache.FindTexture(uncompressed_block_image, uncompressed_block);
 			texture_cache.MarkGpuWritten(uncompressed_block_image);
 			auto compressed_block = MakeLinearDesc(
 			    base + block_alias_offset, sizeof(block_alias_data), vk::Format::eBc3UnormBlock,
@@ -3220,6 +3225,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16UNorm),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto color_image = texture_cache.FindImage(color_desc);
+			(void)texture_cache.FindTexture(color_image, color_desc);
 			texture_cache.MarkGpuWritten(color_image);
 			const std::array<uint16_t, 2> refreshed_multisample_source {0x2000u, 0xe000u};
 			Require(name, "unequal-sample source CPU write",
@@ -3421,6 +3427,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto mirror_image = texture_cache.FindImage(mirror_desc);
+			(void)texture_cache.FindTexture(mirror_image, mirror_desc);
 			texture_cache.MarkGpuWritten(mirror_image);
 			constexpr uint32_t mirror_cpu_value = 0x0f1e2d3cu;
 			Require(name, "CPU-dirty formatted mirror fault",
@@ -3448,6 +3455,7 @@ public:
 			                vk::AccessFlagBits::eTransferWrite);
 			auto       mirror_refresh_desc = mirror_desc;
 			const auto mirror_refresh      = texture_cache.FindImage(mirror_refresh_desc);
+			(void)texture_cache.FindTexture(mirror_refresh, mirror_refresh_desc);
 			Require(name, "buffer-to-image ownership",
 			        mirror_refresh == mirror_image &&
 			            !texture_cache.GetImage(mirror_refresh).IsBufferModified(),
@@ -3464,6 +3472,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto exact_buffer_image = texture_cache.FindImage(exact_buffer_desc);
+			(void)texture_cache.FindTexture(exact_buffer_image, exact_buffer_desc);
 			texture_cache.MarkGpuWritten(exact_buffer_image);
 			auto exact_buffer_binding = resources.GetBufferCache().ObtainBuffer(
 			    command, exact_buffer_desc.info.data.address, exact_buffer_desc.info.data.size,
@@ -3482,6 +3491,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 			exact_float_desc.view_info.format = vk::Format::eR32Sfloat;
 			const auto exact_float_image      = texture_cache.FindImage(exact_float_desc, true);
+			(void)texture_cache.FindTexture(exact_float_image, exact_float_desc);
 			Require(name, "Buffer-superseded exact coexistence",
 			        exact_float_image != exact_buffer_image &&
 			            TextureCacheTestAccess::Contains(texture_cache, exact_buffer_image) &&
@@ -3631,6 +3641,8 @@ public:
 			fault_b_desc.info.data.address = base + 0x8010;
 			const auto fault_a_image       = texture_cache.FindImage(fault_a_desc);
 			const auto fault_b_image       = texture_cache.FindImage(fault_b_desc);
+			(void)texture_cache.FindTexture(fault_a_image, fault_a_desc);
+			(void)texture_cache.FindTexture(fault_b_image, fault_b_desc);
 			texture_cache.MarkGpuWritten(fault_a_image);
 			texture_cache.MarkGpuWritten(fault_b_image);
 			Require(name, "per-image watcher installation",
@@ -3659,6 +3671,8 @@ public:
 			        "a byte-disjoint CPU write discarded authoritative images");
 			const auto retracked_a    = texture_cache.FindImage(fault_a_desc);
 			const auto retracked_b    = texture_cache.FindImage(fault_b_desc);
+			(void)texture_cache.FindTexture(retracked_a, fault_a_desc);
+			(void)texture_cache.FindTexture(retracked_b, fault_b_desc);
 			auto       fault_a_mirror = resources.GetBufferCache().ObtainBuffer(
 			    command, base + 0x8000, sizeof(fault_a), false, true, true);
 			if (fault_a_mirror.owner != nullptr) {
@@ -3683,8 +3697,10 @@ public:
 			        "the surviving image was not protected after its alias retired");
 			constexpr uint32_t fault_b_cpu = 0xa5a6a7a8u;
 			std::memcpy(memory + 0x8010, &fault_b_cpu, sizeof(fault_b_cpu));
+			const auto refreshed_b = texture_cache.FindImage(fault_b_desc);
+			(void)texture_cache.FindTexture(refreshed_b, fault_b_desc);
 			Require(name, "same-page survivor refresh",
-			        texture_cache.FindImage(fault_b_desc) == fault_b_image &&
+			        refreshed_b == fault_b_image &&
 			            !texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty() &&
 			            texture_cache.GetImage(fault_b_image).IsGpuModified(),
 			        "the surviving image could not reconcile its CPU write");
@@ -3700,6 +3716,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto publish_image = texture_cache.FindImage(publish_image_desc);
+			(void)texture_cache.FindTexture(publish_image, publish_image_desc);
 			texture_cache.MarkGpuWritten(publish_image);
 			resources.GetBufferCache().FillBuffer(
 			    base + publish_buffer_offset, sizeof(publish_buffer_value), publish_buffer_value);
@@ -3739,6 +3756,7 @@ public:
 				standalone_ms.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
 				standalone_ms.view_info.usage  = vk::ImageUsageFlagBits::eDepthStencilAttachment;
 				const auto image               = texture_cache.FindImage(standalone_ms);
+				(void)texture_cache.FindDepthTarget(image, standalone_ms);
 				texture_cache.MarkGpuWritten(image);
 				uint16_t standalone_cpu_read = 1;
 				std::memcpy(&standalone_cpu_read, memory + offset, sizeof(standalone_cpu_read));
@@ -3827,6 +3845,7 @@ public:
 			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			    Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto unformatted_alias_image = texture_cache.FindImage(unformatted_alias);
+			(void)texture_cache.FindTexture(unformatted_alias_image, unformatted_alias);
 			texture_cache.MarkGpuWritten(unformatted_alias_image);
 			auto unformatted_alias_buffer = resources.GetBufferCache().ObtainBuffer(
 			    command, unformatted_alias.info.data.address, unformatted_alias.info.data.size,
@@ -3881,6 +3900,7 @@ public:
 			layered_color.info.mip_layout[1]    = {32, 8, 1, 1};
 			layered_color.view_info.level_count = 2;
 			const auto layered_color_image      = texture_cache.FindImage(layered_color);
+			(void)texture_cache.FindTexture(layered_color_image, layered_color);
 			texture_cache.MarkGpuWritten(layered_color_image);
 			auto layered_depth                  = layered_color;
 			layered_depth.type                  = BindingType::DepthTarget;
@@ -3920,6 +3940,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto replacement_source_image = texture_cache.FindImage(replacement_source);
+			(void)texture_cache.FindTexture(replacement_source_image, replacement_source);
 			texture_cache.MarkGpuWritten(replacement_source_image);
 			auto replacement_desc =
 			    MakeLinearDesc(base + replacement_offset, replacement_size, vk::Format::eR32Uint,
@@ -3960,7 +3981,7 @@ public:
 			compressed_desc.info.metadata.compression = VideoOutCompression::Dcc256_256_0;
 			compressed_desc.view_info.usage           = vk::ImageUsageFlagBits::eColorAttachment;
 			const auto compressed_image               = texture_cache.FindImage(compressed_desc);
-			texture_cache.MarkGpuWritten(compressed_image);
+			(void)texture_cache.FindRenderTarget(compressed_image, compressed_desc);
 			uint32_t compressed_cpu_read = 0;
 			std::memcpy(&compressed_cpu_read, memory + 0xc000, sizeof(compressed_cpu_read));
 			Require(name, "compressed write-only read policy",
@@ -4006,6 +4027,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {mixed_source_width, 1, 1}, 1, 4, 1);
 			const auto mixed_source_image = texture_cache.FindImage(mixed_source_desc);
+			(void)texture_cache.FindTexture(mixed_source_image, mixed_source_desc);
 			Require(name, "mixed-page image upload",
 			        !texture_cache.GetImage(mixed_source_image).IsGpuModified(),
 			        "clean Buffer source manufactured GPU image ownership");
@@ -4037,6 +4059,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 1, 1);
 			const auto byte_mirror_image = texture_cache.FindImage(byte_mirror_desc);
+			(void)texture_cache.FindTexture(byte_mirror_image, byte_mirror_desc);
 			texture_cache.MarkGpuWritten(byte_mirror_image);
 			auto byte_mirror = resources.GetBufferCache().ObtainBuffer(
 			    command, base + byte_mirror_offset, 1, false, true, true);
@@ -4059,6 +4082,7 @@ public:
 			bgra16_desc.info.bgra16     = true;
 			bgra16_desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
 			const auto bgra16_image     = texture_cache.FindImage(bgra16_desc);
+			(void)texture_cache.FindRenderTarget(bgra16_image, bgra16_desc);
 			auto  bgra16_readback = CreateHostBuffer(name, sizeof(bgra16_guest),
 			                                         vk::BufferUsageFlagBits::eTransferDst, {0, 0});
 			auto& bgra16_native   = texture_cache.GetImage(bgra16_image);
@@ -4350,6 +4374,7 @@ public:
 			                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
 			                   Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 			const auto exact_image = texture_cache.FindImage(exact_image_desc);
+			(void)texture_cache.FindTexture(exact_image, exact_image_desc);
 			texture_cache.MarkGpuWritten(exact_image);
 			Require(name, "same-page exact alias ownership",
 			        resources.GetBufferCache().HasGpuDirtyBytes(base + dirty_sibling_offset,
@@ -4391,6 +4416,8 @@ public:
 			                                          gc_image_desc_a.info.data.size),
 			        "FindImageFromRange accepted an image without current GPU "
 			        "contents");
+			(void)texture_cache.FindTexture(gc_images[0], gc_image_desc_a);
+			(void)texture_cache.FindTexture(gc_images[1], gc_image_desc_b);
 			for (const auto image: gc_images) {
 				texture_cache.MarkGpuWritten(image);
 			}
@@ -4865,6 +4892,7 @@ public:
 			    vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 			d16_depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
 			const auto d16_depth_image     = texture_cache.FindImage(d16_depth_desc);
+			(void)texture_cache.FindDepthTarget(d16_depth_image, d16_depth_desc);
 			texture_cache.MarkGpuWritten(d16_depth_image);
 			auto d16_storage_desc              = d16_depth_desc;
 			d16_storage_desc.type              = BindingType::Storage;

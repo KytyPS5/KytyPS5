@@ -1196,7 +1196,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 
 	ImageId result {};
-	bool    inserted_new = false;
 	{
 		std::lock_guard transaction(m_resource_mutex);
 		CacheLock       lock(*this, m_lock);
@@ -1243,19 +1242,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
-			inserted_new   = true;
 			auto& inserted = ResolveImage(result);
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
 		}
-		if (inserted_new) {
-			InitializeImage(result, desc);
-		} else {
-			RefreshImage(result, desc);
-		}
-
 		auto& image = ResolveImage(result);
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1278,6 +1270,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		RetainImage(command, result);
 	}
 	return result;
+}
+
+void TextureCache::UpdateImage(ImageId id) {
+	std::lock_guard transaction(m_resource_mutex);
+	CacheLock       lock(*this, m_lock);
+	auto&           image = ResolveImage(id);
+	TouchImage(image);
+	RefreshImage(id, ImageDesc {.info = image.info, .type = UploadBinding(image)});
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
@@ -1332,14 +1332,17 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
+	}
+	if (desc.type == BindingType::Storage) {
+		image.MarkGpuModified();
+	}
+	if (!image.info.data.Empty()) {
 		RefreshImage(id, desc);
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			if (image.info.data.Empty()) {
-				image.MarkGpuModified();
-			} else {
+			if (!image.info.data.Empty()) {
 				if (!image.registered || image.depth_id) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
 				}
@@ -1365,9 +1368,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	image.MarkGpuModified();
+	image.usage.render_target = true;
 	RefreshImage(id, desc);
 	CommitGpuWrite(image);
-	image.usage.render_target = true;
 	TrackImageDownloadLocked(id, image);
 	const auto view = image.FindView(desc.view_info);
 	RetainImage(m_scheduler.Current(), id);
@@ -1385,6 +1389,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	image.MarkGpuModified();
+	image.usage.depth_target = true;
 	RefreshImage(id, desc);
 	if (desc.info.HasMetadata()) {
 		image.info.metadata = desc.info.metadata;
@@ -1392,7 +1398,6 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                            MetaDataInfo {.clear_mask = image.info.htile_clear_mask});
 	}
 	CommitGpuWrite(image);
-	image.usage.depth_target = true;
 	if (desc.info.HasStencil()) {
 		AssociateStencilLocked(id, desc.info.stencil);
 	}

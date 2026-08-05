@@ -379,6 +379,10 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) && !resource.read &&
 	    !Prospero::IsFmaskTextureFormat(descriptor.Format()) && (is_2d || is_2d_array) &&
 	    TileGetBlockLayout(TileBlockFamily::Depth64KB, depth_bpe, depth_block);
+	const bool supported_standard_256b =
+	    (is_2d || is_2d_array) &&
+	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B) &&
+	    TileIsStandard256BTextureSupported(descriptor.Format());
 	const bool supported_standard_tile =
 	    (tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
 	     TileIsStandard4KBTextureSupported(descriptor.Format())) ||
@@ -386,7 +390,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	     TileIsStandard64KBTextureSupported(descriptor.Format()));
 	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
 	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
-	                            supported_depth_tile || supported_standard_tile;
+	                            supported_depth_tile || supported_standard_256b ||
+	                            supported_standard_tile;
 	const auto swizzle        = descriptor.DstSelXYZW();
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&

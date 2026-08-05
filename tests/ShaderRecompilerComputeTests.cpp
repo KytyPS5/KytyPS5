@@ -16738,7 +16738,7 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
 	} else if (std::strcmp(kind, "type") == 0) {
 		descriptor.fields[3] = (descriptor.fields[3] & 0x0fffffffu) |
 		                       (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u);
-	} else if (std::strcmp(kind, "tile") == 0) {
+	} else if (std::strcmp(kind, "standard256b-volume") == 0) {
 		descriptor.fields[3] = (descriptor.fields[3] & ~(0x1fu << 20u)) |
 		                       (Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B) << 20u);
 	} else if (std::strcmp(kind, "mip") == 0) {
@@ -16948,6 +16948,38 @@ void CheckBasicStorageTextureDescriptor() {
 	        "PPSA21268 uint 2D-array storage descriptor fixture is malformed");
 	ValidateStorageTexture(BasicUintArrayStorageTextureResource(), uint_array, 0x10000);
 
+	const ShaderTextureResource standard256b {{
+	    0x204e4900u,
+	    0x43c00000u,
+	    0x00004000u,
+	    0x90100facu,
+	    0x00000000u,
+	    0x00700000u,
+	    0x00000000u,
+	    0x00000000u,
+	}};
+	auto standard256b_resource = BasicBgraStorageTextureResource();
+	standard256b_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+	const auto standard256b_pitch = TileGetTexturePitch(
+	    standard256b.Format(), standard256b.Width5() + 1u, 1, standard256b.TileMode());
+	TileSizeAlign standard256b_size {};
+	TileGetTextureTotalSize(standard256b.Format(), standard256b.Width5() + 1u,
+	                        standard256b.Height5() + 1u, standard256b.Depth() + 1u,
+	                        standard256b_pitch, 1, standard256b.TileMode(), false,
+	                        standard256b_size);
+	Require("BasicStorageTexture", "Standard256B uint 2D descriptor",
+	        standard256b.Width5() + 1u == 2 && standard256b.Height5() + 1u == 2 &&
+	            standard256b.Depth() + 1u == 1 &&
+	            standard256b.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	            standard256b.Format() ==
+	                Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt) &&
+	            standard256b.TileMode() ==
+	                Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B) &&
+	            standard256b.DstSelXYZW() == DstSel(4, 5, 6, 7) &&
+	            standard256b_size.size == 0x100 && standard256b_size.align == 0x100,
+	        "captured PPSA08511 Standard256B storage descriptor is malformed");
+	ValidateStorageTexture(standard256b_resource, standard256b, standard256b_size.size);
+
 	const auto standard4kb_array = Standard4KBUintArrayStorageTextureDescriptor();
 	const auto standard4kb_pitch =
 	    TileGetTexturePitch(standard4kb_array.Format(), 1, 1, standard4kb_array.TileMode());
@@ -17084,7 +17116,7 @@ void CheckBasicStorageTextureDescriptor() {
 	        "GetModuleFileName failed");
 	for (const char* kind: {"resource",
 	                        "type",
-	                        "tile",
+	                        "standard256b-volume",
 	                        "mip",
 	                        "swizzle",
 	                        "linear-rgb1-read",

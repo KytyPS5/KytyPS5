@@ -924,22 +924,21 @@ RenderExecutor::PrepareGraphicsBindings(CommandBuffer& buffer, const ShaderStage
 	return bindings;
 }
 
-static void RetainBindings(CommandBuffer&                            buffer,
-                           const DescriptorCache::NativeDescriptors& resources) {
+static void RetainBindings(CommandBuffer& buffer, DescriptorCache::NativeDescriptors& resources) {
 	if (resources.flattened_srt.owner != nullptr) {
-		buffer.RetainResourceUntilFence(resources.flattened_srt.owner);
+		buffer.RetainResourceUntilFence(std::move(resources.flattened_srt.owner));
 	}
 	if (resources.user_data.owner != nullptr) {
-		buffer.RetainResourceUntilFence(resources.user_data.owner);
+		buffer.RetainResourceUntilFence(std::move(resources.user_data.owner));
 	}
-	for (const auto& view: resources.buffers) {
+	for (auto& view: resources.buffers) {
 		if (view.owner != nullptr) {
-			buffer.RetainResourceUntilFence(view.owner);
+			buffer.RetainResourceUntilFence(std::move(view.owner));
 		}
 	}
-	for (const auto& view: resources.addresses) {
+	for (auto& view: resources.addresses) {
 		if (view.owner != nullptr) {
-			buffer.RetainResourceUntilFence(view.owner);
+			buffer.RetainResourceUntilFence(std::move(view.owner));
 		}
 	}
 }

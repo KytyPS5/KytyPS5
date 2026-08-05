@@ -42,6 +42,10 @@ namespace LibPsml {
 LIB_DEFINE(InitPsml_1);
 } // namespace LibPsml
 
+namespace LibConvertKeycode {
+LIB_DEFINE(InitConvertKeycode_1);
+} // namespace LibConvertKeycode
+
 LIB_DEFINE(InitLibC_1);
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAmpr_1);
@@ -90,6 +94,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(LibMouse::InitMouse_1);
 	LIB_LOAD(LibKeyboard::InitKeyboard_1);
 	LIB_LOAD(InitNet_1);
+	LIB_LOAD(LibConvertKeycode::InitConvertKeycode_1);
 	LIB_LOAD(InitPad_1);
 	LIB_LOAD(InitPlayGo_1);
 	LIB_LOAD(LibPsml::InitPsml_1);

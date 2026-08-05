@@ -786,18 +786,19 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 		return false;
 	}
 
-	if (data.user_data == nullptr) {
-		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
-		     " gs=0x%016" PRIx64 " chksum=0x%016" PRIx64 " user_sgpr_num=%u\n",
-		     shader_addr, regs.es_regs.data_addr, regs.gs_regs.data_addr, regs.gs_regs.chksum,
-		     static_cast<uint32_t>(user_sgpr_num));
-	}
 	ShaderVertexMetadata metadata;
 	std::string          metadata_error;
-	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
-		LOGF("ShaderGetInputInfoVS(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
-		     shader_addr, metadata_error.c_str());
-		return false;
+	if (data.user_data != nullptr) {
+		if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
+			LOGF("ShaderGetInputInfoVS(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+			     shader_addr, metadata_error.c_str());
+			return false;
+		}
+	} else {
+		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
+		     " gs=0x%016" PRIx64 " chksum=0x%016" PRIx64 " user_sgpr_num=%u; continuing without embedded vertex fetch\n",
+		     shader_addr, regs.es_regs.data_addr, regs.gs_regs.data_addr, regs.gs_regs.chksum,
+		     static_cast<uint32_t>(user_sgpr_num));
 	}
 
 	if (metadata.vertex_buffer_reg >= 0) {

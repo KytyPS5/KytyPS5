@@ -37,6 +37,10 @@ LIB_VERSION("Net", 1, "Net", 1, 1);
 static thread_local int   g_net_errno = 0;
 static constexpr uint32_t g_in6addr_any[4] {};
 
+static uint64_t KYTY_SYSV_ABI LibNetMissingFuncStub() {
+	return 0;
+}
+
 namespace Net = Network::Net;
 
 KYTY_SYSV_ABI int* GetNetErrorAddr() {
@@ -214,9 +218,25 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);
 	LIB_FUNC("Rbvt+5Y2iEw", LibNet::NetNtohs);
+	LIB_FUNC("AzqoBha7js4", LibNetMissingFuncStub);
+	LIB_FUNC("kJlYH5uMAWI", LibNetMissingFuncStub);
 }
 
 } // namespace LibNet
+
+namespace LibConvertKeycode {
+
+LIB_VERSION("ConvertKeycode", 1, "ConvertKeycode", 1, 0);
+
+static uint64_t KYTY_SYSV_ABI ConvertKeycodeMissingFuncStub() {
+	return 0;
+}
+
+LIB_DEFINE(InitConvertKeycode_1) {
+	LIB_FUNC("mUuUOWI-C+0", ConvertKeycodeMissingFuncStub);
+}
+
+} // namespace LibConvertKeycode
 
 namespace LibSsl {
 

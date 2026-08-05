@@ -3075,6 +3075,10 @@ namespace EventQueue = LibKernel::EventQueue;
 namespace EventFlag  = LibKernel::EventFlag;
 namespace Semaphore  = LibKernel::Semaphore;
 
+static uint64_t KYTY_SYSV_ABI LibKernelMissingFuncStub() {
+	return 0;
+}
+
 LIB_DEFINE(InitFiber_1) {
 	LIB_USING(Fiber);
 
@@ -3408,6 +3412,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("QKd0qM58Qes", LibKernel::KernelStopUnloadModule);
 	LIB_FUNC("rNhWz+lvOMU", LibKernel::KernelSetThreadDtors);
 	LIB_FUNC("Tz4RNUCBbGI", LibKernel::KernelRtldThreadAtexitIncrement);
+	LIB_FUNC("WlyEA-sLDf0", LibKernelMissingFuncStub);
 	LIB_FUNC("vNe1w4diLCs", LibKernel::tls_get_addr);
 	LIB_FUNC("vYU8P9Td2Zo", KernelAioInitializeImpl);
 	LIB_FUNC("WhCc1w3EhSI", LibKernel::KernelSetThreadAtexitReport);

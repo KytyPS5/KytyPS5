@@ -9051,6 +9051,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode, const std::set<ShaderOpcode>& 
 		case Opcode::BufferAtomicOr:
 		case Opcode::BufferAtomicXor:
 		case Opcode::BufferAtomicFMin:
+		case Opcode::BufferAtomicFMax:
 		case Opcode::FlatLoadUbyte:
 		case Opcode::FlatLoadSbyte:
 		case Opcode::FlatLoadUshort:
@@ -14017,6 +14018,105 @@ TestCase BufferAtomicFMinContendedWorkgroup() {
 	return test;
 }
 
+TestCase BufferAtomicFMaxExactRawGlcModes() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovLiteral(&code, 3, 0x40000000u); // 2.0
+	code.push_back(0xe100000cu);
+	code.push_back(0x80010300u); // exact failing buffer_atomic_fmax v3, offset 12, GLC=0
+	AppendStoreVgpr(&code, 3, 4);
+	AppendVMovLiteral(&code, 0, 0x40800000u); // 4.0
+	code.push_back(0xe100400cu);
+	code.push_back(0x80010000u); // same address with GLC=1
+	AppendStoreVgpr(&code, 0, 5);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMaxExactRawGlcModes";
+	test.code     = code;
+	test.initial  = {0, 0, 0, 0x3f800000u, 0, 0}; // memory[3] = 1.0
+	test.expected = {0, 0, 0, 0x40800000u, 0x40000000u, 0x40000000u};
+	test.opcodes  = {O::VMovB32, O::BufferAtomicFMax, O::BufferStoreDword, O::SEndpgm};
+	const auto descriptor =
+	    MakeStructuredStorageBufferData(0, static_cast<u32>(test.initial.size() * sizeof(u32)));
+	std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
+	test.user_data[50] = 1u << 20u;
+	test.has_user_data = true;
+	return test;
+}
+
+TestCase BufferAtomicFMaxSpecialValues() {
+	using O = ShaderOpcode;
+
+	const u32 values[] = {
+	    0x40000000u, // 2.0, finite update
+	    0x40000000u, // 2.0, finite no-update
+	    0x7f800000u, // incoming +infinity
+	    0xff800000u, // incoming -infinity
+	    0x3f800000u, // finite against old +infinity
+	    0x3f800000u, // finite against old -infinity
+	    0x3f800000u, // finite against old quiet NaN
+	    0x7fcabcdeu, // incoming quiet NaN
+	    0x3f800000u, // finite against old signaling NaN
+	    0x7faabcdeu, // incoming signaling NaN
+	    0x00000000u, // +0.0 against old -0.0
+	    0x80000000u, // -0.0 against old +0.0
+	    0x80000000u, // -0.0 against a negative denorm
+	    0x80000001u, // negative denorm against -0.0
+	    0x00000001u, // positive denorm against +0.0
+	    0x00000000u, // +0.0 against a positive denorm
+	};
+	std::vector<u32> code;
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendVMovU32(&code, 20, i * 4u);
+		AppendVMovLiteral(&code, i, values[i]);
+		AppendBufferStoreOpcode(&code, 0x40, i, 20, true);
+	}
+	for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+		AppendStoreVgpr(&code, i, i + static_cast<u32>(std::size(values)));
+	}
+	AppendEnd(&code);
+
+	return {"BufferAtomicFMaxSpecialValues",
+	        code,
+	        {0x3f800000u, 0x40800000u, 0xbf800000u, 0x3f800000u, 0x7f800000u,
+	         0xff800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x80000001u, 0x80000000u, 0x00000000u,
+	         0x00000001u, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	        {0x40000000u, 0x40800000u, 0x7f800000u, 0x3f800000u, 0x7f800000u,
+	         0x3f800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u, 0x3f800000u,
+	         0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x00000001u,
+	         0x00000001u, 0x3f800000u, 0x40800000u, 0xbf800000u, 0x3f800000u,
+	         0x7f800000u, 0xff800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u,
+	         0x3f800000u, 0x80000000u, 0x00000000u, 0x80000001u, 0x80000000u,
+	         0x00000000u, 0x00000001u},
+	        {O::VMovB32, O::BufferAtomicFMax, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase BufferAtomicFMaxContendedWorkgroup() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // v_cvt_f32_u32 v1, thread_id.x
+	AppendVMovU32(&code, 20, 0);
+	AppendBufferStoreOpcode(&code, 0x40, 1, 20);
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name     = "BufferAtomicFMaxContendedWorkgroup";
+	test.code     = code;
+	test.initial  = {0xc2c80000u}; // -100.0
+	test.expected = {0x427c0000u}; // max(-100.0, 0.0 .. 63.0)
+	test.opcodes  = {O::VCvtF32U32, O::VMovB32, O::BufferAtomicFMax, O::SEndpgm};
+	test.compute_info.threads_num[0] = 64;
+	test.compute_info.threads_num[1] = 1;
+	test.compute_info.threads_num[2] = 1;
+	test.compute_info.thread_ids_num = 1;
+	test.has_compute_info            = true;
+	return test;
+}
+
 std::vector<u32> MakeRgbaImage(u32 width, u32 height, u32 value = 0) {
 	return std::vector<u32>(static_cast<size_t>(width) * height * 4u, value);
 }
@@ -15370,6 +15470,9 @@ std::vector<TestCase> MakeCases() {
 	AddCase(BufferAtomicFMinExactRawGlcModes);
 	AddCase(BufferAtomicFMinSpecialValues);
 	AddCase(BufferAtomicFMinContendedWorkgroup);
+	AddCase(BufferAtomicFMaxExactRawGlcModes);
+	AddCase(BufferAtomicFMaxSpecialValues);
+	AddCase(BufferAtomicFMaxContendedWorkgroup);
 	AddCase(ImageLoadVariants);
 	AddCase(ImageLoadR32UintUsesIntegerSampledImage);
 	AddCase(ImageLoad1DUsesScalarCoordinate);

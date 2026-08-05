@@ -435,6 +435,7 @@ enum class Opcode {
 	BufferAtomicOr,
 	BufferAtomicXor,
 	BufferAtomicFMin,
+	BufferAtomicFMax,
 	FlatLoadUbyte,
 	FlatLoadSbyte,
 	FlatLoadUshort,

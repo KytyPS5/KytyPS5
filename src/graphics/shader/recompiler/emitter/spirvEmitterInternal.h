@@ -414,6 +414,9 @@ struct EmitterState {
 	bool                                             needs_image_gather_extended           = false;
 	bool                                             needs_function_lds                    = false;
 	bool                                             needs_pixel_valid_mask                = false;
+	bool                                             unsupported_ir_instruction            = false;
+	IR::Opcode                                       unsupported_ir_opcode = IR::Opcode::Count;
+	uint32_t                                         unsupported_ir_pc     = 0;
 	std::vector<RegisterBinding>                     registers;
 	std::vector<InputBinding>                        inputs;
 	std::vector<OutputBinding>                       outputs;
@@ -1012,6 +1015,7 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t opcode);
 
 void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst);
+void EmitAtomicFMaxF32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst);
 

@@ -353,6 +353,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::BufferAtomicOr, Opcode::AtomicOrU32},
     {Decoder::Opcode::BufferAtomicXor, Opcode::AtomicXorU32},
     {Decoder::Opcode::BufferAtomicFMin, Opcode::AtomicFMinF32},
+    {Decoder::Opcode::BufferAtomicFMax, Opcode::AtomicFMaxF32},
     {Decoder::Opcode::FlatLoadUbyte, Opcode::FlatLoadUbyte},
     {Decoder::Opcode::FlatLoadSbyte, Opcode::FlatLoadSbyte},
     {Decoder::Opcode::FlatLoadSshort, Opcode::FlatLoadSshort},

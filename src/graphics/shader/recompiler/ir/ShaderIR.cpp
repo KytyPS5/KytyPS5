@@ -975,7 +975,12 @@ bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& bl
 			return LowerControlMarker(decoded, block, Opcode::TtraceData, true, error);
 		case Decoder::Opcode::SInstPrefetch:
 			return LowerControlMarker(decoded, block, Opcode::InstPrefetch, true, error);
-		default: return false;
+		default:
+			if (error != nullptr) {
+				*error = fmt::format("control opcode has no specialized IR lowering: {}",
+				                     Decoder::OpcodeToString(decoded.opcode));
+			}
+			return false;
 	}
 }
 
@@ -1064,6 +1069,18 @@ bool IsTerminatorOpcode(Decoder::Opcode opcode) {
 
 bool LowerImplemented(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error);
 
+bool IsMemoryFamily(Decoder::Family family) {
+	switch (family) {
+		case Decoder::Family::SMEM:
+		case Decoder::Family::MUBUF:
+		case Decoder::Family::MTBUF:
+		case Decoder::Family::FLAT:
+		case Decoder::Family::DS:
+		case Decoder::Family::MIMG: return true;
+		default: return false;
+	}
+}
+
 bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block,
                              std::string* error) {
 	switch (inst.opcode) {
@@ -1116,6 +1133,15 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 	}
 	if (IsMemoryOpcode(inst.opcode)) {
 		return LowerMemoryInstruction(inst, block, error);
+	}
+	// Memory instructions require specialized lowering to populate MemoryInfo. Never let a
+	// newly decoded memory-family opcode fall through to generic register-only IR.
+	if (IsMemoryFamily(inst.family)) {
+		if (error != nullptr) {
+			*error = fmt::format("decoded memory-family opcode has no specialized IR lowering: {}",
+			                     Decoder::OpcodeToString(inst.opcode));
+		}
+		return false;
 	}
 	if (ScalarShiftLeftAddAmount(inst.opcode) != 0) {
 		return LowerScalarShiftLeftAdd(inst, block, error);

@@ -778,6 +778,9 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::AtomicFMinF32:
 			EmitGuardedByExec(state, [&]() { EmitAtomicFMinF32(state, inst); });
 			break;
+		case IR::Opcode::AtomicFMaxF32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicFMaxF32(state, inst); });
+			break;
 		case IR::Opcode::FlatLoadUbyte: EmitFlatLoadUbyte(state, inst); break;
 		case IR::Opcode::FlatLoadSbyte: EmitFlatLoadSbyte(state, inst); break;
 		case IR::Opcode::FlatLoadUshort: EmitFlatLoadUshort(state, inst); break;
@@ -854,7 +857,13 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 			}
 			EmitGuardedByExec(state, [&]() { EmitExport(state, inst); });
 			break;
-		default: break;
+		default:
+			if (!state.unsupported_ir_instruction) {
+				state.unsupported_ir_instruction = true;
+				state.unsupported_ir_opcode      = inst.op;
+				state.unsupported_ir_pc          = inst.pc;
+			}
+			break;
 	}
 }
 

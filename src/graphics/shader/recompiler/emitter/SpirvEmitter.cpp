@@ -132,7 +132,8 @@ bool IsAtomic(IR::Opcode op) {
 		case IR::Opcode::AtomicAndU32:
 		case IR::Opcode::AtomicOrU32:
 		case IR::Opcode::AtomicXorU32:
-		case IR::Opcode::AtomicFMinF32: return true;
+		case IR::Opcode::AtomicFMinF32:
+		case IR::Opcode::AtomicFMaxF32: return true;
 		default: return false;
 	}
 }
@@ -142,6 +143,9 @@ uint32_t BufferAddressOperandCount(const IR::Instruction& inst) {
 }
 
 bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error) {
+	if (static_cast<size_t>(inst.op) >= static_cast<size_t>(IR::Opcode::Count)) {
+		return Fail(error, "IR instruction opcode is out of range");
+	}
 	if (inst.src_count > std::size(inst.src)) {
 		return Fail(error, "instruction source count exceeds fixed IR storage");
 	}
@@ -200,6 +204,12 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	    ((kind != IR::ResourceKind::StorageImage && kind != IR::ResourceKind::StorageImageUint) ||
 	     inst.src_count != 2)) {
 		return Fail(error, "storage image instruction has an invalid resource class");
+	}
+	const auto float_atomic =
+	    inst.op == IR::Opcode::AtomicFMinF32 || inst.op == IR::Opcode::AtomicFMaxF32;
+	if (float_atomic &&
+	    (kind != IR::ResourceKind::Buffer || inst.src_count != buffer_address_count + 1u)) {
+		return Fail(error, "floating-point atomic instruction must target a buffer");
 	}
 	if (IsAtomic(inst.op) &&
 	    !((kind == IR::ResourceKind::Buffer && inst.src_count == buffer_address_count + 1u) ||
@@ -489,6 +499,13 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	AllocateBlockLabels(state, program);
 	AllocateDispatcherState(state, program);
 	EmitFunction(state, program);
+	if (state.unsupported_ir_instruction) {
+		char pc[9] {};
+		std::snprintf(pc, sizeof(pc), "%08x", state.unsupported_ir_pc);
+		return Fail(error, "SPIR-V emitter has no handler for IR opcode " +
+		                       std::string(IR::OpcodeName(state.unsupported_ir_opcode)) +
+		                       " at pc 0x" + pc);
+	}
 
 	ReportReserveExceeded(program, "registers", state.registers.size());
 	ReportReserveExceeded(program, "inputs", state.inputs.size());

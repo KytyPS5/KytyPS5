@@ -2959,6 +2959,15 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
 	Check(Common::ContainsStr(error, "no IR lowering"),
 	      "missing decoder-to-IR mapping did not report an explicit error");
 	Check(ir.blocks.empty(), "missing decoder-to-IR mapping emitted a fallback IR block");
+
+	decoded.instructions.front().family = ShaderRecompiler::Decoder::Family::MUBUF;
+	decoded.instructions.front().opcode = ShaderRecompiler::Decoder::Opcode::VAddNcU32;
+	error.clear();
+	Check(!ShaderRecompiler::IR::LowerProgram(decoded, cfg, ShaderType::Compute, 64u, ir, &error),
+	      "memory-family opcode bypassed specialized memory lowering");
+	Check(Common::ContainsStr(error, "memory-family opcode") &&
+	          Common::ContainsStr(error, "specialized IR lowering"),
+	      "memory-family lowering bypass did not report an explicit error");
 }
 
 void TestNewShaderRecompilerMemoryFamilyLowering() {
@@ -4790,6 +4799,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	    EncodeMubuf1(6, 0, 1), // buffer_atomic_xor
 	    0xe0fc0000u,
 	    0x80010000u, // exact buffer_atomic_fmin v0, s[4:7], 0 (GLC=0)
+	    0xe100000cu,
+	    0x80010300u, // exact failing buffer_atomic_fmax v3, s[4:7], 12 (GLC=0)
 	    EncodeDs0(0x00),
 	    EncodeDs1(0, 2, 1), // ds_add_u32
 	    EncodeDs0(0x01),
@@ -4846,6 +4857,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "new decoder did not decode buffer atomic xor");
 	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_fmin"),
 	      "new decoder did not decode buffer atomic float min");
+	Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_fmax"),
+	      "new decoder did not decode buffer atomic float max");
 	Check(Common::ContainsStr(result.decoded_dump, "ds_add_u32"),
 	      "new decoder did not decode DS atomic add");
 	Check(Common::ContainsStr(result.decoded_dump, "ds_sub_u32"),
@@ -4880,6 +4893,8 @@ void TestNewShaderRecompilerAtomicLowering() {
 	      "buffer atomic xor did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicFMinF32 null, v0"),
 	      "buffer atomic float min did not lower to IR without a GLC return");
+	Check(Common::ContainsStr(result.ir_dump, "AtomicFMaxF32 null, v3"),
+	      "buffer atomic float max did not lower to IR without a GLC return");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicAddU32 null, v2"),
 	      "DS no-return atomic add did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "AtomicSubU32 null, v10"),
@@ -6711,6 +6726,35 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 	                                          nullptr, rejected_spirv, &rejected_error) &&
 	        rejected_spirv == rejected_before && rejected_error.find("atomic") != std::string::npos,
 	    "malformed atomic instruction reached a fatal descriptor path");
+
+	auto malformed_float_atomic = result.program;
+	atomic_inst                 = FindBufferInstruction(&malformed_float_atomic);
+	Check(atomic_inst != nullptr, "native validation fixture lacks a float atomic candidate");
+	atomic_inst->op              = ShaderRecompiler::IR::Opcode::AtomicFMaxF32;
+	atomic_inst->memory.kind     = ShaderRecompiler::IR::ResourceKind::Lds;
+	atomic_inst->memory.resource = 0;
+	atomic_inst->src_count       = 2;
+	rejected_spirv               = rejected_before;
+	rejected_error.clear();
+	Check(!ShaderRecompiler::Spirv::EmitProgram(malformed_float_atomic, result.resources, nullptr,
+	                                            nullptr, nullptr, rejected_spirv,
+	                                            &rejected_error) &&
+	          rejected_spirv == rejected_before &&
+	          rejected_error.find("floating-point atomic") != std::string::npos,
+	      "buffer-only floating-point atomic accepted a non-buffer resource");
+
+	auto invalid_ir_opcode = result.program;
+	Check(!invalid_ir_opcode.blocks.empty() && !invalid_ir_opcode.blocks.front().instructions.empty(),
+	      "native validation fixture lacks an invalid-opcode candidate");
+	invalid_ir_opcode.blocks.front().instructions.front().op =
+	    ShaderRecompiler::IR::Opcode::Count;
+	rejected_spirv = rejected_before;
+	rejected_error.clear();
+	Check(!ShaderRecompiler::Spirv::EmitProgram(invalid_ir_opcode, result.resources, nullptr, nullptr,
+	                                            nullptr, rejected_spirv, &rejected_error) &&
+	          rejected_spirv == rejected_before &&
+	          rejected_error.find("opcode is out of range") != std::string::npos,
+	      "out-of-range IR opcode was not rejected transactionally before emission");
 
 	auto overwide_atomic = result.program;
 	atomic_inst          = FindBufferInstruction(&overwide_atomic);

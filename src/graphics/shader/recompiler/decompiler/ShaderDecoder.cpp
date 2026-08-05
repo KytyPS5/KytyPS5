@@ -836,6 +836,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::BufferAtomicOr: return "buffer_atomic_or";
 		case Opcode::BufferAtomicXor: return "buffer_atomic_xor";
 		case Opcode::BufferAtomicFMin: return "buffer_atomic_fmin";
+		case Opcode::BufferAtomicFMax: return "buffer_atomic_fmax";
 		case Opcode::FlatLoadUbyte: return "flat_load_ubyte";
 		case Opcode::FlatLoadSbyte: return "flat_load_sbyte";
 		case Opcode::FlatLoadUshort: return "flat_load_ushort";
@@ -1127,6 +1128,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BufferAtomicOr:
 		case Opcode::BufferAtomicXor:
 		case Opcode::BufferAtomicFMin:
+		case Opcode::BufferAtomicFMax:
 		case Opcode::BufferLoadSbyte:
 		case Opcode::BufferLoadSshort:
 		case Opcode::FlatLoadUbyte:

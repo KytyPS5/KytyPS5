@@ -571,6 +571,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicXorU32, error);
 		case Decoder::Opcode::BufferAtomicFMin:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMinF32, error);
+		case Decoder::Opcode::BufferAtomicFMax:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMaxF32, error);
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:
@@ -675,7 +677,12 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 		case Decoder::Opcode::ImageAtomicAnd:
 		case Decoder::Opcode::ImageAtomicOr:
 		case Decoder::Opcode::ImageAtomicXor: return LowerImageAtomicU32(decoded, block, error);
-		default: return false;
+		default:
+			if (error != nullptr) {
+				*error = fmt::format("memory opcode has no specialized IR lowering: {}",
+				                     Decoder::OpcodeToString(decoded.opcode));
+			}
+			return false;
 	}
 }
 
@@ -732,6 +739,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::BufferAtomicOr:
 		case Decoder::Opcode::BufferAtomicXor:
 		case Decoder::Opcode::BufferAtomicFMin:
+		case Decoder::Opcode::BufferAtomicFMax:
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:

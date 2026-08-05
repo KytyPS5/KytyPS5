@@ -1184,7 +1184,8 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 
 namespace {
 
-uint32_t EmitF32BitsOrderedLessThan(EmitterState& state, uint32_t lhs_bits, uint32_t rhs_bits) {
+uint32_t EmitF32BitsOrderedCompare(EmitterState& state, uint32_t lhs_bits, uint32_t rhs_bits,
+                                   uint32_t comparison_opcode) {
 	struct ClassifiedBits {
 		uint32_t nan  = 0;
 		uint32_t zero = 0;
@@ -1219,14 +1220,13 @@ uint32_t EmitF32BitsOrderedLessThan(EmitterState& state, uint32_t lhs_bits, uint
 	const auto both_zero = EmitLogicalAndBool(state, lhs.zero, rhs.zero);
 	const auto ordered_nonzero =
 	    EmitLogicalNotBool(state, EmitLogicalOrBool(state, any_nan, both_zero));
-	const auto less = state.builder.AllocateId();
-	state.builder.AddFunction({OpULessThan, state.bool_type, less, lhs.key, rhs.key});
-	return EmitLogicalAndBool(state, ordered_nonzero, less);
+	const auto comparison = state.builder.AllocateId();
+	state.builder.AddFunction({comparison_opcode, state.bool_type, comparison, lhs.key, rhs.key});
+	return EmitLogicalAndBool(state, ordered_nonzero, comparison);
 }
 
-} // namespace
-
-void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst) {
+void EmitAtomicFMinMaxF32(EmitterState& state, const IR::Instruction& inst,
+                          uint32_t comparison_opcode) {
 	const auto index =
 	    EmitMemoryDwordIndex(state, inst, inst.memory, 1, AddressSourceCount(inst, 1));
 	const auto in_bounds = EmitStorageBufferElementInBounds(state, inst.memory, index, inst.pc);
@@ -1235,13 +1235,24 @@ void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst) {
 		const auto pointer = EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
 		return EmitAtomicUpdateU32(state, pointer, inst.memory.kind, [&](uint32_t old_u32) {
 			const auto replace_old = state.builder.AllocateId();
-			const auto less        = EmitF32BitsOrderedLessThan(state, src_u32, old_u32);
+			const auto replace =
+			    EmitF32BitsOrderedCompare(state, src_u32, old_u32, comparison_opcode);
 			state.builder.AddFunction(
-			    {OpSelect, state.uint_type, replace_old, less, src_u32, old_u32});
+			    {OpSelect, state.uint_type, replace_old, replace, src_u32, old_u32});
 			return replace_old;
 		});
 	});
 	EmitStoreU32(state, inst.dst, old);
+}
+
+} // namespace
+
+void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst) {
+	EmitAtomicFMinMaxF32(state, inst, OpULessThan);
+}
+
+void EmitAtomicFMaxF32(EmitterState& state, const IR::Instruction& inst) {
+	EmitAtomicFMinMaxF32(state, inst, OpUGreaterThan);
 }
 
 void EmitSLoadDword(EmitterState& state, const IR::Instruction& inst) {

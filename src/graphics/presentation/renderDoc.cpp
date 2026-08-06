@@ -128,8 +128,7 @@ static bool BindRenderDocApi(HMODULE module) {
 	g_api    = static_cast<RenderDocApi*>(api);
 
 	g_api->SetCaptureFilePathTemplate("_RenderDoc/kyty");
-	static RenderDocInputButton capture_keys[] = {eRENDERDOC_Key_F1};
-	g_api->SetCaptureKeys(capture_keys, 1);
+	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
 
 	char module_path[MAX_PATH] = {};
@@ -170,8 +169,7 @@ static bool BindRenderDocApi(HMODULE module) {
 	g_api    = static_cast<RenderDocApi*>(api);
 
 	g_api->SetCaptureFilePathTemplate("_RenderDoc/kyty");
-	static RenderDocInputButton capture_keys[] = {eRENDERDOC_Key_F1};
-	g_api->SetCaptureKeys(capture_keys, 1);
+	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
 
 	Dl_info info {};

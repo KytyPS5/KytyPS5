@@ -316,13 +316,10 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 	if (base == view) {
 		return true;
 	}
-	// Explicit alias-view compatibility between R16G16B16A16_UINT (95) and
-	// R16G16B16A16_SFLOAT (97). These are treated as a compatible format pair so
-	// that image views can be created across the two formats in either direction.
-	if ((base == vk::Format::eR16G16B16A16Uint && view == vk::Format::eR16G16B16A16Sfloat) ||
-	    (base == vk::Format::eR16G16B16A16Sfloat && view == vk::Format::eR16G16B16A16Uint)) {
-		return true;
-	}
+	// Format compatibility is determined by the generic FormatClass-based check below.
+	// Formats with the same compatibility class (e.g. R16G16B16A16_UINT and
+	// R16G16B16A16_SFLOAT both belong to Bit64) are considered compatible,
+	// enabling image view creation across formats in the same class.
 	const auto base_class = FormatClass(base);
 	const auto view_class = FormatClass(view);
 	return view_class != None && (base_class & view_class) == view_class;

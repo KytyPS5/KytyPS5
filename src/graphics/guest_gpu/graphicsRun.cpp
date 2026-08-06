@@ -450,7 +450,9 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		case 6: break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
-	EXIT_NOT_IMPLEMENTED(increment != 0);
+	if (increment != 0) {
+		LOGF("\t warning: write_data increment not implemented, bypassing\n");
+	}
 
 	if (cache_policy > 3 || write_confirm > 1) {
 		LOGF("\t warning: unexpected write_data control 0x%08" PRIx32 "\n", write_control);

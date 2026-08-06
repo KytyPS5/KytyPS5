@@ -344,7 +344,11 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
-	                               IsCompatibleViewFormat(image.format, normalized.format);
+	                               (IsCompatibleViewFormat(image.format, normalized.format) ||
+	                                (static_cast<int>(image.format) == 97 &&
+	                                 static_cast<int>(normalized.format) == 95) ||
+	                                (static_cast<int>(image.format) == 95 &&
+	                                 static_cast<int>(normalized.format) == 97));
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);

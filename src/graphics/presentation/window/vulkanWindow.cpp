@@ -475,7 +475,8 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	     graphics.subgroup_size_control_enabled ? "true" : "false");
 }
 
-static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
+static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device,
+                                     [[maybe_unused]] const VulkanExtensions& r,
                                      uint32_t                        queue_family,
                                      const std::vector<const char*>& device_extensions,
                                      GraphicContext&                 graphics) {
@@ -601,10 +602,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.flags                = {};
 	create_info.pQueueCreateInfos    = &queue_create_info;
 	create_info.queueCreateInfoCount = 1;
-	create_info.enabledLayerCount =
-	    (r.enable_validation_layers ? static_cast<uint32_t>(r.required_layers.size()) : 0);
-	create_info.ppEnabledLayerNames =
-	    (r.enable_validation_layers ? r.required_layers.data() : nullptr);
+	// Instance layers only — device layers are obsolete.
+	// Passing enabledLayerCount != 0 fails VUID-VkDeviceCreateInfo-enabledLayerCount-12384.
+	create_info.enabledLayerCount       = 0;
+	create_info.ppEnabledLayerNames     = nullptr;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;

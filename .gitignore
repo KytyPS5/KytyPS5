@@ -5,3 +5,8 @@ build/
 _Build/vscode-clang/
 _Build/
 cmake-build-debug/
+/_kyty*
+/_build_p*
+/_diff_*
+/_validate_*.log
+/_reconfig_p*

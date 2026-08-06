@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/scratchRingBuffer.h"
 #include "kernel/eventQueue.h"
 
 #include <memory>
@@ -46,6 +47,7 @@ public:
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
+	ScratchRingBuffer&  GetScratchRingBuffer() { return m_scratch_ring; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	void AddEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
@@ -67,6 +69,7 @@ private:
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	GpuResourceManager        m_gpu_resources;
+	ScratchRingBuffer         m_scratch_ring;
 	std::unique_ptr<Gpu>      m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 

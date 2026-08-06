@@ -1,5 +1,8 @@
 #include "common/hostException.h"
 
+#include "common/crashDiagnostics.h"
+#include "common/fatalLog.h"
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +41,8 @@ static_assert(decltype(g_install_state)::is_always_lock_free);
 	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	Common::NoteHaltReason("FailFast", reason);
+	Common::LogFatalToFile(reason != nullptr ? reason : "HostException fail-fast");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 #endif

@@ -134,6 +134,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(!clip_control.IsZClipModeRepresentable());
 	static_params.negative_one_to_one = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable   = clip_control.IsZClipEnabled();
+	const auto depth_bias             = HW::ResolveVulkanDepthBias(mc, ctx.GetPolyOffset());
+	static_params.depth_bias_enable   = depth_bias.enable;
 	static_params.topology            = topology;
 	static_params.samples             = attachment_samples;
 	static_params.sample_shading_enable =

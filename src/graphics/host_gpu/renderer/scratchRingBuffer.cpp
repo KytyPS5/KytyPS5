@@ -10,6 +10,20 @@
 
 namespace Libs::Graphics {
 
+ScratchRingBuffer::~ScratchRingBuffer() {
+	if (m_buffer != nullptr) {
+		m_graphics.DeleteBuffer(*m_buffer);
+		m_buffer.reset();
+	}
+	for (auto& retired: m_retired) {
+		if (retired != nullptr) {
+			m_graphics.DeleteBuffer(*retired);
+		}
+	}
+	m_retired.clear();
+	m_capacity = 0;
+}
+
 void ScratchRingBuffer::EnsureCapacity(uint64_t bytes) {
 	if (bytes == 0) {
 		return;

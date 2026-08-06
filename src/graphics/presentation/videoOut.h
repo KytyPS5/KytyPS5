@@ -100,6 +100,12 @@ KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
 
+// Lightweight Flip/Register counters (diag). No phase soft-HLE.
+[[nodiscard]] uint64_t FlipStatsSubmitCpu();
+[[nodiscard]] uint64_t FlipStatsSubmitGpu();
+[[nodiscard]] uint64_t FlipStatsPresented();
+[[nodiscard]] uint64_t FlipStatsRegisterBuffers();
+
 } // namespace Libs::VideoOut
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_VIDEOOUT_H_ */

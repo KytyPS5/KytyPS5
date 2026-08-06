@@ -27,6 +27,10 @@ target_link_libraries(common
 		spdlog::spdlog
 )
 
+if(WIN32)
+	target_link_libraries(common PRIVATE psapi)
+endif()
+
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)
 set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})
 

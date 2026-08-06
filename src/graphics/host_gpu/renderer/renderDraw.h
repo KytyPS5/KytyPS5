@@ -21,6 +21,9 @@ struct PipelineDynamicParameters {
 	int   scissor_ltrb[4]    = {0};
 
 	float    line_width                                       = 1.0f;
+	float    depth_bias_constant_factor                        = 0.0f;
+	float    depth_bias_clamp                                 = 0.0f;
+	float    depth_bias_slope_factor                           = 0.0f;
 	uint32_t color_write_count                                = 1;
 	bool     color_write_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {true, true};
 
@@ -34,8 +37,9 @@ static_assert(std::is_trivially_copyable_v<PipelineDynamicParameters>);
 static_assert(std::is_standard_layout_v<PipelineDynamicParameters>);
 static_assert(alignof(PipelineDynamicParameters) == 1);
 static_assert(sizeof(PipelineDynamicParameters) ==
-              sizeof(bool) + sizeof(float[3]) + sizeof(float[3]) + sizeof(int[4]) + sizeof(float) +
-                  sizeof(uint32_t) + sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) +
+              sizeof(bool) + sizeof(float[3]) + sizeof(float[3]) + sizeof(int[4]) +
+                  sizeof(float) * 4 + sizeof(uint32_t) +
+                  sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) +
                   sizeof(PipelineStencilDynamicState) * 2);
 
 [[nodiscard]] int32_t ResolveVertexOffset(uint32_t                     index_offset,

@@ -335,6 +335,12 @@ static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandB
 	ret.stencil_front      = depth.stencil_dynamic_front;
 	ret.stencil_back       = depth.stencil_dynamic_back;
 
+	const auto depth_bias =
+	    HW::ResolveVulkanDepthBias(ctx.GetModeControl(), ctx.GetPolyOffset());
+	ret.depth_bias_constant_factor = depth_bias.constant_factor;
+	ret.depth_bias_clamp           = depth_bias.clamp;
+	ret.depth_bias_slope_factor    = depth_bias.slope_factor;
+
 	// CB_COLOR_CONTROL.operation controls special CB operations, not the normal color component
 	// write mask. Use CB_TARGET_MASK here so scanout passes with mode=Disable do not go black.
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
@@ -378,6 +384,10 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 		line_width = 1.0f;
 	}
 	vk_buffer.setLineWidth(line_width);
+
+	vk_buffer.setDepthBias(dynamic_params.depth_bias_constant_factor,
+	                       dynamic_params.depth_bias_clamp,
+	                       dynamic_params.depth_bias_slope_factor);
 
 	if (dynamic_params.stencil_test_enable) {
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,

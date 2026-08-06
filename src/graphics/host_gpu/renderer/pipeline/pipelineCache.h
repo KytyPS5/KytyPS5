@@ -36,6 +36,7 @@ struct PipelineStaticParameters {
 	float                      viewport_offset[3]       = {};
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
+	bool                       depth_bias_enable        = false;
 	int                        scissor_ltrb[4]          = {0};
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
 	uint32_t                   samples                  = 1;
@@ -78,7 +79,7 @@ static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
 static_assert(sizeof(PipelineStaticParameters) ==
-              sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 2 + sizeof(int[4]) +
+              sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 3 + sizeof(int[4]) +
                   sizeof(vk::PrimitiveTopology) + sizeof(uint32_t) + sizeof(bool) * 4 +
                   sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 + sizeof(bool) +
                   sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +

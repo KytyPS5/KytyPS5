@@ -1056,6 +1056,37 @@ void SetFlexibleMemorySize(uint64_t size) {
 	     size / (1024ull * 1024ull));
 }
 
+void SyncFlexibleMemoryFromProcParam(uint64_t flex_scalar) {
+	constexpr uint64_t flexible_base = 64ull * 1024ull * 1024ull;
+	const auto         configured    = flex_scalar + flexible_base;
+	if (g_flexible_memory_size == configured) {
+		return;
+	}
+	if (g_flexible_memory_size_frozen || g_guest_address_space != nullptr) {
+		LOGF("SyncFlexibleMemoryFromProcParam: kernel flex 0x%016" PRIx64
+		     " != proc_param 0x%016" PRIx64 " (frozen; keeping kernel)\n",
+		     g_flexible_memory_size, configured);
+		return;
+	}
+	LOGF("SyncFlexibleMemoryFromProcParam: kernel flex 0x%016" PRIx64
+	     " != proc_param 0x%016" PRIx64 ", updating kernel\n",
+	     g_flexible_memory_size, configured);
+	SetFlexibleMemorySize(configured);
+}
+
+void ApplyMemoryRegionsFromProcParam(uint64_t flex_scalar) {
+	constexpr uint64_t flexible_base = 64ull * 1024ull * 1024ull;
+	const auto         configured    = flex_scalar + flexible_base;
+
+	SyncFlexibleMemoryFromProcParam(flex_scalar);
+
+	const auto direct = PhysicalMemory::Size();
+	LOGF("ApplyMemoryRegionsFromProcParam: direct=0x%016" PRIx64 " (%" PRIu64 " MiB)"
+	     " flexible=0x%016" PRIx64 " (%" PRIu64 " MiB) scalar=0x%016" PRIx64 "\n",
+	     direct, direct / (1024ull * 1024ull), configured, configured / (1024ull * 1024ull),
+	     flex_scalar);
+}
+
 bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
                            uint64_t* phys_addr_out, int memory_type, bool pool_expansion) {
 	if (phys_addr_out == nullptr) {

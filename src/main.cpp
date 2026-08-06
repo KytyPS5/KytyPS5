@@ -1,5 +1,6 @@
 #include "common/common.h"
 #include "common/commonSubsystem.h"
+#include "common/crashDiagnostics.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
@@ -265,6 +266,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
+	if (Common::RunExitWatcherIfRequested(argc, argv)) {
+		return 0;
+	}
+
+	Common::InstallCrashDiagnostics();
+
 	auto& slist = *SubsystemsList::Instance();
 
 	slist.SetArgs(argc, argv);

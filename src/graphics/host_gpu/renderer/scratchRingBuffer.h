@@ -19,7 +19,7 @@ public:
 	explicit ScratchRingBuffer(GraphicContext& graphics): m_graphics(graphics) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
-	~ScratchRingBuffer() { KYTY_NOT_IMPLEMENTED; }
+	~ScratchRingBuffer();
 	KYTY_CLASS_NO_COPY(ScratchRingBuffer);
 
 	void EnsureCapacity(uint64_t bytes);

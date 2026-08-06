@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <list>
 #include <thread>
 #include <vector>
@@ -65,6 +66,26 @@ enum class VideoOutEventKind : uintptr_t {
 };
 
 enum class FlipRequestSource { Cpu, GpuEop };
+
+namespace FlipStats {
+std::atomic<uint64_t> submit_cpu {0};
+std::atomic<uint64_t> submit_gpu {0};
+std::atomic<uint64_t> presented {0};
+std::atomic<uint64_t> register_buffers {0};
+} // namespace FlipStats
+
+uint64_t FlipStatsSubmitCpu() {
+	return FlipStats::submit_cpu.load(std::memory_order_relaxed);
+}
+uint64_t FlipStatsSubmitGpu() {
+	return FlipStats::submit_gpu.load(std::memory_order_relaxed);
+}
+uint64_t FlipStatsPresented() {
+	return FlipStats::presented.load(std::memory_order_relaxed);
+}
+uint64_t FlipStatsRegisterBuffers() {
+	return FlipStats::register_buffers.load(std::memory_order_relaxed);
+}
 
 struct VideoOutEventState;
 
@@ -1132,6 +1153,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	m_presenter.Present(*r.frame);
+	FlipStats::presented.fetch_add(1, std::memory_order_relaxed);
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1381,6 +1403,7 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		     attribute->dcc_control);
 	}
 
+	FlipStats::register_buffers.fetch_add(1, std::memory_order_relaxed);
 	return OK;
 }
 
@@ -1467,6 +1490,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 		return result;
 	}
 	g_video_out_driver->SubmitFlipPreparation(request_id);
+	FlipStats::submit_cpu.fetch_add(1, std::memory_order_relaxed);
 
 	return OK;
 }
@@ -1481,6 +1505,7 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 		return result;
 	}
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
+	FlipStats::submit_gpu.fetch_add(1, std::memory_order_relaxed);
 
 	return OK;
 }

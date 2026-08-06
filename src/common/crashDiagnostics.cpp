@@ -26,6 +26,24 @@ namespace {
 constexpr size_t kHleRingSize = 64;
 constexpr size_t kHleNameMax  = 96;
 
+[[nodiscard]] bool CrashDiagVerbose() {
+	static int cached = -1;
+	if (cached < 0) {
+		const char* env = std::getenv("KYTY_CRASH_DIAG_VERBOSE");
+		cached          = (env != nullptr && env[0] == '1' && env[1] == '\0') ? 1 : 0;
+	}
+	return cached != 0;
+}
+
+// Boot-only diagnostics chatter. Real HaltReason / fatal paths stay unmuted.
+void CrashDiagBootLog(const char* message) {
+	if (!CrashDiagVerbose() || message == nullptr) {
+		return;
+	}
+	EmergencyLogRaw(message);
+	::printf("%s\n", message);
+}
+
 struct HleRingEntry {
 	uint32_t tid = 0;
 	char     library[32] {};
@@ -144,12 +162,12 @@ static void SpawnExitWatcher() {
 		char message[320];
 		std::snprintf(message, sizeof(message), "CrashTrace: exit watcher spawned out=%s",
 		              out_path);
-		EmergencyLogRaw(message);
+		CrashDiagBootLog(message);
 	} else {
 		char message[160];
 		std::snprintf(message, sizeof(message), "CrashTrace: exit watcher spawn FAILED gle=%lu",
 		              static_cast<unsigned long>(GetLastError()));
-		EmergencyLogRaw(message);
+		CrashDiagBootLog(message);
 	}
 }
 #endif
@@ -870,7 +888,7 @@ static void BypassGsInAllModules() {
 	              "CrashTrace: GS bypass modules=%d cookie_ret=%d fastfail2_nops=%d "
 	              "int29_safe_nops=%d",
 	              modules, cookie_rets, fastfail_nops, int29_nops);
-	EmergencyLogRaw(message);
+	CrashDiagBootLog(message);
 }
 
 static bool HookReportGsFailureTarget(void* target, const char* tag, int* hooked) {
@@ -894,7 +912,7 @@ static bool HookReportGsFailureTarget(void* target, const char* tag, int* hooked
 		char message[192];
 		std::snprintf(message, sizeof(message),
 		              "CrashTrace: __report_gsfailure hook FAILED at %s", tag);
-		EmergencyLogRaw(message);
+		CrashDiagBootLog(message);
 		return false;
 	}
 	g_gs_hooked_targets[*hooked] = target;
@@ -903,7 +921,7 @@ static bool HookReportGsFailureTarget(void* target, const char* tag, int* hooked
 	std::snprintf(message, sizeof(message),
 	              "CrashTrace: __report_gsfailure INLINE hooked in %s stolen=%zu ptr=%p", tag,
 	              stolen, target);
-	EmergencyLogRaw(message);
+	CrashDiagBootLog(message);
 	return true;
 }
 
@@ -953,7 +971,7 @@ static void InstallGsFailureHook() {
 	ScanModuleForLocalReportGsFailure(exe, "kyty_emulator.exe", &hooked);
 	char message[96];
 	std::snprintf(message, sizeof(message), "CrashTrace: __report_gsfailure hooks=%d", hooked);
-	EmergencyLogRaw(message);
+	CrashDiagBootLog(message);
 
 	BypassGsInAllModules();
 }
@@ -1062,11 +1080,11 @@ static void InstallExitHooks() {
 
 	// Do not hook ntdll RtlExitUserProcess / NtTerminateProcess — fragile trampolines and
 	// re-entrancy. Soft-idle 321 is covered by ExitProcess + TerminateProcess IAT hooks.
-	EmergencyLogRaw("CrashTrace: NtTerminateProcess/RtlExitUserProcess unhooked (passthrough)");
+	CrashDiagBootLog("CrashTrace: NtTerminateProcess/RtlExitUserProcess unhooked (passthrough)");
 	char message[256];
 	std::snprintf(message, sizeof(message),
 	              "CrashTrace: Exit=%d Term=%d modules=%zu", exit_hits, term_hits, count);
-	EmergencyLogRaw(message);
+	CrashDiagBootLog(message);
 }
 
 void InstallCrashDiagnostics() {
@@ -1077,8 +1095,11 @@ void InstallCrashDiagnostics() {
 	PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY shadow_stack_policy {};
 	if (SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, &shadow_stack_policy,
 	                               sizeof(shadow_stack_policy)) == 0) {
-		::printf("Warning: SetProcessMitigationPolicy(UserShadowStack) failed: 0x%08" PRIx32 "\n",
-		         static_cast<uint32_t>(GetLastError()));
+		if (CrashDiagVerbose()) {
+			::printf("Warning: SetProcessMitigationPolicy(UserShadowStack) failed: 0x%08" PRIx32
+			         "\n",
+			         static_cast<uint32_t>(GetLastError()));
+		}
 	}
 
 	PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY shadow_stack_state {};
@@ -1094,17 +1115,18 @@ void InstallCrashDiagnostics() {
 		    static_cast<unsigned>(shadow_stack_state.AuditUserShadowStack),
 		    static_cast<unsigned>(shadow_stack_state.SetContextIpValidation),
 		    static_cast<unsigned>(shadow_stack_state.EnableUserShadowStackStrictMode));
-		::printf("%s\n", message);
-		LogFatalToFile(message);
-	} else {
+		CrashDiagBootLog(message);
+	} else if (CrashDiagVerbose()) {
 		::printf("Warning: GetProcessMitigationPolicy(UserShadowStack) failed: 0x%08" PRIx32 "\n",
 		         static_cast<uint32_t>(GetLastError()));
 	}
 
 	if (AddVectoredExceptionHandler(1, FatalFailfastVectoredHandler) == nullptr) {
-		::printf("Warning: AddVectoredExceptionHandler(FatalFailfast) failed\n");
+		if (CrashDiagVerbose()) {
+			::printf("Warning: AddVectoredExceptionHandler(FatalFailfast) failed\n");
+		}
 	} else {
-		::printf("CrashTrace: FatalFailfast VEH installed\n");
+		CrashDiagBootLog("CrashTrace: FatalFailfast VEH installed");
 	}
 
 	SetUnhandledExceptionFilter(UnhandledFilter);
@@ -1115,7 +1137,7 @@ void InstallCrashDiagnostics() {
 	SpawnExitWatcher();
 	InstallGsFailureHook();
 
-	EmergencyLogRaw("CrashTrace: emergency log + heartbeat + unhandled filter armed");
+	CrashDiagBootLog("CrashTrace: emergency log + heartbeat + unhandled filter armed");
 
 	// Background pulse — if this stops updating, death was not a clean Exit/Terminate path.
 	std::thread([] {
@@ -1129,7 +1151,9 @@ void InstallCrashDiagnostics() {
 	}).detach();
 
 	// `_set_security_error_handler` is gone on modern UCRT; rely on InstallGsFailureHook above.
-	EmergencyLogRaw("CrashTrace: security_error_handler skipped (use __report_gsfailure hook)");
+	CrashDiagBootLog("CrashTrace: security_error_handler skipped (use __report_gsfailure hook)");
+
+	::printf("CrashTrace: diagnostics installed\n");
 #endif
 }
 

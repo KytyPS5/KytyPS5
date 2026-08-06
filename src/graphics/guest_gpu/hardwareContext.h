@@ -482,6 +482,26 @@ struct VsShaderResource2 {
 	uint8_t shared_vgprs      = 0;
 };
 
+struct HsShaderResource1 {
+	uint8_t vgprs                     = 0;
+	uint8_t priority                  = 0;
+	uint8_t float_mode                = 0;
+	bool    dx10_clamp                = false;
+	bool    debug_mode                = false;
+	bool    ieee_mode                 = false;
+	bool    require_forward_progress  = false;
+	bool    threadgroup_configuration = false;
+	uint8_t ls_vgpr_component_count   = 0;
+	bool    fp16_overflow             = false;
+};
+
+struct HsShaderResource2 {
+	bool     scratch_en   = false;
+	uint8_t  user_sgpr    = 0;
+	uint16_t lds_size     = 0;
+	uint8_t  shared_vgprs = 0;
+};
+
 struct PsShaderResource1 {
 	uint8_t vgprs                    = 0;
 	uint8_t sgprs                    = 0;
@@ -500,7 +520,7 @@ struct PsShaderResource2 {
 	uint8_t user_sgpr              = 0;
 	bool    wave_cnt_en            = false;
 	uint8_t extra_lds_size         = 0;
-	bool    raster_ordered_shading = false;
+	uint8_t raster_ordered_shading = 0;
 	uint8_t shared_vgprs           = 0;
 };
 
@@ -513,26 +533,27 @@ struct PsStageRegisters {
 
 struct CsStageRegisters {
 
-	uint64_t data_addr      = 0;
-	uint32_t num_thread_x   = 0;
-	uint32_t num_thread_y   = 0;
-	uint32_t num_thread_z   = 0;
-	uint8_t  vgprs          = 0;
-	uint8_t  sgprs          = 0;
-	uint8_t  float_mode     = 0;
-	bool     dx10_clamp     = false;
-	bool     ieee_mode      = false;
-	bool     fp16_overflow  = false;
-	uint8_t  bulky          = 0;
-	uint8_t  wave_size      = 64;
-	uint8_t  scratch_en     = 0;
-	uint8_t  user_sgpr      = 0;
-	uint8_t  tgid_x_en      = 0;
-	uint8_t  tgid_y_en      = 0;
-	uint8_t  tgid_z_en      = 0;
-	uint8_t  tg_size_en     = 0;
-	uint8_t  tidig_comp_cnt = 0;
-	uint8_t  lds_size       = 0;
+	uint64_t data_addr                 = 0;
+	uint32_t num_thread_x              = 0;
+	uint32_t num_thread_y              = 0;
+	uint32_t num_thread_z              = 0;
+	uint8_t  vgprs                     = 0;
+	uint8_t  sgprs                     = 0;
+	uint8_t  float_mode                = 0;
+	bool     dx10_clamp                = false;
+	bool     ieee_mode                 = false;
+	bool     fp16_overflow             = false;
+	bool     bulky                     = false;
+	bool     threadgroup_configuration = false;
+	uint8_t  wave_size                 = 64;
+	bool     scratch_en                = false;
+	uint8_t  user_sgpr                 = 0;
+	bool     tgid_x_en                 = false;
+	bool     tgid_y_en                 = false;
+	bool     tgid_z_en                 = false;
+	bool     tg_size_en                = false;
+	uint8_t  tidig_comp_cnt            = 0;
+	uint16_t lds_size                  = 0;
 };
 
 struct EsStageRegisters {
@@ -547,24 +568,24 @@ struct LsStageRegisters {
 
 struct HsStageRegisters {
 	uint64_t          data_addr = 0;
-	VsShaderResource1 rsrc1;
-	VsShaderResource2 rsrc2;
+	HsShaderResource1 rsrc1;
+	HsShaderResource2 rsrc2;
 	uint64_t          chksum = 0;
 };
 
 struct GsShaderResource1 {
-	uint8_t vgprs                    = 0;
-	uint8_t sgprs                    = 0;
-	uint8_t priority                 = 0;
-	uint8_t float_mode               = 0;
-	bool    dx10_clamp               = false;
-	bool    debug_mode               = false;
-	bool    ieee_mode                = false;
-	bool    cu_group_enable          = false;
-	bool    require_forward_progress = false;
-	bool    lds_configuration        = false;
-	uint8_t gs_vgpr_component_count  = 0;
-	bool    fp16_overflow            = false;
+	uint8_t vgprs                     = 0;
+	uint8_t sgprs                     = 0;
+	uint8_t priority                  = 0;
+	uint8_t float_mode                = 0;
+	bool    dx10_clamp                = false;
+	bool    debug_mode                = false;
+	bool    ieee_mode                 = false;
+	bool    cu_group_enable           = false;
+	bool    require_forward_progress  = false;
+	bool    threadgroup_configuration = false;
+	uint8_t gs_vgpr_component_count   = 0;
+	bool    fp16_overflow             = false;
 };
 
 struct GsShaderResource2 {
@@ -1038,8 +1059,8 @@ public:
 	void SetLsShaderResource1(const VsShaderResource1& rsrc1) { m_vs.ls_regs.rsrc1 = rsrc1; }
 	void SetLsShaderResource2(const VsShaderResource2& rsrc2) { m_vs.ls_regs.rsrc2 = rsrc2; }
 	void SetHsShaderBase(uint64_t addr) { m_vs.hs_regs.data_addr = addr; }
-	void SetHsShaderResource1(const VsShaderResource1& rsrc1) { m_vs.hs_regs.rsrc1 = rsrc1; }
-	void SetHsShaderResource2(const VsShaderResource2& rsrc2) { m_vs.hs_regs.rsrc2 = rsrc2; }
+	void SetHsShaderResource1(const HsShaderResource1& rsrc1) { m_vs.hs_regs.rsrc1 = rsrc1; }
+	void SetHsShaderResource2(const HsShaderResource2& rsrc2) { m_vs.hs_regs.rsrc2 = rsrc2; }
 	void SetHsShaderChksum(uint32_t value) { m_vs.hs_regs.chksum = value; }
 	void SetGsShaderBase(uint64_t addr) { m_vs.gs_regs.data_addr = addr; }
 	void SetGsShaderResource1(const GsShaderResource1& rsrc1) { m_vs.gs_regs.rsrc1 = rsrc1; }

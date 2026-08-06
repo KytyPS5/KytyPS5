@@ -1320,26 +1320,28 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                         Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_MASK) != 0u;
 			cs_regs.fp16_overflow = ((value >> Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_MASK) != 0u;
-			cs_regs.bulky =
-			    (value >> Pm4::COMPUTE_PGM_RSRC1_BULKY_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK;
-			cs_regs.wave_size = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-			                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u)
-			                        ? 32u
-			                        : 64u;
+			cs_regs.bulky         = ((value >> Pm4::COMPUTE_PGM_RSRC1_BULKY_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK) != 0u;
+			cs_regs.threadgroup_configuration = ((value >> Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT) &
+			                                     Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_MASK) != 0u;
+			cs_regs.wave_size                 = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
+			                                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u)
+			                                        ? 32u
+			                                        : 64u;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
-			cs_regs.scratch_en     = (value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_MASK;
+			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_MASK) != 0u;
 			cs_regs.user_sgpr      = (value >> Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_MASK;
-			cs_regs.tgid_x_en      = (value >> Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK;
-			cs_regs.tgid_y_en      = (value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK;
-			cs_regs.tgid_z_en      = (value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK;
-			cs_regs.tg_size_en     = (value >> Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_MASK;
+			cs_regs.tgid_x_en      = ((value >> Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0u;
+			cs_regs.tgid_y_en      = ((value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK) != 0u;
+			cs_regs.tgid_z_en      = ((value >> Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK) != 0u;
+			cs_regs.tg_size_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_SHIFT) &
+			                          Pm4::COMPUTE_PGM_RSRC2_TG_SIZE_EN_MASK) != 0u;
 			cs_regs.tidig_comp_cnt = (value >> Pm4::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_MASK;
 			cs_regs.lds_size       = (value >> Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT) &
@@ -4241,29 +4243,28 @@ void GraphicsInitJmpTablesShIndirect() {
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HW::VsShaderResource1 r1;
-		r1.vgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPRS);
-		r1.sgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, SGPRS);
-		r1.priority             = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, PRIORITY);
-		r1.float_mode           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FLOAT_MODE);
-		r1.dx10_clamp           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, DX10_CLAMP) != 0;
-		r1.ieee_mode            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, IEEE_MODE) != 0;
-		r1.vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT);
-		r1.cu_group_enable = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, CU_GROUP_ENABLE) != 0;
+		HW::HsShaderResource1 r1;
+		r1.vgprs      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, VGPRS);
+		r1.priority   = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, PRIORITY);
+		r1.float_mode = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FLOAT_MODE);
+		r1.dx10_clamp = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, DX10_CLAMP) != 0;
+		r1.debug_mode = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, DEBUG_MODE) != 0;
+		r1.ieee_mode  = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, IEEE_MODE) != 0;
 		r1.require_forward_progress =
-		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FWD_PROGRESS) != 0;
-		r1.fp16_overflow = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FP16_OVFL) != 0;
+		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FWD_PROGRESS) != 0;
+		r1.threadgroup_configuration = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, WGP_MODE) != 0;
+		r1.ls_vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, LS_VGPR_COMP_CNT);
+		r1.fp16_overflow           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FP16_OVFL) != 0;
 		cp.GetShCtx().SetHsShaderResource1(r1);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HW::VsShaderResource2 r2;
-		r2.scratch_en        = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SCRATCH_EN) != 0;
-		r2.user_sgpr         = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR) +
-		                       (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR_MSB) << 5u);
-		r2.offchip_lds       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN) != 0;
-		r2.streamout_enabled = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SO_EN) != 0;
-		r2.shared_vgprs      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SHARED_VGPR_CNT);
+		HW::HsShaderResource2 r2;
+		r2.scratch_en   = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, SCRATCH_EN) != 0;
+		r2.user_sgpr    = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, USER_SGPR) +
+		                  (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, USER_SGPR_MSB) << 5u);
+		r2.lds_size     = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, LDS_SIZE);
+		r2.shared_vgprs = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, SHARED_VGPR_CNT);
 		cp.GetShCtx().SetHsShaderResource2(r2);
 	};
 
@@ -4351,7 +4352,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r1.cu_group_enable = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, CU_GROUP_ENABLE) != 0;
 		r1.require_forward_progress =
 		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, FWD_PROGRESS) != 0;
-		r1.lds_configuration       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, WGP_MODE) != 0;
+		r1.threadgroup_configuration = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, WGP_MODE) != 0;
 		r1.gs_vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, GS_VGPR_COMP_CNT);
 		r1.fp16_overflow           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, FP16_OVFL) != 0;
 		cp.GetShCtx().SetGsShaderResource1(r1);
@@ -4411,7 +4412,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r2.wave_cnt_en    = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, WAVE_CNT_EN);
 		r2.extra_lds_size = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, EXTRA_LDS_SIZE);
 		r2.raster_ordered_shading =
-		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, LOAD_INTRAWAVE_COLLISION);
+		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, RASTER_ORDERED_SHADING);
 		r2.shared_vgprs = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, SHARED_VGPR_CNT);
 		cp.GetShCtx().SetPsShaderResource2(r2);
 	};

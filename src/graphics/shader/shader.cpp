@@ -302,7 +302,7 @@ static void vs_check(const HW::VertexShaderInfo& vs, const HW::ShaderRegisters& 
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.ieee_mode != false);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.cu_group_enable != false);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.require_forward_progress != false);
-		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.lds_configuration != false);
+		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.threadgroup_configuration != false);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.gs_vgpr_component_count != 3);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.fp16_overflow != false);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc2.scratch_en != false);
@@ -374,7 +374,7 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 			     ps.rsrc2.extra_lds_size);
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(ps.rsrc2.raster_ordered_shading != false);
+	EXIT_NOT_IMPLEMENTED(ps.rsrc2.raster_ordered_shading != 0);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc2.shared_vgprs != 0);
 
 	if (sh.shader_z_format != 0x00000000 && sh.shader_z_format != 0x00000001 &&

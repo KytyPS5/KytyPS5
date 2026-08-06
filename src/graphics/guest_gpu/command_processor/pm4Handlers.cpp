@@ -1312,6 +1312,14 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_VGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_VGPRS_MASK;
 			cs_regs.sgprs =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_SGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_SGPRS_MASK;
+			cs_regs.float_mode    = (value >> Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT) &
+			                        Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK;
+			cs_regs.dx10_clamp    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_MASK) != 0u;
+			cs_regs.ieee_mode     = ((value >> Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_MASK) != 0u;
+			cs_regs.fp16_overflow = ((value >> Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_MASK) != 0u;
 			cs_regs.bulky =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_BULKY_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK;
 			cs_regs.wave_size = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &

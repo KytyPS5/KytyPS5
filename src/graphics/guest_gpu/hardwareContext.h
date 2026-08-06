@@ -519,6 +519,10 @@ struct CsStageRegisters {
 	uint32_t num_thread_z   = 0;
 	uint8_t  vgprs          = 0;
 	uint8_t  sgprs          = 0;
+	uint8_t  float_mode     = 0;
+	bool     dx10_clamp     = false;
+	bool     ieee_mode      = false;
+	bool     fp16_overflow  = false;
 	uint8_t  bulky          = 0;
 	uint8_t  wave_size      = 64;
 	uint8_t  scratch_en     = 0;

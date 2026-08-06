@@ -168,14 +168,6 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 
 namespace {
 
-static uint64_t GetLevelSrcOffset(const TileSizeOffset& level_size) {
-	return (level_size.src_size != 0 ? level_size.src_offset : level_size.offset);
-}
-
-static uint64_t GetLevelSrcSize(const TileSizeOffset& level_size) {
-	return (level_size.src_size != 0 ? level_size.src_size : level_size.size);
-}
-
 static uint32_t GetTextureLevelDepth(uint32_t depth, uint32_t level, bool volume_texture) {
 	return volume_texture ? std::max(depth >> level, 1u) : depth;
 }
@@ -186,20 +178,6 @@ static size_t GetTextureRegionCount(uint32_t depth, uint64_t levels, bool volume
 		count += GetTextureLevelDepth(depth, level, volume_texture);
 	}
 	return count;
-}
-
-uint64_t TextureUploadSliceSourceOffset(const TextureUploadLayout& layout, uint32_t level,
-                                        uint32_t slice) {
-	if (level >= 16 || layout.level_sizes[level].size == 0) {
-		EXIT("invalid texture upload slice source, level=%u slice=%u\n", level, slice);
-	}
-	const auto level_offset = GetLevelSrcOffset(layout.level_sizes[level]);
-	const auto slice_stride =
-	    layout.source_slice_stride != 0 ? layout.source_slice_stride : layout.slice_stride;
-	if (slice_stride != 0 && slice > (UINT64_MAX - level_offset) / slice_stride) {
-		EXIT("texture upload slice source offset overflow, level=%u slice=%u\n", level, slice);
-	}
-	return level_offset + static_cast<uint64_t>(slice) * slice_stride;
 }
 
 vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t s) {
@@ -241,12 +219,11 @@ vk::Format TextureGetFormat(uint32_t fmt) {
 
 namespace {
 
-uint64_t CalcTextureSliceStride(const TileSizeOffset* level_sizes, uint64_t levels,
+uint64_t CalcTextureSliceStride(const TextureUploadMipLayout* mips, uint64_t levels,
                                 uint64_t total_size, uint32_t depth) {
 	uint64_t stride = 0;
 	for (uint32_t i = 0; i < levels; i++) {
-		stride =
-		    std::max(stride, static_cast<uint64_t>(level_sizes[i].offset) + level_sizes[i].size);
+		stride = std::max(stride, mips[i].offset + mips[i].size);
 	}
 
 	if (depth > 1 && total_size != 0 && total_size % depth == 0) {
@@ -259,39 +236,26 @@ uint64_t CalcTextureSliceStride(const TileSizeOffset* level_sizes, uint64_t leve
 	return stride;
 }
 
-uint64_t CalcLinearUploadLevelSize(uint32_t fmt, uint32_t pitch, uint32_t height) {
-	if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(fmt);
-	    bytes_per_element != 0) {
-		return static_cast<uint64_t>(pitch) * height * bytes_per_element;
-	}
-
-	if (const uint32_t bytes_per_block = Prospero::BlockCompressedBytesPerBlock(fmt);
-	    bytes_per_block != 0) {
-		const uint32_t blocks_w = std::max((pitch + 3u) / 4u, 1u);
-		const uint32_t blocks_h = std::max((height + 3u) / 4u, 1u);
-		return static_cast<uint64_t>(blocks_w) * blocks_h * bytes_per_block;
-	}
-
-	return 0;
+uint64_t CalcLinearUploadLevelSize(const TileTextureElementLayout& element, uint32_t pitch,
+                                   uint32_t height) {
+	const uint32_t elements_w =
+	    std::max((pitch + element.texel_width - 1u) / element.texel_width, 1u);
+	const uint32_t elements_h =
+	    std::max((height + element.texel_height - 1u) / element.texel_height, 1u);
+	return static_cast<uint64_t>(elements_w) * elements_h * element.bytes;
 }
 
-uint64_t SetLinearUploadLevels(TileSizeOffset* level_sizes, uint32_t fmt, uint64_t height,
+uint64_t SetLinearUploadLevels(TextureUploadMipLayout*         mips,
+                               const TileTextureElementLayout& element, uint64_t height,
                                uint64_t levels, uint32_t base_pitch) {
 	uint64_t offset = 0;
 	auto     pitch  = base_pitch;
 	auto     h      = static_cast<uint32_t>(height);
 
 	for (uint32_t i = 0; i < levels; i++) {
-		const auto size = CalcLinearUploadLevelSize(fmt, pitch, h);
-		EXIT_NOT_IMPLEMENTED(size > 0xffffffffull);
-		EXIT_NOT_IMPLEMENTED(offset > 0xffffffffull);
-
-		level_sizes[i].size       = static_cast<uint32_t>(size);
-		level_sizes[i].offset     = static_cast<uint32_t>(offset);
-		level_sizes[i].src_size   = 0;
-		level_sizes[i].src_offset = 0;
-		level_sizes[i].x          = 0;
-		level_sizes[i].y          = 0;
+		const auto size = CalcLinearUploadLevelSize(element, pitch, h);
+		mips[i].size    = size;
+		mips[i].offset  = offset;
 
 		offset += size;
 		if (pitch > 1) {
@@ -307,141 +271,123 @@ uint64_t SetLinearUploadLevels(TileSizeOffset* level_sizes, uint32_t fmt, uint64
 
 } // namespace
 
-TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64_t height,
-                                            uint64_t levels, uint32_t depth, uint64_t pitch,
-                                            uint64_t tile, uint64_t upload_size,
-                                            bool allow_depth_tile, bool volume_texture,
-                                            const char* owner) {
+TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint32_t width, uint32_t height,
+                                            uint32_t levels, uint32_t depth, uint32_t tile,
+                                            uint64_t upload_size, bool allow_depth_tile,
+                                            bool volume_texture, const char* owner) {
 	TextureUploadLayout layout {};
-	layout.tile           = static_cast<uint32_t>(tile);
-	layout.pitch          = static_cast<uint32_t>(pitch);
-	layout.texel_block    = Prospero::BlockCompressedBytesPerBlock(fmt) != 0 ? 4u : 1u;
-	layout.volume_texture = volume_texture;
+	layout.surface.description = {
+	    fmt,
+	    tile,
+	    volume_texture ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+	    width,
+	    height,
+	    volume_texture ? depth : 1u,
+	    levels,
+	    volume_texture ? 1u : depth,
+	};
+	const auto&              description = layout.surface.description;
+	const auto               tile_mode   = static_cast<Prospero::TileMode>(description.tile_mode);
+	TileTextureElementLayout element {};
 
-	if (fmt != 0) {
-		if (layout.tile != 0) {
-			const auto tile_mode = static_cast<Prospero::TileMode>(layout.tile);
-			switch (tile_mode) {
-				case Prospero::TileMode::kStandard256B:
-					if (TileIsStandard256BTextureSupported(fmt)) {
-						layout.tile_family = TileBlockFamily::Standard256B;
-					}
-					break;
-				case Prospero::TileMode::kStandard4KB:
-					if (TileIsStandard4KBTextureSupported(fmt)) {
-						layout.tile_family = TileBlockFamily::Standard4KB;
-					}
-					break;
-				case Prospero::TileMode::kStandard64KB:
-					if (TileIsStandard64KBTextureSupported(fmt)) {
-						layout.tile_family = TileBlockFamily::Standard64KB;
-					}
-					break;
-				case Prospero::TileMode::kPrt:
-					if (TileIsStandard64KBTextureSupported(fmt)) {
-						layout.tile_family = TileBlockFamily::Prt64KB;
-					}
-					break;
-				case Prospero::TileMode::kRenderTarget:
-					if (Prospero::RenderTargetBytesPerElement(fmt) != 0) {
-						layout.tile_family = TileBlockFamily::RenderTarget64KB;
-					}
-					break;
-				case Prospero::TileMode::kDepth:
-					if (allow_depth_tile && Prospero::RenderTargetBytesPerElement(fmt) != 0) {
-						layout.tile_family = TileBlockFamily::Depth64KB;
-					}
-					break;
-				default: break;
-			}
-			if (layout.tile_family == TileBlockFamily::Count) {
-				EXIT("%s: unsupported typed tiled upload: fmt=%u tile=%u "
-				     "size=%" PRIu64 " extent=%" PRIu64 "x%" PRIu64 " pitch=%" PRIu64
-				     " levels=%" PRIu64 "\n",
-				     owner, static_cast<uint32_t>(fmt), layout.tile, upload_size, width, height,
-				     pitch, levels);
-			}
-		}
-
-		layout.pitch = TileGetTexturePitch(fmt, width, levels, layout.tile);
-
-		TileGetTextureSize(fmt, width, height, layout.pitch, levels, layout.tile, nullptr,
-		                   layout.level_sizes, layout.padded_sizes);
-
-		if (static_cast<Prospero::TileMode>(layout.tile) != Prospero::TileMode::kLinear) {
-			if (layout.volume_texture) {
-				layout.slice_stride = SetLinearUploadLevels(layout.level_sizes, fmt, height, levels,
-				                                            static_cast<uint32_t>(width));
-			} else {
-				TileSizeOffset tiled_levels[16] {};
-				std::copy_n(layout.level_sizes, levels, tiled_levels);
-				layout.source_slice_stride =
-				    CalcTextureSliceStride(tiled_levels, levels, upload_size, depth);
-				SetLinearUploadLevels(layout.level_sizes, fmt, height, levels, layout.pitch);
-				for (uint32_t i = 0; i < levels; ++i) {
-					if (tiled_levels[i].src_size > tiled_levels[i].size) {
-						layout.first_tail_level = std::min(layout.first_tail_level, i);
-					}
-					layout.level_sizes[i].src_offset = GetLevelSrcOffset(tiled_levels[i]);
-					layout.level_sizes[i].src_size   = GetLevelSrcSize(tiled_levels[i]);
-					layout.level_sizes[i].x          = tiled_levels[i].x;
-					layout.level_sizes[i].y          = tiled_levels[i].y;
-				}
-			}
-		} else if (layout.volume_texture) {
-			layout.slice_stride =
-			    CalcTextureSliceStride(layout.level_sizes, levels, upload_size, depth);
-		}
-	} else {
+	if (fmt == 0) {
 		EXIT("%s: legacy texture upload format unsupported: fmt=0 tile=%u size=%" PRIu64
-		     " extent=%" PRIu64 "x%" PRIu64 " pitch=%" PRIu64 " levels=%" PRIu64 "\n",
-		     owner, layout.tile, upload_size, width, height, pitch, levels);
+		     " extent=%ux%u levels=%u\n",
+		     owner, description.tile_mode, upload_size, width, height, levels);
 	}
 
-	if (!layout.volume_texture) {
-		layout.slice_stride =
-		    CalcTextureSliceStride(layout.level_sizes, levels, upload_size, depth);
+	switch (tile_mode) {
+		case Prospero::TileMode::kLinear:
+			if (!TileGetTextureElementLayout(fmt, element)) {
+				EXIT("%s: unsupported linear texture format: fmt=%u\n", owner, fmt);
+			}
+			break;
+		case Prospero::TileMode::kDepth:
+			if (!allow_depth_tile || !TileGetTiledTextureLayout(description, layout.surface)) {
+				EXIT("%s: unsupported typed tiled upload: fmt=%u tile=%u "
+				     "size=%" PRIu64 " extent=%ux%u levels=%u\n",
+				     owner, static_cast<uint32_t>(fmt), description.tile_mode, upload_size, width,
+				     height, levels);
+			}
+			break;
+		default:
+			if (!TileGetTiledTextureLayout(description, layout.surface)) {
+				EXIT("%s: unsupported typed tiled upload: fmt=%u tile=%u "
+				     "size=%" PRIu64 " extent=%ux%u levels=%u\n",
+				     owner, static_cast<uint32_t>(fmt), description.tile_mode, upload_size, width,
+				     height, levels);
+			}
+			break;
+	}
+
+	if (tile_mode != Prospero::TileMode::kLinear) {
+		element = {layout.surface.texture.block.bytes_per_element,
+		           layout.surface.texture.texel_width, layout.surface.texture.texel_height};
+	}
+	layout.pitch = TileGetTexturePitch(fmt, width, description.tile_mode);
+	if (tile_mode == Prospero::TileMode::kLinear) {
+		TileSizeOffset level_sizes[16] {};
+		TilePaddedSize padded_sizes[16] {};
+		TileGetTextureSize(fmt, width, height, levels, description.tile_mode, nullptr, level_sizes,
+		                   padded_sizes);
+		for (uint32_t level = 0; level < levels; ++level) {
+			layout.mips[level] = {level_sizes[level].offset, level_sizes[level].size,
+			                      padded_sizes[level].width, padded_sizes[level].height};
+		}
+	} else if (volume_texture) {
+		layout.slice_stride = SetLinearUploadLevels(layout.mips, element, height, levels, width);
+	} else {
+		layout.source_slice_stride = layout.surface.block_slice_size;
+		if (depth > 1 && upload_size != 0 && upload_size % depth == 0) {
+			layout.source_slice_stride = std::max(layout.source_slice_stride, upload_size / depth);
+		}
+		SetLinearUploadLevels(layout.mips, element, height, levels, layout.pitch);
+	}
+
+	if (!volume_texture || tile_mode == Prospero::TileMode::kLinear) {
+		layout.slice_stride = CalcTextureSliceStride(layout.mips, levels, upload_size, depth);
 	}
 	return layout;
 }
 
-std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout,
-                                                         uint32_t width, uint32_t height,
-                                                         uint32_t depth, uint64_t levels,
-                                                         bool array_texture, bool volume_texture) {
-	uint32_t mip_width  = width;
-	uint32_t mip_height = height;
-	uint32_t mip_pitch  = volume_texture && static_cast<Prospero::TileMode>(layout.tile) !=
-	                                            Prospero::TileMode::kLinear
-	                          ? width
-	                          : layout.pitch;
+std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout) {
+	const auto& description    = layout.surface.description;
+	const bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
+	const auto  depth          = volume_texture ? description.depth : description.layers;
+	uint32_t    mip_width      = description.width;
+	uint32_t    mip_height     = description.height;
+	uint32_t mip_pitch = volume_texture && static_cast<Prospero::TileMode>(description.tile_mode) !=
+	                                           Prospero::TileMode::kLinear
+	                         ? description.width
+	                         : layout.pitch;
 
 	std::vector<vk::BufferImageCopy> regions;
-	regions.reserve(GetTextureRegionCount(depth, levels, volume_texture));
-	for (uint32_t i = 0; i < levels; i++) {
-		EXIT_NOT_IMPLEMENTED(layout.level_sizes[i].size == 0);
+	regions.reserve(GetTextureRegionCount(depth, description.levels, volume_texture));
+	for (uint32_t i = 0; i < description.levels; i++) {
+		EXIT_NOT_IMPLEMENTED(layout.mips[i].size == 0);
 
 		const auto mip_depth = GetTextureLevelDepth(depth, i, volume_texture);
 
 		for (uint32_t z = 0; z < mip_depth; z++) {
 			const auto          slice_offset = z * layout.slice_stride;
 			vk::BufferImageCopy region {};
-			region.bufferOffset     = layout.level_sizes[i].offset + slice_offset;
-			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, i, array_texture ? z : 0,
+			region.bufferOffset     = layout.mips[i].offset + slice_offset;
+			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, i, volume_texture ? 0u : z,
 			                           1};
 			region.imageOffset.z    = volume_texture ? static_cast<int>(z) : 0;
 			region.imageExtent      = {mip_width, mip_height, 1};
-			const bool linear =
-			    static_cast<Prospero::TileMode>(layout.tile) == Prospero::TileMode::kLinear;
+			const bool linear       = static_cast<Prospero::TileMode>(description.tile_mode) ==
+			                          Prospero::TileMode::kLinear;
 			if (linear) {
-				region.bufferRowLength   = layout.padded_sizes[i].width;
-				region.bufferImageHeight = layout.padded_sizes[i].height;
+				region.bufferRowLength   = layout.mips[i].row_length;
+				region.bufferImageHeight = layout.mips[i].image_height;
 			} else {
-				const auto align = [](uint32_t value, uint32_t block) {
+				const auto texel_width = layout.surface.texture.texel_width;
+				const auto align       = [](uint32_t value, uint32_t block) {
 					return ((value + block - 1u) / block) * block;
 				};
-				const auto pitch       = align(mip_pitch, layout.texel_block);
-				region.bufferRowLength = pitch > align(mip_width, layout.texel_block) ? pitch : 0;
+				const auto pitch       = align(mip_pitch, texel_width);
+				region.bufferRowLength = pitch > align(mip_width, texel_width) ? pitch : 0;
 			}
 			regions.push_back(region);
 		}
@@ -460,24 +406,6 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 	return regions;
 }
 
-struct GpuTileElementLayout {
-	uint32_t bytes = 0;
-	uint32_t wide  = 1;
-	uint32_t tall  = 1;
-};
-
-static bool GetGpuTileElementLayout(uint32_t fmt, GpuTileElementLayout& out) {
-	if (const auto bytes = Prospero::NumBytesPerElement(fmt); bytes != 0) {
-		out = {bytes, 1, 1};
-		return true;
-	}
-	if (const auto bytes = Prospero::BlockCompressedBytesPerBlock(fmt); bytes != 0) {
-		out = {bytes, 4, 4};
-		return true;
-	}
-	return false;
-}
-
 static bool SetGpuTileSize(uint64_t offset, uint64_t length, uint64_t capacity, uint64_t& size) {
 	if (offset > capacity || length > capacity - offset) {
 		return false;
@@ -487,42 +415,32 @@ static bool SetGpuTileSize(uint64_t offset, uint64_t length, uint64_t capacity, 
 }
 
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
-                              const TextureUploadLayout& layout, uint32_t fmt, uint32_t depth,
-                              uint64_t levels, std::vector<GpuTileInfo>& out_infos) {
+                              const TextureUploadLayout& layout, uint32_t levels,
+                              std::vector<GpuTileInfo>& out_infos) {
+	const auto& description    = layout.surface.description;
+	const bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
+	const auto  depth          = volume_texture ? description.depth : description.layers;
 	if (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 ||
-	    regions.size() != GetTextureRegionCount(depth, levels, layout.volume_texture) ||
-	    Prospero::IsFmaskTextureFormat(fmt)) {
+	    regions.size() != GetTextureRegionCount(depth, levels, volume_texture) ||
+	    Prospero::IsFmaskTextureFormat(description.format)) {
 		return false;
 	}
 
-	GpuTileElementLayout element {};
-	if (layout.tile_family == TileBlockFamily::RenderTarget64KB ||
-	    layout.tile_family == TileBlockFamily::Depth64KB) {
-		element.bytes = Prospero::RenderTargetBytesPerElement(fmt);
-	} else if (!GetGpuTileElementLayout(fmt, element)) {
-		return false;
-	}
-	if (element.bytes == 0) {
+	const auto& surface = layout.surface;
+	const auto& texture = surface.texture;
+	const auto& block   = texture.block;
+	if (surface.description.levels < levels || block.bytes_per_element == 0 ||
+	    block.family == TileBlockFamily::Count) {
 		return false;
 	}
 
 	std::vector<GpuTileInfo> infos;
 	infos.reserve(regions.size());
-	if (layout.volume_texture) {
-		TileVolumeLayout volume {};
-		if (!TileGetTextureVolumeLayout(fmt, regions[0].imageExtent.width,
-		                                regions[0].imageExtent.height, depth,
-		                                static_cast<uint32_t>(levels), layout.tile, volume)) {
-			return false;
-		}
-		element = {volume.bytes_per_element, volume.texel_width, volume.texel_height};
-		TileBlockLayout block {};
-		if (!TileGetBlockLayout(volume.family, element.bytes, block)) return false;
-
+	if (volume_texture) {
 		size_t region_base = 0;
 		for (uint32_t level = 0; level < levels; ++level) {
 			const uint32_t mip_depth     = GetTextureLevelDepth(depth, level, true);
-			const bool     tail          = level >= volume.first_tail_level;
+			const bool     tail          = level >= surface.first_tail_level;
 			const uint64_t linear_stride = layout.slice_stride;
 			for (uint32_t z = 0; z < mip_depth; z += block.block_depth) {
 				const uint32_t copy_depth = std::min(block.block_depth, mip_depth - z);
@@ -537,50 +455,43 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 				info.bytes_per_element = block.bytes_per_element;
 				info.linear_offset     = region.bufferOffset;
 				info.tiled_offset =
-				    static_cast<uint64_t>(z / block.block_depth) * volume.block_slice_size +
-				    volume.level_offsets[level];
+				    static_cast<uint64_t>(z / block.block_depth) * surface.block_slice_size +
+				    surface.mips[level].offset;
 				const uint64_t linear_span =
 				    static_cast<uint64_t>(copy_depth - 1u) * linear_stride +
-				    layout.level_sizes[level].size;
+				    layout.mips[level].size;
 				if (!SetGpuTileSize(info.linear_offset, linear_span, UINT64_MAX,
 				                    info.linear_size) ||
-				    !SetGpuTileSize(info.tiled_offset, volume.level_sizes[level], tiled_size,
+				    !SetGpuTileSize(info.tiled_offset, surface.mips[level].size, tiled_size,
 				                    info.tiled_size)) {
 					return false;
 				}
 				info.linear_slice_stride = linear_stride;
-				info.width =
-				    std::max((region.imageExtent.width + element.wide - 1u) / element.wide, 1u);
-				info.height = std::max((logical_height + element.tall - 1u) / element.tall, 1u);
-				info.depth  = copy_depth;
+				info.width  = std::max((region.imageExtent.width + texture.texel_width - 1u) /
+				                           texture.texel_width,
+				                       1u);
+				info.height = std::max(
+				    (logical_height + texture.texel_height - 1u) / texture.texel_height, 1u);
+				info.depth = copy_depth;
 				info.surface_z =
 				    block.block_depth == 1 ? static_cast<uint32_t>(region.imageOffset.z) : 0;
-				info.pitch        = std::max((pitch + element.wide - 1u) / element.wide, 1u);
-				info.tail_x       = tail ? volume.tail_x[level] : 0;
-				info.tail_y       = tail ? volume.tail_y[level] : 0;
+				info.pitch = std::max((pitch + texture.texel_width - 1u) / texture.texel_width, 1u);
+				info.tail_x       = tail ? surface.mips[level].tail_x : 0;
+				info.tail_y       = tail ? surface.mips[level].tail_y : 0;
 				info.tail         = tail;
-				info.tiled_width  = volume.level_widths[level];
-				info.tiled_height = volume.level_heights[level];
+				info.tiled_width  = surface.mips[level].padded_width;
+				info.tiled_height = surface.mips[level].padded_height;
 				infos.push_back(info);
 			}
 			region_base += mip_depth;
 		}
 	} else {
-		const auto base_family = layout.tile_family;
-		if (base_family == TileBlockFamily::Count) {
-			return false;
-		}
-
 		size_t region_index = 0;
 		for (uint32_t level = 0; level < levels; level++) {
-			const auto&     level_size = layout.level_sizes[level];
-			const bool      tail       = level >= layout.first_tail_level;
-			const auto      family     = base_family;
-			TileBlockLayout block {};
-			if (!TileGetBlockLayout(family, element.bytes, block)) {
-				return false;
-			}
-			const auto level_depth = GetTextureLevelDepth(depth, level, layout.volume_texture);
+			const auto& level_size  = layout.mips[level];
+			const auto& mip         = surface.mips[level];
+			const bool  tail        = level >= surface.first_tail_level;
+			const auto  level_depth = GetTextureLevelDepth(depth, level, false);
 			for (uint32_t z = 0; z < level_depth; z++) {
 				const auto& region = regions[region_index++];
 				const auto  pitch =
@@ -589,39 +500,36 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 				                                 ? region.bufferImageHeight
 				                                 : region.imageExtent.height;
 				GpuTileInfo info {};
-				info.family            = block.family;
-				info.bytes_per_element = block.bytes_per_element;
-				info.linear_offset     = region.bufferOffset;
-				info.tiled_offset      = TextureUploadSliceSourceOffset(layout, level, z);
-				if (!SetGpuTileSize(info.linear_offset, level_size.size, UINT64_MAX,
-				                    info.linear_size) ||
-				    !SetGpuTileSize(info.tiled_offset, GetLevelSrcSize(level_size), tiled_size,
-				                    info.tiled_size)) {
+				info.family              = block.family;
+				info.bytes_per_element   = block.bytes_per_element;
+				info.linear_offset       = region.bufferOffset;
+				const auto source_stride = layout.source_slice_stride != 0
+				                               ? layout.source_slice_stride
+				                               : surface.block_slice_size;
+				if (z > (UINT64_MAX - mip.offset) / source_stride) {
 					return false;
 				}
-				info.width =
-				    std::max((region.imageExtent.width + element.wide - 1u) / element.wide, 1u);
-				info.height    = std::max((logical_height + element.tall - 1u) / element.tall, 1u);
-				info.surface_z = base_family == TileBlockFamily::RenderTarget64KB ||
-				                         base_family == TileBlockFamily::Depth64KB
+				info.tiled_offset = mip.offset + static_cast<uint64_t>(z) * source_stride;
+				if (!SetGpuTileSize(info.linear_offset, level_size.size, UINT64_MAX,
+				                    info.linear_size) ||
+				    !SetGpuTileSize(info.tiled_offset, mip.size, tiled_size, info.tiled_size)) {
+					return false;
+				}
+				info.width  = std::max((region.imageExtent.width + texture.texel_width - 1u) /
+				                           texture.texel_width,
+				                       1u);
+				info.height = std::max(
+				    (logical_height + texture.texel_height - 1u) / texture.texel_height, 1u);
+				info.surface_z = block.family == TileBlockFamily::RenderTarget64KB ||
+				                         block.family == TileBlockFamily::Depth64KB
 				                     ? region.imageSubresource.baseArrayLayer
 				                     : 0;
-				info.pitch     = std::max((pitch + element.wide - 1u) / element.wide, 1u);
-				info.tail      = tail;
-				info.tail_x    = tail ? level_size.x : 0;
-				info.tail_y    = tail ? level_size.y : 0;
-				info.tiled_width =
-				    layout.padded_sizes[level].width != 0
-				        ? std::max((layout.padded_sizes[level].width + element.wide - 1u) /
-				                       element.wide,
-				                   1u)
-				        : info.pitch;
-				info.tiled_height =
-				    layout.padded_sizes[level].height != 0
-				        ? std::max((layout.padded_sizes[level].height + element.tall - 1u) /
-				                       element.tall,
-				                   1u)
-				        : info.height;
+				info.pitch = std::max((pitch + texture.texel_width - 1u) / texture.texel_width, 1u);
+				info.tail  = tail;
+				info.tail_x       = tail ? mip.tail_x : 0;
+				info.tail_y       = tail ? mip.tail_y : 0;
+				info.tiled_width  = mip.padded_width;
+				info.tiled_height = mip.padded_height;
 				infos.push_back(info);
 			}
 		}

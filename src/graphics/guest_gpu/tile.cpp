@@ -24,7 +24,7 @@ static uint32_t ShiftCeil(uint32_t value, uint32_t shift) {
 }
 
 static uint32_t CalcLinearBlockWidth(uint32_t bytes_per_element) {
-	return std::max(1u, 256u / bytes_per_element);
+	return 256u / bytes_per_element;
 }
 
 static uint32_t CalcLinearAlignedLevelPitch(uint32_t base_width, uint32_t base_height,
@@ -64,244 +64,65 @@ static uint32_t SetLinearMipChainLayout(uint32_t levels, const uint32_t* mip_pit
 	return AlignUp(offset, 256u);
 }
 
-static bool Gen5Standard4KBLayout(uint32_t format, uint32_t* bytes_per_element,
-                                  uint32_t* texels_per_element_wide,
-                                  uint32_t* texels_per_element_tall, uint32_t* block_width_log2,
-                                  uint32_t* block_height_log2) {
-	const auto bytes = Prospero::NumBytesPerElement(format);
-	switch (bytes) {
-		case 1:
-			*bytes_per_element       = 1;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 6;
-			*block_height_log2       = 6;
-			return true;
-		case 2:
-			*bytes_per_element       = 2;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 6;
-			*block_height_log2       = 5;
-			return true;
-		case 4:
-			*bytes_per_element       = 4;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 5;
-			*block_height_log2       = 5;
-			return true;
-		case 8:
-			*bytes_per_element       = 8;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 5;
-			*block_height_log2       = 4;
-			return true;
-		case 16:
-			*bytes_per_element       = 16;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 4;
-			*block_height_log2       = 4;
-			return true;
-		default: break;
-	}
+struct Log2BlockDimensions {
+	uint8_t width;
+	uint8_t height;
+	uint8_t depth;
+};
 
-	switch (Prospero::BlockCompressedBytesPerBlock(format)) {
-		case 8:
-			*bytes_per_element       = 8;
-			*texels_per_element_wide = 4;
-			*texels_per_element_tall = 4;
-			*block_width_log2        = 5;
-			*block_height_log2       = 4;
-			return true;
-		case 16:
-			*bytes_per_element       = 16;
-			*texels_per_element_wide = 4;
-			*texels_per_element_tall = 4;
-			*block_width_log2        = 4;
-			*block_height_log2       = 4;
-			return true;
-		default: return false;
-	}
-}
+// Indexed by log2(bytes per element). These are the block dimensions from
+// Resolve texture layout facts once and share the result with every consumer.
+static constexpr Log2BlockDimensions LOG2_BLOCK_THIN_256B[] = {
+    {4, 4, 0}, {4, 3, 0}, {3, 3, 0}, {3, 2, 0}, {2, 2, 0}};
+static constexpr Log2BlockDimensions LOG2_BLOCK_THIN_4KB[] = {
+    {6, 6, 0}, {6, 5, 0}, {5, 5, 0}, {5, 4, 0}, {4, 4, 0}};
+static constexpr Log2BlockDimensions LOG2_BLOCK_THIN_64KB[] = {
+    {8, 8, 0}, {8, 7, 0}, {7, 7, 0}, {7, 6, 0}, {6, 6, 0}};
+static constexpr Log2BlockDimensions LOG2_BLOCK_THICK_4KB[] = {
+    {4, 4, 4}, {3, 4, 4}, {3, 4, 3}, {3, 3, 3}, {2, 3, 3}};
+static constexpr Log2BlockDimensions LOG2_BLOCK_THICK_64KB[] = {
+    {6, 5, 5}, {5, 5, 5}, {5, 5, 4}, {5, 4, 4}, {4, 4, 4}};
 
-static bool Gen5Standard256BLayout(uint32_t format, uint32_t* bytes_per_element,
-                                   uint32_t* texels_per_element_wide,
-                                   uint32_t* texels_per_element_tall, uint32_t* block_width_log2,
-                                   uint32_t* block_height_log2) {
-	const auto bytes = Prospero::NumBytesPerElement(format);
-	switch (bytes) {
-		case 1:
-			*bytes_per_element       = 1;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 4;
-			*block_height_log2       = 4;
-			return true;
-		case 2:
-			*bytes_per_element       = 2;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 4;
-			*block_height_log2       = 3;
-			return true;
-		case 4:
-			*bytes_per_element       = 4;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 3;
-			*block_height_log2       = 3;
-			return true;
-		case 8:
-			*bytes_per_element       = 8;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 3;
-			*block_height_log2       = 2;
-			return true;
-		case 16:
-			*bytes_per_element       = 16;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 2;
-			*block_height_log2       = 2;
-			return true;
-		default: break;
-	}
+struct BlockFamilyInfo {
+	uint32_t                   block_size;
+	const Log2BlockDimensions* dimensions;
+	uint32_t                   max_bytes_per_element;
+};
 
-	switch (Prospero::BlockCompressedBytesPerBlock(format)) {
-		case 8:
-			*bytes_per_element       = 8;
-			*texels_per_element_wide = 4;
-			*texels_per_element_tall = 4;
-			*block_width_log2        = 3;
-			*block_height_log2       = 2;
-			return true;
-		case 16:
-			*bytes_per_element       = 16;
-			*texels_per_element_wide = 4;
-			*texels_per_element_tall = 4;
-			*block_width_log2        = 2;
-			*block_height_log2       = 2;
-			return true;
-		default: return false;
-	}
-}
+static constexpr BlockFamilyInfo BLOCK_FAMILIES[] = {
+    {256, LOG2_BLOCK_THIN_256B, 16},    {4096, LOG2_BLOCK_THIN_4KB, 16},
+    {4096, LOG2_BLOCK_THICK_4KB, 16},   {65536, LOG2_BLOCK_THIN_64KB, 16},
+    {65536, LOG2_BLOCK_THICK_64KB, 16}, {65536, LOG2_BLOCK_THIN_64KB, 16},
+    {65536, LOG2_BLOCK_THICK_64KB, 16}, {65536, LOG2_BLOCK_THIN_64KB, 16},
+    {65536, LOG2_BLOCK_THIN_64KB, 8},
+};
+static_assert(std::size(BLOCK_FAMILIES) == static_cast<size_t>(TileBlockFamily::Count));
 
-static bool Gen5Standard64KBLayout(uint32_t format, uint32_t* bytes_per_element,
-                                   uint32_t* texels_per_element_wide,
-                                   uint32_t* texels_per_element_tall, uint32_t* block_width_log2,
-                                   uint32_t* block_height_log2) {
-	switch (Prospero::NumBytesPerElement(format)) {
-		case 1:
-			*bytes_per_element       = 1;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 8;
-			*block_height_log2       = 8;
-			return true;
-		case 2:
-			*bytes_per_element       = 2;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 8;
-			*block_height_log2       = 7;
-			return true;
-		case 4:
-			*bytes_per_element       = 4;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 7;
-			*block_height_log2       = 7;
-			return true;
-		case 8:
-			*bytes_per_element       = 8;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 7;
-			*block_height_log2       = 6;
-			return true;
-		case 16:
-			*bytes_per_element       = 16;
-			*texels_per_element_wide = 1;
-			*texels_per_element_tall = 1;
-			*block_width_log2        = 6;
-			*block_height_log2       = 6;
-			return true;
-		default: break;
-	}
+static constexpr Log2BlockDimensions LOG2_BLOCK_MSAA[4][5] = {
+    {{8, 8, 0}, {8, 7, 0}, {7, 7, 0}, {7, 6, 0}, {6, 6, 0}},
+    {{7, 8, 0}, {7, 7, 0}, {6, 7, 0}, {6, 6, 0}, {5, 6, 0}},
+    {{7, 7, 0}, {7, 6, 0}, {6, 6, 0}, {6, 5, 0}, {5, 5, 0}},
+    {{6, 7, 0}, {6, 6, 0}, {5, 6, 0}, {5, 5, 0}, {4, 5, 0}},
+};
 
-	switch (Prospero::BlockCompressedBytesPerBlock(format)) {
-		case 8:
-			*bytes_per_element       = 8;
-			*texels_per_element_wide = 4;
-			*texels_per_element_tall = 4;
-			*block_width_log2        = 7;
-			*block_height_log2       = 6;
-			return true;
-		case 16:
-			*bytes_per_element       = 16;
-			*texels_per_element_wide = 4;
-			*texels_per_element_tall = 4;
-			*block_width_log2        = 6;
-			*block_height_log2       = 6;
-			return true;
-		default: return false;
+static void SetBlockDimensions(const Log2BlockDimensions& dimensions, uint32_t* block_width,
+                               uint32_t* block_height, uint32_t* block_depth = nullptr) {
+	*block_width  = 1u << dimensions.width;
+	*block_height = 1u << dimensions.height;
+	if (block_depth != nullptr) {
+		*block_depth = 1u << dimensions.depth;
 	}
-}
-
-static bool Gen5Thin64KBBlockSizeFromElementBytes(uint32_t bytes_per_element, uint32_t* block_width,
-                                                  uint32_t* block_height) {
-	// Thin 64 KiB block dimensions shared by depth and render-target tiles.
-	switch (bytes_per_element) {
-		case 1:
-			*block_width  = 256;
-			*block_height = 256;
-			return true;
-		case 2:
-			*block_width  = 256;
-			*block_height = 128;
-			return true;
-		case 4:
-			*block_width  = 128;
-			*block_height = 128;
-			return true;
-		case 8:
-			*block_width  = 128;
-			*block_height = 64;
-			return true;
-		case 16:
-			*block_width  = 64;
-			*block_height = 64;
-			return true;
-		default: break;
-	}
-
-	return false;
 }
 
 static bool Gen5Msaa64KBBlockSizeFromElementBytes(uint32_t  bytes_per_element,
                                                   uint32_t  num_fragments_log2,
                                                   uint32_t* block_width, uint32_t* block_height) {
-	if (num_fragments_log2 == 0) {
-		return Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, block_width, block_height);
-	}
 	if (num_fragments_log2 > 3 || !std::has_single_bit(bytes_per_element) ||
 	    bytes_per_element > 16) {
 		return false;
 	}
-	// Row zero is the ordinary thin layout; rows 1..3 are 2x, 4x and 8x blocks.
-	static constexpr uint8_t LOG2_BLOCK[4][5][2] = {
-	    {{8, 8}, {8, 7}, {7, 7}, {7, 6}, {6, 6}},
-	    {{7, 8}, {7, 7}, {6, 7}, {6, 6}, {5, 6}},
-	    {{7, 7}, {7, 6}, {6, 6}, {6, 5}, {5, 5}},
-	    {{6, 7}, {6, 6}, {5, 6}, {5, 5}, {4, 5}},
-	};
 	const auto bytes_log2 = std::countr_zero(bytes_per_element);
-	*block_width          = 1u << LOG2_BLOCK[num_fragments_log2][bytes_log2][0];
-	*block_height         = 1u << LOG2_BLOCK[num_fragments_log2][bytes_log2][1];
+	SetBlockDimensions(LOG2_BLOCK_MSAA[num_fragments_log2][bytes_log2], block_width, block_height);
 	return true;
 }
 
@@ -395,220 +216,231 @@ static constexpr Gen5MipTailLocation GEN5_MIP_TAIL_LOCATIONS_THICK_4KB[5][5] = {
     {{0, 4}, {2, 2}, {2, 0}, {0, 2}, {0, 0}},
 };
 
-struct TextureBlockLayout {
-	uint32_t bytes;
-	uint32_t texel_width;
-	uint32_t texel_height;
-	uint32_t block_width;
-	uint32_t block_height;
-	uint32_t block_size;
+struct MipTailLayout {
+	const Gen5MipTailLocation* locations;
+	uint32_t                   max_levels;
+	uint32_t                   width_limit;
+	uint32_t                   height_limit;
 };
 
-static bool GetTextureBlockLayout(uint32_t format, uint32_t tile, TextureBlockLayout& out) {
-	uint32_t width_log2 = 0, height_log2 = 0;
-	if (tile == 1 && Gen5Standard256BLayout(format, &out.bytes, &out.texel_width, &out.texel_height,
-	                                        &width_log2, &height_log2)) {
-		out.block_size = 256;
-	} else if (tile == 5 && Gen5Standard4KBLayout(format, &out.bytes, &out.texel_width,
-	                                              &out.texel_height, &width_log2, &height_log2)) {
-		out.block_size = 4096;
-	} else if ((tile == 9 || tile == 17) &&
-	           Gen5Standard64KBLayout(format, &out.bytes, &out.texel_width, &out.texel_height,
-	                                  &width_log2, &height_log2)) {
-		out.block_size = 65536;
-	} else if (tile == 24 || tile == 27) {
-		out.bytes       = Prospero::NumBytesPerElement(format);
-		out.texel_width = out.texel_height = 1;
-		if (out.bytes == 0 || (tile == 24 && out.bytes > 8) ||
-		    !Gen5Thin64KBBlockSizeFromElementBytes(out.bytes, &out.block_width,
-		                                           &out.block_height)) {
-			return false;
-		}
-		out.block_size = 65536;
+template <size_t Levels>
+static MipTailLayout MakeMipTailLayout(const Gen5MipTailLocation (&locations)[Levels],
+                                       uint32_t width_limit, uint32_t height_limit) {
+	return {locations, static_cast<uint32_t>(Levels), width_limit, height_limit};
+}
+
+static bool GetMipTailLayout(const TileBlockLayout& block, MipTailLayout& out) {
+	const auto index = std::countr_zero(block.bytes_per_element);
+	switch (block.family) {
+		case TileBlockFamily::Standard4KB:
+			out = MakeMipTailLayout(GEN5_MIP_TAIL_LOCATIONS_THIN_4KB[index],
+			                        block.block_width >> 1u, block.block_height);
+			return true;
+		case TileBlockFamily::Standard4KB3D:
+			out = MakeMipTailLayout(GEN5_MIP_TAIL_LOCATIONS_THICK_4KB[index], block.block_width,
+			                        block.block_height >> 1u);
+			return true;
+		case TileBlockFamily::Standard64KB3D:
+		case TileBlockFamily::Prt64KB3D:
+			out = MakeMipTailLayout(GEN5_MIP_TAIL_LOCATIONS_THICK_64KB[index],
+			                        block.block_width >> 1u, block.block_height);
+			return true;
+		case TileBlockFamily::Depth64KB:
+			out = MakeMipTailLayout(GEN5_MIP_TAIL_LOCATIONS_THIN_64KB[index],
+			                        block.block_width >> 1u, block.block_height);
+			if (block.bytes_per_element < 4) {
+				out.width_limit  = 64;
+				out.height_limit = 128;
+			}
+			return true;
+		case TileBlockFamily::Standard64KB:
+		case TileBlockFamily::Prt64KB:
+		case TileBlockFamily::RenderTarget64KB:
+			out = MakeMipTailLayout(GEN5_MIP_TAIL_LOCATIONS_THIN_64KB[index],
+			                        block.block_width >> 1u, block.block_height);
+			return true;
+		case TileBlockFamily::Standard256B:
+		case TileBlockFamily::Count: return false;
+	}
+	return false;
+}
+
+bool TileGetTextureElementLayout(uint32_t format, TileTextureElementLayout& out) {
+	if (const auto bytes = Prospero::NumBytesPerElement(format); std::has_single_bit(bytes)) {
+		out = {bytes, 1, 1};
 		return true;
-	} else {
+	}
+	if (const auto bytes = Prospero::BlockCompressedBytesPerBlock(format); bytes != 0) {
+		out = {bytes, 4, 4};
+		return true;
+	}
+	return false;
+}
+
+bool TileGetTextureBlockLayout(uint32_t format, uint32_t tile, bool volume,
+                               TileTextureBlockLayout& out) {
+	TileBlockFamily family = TileBlockFamily::Count;
+	switch (static_cast<Prospero::TileMode>(tile)) {
+		case Prospero::TileMode::kStandard256B:
+			if (!volume) family = TileBlockFamily::Standard256B;
+			break;
+		case Prospero::TileMode::kStandard4KB:
+			family = volume ? TileBlockFamily::Standard4KB3D : TileBlockFamily::Standard4KB;
+			break;
+		case Prospero::TileMode::kStandard64KB:
+			family = volume ? TileBlockFamily::Standard64KB3D : TileBlockFamily::Standard64KB;
+			break;
+		case Prospero::TileMode::kPrt:
+			family = volume ? TileBlockFamily::Prt64KB3D : TileBlockFamily::Prt64KB;
+			break;
+		case Prospero::TileMode::kDepth: family = TileBlockFamily::Depth64KB; break;
+		case Prospero::TileMode::kRenderTarget: family = TileBlockFamily::RenderTarget64KB; break;
+		default: return false;
+	}
+	if (family == TileBlockFamily::Count) {
 		return false;
 	}
-	out.block_width  = 1u << width_log2;
-	out.block_height = 1u << height_log2;
+
+	TileTextureElementLayout element {};
+	if (!TileGetTextureElementLayout(format, element)) {
+		return false;
+	}
+	if ((family == TileBlockFamily::Depth64KB || family == TileBlockFamily::RenderTarget64KB) &&
+	    Prospero::RenderTargetBytesPerElement(format) != element.bytes) {
+		return false;
+	}
+
+	TileBlockLayout block {};
+	if (!TileGetBlockLayout(family, element.bytes, block)) {
+		return false;
+	}
+	out = {block, element.texel_width, element.texel_height};
 	return true;
 }
 
-static void SetMicroMipLayout(const TextureBlockLayout& block, uint32_t width, uint32_t height,
-                              uint32_t levels, TileSizeAlign* total_size,
-                              TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
-	const uint32_t width0  = (width + block.texel_width - 1u) / block.texel_width;
-	const uint32_t height0 = (height + block.texel_height - 1u) / block.texel_height;
-	uint32_t       offset  = 0;
-	for (int32_t l = static_cast<int32_t>(levels) - 1; l >= 0; --l) {
-		const auto     level = static_cast<uint32_t>(l);
-		const uint32_t padded_width =
-		    AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		const uint32_t padded_height =
-		    AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
-		const uint32_t size = padded_width * padded_height * block.bytes;
-		if (level_sizes != nullptr) level_sizes[level] = {size, offset};
-		if (padded_size != nullptr) {
-			padded_size[level] = {padded_width * block.texel_width,
-			                      padded_height * block.texel_height};
-		}
-		offset += size;
+bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSurfaceLayout& out) {
+	bool volume = false;
+	switch (description.dimension) {
+		case TileSurfaceDimension::Dim2D: break;
+		case TileSurfaceDimension::Dim3D: volume = true; break;
+		default: return false;
 	}
-	if (total_size != nullptr) *total_size = {offset, block.block_size};
-}
-
-static void SetMacroMipLayout(const TextureBlockLayout& block, uint32_t tile, uint32_t width,
-                              uint32_t height, uint32_t levels, TileSizeAlign* total_size,
-                              TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
-	const uint32_t width0     = (width + block.texel_width - 1u) / block.texel_width;
-	const uint32_t height0    = (height + block.texel_height - 1u) / block.texel_height;
-	const uint32_t bytes_log2 = std::countr_zero(block.bytes);
-	const uint32_t max_tail   = block.block_size == 4096 ? 8u : 12u;
-	uint32_t       tail_width = block.block_width >> 1u, tail_height = block.block_height;
-	if (tile == 24 && block.bytes < 4) {
-		tail_width  = 64;
-		tail_height = 128;
+	if (description.width == 0 || description.height == 0 || description.depth == 0 ||
+	    description.levels == 0 || description.levels > 16 || description.layers == 0 ||
+	    (volume ? description.layers != 1 : description.depth != 1)) {
+		return false;
 	}
 
-	uint32_t first_tail = levels;
-	if (levels > 1) {
-		for (uint32_t level = 0; level < levels; ++level) {
-			if (ShiftCeil(width0, level) <= tail_width &&
-			    ShiftCeil(height0, level) <= tail_height && levels - level <= max_tail) {
-				first_tail = level;
+	TileTextureBlockLayout texture {};
+	if (!TileGetTextureBlockLayout(description.format, description.tile_mode, volume, texture)) {
+		return false;
+	}
+	const auto& block   = texture.block;
+	const auto  width0  = (description.width + texture.texel_width - 1u) / texture.texel_width;
+	const auto  height0 = (description.height + texture.texel_height - 1u) / texture.texel_height;
+
+	TileSurfaceLayout result {};
+	result.description      = description;
+	result.texture          = texture;
+	result.first_tail_level = description.levels;
+	const uint32_t block_slices =
+	    volume ? ShiftCeil(description.depth, std::countr_zero(block.block_depth))
+	           : description.layers;
+
+	MipTailLayout tail {};
+	const bool    has_tail = GetMipTailLayout(block, tail);
+	if (has_tail && description.levels > 1) {
+		for (uint32_t level = 0; level < description.levels; ++level) {
+			if (ShiftCeil(width0, level) <= tail.width_limit &&
+			    ShiftCeil(height0, level) <= tail.height_limit &&
+			    description.levels - level <= tail.max_levels) {
+				result.first_tail_level = level;
 				break;
 			}
 		}
 	}
 
-	uint32_t offset = first_tail < levels ? block.block_size : 0;
-	for (int32_t l = static_cast<int32_t>(first_tail) - 1; l >= 0; --l) {
-		const auto     level = static_cast<uint32_t>(l);
-		const uint32_t padded_width =
-		    AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		const uint32_t padded_height =
-		    AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
-		const uint32_t size = padded_width * padded_height * block.bytes;
-		if (level_sizes != nullptr) level_sizes[level] = {size, offset, size, offset};
-		if (padded_size != nullptr) {
-			padded_size[level] = {padded_width * block.texel_width,
-			                      padded_height * block.texel_height};
-		}
-		offset += size;
+	for (uint32_t level = 0; level < result.first_tail_level; ++level) {
+		auto& mip = result.mips[level];
+		mip.width = std::max(
+		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
+		mip.height = std::max(
+		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
+		mip.padded_width  = AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		mip.padded_height = AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
+		           block.bytes_per_element;
+		result.block_slice_size += mip.size;
 	}
 
-	uint32_t linear_offset = 0;
-	for (uint32_t level = first_tail; level < levels; ++level) {
-		const uint32_t mip_width =
-		    std::max(((width >> level) + block.texel_width - 1u) / block.texel_width, 1u);
-		const uint32_t mip_height =
-		    std::max(((height >> level) + block.texel_height - 1u) / block.texel_height, 1u);
-		const auto tail = block.block_size == 4096
-		                      ? GEN5_MIP_TAIL_LOCATIONS_THIN_4KB[bytes_log2][level - first_tail]
-		                      : GEN5_MIP_TAIL_LOCATIONS_THIN_64KB[bytes_log2][level - first_tail];
-		if (level_sizes != nullptr) {
-			level_sizes[level] = {mip_width * mip_height * block.bytes,
-			                      linear_offset,
-			                      block.block_size,
-			                      0,
-			                      tail.x,
-			                      tail.y};
-		}
-		if (padded_size != nullptr) {
-			padded_size[level] = {block.block_width * block.texel_width,
-			                      block.block_height * block.texel_height};
-		}
-		linear_offset += mip_width * mip_height * block.bytes;
+	if (result.first_tail_level < description.levels) {
+		result.block_slice_size += block.block_size;
 	}
-	if (total_size != nullptr) *total_size = {offset, block.block_size};
-}
+	for (uint32_t level = result.first_tail_level; level < description.levels; ++level) {
+		auto& mip = result.mips[level];
+		mip.width = std::max(
+		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
+		mip.height = std::max(
+		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
+		mip.padded_width  = block.block_width;
+		mip.padded_height = block.block_height;
+		mip.size          = block.block_size;
+		mip.tail_x        = tail.locations[level - result.first_tail_level].x;
+		mip.tail_y        = tail.locations[level - result.first_tail_level].y;
+	}
 
-bool TileGetTextureVolumeLayout(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-                                uint32_t levels, uint32_t tile, TileVolumeLayout& out) {
-	if (width == 0 || height == 0 || depth == 0 || levels == 0 || levels > 16) {
+	uint64_t offset = result.first_tail_level < description.levels ? block.block_size : 0;
+	for (int32_t level = static_cast<int32_t>(result.first_tail_level) - 1; level >= 0; --level) {
+		result.mips[level].offset = offset;
+		offset += result.mips[level].size;
+	}
+	if (offset != result.block_slice_size || result.block_slice_size > UINT64_MAX / block_slices) {
 		return false;
 	}
-	TextureBlockLayout element {};
-	if (!GetTextureBlockLayout(format, tile, element)) return false;
+	result.total_size = result.block_slice_size * block_slices;
+	out               = result;
+	return true;
+}
 
-	TileBlockFamily family = TileBlockFamily::Count;
-	switch (tile) {
-		case 5: family = TileBlockFamily::Standard4KB3D; break;
-		case 9: family = TileBlockFamily::Standard64KB3D; break;
-		case 17: family = TileBlockFamily::Prt64KB3D; break;
-		case 24: family = TileBlockFamily::Depth64KB; break;
-		case 27: family = TileBlockFamily::RenderTarget64KB; break;
-		default: return false;
-	}
-	TileBlockLayout block {};
-	if (!TileGetBlockLayout(family, element.bytes, block)) return false;
-
-	out                    = {};
-	out.family             = family;
-	out.bytes_per_element  = element.bytes;
-	out.texel_width        = element.texel_width;
-	out.texel_height       = element.texel_height;
-	out.block_depth        = block.block_depth;
-	out.first_tail_level   = levels;
-	const uint32_t width0  = (width + element.texel_width - 1u) / element.texel_width;
-	const uint32_t height0 = (height + element.texel_height - 1u) / element.texel_height;
-	const bool     thick4  = family == TileBlockFamily::Standard4KB3D;
-	const bool     thick64 =
-	    family == TileBlockFamily::Standard64KB3D || family == TileBlockFamily::Prt64KB3D;
-	uint32_t max_tail = 12u;
-	if (thick4) {
-		max_tail = 5u;
-	} else if (thick64) {
-		max_tail = 10u;
-	}
-	uint32_t tail_width  = thick4 ? block.block_width : block.block_width >> 1u;
-	uint32_t tail_height = thick4 ? block.block_height >> 1u : block.block_height;
-	if (family == TileBlockFamily::Depth64KB && element.bytes < 4) {
-		tail_width  = 64;
-		tail_height = 128;
+static void SetLegacyTiledMipLayout(const TileSurfaceLayout& layout, TileSizeAlign* total_size,
+                                    TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
+	EXIT_NOT_IMPLEMENTED(layout.block_slice_size > UINT32_MAX);
+	const auto& block = layout.texture.block;
+	if (total_size != nullptr) {
+		*total_size = {static_cast<uint32_t>(layout.block_slice_size), block.block_size};
 	}
 
-	for (uint32_t level = 0; level < levels; ++level) {
-		const uint32_t mip_width  = std::max(ShiftCeil(width0, level), 1u);
-		const uint32_t mip_height = std::max(ShiftCeil(height0, level), 1u);
-		if (levels > 1 && mip_width <= tail_width && mip_height <= tail_height &&
-		    levels - level <= max_tail) {
-			out.first_tail_level = level;
-			out.block_slice_size += block.block_size;
-			break;
+	uint64_t linear_tail_offset = 0;
+	for (uint32_t level = 0; level < layout.description.levels; ++level) {
+		const auto& mip  = layout.mips[level];
+		const bool  tail = level >= layout.first_tail_level;
+		EXIT_NOT_IMPLEMENTED(mip.offset > UINT32_MAX || mip.size > UINT32_MAX);
+		if (level_sizes != nullptr) {
+			if (tail) {
+				const uint64_t linear_size =
+				    static_cast<uint64_t>(mip.width) * mip.height * block.bytes_per_element;
+				EXIT_NOT_IMPLEMENTED(linear_size > UINT32_MAX || linear_tail_offset > UINT32_MAX);
+				level_sizes[level] = {static_cast<uint32_t>(linear_size),
+				                      static_cast<uint32_t>(linear_tail_offset),
+				                      static_cast<uint32_t>(mip.size),
+				                      static_cast<uint32_t>(mip.offset),
+				                      mip.tail_x,
+				                      mip.tail_y};
+				linear_tail_offset += linear_size;
+			} else if (block.family == TileBlockFamily::Standard256B) {
+				level_sizes[level] = {static_cast<uint32_t>(mip.size),
+				                      static_cast<uint32_t>(mip.offset)};
+			} else {
+				level_sizes[level] = {
+				    static_cast<uint32_t>(mip.size), static_cast<uint32_t>(mip.offset),
+				    static_cast<uint32_t>(mip.size), static_cast<uint32_t>(mip.offset)};
+			}
 		}
-		out.level_widths[level]  = AlignUp(mip_width, block.block_width);
-		out.level_heights[level] = AlignUp(mip_height, block.block_height);
-		out.level_sizes[level] = static_cast<uint64_t>(block.block_depth) *
-		                         out.level_widths[level] * out.level_heights[level] * element.bytes;
-		out.block_slice_size += out.level_sizes[level];
+		if (padded_size != nullptr) {
+			padded_size[level] = {mip.padded_width * layout.texture.texel_width,
+			                      mip.padded_height * layout.texture.texel_height};
+		}
 	}
-
-	const auto                 bytes_log2     = std::countr_zero(element.bytes);
-	const Gen5MipTailLocation* tail_locations = nullptr;
-	if (thick4) {
-		tail_locations = GEN5_MIP_TAIL_LOCATIONS_THICK_4KB[bytes_log2];
-	} else if (thick64) {
-		tail_locations = GEN5_MIP_TAIL_LOCATIONS_THICK_64KB[bytes_log2];
-	} else {
-		tail_locations = GEN5_MIP_TAIL_LOCATIONS_THIN_64KB[bytes_log2];
-	}
-	for (uint32_t level = out.first_tail_level; level < levels; ++level) {
-		const auto index         = level - out.first_tail_level;
-		const auto tail          = tail_locations[index];
-		out.level_sizes[level]   = block.block_size;
-		out.level_widths[level]  = block.block_width;
-		out.level_heights[level] = block.block_height;
-		out.tail_x[level]        = tail.x;
-		out.tail_y[level]        = tail.y;
-	}
-	uint64_t offset = out.first_tail_level < levels ? block.block_size : 0;
-	for (int32_t l = static_cast<int32_t>(out.first_tail_level) - 1; l >= 0; --l) {
-		out.level_offsets[l] = offset;
-		offset += out.level_sizes[l];
-	}
-	out.total_size = out.block_slice_size * ShiftCeil(depth, std::countr_zero(block.block_depth));
-	return offset == out.block_slice_size;
 }
 
 static uint32_t Gen5Standard4KBOffsetInBlock(uint32_t x, uint32_t y, uint32_t bytes_per_element) {
@@ -742,39 +574,6 @@ static uint32_t Gen5Standard64KBVolumeOffsetInBlock(uint32_t x, uint32_t y, uint
 	const auto* bits = SOURCES[std::countr_zero(bytes_per_element)];
 	return Gen5Standard4KBVolumeOffsetInBlock(x, y, z, bytes_per_element) ^ Bit(x, bits[0], 12) ^
 	       Bit(z, bits[1], 13) ^ Bit(y, bits[2], 14) ^ Bit(x, bits[3], 15);
-}
-
-bool TileIsStandard4KBTextureSupported(uint32_t format) {
-	uint32_t bytes_per_element       = 0;
-	uint32_t texels_per_element_wide = 0;
-	uint32_t texels_per_element_tall = 0;
-	uint32_t block_width_log2        = 0;
-	uint32_t block_height_log2       = 0;
-
-	return Gen5Standard4KBLayout(format, &bytes_per_element, &texels_per_element_wide,
-	                             &texels_per_element_tall, &block_width_log2, &block_height_log2);
-}
-
-bool TileIsStandard256BTextureSupported(uint32_t format) {
-	uint32_t bytes_per_element       = 0;
-	uint32_t texels_per_element_wide = 0;
-	uint32_t texels_per_element_tall = 0;
-	uint32_t block_width_log2        = 0;
-	uint32_t block_height_log2       = 0;
-
-	return Gen5Standard256BLayout(format, &bytes_per_element, &texels_per_element_wide,
-	                              &texels_per_element_tall, &block_width_log2, &block_height_log2);
-}
-
-bool TileIsStandard64KBTextureSupported(uint32_t format) {
-	uint32_t bytes_per_element       = 0;
-	uint32_t texels_per_element_wide = 0;
-	uint32_t texels_per_element_tall = 0;
-	uint32_t block_width_log2        = 0;
-	uint32_t block_height_log2       = 0;
-
-	return Gen5Standard64KBLayout(format, &bytes_per_element, &texels_per_element_wide,
-	                              &texels_per_element_tall, &block_width_log2, &block_height_log2);
 }
 
 struct Uint128 {
@@ -1058,85 +857,18 @@ static constexpr uint32_t Depth64KB64YOffsetBytes(uint32_t y);
 
 bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
                         TileBlockLayout& layout) {
-	if (!std::has_single_bit(bytes_per_element) || bytes_per_element > 16) {
+	const auto family_index = static_cast<size_t>(family);
+	if (family_index >= std::size(BLOCK_FAMILIES) || !std::has_single_bit(bytes_per_element)) {
+		return false;
+	}
+	const auto& info = BLOCK_FAMILIES[family_index];
+	if (bytes_per_element > info.max_bytes_per_element) {
 		return false;
 	}
 
-	TileBlockLayout result {family, bytes_per_element, 0, 0, 0, 1};
-	auto            thin = [&] {
-		return Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &result.block_width,
-		                                             &result.block_height);
-	};
-	auto thick64 = [&] {
-		static constexpr uint8_t LOG2_DIMS[5][3] = {
-		    {6, 5, 5}, {5, 5, 5}, {5, 5, 4}, {5, 4, 4}, {4, 4, 4}};
-		const auto index    = std::countr_zero(bytes_per_element);
-		result.block_width  = 1u << LOG2_DIMS[index][0];
-		result.block_height = 1u << LOG2_DIMS[index][1];
-		result.block_depth  = 1u << LOG2_DIMS[index][2];
-	};
-	switch (family) {
-		case TileBlockFamily::Standard256B:
-			result.block_size = 256;
-			if (bytes_per_element <= 2) {
-				result.block_width = 16;
-			} else if (bytes_per_element <= 8) {
-				result.block_width = 8;
-			} else {
-				result.block_width = 4;
-			}
-			result.block_height = result.block_size / (result.block_width * bytes_per_element);
-			break;
-		case TileBlockFamily::Standard4KB:
-			result.block_size = 4096;
-			if (bytes_per_element <= 2) {
-				result.block_width = 64;
-			} else if (bytes_per_element <= 8) {
-				result.block_width = 32;
-			} else {
-				result.block_width = 16;
-			}
-			result.block_height = result.block_size / (result.block_width * bytes_per_element);
-			break;
-		case TileBlockFamily::Standard4KB3D: {
-			static constexpr uint8_t LOG2_DIMS[5][3] = {
-			    {4, 4, 4}, {3, 4, 4}, {3, 4, 3}, {3, 3, 3}, {2, 3, 3}};
-			const auto index    = std::countr_zero(bytes_per_element);
-			result.block_size   = 4096;
-			result.block_width  = 1u << LOG2_DIMS[index][0];
-			result.block_height = 1u << LOG2_DIMS[index][1];
-			result.block_depth  = 1u << LOG2_DIMS[index][2];
-			break;
-		}
-		case TileBlockFamily::Standard64KB:
-		case TileBlockFamily::Prt64KB:
-			result.block_size = 65536;
-			if (!thin()) {
-				return false;
-			}
-			break;
-		case TileBlockFamily::Standard64KB3D:
-		case TileBlockFamily::Prt64KB3D:
-			result.block_size = 65536;
-			thick64();
-			break;
-		case TileBlockFamily::RenderTarget64KB:
-			result.block_size = 65536;
-			if (!thin()) {
-				return false;
-			}
-			break;
-		case TileBlockFamily::Depth64KB:
-			if (bytes_per_element > 8) {
-				return false;
-			}
-			result.block_size = 65536;
-			if (!thin()) {
-				return false;
-			}
-			break;
-		case TileBlockFamily::Count: return false;
-	}
+	TileBlockLayout result {family, bytes_per_element, info.block_size, 0, 0, 1};
+	SetBlockDimensions(info.dimensions[std::countr_zero(bytes_per_element)], &result.block_width,
+	                   &result.block_height, &result.block_depth);
 
 	if (static_cast<uint64_t>(result.block_width) * result.block_height * result.block_depth *
 	        bytes_per_element !=
@@ -1382,7 +1114,7 @@ static_assert(Depth64KB32XOffsetBytes(2) == 0x0010u);
 static_assert(Depth64KB32YOffsetBytes(1) == 0x0008u);
 static_assert((Depth64KB32XOffsetBytes(3) ^ Depth64KB32YOffsetBytes(5)) == 0x009cu);
 
-bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& htile_size) {
+static bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& htile_size) {
 	htile_size = {};
 	if (width == 0 || width > 16384 || height == 0 || height > 16384) {
 		return false;
@@ -1513,28 +1245,41 @@ bool TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t pitc
 		case 16: format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float); break;
 		default: return false;
 	}
-	TileGetTextureSize(format, width, height, pitch, levels,
+	TileGetTextureSize(format, width, height, levels,
 	                   Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget), &total_size,
 	                   level_sizes, padded_size);
 	return total_size.size != 0 && total_size.align == 65536;
 }
 
-void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
-                        uint32_t levels, uint32_t tile, TileSizeAlign* total_size,
-                        TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
+void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32_t levels,
+                        uint32_t tile, TileSizeAlign* total_size, TileSizeOffset* level_sizes,
+                        TilePaddedSize* padded_size) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(levels == 0 || levels > 16);
 
-	if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
-	    bytes_per_element != 0 && tile == 0) {
+	TileTextureElementLayout element {};
+	if (static_cast<Prospero::TileMode>(tile) == Prospero::TileMode::kLinear &&
+	    TileGetTextureElementLayout(format, element)) {
 		uint32_t mip_pitch[16] {};
 		uint32_t mip_height[16] {};
 		uint32_t mip_size[16] {};
 
+		const uint32_t elements_w0 =
+		    std::max((width + element.texel_width - 1u) / element.texel_width, 1u);
+		const uint32_t elements_h0 =
+		    std::max((height + element.texel_height - 1u) / element.texel_height, 1u);
+		const bool compressed = element.texel_width != 1 || element.texel_height != 1;
 		for (uint32_t l = 0; l < levels; l++) {
-			mip_pitch[l] = CalcLinearAlignedLevelPitch(width, height, l, bytes_per_element,
-			                                           &mip_height[l], &mip_size[l]);
+			uint32_t       padded_elements_h  = 0;
+			const uint32_t aligned_elements_w = CalcLinearAlignedLevelPitch(
+			    elements_w0, elements_h0, l, element.bytes, &padded_elements_h, &mip_size[l]);
+			mip_pitch[l]  = aligned_elements_w * element.texel_width;
+			mip_height[l] = padded_elements_h * element.texel_height;
+			if (compressed) {
+				mip_pitch[l]  = std::max(mip_pitch[l], 32u);
+				mip_height[l] = std::max(mip_height[l], 32u);
+			}
 		}
 
 		const uint32_t total = SetLinearMipChainLayout(levels, mip_pitch, mip_height, mip_size,
@@ -1548,42 +1293,11 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 		return;
 	}
 
-	TextureBlockLayout block {};
-	if (GetTextureBlockLayout(format, tile, block)) {
-		if (tile == 1) {
-			SetMicroMipLayout(block, width, height, levels, total_size, level_sizes, padded_size);
-		} else {
-			SetMacroMipLayout(block, tile, width, height, levels, total_size, level_sizes,
-			                  padded_size);
-		}
-		return;
-	}
-
-	if (auto bytes_per_block = Prospero::BlockCompressedBytesPerBlock(format);
-	    bytes_per_block != 0 && tile == 0) {
-		uint32_t mip_pitch[16] {};
-		uint32_t mip_height[16] {};
-		uint32_t mip_size[16] {};
-
-		const uint32_t blocks_w0 = std::max((width + 3u) / 4u, 1u);
-		const uint32_t blocks_h0 = std::max((height + 3u) / 4u, 1u);
-		for (uint32_t l = 0; l < levels; l++) {
-			uint32_t       padded_blocks_h  = 0;
-			const uint32_t aligned_blocks_w = CalcLinearAlignedLevelPitch(
-			    blocks_w0, blocks_h0, l, bytes_per_block, &padded_blocks_h, &mip_size[l]);
-
-			mip_pitch[l]  = std::max(aligned_blocks_w * 4u, 32u);
-			mip_height[l] = std::max(padded_blocks_h * 4u, 32u);
-		}
-
-		const uint32_t total = SetLinearMipChainLayout(levels, mip_pitch, mip_height, mip_size,
-		                                               level_sizes, padded_size);
-
-		if (total_size != nullptr) {
-			total_size->size  = total;
-			total_size->align = 256;
-		}
-
+	TileSurfaceLayout            layout {};
+	const TileSurfaceDescription description {
+	    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+	if (TileGetTiledTextureLayout(description, layout)) {
+		SetLegacyTiledMipLayout(layout, total_size, level_sizes, padded_size);
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {
@@ -1591,7 +1305,6 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 		list.push_back(fmt::format("format = {}", format));
 		list.push_back(fmt::format("width  = {}", width));
 		list.push_back(fmt::format("height = {}", height));
-		list.push_back(fmt::format("pitch  = {}", pitch));
 		list.push_back(fmt::format("levels = {}", levels));
 		list.push_back(fmt::format("tile   = {}", tile));
 		EXIT("unknown format:\n%s\n", Common::Concat(list, '\n').c_str());
@@ -1599,65 +1312,53 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 }
 
 void TileGetTextureTotalSize(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-                             uint32_t pitch, uint32_t levels, uint32_t tile, bool volume_texture,
+                             uint32_t levels, uint32_t tile, bool volume_texture,
                              TileSizeAlign& total_size) {
 	EXIT_NOT_IMPLEMENTED(depth == 0);
-	if (volume_texture) {
-		TileVolumeLayout volume {};
-		if (TileGetTextureVolumeLayout(format, width, height, depth, levels, tile, volume)) {
-			EXIT_NOT_IMPLEMENTED(volume.total_size > UINT32_MAX);
-			total_size.size  = static_cast<uint32_t>(volume.total_size);
-			total_size.align = tile == 5 ? 4096u : 65536u;
-			return;
+	if (volume_texture && static_cast<Prospero::TileMode>(tile) != Prospero::TileMode::kLinear) {
+		TileSurfaceLayout            layout {};
+		const TileSurfaceDescription description {
+		    format, tile, TileSurfaceDimension::Dim3D, width, height, depth, levels, 1};
+		if (!TileGetTiledTextureLayout(description, layout)) {
+			EXIT("unsupported 3D texture layout: format=%u tile=%u extent=%ux%ux%u levels=%u\n",
+			     format, tile, width, height, depth, levels);
 		}
+		EXIT_NOT_IMPLEMENTED(layout.total_size > UINT32_MAX);
+		total_size.size  = static_cast<uint32_t>(layout.total_size);
+		total_size.align = layout.texture.block.block_size;
+		return;
 	}
 
 	TileSizeAlign slice_size {};
-	TileGetTextureSize(format, width, height, pitch, levels, tile, &slice_size, nullptr, nullptr);
+	TileGetTextureSize(format, width, height, levels, tile, &slice_size, nullptr, nullptr);
 	total_size           = slice_size;
 	const uint64_t total = static_cast<uint64_t>(slice_size.size) * depth;
 	EXIT_NOT_IMPLEMENTED(total > 0xffffffffull);
 	total_size.size = static_cast<uint32_t>(total);
 }
 
-uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, uint32_t tile) {
+uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t tile) {
 	uint32_t pitch = width;
-
-	if (tile == 27) {
-		if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
-		    bytes_per_element != 0) {
-			uint32_t block_width  = 0;
-			uint32_t block_height = 0;
-			EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
-			    bytes_per_element, &block_width, &block_height));
-			pitch = AlignUp(pitch, block_width);
+	switch (static_cast<Prospero::TileMode>(tile)) {
+		case Prospero::TileMode::kLinear: {
+			TileTextureElementLayout element {};
+			if (TileGetTextureElementLayout(format, element) && element.texel_width == 1 &&
+			    element.texel_height == 1) {
+				pitch = AlignUp(pitch, CalcLinearBlockWidth(element.bytes));
+			}
+			break;
 		}
-	}
-
-	if (tile == 0) {
-		if (const auto bytes_per_element = Prospero::NumBytesPerElement(format);
-		    bytes_per_element != 0) {
-			pitch = AlignUp(pitch * bytes_per_element, 256u) / bytes_per_element;
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt:
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget: {
+			TileTextureBlockLayout layout {};
+			if (TileGetTextureBlockLayout(format, tile, false, layout)) {
+				pitch = AlignUp(pitch, layout.block.block_width * layout.texel_width);
+			}
+			break;
 		}
-	}
-	uint32_t bytes_per_element       = 0;
-	uint32_t texels_per_element_wide = 0;
-	uint32_t texels_per_element_tall = 0;
-	uint32_t block_width_log2        = 0;
-	uint32_t block_height_log2       = 0;
-	if ((tile == 9 || tile == 17) &&
-	    Gen5Standard64KBLayout(format, &bytes_per_element, &texels_per_element_wide,
-	                           &texels_per_element_tall, &block_width_log2, &block_height_log2)) {
-		pitch = AlignUp(pitch, (1u << block_width_log2) * texels_per_element_wide);
-	}
-	if (tile == 24) {
-		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
-		uint32_t       block_width       = 0;
-		uint32_t       block_height      = 0;
-		if (bytes_per_element <= 8 &&
-		    Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width, &block_height)) {
-			pitch = AlignUp(pitch, block_width);
-		}
+		default: break;
 	}
 
 	return pitch;

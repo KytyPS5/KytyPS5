@@ -178,10 +178,10 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		pitch = (rt.pitch.pitch_div8_minus1 + 1u) << 3u;
 	} else if (tile) {
 		if (volume) {
-			pitch = TileGetTexturePitch(transfer_format, width, levels, rt.attrib3.tile_mode);
+			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 		} else if (standard64) {
 			pitch = TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
-			                            width, levels, rt.attrib3.tile_mode);
+			                            width, rt.attrib3.tile_mode);
 		} else {
 			pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
 		}
@@ -192,13 +192,20 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		pitch = width;
 	}
 
-	TileSizeOffset   mip_sizes[16] {};
-	TilePaddedSize   mip_padded[16] {};
-	TileVolumeLayout volume_layout {};
-	uint64_t         backing_size = 0;
+	TileSizeOffset    mip_sizes[16] {};
+	TilePaddedSize    mip_padded[16] {};
+	TileSurfaceLayout volume_layout {};
+	uint64_t          backing_size = 0;
 	if (volume) {
-		if (!tile || !TileGetTextureVolumeLayout(transfer_format, width, height, depth, levels,
-		                                         rt.attrib3.tile_mode, volume_layout)) {
+		const TileSurfaceDescription description {transfer_format,
+		                                          rt.attrib3.tile_mode,
+		                                          TileSurfaceDimension::Dim3D,
+		                                          width,
+		                                          height,
+		                                          depth,
+		                                          levels,
+		                                          1};
+		if (!tile || !TileGetTiledTextureLayout(description, volume_layout)) {
 			EXIT("unsupported 3D render-target layout: %ux%ux%u levels=%u tile=%u\n", width, height,
 			     depth, levels, rt.attrib3.tile_mode);
 		}
@@ -209,7 +216,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		bool          valid_layout = false;
 		if (standard64) {
 			TileGetTextureSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), width,
-			                   height, pitch, levels, rt.attrib3.tile_mode, &layout, mip_sizes,
+			                   height, levels, rt.attrib3.tile_mode, &layout, mip_sizes,
 			                   mip_padded);
 			valid_layout = layout.size != 0 && layout.align == 65536;
 		} else {
@@ -289,11 +296,12 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
+			const auto& mip             = volume_layout.mips[level];
 			desc.info.mip_layout[level] = {
-			    volume_layout.level_offsets[level],
-			    volume_layout.level_sizes[level],
-			    volume_layout.level_widths[level],
-			    volume_layout.level_heights[level],
+			    mip.offset,
+			    mip.size,
+			    mip.padded_width,
+			    mip.padded_height,
 			};
 			continue;
 		}

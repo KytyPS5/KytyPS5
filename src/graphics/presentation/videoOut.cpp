@@ -537,10 +537,10 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	const auto tile_mode =
 	    Graphics::Prospero::GpuEnumValue(Graphics::Prospero::TileMode::kRenderTarget);
 	const auto pitch =
-	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, 1, tile_mode);
+	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
-	                                  1, pitch, 1, tile_mode, false, total);
+	                                  1, 1, tile_mode, false, total);
 	if (total.size == 0 || total.align != 65536 ||
 	    (buffer.data_address & (total.align - 1u)) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");

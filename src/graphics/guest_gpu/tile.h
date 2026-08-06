@@ -39,7 +39,7 @@ enum class TileBlockFamily : uint32_t {
 };
 
 struct TileBlockLayout {
-	TileBlockFamily family            = TileBlockFamily::Standard256B;
+	TileBlockFamily family            = TileBlockFamily::Count;
 	uint32_t        bytes_per_element = 0;
 	uint32_t        block_size        = 0;
 	uint32_t        block_width       = 0;
@@ -47,38 +47,69 @@ struct TileBlockLayout {
 	uint32_t        block_depth       = 0;
 };
 
-struct TileVolumeLayout {
-	TileBlockFamily family            = TileBlockFamily::Count;
-	uint32_t        bytes_per_element = 0;
-	uint32_t        texel_width       = 1;
-	uint32_t        texel_height      = 1;
-	uint32_t        first_tail_level  = 0;
-	uint32_t        block_depth       = 1;
-	uint64_t        block_slice_size  = 0;
-	uint64_t        total_size        = 0;
-	uint64_t        level_offsets[16] = {};
-	uint64_t        level_sizes[16]   = {};
-	uint32_t        tail_x[16]        = {};
-	uint32_t        tail_y[16]        = {};
-	uint32_t        level_widths[16]  = {};
-	uint32_t        level_heights[16] = {};
+struct TileTextureElementLayout {
+	uint32_t bytes        = 0;
+	uint32_t texel_width  = 1;
+	uint32_t texel_height = 1;
+};
+
+struct TileTextureBlockLayout {
+	TileBlockLayout block;
+	uint32_t        texel_width  = 1;
+	uint32_t        texel_height = 1;
+};
+
+enum class TileSurfaceDimension : uint32_t {
+	Dim2D,
+	Dim3D,
+};
+
+struct TileSurfaceDescription {
+	uint32_t             format    = 0;
+	uint32_t             tile_mode = 0;
+	TileSurfaceDimension dimension = TileSurfaceDimension::Dim2D;
+	uint32_t             width     = 0;
+	uint32_t             height    = 0;
+	uint32_t             depth     = 1;
+	uint32_t             levels    = 1;
+	uint32_t             layers    = 1;
+};
+
+// Width/height fields are measured in addressable elements, not texture texels.
+struct TileMipLayout {
+	uint64_t offset        = 0;
+	uint64_t size          = 0;
+	uint32_t width         = 0;
+	uint32_t height        = 0;
+	uint32_t padded_width  = 0;
+	uint32_t padded_height = 0;
+	uint32_t tail_x        = 0;
+	uint32_t tail_y        = 0;
+};
+
+struct TileSurfaceLayout {
+	TileSurfaceDescription description;
+	TileTextureBlockLayout texture;
+	uint32_t               first_tail_level = 0;
+	uint64_t               block_slice_size = 0;
+	uint64_t               total_size       = 0;
+	TileMipLayout          mips[16]         = {};
 };
 
 bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
                         TileBlockLayout& layout);
+bool TileGetTextureElementLayout(uint32_t format, TileTextureElementLayout& layout);
+bool TileGetTextureBlockLayout(uint32_t format, uint32_t tile, bool volume,
+                               TileTextureBlockLayout& layout);
+bool TileGetTiledTextureLayout(const TileSurfaceDescription& description,
+                               TileSurfaceLayout&            layout);
 bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, uint32_t z,
                         uint32_t& byte_offset);
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
                      uint32_t& byte_offset);
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
                      uint32_t block_z, uint32_t& byte_offset);
-bool TileIsStandard256BTextureSupported(uint32_t format);
-bool TileIsStandard4KBTextureSupported(uint32_t format);
-bool TileIsStandard64KBTextureSupported(uint32_t format);
-bool TileGetTextureVolumeLayout(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-                                uint32_t levels, uint32_t tile, TileVolumeLayout& layout);
 
-bool     TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& htile_size);
 bool     TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch, uint32_t z_format,
                           uint32_t stencil_format, bool htile, TileSizeAlign& stencil_size,
                           TileSizeAlign& htile_size, TileSizeAlign& depth_size,
@@ -94,13 +125,13 @@ bool     TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t 
                                       uint32_t bytes_per_element, uint32_t levels,
                                       TileSizeAlign& total_size, TileSizeOffset* level_sizes,
                                       TilePaddedSize* padded_size);
-void     TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32_t pitch,
-                            uint32_t levels, uint32_t tile, TileSizeAlign* total_size,
-                            TileSizeOffset* level_sizes, TilePaddedSize* padded_size);
-void TileGetTextureTotalSize(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-                             uint32_t pitch, uint32_t levels, uint32_t tile, bool volume_texture,
-                             TileSizeAlign& total_size);
-uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, uint32_t tile);
+void     TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32_t levels,
+                            uint32_t tile, TileSizeAlign* total_size, TileSizeOffset* level_sizes,
+                            TilePaddedSize* padded_size);
+void     TileGetTextureTotalSize(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
+                                 uint32_t levels, uint32_t tile, bool volume_texture,
+                                 TileSizeAlign& total_size);
+uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t tile);
 
 } // namespace Libs::Graphics
 

@@ -239,7 +239,7 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	const auto samples      = multisampled ? 1u << descriptor.LastLevel() : 1u;
 	const auto pitch =
 	    multisampled ? TileGetDepthPitch(width, image.info.bytes_per_block, descriptor.LastLevel())
-	                 : TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
+	                 : TileGetTexturePitch(descriptor.Format(), width, descriptor.TileMode());
 	const bool supported_2d    = type == Prospero::ImageType::kColor2D &&
 	                             image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
 	                             descriptor.BaseArray5() == 0;
@@ -321,7 +321,7 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 		return;
 	}
 	const auto descriptor_pitch =
-	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u, 1,
+	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
 	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
 	     "kind=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
@@ -373,26 +373,33 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D) &&
 	                   descriptor.BaseArray5() == 0;
-	TileBlockLayout depth_block {};
-	const auto      depth_bpe = Prospero::RenderTargetBytesPerElement(descriptor.Format());
-	const bool      supported_depth_tile =
-	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) && !resource.read &&
-	    !Prospero::IsFmaskTextureFormat(descriptor.Format()) && (is_2d || is_2d_array) &&
-	    TileGetBlockLayout(TileBlockFamily::Depth64KB, depth_bpe, depth_block);
-	const bool supported_standard_256b =
-	    (is_2d || is_2d_array) &&
-	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B) &&
-	    TileIsStandard256BTextureSupported(descriptor.Format());
-	const bool supported_standard_tile =
-	    (tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
-	     TileIsStandard4KBTextureSupported(descriptor.Format())) ||
-	    (tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) &&
-	     TileIsStandard64KBTextureSupported(descriptor.Format()));
-	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
-	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
-	                            supported_depth_tile || supported_standard_256b ||
-	                            supported_standard_tile;
-	const auto swizzle        = descriptor.DstSelXYZW();
+	TileTextureBlockLayout tile_layout {};
+	bool                   supported_tile = false;
+	switch (static_cast<Prospero::TileMode>(tile)) {
+		case Prospero::TileMode::kLinear: supported_tile = true; break;
+		case Prospero::TileMode::kDepth:
+			supported_tile =
+			    !resource.read && !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
+			    (is_2d || is_2d_array) &&
+			    TileGetTextureBlockLayout(descriptor.Format(), tile, false, tile_layout);
+			break;
+		case Prospero::TileMode::kStandard256B:
+			supported_tile =
+			    (is_2d || is_2d_array) &&
+			    TileGetTextureBlockLayout(descriptor.Format(), tile, false, tile_layout);
+			break;
+		case Prospero::TileMode::kStandard4KB:
+		case Prospero::TileMode::kStandard64KB:
+			supported_tile =
+			    TileGetTextureBlockLayout(descriptor.Format(), tile, is_3d, tile_layout);
+			break;
+		case Prospero::TileMode::kRenderTarget:
+			supported_tile =
+			    TileGetTextureBlockLayout(descriptor.Format(), tile, false, tile_layout);
+			break;
+		default: break;
+	}
+	const auto swizzle = descriptor.DstSelXYZW();
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
@@ -498,18 +505,20 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 
 static void PopulateTextureMipLayout(ImageInfo& info) {
 	if (info.IsVolume() && info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kLinear)) {
-		TileVolumeLayout volume {};
-		if (!TileGetTextureVolumeLayout(info.guest_format, info.extent.width, info.extent.height,
-		                                info.extent.depth, info.resources.levels, info.tile_mode,
-		                                volume)) {
+		TileSurfaceLayout            surface {};
+		const TileSurfaceDescription description {
+		    info.guest_format,  info.tile_mode,    TileSurfaceDimension::Dim3D, info.extent.width,
+		    info.extent.height, info.extent.depth, info.resources.levels,       1};
+		if (!TileGetTiledTextureLayout(description, surface)) {
 			EXIT("unsupported normalized volume texture layout\n");
 		}
 		for (uint32_t level = 0; level < info.resources.levels; level++) {
+			const auto& mip        = surface.mips[level];
 			info.mip_layout[level] = {
-			    volume.level_offsets[level],
-			    volume.level_sizes[level],
-			    volume.level_widths[level],
-			    volume.level_heights[level],
+			    mip.offset,
+			    mip.size,
+			    mip.padded_width,
+			    mip.padded_height,
 			};
 		}
 		return;
@@ -517,7 +526,7 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 	TileSizeOffset levels[16] {};
 	TilePaddedSize padded[16] {};
-	TileGetTextureSize(info.guest_format, info.extent.width, info.extent.height, info.pitch,
+	TileGetTextureSize(info.guest_format, info.extent.width, info.extent.height,
 	                   info.resources.levels, info.tile_mode, nullptr, levels, padded);
 	for (uint32_t level = 0; level < info.resources.levels; level++) {
 		const auto offset =
@@ -675,9 +684,9 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		}
 		size.size *= image_layers;
 	} else {
-		pitch = TileGetTexturePitch(format, width, levels, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, pitch, levels,
-		                        tile, volume, size);
+		pitch = TileGetTexturePitch(format, width, tile);
+		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels, tile,
+		                        volume, size);
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);

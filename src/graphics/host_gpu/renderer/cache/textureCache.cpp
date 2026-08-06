@@ -911,7 +911,6 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 	uint32_t    format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
 	bool        volume           = info.IsVolume();
-	bool        layered          = info.IsLayered();
 	bool        allow_depth_tile = direction == TransferDirection::Upload;
 	const char* owner =
 	    direction == TransferDirection::Upload ? "TextureCache" : "TextureCache readback";
@@ -940,7 +939,6 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 				format           = info.guest_format;
 				layers           = info.resources.layers;
 				volume           = false;
-				layered          = layers > 1;
 				allow_depth_tile = false;
 				plan.swap_bgra16 = info.bgra16;
 				owner            = "VideoOut";
@@ -958,19 +956,14 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 		plan.swap_bgra16 = info.bgra16;
 	}
 
-	plan.layout = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
-	                                      info.resources.levels, layers, info.pitch, info.tile_mode,
-	                                      info.data.size, allow_depth_tile, volume, owner);
-	plan.regions = TextureBuildImageCopies(plan.layout, info.extent.width, info.extent.height,
-	                                       layers, info.resources.levels, layered, volume);
-	plan.tiled   = static_cast<Prospero::TileMode>(plan.layout.tile) != Prospero::TileMode::kLinear;
+	plan.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
+	                                       info.resources.levels, layers, info.tile_mode,
+	                                       info.data.size, allow_depth_tile, volume, owner);
+	plan.regions = TextureBuildImageCopies(plan.layout);
+	plan.tiled   = static_cast<Prospero::TileMode>(plan.layout.surface.description.tile_mode) !=
+	               Prospero::TileMode::kLinear;
 	if (plan.tiled) {
-		// CMASK/FMASK decoding is intentionally deferred.
-		if (plan.layout.tile_family == TileBlockFamily::Depth64KB &&
-		    Prospero::IsFmaskTextureFormat(format)) {
-			return plan;
-		}
-		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout, format, layers,
+		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,
 		                              info.resources.levels, plan.tiles)) {
 			return plan;
 		}
@@ -1017,9 +1010,10 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
 			     "pitch=%u levels=%u layers=%u samples=%u\n",
 			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
-			     info.guest_format, info.tile_mode, static_cast<uint32_t>(plan.layout.tile_family),
-			     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
-			     info.resources.levels, info.resources.layers, info.samples);
+			     info.guest_format, info.tile_mode,
+			     static_cast<uint32_t>(plan.layout.surface.texture.block.family), info.extent.width,
+			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
+			     info.resources.layers, info.samples);
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
@@ -1718,14 +1712,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			return false;
 		}
 		if (color.tiled) {
-			const auto binding = m_texture_cache.UploadBinding(image);
-			const auto format =
-			    binding == TextureCache::BindingType::RenderTarget
-			        ? ImageOps::RenderTargetTransferFormat(image.info.bytes_per_block)
-			        : image.info.guest_format;
 			color.tiles.clear();
-			if (!TextureBuildGpuTileInfos(copy_size, color.regions, color.layout, format,
-			                              image.info.TransferLayers(), levels, color.tiles)) {
+			if (!TextureBuildGpuTileInfos(copy_size, color.regions, color.layout, levels,
+			                              color.tiles)) {
 				return false;
 			}
 			color.linear_size = GetLinearSize(color.tiles);

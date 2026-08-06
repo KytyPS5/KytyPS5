@@ -2970,11 +2970,11 @@ public:
 			constexpr uint32_t mip_height = 1;
 			constexpr uint32_t mip_levels = 1;
 			const uint32_t     mip_pitch =
-			    TileGetTexturePitch(mip_format, mip_width, mip_levels, mip_tile);
+			    TileGetTexturePitch(mip_format, mip_width, mip_tile);
 			TileSizeAlign                  mip_total {};
 			std::array<TileSizeOffset, 16> mip_sizes {};
 			std::array<TilePaddedSize, 16> mip_padded {};
-			TileGetTextureSize(mip_format, mip_width, mip_height, mip_pitch, mip_levels, mip_tile,
+			TileGetTextureSize(mip_format, mip_width, mip_height, mip_levels, mip_tile,
 			                   &mip_total, mip_sizes.data(), mip_padded.data());
 			const uint64_t mip_prefix_size = mip_sizes[0].offset + mip_sizes[0].size;
 			const uint64_t mip_guest_size  = mip_total.size + 256;
@@ -3866,11 +3866,10 @@ public:
 			                                            0.625f, 0.75f,  0.875f, 1.0f,   0.0625f};
 			std::memset(memory + layered_offset, 0, layered_guest_size);
 			const auto layered_layout = TextureCalcUploadLayout(
-			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 2, 2, 2, 2, 2,
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 2, 2, 2, 2,
 			    Prospero::GpuEnumValue(Prospero::TileMode::kLinear), layered_guest_size, true,
 			    false, "UnifiedTextureCacheFlow");
-			const auto layered_upload_regions =
-			    TextureBuildImageCopies(layered_layout, 2, 2, 2, 2, true, false);
+			const auto layered_upload_regions = TextureBuildImageCopies(layered_layout);
 			Require(name, "layered guest layout", layered_upload_regions.size() == 4,
 			        "unexpected layered/mipped upload-region count");
 			for (const auto& region: layered_upload_regions) {
@@ -5181,11 +5180,11 @@ public:
 		{
 			GpuResourceManager resources(m_runtime_context, scheduler);
 			resources.MapMemory(base, allocation_size);
-			const uint32_t pitch = TileGetTexturePitch(format, 1, 1, tile);
+			const uint32_t pitch = TileGetTexturePitch(format, 1, tile);
 			TileSizeAlign  total {};
 			TileSizeOffset mip {};
 			TilePaddedSize padded {};
-			TileGetTextureSize(format, 1, 1, pitch, 1, tile, &total, &mip, &padded);
+			TileGetTextureSize(format, 1, 1, 1, tile, &total, &mip, &padded);
 			Require(name, "tiled layout", total.size >= 8 && total.size <= allocation_size,
 			        "BGRA16 tiled layout exceeds its guest allocation");
 			std::memset(mapped, 0x5a, total.size);
@@ -5465,9 +5464,8 @@ public:
 
 			constexpr auto stencil_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
 			constexpr auto linear         = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-			const auto     stencil_pitch  = TileGetTexturePitch(stencil_format, 1, 1, linear);
 			TileSizeAlign  stencil_layout {};
-			TileGetTextureTotalSize(stencil_format, 1, 1, 1, stencil_pitch, 1, linear, false,
+			TileGetTextureTotalSize(stencil_format, 1, 1, 1, 1, linear, false,
 			                        stencil_layout);
 			Require(name, "stencil footprint",
 			        stencil_layout.size != 0 && stencil_layout.align != 0 &&
@@ -7717,7 +7715,7 @@ public:
 			TileSizeAlign  total {};
 			TileSizeOffset mip[levels] {};
 			TilePaddedSize padded[levels] {};
-			TileGetTextureSize(format, 65, 33, 72, levels,
+			TileGetTextureSize(format, 65, 33, levels,
 			                   Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B), &total,
 			                   mip, padded);
 			constexpr u32 offsets[levels] = {0x1a00, 0xb00, 0x500, 0x300, 0x200, 0x100, 0};
@@ -7826,18 +7824,57 @@ public:
 		struct StandardMode {
 			u32             tile;
 			TileBlockFamily family;
-			bool (*supported)(u32);
 		};
 		constexpr StandardMode standard_modes[] = {
 		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B),
-		     TileBlockFamily::Standard256B, TileIsStandard256BTextureSupported},
-		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB), TileBlockFamily::Standard4KB,
-		     TileIsStandard4KBTextureSupported},
+		     TileBlockFamily::Standard256B},
+		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB),
+		     TileBlockFamily::Standard4KB},
 		    {Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB),
-		     TileBlockFamily::Standard64KB, TileIsStandard64KBTextureSupported},
-		    {Prospero::GpuEnumValue(Prospero::TileMode::kPrt), TileBlockFamily::Prt64KB,
-		     TileIsStandard64KBTextureSupported},
+		     TileBlockFamily::Standard64KB},
+		    {Prospero::GpuEnumValue(Prospero::TileMode::kPrt), TileBlockFamily::Prt64KB},
 		};
+		for (const auto format: {Prospero::BufferFormat::k8Srgb,
+		                         Prospero::BufferFormat::k8_8Srgb,
+		                         Prospero::BufferFormat::k9_9_9_5Float}) {
+			for (const auto tile: {Prospero::TileMode::kDepth,
+			                       Prospero::TileMode::kRenderTarget}) {
+				TileTextureBlockLayout texture {};
+				Require(name, "RT format policy",
+				        !TileGetTextureBlockLayout(Prospero::GpuEnumValue(format),
+				                                   Prospero::GpuEnumValue(tile), false, texture),
+				        "non-render-target format admitted by an RT/depth tile family");
+			}
+		}
+		{
+			TileSurfaceLayout invalid {};
+			const TileSurfaceDescription description {
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
+			    Prospero::GpuEnumValue(Prospero::TileMode::kStandard256B),
+			    TileSurfaceDimension::Dim3D,
+			    16,
+			    16,
+			    16,
+			    1,
+			    1,
+			};
+			Require(name, "3D tile policy", !TileGetTiledTextureLayout(description, invalid),
+			        "Standard256B volume silently fell back to a 2D array layout");
+		}
+		{
+			constexpr u32 format =
+			    Prospero::GpuEnumValue(Prospero::BufferFormat::kFmask8_S4_F4);
+			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+			TileSizeAlign total {};
+			TileGetTextureSize(format, 128, 128, 1, tile, &total, nullptr, nullptr);
+			const auto layout = TextureCalcUploadLayout(format, 128, 128, 1, 1, tile, total.size,
+			                                            false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
+			std::vector<GpuTileInfo> infos;
+			Require(name, "FMASK policy",
+			        !TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
+			        "FMASK entered the texel tiler through a non-depth family");
+		}
 		u32 format_cases = 0;
 		for (u32 format = 1; format <= Prospero::GpuEnumValue(Prospero::BufferFormat::kBc7Srgb);
 		     ++format) {
@@ -7847,30 +7884,28 @@ public:
 				continue;
 			}
 			for (const auto& mode: standard_modes) {
-				if (!mode.supported(format)) {
+				TileTextureBlockLayout texture {};
+				if (!TileGetTextureBlockLayout(format, mode.tile, false, texture)) {
 					continue;
 				}
-				const u32       bpe = std::max(Prospero::NumBytesPerElement(format),
-				                               Prospero::BlockCompressedBytesPerBlock(format));
-				TileBlockLayout block {};
-				Require(name, "format block", TileGetBlockLayout(mode.family, bpe, block),
-				        "CPU-supported format has no GPU family/BPE mapping");
+				const u32 bpe = texture.block.bytes_per_element;
+				Require(name, "format block", texture.block.family == mode.family,
+				        "CPU-supported format selected the wrong block family");
 
 				constexpr u32 width  = 67;
 				constexpr u32 height = 51;
-				const u32     pitch  = TileGetTexturePitch(format, width, 1, mode.tile);
+				const u32     pitch  = TileGetTexturePitch(format, width, mode.tile);
 				TileSizeAlign total {};
-				TileGetTextureSize(format, width, height, pitch, 1, mode.tile, &total, nullptr,
+				TileGetTextureSize(format, width, height, 1, mode.tile, &total, nullptr,
 				                   nullptr);
 				Require(name, "format size", total.size != 0,
 				        "supported format has an empty layout");
 
 				const auto layout = TextureCalcUploadLayout(
-				    format, width, height, 1, 1, pitch, mode.tile, total.size, false, false, name);
-				const auto regions =
-				    TextureBuildImageCopies(layout, width, height, 1, 1, false, false);
+				    format, width, height, 1, 1, mode.tile, total.size, false, false, name);
+				const auto regions = TextureBuildImageCopies(layout);
 				std::vector<GpuTileInfo> infos;
-				if (!TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, 1, infos)) {
+				if (!TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos)) {
 					std::ostringstream out;
 					out << "format=" << format << " tile=" << mode.tile << " size=" << total.size
 					    << " pitch=" << pitch;
@@ -7895,26 +7930,30 @@ public:
 		        "no CPU-supported standard formats were tested");
 
 		{
+			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32Float);
+			TileTextureElementLayout element {};
+			Require(name, "RGB32 texture policy", !TileGetTextureElementLayout(format, element),
+			        "12-byte texel layouts must be rejected");
+		}
+
+		{
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc1UNorm);
 			constexpr u32 tile = Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
 			constexpr u32 width = 256, height = 256, levels = 9;
-			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            tile, total.size, false, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, tile,
+			                                            total.size, false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool built =
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
 			uint64_t linear_size = 0;
 			for (const auto& info: infos) {
 				linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
 			}
 			Require(name, "BC1 mip-tail capacities",
-			        built && total.size == 0x10000 && layout.first_tail_level == 0 &&
+			        built && total.size == 0x10000 && layout.surface.first_tail_level == 0 &&
 			            linear_size == 0x15560 && linear_size > total.size,
 			        "BC1 mip tail conflated tiled and linear capacities");
 			check_round_trip("BC1 mip tail", total.size, infos);
@@ -7924,16 +7963,13 @@ public:
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 			constexpr u32 tile   = Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 			constexpr u32 width = 129, height = 65, layers = 3;
-			const u32     pitch = TileGetTexturePitch(format, width, 1, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(format, width, height, layers, pitch, 1, tile, false, total);
-			const auto layout = TextureCalcUploadLayout(format, width, height, 1, layers, pitch,
-			                                            tile, total.size, true, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, layers, 1, true, false);
+			TileGetTextureTotalSize(format, width, height, layers, 1, tile, false, total);
+			const auto layout = TextureCalcUploadLayout(format, width, height, 1, layers, tile,
+			                                            total.size, true, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool               built =
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, layers, 1, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos);
 			Require(name, "array infos",
 			        built && infos.size() == layers && infos[0].surface_z == 0 &&
 			            infos[1].surface_z == 1 && infos[2].surface_z == 2,
@@ -7949,18 +7985,16 @@ public:
 			        "odd multi-mip format has no block layout");
 			const u32     width  = block.block_width * 2u + 1u;
 			const u32     height = block.block_height * 2u + 1u;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, mode.tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, mode.tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, mode.tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            mode.tile, total.size, false, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
+			                                            total.size, false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			Require(
 			    name, "odd mip infos",
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels, infos) &&
+			    TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			        infos.size() == 2 && infos[1].tiled_width >= infos[1].pitch &&
 			        infos[1].tiled_height >= infos[1].height &&
 			        (mode.family == TileBlockFamily::Standard256B ||
@@ -7992,19 +8026,16 @@ public:
 			        "2D tail mode has no block layout");
 			const u32     width  = block.block_width * 2u;
 			const u32     height = block.block_height * 2u;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, mode.tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, mode.tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, mode.tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            mode.tile, total.size, true, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
+			                                            total.size, true, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			Require(name, "2D mip tail seam",
-			        layout.first_tail_level == 2 &&
-			            TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, levels,
-			                                     infos) &&
+			        layout.surface.first_tail_level == 2 &&
+			            TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			            infos.size() == levels && !infos[0].tail && !infos[1].tail &&
 			            std::all_of(infos.begin() + 2, infos.end(),
 			                        [](const auto& info) { return info.tail; }),
@@ -8019,16 +8050,13 @@ public:
 			constexpr u32 height = 129;
 			constexpr u32 depth  = 17;
 			constexpr u32 levels = 2;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile, true, total);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, pitch,
-			                                            tile, total.size, false, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			TileGetTextureTotalSize(format, width, height, depth, levels, tile, true, total);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, tile,
+			                                            total.size, false, true, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool               built =
-			    TextureBuildGpuTileInfos(total.size, regions, layout, format, depth, levels, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
 			Require(name, "3D mip infos",
 			        regions.size() == depth + (depth >> 1u) && built && infos.size() == 4 &&
 			            infos[0].depth == 8 && infos[1].depth == 8 && infos[2].depth == 1 &&
@@ -8048,17 +8076,14 @@ public:
 			constexpr u32 height = 129;
 			constexpr u32 depth  = 17;
 			constexpr u32 levels = 2;
-			const u32     pitch  = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile, true, total);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, pitch,
-			                                            tile, total.size, false, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			TileGetTextureTotalSize(format, width, height, depth, levels, tile, true, total);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, depth, tile,
+			                                            total.size, false, true, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			Require(name, "3D BC mip infos",
-			        TextureBuildGpuTileInfos(total.size, regions, layout, format, depth, levels,
-			                                 infos) &&
+			        TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			            infos.size() == 4 && infos[3].pitch == 8 && infos[3].height == 16 &&
 			            infos[3].tiled_width == 16 && infos[3].tiled_height == 24,
 			        "block-compressed 3D mip lost its physical row or slice stride");
@@ -8069,14 +8094,12 @@ public:
 			constexpr u32 format = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc3UNorm);
 			constexpr u32 tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 			constexpr u32 width = 8, height = 8, levels = 4;
-			const u32     pitch = TileGetTexturePitch(format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureSize(format, width, height, pitch, levels, tile, &total, nullptr,
+			TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
 			                   nullptr);
-			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, pitch,
-			                                            tile, total.size, false, false, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, 1, levels, false, false);
+			const auto layout = TextureCalcUploadLayout(format, width, height, levels, 1, tile,
+			                                            total.size, false, false, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			Require(name, "linear BC native regions",
 			        regions.size() == levels &&
 			            std::all_of(regions.begin(), regions.end(),
@@ -8114,18 +8137,15 @@ public:
 		};
 		for (const auto test: volume_modes) {
 			constexpr u32 width = 65, height = 33, depth = 37, levels = 6;
-			const u32     pitch = TileGetTexturePitch(test.format, width, levels, test.tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(test.format, width, height, depth, pitch, levels, test.tile,
-			                        true, total);
+			TileGetTextureTotalSize(test.format, width, height, depth, levels, test.tile, true,
+			                        total);
 			const auto layout =
-			    TextureCalcUploadLayout(test.format, width, height, levels, depth, pitch, test.tile,
+			    TextureCalcUploadLayout(test.format, width, height, levels, depth, test.tile,
 			                            total.size, true, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
-			const bool built  = TextureBuildGpuTileInfos(total.size, regions, layout, test.format,
-			                                             depth, levels, infos);
+			const bool built = TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
 			const bool uses_z = test.family == TileBlockFamily::RenderTarget64KB ||
 			                    test.family == TileBlockFamily::Depth64KB;
 			Require(
@@ -8168,21 +8188,18 @@ public:
 			const u32     width      = block.block_width * (compressed ? 4u : 1u);
 			const u32     height     = block.block_height / 2u * (compressed ? 4u : 1u);
 			const u32     depth      = block.block_depth + 1u;
-			const u32     pitch      = TileGetTexturePitch(tail.format, width, levels, tile);
 			TileSizeAlign total {};
-			TileGetTextureTotalSize(tail.format, width, height, depth, pitch, levels, tile, true,
+			TileGetTextureTotalSize(tail.format, width, height, depth, levels, tile, true,
 			                        total);
 			const auto layout = TextureCalcUploadLayout(tail.format, width, height, levels, depth,
-			                                            pitch, tile, total.size, false, true, name);
-			const auto regions =
-			    TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+			                                            tile, total.size, false, true, name);
+			const auto regions = TextureBuildImageCopies(layout);
 			std::vector<GpuTileInfo> infos;
 			bool                     valid =
 			    total.size == 8192 &&
 			    regions.size() == depth + std::max(depth >> 1u, 1u) + std::max(depth >> 2u, 1u) +
 			                          std::max(depth >> 3u, 1u) + std::max(depth >> 4u, 1u) &&
-			    TextureBuildGpuTileInfos(total.size, regions, layout, tail.format, depth, levels,
-			                             infos) &&
+			    TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos) &&
 			    infos.size() == 6;
 			const u32 table = std::countr_zero(tail.bytes);
 			for (u32 level = 0; level < levels && valid; level++) {
@@ -8280,15 +8297,14 @@ public:
 		constexpr u32 volume_width = 8, volume_height = 4, volume_depth = 5;
 		constexpr u32 volume_levels = 3;
 		const u32     volume_pitch =
-		    TileGetTexturePitch(volume_format, volume_width, volume_levels, volume_tile);
+		    TileGetTexturePitch(volume_format, volume_width, volume_tile);
 		TileSizeAlign volume_size {};
 		TileGetTextureTotalSize(volume_format, volume_width, volume_height, volume_depth,
-		                        volume_pitch, volume_levels, volume_tile, true, volume_size);
+		                        volume_levels, volume_tile, true, volume_size);
 		const auto volume_layout = TextureCalcUploadLayout(
-		    volume_format, volume_width, volume_height, volume_levels, volume_depth, volume_pitch,
-		    volume_tile, volume_size.size, true, true, name);
-		const auto volume_copies = TextureBuildImageCopies(
-		    volume_layout, volume_width, volume_height, volume_depth, volume_levels, false, true);
+		    volume_format, volume_width, volume_height, volume_levels, volume_depth, volume_tile,
+		    volume_size.size, true, true, name);
+		const auto volume_copies = TextureBuildImageCopies(volume_layout);
 		std::vector<u32>                    volume_source(volume_size.size / sizeof(u32), 0);
 		std::vector<std::pair<size_t, u32>> volume_probes;
 		for (const auto& copy: volume_copies) {
@@ -8323,9 +8339,10 @@ public:
 		volume_info.bytes_per_block = sizeof(u32);
 		volume_info.tile_mode       = volume_tile;
 		for (u32 level = 0; level < volume_levels; level++) {
-			volume_info.mip_layout[level] = {
-			    volume_layout.level_sizes[level].offset, volume_layout.level_sizes[level].size,
-			    volume_layout.padded_sizes[level].width, volume_layout.padded_sizes[level].height};
+			volume_info.mip_layout[level] = {volume_layout.mips[level].offset,
+			                                 volume_layout.mips[level].size,
+			                                 volume_layout.mips[level].row_length,
+			                                 volume_layout.mips[level].image_height};
 		}
 		Libs::Graphics::Image volume_image(m_runtime_context, scheduler, volume_info);
 		volume_image.Upload(volume_copies, volume_upload.buffer, 0, volume_size.size);
@@ -16988,12 +17005,10 @@ void CheckBasicStorageTextureDescriptor() {
 	}};
 	auto standard256b_resource = BasicBgraStorageTextureResource();
 	standard256b_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-	const auto standard256b_pitch = TileGetTexturePitch(
-	    standard256b.Format(), standard256b.Width5() + 1u, 1, standard256b.TileMode());
 	TileSizeAlign standard256b_size {};
 	TileGetTextureTotalSize(standard256b.Format(), standard256b.Width5() + 1u,
 	                        standard256b.Height5() + 1u, standard256b.Depth() + 1u,
-	                        standard256b_pitch, 1, standard256b.TileMode(), false,
+	                        1, standard256b.TileMode(), false,
 	                        standard256b_size);
 	Require("BasicStorageTexture", "Standard256B uint 2D descriptor",
 	        standard256b.Width5() + 1u == 2 && standard256b.Height5() + 1u == 2 &&
@@ -17009,10 +17024,8 @@ void CheckBasicStorageTextureDescriptor() {
 	ValidateStorageTexture(standard256b_resource, standard256b, standard256b_size.size);
 
 	const auto standard4kb_array = Standard4KBUintArrayStorageTextureDescriptor();
-	const auto standard4kb_pitch =
-	    TileGetTexturePitch(standard4kb_array.Format(), 1, 1, standard4kb_array.TileMode());
 	TileSizeAlign standard4kb_size {};
-	TileGetTextureTotalSize(standard4kb_array.Format(), 1, 1, 1, standard4kb_pitch, 1,
+	TileGetTextureTotalSize(standard4kb_array.Format(), 1, 1, 1, 1,
 	                        standard4kb_array.TileMode(), false, standard4kb_size);
 	Require(
 	    "BasicStorageTexture", "Standard4KB uint 2D-array descriptor",
@@ -17029,11 +17042,9 @@ void CheckBasicStorageTextureDescriptor() {
 	auto based_standard4kb_array       = standard4kb_array;
 	based_standard4kb_array.fields[0]  = 0x006c6800u;
 	based_standard4kb_array.fields[4]  = 0x00010001u;
-	const auto based_standard4kb_pitch = TileGetTexturePitch(based_standard4kb_array.Format(), 1, 1,
-	                                                         based_standard4kb_array.TileMode());
 	TileSizeAlign based_standard4kb_size {};
 	TileGetTextureTotalSize(based_standard4kb_array.Format(), 1, 1,
-	                        based_standard4kb_array.Depth() + 1u, based_standard4kb_pitch, 1,
+	                        based_standard4kb_array.Depth() + 1u, 1,
 	                        based_standard4kb_array.TileMode(), false, based_standard4kb_size);
 	Require("BasicStorageTexture", "based Standard4KB array view",
 	        based_standard4kb_array.Base40() == 0x6c680000ull &&
@@ -17044,12 +17055,10 @@ void CheckBasicStorageTextureDescriptor() {
 	                       based_standard4kb_size.size);
 
 	const auto standard64kb       = Standard64KBStorageTextureDescriptor();
-	const auto standard64kb_pitch = TileGetTexturePitch(
-	    standard64kb.Format(), standard64kb.Width5() + 1u, 1, standard64kb.TileMode());
 	TileSizeAlign standard64kb_size {};
 	TileGetTextureTotalSize(standard64kb.Format(), standard64kb.Width5() + 1u,
 	                        standard64kb.Height5() + 1u, standard64kb.Depth() + 1u,
-	                        standard64kb_pitch, 1, standard64kb.TileMode(), false,
+	                        1, standard64kb.TileMode(), false,
 	                        standard64kb_size);
 	Require("BasicStorageTexture", "Standard64KB 2D descriptor",
 	        standard64kb.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
@@ -17109,11 +17118,11 @@ void CheckBasicStorageTextureDescriptor() {
 	        d16_depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
 	    "PPSA10112 writable D16 depth-plane descriptor fixture is malformed");
 	const auto d16_pitch = TileGetTexturePitch(
-	    d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u, 1, d16_depth_tile.TileMode());
+	    d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u, d16_depth_tile.TileMode());
 	TileSizeAlign d16_size {};
 	TileGetTextureTotalSize(d16_depth_tile.Format(), d16_depth_tile.Width5() + 1u,
-	                        d16_depth_tile.Height5() + 1u, d16_depth_tile.Depth() + 1u, d16_pitch,
-	                        1, d16_depth_tile.TileMode(), false, d16_size);
+	                        d16_depth_tile.Height5() + 1u, d16_depth_tile.Depth() + 1u, 1,
+	                        d16_depth_tile.TileMode(), false, d16_size);
 	Require("BasicStorageTexture", "PPSA10112 D16 depth-tile footprint",
 	        d16_pitch == 256 && d16_size.size == 0x20000 && d16_size.align == 0x10000,
 	        "PPSA10112 writable D16 depth-plane footprint is incorrect");
@@ -17191,16 +17200,17 @@ void CheckStorageTextureLinearUploadLayout() {
 	constexpr uint32_t height = 2160;
 	constexpr uint32_t depth  = 1;
 	constexpr uint32_t tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const auto         pitch  = TileGetTexturePitch(format, width, 1, tile);
+	const auto         pitch  = TileGetTexturePitch(format, width, tile);
 	TileSizeAlign      total {};
-	TileGetTextureTotalSize(format, width, height, depth, pitch, 1, tile, false, total);
+	TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, 1, depth, pitch, tile, total.size, true,
+	    TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size, true,
 	                            false, "StorageTextureLinearTest");
-	const auto regions = TextureBuildImageCopies(layout, width, height, depth, 1, false, false);
+	const auto regions = TextureBuildImageCopies(layout);
 	Require("StorageTextureLinearUpload", "layout",
 	        pitch == width && total.size == 0x1fa4000 && total.align == 256 &&
-	            layout.tile == tile && layout.pitch == width && layout.slice_stride == total.size &&
+	            layout.surface.description.tile_mode == tile && layout.pitch == width &&
+	            layout.slice_stride == total.size &&
 	            regions.size() == 1 && regions[0].bufferOffset == 0 &&
 	            regions[0].imageExtent.width == width && regions[0].imageExtent.height == height &&
 	            regions[0].bufferRowLength == width,
@@ -17214,25 +17224,27 @@ void CheckStorageTextureDepthTileUploadLayout() {
 	constexpr uint32_t height = 1;
 	constexpr uint32_t depth  = 1;
 	constexpr uint32_t tile   = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
-	const auto         pitch  = TileGetTexturePitch(format, width, 1, tile);
+	const auto         pitch  = TileGetTexturePitch(format, width, tile);
 	TileSizeAlign      slice {};
 	TileSizeAlign      total {};
 	TileSizeOffset     level {};
 	TilePaddedSize     padded {};
-	TileGetTextureSize(format, width, height, pitch, 1, tile, &slice, &level, &padded);
-	TileGetTextureTotalSize(format, width, height, depth, pitch, 1, tile, false, total);
+	TileGetTextureSize(format, width, height, 1, tile, &slice, &level, &padded);
+	TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, 1, depth, pitch, tile, total.size, true,
+	    TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size, true,
 	                            false, "StorageTextureDepthTileTest");
-	const auto regions = TextureBuildImageCopies(layout, width, height, depth, 1, true, false);
+	const auto regions = TextureBuildImageCopies(layout);
 	Require("StorageTextureDepthTileUpload", "PPSA14053 layout",
 	        pitch == 256 && padded.width == 256 && padded.height == 256 && slice.size == 0x10000 &&
 	            slice.align == 0x10000 && level.size == slice.size && level.offset == 0 &&
-	            total.size == slice.size && total.align == slice.align && layout.tile == tile &&
-	            layout.tile_family == TileBlockFamily::Depth64KB && layout.pitch == pitch &&
+	            total.size == slice.size && total.align == slice.align &&
+	            layout.surface.description.tile_mode == tile &&
+	            layout.surface.texture.block.family == TileBlockFamily::Depth64KB &&
+	            layout.pitch == pitch &&
 	            layout.slice_stride == pitch && layout.source_slice_stride == total.size &&
-	            layout.level_sizes[0].size == pitch &&
-	            layout.level_sizes[0].src_size == total.size && regions.size() == 1 &&
+	            layout.mips[0].size == pitch &&
+	            layout.surface.mips[0].size == total.size && regions.size() == 1 &&
 	            regions[0].bufferOffset == 0 && regions[0].imageExtent.width == width &&
 	            regions[0].imageExtent.height == height && regions[0].bufferRowLength == pitch,
 	        "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
@@ -17274,24 +17286,24 @@ void CheckStorageTextureVolumeUploadLayout() {
 	constexpr uint32_t height = 33;
 	constexpr uint32_t depth  = 33;
 	const auto         pitch  = TileGetTexturePitch(
-	    format, width, 1, Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget));
+	    format, width, Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget));
 	TileSizeAlign total {};
-	TileGetTextureTotalSize(format, width, height, depth, pitch, 1,
+	TileGetTextureTotalSize(format, width, height, depth, 1,
 	                        Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget), true, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, 1, depth, pitch,
+	    TextureCalcUploadLayout(format, width, height, 1, depth,
 	                            Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget),
 	                            total.size, true, true, "StorageTextureVolumeTest");
-	const auto regions = TextureBuildImageCopies(layout, width, height, depth, 1, false, true);
+	const auto regions = TextureBuildImageCopies(layout);
 	Require("StorageTextureVolumeUpload", "layout",
 	        pitch == 128 && total.size == 0x210000 && layout.slice_stride == 0x2208 &&
-	            layout.source_slice_stride == 0 && layout.level_sizes[0].size == 0x2208 &&
-	            layout.level_sizes[0].src_size == 0 && regions.size() == depth,
+	            layout.source_slice_stride == 0 && layout.mips[0].size == 0x2208 &&
+	            layout.surface.mips[0].size == 0x10000 && regions.size() == depth,
 	        "3D render-target upload did not preserve its compact linear layout");
 
 	std::vector<GpuTileInfo> infos;
 	Require("StorageTextureVolumeUpload", "GPU records",
-	        TextureBuildGpuTileInfos(total.size, regions, layout, format, depth, 1, infos) &&
+	        TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos) &&
 	            infos.size() == depth,
 	        "3D render-target GPU records were not built");
 	for (const uint32_t z: {0u, 1u, depth - 1u}) {
@@ -17311,13 +17323,12 @@ void CheckStorageTextureVolumeMipRegions() {
 	constexpr uint32_t depth  = 5;
 	constexpr uint32_t levels = 3;
 	constexpr uint32_t tile   = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const auto         pitch  = TileGetTexturePitch(format, width, levels, tile);
 	TileSizeAlign      total {};
-	TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile, true, total);
+	TileGetTextureTotalSize(format, width, height, depth, levels, tile, true, total);
 	const auto layout =
-	    TextureCalcUploadLayout(format, width, height, levels, depth, pitch, tile, total.size, true,
+	    TextureCalcUploadLayout(format, width, height, levels, depth, tile, total.size, true,
 	                            true, "StorageTextureVolumeMipTest");
-	const auto copies = TextureBuildImageCopies(layout, width, height, depth, levels, false, true);
+	const auto copies = TextureBuildImageCopies(layout);
 
 	bool   valid = copies.size() == 8;
 	size_t index = 0;
@@ -17331,9 +17342,9 @@ void CheckStorageTextureVolumeMipRegions() {
 			    copy.imageSubresource.mipLevel == level &&
 			    copy.imageOffset.z == static_cast<int>(z) && copy.imageExtent.width == mip_width &&
 			    copy.imageExtent.height == mip_height &&
-			    copy.bufferOffset == layout.level_sizes[level].offset + z * layout.slice_stride &&
-			    copy.bufferRowLength == layout.padded_sizes[level].width &&
-			    copy.bufferImageHeight == layout.padded_sizes[level].height;
+			    copy.bufferOffset == layout.mips[level].offset + z * layout.slice_stride &&
+			    copy.bufferRowLength == layout.mips[level].row_length &&
+			    copy.bufferImageHeight == layout.mips[level].image_height;
 		}
 	}
 	valid &= index == copies.size();
@@ -17348,9 +17359,9 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 
 	constexpr uint32_t observed_width  = 3840;
 	constexpr uint32_t observed_height = 2160;
-	const auto         observed_pitch  = TileGetTexturePitch(format, observed_width, 1, tile);
+	const auto         observed_pitch  = TileGetTexturePitch(format, observed_width, tile);
 	TileSizeAlign      observed {};
-	TileGetTextureSize(format, observed_width, observed_height, observed_pitch, 1, tile, &observed,
+	TileGetTextureSize(format, observed_width, observed_height, 1, tile, &observed,
 	                   nullptr, nullptr);
 	Require("Standard64RenderTarget", "observed layout",
 	        observed_pitch == 3840 && observed.size == 0x1fe0000 && observed.align == 0x10000,
@@ -17358,9 +17369,9 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 
 	constexpr uint32_t width  = 257;
 	constexpr uint32_t height = 131;
-	const auto         pitch  = TileGetTexturePitch(format, width, 1, tile);
+	const auto         pitch  = TileGetTexturePitch(format, width, tile);
 	TileSizeAlign      storage {};
-	TileGetTextureSize(format, width, height, pitch, 1, tile, &storage, nullptr, nullptr);
+	TileGetTextureSize(format, width, height, 1, tile, &storage, nullptr, nullptr);
 	Require("Standard64RenderTarget", "partial layout",
 	        pitch == 384 && storage.size == 0x60000 && storage.align == 0x10000,
 	        "partial Standard64KB footprint was not padded in 128x128 blocks");
@@ -17838,11 +17849,11 @@ void CheckDepthTargetFootprints() {
 	        "non-HTile depth/stencil footprint disagrees with Prospero block rules");
 
 	const auto depth_pitch =
-	    TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 640, 1,
+	    TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 640,
 	                        Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	TileSizeAlign texture_depth {};
 	TileGetTextureTotalSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 640, 360, 1,
-	                        depth_pitch, 1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth),
+	                        1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth),
 	                        false, texture_depth);
 	Require("DepthTargetFootprints", "640x360 generic depth tile",
 	        depth_pitch == 640 && texture_depth.size == 0xf0000 && texture_depth.align == 0x10000,

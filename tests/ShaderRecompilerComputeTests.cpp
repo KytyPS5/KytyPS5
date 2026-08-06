@@ -18059,6 +18059,41 @@ void CheckPm4StencilInfoValueLane(RenderContext& renderer) {
 	std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
 }
 
+void CheckPm4PolygonOffsetRegisters(RenderContext& renderer) {
+	GraphicsInitJmpTables();
+	CommandProcessor processor(renderer);
+	const auto&      defaults = processor.GetCtx().GetPolyOffset();
+	Require("Pm4PolygonOffset", "format defaults",
+	        defaults.neg_num_db_bits == -23 && defaults.db_is_float_fmt,
+	        "polygon offset Z format did not default to D32F");
+
+	constexpr std::array<uint32_t, 6> payload {
+	    0x000000f0u, std::bit_cast<uint32_t>(2.5f), std::bit_cast<uint32_t>(16.0f),
+	    std::bit_cast<uint32_t>(-3.25f), std::bit_cast<uint32_t>(32.0f),
+	    std::bit_cast<uint32_t>(4.5f)};
+	const auto consumed = HwCtxSetPolyOffsetRegisters(
+	    processor, KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+	    Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, payload.data(), 0);
+	const auto& direct = processor.GetCtx().GetPolyOffset();
+	Require("Pm4PolygonOffset", "direct registers",
+	        consumed == payload.size() && direct.neg_num_db_bits == -16 &&
+	            !direct.db_is_float_fmt && direct.clamp == 2.5f && direct.front_scale == 16.0f &&
+	            direct.front_offset == -3.25f && direct.back_scale == 32.0f &&
+	            direct.back_offset == 4.5f,
+	        "direct polygon offset register packet was decoded incorrectly");
+
+	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL](
+	    processor, Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, 0x000001e9u);
+	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE](
+	    processor, Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE, std::bit_cast<uint32_t>(24.0f));
+	const auto& indirect = processor.GetCtx().GetPolyOffset();
+	Require("Pm4PolygonOffset", "indirect registers",
+	        indirect.neg_num_db_bits == -23 && indirect.db_is_float_fmt &&
+	            indirect.front_scale == 24.0f && indirect.front_offset == -3.25f,
+	        "indirect polygon offset register write was decoded incorrectly");
+	std::printf("[host]    %-32s ok\n", "Pm4PolygonOffset");
+}
+
 void CheckPm4ContextStateOperations(RenderContext& renderer) {
 	GraphicsInitJmpTables();
 	CommandProcessor processor(renderer);
@@ -18327,6 +18362,7 @@ int main(int argc, char** argv) {
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
 		VulkanHarness vulkan;
+		CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
 		CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
 		return 0;
 	}
@@ -18464,6 +18500,7 @@ int main(int argc, char** argv) {
 	CheckVulkan13FeatureRequirements();
 	CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
 	CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+	CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
 	CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
 	CheckPm4WaitResume(vulkan.RuntimeRenderer());
 	CheckPm4CeCompletion(vulkan.RuntimeRenderer());

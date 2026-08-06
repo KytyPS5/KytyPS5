@@ -686,14 +686,6 @@ static void McCheck(const HW::ModeControl& c) {
 	}
 	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype != 0 && c.polymode_front_ptype != 2);
 	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype != 0 && c.polymode_back_ptype != 2);
-	if (c.poly_offset_front_enable || c.poly_offset_back_enable) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.POLY_OFFSET_*_ENABLE is not implemented; "
-			     "continuing without depth bias\n");
-			logged = true;
-		}
-	}
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {

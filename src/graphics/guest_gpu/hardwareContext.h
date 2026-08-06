@@ -348,6 +348,16 @@ struct ModeControl {
 	bool    persp_corr_dis           = false;
 };
 
+struct PolyOffset {
+	int8_t neg_num_db_bits = -23;
+	bool   db_is_float_fmt = true;
+	float  clamp           = 0.0f;
+	float  front_scale     = 0.0f;
+	float  front_offset    = 0.0f;
+	float  back_scale      = 0.0f;
+	float  back_offset     = 0.0f;
+};
+
 struct BlendControl {
 	uint8_t color_srcblend       = 1;
 	uint8_t color_comb_fcn       = 0;
@@ -905,6 +915,8 @@ public:
 	void SetDepthControl(const DepthControl& control) { m_depth_control = control; }
 	[[nodiscard]] const ModeControl& GetModeControl() const { return m_mode_control; }
 	void SetModeControl(const ModeControl& control) { m_mode_control = control; }
+	[[nodiscard]] const PolyOffset& GetPolyOffset() const { return m_poly_offset; }
+	void SetPolyOffset(const PolyOffset& offset) { m_poly_offset = offset; }
 	[[nodiscard]] const EqaaControl& GetEqaaControl() const { return m_eqaa_control; }
 	void SetEqaaControl(const EqaaControl& control) { m_eqaa_control = control; }
 	[[nodiscard]] const StencilControl& GetStencilControl() const { return m_stencil_control; }
@@ -1002,6 +1014,7 @@ private:
 	uint8_t           m_stencil_clear_value = 0;
 
 	ModeControl m_mode_control;
+	PolyOffset  m_poly_offset;
 	EqaaControl m_eqaa_control;
 
 	ShaderRegisters m_sh_regs;

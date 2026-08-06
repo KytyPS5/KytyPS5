@@ -947,6 +947,8 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eViewport,
 	    vk::DynamicState::eScissor,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eDepthBiasEnable,
+	    vk::DynamicState::eDepthBias,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,

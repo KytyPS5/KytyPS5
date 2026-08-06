@@ -18,7 +18,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -895,23 +897,44 @@ KYTY_HW_CTX_PARSER(HwCtxSetModeControl) {
 	return 1;
 }
 
-static void HwCtxIgnorePolyOffsetRegister(uint32_t cmd_offset, uint32_t value) {
-	static std::atomic<uint32_t> log_count = 0;
+static void HwCtxSetPolyOffsetRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	HW::PolyOffset offset = cp.GetCtx().GetPolyOffset();
 
-	auto count = log_count.fetch_add(1);
-	if (count < 8) {
-		LOGF_COLOR(Log::Color::Red,
-		           "\t temporary: ignoring polygon offset context register 0x%03" PRIx32
-		           " = 0x%08" PRIx32 " (depth bias not implemented)\n",
-		           cmd_offset, value);
+	switch (cmd_offset) {
+		case Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL: {
+			const auto neg_bits =
+			    KYTY_PM4_GET(value, PA_SU_POLY_OFFSET_DB_FMT_CNTL, NEG_NUM_DB_BITS);
+			offset.neg_num_db_bits = std::bit_cast<int8_t>(static_cast<uint8_t>(neg_bits));
+			offset.db_is_float_fmt =
+			    KYTY_PM4_GET(value, PA_SU_POLY_OFFSET_DB_FMT_CNTL, DB_IS_FLOAT_FMT) != 0;
+			break;
+		}
+		case Pm4::PA_SU_POLY_OFFSET_CLAMP: offset.clamp = std::bit_cast<float>(value); break;
+		case Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE:
+			offset.front_scale = std::bit_cast<float>(value);
+			break;
+		case Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET:
+			offset.front_offset = std::bit_cast<float>(value);
+			break;
+		case Pm4::PA_SU_POLY_OFFSET_BACK_SCALE:
+			offset.back_scale = std::bit_cast<float>(value);
+			break;
+		case Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET:
+			offset.back_offset = std::bit_cast<float>(value);
+			break;
+		default:
+			EXIT("unknown polygon offset context register 0x%03" PRIx32 " = 0x%08" PRIx32 "\n",
+			     cmd_offset, value);
 	}
+
+	cp.GetCtx().SetPolyOffset(offset);
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetPolyOffsetRegisters) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset + i, buffer[i]);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -3705,22 +3728,22 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_CLAMP] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_BACK_SCALE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePolyOffsetRegister(cmd_offset, value);
+		HwCtxSetPolyOffsetRegister(cp, cmd_offset, value);
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_Z_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {

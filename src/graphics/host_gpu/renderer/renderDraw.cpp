@@ -64,11 +64,31 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 	return 0;
 }
 
-static std::atomic<uint32_t> g_draw_state_log_count       = 0;
-static std::atomic<uint32_t> g_draw_input_log_count       = 0;
-static std::atomic<uint32_t> g_mrt_state_log_count        = 0;
-static std::atomic<uint32_t> g_shader_stage_log_count     = 0;
+static std::atomic<uint32_t> g_draw_state_log_count   = 0;
+static std::atomic<uint32_t> g_draw_input_log_count   = 0;
+static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
+static std::atomic<uint32_t> g_shader_stage_log_count = 0;
+
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
+
+static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::PolyOffset& offset,
+                                                vk::Format host_depth_format) {
+	if (offset.db_is_float_fmt) {
+		return guest_factor;
+	}
+
+	int host_depth_bits = 0;
+	switch (host_depth_format) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint: host_depth_bits = 16; break;
+		case vk::Format::eD24UnormS8Uint: host_depth_bits = 24; break;
+		default:
+			// A fixed-point guest bias cannot be represented exactly by a floating-point host
+			// attachment without VK_EXT_depth_bias_control.
+			return guest_factor;
+	}
+	return std::ldexp(guest_factor, host_depth_bits + offset.neg_num_db_bits);
+}
 
 static const char* RenderColorTypeName(RenderColorType type) {
 	switch (type) {
@@ -335,6 +355,22 @@ static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandB
 	ret.stencil_front      = depth.stencil_dynamic_front;
 	ret.stencil_back       = depth.stencil_dynamic_back;
 
+	const auto& mode        = ctx.GetModeControl();
+	const auto& poly_offset = ctx.GetPolyOffset();
+	const bool  use_front   = mode.poly_offset_front_enable && !mode.cull_front;
+	const bool  use_back    = mode.poly_offset_back_enable && !mode.cull_back;
+	ret.depth_bias_enable   = use_front || use_back;
+	if (ret.depth_bias_enable) {
+		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
+		const float guest_constant_factor =
+		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
+		ret.depth_bias_constant_factor =
+		    ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset, depth.format);
+		ret.depth_bias_clamp = poly_offset.clamp;
+		ret.depth_bias_slope_factor =
+		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
+	}
+
 	// CB_COLOR_CONTROL.operation controls special CB operations, not the normal color component
 	// write mask. Use CB_TARGET_MASK here so scanout passes with mode=Disable do not go black.
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
@@ -378,6 +414,13 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 		line_width = 1.0f;
 	}
 	vk_buffer.setLineWidth(line_width);
+
+	vk_buffer.setDepthBiasEnable(dynamic_params.depth_bias_enable ? VK_TRUE : VK_FALSE);
+	if (dynamic_params.depth_bias_enable) {
+		vk_buffer.setDepthBias(dynamic_params.depth_bias_constant_factor,
+		                       dynamic_params.depth_bias_clamp,
+		                       dynamic_params.depth_bias_slope_factor);
+	}
 
 	if (dynamic_params.stencil_test_enable) {
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,

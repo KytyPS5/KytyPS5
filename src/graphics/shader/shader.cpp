@@ -814,22 +814,22 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	info.fetch_attrib_reg = metadata.vertex_attrib_reg;
 	info.fetch_buffer_reg = metadata.vertex_buffer_reg;
 
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
-		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
-		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+	const auto* attrib = reinterpret_cast<const uint32_t*>(
+	    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
+	    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
+	const auto* buffer = reinterpret_cast<const uint32_t*>(
+	    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
+	    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
 
-		if (attrib == nullptr || buffer == nullptr) {
-			LOGF("ShaderGetInputInfoVS(): null vertex table pointer shader=0x%016" PRIx64 "\n",
-			     shader_addr);
-			return false;
-		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
-		                           metadata.input_semantics_count, attrib, buffer);
-		ShaderDetectBuffers(info);
+	if (attrib == nullptr || buffer == nullptr) {
+		LOGF("ShaderGetInputInfoVS(): null vertex table pointer shader=0x%016" PRIx64 "\n",
+		     shader_addr);
+		return false;
 	}
+	ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
+	                           metadata.input_semantics_count, attrib, buffer);
+	ShaderDetectBuffers(info);
+
 	return true;
 }
 

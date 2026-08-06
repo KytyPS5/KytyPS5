@@ -194,7 +194,11 @@ void BufferCache::PublishDownloads(std::span<const DownloadRange> downloads) {
 	for (const auto& range: downloads) {
 		if (IsLowMemory(range.address) || range.size == 0 ||
 		    range.size > UINT64_MAX - range.address) {
-			EXIT("BufferCache: invalid download write-back range\n");
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "BufferCache: skipping invalid download write-back range addr=0x%016" PRIx64
+			           " size=0x%016" PRIx64 "\n",
+			           range.address, range.size);
+			continue;
 		}
 		m_download_buffer.Invalidate(range.offset, range.size);
 		Libs::LibKernel::Memory::WriteBacking(
@@ -727,7 +731,11 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 
 void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data) {
 	if (IsLowMemory(vaddr) || data.empty() || data.size() > UINT64_MAX - vaddr) {
-		EXIT("BufferCache: invalid host DMA write\n");
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "BufferCache: skipping invalid host DMA write addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 "\n",
+		           vaddr, static_cast<uint64_t>(data.size()));
+		return;
 	}
 	Libs::LibKernel::Memory::WriteBacking(vaddr, data.data(), data.size());
 
@@ -758,7 +766,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 	if (IsLowMemory(vaddr)) {
-		EXIT("BufferCache: invalid fill memory address\n");
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "BufferCache: skipping fill on invalid memory address addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 "\n",
+		           vaddr, size);
+		return;
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	{
@@ -800,7 +812,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    (dst_gds == src_gds && src_vaddr < dst_vaddr + size && dst_vaddr < src_vaddr + size) ||
 	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
 	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {
-		EXIT("BufferCache: invalid or overlapping copy range\n");
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "BufferCache: skipping invalid or overlapping copy range dst=0x%016" PRIx64
+		           " src=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		           dst_vaddr, src_vaddr, size);
+		return;
 	}
 	if (src_memory || dst_memory) {
 		std::lock_guard transaction(m_resource_mutex);

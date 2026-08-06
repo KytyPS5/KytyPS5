@@ -27,6 +27,15 @@ namespace {
 	return ImageViewOps::FormatsCompatible(image_format, view_format);
 }
 
+[[nodiscard]] bool IsDepthStencilFormatPair(vk::Format image_format, vk::Format view_format) {
+	const auto image_transfer = DepthAspectTransferFormat(image_format);
+	const auto view_transfer  = DepthAspectTransferFormat(view_format);
+	if (image_transfer == vk::Format::eUndefined || view_transfer == vk::Format::eUndefined) {
+		return false;
+	}
+	return image_transfer == view_transfer;
+}
+
 [[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
 	switch (format) {
 		case vk::Format::eS8Uint:
@@ -342,13 +351,10 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
-	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               (IsCompatibleViewFormat(image.format, normalized.format) ||
-	                                (static_cast<int>(image.format) == 97 &&
-	                                 static_cast<int>(normalized.format) == 95) ||
-	                                (static_cast<int>(image.format) == 95 &&
-	                                 static_cast<int>(normalized.format) == 97));
+	                                IsDepthStencilFormatPair(image.format, normalized.format));
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);
@@ -386,6 +392,15 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.sType = vk::StructureType::eImageViewUsageCreateInfo;
 	usage.usage = image.usage;
+	if (usage.usage == vk::ImageUsageFlags {}) {
+		usage.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+		              vk::ImageUsageFlagBits::eTransferDst;
+		if (DepthAspectTransferFormat(image.format) != vk::Format::eUndefined) {
+			usage.usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		} else {
+			usage.usage |= vk::ImageUsageFlagBits::eColorAttachment;
+		}
+	}
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}

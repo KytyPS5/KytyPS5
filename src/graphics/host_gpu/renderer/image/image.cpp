@@ -34,6 +34,12 @@ namespace {
 		if (Prospero::BlockCompressedBytesPerBlock(info.guest_format) != 0) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
 		}
+	} else {
+		// Depth/stencil images may need to be viewed with a different but
+		// compatible depth/stencil format (e.g. D32_SFLOAT_S8_UINT viewed as
+		// D24_UNORM_S8_UINT). VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT is required
+		// to allow creating such views.
+		flags |= vk::ImageCreateFlagBits::eMutableFormat;
 	}
 	if (info.IsVolume()) {
 		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;

@@ -5,7 +5,6 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -220,8 +219,7 @@ void BufferCache::QueueGarbageDownload(std::span<const DownloadCopy> copies, Ret
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                         PageManager& page_manager, TextureCache& texture_cache,
-                         ResourceMutex& resource_mutex)
+                         PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_memory_tracker(page_manager),
@@ -229,7 +227,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache), m_resource_mutex(resource_mutex) {
+      m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	if (!m_graphics.CanReportMemoryUsage()) {
@@ -301,11 +299,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
-		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	if (m_resource_mutex.IsOwnedByCurrentThread()) {
-		EXIT("unsupported buffer readback from a pre-owned resource transaction, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
@@ -529,7 +522,6 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	if (command.IsInvalid() || command.IsExecute()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-	std::lock_guard transaction(m_resource_mutex);
 
 	if (is_read && !is_written && size <= CACHING_PAGE_SIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
@@ -556,25 +548,33 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		(void)m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, true);
 	}
 
-	FaultSafeCacheLock                         lock(this, m_mutex);
-	auto&                                      cached = GetOrCreateBuffer(command, vaddr, size);
-	std::vector<std::pair<uint64_t, uint64_t>> uploads;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
-	    [&]() noexcept {
-		    for (const auto& [address, bytes]: uploads) {
-			    Upload(command, *cached.buffer, cached.buffer->Offset(address),
-			           reinterpret_cast<const void*>(address), bytes);
-		    }
-	    });
-	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
+	std::shared_ptr<Buffer> owner;
+	uint64_t                offset = 0;
+	{
+		FaultSafeCacheLock                         lock(this, m_mutex);
+		auto&                                      cached = GetOrCreateBuffer(command, vaddr, size);
+		std::vector<std::pair<uint64_t, uint64_t>> uploads;
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    uploads.emplace_back(address, bytes);
+		    },
+		    [&]() noexcept {
+			    for (const auto& [address, bytes]: uploads) {
+				    Upload(command, *cached.buffer, cached.buffer->Offset(address),
+				           reinterpret_cast<const void*>(address), bytes);
+			    }
+		    });
+		if (is_written) {
+			m_gpu_modified_ranges.Add(vaddr, size);
+		}
+		owner  = cached.buffer;
+		offset = cached.buffer->Offset(vaddr);
 	}
 	if (is_formatted && is_read && !is_written) {
-		(void)SynchronizeBufferFromImage(*cached.buffer, vaddr, size);
+		(void)SynchronizeBufferFromImage(*owner, vaddr, size);
 	}
-	return {cached.buffer, cached.buffer->Handle(), cached.buffer->Offset(vaddr)};
+	return {owner, owner->Handle(), offset};
 }
 
 std::shared_ptr<Buffer> BufferCache::ObtainNullBuffer() {
@@ -750,8 +750,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	{
-		std::lock_guard transaction(m_resource_mutex);
-		const auto      region = m_texture_cache.QueryRegion(vaddr, size);
+		const auto region = m_texture_cache.QueryRegion(vaddr, size);
 		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {
 			if (region.image_bytes) {
 				m_texture_cache.InvalidateMemory(vaddr, size);
@@ -790,8 +789,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: invalid or overlapping copy range\n");
 	}
 	if (src_memory || dst_memory) {
-		std::lock_guard transaction(m_resource_mutex);
-		const auto      src_region =
+		const auto src_region =
 		    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
 		const auto dst_region =
 		    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
@@ -870,8 +868,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
-	std::lock_guard transaction(m_resource_mutex);
-	const auto      tick = m_gc_tick++;
+	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

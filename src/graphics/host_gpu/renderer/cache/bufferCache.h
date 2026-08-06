@@ -20,7 +20,6 @@ struct GraphicContext;
 class CommandBuffer;
 class CommandScheduler;
 class TextureCache;
-class ResourceMutex;
 
 struct BufferBinding {
 	std::shared_ptr<void> owner;
@@ -41,7 +40,7 @@ public:
 	}
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	            TextureCache& texture_cache, ResourceMutex& resource_mutex);
+	            TextureCache& texture_cache);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
@@ -112,7 +111,6 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
-	ResourceMutex&                                    m_resource_mutex;
 	uint64_t                                          m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

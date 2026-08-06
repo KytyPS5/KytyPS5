@@ -8,7 +8,6 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
-#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -56,13 +55,12 @@ private:
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                           PageManager& page_manager, BufferCache& buffer_cache,
-                           ResourceMutex& resource_mutex)
+                           PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(std::make_unique<TileManager>(graphics, scheduler,
                                             buffer_cache.GetUtilityBuffer(MemoryUsage::Stream))),
-      m_buffer_cache(buffer_cache), m_resource_mutex(resource_mutex),
+      m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
@@ -434,9 +432,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto&           image = ResolveImage(id);
+	CacheLock lock(*this, m_lock);
+	auto&     image = ResolveImage(id);
 	TrackImageDownloadLocked(id, image);
 }
 
@@ -1146,8 +1143,7 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 }
 
 void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
+	CacheLock lock(*this, m_lock);
 	AssociateStencilLocked(depth_id, stencil);
 }
 
@@ -1191,9 +1187,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 	ImageId result {};
 	{
-		std::lock_guard transaction(m_resource_mutex);
-		CacheLock       lock(*this, m_lock);
-		const auto      candidates =
+		CacheLock  lock(*this, m_lock);
+		const auto candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
@@ -1267,9 +1262,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 }
 
 void TextureCache::UpdateImage(ImageId id) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto&           image = ResolveImage(id);
+	CacheLock lock(*this, m_lock);
+	auto&     image = ResolveImage(id);
 	TouchImage(image);
 	RefreshImage(id, ImageDesc {.info = image.info, .type = UploadBinding(image)});
 }
@@ -1318,9 +1312,8 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto&           image = ResolveImage(id);
+	CacheLock lock(*this, m_lock);
+	auto&     image = ResolveImage(id);
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1355,9 +1348,8 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto&           image = ResolveImage(id);
+	CacheLock lock(*this, m_lock);
+	auto&     image = ResolveImage(id);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
@@ -1376,9 +1368,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto&           image = ResolveImage(id);
+	CacheLock lock(*this, m_lock);
+	auto&     image = ResolveImage(id);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
@@ -1401,9 +1392,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto&           image = ResolveImage(id);
+	CacheLock lock(*this, m_lock);
+	auto&     image = ResolveImage(id);
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
@@ -1427,7 +1417,6 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
-	std::lock_guard      transaction(m_resource_mutex);
 	CacheLock            lock(*this, m_lock);
 	ImageId              selected {};
 	vk::ImageAspectFlags aspect {};
@@ -1885,9 +1874,8 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	const auto      found = m_surface_metas.find(address);
+	CacheLock  lock(*this, m_lock);
+	const auto found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
@@ -1913,9 +1901,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	auto            images = FindImagesInRegion(address, size, false);
+	CacheLock lock(*this, m_lock);
+	auto      images = FindImagesInRegion(address, size, false);
 	if (!images.empty()) {
 		m_scheduler.Finish();
 	}
@@ -1932,9 +1919,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	const uint64_t  tick = m_gc_tick++;
+	CacheLock      lock(*this, m_lock);
+	const uint64_t tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -1994,8 +1980,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
+	CacheLock lock(*this, m_lock);
 	for (const auto id: m_download_images) {
 		const auto owner = ResolveOwner(id);
 		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {

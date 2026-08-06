@@ -16,7 +16,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
-#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -71,6 +70,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <semaphore>
@@ -169,6 +169,10 @@ struct TextureCacheTestAccess {
 	static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
 	static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
+	static std::unique_lock<TrackingSpinLock> Lock(TextureCache& cache) {
+		return std::unique_lock(cache.m_lock);
+	}
+
 	static void ConfigureGarbageCollection(TextureCache& cache, std::span<const ImageId> oldest,
 	                                       uint64_t tick, uint64_t pressure) {
 		cache.m_trigger_gc_memory  = 0;
@@ -261,13 +265,11 @@ struct TextureCacheTestAccess {
 	}
 
 	static ImageId InsertImage(TextureCache& cache, const ImageInfo& info) {
-		std::lock_guard transaction(cache.m_resource_mutex);
 		std::lock_guard lock(cache.m_lock);
 		return cache.InsertImage(info);
 	}
 
 	static void DeleteImage(TextureCache& cache, ImageId id) {
-		std::lock_guard transaction(cache.m_resource_mutex);
 		std::lock_guard lock(cache.m_lock);
 		cache.DeleteImage(id);
 	}
@@ -3021,8 +3023,41 @@ public:
 			        "mip, rejected a fitting mip "
 			        "prefix, or transferred ownership");
 
-			auto mip_formatted = resources.GetBufferCache().ObtainBuffer(
-			    command, mip_desc.info.data.address, mip_desc.info.data.size, false, true, true);
+			auto& buffer_cache = resources.GetBufferCache();
+			Require(name, "formatted lock-handoff fixture",
+			        !buffer_cache.HasPageOverlap(mip_desc.info.data.address,
+			                                     mip_desc.info.data.size),
+			        "formatted image already had a cached Buffer owner");
+			BufferBinding         mip_formatted;
+			std::binary_semaphore obtain_entered {0};
+			std::binary_semaphore obtain_complete {0};
+			std::binary_semaphore buffer_visible {0};
+			auto                  texture_lock = TextureCacheTestAccess::Lock(texture_cache);
+			gpu.SendCommand([&] {
+				obtain_entered.release();
+				mip_formatted = buffer_cache.ObtainBuffer(command, mip_desc.info.data.address,
+				                                            mip_desc.info.data.size, false, true, true);
+				obtain_complete.release();
+			});
+			obtain_entered.acquire();
+			std::jthread buffer_probe([&] {
+				while (!buffer_cache.HasPageOverlap(mip_desc.info.data.address,
+				                                    mip_desc.info.data.size)) {
+					std::this_thread::yield();
+				}
+				buffer_visible.release();
+			});
+			const bool buffer_released_before_texture =
+			    buffer_visible.try_acquire_for(std::chrono::seconds(2));
+			texture_lock.unlock();
+			if (!buffer_released_before_texture) {
+				buffer_visible.acquire();
+			}
+			obtain_complete.acquire();
+			buffer_probe.join();
+			Require(name, "formatted cache lock handoff", buffer_released_before_texture,
+			        "formatted Buffer acquisition retained the BufferCache lock while waiting for "
+			        "TextureCache");
 			Require(name, "formatted Buffer path",
 			        mip_formatted.owner != nullptr && mip_formatted.buffer != nullptr &&
 			            texture_cache.GetImage(mip_image).IsGpuModified(),

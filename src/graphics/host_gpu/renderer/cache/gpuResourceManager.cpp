@@ -6,9 +6,8 @@
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_scheduler(scheduler),
-      m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, m_resource_mutex),
-      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache, m_resource_mutex) {}
+    : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
+      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {}
 
 GpuResourceManager::~GpuResourceManager() = default;
 
@@ -55,11 +54,6 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
-		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	if (m_resource_mutex.IsOwnedByCurrentThread()) {
-		EXIT("unsupported memory unmap from a pre-owned resource transaction, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}

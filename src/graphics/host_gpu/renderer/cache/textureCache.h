@@ -26,7 +26,6 @@ class Buffer;
 class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
-class ResourceMutex;
 class RenderExecutor;
 class StreamBuffer;
 class TileManager;
@@ -49,7 +48,7 @@ public:
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	             BufferCache& buffer_cache, ResourceMutex& resource_mutex);
+	             BufferCache& buffer_cache);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
@@ -169,7 +168,6 @@ private:
 	BlitHelper                                        m_blit_helper;
 	std::unique_ptr<TileManager>                      m_tiler;
 	BufferCache&                                      m_buffer_cache;
-	ResourceMutex&                                    m_resource_mutex;
 	std::vector<Slot>                                 m_slots;
 	std::vector<uint32_t>                             m_free_slots;
 	ImagePageTable                                    m_image_page_table;

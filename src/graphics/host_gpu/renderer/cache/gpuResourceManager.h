@@ -5,7 +5,6 @@
 #include "common/common.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
-#include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <cstdint>
@@ -35,7 +34,6 @@ public:
 
 private:
 	PageManager               m_page_manager;
-	ResourceMutex             m_resource_mutex;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;

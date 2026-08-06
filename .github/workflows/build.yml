@@ -7,7 +7,7 @@ on:
   pull_request:
 
 env:
-  KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
+  KYTY_BUILD_ORIGIN: "${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}"
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
 jobs:

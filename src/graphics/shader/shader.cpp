@@ -790,22 +790,29 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	std::string          metadata_error;
 	if (data.user_data != nullptr) {
 		if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
-			LOGF("ShaderGetInputInfoVS(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+			LOGF("ShaderGetInputInfoVS(): invalid AGC metadata shader=0x%016" PRIx64 ": %s; continuing without embedded vertex fetch\n",
 			     shader_addr, metadata_error.c_str());
-			return false;
+			info.fetch_external = true;
+			return true;
 		}
 	} else {
 		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
 		     " gs=0x%016" PRIx64 " chksum=0x%016" PRIx64 " user_sgpr_num=%u; continuing without embedded vertex fetch\n",
 		     shader_addr, regs.es_regs.data_addr, regs.gs_regs.data_addr, regs.gs_regs.chksum,
 		     static_cast<uint32_t>(user_sgpr_num));
+		info.fetch_external = true;
+		return true;
 	}
 
-	if (metadata.vertex_buffer_reg >= 0) {
-		info.fetch_external   = false;
-		info.fetch_embedded   = true;
-		info.fetch_attrib_reg = metadata.vertex_attrib_reg;
-		info.fetch_buffer_reg = metadata.vertex_buffer_reg;
+	if (metadata.vertex_buffer_reg < 0) {
+		info.fetch_external = true;
+		return true;
+	}
+
+	info.fetch_external   = false;
+	info.fetch_embedded   = true;
+	info.fetch_attrib_reg = metadata.vertex_attrib_reg;
+	info.fetch_buffer_reg = metadata.vertex_buffer_reg;
 
 		const auto* attrib = reinterpret_cast<const uint32_t*>(
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |

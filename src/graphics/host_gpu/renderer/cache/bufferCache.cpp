@@ -59,15 +59,6 @@ uint64_t BufferCache::AlignUp(uint64_t value) {
 	return (value + CACHING_PAGE_SIZE - 1) & ~(CACHING_PAGE_SIZE - 1);
 }
 
-bool BufferCache::PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right,
-                               uint64_t right_size) noexcept {
-	const auto left_begin  = left & ~(TRACKER_PAGE_SIZE - 1);
-	const auto left_end    = (left + left_size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	const auto right_begin = right & ~(TRACKER_PAGE_SIZE - 1);
-	const auto right_end = (right + right_size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	return left_begin < right_end && right_begin < left_end;
-}
-
 void BufferCache::Upload(CommandBuffer& command, Buffer& destination, uint64_t destination_offset,
                          const void* source, uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
@@ -285,7 +276,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	if (!HasPageOverlap(vaddr, size)) {
+	if (!IsRegionRegistered(vaddr, size)) {
 		return;
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
@@ -840,18 +831,20 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	destination.CopyFrom(command, source, src.offset, dst.offset, size);
 }
 
-bool BufferCache::HasPageOverlap(uint64_t vaddr, uint64_t size) {
+bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("BufferCache: invalid page-overlap query\n");
+		EXIT("BufferCache: invalid registered-region query\n");
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
-	for (const auto& [address, cached]: m_buffers) {
-		if (PageOverlaps(vaddr, size, address, cached->size)) {
-			return true;
-		}
+	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query
+	// end is therefore the only possible intersection.
+	const auto candidate = m_buffers.lower_bound(vaddr + size);
+	if (candidate == m_buffers.begin()) {
+		return false;
 	}
-	return false;
+	const auto& [address, cached] = *std::prev(candidate);
+	return address + cached->size > vaddr;
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {

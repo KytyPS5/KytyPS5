@@ -1822,7 +1822,7 @@ public:
 		gpu.SendCommandSync([&] {
 			auto& buffer_cache = resources.GetBufferCache();
 			Require("GpuCommandLane", "clean cached setup",
-			        buffer_cache.HasPageOverlap(clean_cached_fill, sizeof(source_words)) &&
+			        buffer_cache.IsRegionRegistered(clean_cached_fill, sizeof(source_words)) &&
 			            buffer_cache.HasGpuDirtyBytes(immediate_dst, sizeof(source_words)),
 			        "DMA did not establish a cached page with a dirty sibling");
 
@@ -1907,7 +1907,7 @@ public:
 
 		auto& buffer_cache = resources.GetBufferCache();
 		Require("GpuCommandLane", "clean tracked fault setup",
-		        buffer_cache.HasPageOverlap(immediate_dst, sizeof(uint32_t)) &&
+		        buffer_cache.IsRegionRegistered(immediate_dst, sizeof(uint32_t)) &&
 		            !buffer_cache.HasGpuDirtyBytes(immediate_dst, sizeof(uint32_t)),
 		        "clean write-fault test address is not backed by a clean cached Buffer");
 		constexpr uint64_t dirty_fault_address = fault_base + 0xd000;
@@ -2274,6 +2274,46 @@ public:
 				        "dirty-GC buffer allocation failed");
 				scheduler.Current().RetainResourceUntilFence(allocation.owner);
 			};
+
+			constexpr uint64_t index_offset = 0x180000;
+			constexpr uint64_t index_page   = BufferCache::CACHING_PAGE_SIZE;
+			constexpr uint64_t index_span   = 3 * index_page;
+			const uint64_t     index_begin  = base + index_offset;
+			Require(name, "registered-range empty lookup",
+			        !cache.IsRegionRegistered(index_begin, index_span),
+			        "empty Buffer cache reported a registered range");
+			auto index_left = cache.ObtainBuffer(scheduler.Current(), index_begin + 0x100,
+			                                     sizeof(uint32_t), false, false);
+			auto index_right = cache.ObtainBuffer(scheduler.Current(),
+			                                      index_begin + 2 * index_page + 0x100,
+			                                      sizeof(uint32_t), false, false);
+			Require(name, "registered-range owners",
+			        index_left.owner != nullptr && index_right.owner != nullptr,
+			        "failed to create disjoint Buffer index owners");
+			scheduler.Current().RetainResourceUntilFence(index_left.owner);
+			scheduler.Current().RetainResourceUntilFence(index_right.owner);
+			Require(
+			    name, "registered-range boundaries",
+			    cache.IsRegionRegistered(index_begin, 1) &&
+			        cache.IsRegionRegistered(index_begin + index_page - 1, 1) &&
+			        !cache.IsRegionRegistered(index_begin - 1, 1) &&
+			        !cache.IsRegionRegistered(index_begin + index_page, index_page) &&
+			        cache.IsRegionRegistered(index_begin + index_page, index_page + 1) &&
+			        !cache.IsRegionRegistered(index_begin + index_span, 1) &&
+			        cache.IsRegionRegistered(index_begin - 1, index_span + 2),
+			    "indexed lookup mishandled a half-open boundary, gap, or broad overlap");
+			auto index_bridge = cache.ObtainBuffer(scheduler.Current(), index_begin + index_page - 1,
+			                                       index_page + 2, false, false);
+			Require(name, "registered-range merge",
+			        index_bridge.owner != nullptr &&
+			            cache.IsRegionRegistered(index_begin + index_page, index_page),
+			        "bridging acquisition did not publish its merged Buffer range");
+			scheduler.Current().RetainResourceUntilFence(index_bridge.owner);
+			cache.UnmapMemory(index_begin, index_span);
+			Require(name, "registered-range removal",
+			        !cache.IsRegionRegistered(index_begin, index_span),
+			        "unmapped Buffer owner remained in the registered-range index");
+
 			MarkGpuWrite(base + first_offset, sizeof(first_value));
 			MarkGpuWrite(base + second_offset, sizeof(second_value));
 			cache.FillBuffer(base + first_offset, sizeof(first_value), first_value);
@@ -2328,13 +2368,13 @@ public:
 			for (uint32_t tick = 0; tick < 160; tick++) {
 				cache.RunGarbageCollector();
 			}
-			Require(name, "age before pressure", cache.HasPageOverlap(base, allocation_size),
+			Require(name, "age before pressure", cache.IsRegionRegistered(base, allocation_size),
 			        "buffer was reclaimed without memory pressure");
 			BufferCacheTestAccess::SetGarbageCollectionThresholds(
 			    cache, 0, std::numeric_limits<uint64_t>::max());
 			const auto gc_submission_tick = scheduler.CurrentTick();
 			cache.RunGarbageCollector();
-			Require(name, "dirty retirement", !cache.HasPageOverlap(base, allocation_size),
+			Require(name, "dirty retirement", !cache.IsRegionRegistered(base, allocation_size),
 			        "aged GPU-dirty buffer survived pressured "
 			        "collection");
 
@@ -2382,7 +2422,8 @@ public:
 			uint32_t unmap_backing = 0;
 			std::memcpy(&unmap_backing, memory + unmap_offset, sizeof(unmap_backing));
 			Require(name, "direct-unmap contents",
-			        unmap_backing == unmap_value && !cache.HasPageOverlap(base + 0x4000, 0x4000),
+			        unmap_backing == unmap_value &&
+			            !cache.IsRegionRegistered(base + 0x4000, 0x4000),
 			        "direct dirty unmap cleared tracking before "
 			        "publishing bytes");
 
@@ -2447,7 +2488,7 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "near-capacity deferred retirement",
-			        !cache.HasPageOverlap(base + large_offset, large_size),
+			        !cache.IsRegionRegistered(base + large_offset, large_size),
 			        "near-capacity dirty Buffer survived pressured collection");
 			uint32_t large_before_completion = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + large_offset, &large_before_completion,
@@ -2504,8 +2545,8 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "per-owner fixed-ring retirement",
-			        !cache.HasPageOverlap(base + grouped_first_offset, grouped_owner_size) &&
-			            !cache.HasPageOverlap(base + grouped_second_offset, grouped_owner_size) &&
+			        !cache.IsRegionRegistered(base + grouped_first_offset, grouped_owner_size) &&
+			            !cache.IsRegionRegistered(base + grouped_second_offset, grouped_owner_size) &&
 			            &BufferCacheTestAccess::DownloadBuffer(cache) == fixed_download &&
 			            fixed_download->Handle() == fixed_download_handle,
 			        "GC aggregated disjoint retirees or replaced the download ring");
@@ -2544,7 +2585,7 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "disjoint deferred retirement",
-			        !cache.HasPageOverlap(base + disjoint_owner_offset, disjoint_owner_size),
+			        !cache.IsRegionRegistered(base + disjoint_owner_offset, disjoint_owner_size),
 			        "cross-page owner survived pressured collection");
 			uint32_t disjoint_before_unmap = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + disjoint_dirty_offset,
@@ -2603,7 +2644,7 @@ public:
 				cache.RunGarbageCollector();
 			}
 			Require(name, "reacquire deferred retirement",
-			        !cache.HasPageOverlap(base + reacquire_owner_offset, reacquire_owner_size),
+			        !cache.IsRegionRegistered(base + reacquire_owner_offset, reacquire_owner_size),
 			        "fresh cross-page owner survived pressured collection");
 			uint32_t reacquire_before = 0;
 			Libs::LibKernel::Memory::TryReadBacking(base + reacquire_dirty_offset,
@@ -3025,8 +3066,8 @@ public:
 
 			auto& buffer_cache = resources.GetBufferCache();
 			Require(name, "formatted lock-handoff fixture",
-			        !buffer_cache.HasPageOverlap(mip_desc.info.data.address,
-			                                     mip_desc.info.data.size),
+			        !buffer_cache.IsRegionRegistered(mip_desc.info.data.address,
+			                                          mip_desc.info.data.size),
 			        "formatted image already had a cached Buffer owner");
 			BufferBinding         mip_formatted;
 			std::binary_semaphore obtain_entered {0};
@@ -3041,8 +3082,8 @@ public:
 			});
 			obtain_entered.acquire();
 			std::jthread buffer_probe([&] {
-				while (!buffer_cache.HasPageOverlap(mip_desc.info.data.address,
-				                                    mip_desc.info.data.size)) {
+				while (!buffer_cache.IsRegionRegistered(mip_desc.info.data.address,
+				                                         mip_desc.info.data.size)) {
 					std::this_thread::yield();
 				}
 				buffer_visible.release();

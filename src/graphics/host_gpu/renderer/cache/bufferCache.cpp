@@ -25,8 +25,13 @@ namespace {
 
 thread_local const void* g_cache_lock_owner = nullptr;
 
-constexpr uint64_t MiB           = 1024 * 1024;
-constexpr uint64_t GdsBufferSize = 64 * 1024;
+constexpr uint64_t MiB            = 1024 * 1024;
+constexpr uint64_t GdsBufferSize  = 64 * 1024;
+constexpr uint64_t LowMemoryLimit = 64 * 1024;
+
+bool IsLowMemory(uint64_t vaddr) noexcept {
+	return vaddr < LowMemoryLimit;
+}
 
 class FaultSafeCacheLock final {
 public:
@@ -84,8 +89,8 @@ void BufferCache::Upload(CommandBuffer& command, Buffer& destination, uint64_t d
 }
 
 bool BufferCache::ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept {
-	if (merged.address == 0 || merged.size == 0 || candidate.address == 0 || candidate.size == 0 ||
-	    merged.size > UINT64_MAX - merged.address ||
+	if (IsLowMemory(merged.address) || merged.size == 0 || IsLowMemory(candidate.address) ||
+	    candidate.size == 0 || merged.size > UINT64_MAX - merged.address ||
 	    candidate.size > UINT64_MAX - candidate.address) {
 		EXIT("BufferCache: invalid overlap-merge range\n");
 	}
@@ -187,6 +192,10 @@ BufferCache::RecordDownloads(std::span<const DownloadCopy> copies) {
 
 void BufferCache::PublishDownloads(std::span<const DownloadRange> downloads) {
 	for (const auto& range: downloads) {
+		if (IsLowMemory(range.address) || range.size == 0 ||
+		    range.size > UINT64_MAX - range.address) {
+			EXIT("BufferCache: invalid download write-back range\n");
+		}
 		m_download_buffer.Invalidate(range.offset, range.size);
 		Libs::LibKernel::Memory::WriteBacking(
 		    range.address, m_download_buffer.Mapped().data() + range.offset, range.size);
@@ -283,7 +292,7 @@ BufferBinding BufferCache::UploadTransient(const void* data, uint64_t size, uint
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	if (IsLowMemory(vaddr) || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
@@ -372,7 +381,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 }
 
 void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
+	if (IsLowMemory(vaddr) || size == 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: invalid unmap range\n");
 	}
 	std::vector<DownloadCopy>                  copies;
@@ -526,7 +535,7 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
 
 BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
                                         bool is_written, bool is_read, bool is_formatted) {
-	if (vaddr == 0) {
+	if (IsLowMemory(vaddr)) {
 		return {};
 	}
 	if (command.IsInvalid() || command.IsExecute()) {
@@ -597,7 +606,7 @@ std::shared_ptr<Buffer> BufferCache::ObtainNullBuffer() {
 }
 
 ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	if (IsLowMemory(vaddr) || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -717,7 +726,7 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 }
 
 void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data) {
-	if (vaddr == 0 || data.empty() || data.size() > UINT64_MAX - vaddr) {
+	if (IsLowMemory(vaddr) || data.empty() || data.size() > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: invalid host DMA write\n");
 	}
 	Libs::LibKernel::Memory::WriteBacking(vaddr, data.data(), data.size());
@@ -748,7 +757,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		m_gds_buffer.Fill(vaddr, size, value);
 		return;
 	}
-	if (vaddr == 0) {
+	if (IsLowMemory(vaddr)) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
@@ -784,8 +793,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
-	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
-	    ((dst_vaddr | src_vaddr | size) & 3u) != 0 || size > UINT64_MAX - dst_vaddr ||
+	if ((dst_memory && IsLowMemory(dst_vaddr)) || (src_memory && IsLowMemory(src_vaddr)) ||
+	    size == 0 || ((dst_vaddr | src_vaddr | size) & 3u) != 0 ||
+	    size > UINT64_MAX - dst_vaddr ||
 	    size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||
 	    (dst_gds == src_gds && src_vaddr < dst_vaddr + size && dst_vaddr < src_vaddr + size) ||
 	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
@@ -846,7 +856,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 }
 
 bool BufferCache::HasPageOverlap(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	if (IsLowMemory(vaddr) || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid page-overlap query\n");
 	}

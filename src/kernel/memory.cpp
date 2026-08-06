@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -886,6 +887,23 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	if (!TryWriteBacking(vaddr, data, size)) {
+		// A write to an unmapped address is a real bug in the caller: some guest or host
+		// operation passed a base pointer that was never allocated/mapped. Diagnose the
+		// source before aborting. Low-memory addresses (< 0x1000) are especially likely to
+		// be an uninitialized (null) base pointer plus a small offset.
+		if (vaddr < 0x1000) {
+			Common::DebugStack stack;
+			Common::DebugStack::Trace(&stack);
+			LOGF_COLOR(Log::Color::Red,
+			           "Memory: direct-backing write to unmapped LOW address, addr=0x%016" PRIx64
+			           " size=0x%016" PRIx64 " data=%p\n",
+			           vaddr, size, data);
+			LOGF_COLOR(Log::Color::Red, "Memory: caller stack trace:\n");
+			for (int i = 0; i < stack.depth; i++) {
+				LOGF_COLOR(Log::Color::Red, "Memory:   [%d] 0x%016" PRIx64 "\n", i,
+				           static_cast<uint64_t>(stack.GetAddr(i)));
+			}
+		}
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);

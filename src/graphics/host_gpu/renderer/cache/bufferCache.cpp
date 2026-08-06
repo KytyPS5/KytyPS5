@@ -526,6 +526,9 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
 
 BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
                                         bool is_written, bool is_read, bool is_formatted) {
+	if (vaddr == 0) {
+		return {};
+	}
 	if (command.IsInvalid() || command.IsExecute()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}

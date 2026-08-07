@@ -1,3 +1,8 @@
+option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
+
+if(NOT KYTY_BUILD_LAUNCHER)
+	return()
+endif()
 
 find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
 

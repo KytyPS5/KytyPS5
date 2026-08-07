@@ -22,6 +22,13 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 	return candidate <= range_end && size <= range_end - candidate;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
+	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
+	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
+}
+#endif
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -263,6 +270,19 @@ public:
 			EXIT_IF(!part_placeholder_preserved);
 			removed.push_back(entry);
 		}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
+		// records this contiguous guest span as one free range, so normalize fragmented backing
+		// views into one placeholder before publishing it there.
+		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
+			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
+				                                     it->mode));
+			}
+			return false;
+		}
+#endif
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -832,6 +852,8 @@ public:
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_vaddr), region_size,
 			                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
 		}
+		// ReleaseCommitted also publishes the aggregate span as one logical free range.
+		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
 #else
 		for (const auto& [region_vaddr, region_size]: regions) {
 			RestorePlaceholder(region_vaddr, region_size);
@@ -1252,8 +1274,7 @@ private:
 
 		if (base != it->first || end != it->first + it->second) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (VirtualFree(reinterpret_cast<void*>(base), end - base,
-			                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0) {
+			if (CoalescePlaceholders(base, end - base)) {
 				m_free.erase(first, last);
 				m_free.emplace(base, end - base);
 			}

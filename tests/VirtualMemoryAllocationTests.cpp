@@ -495,6 +495,85 @@ void TestFlexibleMemoryReuseIsZeroFilled() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestSmallerFlexibleMapReusesReleasedHole() {
+	const char*        test       = "SmallerFlexibleMapReusesReleasedHole";
+	const auto         baseline   = AvailableFlexibleMemory(test);
+	constexpr uint64_t SmallSize  = SceKernelPageSize * 12;
+	constexpr uint64_t LargeSize  = SceKernelPageSize * 16;
+	constexpr uint64_t BlockSize  = SceKernelPageSize * 4;
+	constexpr int      RuntimeMap = 0x8000;
+
+	// Leave a 0x30000 hole before an allocated backing block. The large mapping must then be
+	// assembled from two flexible-backing extents, matching the allocation that exposed the
+	// PPSA30528 regression.
+	void* seed_hole = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &seed_hole, SmallSize, SceKernelProtCpuRw, RuntimeMap, "backing_seed_hole"),
+	        "KernelMapNamedFlexibleMemory(seed hole)");
+	void* seed_blocker = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &seed_blocker, BlockSize, SceKernelProtCpuRw, RuntimeMap, "backing_seed_blocker"),
+	        "KernelMapNamedFlexibleMemory(seed blocker)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(seed_hole), SmallSize),
+	        "KernelMunmap(seed hole)");
+	void* virtual_blocker = seed_hole;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&virtual_blocker, SmallSize, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(seed virtual blocker)");
+	Check(test, virtual_blocker == seed_hole, "seed virtual hole was not reserved in place");
+
+	void* large = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &large, LargeSize, SceKernelProtCpuRw, RuntimeMap, "released_large_hole"),
+	        "KernelMapNamedFlexibleMemory(large)");
+	void* blocker = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &blocker, SmallSize, SceKernelProtCpuRw, RuntimeMap, "adjacent_blocker"),
+	        "KernelMapNamedFlexibleMemory(blocker)");
+	const auto large_base   = reinterpret_cast<uint64_t>(large);
+	const auto blocker_base = reinterpret_cast<uint64_t>(blocker);
+	Check(test, blocker_base == large_base + LargeSize,
+	      "hint-less flexible maps were not adjacent");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(large_base, LargeSize),
+	        "KernelMunmap(large)");
+
+	void* reused = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &reused, SmallSize, SceKernelProtCpuRw, RuntimeMap, "smaller_hole_reuse"),
+	        "KernelMapNamedFlexibleMemory(smaller reuse)");
+	Check(test, reinterpret_cast<uint64_t>(reused) == large_base,
+	      "smaller flexible map did not reuse the released hole");
+	*reinterpret_cast<uint64_t*>(reused) = 0x4b59545952455553ull; // "KYTYREUS"
+	Check(test, *reinterpret_cast<const uint64_t*>(reused) == 0x4b59545952455553ull,
+	      "reused flexible hole is not writable");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(reused), SmallSize),
+	        "KernelMunmap(reused)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(blocker_base, SmallSize),
+	        "KernelMunmap(blocker)");
+	CheckOk(
+	    test,
+	    Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(seed_blocker), BlockSize),
+	    "KernelMunmap(seed blocker)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(virtual_blocker),
+	                                              SmallSize),
+	        "KernelMunmap(seed virtual blocker)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "released-hole reuse leaked flexible memory capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 	const char* test     = "GuestStackUsesPrivateOwnerMemoryAndCache";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -605,6 +684,13 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	    test,
 	    Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(adjacent_first, SceKernelPageSize * 2),
 	    "combined adjacent runtime free did not restore one owner placeholder");
+	const auto adjacent_reused = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    adjacent_first, SceKernelPageSize, Common::VirtualMemory::Mode::ReadWrite,
+	    "runtime_adjacent_reuse", true);
+	Check(test, adjacent_reused == adjacent_first,
+	      "combined adjacent runtime placeholder could not be split for reuse");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(adjacent_reused, SceKernelPageSize),
+	      "adjacent runtime reuse cleanup failed");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -2258,6 +2344,7 @@ int main() {
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);

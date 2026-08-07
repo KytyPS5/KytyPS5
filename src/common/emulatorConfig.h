@@ -45,7 +45,10 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
-	Keymap                 keymap;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool red_zone_protection_enabled = false;
+#endif
+	Keymap keymap;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -76,6 +79,9 @@ bool SpirvDebugPrintfEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool RedZoneProtectionEnabled();
+#endif
 
 const Keymap& GetKeymap();
 

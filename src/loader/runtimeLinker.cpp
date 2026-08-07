@@ -19,6 +19,7 @@
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
+#include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -2202,17 +2203,39 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool         use_red_zone_protection  = Config::RedZoneProtectionEnabled();
+	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+	if (use_red_zone_protection) {
+		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
+		program->mapped_size += RED_ZONE_TRAMPOLINE_SIZE;
+	}
+#endif
+
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
+	EXIT_IF(program->base_vaddr == 0);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (use_red_zone_protection) {
+		program->red_zone_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
+		program->red_zone_trampoline_size  = RED_ZONE_TRAMPOLINE_SIZE;
+		RegisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr),
+		                           program->base_size_aligned,
+		                           reinterpret_cast<void*>(program->red_zone_trampoline_vaddr),
+		                           program->red_zone_trampoline_size);
+	}
+#endif
 	if (!is_shared) {
 		program->tls.handler_vaddr = program->base_vaddr + program->base_size_aligned;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		program->tls.handler_vaddr += program->red_zone_trampoline_size;
+#endif
 	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
 
-	EXIT_IF(program->base_vaddr == 0);
 	EXIT_IF(program->base_size_aligned < program->base_size);
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
@@ -2228,6 +2251,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	// program->elf->SetBaseVAddr(program->base_vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
+	uint64_t                                   eh_frame_header_addr = 0;
+	uint64_t                                   eh_frame_header_size = 0;
+#endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
@@ -2250,6 +2278,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
 				PatchProgram(program, segment_addr, segment_memory_size);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				if (use_red_zone_protection) {
+					executable_segments.emplace_back(segment_addr, segment_file_size);
+				}
+#endif
 			}
 
 			if (!skip_protect) {
@@ -2284,7 +2317,41 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 		}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (use_red_zone_protection && phdr[i].p_type == PT_GNU_EH_FRAME) {
+			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
+			eh_frame_header_size = phdr[i].p_memsz;
+		}
+#endif
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (use_red_zone_protection) {
+		std::vector<uintptr_t> function_starts;
+		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
+		                                 &function_starts)) {
+			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
+			     Common::PathToString(program->file_name).c_str());
+		}
+		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			const auto result =
+			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
+			     result.red_zone_function_count, result.memory_instruction_count,
+			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
+			     result.stack_dependent_memory_instruction_count,
+			     result.control_flow_memory_instruction_count,
+			     result.unrelocatable_memory_instruction_count);
+			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
+		}
+		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,
+		                                             program->red_zone_trampoline_size);
+	}
+#endif
 
 	if (!is_shared) {
 		SetupTlsHandler(program);
@@ -2311,6 +2378,11 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (program->red_zone_trampoline_size != 0) {
+			UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
+		}
+#endif
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
 	}

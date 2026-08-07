@@ -18265,39 +18265,67 @@ void CheckPm4ContextStateOperations(RenderContext& renderer) {
 	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
 	        "push changed live Cx state");
 	processor.GetCtx().SetRenderTargetMask(0x01020304);
-	Require("Pm4ContextState", "push-pop restore",
-	        invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
-	            processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
-	        "ordinary push/pop did not restore Cx state");
+        Require("Pm4ContextState", "push-pop restore",
+                invoke(ContextStateOperation::Pop) ==
+                        Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() == 0x1234abcd,
+                "ordinary push/pop did not restore Cx state");
 
-	Require("Pm4ContextState", "clear",
-	        invoke(ContextStateOperation::Clear) == Pm4ProcessResult::Complete &&
-	            !processor.GetCtx().GetRenderControl().depth_clear_enable &&
-	            processor.GetCtx().GetRenderTargetMask() == HW::Context {}.GetRenderTargetMask() &&
-	            processor.GetUcfg().GetPrimType() == 0x35 &&
-	            processor.GetShCtx().GetPs().ps_regs.data_addr == shader_address,
-	        "clear reset state outside the Cx register domain");
+        Require("Pm4ContextState", "clear",
+                invoke(ContextStateOperation::Clear) ==
+                        Pm4ProcessResult::Complete &&
+                    !processor.GetCtx().GetRenderControl().depth_clear_enable &&
+                    processor.GetCtx().GetRenderTargetMask() ==
+                        HW::Context{}.GetRenderTargetMask() &&
+                    processor.GetUcfg().GetPrimType() == 0x35 &&
+                    processor.GetShCtx().GetPs().ps_regs.data_addr ==
+                        shader_address,
+                "clear reset state outside the Cx register domain");
 
-	processor.GetCtx().SetRenderTargetMask(0xabcdef01);
-	Require("Pm4ContextState", "push before processor reset",
-	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete,
-	        "push before reset failed");
-	processor.Reset();
-	processor.GetCtx().SetRenderTargetMask(0x76543210);
-	Require("Pm4ContextState", "processor reset discards push",
-	        invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete &&
-	            invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
-	            processor.GetCtx().GetRenderTargetMask() == 0x76543210,
-	        "processor reset retained an invalid saved Cx state");
+        processor.GetCtx().SetRenderTargetMask(0x0badc0de);
+        Require("Pm4ContextState", "push before clear-state packet",
+                invoke(ContextStateOperation::Push) ==
+                    Pm4ProcessResult::Complete,
+                "push before CLEAR_STATE failed");
+        processor.GetCtx().SetRenderTargetMask(0xfeedface);
+        std::array<uint32_t, 2> clear_state_packet{0xc0001200, 0};
+        Pm4Execution clear_state_execution;
+        Require("Pm4ContextState", "clear-state packet",
+                processor.Process(
+                    clear_state_execution, clear_state_packet.data(),
+                    clear_state_packet.size()) == Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() ==
+                        HW::Context{}.GetRenderTargetMask(),
+                "CLEAR_STATE did not clear the current Cx state");
+        Require("Pm4ContextState", "pop after clear-state packet",
+                invoke(ContextStateOperation::Pop) ==
+                        Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() == 0x0badc0de,
+                "CLEAR_STATE discarded the pushed Cx state");
 
-	Require("Pm4ContextState", "HLE packet size",
-	        Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
-	            Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
-	        "context-state HLE sizes do not match libSceAgc");
-	std::printf("[host]    %-32s ok\n", "Pm4ContextState");
+        processor.GetCtx().SetRenderTargetMask(0xabcdef01);
+        Require("Pm4ContextState", "push before processor reset",
+                invoke(ContextStateOperation::Push) ==
+                    Pm4ProcessResult::Complete,
+                "push before reset failed");
+        processor.Reset();
+        processor.GetCtx().SetRenderTargetMask(0x76543210);
+        Require("Pm4ContextState", "processor reset discards push",
+                invoke(ContextStateOperation::Push) ==
+                        Pm4ProcessResult::Complete &&
+                    invoke(ContextStateOperation::Pop) ==
+                        Pm4ProcessResult::Complete &&
+                    processor.GetCtx().GetRenderTargetMask() == 0x76543210,
+                "processor reset retained an invalid saved Cx state");
+
+        Require("Pm4ContextState", "HLE packet size",
+                Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
+                    Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
+                "context-state HLE sizes do not match libSceAgc");
+        std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
 void CheckPm4WaitResume(RenderContext& renderer) {

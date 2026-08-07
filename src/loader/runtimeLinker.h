@@ -114,15 +114,19 @@ struct Program {
 	Program();
 	~Program();
 
-	int32_t                         unique_id = -1;
-	RuntimeLinker*                  rt        = nullptr;
-	std::filesystem::path           file_name;
-	std::unique_ptr<Elf64>          elf;
-	std::unique_ptr<DynamicInfo>    dynamic_info;
-	uint64_t                        base_vaddr        = 0;
-	uint64_t                        base_size         = 0;
-	uint64_t                        base_size_aligned = 0;
-	uint64_t                        mapped_size       = 0;
+	int32_t                      unique_id = -1;
+	RuntimeLinker*               rt        = nullptr;
+	std::filesystem::path        file_name;
+	std::unique_ptr<Elf64>       elf;
+	std::unique_ptr<DynamicInfo> dynamic_info;
+	uint64_t                     base_vaddr        = 0;
+	uint64_t                     base_size         = 0;
+	uint64_t                     base_size_aligned = 0;
+	uint64_t                     mapped_size       = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t red_zone_trampoline_vaddr = 0;
+	uint64_t red_zone_trampoline_size  = 0;
+#endif
 	std::unique_ptr<SymbolDatabase> export_symbols;
 	std::unique_ptr<SymbolDatabase> import_symbols;
 	ThreadLocalStorage              tls;

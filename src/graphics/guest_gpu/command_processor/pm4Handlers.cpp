@@ -2135,7 +2135,7 @@ KYTY_CP_OP_PARSER(CpOpClearState) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0001200);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0xfu) != 0);
 
-	cp.Reset();
+	cp.ApplyContextStateOperation(ContextStateOperation::Clear);
 
 	return 1;
 }

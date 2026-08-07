@@ -516,6 +516,7 @@ static void QueuePendingSignal(Pthread thread, int signum) {
 	PthreadQueuePendingSignal(thread, signum);
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 static void WaitForSignalDispatch(Pthread thread, int signum) {
 	constexpr auto DISPATCH_WAIT_STEP = std::chrono::microseconds(1000);
 	constexpr auto DISPATCH_WAIT_MAX  = std::chrono::milliseconds(2);
@@ -526,6 +527,7 @@ static void WaitForSignalDispatch(Pthread thread, int signum) {
 		waited += DISPATCH_WAIT_STEP;
 	}
 }
+#endif
 
 static bool TakePendingSignal(Pthread thread, int signum) {
 	return PthreadTakePendingSignal(thread, signum);
@@ -1070,60 +1072,6 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 	}
 }
 
-static bool DispatchSignalWithSuspendedThreadContext(HANDLE target_thread, Pthread thread,
-                                                     int signum, exception_handler_func_t handler) {
-	if (target_thread == nullptr || thread == nullptr || handler == nullptr) {
-		return false;
-	}
-
-	if (!PthreadHasPendingSignal(thread, signum)) {
-		return true;
-	}
-
-	if (SuspendThread(target_thread) == static_cast<DWORD>(-1)) {
-		return false;
-	}
-
-	bool    dispatched = false;
-	CONTEXT host_ctx {};
-	host_ctx.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
-	if (GetThreadContext(target_thread, &host_ctx) != FALSE) {
-		if (TakePendingSignal(thread, signum)) {
-			auto   ctx                  = CreateSignalUcontext(&host_ctx);
-			auto   guest_context        = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
-			HANDLE helper_thread_handle = nullptr;
-			if (guest_context) {
-				if (DuplicateHandle(GetCurrentProcess(), target_thread, GetCurrentProcess(),
-				                    &helper_thread_handle, THREAD_SUSPEND_RESUME, FALSE,
-				                    0) == FALSE) {
-					ResumeThread(target_thread);
-					return false;
-				}
-			} else {
-				SanitizeNonGuestSignalUcontext(&ctx, thread);
-				ResumeThread(target_thread);
-			}
-
-			std::thread([helper_thread_handle, thread, signum, handler, ctx]() mutable {
-				SignalDispatchScope scope;
-				auto*               previous_self = PthreadSwapSelfForSignal(thread);
-				handler(signum, &ctx);
-				PthreadSwapSelfForSignal(previous_self);
-				if (helper_thread_handle != nullptr) {
-					ResumeThread(helper_thread_handle);
-					CloseHandle(helper_thread_handle);
-				}
-			}).detach();
-			dispatched = true;
-			return true;
-		}
-		dispatched = true;
-	}
-
-	ResumeThread(target_thread);
-
-	return dispatched;
-}
 #endif
 
 void KernelDispatchPendingSignalForCurrentThread() {
@@ -1206,8 +1154,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		}
 
 		HANDLE target_thread =
-		    OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
-		               static_cast<DWORD>(target_thread_id));
+		    OpenThread(THREAD_SET_CONTEXT, FALSE, static_cast<DWORD>(target_thread_id));
 		if (target_thread == nullptr) {
 			return KERNEL_ERROR_EINVAL;
 		}
@@ -1231,10 +1178,6 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 
 		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
-		WaitForSignalDispatch(thread, signum);
-		if (PthreadHasPendingSignal(thread, signum)) {
-			DispatchSignalWithSuspendedThreadContext(target_thread, thread, signum, handler);
-		}
 		CloseHandle(target_thread);
 		return OK;
 #elif defined(__x86_64__)

@@ -164,6 +164,11 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
+#if defined(_WIN32)
+	m_ui->checkBox_red_zone_protection->setChecked(info.red_zone_protection_enabled);
+#else
+	m_ui->checkBox_red_zone_protection->setVisible(false);
+#endif
 	ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
@@ -286,7 +291,10 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
-	info.shader_optimization_type  = TextToEnum<Configuration::ShaderOptimizationType>(
+#if defined(_WIN32)
+	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
+#endif
+	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::ShaderLogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());

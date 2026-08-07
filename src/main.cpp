@@ -64,6 +64,9 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+#endif
 	::printf("  --keymap <Pad=Key>                   DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
@@ -137,6 +140,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.fullscreen_enabled = true;
 			continue;
 		}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (arg == "--redzone") {
+			options.config.red_zone_protection_enabled = true;
+			continue;
+		}
+#endif
 
 		if (!Common::StartsWith(arg, "--")) {
 			::printf("game input must be provided with --game\n");

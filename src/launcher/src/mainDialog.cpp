@@ -220,6 +220,11 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	args << "--profiler-direction" << EnumToText(info.profiler_direction);
 	args << "--spirv-debug-printf" << "false";
+#if defined(_WIN32)
+	if (info.red_zone_protection_enabled) {
+		args << "--redzone";
+	}
+#endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
 	}

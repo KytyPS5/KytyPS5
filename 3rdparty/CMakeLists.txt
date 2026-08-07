@@ -2,6 +2,32 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(cpuinfo)
 
+# The Windows guest red-zone patcher needs a decoder/encoder and a small
+# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
+include(FetchContent)
+
+set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	xbyak
+	GIT_REPOSITORY https://github.com/herumi/xbyak.git
+	GIT_TAG 44a72f369268f7d552650891b296693e91db86bb
+	GIT_SHALLOW FALSE
+)
+
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	zydis
+	GIT_REPOSITORY https://github.com/zyantific/zydis.git
+	GIT_TAG 120e0e705f8e3b507dc49377ac2879979f0d545c
+	GIT_SUBMODULES_RECURSE TRUE
+	GIT_SHALLOW FALSE
+)
+
+FetchContent_MakeAvailable(xbyak zydis)
+
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
 

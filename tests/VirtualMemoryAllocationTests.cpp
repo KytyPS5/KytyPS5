@@ -8,15 +8,28 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <array>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
+#endif
 
 namespace {
 
@@ -132,6 +145,105 @@ void InitSubsystems() {
 
 	initialized = true;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void* g_red_zone_fault_page = nullptr;
+
+LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
+	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+	    exception->ContextRecord == nullptr ||
+	    exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+	    reinterpret_cast<void*>(exception->ExceptionRecord->ExceptionInformation[1]) !=
+	        g_red_zone_fault_page) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	// Model the Windows exception stack footprint that prompted the static patch:
+	// data below the interrupted RSP is not part of the Windows ABI contract.
+	*reinterpret_cast<uint64_t*>(exception->ContextRecord->Rsp - 0x18) = 0;
+	DWORD old_protection = 0;
+	if (VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_READWRITE, &old_protection) == FALSE) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void TestWindowsGuestRedZoneStaticPatcher() {
+	const char* test = "WindowsGuestRedZoneStaticPatcher";
+	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
+	constexpr uint64_t CODE_SIZE = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000902000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_patcher_test");
+	Check(test, mapping != 0, "failed to allocate patch test code");
+
+	std::vector<uint8_t> code;
+	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
+		code.insert(code.end(), bytes.begin(), bytes.end());
+	};
+	const auto emit64 = [&code](uint64_t value) {
+		const auto offset = code.size();
+		code.resize(offset + sizeof(value));
+		std::memcpy(code.data() + offset, &value, sizeof(value));
+	};
+	emit({0x48, 0xb8});
+	emit64(SENTINEL);                         // movabs rax, sentinel
+	emit({0x48, 0x89, 0x44, 0x24, 0xe8});     // mov [rsp-0x18], rax
+	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8b, 0x44, 0x24, 0xe8});     // mov rax, [rsp-0x18]
+	emit({0x48, 0xb9});
+	emit64(SENTINEL);                         // movabs rcx, sentinel
+	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
+	emit({0x0f, 0x94, 0xc0});                 // sete al
+	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
+	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
+	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
+	      "failed to flush generated test code");
+
+	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+	Check(test, g_red_zone_fault_page != nullptr, "failed to allocate fault page");
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const bool unpatched_was_corrupted = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
+
+	DWORD old_protection = 0;
+	Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+	      "failed to reset fault page protection");
+	Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
+	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
+	                                   TRAMPOLINE_SIZE);
+	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
+	const auto result = Loader::PatchRedZoneMemoryInstructions(
+	    mapping, code.size(), function_starts);
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
+	      "failed to flush patched test code");
+	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+
+	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
+	RemoveVectoredExceptionHandler(handler);
+	VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
+	g_red_zone_fault_page = nullptr;
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
+
+	Check(test, unpatched_was_corrupted, "test harness did not reproduce red-zone corruption");
+	Check(test, result.red_zone_function_count == 1 && result.memory_instruction_count >= 1 &&
+	                result.patched_memory_instruction_count >= 1 &&
+	                result.unrelocatable_memory_instruction_count == 0,
+	      "static patcher did not cover the faultable instruction");
+	Check(test, patched_preserved, "patched fault still corrupted the guest red zone");
+	Check(test, freed, "failed to free patch test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#else
+void TestWindowsGuestRedZoneStaticPatcher() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
+}
+#endif
 
 void RunTest(void (*test_func)()) {
 	if (g_failed_tests != 0) {
@@ -2332,9 +2444,14 @@ void TestModuleRelocationUsesWritableHostMapping() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
+		RunTest(TestWindowsGuestRedZoneStaticPatcher);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 
+	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);

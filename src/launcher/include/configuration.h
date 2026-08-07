@@ -99,7 +99,10 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   renderdoc_enabled           = false;
-	QStringList            host_input_mapping;
+#if defined(_WIN32)
+	bool red_zone_protection_enabled = false;
+#endif
+	QStringList host_input_mapping;
 
 	QString elf = QStringLiteral("eboot.bin");
 
@@ -119,7 +122,10 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_direction          = other.profiler_direction;
 		renderdoc_enabled           = other.renderdoc_enabled;
-		host_input_mapping          = other.host_input_mapping;
+#if defined(_WIN32)
+		red_zone_protection_enabled = other.red_zone_protection_enabled;
+#endif
+		host_input_mapping = other.host_input_mapping;
 	}
 
 	void CopyFrom(const Configuration& other) {
@@ -156,6 +162,9 @@ public:
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_direction);
 		KYTY_CFG_SET(renderdoc_enabled);
+#if defined(_WIN32)
+		KYTY_CFG_SET(red_zone_protection_enabled);
+#endif
 		s->setValue("host_input_mapping", host_input_mapping);
 		KYTY_CFG_SET(elf);
 	}
@@ -183,6 +192,10 @@ public:
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_direction);
 		KYTY_CFG_GET(renderdoc_enabled);
+#if defined(_WIN32)
+		red_zone_protection_enabled =
+		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
+#endif
 		host_input_mapping = s->value("host_input_mapping", host_input_mapping).toStringList();
 		elf                = s->value("elf", elf).toString();
 	}

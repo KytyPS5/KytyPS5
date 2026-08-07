@@ -101,6 +101,12 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool RedZoneProtectionEnabled() {
+	return g_config->red_zone_protection_enabled;
+}
+#endif
+
 const Keymap& GetKeymap() {
 	return g_config->keymap;
 }

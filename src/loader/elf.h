@@ -53,6 +53,7 @@ constexpr Elf64_Half ET_DYNAMIC = 0xfe18; // Shared
 constexpr Elf64_Word PT_LOAD          = 1;
 constexpr Elf64_Word PT_DYNAMIC       = 2;
 constexpr Elf64_Word PT_TLS           = 7;
+constexpr Elf64_Word PT_GNU_EH_FRAME  = 0x6474e550;
 constexpr Elf64_Word PT_OS_DYNLIBDATA = 0x61000000;
 constexpr Elf64_Word PT_OS_PROCPARAM  = 0x61000001;
 constexpr Elf64_Word PT_OS_RELRO      = 0x61000010;

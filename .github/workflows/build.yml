@@ -373,7 +373,13 @@ jobs:
 
   release:
     name: Release KytyPS5
-    if: github.event_name == 'push' && github.repository == 'KytyPS5/KytyPS5'
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.repository == 'KytyPS5/KytyPS5' &&
+      (needs.windows.result == 'success' ||
+       needs.macos.result == 'success' ||
+       needs.linux.result == 'success')
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
@@ -382,34 +388,62 @@ jobs:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
 
     steps:
-      - name: Download builds
+      - name: Download Windows build
+        if: needs.windows.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: KytyPS5-Windows-x64
+          path: artifacts/KytyPS5-Windows-x64
 
-      - name: Package builds
+      - name: Download macOS build
+        if: needs.macos.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-macOS-x86_64
+          path: artifacts/KytyPS5-macOS-x86_64
+
+      - name: Download Linux build
+        if: needs.linux.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: artifacts/KytyPS5-Linux-x86_64
+
+      - name: Package Windows build
+        if: needs.windows.result == 'success'
         shell: bash
         run: |
           windows_dir="artifacts/KytyPS5-Windows-x64"
-          macos_dir="artifacts/KytyPS5-macOS-x86_64"
-          linux_dir="artifacts/KytyPS5-Linux-x86_64"
           test -d "$windows_dir"
-          test -d "$macos_dir"
-          test -d "$linux_dir"
-          chmod a+x \
-            "$macos_dir/launcher" \
-            "$macos_dir/kyty_emulator" \
-            "$macos_dir/libMoltenVK.dylib" \
-            "$linux_dir/launcher" \
-            "$linux_dir/kyty_emulator"
           (
             cd "$windows_dir"
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
           )
+
+      - name: Package macOS build
+        if: needs.macos.result == 'success'
+        shell: bash
+        run: |
+          macos_dir="artifacts/KytyPS5-macOS-x86_64"
+          test -d "$macos_dir"
+          chmod a+x \
+            "$macos_dir/launcher" \
+            "$macos_dir/kyty_emulator" \
+            "$macos_dir/libMoltenVK.dylib"
           (
             cd "$macos_dir"
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-macOS-x86_64.zip" .
           )
+
+      - name: Package Linux build
+        if: needs.linux.result == 'success'
+        shell: bash
+        run: |
+          linux_dir="artifacts/KytyPS5-Linux-x86_64"
+          test -d "$linux_dir"
+          chmod a+x \
+            "$linux_dir/launcher" \
+            "$linux_dir/kyty_emulator"
           tar -C "$linux_dir" -czf \
             "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
 
@@ -418,11 +452,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          assets=(
-            "$RELEASE_NAME-Windows-x64.zip"
-            "$RELEASE_NAME-macOS-x86_64.zip"
-            "$RELEASE_NAME-Linux-x86_64.tar.gz"
-          )
+          assets=()
+          for artifact in \
+            "$RELEASE_NAME-Windows-x64.zip" \
+            "$RELEASE_NAME-macOS-x86_64.zip" \
+            "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
+            if [[ -f "$artifact" ]]; then
+              assets+=("$artifact")
+            fi
+          done
+          test "${#assets[@]}" -gt 0
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$RELEASE_NAME" "${assets[@]}" \
               --clobber \

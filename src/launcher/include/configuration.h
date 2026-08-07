@@ -66,7 +66,7 @@ public:
 	enum class ProfilerDirection { None, Network };
 	Q_ENUM(ProfilerDirection)
 
-	enum class LogDirection { Silent, Console, File };
+	enum class LogDirection { Silent, Console, File, FilePerTest };
 	Q_ENUM(LogDirection)
 
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };

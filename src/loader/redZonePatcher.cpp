@@ -20,8 +20,10 @@
 #include <set>
 #include <unordered_set>
 #include <vector>
+#if defined(_WIN32)
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+#endif
 
 #ifdef min
 #undef min
@@ -30,7 +32,9 @@
 #undef max
 #endif
 
+#if defined(_WIN32)
 using namespace Xbyak::util;
+#endif
 
 namespace Loader {
 

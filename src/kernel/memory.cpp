@@ -3650,7 +3650,17 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
-	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
+	// The guest-visible protection lives in the range tracker; the host mapping must stay
+	// writable so loader/runtime patching of guest pages (relocations, PLT stubs) never
+	// faults against a guest-only protection. Restoring a tracker mode verbatim used to
+	// leave program pages host-read-only and livelock the first relocation write.
+	// NoAccess is kept intact: guard pages must trap. Mirrors SetProgramMemoryProtection.
+	const auto host_mode =
+	    mode == VirtualMemory::Mode::NoAccess
+	        ? VirtualMemory::Mode::NoAccess
+	        : (VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
+	                                          : VirtualMemory::Mode::ReadWrite);
+	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, host_mode)) {
 		return false;
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_size, ProgramProtection(mode));

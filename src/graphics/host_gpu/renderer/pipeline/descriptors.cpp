@@ -994,13 +994,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                  ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
 			                  : vk::AccessFlagBits2::eShaderRead,
 			              range, vk_buffer);
-		} else if ((image.binding.force_general || image.binding.is_target) &&
-		           !image.info.IsDepth()) {
+		} else if (image.binding.force_general || image.binding.is_target) {
+			// Depth reaches this branch too: AcquireRenderTargets sets force_general on a
+			// depth attachment the same draw samples, and both sides must agree on eGeneral.
+			const auto attachment_access =
+			    image.info.IsDepth() ? vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+			                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+			                         : vk::AccessFlagBits2::eColorAttachmentRead |
+			                               vk::AccessFlagBits2::eColorAttachmentWrite;
 			image.Transit(vk::ImageLayout::eGeneral,
-			              vk::AccessFlagBits2::eShaderRead |
-			                  vk::AccessFlagBits2::eColorAttachmentRead |
-			                  vk::AccessFlagBits2::eColorAttachmentWrite,
-			              {}, vk_buffer);
+			              vk::AccessFlagBits2::eShaderRead | attachment_access, {}, vk_buffer);
 		} else if (storage) {
 			image.Transit(vk::ImageLayout::eGeneral,
 			              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,

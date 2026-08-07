@@ -2,6 +2,8 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -209,6 +211,40 @@ void TestQueriesDoNotRequireMappedOwnership() {
   Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
             !harness.tracker.IsRegionGpuModified(address, page_size),
         "unowned tracker range did not expose its initial CPU-dirty state");
+}
+
+void TestConcurrentRegionPublication() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  std::binary_semaphore start_first{0};
+  std::binary_semaphore start_second{0};
+  std::atomic_uint32_t cpu_dirty_results{0};
+  std::jthread first([&] {
+    start_first.acquire();
+    if (tracker.IsRegionCpuModified(address, page_size)) {
+      cpu_dirty_results.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  std::jthread second([&] {
+    start_second.acquire();
+    if (tracker.IsRegionCpuModified(address, page_size)) {
+      cpu_dirty_results.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  start_first.release();
+  start_second.release();
+  first.join();
+  second.join();
+
+  tracker.UntrackMemory(address, page_size);
+  Release(page_manager, memory, page_size);
+  Check(cpu_dirty_results.load(std::memory_order_relaxed) == 2,
+        "concurrent region publication lost initial CPU ownership");
 }
 
 void TestCpuDirtyUpload() {
@@ -497,6 +533,114 @@ void TestCrossRegionUpload() {
   Release(page_manager, memory, region_size * 2);
 }
 
+void TestUploadDoesNotSerializeDisjointRegion() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto second_region =
+      (allocation_base & ~(region_size - 1)) + region_size;
+  Check(second_region + page_size <= allocation_base + region_size * 2,
+        "test allocation does not span two tracker regions");
+
+  // Publish both managers before the concurrent section so this test measures
+  // tracker access serialization rather than manager allocation.
+  Check(tracker.IsRegionCpuModified(allocation_base, page_size) &&
+            tracker.IsRegionCpuModified(second_region, page_size),
+        "disjoint upload setup did not initialize both regions");
+
+  std::binary_semaphore upload_entered{0};
+  std::binary_semaphore finish_upload{0};
+  std::binary_semaphore query_finished{0};
+  std::atomic_bool query_result{false};
+  std::jthread uploader([&] {
+    tracker.ForEachUploadRange(
+        allocation_base, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          upload_entered.release();
+          finish_upload.acquire();
+        });
+  });
+  upload_entered.acquire();
+  std::jthread query([&] {
+    query_result.store(tracker.IsRegionCpuModified(second_region, page_size),
+                       std::memory_order_relaxed);
+    query_finished.release();
+  });
+
+  const bool completed_while_upload_blocked =
+      query_finished.try_acquire_for(std::chrono::seconds(5));
+  finish_upload.release();
+  uploader.join();
+  query.join();
+
+  tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
+  tracker.MarkRegionAsCpuModified(allocation_base, page_size);
+  tracker.UntrackMemory(allocation_base, region_size * 2);
+  Release(page_manager, memory, region_size * 2);
+  Check(completed_while_upload_blocked &&
+            query_result.load(std::memory_order_relaxed),
+        "upload callback serialized an unrelated tracker region");
+}
+
+void TestDownloadDoesNotSerializeDisjointRegion() {
+  constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_size * 2 / page_size);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto second_region =
+      (allocation_base & ~(region_size - 1)) + region_size;
+  Check(second_region + page_size <= allocation_base + region_size * 2,
+        "test allocation does not span two tracker regions");
+
+  tracker.ForEachUploadRange(
+      allocation_base, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.ForEachUploadRange(
+      second_region, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+
+  std::binary_semaphore download_entered{0};
+  std::binary_semaphore finish_download{0};
+  std::binary_semaphore mutation_finished{0};
+  std::jthread downloader([&] {
+    tracker.ForEachDownloadRange<false>(allocation_base, page_size,
+                                        [&](uint64_t, uint64_t) noexcept {
+                                          download_entered.release();
+                                          finish_download.acquire();
+                                        });
+  });
+  download_entered.acquire();
+  std::jthread mutation([&] {
+    tracker.MarkRegionAsGpuModified(second_region, page_size);
+    mutation_finished.release();
+  });
+
+  const bool completed_while_download_blocked =
+      mutation_finished.try_acquire_for(std::chrono::seconds(5));
+  finish_download.release();
+  downloader.join();
+  mutation.join();
+
+  const bool both_gpu_owned =
+      tracker.IsRegionGpuModified(allocation_base, page_size) &&
+      tracker.IsRegionGpuModified(second_region, page_size);
+  tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
+  tracker.UnmarkRegionAsGpuModified(second_region, page_size);
+  tracker.MarkRegionAsCpuModified(allocation_base, page_size);
+  tracker.MarkRegionAsCpuModified(second_region, page_size);
+  tracker.UntrackMemory(allocation_base, region_size * 2);
+  Release(page_manager, memory, region_size * 2);
+  Check(completed_while_download_blocked && both_gpu_owned,
+        "download callback serialized an unrelated tracker region");
+}
+
 void TestGpuUnmarkUsesRegionMask() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -683,6 +827,7 @@ int main(int argc, char **argv) {
   }
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
+  TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
@@ -690,6 +835,8 @@ int main(int argc, char **argv) {
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
+  TestUploadDoesNotSerializeDisjointRegion();
+  TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();

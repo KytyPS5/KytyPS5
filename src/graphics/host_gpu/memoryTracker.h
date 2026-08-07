@@ -68,7 +68,6 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-		std::lock_guard             access(m_access_mutex);
 		std::vector<RegionManager*> managers;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
 			managers.push_back(manager);
@@ -109,7 +108,6 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		std::unique_lock access(m_access_mutex);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -173,13 +171,12 @@ private:
 	}
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
-	void           UntrackMemoryLocked(uint64_t vaddr, uint64_t size);
+	void           UntrackMemoryImpl(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
-	std::mutex                                     m_access_mutex;
 	PageManager&                                   m_page_manager;
 };
 

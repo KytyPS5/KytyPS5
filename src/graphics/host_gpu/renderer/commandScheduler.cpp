@@ -99,7 +99,10 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	m_buffers.reserve(CommandBufferGrowStep);
+	m_buffer_ticks.reserve(CommandBufferGrowStep);
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -154,10 +157,7 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	m_shaders     = &shaders;
 
 	if (!Active()) {
-		for (auto& buffer: m_buffers) {
-			buffer = std::make_unique<RenderCommandBuffer>(*this);
-		}
-		m_current = 0;
+		m_current = static_cast<int>(GrowCommandBuffers());
 	}
 
 	BindCurrent();
@@ -235,7 +235,13 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	PopPendingOperations(true);
+}
+
+void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
+	if (refresh_gpu_tick) {
+		m_master.Refresh();
+	}
 	for (;;) {
 		Common::UniqueFunction<void> callback;
 		{
@@ -362,7 +368,7 @@ uint64_t CommandScheduler::NextSubmitSequence() noexcept {
 }
 
 void CommandScheduler::CheckActive() const {
-	EXIT_IF(!Active() || m_current >= BufferCount);
+	EXIT_IF(!Active() || static_cast<size_t>(m_current) >= m_buffers.size());
 }
 
 RenderCommandBuffer& CommandScheduler::Current() const {
@@ -384,15 +390,52 @@ CommandBuffer& CommandScheduler::SubmitCurrent(SubmitInfo& submit) {
 	const auto signal_tick = m_master.NextTick();
 	submit.AddSignal(m_master.Handle(), signal_tick);
 	submitted.Execute(submit);
-	m_recording = false;
+	m_buffer_ticks[static_cast<size_t>(m_current)] = signal_tick;
+	m_recording                                    = false;
 	return submitted;
+}
+
+int CommandScheduler::FindReusableBuffer(uint64_t gpu_tick) const {
+	EXIT_IF(m_buffer_ticks.size() != m_buffers.size());
+	const auto buffer_count = m_buffers.size();
+	for (size_t offset = 1; offset <= buffer_count; ++offset) {
+		const auto candidate = (static_cast<size_t>(m_current) + offset) % buffer_count;
+		if (gpu_tick >= m_buffer_ticks[candidate]) {
+			return static_cast<int>(candidate);
+		}
+	}
+	return -1;
+}
+
+size_t CommandScheduler::GrowCommandBuffers() {
+	const auto first = m_buffers.size();
+	const auto end   = first + CommandBufferGrowStep;
+	m_buffers.reserve(end);
+	m_buffer_ticks.reserve(end);
+	for (size_t i = first; i < end; ++i) {
+		m_buffers.emplace_back(std::make_unique<RenderCommandBuffer>(*this));
+		m_buffer_ticks.push_back(0);
+	}
+	return first;
 }
 
 void CommandScheduler::BeginNext() {
 	EXIT_IF(m_recording);
-	m_current = (m_current + 1) % BufferCount;
+
+	auto candidate = FindReusableBuffer(m_master.KnownGpuTick());
+	bool refreshed = false;
+	if (candidate < 0) {
+		m_master.Refresh();
+		refreshed = true;
+		candidate = FindReusableBuffer(m_master.KnownGpuTick());
+	}
+	if (candidate < 0) {
+		candidate = static_cast<int>(GrowCommandBuffers());
+	}
+
+	m_current = candidate;
 	Current().WaitForFenceAndReset();
-	PopPendingOperations();
+	PopPendingOperations(!refreshed);
 	BindCurrent();
 	Current().Begin();
 	m_recording = true;

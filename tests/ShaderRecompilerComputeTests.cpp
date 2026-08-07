@@ -1323,10 +1323,28 @@ public:
 		const auto         external_wait_tick  = scheduler.CurrentTick();
 		SubmitInfo         external_wait;
 		external_wait.AddWait(external_timeline, external_wait_value);
-		scheduler.Flush(external_wait);
-		Require("SchedulerTimeline", "external timeline blocked",
-		        !scheduler.IsFree(external_wait_tick),
-		        "submission ignored the external timeline wait value");
+		constexpr size_t blocked_submission_count = 6;
+		std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles {};
+		for (size_t i = 0; i < blocked_submission_count; ++i) {
+			blocked_handles[i] = scheduler.Current().Handle();
+			if (i == 0) {
+				scheduler.Flush(external_wait);
+			} else {
+				scheduler.Flush();
+			}
+		}
+		bool distinct_handles = true;
+		for (size_t i = 0; i < blocked_handles.size(); ++i) {
+			for (size_t j = i + 1; j < blocked_handles.size(); ++j) {
+				distinct_handles &= blocked_handles[i] != blocked_handles[j];
+			}
+		}
+		const auto last_blocked_tick = scheduler.CurrentTick() - 1;
+		Require("SchedulerTimeline", "external timeline overflow",
+		        distinct_handles && last_blocked_tick ==
+		                                external_wait_tick + blocked_submission_count - 1 &&
+		            !scheduler.IsFree(last_blocked_tick),
+		        "blocked submissions did not grow the command-buffer pool");
 		vk::SemaphoreSignalInfo signal_info {};
 		signal_info.sType     = vk::StructureType::eSemaphoreSignalInfo;
 		signal_info.semaphore = external_timeline;
@@ -1334,8 +1352,14 @@ public:
 		Require("SchedulerTimeline", "external timeline signal",
 		        m_runtime_context.device.signalSemaphore(&signal_info) == vk::Result::eSuccess,
 		        "failed to signal the external timeline semaphore");
-		scheduler.Wait(external_wait_tick);
+		scheduler.Wait(last_blocked_tick);
 		m_runtime_context.device.destroySemaphore(external_timeline, nullptr);
+		scheduler.Flush();
+		scheduler.Flush();
+		Require("SchedulerTimeline", "timeline pool reuse",
+		        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
+		            blocked_handles.end(),
+		        "completed command buffers were not reused after timeline progress");
 		scheduler.Shutdown();
 
 		CommandScheduler draining(Renderer(), m_runtime_context);

@@ -16,6 +16,7 @@
 #include <queue>
 
 #include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -31,8 +32,6 @@ struct CommandSlot {
 
 class CommandScheduler {
 public:
-	static constexpr int BufferCount = 8;
-
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
@@ -65,6 +64,8 @@ public:
 	[[nodiscard]] GraphicContext& Graphics() const noexcept { return m_graphics; }
 
 private:
+	static constexpr size_t CommandBufferGrowStep = 4;
+
 	class CommandPool {
 	public:
 		CommandPool() = default;
@@ -94,30 +95,34 @@ private:
 	void                       BindCurrent() const;
 	CommandBuffer&             SubmitCurrent(SubmitInfo& submit);
 	void                       BeginNext();
+	void                       PopPendingOperations(bool refresh_gpu_tick);
+	[[nodiscard]] int          FindReusableBuffer(uint64_t gpu_tick) const;
+	[[nodiscard]] size_t       GrowCommandBuffers();
 	void                       PriorityOperationsThread(std::stop_token stop);
 	void                       RunOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] CommandSlot* AllocateCommandBuffer();
 	[[nodiscard]] uint64_t     NextSubmitSequence() noexcept;
 
-	MasterSemaphore                                               m_master;
-	RenderContext&                                                m_context;
-	GraphicContext&                                               m_graphics;
-	CommandPool                                                   m_command_pool;
-	std::array<std::unique_ptr<RenderCommandBuffer>, BufferCount> m_buffers;
-	std::queue<PendingOperation>                                  m_pending_operations;
-	std::queue<PendingOperation>                                  m_priority_operations;
-	std::mutex                                                    m_operation_mutex;
-	std::condition_variable                                       m_operation_available;
-	std::jthread                                                  m_priority_thread;
-	bool                                                          m_priority_active      = false;
-	uint64_t                                                      m_priority_active_tick = 0;
-	OperationState        m_operation_state = OperationState::Open;
-	int                   m_current         = -1;
-	bool                  m_recording       = false;
-	HW::Context*          m_registers       = nullptr;
-	HW::UserConfig*       m_user_config     = nullptr;
-	HW::Shader*           m_shaders         = nullptr;
-	std::atomic<uint64_t> m_submit_sequence = 0;
+	MasterSemaphore                                   m_master;
+	RenderContext&                                    m_context;
+	GraphicContext&                                   m_graphics;
+	CommandPool                                       m_command_pool;
+	std::vector<std::unique_ptr<RenderCommandBuffer>> m_buffers;
+	std::vector<uint64_t>                             m_buffer_ticks;
+	std::queue<PendingOperation>                      m_pending_operations;
+	std::queue<PendingOperation>                      m_priority_operations;
+	std::mutex                                        m_operation_mutex;
+	std::condition_variable                           m_operation_available;
+	std::jthread                                      m_priority_thread;
+	bool                                              m_priority_active      = false;
+	uint64_t                                          m_priority_active_tick = 0;
+	OperationState                                    m_operation_state      = OperationState::Open;
+	int                                               m_current              = -1;
+	bool                                              m_recording            = false;
+	HW::Context*                                      m_registers            = nullptr;
+	HW::UserConfig*                                   m_user_config          = nullptr;
+	HW::Shader*                                       m_shaders              = nullptr;
+	std::atomic<uint64_t>                             m_submit_sequence      = 0;
 
 	friend class CommandBuffer;
 };

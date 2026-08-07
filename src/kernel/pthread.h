@@ -269,6 +269,8 @@ int KYTY_SYSV_ABI pthread_rwlock_rdlock(LibKernel::PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI pthread_rwlock_unlock(LibKernel::PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI pthread_rwlock_wrlock(LibKernel::PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI pthread_rwlock_destroy(LibKernel::PthreadRwlock* rwlock);
+int KYTY_SYSV_ABI pthread_rwlock_init(LibKernel::PthreadRwlock*           rwlock,
+                                      const LibKernel::PthreadRwlockattr* attr);
 int KYTY_SYSV_ABI pthread_key_create(LibKernel::PthreadKey*                   key,
                                      LibKernel::pthread_key_destructor_func_t destructor);
 int KYTY_SYSV_ABI pthread_key_delete(LibKernel::PthreadKey key);

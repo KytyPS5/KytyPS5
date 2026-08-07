@@ -2172,9 +2172,11 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("ltCfaGr2JGE", Posix::pthread_mutex_destroy);
 	LIB_FUNC("mkx2fVhNMsg", Posix::pthread_cond_broadcast);
 	LIB_FUNC("2MOy+rUfuhQ", Posix::pthread_cond_signal);
+	LIB_FUNC("0TyVk4MSLt0", Posix::pthread_cond_init);
 	LIB_FUNC("Op8TBGY5KHg", Posix::pthread_cond_wait);
 	LIB_FUNC("Z4QosVuAsA0", Posix::pthread_once);
 	LIB_FUNC("1471ajPzxh0", Posix::pthread_rwlock_destroy);
+	LIB_FUNC("ytQULN-nhL4", Posix::pthread_rwlock_init);
 	LIB_FUNC("sIlRvQqsN2Y", Posix::pthread_rwlock_wrlock);
 	LIB_FUNC("SFxTMOfuCkE", LibKernel::PthreadRwlockTryrdlock);
 	LIB_FUNC("XhWHn6P5R7U", LibKernel::PthreadRwlockTrywrlock);
@@ -3211,7 +3213,6 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("FXPWHNk8Of0", LibKernel::PthreadAttrGetschedparam);
 
 	LIB_FUNC("6ULAa0fq4jA", LibKernel::PthreadRwlockInit);
-	LIB_FUNC("ytQULN-nhL4", LibKernel::PthreadRwlockInit);
 	LIB_FUNC("BB+kb08Tl9A", LibKernel::PthreadRwlockDestroy);
 	LIB_FUNC("Ox9i0c7L5w0", LibKernel::PthreadRwlockRdlock);
 	LIB_FUNC("iGjsr1WAtI0", LibKernel::PthreadRwlockRdlock);
@@ -3227,7 +3228,6 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("h-OifiouBd8", LibKernel::PthreadRwlockattrSettype);
 
 	LIB_FUNC("2Tb92quprl0", LibKernel::PthreadCondInit);
-	LIB_FUNC("0TyVk4MSLt0", LibKernel::PthreadCondInit);
 	LIB_FUNC("g+PZd2hiacg", LibKernel::PthreadCondDestroy);
 	LIB_FUNC("RXXqi4CtF8w", LibKernel::PthreadCondDestroy);
 	LIB_FUNC("WKAXJ4XBPQ4", LibKernel::PthreadCondWait);

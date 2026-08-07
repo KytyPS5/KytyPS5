@@ -1952,6 +1952,35 @@ uint32_t EmitFMulConstant(EmitterState& state, uint32_t value, uint32_t bits) {
 	return ret;
 }
 
+// The sRGB electro-optical transfer function, gamma to linear:
+//     v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+// Emitted for texels the host image cannot decode by itself - see
+// Prospero::IsShaderDecodedSrgbTextureFormat for which formats those are and why.
+//
+// pow is spelled exp2(2.4 * log2(x)) rather than GLSL.std.450 Pow because Log2 and Exp2 are
+// already in the extended-instruction enum and Pow is not: this needs no new opcode number.
+//
+// Both arms are evaluated because OpSelect is not a branch. That is safe here: the log2
+// argument is (v + 0.055) * 0.94787, which is at least 0.052 for any v >= 0, and v is
+// sampled from an 8-bit unorm image so it cannot be negative.
+uint32_t EmitSrgbToLinearF32(EmitterState& state, uint32_t value) {
+	const auto low    = EmitFMulConstant(state, value, FloatBits(1.0f / 12.92f));
+	const auto biased = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFAdd, state.float_type, biased, value, ConstantF32Value(state, 0.055f)});
+	const auto scaled = EmitFMulConstant(state, biased, FloatBits(1.0f / 1.055f));
+	const auto log    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, state.float_type, log, state.glsl_std450, GlslLog2, scaled});
+	const auto exponent = EmitFMulConstant(state, log, FloatBits(2.4f));
+	const auto high     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, state.float_type, high, state.glsl_std450, GlslExp2, exponent});
+	const auto is_low = EmitFCompareValue(state, OpFOrdLessThanEqual, value,
+	                                      ConstantF32Value(state, 0.04045f));
+	return EmitFSelectValue(state, is_low, low, high);
+}
+
 CubeF32Values EmitCubeF32Values(EmitterState& state, const IR::Instruction& inst) {
 	CubeF32Values cube;
 	cube.x            = EmitFloatLoad(state, inst.src[0]);

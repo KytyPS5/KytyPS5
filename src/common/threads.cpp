@@ -28,7 +28,8 @@
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
-constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
+constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
+constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -39,7 +40,10 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 		return;
 	}
 
-	if (units_100ns <= 10000) {
+	// Keep spinning only where a kernel transition is
+	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
+	// per-thread high-resolution waitable timer below.
+	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
 		LARGE_INTEGER frequency {};
 		LARGE_INTEGER start {};
 		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&

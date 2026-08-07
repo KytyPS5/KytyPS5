@@ -752,26 +752,18 @@ void WindowContext::Run() {
 #if defined(__APPLE__)
 		DrainMainThreadTasks();
 #endif
-		if (SDL_PollEvent(&loop.event) != 0) {
-			ProcessEvent(timer.GetTimeS());
-			continue;
-		}
-
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
 			}
-			if (SDL_WaitEvent(&loop.event) == 0) {
-				EXIT("%s\n", SDL_GetError());
-			}
-			ProcessEvent(timer.GetTimeS());
-			continue;
-		}
-
-		if (timer.IsPaused()) {
+		} else if (timer.IsPaused()) {
 			timer.Resume();
 		}
-		Common::Thread::SleepMicro(1000);
+
+		if (SDL_WaitEvent(&loop.event) == 0) {
+			EXIT("%s\n", SDL_GetError());
+		}
+		ProcessEvent(timer.GetTimeS());
 	}
 }
 

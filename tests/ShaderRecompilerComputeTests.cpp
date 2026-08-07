@@ -729,14 +729,6 @@ void Require(const char* shader_name, const char* stage, bool value, const std::
 	}
 }
 
-void WaitForSuspendPoint(Gpu& gpu) {
-	const int completion = gpu.GetFrameNum() + 1;
-	gpu.SuspendPoint();
-	while (gpu.GetFrameNum() < completion) {
-		std::this_thread::yield();
-	}
-}
-
 void CheckLeastRecentlyUsedCacheOrdering() {
 	Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
 	const auto                                         first  = cache.Insert(1, 1);
@@ -1667,7 +1659,7 @@ public:
 			});
 			std::this_thread::yield();
 		}
-		WaitForSuspendPoint(gpu);
+		gpu.Done();
 		Require("GpuCommandLane", "packet-boundary command polling",
 		        packet_marker_a_at_callback == 11 && packet_marker_b_at_callback == 0 &&
 		            packet_marker_a == 11 && packet_marker_b == 22,
@@ -1696,47 +1688,25 @@ public:
 		commands[16] = 22;
 		gpu.Submit(commands.data(), static_cast<uint32_t>(commands.size()), nullptr, 0);
 
-		std::binary_semaphore first_suspend_inserted {0};
-		std::binary_semaphore second_suspend_started {0};
-		std::atomic<bool>     second_suspend_finished {false};
-		uint32_t              suffix_after_first_suspend = UINT32_MAX;
-		const int             ordered_completion         = gpu.GetFrameNum() + 2;
+		std::binary_semaphore ordered_started {0};
+		std::atomic<bool>     ordered_finished {false};
+		uint32_t              ordered_suffix = 0;
 		std::jthread          ordered([&] {
-			gpu.SuspendPoint();
-			suffix_after_first_suspend = suffix;
-			first_suspend_inserted.release();
-			second_suspend_started.release();
-			gpu.SuspendPoint();
-			second_suspend_finished = true;
+			ordered_started.release();
+			gpu.Done();
+			ordered_suffix   = suffix;
+			ordered_finished = true;
 		});
-		const bool first_returned = first_suspend_inserted.try_acquire_for(std::chrono::seconds(2));
-		const bool second_started =
-		    first_returned && second_suspend_started.try_acquire_for(std::chrono::seconds(2));
-		if (second_started) {
-			const auto ordered_deadline =
-			    std::chrono::steady_clock::now() + std::chrono::seconds(2);
-			while (!second_suspend_finished.load() &&
-			       std::chrono::steady_clock::now() < ordered_deadline) {
-				std::this_thread::yield();
-			}
-		}
-		const bool second_blocked_before_release = second_started && !second_suspend_finished.load();
+		ordered_started.acquire();
 		gpu.SendCommandSync([&] {
+			Require("GpuCommandLane", "submit done barrier", !ordered_finished.load(),
+			        "submit done returned before a queued submission");
 			label = 1;
 		});
 		ordered.join();
-		while (gpu.GetFrameNum() < ordered_completion) {
-			std::this_thread::yield();
-		}
-		Require("GpuCommandLane", "asynchronous suspend insertion",
-		        first_returned && suffix_after_first_suspend == 0,
-		        "first suspend point blocked on earlier graphics work");
-		Require("GpuCommandLane", "single in-flight suspend point",
-		        second_blocked_before_release && second_suspend_finished.load(),
-		        "second suspend point did not wait for the first marker");
 		Require("GpuCommandLane", "ordered completion",
-		        prefix == 11 && suffix == 22,
-		        "queued suspend point completed before earlier graphics work");
+		        prefix == 11 && suffix == 22 && ordered_suffix == 22 && ordered_finished.load(),
+		        "submit done did not drain prior PM4 work");
 
 		auto&              resources         = context.GetGpuResources();
 		constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
@@ -1758,7 +1728,7 @@ public:
 			unmap_complete.acquire();
 		}
 		unmap_thread.join();
-		WaitForSuspendPoint(gpu);
+		gpu.Done();
 		Require("GpuCommandLane", "unmap queue progress",
 		        unmap_returned && !resources.IsMapped(empty_unmap_base, empty_unmap_size) &&
 		            prefix == 11 && suffix == 22,
@@ -1871,7 +1841,7 @@ public:
 		Require("GpuCommandLane", "DMA_DATA packet assembly", dma_cursor == dma_commands.size(),
 		        "DMA_DATA GDS packet stream has the wrong size");
 		gpu.Submit(dma_commands.data(), static_cast<uint32_t>(dma_commands.size()), nullptr, 0);
-		WaitForSuspendPoint(gpu);
+		gpu.Done();
 		constexpr uint32_t clean_fill_value = 0xdecafbad;
 		gpu.SendCommandSync([&] {
 			auto& buffer_cache = resources.GetBufferCache();
@@ -2075,11 +2045,12 @@ public:
 		std::binary_semaphore command_entered {0};
 		std::binary_semaphore release_command {0};
 		std::atomic<bool>     shutdown_complete {false};
-		std::atomic<bool>     command_completed {false};
+		std::atomic<bool>     submission_lane_entered {false};
 		gpu.SendCommand([&] {
 			command_entered.release();
 			release_command.acquire();
-			command_completed = true;
+			gpu.Done();
+			submission_lane_entered = true;
 		});
 		command_entered.acquire();
 		std::jthread shutdown_thread([&] {
@@ -2094,8 +2065,8 @@ public:
 		release_command.release();
 		shutdown_thread.join();
 		Require("GpuCommandLane", "owned shutdown completion",
-		        shutdown_complete.load() && command_completed.load(),
-		        "GPU owner did not drain an in-flight command");
+		        shutdown_complete.load() && submission_lane_entered.load(),
+		        "GPU owner did not drain a command that entered the submission lane");
 		context.ShutdownGpu();
 		std::printf("[host]    %-32s ok\n", "GpuCommandLane");
 	}

@@ -1440,7 +1440,7 @@ int KYTY_SYSV_ABI GraphicsSuspendPoint() {
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().SuspendPoint();
+	g_renderer->GetGpu().Done();
 
 	return OK;
 }
@@ -1466,7 +1466,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbContextStateOp(CommandBuffer* buf, uint32_t o
 
 	buf->DbgDump();
 
-	uint32_t*  first  = nullptr;
+	uint32_t* first = nullptr;
 	const auto append = [&](uint32_t segment_size_dw) {
 		auto* segment = buf->AllocateDW(segment_size_dw);
 		if (segment == nullptr) {

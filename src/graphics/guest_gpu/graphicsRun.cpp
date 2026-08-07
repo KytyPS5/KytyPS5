@@ -97,7 +97,7 @@ public:
 	void SubmitCompute(uint32_t queue, uint32_t* cmd_buffer, uint32_t num_dw,
 	                   bool trigger_agc_interrupt_on_done);
 	void SubmitFlipPreparation(uint64_t request_id);
-	void SuspendPoint();
+	void Done();
 	void Shutdown();
 	[[nodiscard]] bool        IsStopping();
 	void                      SendCommand(Common::UniqueFunction<void>&& command);
@@ -106,7 +106,7 @@ public:
 	[[nodiscard]] static bool IsGpuThread() noexcept { return g_gpu_thread; }
 
 private:
-	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation };
 
 	struct Submission {
 		SubmissionType type     = SubmissionType::Graphics;
@@ -124,7 +124,9 @@ private:
 		uint64_t       flip_request_id               = 0;
 	};
 
+	void              WaitLocked();
 	void              Enqueue(Submission submission);
+	void              WaitForIdle();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -135,16 +137,17 @@ private:
 	Common::Mutex                                  m_queue_mutex;
 	std::mutex                                     m_shutdown_mutex;
 	Common::CondVar                                m_work_available;
+	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
-	bool                                           m_reset_graphics    = true;
+	bool                                           m_processing        = false;
+	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
-	std::binary_semaphore                          m_suspend_point_slot {1};
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
@@ -238,8 +241,8 @@ void GpuState::Submit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t*
 	submission.commands                      = OwnedCmdBuffer(cmd_draw_buffer, num_draw_dw);
 	submission.constant_commands             = OwnedCmdBuffer(cmd_const_buffer, num_const_dw);
 	submission.trigger_agc_interrupt_on_done = trigger_agc_interrupt_on_done;
-	submission.reset_processor               = m_reset_graphics;
-	m_reset_graphics                         = false;
+	submission.reset_processor               = m_graphics_done;
+	m_graphics_done                          = false;
 	Enqueue(std::move(submission));
 }
 
@@ -265,25 +268,30 @@ void GpuState::SubmitFlipPreparation(uint64_t request_id) {
 	Submission   submission;
 	submission.type            = SubmissionType::FlipPreparation;
 	submission.queue_id        = 0;
-	submission.reset_processor = m_reset_graphics;
+	submission.reset_processor = m_graphics_done;
 	submission.flip_request_id = request_id;
-	m_reset_graphics           = false;
+	m_graphics_done            = false;
 	Enqueue(std::move(submission));
 }
 
-void GpuState::SuspendPoint() {
-	EXIT_IF(IsGpuThread());
-	m_suspend_point_slot.acquire();
+void GpuState::Done() {
 	GpuMutexLock lock(m_submission_mutex);
-	Submission   submission;
-	submission.type     = SubmissionType::SuspendPoint;
-	submission.queue_id = 0;
-	m_reset_graphics    = false;
-	Enqueue(std::move(submission));
+	if (IsGpuThread()) {
+		m_gfx_cp->BufferWait();
+	} else {
+		WaitLocked();
+	}
+	m_graphics_done = true;
+	m_done_num++;
 }
 
 int GpuState::GetFrameNum() {
 	return m_done_num;
+}
+
+void GpuState::WaitLocked() {
+	WaitForIdle();
+	SendCommandSync([this] { m_gfx_cp->BufferWait(); });
 }
 
 CommandProcessor& GpuState::GetProcessor(uint32_t queue_id) {
@@ -308,12 +316,9 @@ void CommandProcessor::Reset() {
 	m_context_state_pushed             = false;
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
-	m_index_base_addr                  = 0;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
-	m_num_instances                    = 1;
-	m_predicate_skip                   = false;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -527,6 +532,13 @@ void GpuState::Enqueue(Submission submission) {
 	m_work_available.Signal();
 }
 
+void GpuState::WaitForIdle() {
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		m_idle.Wait(&m_queue_mutex);
+	}
+}
+
 void GpuState::ThreadRun(void* data) {
 	auto* gpu = static_cast<GpuState*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -542,14 +554,19 @@ void GpuState::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				gpu->m_processing = false;
+				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+				gpu->m_processing = false;
+				gpu->m_idle.SignalAll();
 				should_stop = true;
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+				gpu->m_processing = true;
 			} else {
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
@@ -560,6 +577,7 @@ void GpuState::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					gpu->m_processing = false;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -573,6 +591,7 @@ void GpuState::ThreadRun(void* data) {
 				queue.pop_front();
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+				gpu->m_processing = true;
 				has_submission    = true;
 			}
 		}
@@ -587,6 +606,11 @@ void GpuState::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			command();
 
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			gpu->m_processing = false;
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+				gpu->m_idle.SignalAll();
+			}
 			continue;
 		}
 
@@ -605,19 +629,16 @@ void GpuState::ThreadRun(void* data) {
 				}
 			}
 		}
+		gpu->m_processing = false;
+		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			gpu->m_idle.SignalAll();
+		}
 	}
 }
 
 bool GpuState::Process(Submission& submission) {
 	auto&      cp          = GetProcessor(submission.queue_id);
 	const bool first_slice = !submission.started;
-	if (submission.type == SubmissionType::SuspendPoint) {
-		EXIT_IF(!first_slice || submission.queue_id != 0);
-		cp.Reset();
-		m_done_num++;
-		m_suspend_point_slot.release();
-		return true;
-	}
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -705,7 +726,6 @@ bool GpuState::Process(Submission& submission) {
 			m_renderer.GetGpuResources().RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint: EXIT("unreachable suspend point submission\n");
 	}
 
 	return complete;
@@ -1688,8 +1708,8 @@ void Gpu::SubmitFlipPreparation(uint64_t request_id) {
 	m_state->SubmitFlipPreparation(request_id);
 }
 
-void Gpu::SuspendPoint() {
-	m_state->SuspendPoint();
+void Gpu::Done() {
+	m_state->Done();
 }
 
 int Gpu::GetFrameNum() const {

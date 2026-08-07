@@ -1849,8 +1849,9 @@ static int PthreadMutexInitNamed(PthreadMutex* mutex, const PthreadMutexattr* at
 	}
 }
 
-int KYTY_SYSV_ABI PthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr) {
-	return PthreadMutexInitNamed(mutex, attr, "");
+int KYTY_SYSV_ABI PthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr,
+                                   const char* name) {
+	return PthreadMutexInitNamed(mutex, attr, name);
 }
 
 int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
@@ -2443,8 +2444,9 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
 	return OK;
 }
 
-int KYTY_SYSV_ABI PthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockattr* attr) {
-	return PthreadRwlockInitNamed(rwlock, attr, "");
+int KYTY_SYSV_ABI PthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockattr* attr,
+                                    const char* name) {
+	return PthreadRwlockInitNamed(rwlock, attr, name);
 }
 
 static PthreadRwlockPrivate::Reader* RwlockFindReader(PthreadRwlock rwlock, Pthread thread) {
@@ -2938,8 +2940,9 @@ static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, 
 	}
 }
 
-int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr) {
-	return PthreadCondInitNamed(cond, attr, "");
+int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr,
+                                  const char* name) {
+	return PthreadCondInitNamed(cond, attr, name);
 }
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
@@ -4560,7 +4563,7 @@ int KYTY_SYSV_ABI pthread_mutex_init(LibKernel::PthreadMutex*           mutex,
                                      const LibKernel::PthreadMutexattr* attr) {
 	PRINT_NAME();
 
-	return POSIX_PTHREAD_CALL(LibKernel::PthreadMutexInit(mutex, attr));
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadMutexInit(mutex, attr, nullptr));
 }
 
 int KYTY_SYSV_ABI pthread_mutexattr_init(LibKernel::PthreadMutexattr* attr) {

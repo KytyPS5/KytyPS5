@@ -77,7 +77,8 @@ int KYTY_SYSV_ABI PthreadMutexattrInit(PthreadMutexattr* attr);
 int KYTY_SYSV_ABI PthreadMutexattrDestroy(PthreadMutexattr* attr);
 int KYTY_SYSV_ABI PthreadMutexattrSettype(PthreadMutexattr* attr, int type);
 int KYTY_SYSV_ABI PthreadMutexattrSetprotocol(PthreadMutexattr* attr, int protocol);
-int KYTY_SYSV_ABI PthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr);
+int KYTY_SYSV_ABI PthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr,
+                                   const char* name);
 int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex);
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex);
 int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex);
@@ -159,7 +160,8 @@ int KYTY_SYSV_ABI PthreadAttrSetstackaddr(PthreadAttr* attr, void* addr);
 int KYTY_SYSV_ABI PthreadAttrSetstacksize(PthreadAttr* attr, size_t stack_size);
 
 int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock);
-int KYTY_SYSV_ABI PthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockattr* attr);
+int KYTY_SYSV_ABI PthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockattr* attr,
+                                    const char* name);
 int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec);
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec);
@@ -177,7 +179,7 @@ int KYTY_SYSV_ABI PthreadCondattrInit(PthreadCondattr* attr);
 int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid clock_id);
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond);
 int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond);
-int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr);
+int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond);
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread);
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex, KernelUseconds usec);

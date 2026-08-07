@@ -562,8 +562,7 @@ static bool EvaluateRuntimeSourcesImpl(const Program&                           
 		const auto  dynamic =
 		    std::find(program.srt.dynamic_sources.begin(), program.srt.dynamic_sources.end(),
 		              request.source) != program.srt.dynamic_sources.end();
-		if (descriptor == nullptr || dynamic ||
-		    !DescriptorSourceResolved(program, request.source)) {
+		if (descriptor == nullptr || dynamic) {
 			if (error != nullptr) {
 				*error = Diagnostic(program, request.use_pc,
 				                    fmt::format("descriptor source {} is {}", request.source,

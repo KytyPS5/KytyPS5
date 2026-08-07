@@ -124,7 +124,6 @@ private:
 		uint64_t       flip_request_id               = 0;
 	};
 
-	void              WaitLocked();
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
 	void              ProcessCommands();
@@ -276,10 +275,8 @@ void GpuState::SubmitFlipPreparation(uint64_t request_id) {
 
 void GpuState::Done() {
 	GpuMutexLock lock(m_submission_mutex);
-	if (IsGpuThread()) {
-		m_gfx_cp->BufferWait();
-	} else {
-		WaitLocked();
+	if (!IsGpuThread()) {
+		WaitForIdle();
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -287,11 +284,6 @@ void GpuState::Done() {
 
 int GpuState::GetFrameNum() {
 	return m_done_num;
-}
-
-void GpuState::WaitLocked() {
-	WaitForIdle();
-	SendCommandSync([this] { m_gfx_cp->BufferWait(); });
 }
 
 CommandProcessor& GpuState::GetProcessor(uint32_t queue_id) {
@@ -307,8 +299,6 @@ CommandProcessor& GpuState::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
-	BufferWait();
-
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
@@ -385,7 +375,6 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 }
 
 void CommandProcessor::IncrementDe() {
-	BufferWait();
 	m_de_count++;
 }
 
@@ -1352,6 +1341,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,
 					                            value >> 16u);
+					if (with_interrupt) {
+						m_renderer.TriggerEopEvent(interrupt_context_id);
+					}
 					return;
 				}
 			} else if (eop_event_type == 0x04 && cache_action == 0x00 && event_index == 0x05) {
@@ -1554,7 +1546,6 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 				     event_index);
 			}
 			EmitGlobalBarrier();
-			SynchronizeGpu();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x0000002a:

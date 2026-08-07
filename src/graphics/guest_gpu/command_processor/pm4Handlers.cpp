@@ -2682,23 +2682,26 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
+		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
 			case 0x01:
 			case 0x02:
-			case 0x04: cp.TriggerEopEventAtEndOfPipe(interrupt_context_id); break;
+			case 0x04:
+				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+				queued = true;
+				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
+		}
+		if (queued) {
+			cp.BufferFlush();
 		}
 	};
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
 			cp.EmitGlobalBarrier();
-		}
-
-		if (gl2_writeback) {
-			cp.SynchronizeGpu();
 		}
 
 		trigger_interrupt();
@@ -2709,10 +2712,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	if (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
 			cp.EmitGlobalBarrier();
-		}
-
-		if (gl2_writeback) {
-			cp.SynchronizeGpu();
 		}
 
 		trigger_interrupt();
@@ -2728,17 +2727,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	cache_policy      = 0;
 
 	if (data_sel == 1) {
-		static std::atomic<uint32_t> log_count {0};
-		const auto                   dst_addr = reinterpret_cast<uint64_t>(dst_gpu_addr);
-		if ((dst_addr & 0xffffffffff000000ull) == 0x0000001021000000ull || log_count.load() < 64) {
-			if (log_count.fetch_add(1) < 256) {
-				LOGF(
-				    "\t runtime release_mem32: dst=0x%016" PRIx64 ", value=0x%08" PRIx32
-				    ", action=0x%02" PRIx32 ", gcr=0x%04" PRIx32 ", cache_action=0x%08" PRIx32 "\n",
-				    dst_addr, static_cast<uint32_t>(value), eop_event_type, gcr_cntl, cache_action);
-			}
-		}
-
 		eop_event_type    = 0x2f;
 		event_index       = 6;
 		auto event_source = 2u;
@@ -2753,7 +2741,6 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	if (data_sel == 5) {
 		if (gl2_writeback) {
-			cp.SynchronizeGpu();
 			cache_action = 0;
 		}
 
@@ -2764,7 +2751,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		if (interrupt_selector == 0x01) {
+			cp.BufferFlush();
+		}
 
 		return 7;
 	}

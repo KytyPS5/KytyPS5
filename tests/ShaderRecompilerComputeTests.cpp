@@ -1607,6 +1607,145 @@ public:
 		        order == 2 && gpu_thread != caller_thread && nested_thread == gpu_thread,
 		        "host command did not run on the GPU thread or nested sync deadlocked");
 
+		{
+			const auto make_release_mem = [](uint32_t data_sel, uint32_t interrupt_selector,
+			                                 void* destination, uint64_t value) {
+				std::array<uint32_t, 8> packet {};
+				const auto              address = reinterpret_cast<uint64_t>(destination);
+				constexpr uint32_t       eop_none = 0x28u;
+				constexpr uint32_t       gcr_gl2_writeback = 1u << 9u;
+				packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+				packet[1] = eop_none | (gcr_gl2_writeback << 12u);
+				packet[2] = (interrupt_selector << 24u) | (data_sel << 29u);
+				packet[3] = static_cast<uint32_t>(address);
+				packet[4] = static_cast<uint32_t>(address >> 32u);
+				packet[5] = static_cast<uint32_t>(value);
+				packet[6] = static_cast<uint32_t>(value >> 32u);
+				packet[7] = 0x123u;
+				return packet;
+			};
+
+			vk::SemaphoreTypeCreateInfo timeline_type {};
+			timeline_type.sType         = vk::StructureType::eSemaphoreTypeCreateInfo;
+			timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+			vk::SemaphoreCreateInfo timeline_create {};
+			timeline_create.sType           = vk::StructureType::eSemaphoreCreateInfo;
+			timeline_create.pNext           = &timeline_type;
+			vk::Semaphore blocked_timeline = nullptr;
+			Require("GpuCommandLane", "blocked timeline create",
+			        m_runtime_context.device.createSemaphore(
+			            &timeline_create, nullptr, &blocked_timeline) == vk::Result::eSuccess &&
+			            blocked_timeline != nullptr,
+			        "failed to create the blocked GPU timeline");
+
+			constexpr uint64_t release_tick = 1;
+			auto&              gpu_scheduler = context.GetCommandScheduler();
+			auto               processor     = std::make_unique<CommandProcessor>(context);
+			gpu.SendCommandSync([&] {
+				SubmitInfo blocked_submit;
+				blocked_submit.AddWait(blocked_timeline, release_tick);
+				gpu_scheduler.Flush(blocked_submit);
+			});
+
+			std::binary_semaphore parser_complete {0};
+			alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
+			bool                       parser_kept_nonblocking_boundaries = false;
+			std::jthread               no_gpu_wait([&] {
+				gpu.SendCommandSync([&] {
+					processor->BufferInit();
+					const auto tick_before = gpu_scheduler.CurrentTick();
+					processor->TriggerEvent(0x16u, 0u);
+					auto         packet = make_release_mem(0, 0, nullptr, 0);
+					Pm4Execution execution;
+					const auto   result = processor->Process(execution, packet.data(), packet.size());
+					processor->IncrementDe();
+					const bool cache_and_counter_did_not_submit =
+					    result == Pm4ProcessResult::Complete &&
+					    gpu_scheduler.CurrentTick() == tick_before;
+
+					auto gds_interrupt_only =
+					    make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
+					Pm4Execution gds_interrupt_execution;
+					const auto   interrupt_tick = gpu_scheduler.CurrentTick();
+					const auto   interrupt_result = processor->Process(
+					    gds_interrupt_execution, gds_interrupt_only.data(), gds_interrupt_only.size());
+					parser_kept_nonblocking_boundaries =
+					    cache_and_counter_did_not_submit &&
+					    interrupt_result == Pm4ProcessResult::Complete &&
+					    gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
+					    interrupt_only_gds_label == UINT64_MAX;
+				});
+				parser_complete.release();
+			});
+			const bool parser_did_not_wait_gpu =
+			    parser_complete.try_acquire_for(std::chrono::seconds(2));
+
+			vk::SemaphoreSignalInfo signal_info {};
+			signal_info.sType     = vk::StructureType::eSemaphoreSignalInfo;
+			signal_info.semaphore = blocked_timeline;
+			signal_info.value     = release_tick;
+			Require("GpuCommandLane", "blocked timeline signal",
+			        m_runtime_context.device.signalSemaphore(&signal_info) == vk::Result::eSuccess,
+			        "failed to release the blocked GPU timeline");
+			no_gpu_wait.join();
+			gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+			m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
+			Require("GpuCommandLane", "nonblocking GPU packets",
+			        parser_did_not_wait_gpu && parser_kept_nonblocking_boundaries,
+			        "a cache event, GL2 writeback, DE counter, or interrupt boundary used the wrong "
+			        "submission behavior");
+
+			alignas(uint64_t) uint64_t release_label = 0;
+			alignas(uint64_t) uint64_t gds_label     = UINT64_MAX;
+			bool                       release_mem_submission_counts = false;
+			gpu.SendCommandSync([&] {
+				processor->BufferInit();
+
+				auto         immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
+				Pm4Execution immediate_execution;
+				const auto   immediate_tick = gpu_scheduler.CurrentTick();
+				const auto   immediate_result =
+				    processor->Process(immediate_execution, immediate.data(), immediate.size());
+				const bool immediate_split_once =
+				    gpu_scheduler.CurrentTick() == immediate_tick + 1;
+
+				auto         gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
+				Pm4Execution gds_execution;
+				const auto   gds_tick   = gpu_scheduler.CurrentTick();
+				const auto   gds_result = processor->Process(gds_execution, gds.data(), gds.size());
+				const bool   gds_waited_once = gpu_scheduler.CurrentTick() == gds_tick + 1;
+
+				auto         interrupt_only = make_release_mem(0, 4, nullptr, 0);
+				Pm4Execution interrupt_execution;
+				const auto   interrupt_tick = gpu_scheduler.CurrentTick();
+				const auto interrupt_result = processor->Process(
+				    interrupt_execution, interrupt_only.data(), interrupt_only.size());
+				const bool interrupt_split_once =
+				    gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+
+				auto         gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
+				Pm4Execution gds_interrupt_execution;
+				const auto   gds_interrupt_tick = gpu_scheduler.CurrentTick();
+				const auto   gds_interrupt_result = processor->Process(
+				    gds_interrupt_execution, gds_interrupt.data(), gds_interrupt.size());
+				const bool gds_interrupt_waited_once =
+				    gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
+
+				release_mem_submission_counts =
+				    immediate_result == Pm4ProcessResult::Complete && immediate_split_once &&
+				    gds_result == Pm4ProcessResult::Complete && gds_waited_once &&
+				    interrupt_result == Pm4ProcessResult::Complete && interrupt_split_once &&
+				    gds_interrupt_result == Pm4ProcessResult::Complete &&
+				    gds_interrupt_waited_once;
+			});
+			gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
+			Require("GpuCommandLane", "RELEASE_MEM submission counts",
+			        release_mem_submission_counts &&
+			            static_cast<uint32_t>(release_label) == 0x11223344u &&
+			            static_cast<uint32_t>(gds_label) == 0,
+			        "RELEASE_MEM lost its required split/readback or retained a redundant GPU wait");
+		}
+
 		alignas(uint32_t) uint32_t packet_marker_a = 0;
 		alignas(uint32_t) uint32_t packet_marker_b = 0;
 		const auto write_packet = [](uint32_t* packet, uint32_t* destination, uint32_t value) {
@@ -18420,14 +18559,16 @@ void CheckPm4CeCompletion(RenderContext& renderer) {
 	uint32_t         suffix  = 0;
 	const auto       address = reinterpret_cast<uint64_t>(&suffix);
 
-	std::array<uint32_t, 7> commands {};
+	std::array<uint32_t, 9> commands {};
 	commands[0] = 0xc0008600u;
 	commands[1] = 1;
-	commands[2] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+	commands[2] = 0xc0008500u;
 	commands[3] = 0;
-	commands[4] = static_cast<uint32_t>(address);
-	commands[5] = static_cast<uint32_t>(address >> 32u);
-	commands[6] = 33;
+	commands[4] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+	commands[5] = 0;
+	commands[6] = static_cast<uint32_t>(address);
+	commands[7] = static_cast<uint32_t>(address >> 32u);
+	commands[8] = 33;
 
 	processor.ResetDeCe();
 	Pm4Execution execution;
@@ -18437,9 +18578,28 @@ void CheckPm4CeCompletion(RenderContext& renderer) {
 	            suffix == 0,
 	        "DE did not wait for an active CE stream");
 
-	processor.SetCeComplete(true);
-	Require("Pm4CeCompletion", "complete",
+	std::array<uint32_t, 2> ce_increment {0xc0008400u, 1};
+	Pm4Execution            ce_execution;
+	Require("Pm4CeCompletion", "CE increment",
+	        processor.Process(ce_execution, ce_increment.data(), ce_increment.size()) ==
+	            Pm4ProcessResult::Complete,
+	        "CE counter increment did not complete");
+	Require("Pm4CeCompletion", "counter gate",
 	        processor.Process(execution, commands.data(), commands.size()) ==
+	                Pm4ProcessResult::Complete &&
+	            suffix == 33,
+	        "DE did not resume after CE advanced or failed to increment its counter");
+
+	suffix = 0;
+	Pm4Execution balanced_execution;
+	Require("Pm4CeCompletion", "balanced wait",
+	        processor.Process(balanced_execution, commands.data(), commands.size()) ==
+	                Pm4ProcessResult::Blocked &&
+	            suffix == 0,
+	        "balanced CE/DE counters did not gate the next DE packet");
+	processor.SetCeComplete(true);
+	Require("Pm4CeCompletion", "stream complete",
+	        processor.Process(balanced_execution, commands.data(), commands.size()) ==
 	                Pm4ProcessResult::Complete &&
 	            suffix == 33,
 	        "DE remained blocked after the CE stream completed");

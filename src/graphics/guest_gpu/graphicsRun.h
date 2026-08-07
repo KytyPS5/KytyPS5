@@ -28,7 +28,7 @@ public:
 	void SubmitCompute(uint32_t queue, uint32_t* commands, uint32_t size_dw,
 	                   bool trigger_agc_interrupt_on_done = false);
 	void SubmitFlipPreparation(uint64_t request_id);
-	void Done();
+	void SuspendPoint();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;

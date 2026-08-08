@@ -953,11 +953,17 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,
 #if !defined(__APPLE__)
+	    // Keep last so depth-only pipelines can omit this dynamic state.
 	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
 #endif
 	};
-	const auto dynamic_states_count =
+	auto dynamic_states_count =
 	    static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
+#if !defined(__APPLE__)
+	if (static_params.color_count == 0) {
+		dynamic_states_count--;
+	}
+#endif
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};
 	dynamic_state.sType             = vk::StructureType::ePipelineDynamicStateCreateInfo;

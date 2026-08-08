@@ -1,6 +1,6 @@
-name: Game Emulation Bug Report
-description: Report KytyPS5 game boot, crash, freeze, rendering, audio, input, or gameplay behavior problems.
-title: "[GAME BUG]: "
+name: Game Emulation Status Report
+description: Submit a KytyPS5 game compatibility result, including boot, rendering, audio, input, or gameplay behavior.
+title: "[GAME STATUS]: "
 body:
   - type: markdown
     attributes:
@@ -10,6 +10,7 @@ body:
         Before submitting, please:
         - Search existing issues first.
         - Re-test with a clean game dump.
+        - Use the latest KytyPS5 build available to you.
         - Attach the complete log file instead of edited snippets.
 
   - type: markdown
@@ -44,6 +45,28 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: compatibility-status
+    attributes:
+      label: Compatibility status
+      description: Select the furthest point the game consistently reaches on this build.
+      options:
+        - "Doesn't boot"
+        - Logo
+        - Main menu
+        - In game
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        **Status guide**
+        - **Doesn't boot:** The game does not show its first logo or startup screen.
+        - **Logo:** The game shows a logo or startup screen but does not reach the main menu.
+        - **Main menu:** The game reaches its menus but does not enter gameplay.
+        - **In game:** The game reaches controllable gameplay, even if bugs prevent completion.
+
   - type: input
     id: regression-builds
     attributes:
@@ -54,22 +77,22 @@ body:
   - type: markdown
     attributes:
       value: |
-        ## Problem details
+        ## Test result
 
   - type: textarea
     id: what-happened
     attributes:
-      label: What happened?
-      description: Describe the failure or incorrect behavior as directly as possible.
-      placeholder: "Example: The game reaches the main menu, then freezes after selecting Continue."
+      label: Result details
+      description: Describe what worked, what failed, and any visible or audible problems.
+      placeholder: "Example: The game reaches the main menu, then freezes after selecting Continue. Audio plays correctly until the freeze."
     validations:
       required: true
 
   - type: textarea
     id: steps-to-reproduce
     attributes:
-      label: Steps to reproduce
-      description: List the shortest path that triggers the problem from a fresh KytyPS5 start.
+      label: Steps to reproduce the result
+      description: List the shortest path to the reported status or failure from a fresh KytyPS5 start.
       placeholder: |
         1. Open KytyPS5.
         2. Boot the game.
@@ -81,7 +104,7 @@ body:
     id: expected-behavior
     attributes:
       label: Expected behavior
-      description: Explain what should happen at the same point in the game.
+      description: Explain what should happen at the same point in the game. If there is no known problem, write "No known issue".
       placeholder: "Example: The save should load and gameplay should continue normally."
     validations:
       required: true

@@ -3,6 +3,7 @@
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
+#include "kytyGitVersion.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,7 +24,7 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 	DebugStack stack;
 	DebugStack::Trace(&stack);
 
-	std::string report = "--- Stack Trace ---\n";
+	std::string report = "--- Build ---\n" KYTY_BUILD_LABEL "\n--- Stack Trace ---\n";
 	for (int i = PRINT_STACK_FROM; i < stack.depth; i++) {
 		report += fmt::format("[{}] {:016x}\n", i - PRINT_STACK_FROM,
 		                      static_cast<uint64_t>(stack.GetAddr(i)));

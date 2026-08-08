@@ -938,13 +938,6 @@ void WindowContext::UpdateTitle() {
 	static constexpr auto build_type = "Unknown";
 #endif
 
-#if defined(KYTY_OFFICIAL_BUILD)
-	static constexpr auto build_label = "Official build " KYTY_RELEASE_TAG;
-#elif defined(KYTY_FORK_BUILD)
-	static constexpr auto build_label = "Fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH;
-#else
-	static constexpr auto build_label = "Source build " KYTY_GIT_HASH;
-#endif
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
@@ -957,7 +950,7 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", build_label,
+	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL,
 	                       build_type, (has_title ? title : ""), (has_title ? ", " : ""),
 	                       (has_title_id ? title_id : ""), (has_title_id ? ", " : ""),
 	                       (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""), device_name,

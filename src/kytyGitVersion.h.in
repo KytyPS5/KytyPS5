@@ -1,2 +1,13 @@
+#include "cmake_config.h"
+
 #define KYTY_GIT_VERSION "@KYTY_GIT_VERSION@"
 #define KYTY_GIT_HASH "@KYTY_GIT_HASH@"
+
+/* Build provenance, shown in the window title and in crash reports. */
+#if defined(KYTY_OFFICIAL_BUILD)
+#define KYTY_BUILD_LABEL "Official build " KYTY_RELEASE_TAG
+#elif defined(KYTY_FORK_BUILD)
+#define KYTY_BUILD_LABEL "Fork build " KYTY_BUILD_REPOSITORY " " KYTY_GIT_HASH
+#else
+#define KYTY_BUILD_LABEL "Source build " KYTY_GIT_HASH
+#endif

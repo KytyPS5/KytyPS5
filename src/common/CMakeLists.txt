@@ -24,6 +24,7 @@ target_link_libraries(common
 		Tracy::TracyClient
 	PRIVATE
 		cpuinfo
+		kyty_git_version
 		spdlog::spdlog
 )
 

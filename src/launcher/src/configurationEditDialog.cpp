@@ -99,6 +99,8 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
+	connect(m_ui->weak_pc_button, &QPushButton::clicked, this,
+	        &ConfigurationEditDialog::apply_weak_pc_preset);
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::ShaderLogDirection>(text);
@@ -163,6 +165,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	        : Configuration::DEFAULT_CONSOLE_LANGUAGE);
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
+	m_ui->checkBox_async_shader_compile->setChecked(info.async_shader_compile);
+	m_ui->checkBox_readback_linear_images->setChecked(info.readback_linear_images);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 #if defined(_WIN32)
 	m_ui->checkBox_red_zone_protection->setChecked(info.red_zone_protection_enabled);
@@ -290,6 +294,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
+	info.async_shader_compile      = ui.checkBox_async_shader_compile->isChecked();
+	info.readback_linear_images    = ui.checkBox_readback_linear_images->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
@@ -335,6 +341,17 @@ void ConfigurationEditDialog::clear() {
 		m_game_dirs_list->clear();
 		update_game_directory_buttons();
 	}
+}
+
+void ConfigurationEditDialog::apply_weak_pc_preset() {
+	Configuration preset;
+	preset.ApplyWeakPcPreset();
+	// Keep language / folders from current form unless cleared fields matter.
+	preset.console_language          = m_ui->comboBox_console_language->currentIndex();
+	preset.shader_log_folder         = m_ui->lineEdit_shader_log_folder->text();
+	preset.command_buffer_dump_folder = m_ui->lineEdit_cmd_dump_folder->text();
+	preset.printf_output_file        = m_ui->lineEdit_printf_file->text();
+	Init(preset);
 }
 
 void ConfigurationEditDialog::add_game_directory() {

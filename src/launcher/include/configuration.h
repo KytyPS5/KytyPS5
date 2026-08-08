@@ -52,6 +52,7 @@ public:
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
 
 	enum class Resolution {
+		R1024X576,  /* weak-PC / stable20 */
 		R1280X720,
 		R1920X1080,
 	};
@@ -90,6 +91,8 @@ public:
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = true;
+	bool                   async_shader_compile        = false;
+	bool                   readback_linear_images      = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
@@ -104,6 +107,23 @@ public:
 #endif
 	QStringList host_input_mapping;
 
+	/** Apply local low-end preset (matches run-minecraft-stable20.sh). */
+	void ApplyWeakPcPreset() {
+		screen_resolution           = Resolution::R1024X576;
+		fullscreen_enabled          = false;
+		vblank_frequency            = 50;
+		vulkan_validation_enabled   = false;
+		shader_validation_enabled   = false;
+		async_shader_compile        = true;
+		readback_linear_images      = false;
+		shader_optimization_type    = ShaderOptimizationType::None;
+		shader_log_direction        = ShaderLogDirection::Silent;
+		command_buffer_dump_enabled = false;
+		printf_direction            = LogDirection::Silent;
+		profiler_direction          = ProfilerDirection::None;
+		renderdoc_enabled           = false;
+	}
+
 	QString elf = QStringLiteral("eboot.bin");
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
@@ -113,6 +133,8 @@ public:
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
+		async_shader_compile        = other.async_shader_compile;
+		readback_linear_images      = other.readback_linear_images;
 		shader_optimization_type    = other.shader_optimization_type;
 		shader_log_direction        = other.shader_log_direction;
 		shader_log_folder           = other.shader_log_folder;
@@ -153,6 +175,8 @@ public:
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
 		KYTY_CFG_SET(shader_validation_enabled);
+		KYTY_CFG_SET(async_shader_compile);
+		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(shader_optimization_type);
 		KYTY_CFG_SET(shader_log_direction);
 		KYTY_CFG_SET(shader_log_folder);
@@ -183,6 +207,10 @@ public:
 		}
 		KYTY_CFG_GET(vulkan_validation_enabled);
 		KYTY_CFG_GET(shader_validation_enabled);
+		async_shader_compile =
+		    s->value("async_shader_compile", async_shader_compile).toBool();
+		readback_linear_images =
+		    s->value("readback_linear_images", readback_linear_images).toBool();
 		KYTY_CFG_GET(shader_optimization_type);
 		KYTY_CFG_GET(shader_log_direction);
 		KYTY_CFG_GET(shader_log_folder);

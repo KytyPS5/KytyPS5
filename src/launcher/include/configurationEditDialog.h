@@ -57,6 +57,7 @@ protected:
 	void adjust_size();
 	void save();
 	void clear();
+	void apply_weak_pc_preset();
 	void add_game_directory();
 	void remove_selected_game_directories();
 	void update_game_directory_buttons();

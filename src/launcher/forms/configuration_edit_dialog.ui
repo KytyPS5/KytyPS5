@@ -98,6 +98,26 @@
            </property>
           </widget>
          </item>
+         <item row="3" column="0">
+          <widget class="QCheckBox" name="checkBox_async_shader_compile">
+           <property name="toolTip">
+            <string>Create Vulkan pipelines on a background worker and wait before draw (reduces hitch length on weak CPUs)</string>
+           </property>
+           <property name="text">
+            <string>Async shader compile</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1">
+          <widget class="QCheckBox" name="checkBox_readback_linear_images">
+           <property name="toolTip">
+            <string>Read back writable linear images on submit (expensive; keep off on weak PCs)</string>
+           </property>
+           <property name="text">
+            <string>Readback linear images</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </widget>
       </item>
@@ -310,6 +330,22 @@
        </property>
        <property name="text">
         <string>Clear</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="weak_pc_button">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>25</height>
+        </size>
+       </property>
+       <property name="toolTip">
+        <string>Apply weak-PC preset: 1024×576, vblank 50, validations off, shader opt None, async pipeline compile on, silent logs</string>
+       </property>
+       <property name="text">
+        <string>PC fraco</string>
        </property>
       </widget>
      </item>

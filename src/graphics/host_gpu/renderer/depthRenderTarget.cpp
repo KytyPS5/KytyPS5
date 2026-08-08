@@ -205,8 +205,6 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		if (z.depth_view.slice_max >= 32) {
 			DepthFatal("HTile clear tracking supports at most 32 slices");
 		}
-	} else if (z.htile_data_base_addr != 0) {
-		DepthFatal("HTile address without an enabled tile surface");
 	}
 	const bool size_xy_valid = z.size.valid;
 	const bool wh_valid      = z.width_height_valid && z.width != 0 && z.height != 0;

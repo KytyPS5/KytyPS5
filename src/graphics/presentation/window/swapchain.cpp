@@ -27,6 +27,11 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/media/binkHost.h"
+
+extern "C" {
+#include <libavutil/pixfmt.h>
+}
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
@@ -66,9 +71,16 @@ struct Presenter::Frame {
 	bool                           busy         = false;
 	bool                           reusing_last = false;
 
+	// Staging for host-decoded movie frames. One per Frame, so the frame's own fence is what
+	// governs reuse and no extra synchronisation is needed.
+	VulkanBuffer staging;
+	uint64_t     staging_size = 0;
+
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
+	void UploadRgba(GraphicContext& graphics, CommandBuffer& command,
+	                const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
 
@@ -308,6 +320,50 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+}
+
+// Put a host-decoded movie frame straight into the presented image, replacing whatever the guest
+// produced. The frame arrives as tightly packed RGBA already sized to this image.
+void Presenter::Frame::UploadRgba(GraphicContext& graphics, CommandBuffer& command_buffer,
+                                  const std::vector<uint8_t>& rgba, uint32_t width,
+                                  uint32_t height) {
+	const uint64_t needed = static_cast<uint64_t>(width) * height * 4;
+	if (rgba.size() < needed || needed == 0) {
+		return;
+	}
+	if (staging_size < needed) {
+		if (staging.buffer != nullptr) {
+			graphics.DeleteBuffer(staging);
+		}
+		staging.usage = vk::BufferUsageFlagBits::eTransferSrc;
+		// CreateBuffer picks the memory type from these flags; without them the allocation is
+		// device-local and vmaMapMemory fails.
+		staging.memory.property =
+		    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+		graphics.CreateBuffer(needed, staging);
+		staging_size = needed;
+	}
+	void* mapped = nullptr;
+	graphics.MapMemory(staging.memory, mapped);
+	if (mapped == nullptr) {
+		return;
+	}
+	std::memcpy(mapped, rgba.data(), needed);
+	graphics.UnmapMemory(staging.memory);
+
+	command_buffer.EndRendering();
+	auto command = command_buffer.Handle();
+	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	vk::BufferImageCopy region {};
+	region.bufferOffset      = 0;
+	region.bufferRowLength   = width;
+	region.bufferImageHeight = height;
+	region.imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.imageExtent       = {width, height, 1};
+	command.copyBufferToImage(staging.buffer, image.image, vk::ImageLayout::eTransferDstOptimal, 1,
+	                          &region);
+	// Leave the image where CopyFrom leaves it, so the present path is unchanged.
 	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 }
 
@@ -769,6 +825,34 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	// A movie the guest decodes itself never reaches us as pixels we can trust, so when one is
+	// playing the host-decoded frame replaces what the guest composed.
+	if (BinkHost::Active()) {
+		const uint32_t              width  = image.backing.extent.width;
+		const uint32_t              height = image.backing.extent.height;
+		static std::vector<uint8_t> rgba;
+		// Decode straight into the presented image's own format. Demon's Souls presents
+		// A2B10G10R10, so 8-bit pixels would land across the wrong bits and tint the whole frame.
+		int      av_format = AV_PIX_FMT_RGBA;
+		uint32_t bytes     = 4;
+		switch (frame_format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb: av_format = AV_PIX_FMT_BGRA; break;
+			case vk::Format::eA2B10G10R10UnormPack32: av_format = AV_PIX_FMT_X2BGR10LE; break;
+			case vk::Format::eA2R10G10B10UnormPack32: av_format = AV_PIX_FMT_X2RGB10LE; break;
+			default: break;
+		}
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::fprintf(stderr, "[bink] presenting %ux%u vk_format=%u av_format=%d\n", width,
+			             height, static_cast<uint32_t>(frame_format), av_format);
+			std::fflush(stderr);
+		}
+		if (BinkHost::NextFrame(width, height, av_format, bytes, rgba)) {
+			frame->UploadRgba(m_impl->window.graphic_ctx, buffer, rgba, width, height);
+		}
+	}
 	return *frame;
 }
 

@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/media/binkHost.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -435,6 +436,13 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	file->real_name = (directory ? g_mount_points->GetRealDirectory(file->name)
 	                             : g_mount_points->GetRealFilename(file->name));
+
+	// Games that decode video inside their own executable never call a decode export we can see,
+	// so the file open is the only announcement that a movie has started. Demon's Souls opens its
+	// .bk2 movies here.
+	if (!directory) {
+		Libs::Graphics::BinkHost::NotifyFileOpen(Common::PathToString(file->real_name));
+	}
 
 	if (trunc && rw_mode == Common::File::Mode::Read) {
 		return KERNEL_ERROR_EACCES;

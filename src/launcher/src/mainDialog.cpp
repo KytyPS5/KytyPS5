@@ -16,6 +16,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -381,6 +382,27 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
+
+	// Some titles decode their movies inside their own executable rather than through a decode
+	// export we can see - Demon's Souls' .bk2 files do - so those frames are decoded on the host
+	// instead. That needs an ffmpeg carrying the binkvideo2 decoder, which our bundled build does
+	// not have, so point at a "plugins" folder beside the emulator when one is there. Anything the
+	// user has already set in the environment wins.
+	{
+		auto environment = QProcessEnvironment::systemEnvironment();
+		if (!environment.contains(QStringLiteral("KYTY_BINK_HOST"))) {
+			environment.insert(QStringLiteral("KYTY_BINK_HOST"), QStringLiteral("1"));
+		}
+		if (!environment.contains(QStringLiteral("KYTY_BINK_FFMPEG_DIR"))) {
+			const auto plugins = dir.filePath(QStringLiteral("plugins"));
+			if (QFileInfo::exists(plugins)) {
+				environment.insert(QStringLiteral("KYTY_BINK_FFMPEG_DIR"),
+				                   QDir::toNativeSeparators(plugins));
+			}
+		}
+		process->setProcessEnvironment(environment);
+	}
+
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

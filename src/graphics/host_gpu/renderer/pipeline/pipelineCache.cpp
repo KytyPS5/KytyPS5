@@ -1,9 +1,12 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -13,12 +16,112 @@
 
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
 namespace {
+
+constexpr const char* kVulkanPipelineCachePath = "_PipelineCache/vulkan_pipelines.bin";
+
+std::filesystem::path PipelineCacheFilePath() {
+	return std::filesystem::path(kVulkanPipelineCachePath);
+}
+
+std::vector<uint8_t> LoadPipelineCacheBlob() {
+	const auto path = PipelineCacheFilePath();
+	if (!Common::File::IsFileExisting(path)) {
+		return {};
+	}
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return {};
+	}
+	const auto size = file.Size();
+	if (size == 0 || size > (256ull * 1024ull * 1024ull)) {
+		return {};
+	}
+	auto buf = file.ReadWholeBuffer();
+	if (buf.Size() == 0) {
+		return {};
+	}
+	std::vector<uint8_t> out(static_cast<size_t>(buf.Size()));
+	std::memcpy(out.data(), buf.GetData(), out.size());
+	LOGF("VulkanPipelineCache: loaded %zu bytes from %s\n", out.size(),
+	     path.string().c_str());
+	return out;
+}
+
+void SavePipelineCacheBlob(GraphicContext& graphics) {
+	if (graphics.pipeline_cache == nullptr || graphics.device == nullptr) {
+		return;
+	}
+	const auto path = PipelineCacheFilePath();
+	Common::File::CreateDirectories(path.parent_path());
+
+	size_t data_size = 0;
+	auto   result    = graphics.device.getPipelineCacheData(graphics.pipeline_cache, &data_size,
+	                                                        nullptr);
+	if (result != vk::Result::eSuccess || data_size == 0) {
+		LOGF("VulkanPipelineCache: getPipelineCacheData size failed (%s)\n",
+		     VulkanToString(result).c_str());
+		return;
+	}
+	std::vector<uint8_t> data(data_size);
+	result = graphics.device.getPipelineCacheData(graphics.pipeline_cache, &data_size, data.data());
+	if (result != vk::Result::eSuccess) {
+		LOGF("VulkanPipelineCache: getPipelineCacheData failed (%s)\n",
+		     VulkanToString(result).c_str());
+		return;
+	}
+	data.resize(data_size);
+
+	Common::File file;
+	if (!file.Create(path)) {
+		LOGF("VulkanPipelineCache: cannot create %s\n", path.string().c_str());
+		return;
+	}
+	file.Write(data.data(), static_cast<uint32_t>(data.size()));
+	file.Close();
+	LOGF("VulkanPipelineCache: saved %zu bytes to %s\n", data.size(), path.string().c_str());
+}
+
+void CreateVulkanPipelineCache(GraphicContext& graphics) {
+	if (graphics.pipeline_cache != nullptr) {
+		return;
+	}
+	auto initial = LoadPipelineCacheBlob();
+
+	vk::PipelineCacheCreateInfo info {};
+	info.sType           = vk::StructureType::ePipelineCacheCreateInfo;
+	info.initialDataSize = initial.size();
+	info.pInitialData    = initial.empty() ? nullptr : initial.data();
+
+	const auto result =
+	    graphics.device.createPipelineCache(&info, nullptr, &graphics.pipeline_cache);
+	if (result != vk::Result::eSuccess) {
+		// Corrupt/incompatible blob (driver update): retry empty.
+		LOGF("VulkanPipelineCache: create with seed failed (%s), retrying empty\n",
+		     VulkanToString(result).c_str());
+		info.initialDataSize = 0;
+		info.pInitialData    = nullptr;
+		const auto retry =
+		    graphics.device.createPipelineCache(&info, nullptr, &graphics.pipeline_cache);
+		EXIT_NOT_IMPLEMENTED(retry != vk::Result::eSuccess);
+	}
+}
+
+void DestroyVulkanPipelineCache(GraphicContext& graphics) {
+	if (graphics.pipeline_cache == nullptr) {
+		return;
+	}
+	SavePipelineCacheBlob(graphics);
+	graphics.device.destroyPipelineCache(graphics.pipeline_cache, nullptr);
+	graphics.pipeline_cache = nullptr;
+}
 
 void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_params) {
 	static_params.viewport_scale[0]  = 0.5f;
@@ -36,28 +139,103 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 
 } // namespace
 
+PipelineCache::PipelineCache(GraphicContext& graphics, DescriptorCache& descriptor_cache)
+    : m_graphics(graphics), m_descriptor_cache(descriptor_cache) {
+	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	CreateVulkanPipelineCache(m_graphics);
+	if (Config::AsyncShaderCompileEnabled()) {
+		m_worker = std::jthread([this] { WorkerMain(); });
+	}
+}
+
 PipelineCache::~PipelineCache() {
+	{
+		Common::LockGuard lock(m_mutex);
+		m_shutdown = true;
+		m_job_cv.SignalAll();
+	}
+	if (m_worker.joinable()) {
+		m_worker.join();
+	}
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
-			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
-			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+			if (pipeline->pipeline) {
+				m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			}
+			if (pipeline->pipeline_layout) {
+				m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+			}
 		}
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	DestroyVulkanPipelineCache(m_graphics);
+}
+
+void PipelineCache::WorkerMain() {
+	for (;;) {
+		CompileJob job;
+		{
+			Common::LockGuard lock(m_mutex);
+			while (m_jobs.empty() && !m_shutdown) {
+				m_job_cv.Wait(&m_mutex);
+			}
+			if (m_jobs.empty()) {
+				EXIT_IF(!m_shutdown);
+				return;
+			}
+			job = std::move(m_jobs.front());
+			m_jobs.pop_front();
+		}
+
+		if (job.graphics) {
+			auto& g = *job.graphics;
+			EXIT_IF(g.target == nullptr);
+			LogPipelineTrace("CreatePipelineInternal begin", g.vs_hash0, g.vs_crc32, g.ps_hash0,
+			                 g.ps_crc32);
+			{
+				Common::LockGuard create_lock(m_create_mutex);
+				CreatePipelineInternal(
+				    m_graphics, m_descriptor_cache, *g.target, g.rendering, g.vs_input_info,
+				    g.vs_spirv, g.ps_input_info ? &*g.ps_input_info : nullptr, g.ps_spirv,
+				    g.static_params, g.vs_hash0, g.vs_crc32, g.ps_hash0, g.ps_crc32, g.ps_active);
+			}
+			LogPipelineTrace("CreatePipelineInternal done", g.vs_hash0, g.vs_crc32, g.ps_hash0,
+			                 g.ps_crc32);
+			EXIT_NOT_IMPLEMENTED(g.target->pipeline == nullptr);
+			EXIT_NOT_IMPLEMENTED(g.target->pipeline_layout == nullptr);
+			Common::LockGuard lock(m_mutex);
+			g.target->state = CompileState::Ready;
+			m_ready_cv.SignalAll();
+		} else {
+			EXIT_IF(job.compute == nullptr);
+			auto& c = *job.compute;
+			EXIT_IF(c.target == nullptr);
+			{
+				Common::LockGuard create_lock(m_create_mutex);
+				CreatePipelineInternal(m_graphics, m_descriptor_cache, *c.target, c.input_info,
+				                       c.cs_spirv);
+			}
+			EXIT_NOT_IMPLEMENTED(c.target->pipeline == nullptr);
+			EXIT_NOT_IMPLEMENTED(c.target->pipeline_layout == nullptr);
+			Common::LockGuard lock(m_mutex);
+			c.target->state = CompileState::Ready;
+			m_ready_cv.SignalAll();
+		}
+	}
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
+PipelineCache::GraphicsPipeline& PipelineCache::RequestGraphicsPipeline(
     RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
     ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
     ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology, bool ps_active,
     std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv) {
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	KYTY_PROFILER_BLOCK("PipelineCache::RequestPipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors == nullptr);
 	EXIT_IF(color_count > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -200,29 +378,84 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		     ps_id.crc32, static_cast<uint64_t>(ps_spirv.size()));
 	}
 
-	auto cached = std::make_unique<GraphicsPipeline>(p);
-	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                 ps_id.crc32);
-	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, rendering, vs_input_info,
-	                       vs_spirv, ps_input_info, ps_spirv, static_params, vs_id.hash0,
-	                       vs_id.crc32, ps_id.hash0, ps_id.crc32, ps_active);
-	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                 ps_id.crc32);
-
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	auto  cached = std::make_unique<GraphicsPipeline>(p);
+	auto* raw    = cached.get();
+	const bool async =
+	    Config::AsyncShaderCompileEnabled() && static_cast<bool>(m_worker.joinable());
+	raw->state = async ? CompileState::Compiling : CompileState::Ready;
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	if (!async) {
+		LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
+		                 ps_id.crc32);
+		{
+			Common::LockGuard create_lock(m_create_mutex);
+			CreatePipelineInternal(m_graphics, m_descriptor_cache, *raw, rendering, vs_input_info,
+			                       vs_spirv, ps_input_info, ps_spirv, static_params, vs_id.hash0,
+			                       vs_id.crc32, ps_id.hash0, ps_id.crc32, ps_active);
+		}
+		LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
+		                 ps_id.crc32);
+		EXIT_NOT_IMPLEMENTED(raw->pipeline == nullptr);
+		EXIT_NOT_IMPLEMENTED(raw->pipeline_layout == nullptr);
+		raw->state = CompileState::Ready;
+		return *raw;
+	}
+
+	auto job           = std::make_unique<GraphicsCompileJob>();
+	job->target        = raw;
+	job->rendering     = rendering;
+	job->static_params = static_params;
+	job->vs_input_info = vs_input_info;
+	if (ps_active) {
+		job->ps_input_info = *ps_input_info;
+	}
+	job->vs_spirv.assign(vs_spirv.begin(), vs_spirv.end());
+	if (ps_active) {
+		job->ps_spirv.assign(ps_spirv.begin(), ps_spirv.end());
+	}
+	job->ps_active = ps_active;
+	job->vs_hash0  = vs_id.hash0;
+	job->vs_crc32  = vs_id.crc32;
+	job->ps_hash0  = ps_id.hash0;
+	job->ps_crc32  = ps_id.crc32;
+
+	CompileJob queued;
+	queued.graphics = std::move(job);
+	m_jobs.push_back(std::move(queued));
+	m_job_cv.Signal();
+	return *raw;
+}
+
+void PipelineCache::WaitGraphicsPipeline(GraphicsPipeline& pipeline) {
+	Common::LockGuard lock(m_mutex);
+	while (pipeline.state == CompileState::Compiling) {
+		m_ready_cv.Wait(&m_mutex);
+	}
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+}
+
+PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
+    RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
+    ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
+    ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology, bool ps_active,
+    std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	auto& pipeline =
+	    RequestGraphicsPipeline(colors, color_count, depth, vs_input_info, command, ps_input_info,
+	                            topology, ps_active, vs_spirv, ps_spirv);
+	WaitGraphicsPipeline(pipeline);
+	return pipeline;
 }
 
 PipelineCache::ComputePipeline&
-PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
-                                     const HW::ComputeShaderInfo& cs_regs,
-                                     std::span<const uint32_t>    cs_spirv) {
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
+PipelineCache::RequestComputePipeline(ShaderComputeInputInfo&      input_info,
+                                      const HW::ComputeShaderInfo& cs_regs,
+                                      std::span<const uint32_t>    cs_spirv) {
+	KYTY_PROFILER_BLOCK("PipelineCache::RequestPipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(cs_spirv.empty());
 
@@ -244,15 +477,52 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<ComputePipeline>(p);
-	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, input_info, cs_spirv);
-
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	auto  cached = std::make_unique<ComputePipeline>(p);
+	auto* raw    = cached.get();
+	const bool async =
+	    Config::AsyncShaderCompileEnabled() && static_cast<bool>(m_worker.joinable());
+	raw->state = async ? CompileState::Compiling : CompileState::Ready;
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	if (!async) {
+		Common::LockGuard create_lock(m_create_mutex);
+		CreatePipelineInternal(m_graphics, m_descriptor_cache, *raw, input_info, cs_spirv);
+		EXIT_NOT_IMPLEMENTED(raw->pipeline == nullptr);
+		EXIT_NOT_IMPLEMENTED(raw->pipeline_layout == nullptr);
+		raw->state = CompileState::Ready;
+		return *raw;
+	}
+
+	auto job         = std::make_unique<ComputeCompileJob>();
+	job->target      = raw;
+	job->input_info  = input_info;
+	job->cs_spirv.assign(cs_spirv.begin(), cs_spirv.end());
+
+	CompileJob queued;
+	queued.compute = std::move(job);
+	m_jobs.push_back(std::move(queued));
+	m_job_cv.Signal();
+	return *raw;
+}
+
+void PipelineCache::WaitComputePipeline(ComputePipeline& pipeline) {
+	Common::LockGuard lock(m_mutex);
+	while (pipeline.state == CompileState::Compiling) {
+		m_ready_cv.Wait(&m_mutex);
+	}
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+}
+
+PipelineCache::ComputePipeline&
+PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
+                                     const HW::ComputeShaderInfo& cs_regs,
+                                     std::span<const uint32_t>    cs_spirv) {
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
+	auto& pipeline = RequestComputePipeline(input_info, cs_regs, cs_spirv);
+	WaitComputePipeline(pipeline);
+	return pipeline;
 }
 } // namespace Libs::Graphics

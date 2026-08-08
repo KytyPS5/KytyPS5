@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -96,8 +97,8 @@ public:
 				}
 			}
 
-			const bool reserved =
-			    binding.key == SDLK_ESCAPE || binding.key == SDLK_SPACE || binding.key == SDLK_F1;
+			// ESC still reserved (quit). Space is jump in PC layout — pause moved to P.
+			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1;
 			if (binding.pad_button == 0 || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -157,24 +158,32 @@ void SetButton(uint32_t button, bool down) {
 	}
 }
 
+// PC Minecraft-style face/triggers → DualSense used by PS5 Minecraft.
 uint32_t DefaultKeyboardButton(int key_code) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_UP: return Controller::PAD_BUTTON_UP;
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDLK_SPACE: return Controller::PAD_BUTTON_CROSS;      // jump
+		case SDLK_q: return Controller::PAD_BUTTON_CIRCLE;         // drop
+		case SDLK_e: return Controller::PAD_BUTTON_TOUCH_PAD;      // inventory
+		case SDLK_c:
+		case SDLK_f: return Controller::PAD_BUTTON_SQUARE;         // craft / use alt
+		case SDLK_LSHIFT: return Controller::PAD_BUTTON_R3;        // sneak
+		case SDLK_LCTRL: return Controller::PAD_BUTTON_L3;         // sprint-click / stick click
+		case SDLK_TAB: return Controller::PAD_BUTTON_TRIANGLE;     // perspective-ish
+		case SDLK_RETURN:
+		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;  // menu/pause game
+		case SDLK_COMMA:
+		case SDLK_LEFTBRACKET: return Controller::PAD_BUTTON_L1;   // hotbar left
+		case SDLK_PERIOD:
+		case SDLK_RIGHTBRACKET: return Controller::PAD_BUTTON_R1;  // hotbar right
+		// Legacy IJKL face (still available)
 		case SDLK_j: return Controller::PAD_BUTTON_CROSS;
 		case SDLK_i: return Controller::PAD_BUTTON_TRIANGLE;
 		case SDLK_k: return Controller::PAD_BUTTON_SQUARE;
 		case SDLK_l: return Controller::PAD_BUTTON_CIRCLE;
-		case SDLK_q: return Controller::PAD_BUTTON_L1;
-		case SDLK_e: return Controller::PAD_BUTTON_R1;
-		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
-		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
-		case SDLK_RETURN:
-		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
-		case SDLK_BACKSPACE:
-		case SDLK_TAB: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
 	}
 }
@@ -191,9 +200,34 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
+void ApplyAxisValue(Controller::Axis axis, int value) {
+	value = std::clamp(value, 0, 255);
+	Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
+}
+
+struct MouseLookState {
+	float    look_x        = 0.0f; // -1..1
+	float    look_y        = 0.0f;
+	uint32_t idle_frames   = 0;
+	bool     keyboard_look = false; // arrow-keys optional look blocks mouse decay
+};
+
+MouseLookState& LookState() {
+	static MouseLookState state;
+	return state;
+}
+
+void PublishLookStick() {
+	auto& s = LookState();
+	// DualSense right stick: X right positive, Y typically up = low values on hosts
+	const int x = static_cast<int>(std::lround(128.0f + s.look_x * 127.0f));
+	const int y = static_cast<int>(std::lround(128.0f + s.look_y * 127.0f));
+	ApplyAxisValue(Controller::Axis::RightX, x);
+	ApplyAxisValue(Controller::Axis::RightY, y);
+}
+
 void DefaultKeyboardInput(int key_code, bool down) {
 	static StickKeys left;
-	static StickKeys right;
 
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_a:
@@ -212,25 +246,19 @@ void DefaultKeyboardInput(int key_code, bool down) {
 			left.down = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_f:
-			right.left = down;
-			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
-			return;
-		case SDLK_h:
-			right.right = down;
-			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
-			return;
-		case SDLK_t:
-			right.up = down;
-			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
-			return;
-		case SDLK_g:
-			right.down = down;
-			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
-			return;
 		default: SetButton(DefaultKeyboardButton(key_code), down); return;
 	}
 }
+
+uint32_t DefaultMouseButton(uint8_t mouse_button) {
+	switch (mouse_button) {
+		case SDL_BUTTON_LEFT: return Controller::PAD_BUTTON_L2;   // attack / break
+		case SDL_BUTTON_RIGHT: return Controller::PAD_BUTTON_R2;  // use / place
+		case SDL_BUTTON_MIDDLE: return Controller::PAD_BUTTON_TOUCH_PAD;
+		default: return 0;
+	}
+}
+
 } // namespace
 
 void HostInputInit() {
@@ -240,17 +268,58 @@ void HostInputInit() {
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
-		SetButton(map.FindKey(key_code), down);
-	} else {
-		DefaultKeyboardInput(key_code, down);
+		const auto pad = map.FindKey(key_code);
+		if (pad != 0) {
+			SetButton(pad, down);
+			return;
+		}
 	}
+	DefaultKeyboardInput(key_code, down);
 }
 
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
-		SetButton(map.FindMouseButton(mouse_button), down);
+		const auto mapped = map.FindMouseButton(mouse_button);
+		if (mapped != 0) {
+			SetButton(mapped, down);
+			return;
+		}
 	}
+	SetButton(DefaultMouseButton(mouse_button), down);
+}
+
+void HostInputMouseMotion(int dx, int dy) {
+	if (dx == 0 && dy == 0) {
+		return;
+	}
+	auto& s = LookState();
+	// Original feel: accumulate mouse deltas into virtual right stick.
+	constexpr float kSens = 0.035f;
+	s.look_x              = std::clamp(s.look_x + static_cast<float>(dx) * kSens, -1.0f, 1.0f);
+	s.look_y              = std::clamp(s.look_y + static_cast<float>(dy) * kSens, -1.0f, 1.0f);
+	s.idle_frames         = 0;
+	PublishLookStick();
+}
+
+void HostInputFrame() {
+	auto& s = LookState();
+	if (s.keyboard_look) {
+		return;
+	}
+	s.idle_frames++;
+	// Soft decay after a short idle (first working version — small lag, smooth feel).
+	if (s.idle_frames < 2) {
+		return;
+	}
+	constexpr float kDecay = 0.55f;
+	s.look_x *= kDecay;
+	s.look_y *= kDecay;
+	if (std::fabs(s.look_x) < 0.02f && std::fabs(s.look_y) < 0.02f) {
+		s.look_x = 0.0f;
+		s.look_y = 0.0f;
+	}
+	PublishLookStick();
 }
 
 } // namespace Libs::Graphics

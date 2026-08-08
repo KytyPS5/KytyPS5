@@ -3864,6 +3864,16 @@ static int KYTY_SYSV_ABI ImeUpdate(void* handler) {
 	return 0;
 }
 
+// Minecraft and other titles call these Ime_v1.1 helpers; exact semantics unknown.
+// Returning success avoids unresolved-import stubs spamming / aborting flows.
+static int KYTY_SYSV_ABI ImeStub_ieCNrVrzKd4() {
+	return 0;
+}
+
+static int KYTY_SYSV_ABI ImeStub_WLxUN2WMim8() {
+	return 0;
+}
+
 LIB_DEFINE(InitPlatform_1_Ime) {
 	LIB_FUNC("eaFXjfJv3xs", LibIme::ImeKeyboardOpen);
 	LIB_FUNC("PMVehSlfZ94", LibIme::ImeKeyboardClose);
@@ -3871,6 +3881,8 @@ LIB_DEFINE(InitPlatform_1_Ime) {
 	LIB_FUNC("VkqLPArfFdc", LibIme::ImeKeyboardGetInfo);
 	LIB_FUNC("ua+13Hk9kKs", LibIme::ImeKeyboardSetMode);
 	LIB_FUNC("-4GCfYdNF1s", LibIme::ImeUpdate);
+	LIB_FUNC("ieCNrVrzKd4", LibIme::ImeStub_ieCNrVrzKd4);
+	LIB_FUNC("WLxUN2WMim8", LibIme::ImeStub_WLxUN2WMim8);
 }
 
 } // namespace LibIme

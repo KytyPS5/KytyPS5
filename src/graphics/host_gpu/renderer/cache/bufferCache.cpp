@@ -22,29 +22,8 @@ namespace Libs::Graphics {
 
 namespace {
 
-thread_local const void* g_cache_lock_owner = nullptr;
-
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
-
-class FaultSafeCacheLock final {
-public:
-	FaultSafeCacheLock(const void* owner, Common::Mutex& mutex): m_mutex(mutex) {
-		if (g_cache_lock_owner != nullptr) {
-			EXIT("BufferCache: recursive cache lock acquisition\n");
-		}
-		g_cache_lock_owner = owner;
-		m_mutex.Lock();
-	}
-
-	~FaultSafeCacheLock() {
-		m_mutex.Unlock();
-		g_cache_lock_owner = nullptr;
-	}
-
-private:
-	Common::Mutex& m_mutex;
-};
 
 } // namespace
 
@@ -191,21 +170,18 @@ void BufferCache::QueueGarbageDownload(std::span<const DownloadCopy> copies, Ret
 	m_scheduler.DeferOperation(
 	    [this, downloads = std::move(downloads), retire = std::move(retire)]() mutable {
 		    PublishDownloads(downloads);
-		    {
-			    FaultSafeCacheLock lock(this, m_mutex);
-			    for (const auto& range: downloads) {
-				    m_gpu_modified_ranges.Subtract(range.address, range.size);
-			    }
-			    // ForEachDownloadRange reports full tracker pages, and every exact GPU-owned
-			    // interval on those pages was downloaded and removed. Clearing the original
-			    // query therefore cannot orphan a dirty sibling on an edge page.
-			    m_memory_tracker.UnmarkRegionAsGpuModified(retire.address, retire.size);
-			    if (m_memory_tracker.IsRegionGpuModified(retire.address, retire.size) ||
-			        !m_gpu_modified_ranges.Intersections(retire.address, retire.size).empty()) {
-				    EXIT("BufferCache: asynchronous garbage collection retained GPU ownership\n");
-			    }
-			    m_memory_tracker.UntrackMemory(retire.address, retire.size);
+		    for (const auto& range: downloads) {
+			    m_gpu_modified_ranges.Subtract(range.address, range.size);
 		    }
+		    // ForEachDownloadRange reports full tracker pages, and every exact GPU-owned
+		    // interval on those pages was downloaded and removed. Clearing the original
+		    // query therefore cannot orphan a dirty sibling on an edge page.
+		    m_memory_tracker.UnmarkRegionAsGpuModified(retire.address, retire.size);
+		    if (m_memory_tracker.IsRegionGpuModified(retire.address, retire.size) ||
+		        !m_gpu_modified_ranges.Intersections(retire.address, retire.size).empty()) {
+			    EXIT("BufferCache: asynchronous garbage collection retained GPU ownership\n");
+		    }
+		    m_memory_tracker.UntrackMemory(retire.address, retire.size);
 	    });
 }
 
@@ -276,9 +252,6 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	if (!IsRegionRegistered(vaddr, size)) {
-		return;
-	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
@@ -298,60 +271,58 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
+	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return;
+	}
 	std::vector<DownloadCopy> copies;
-	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		m_memory_tracker.ForEachDownloadRange<false>(
-		    vaddr, size,
-		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-			                                           "memory invalidation");
-		    },
-		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
-				    for (uint64_t copied = 0; copied < range.size;) {
-					    const auto copy_address = range.address + copied;
-					    auto       owner        = m_buffers.upper_bound(copy_address);
-					    if (owner == m_buffers.begin()) {
-						    EXIT("BufferCache: invalidation readback has no buffer owner\n");
-					    }
-					    auto& cached = *std::prev(owner)->second;
-					    if (!cached.buffer->IsInBounds(copy_address, 1)) {
-						    EXIT(
-						        "BufferCache: invalidation readback is outside its buffer owner\n");
-					    }
-					    const auto copy_size = std::min(range.size - copied,
-					                                    cached.vaddr + cached.size - copy_address);
-					    copies.push_back({cached.buffer, cached.buffer->Offset(copy_address),
-					                      copy_address, copy_size});
-					    copied += copy_size;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size,
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "memory invalidation");
+	    },
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
+			    for (uint64_t copied = 0; copied < range.size;) {
+				    const auto copy_address = range.address + copied;
+				    auto       owner        = m_buffers.upper_bound(copy_address);
+				    if (owner == m_buffers.begin()) {
+					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
 				    }
+				    auto& cached = *std::prev(owner)->second;
+				    if (!cached.buffer->IsInBounds(copy_address, 1)) {
+					    EXIT("BufferCache: invalidation readback is outside its buffer owner\n");
+				    }
+				    const auto copy_size =
+				        std::min(range.size - copied, cached.vaddr + cached.size - copy_address);
+				    copies.push_back({cached.buffer, cached.buffer->Offset(copy_address),
+				                      copy_address, copy_size});
+				    copied += copy_size;
 			    }
-		    });
-		if (copies.empty()) {
-			if (!is_write) {
-				return;
-			}
-			// A preceding read fault can consume the last GPU-owned copy after this write
-			// invalidation has already chosen to flush. Complete the CPU ownership handoff even
-			// though this callback no longer has bytes to download.
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		    }
+	    });
+	if (copies.empty()) {
+		if (!is_write) {
 			return;
 		}
+		// A preceding read fault can consume the last GPU-owned copy after this write invalidation
+		// has already chosen to flush. Complete the CPU ownership handoff even though this callback
+		// no longer has bytes to download.
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		return;
 	}
 	auto downloads = RecordDownloads(copies);
 	m_scheduler.FinishCurrent();
 	PublishDownloads(downloads);
-	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		for (const auto& range: downloads) {
-			m_gpu_modified_ranges.Subtract(range.address, range.size);
-		}
-		// The enumeration above covered whole dirty pages and every exact interval on them.
-		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
+	for (const auto& range: downloads) {
+		m_gpu_modified_ranges.Subtract(range.address, range.size);
+	}
+	// The enumeration above covered whole dirty pages and every exact interval on them.
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
 }
 
@@ -362,43 +333,40 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	std::vector<DownloadCopy>                  copies;
 	std::vector<std::pair<uint64_t, uint64_t>> modified_buffers;
 	std::vector<std::pair<uint64_t, uint64_t>> retired_buffers;
-	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		for (const auto& [begin, cached]: m_buffers) {
-			if (vaddr < begin + cached->size && begin < vaddr + size) {
-				retired_buffers.emplace_back(begin, cached->size);
-			}
+	for (const auto& [begin, cached]: m_buffers) {
+		if (vaddr < begin + cached->size && begin < vaddr + size) {
+			retired_buffers.emplace_back(begin, cached->size);
 		}
-		for (const auto& [begin, cached]: m_buffers) {
-			if (vaddr >= begin + cached->size || begin >= vaddr + size ||
-			    !m_memory_tracker.IsRegionGpuModified(begin, cached->size)) {
-				continue;
-			}
-			const auto dirty = m_gpu_modified_ranges.Intersections(begin, cached->size);
-			if (dirty.empty()) {
-				EXIT("BufferCache: GPU-modified buffer has no dirty ranges\n");
-			}
-			modified_buffers.emplace_back(begin, cached->size);
+	}
+	for (const auto& [begin, cached]: m_buffers) {
+		if (vaddr >= begin + cached->size || begin >= vaddr + size ||
+		    !m_memory_tracker.IsRegionGpuModified(begin, cached->size)) {
+			continue;
 		}
-		for (const auto& [begin, bytes]: modified_buffers) {
-			auto owner = m_buffers.find(begin);
-			if (owner == m_buffers.end() || owner->second->size != bytes) {
-				EXIT("BufferCache: unmap owner changed during collection\n");
-			}
-			auto& cached = *owner->second;
-			m_memory_tracker.ForEachDownloadRange<false>(
-			    begin, cached.size,
-			    [&](uint64_t address, uint64_t bytes) noexcept {
-				    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-				                                           "unmap");
-			    },
-			    [&](uint64_t address, uint64_t bytes) noexcept {
-				    for (const auto& range: m_gpu_modified_ranges.Intersections(address, bytes)) {
-					    copies.push_back(
-					        {cached.buffer, range.address - begin, range.address, range.size});
-				    }
-			    });
+		const auto dirty = m_gpu_modified_ranges.Intersections(begin, cached->size);
+		if (dirty.empty()) {
+			EXIT("BufferCache: GPU-modified buffer has no dirty ranges\n");
 		}
+		modified_buffers.emplace_back(begin, cached->size);
+	}
+	for (const auto& [begin, bytes]: modified_buffers) {
+		auto owner = m_buffers.find(begin);
+		if (owner == m_buffers.end() || owner->second->size != bytes) {
+			EXIT("BufferCache: unmap owner changed during collection\n");
+		}
+		auto& cached = *owner->second;
+		m_memory_tracker.ForEachDownloadRange<false>(
+		    begin, cached.size,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+			                                           "unmap");
+		    },
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    for (const auto& range: m_gpu_modified_ranges.Intersections(address, bytes)) {
+				    copies.push_back(
+				        {cached.buffer, range.address - begin, range.address, range.size});
+			    }
+		    });
 	}
 	if (!copies.empty()) {
 		auto downloads = RecordDownloads(copies);
@@ -409,29 +377,26 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		// command stream before removing such backing.
 		m_scheduler.FinishCurrent();
 	}
-	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		for (const auto& [begin, bytes]: modified_buffers) {
-			m_gpu_modified_ranges.Subtract(begin, bytes);
-			m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
-		}
-		for (const auto& [begin, bytes]: retired_buffers) {
-			m_memory_tracker.MarkRegionAsCpuModified(begin, bytes);
-		}
-		if (!m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
-			EXIT("BufferCache: unmap retained dirty byte ranges\n");
-		}
-		m_memory_tracker.UntrackMemory(vaddr, size);
-		for (auto it = m_buffers.begin(); it != m_buffers.end();) {
-			if (vaddr < it->first + it->second->size && it->first < vaddr + size) {
-				if (it->second->size > m_total_used_memory) {
-					EXIT("BufferCache: allocation accounting underflow\n");
-				}
-				m_total_used_memory -= it->second->size;
-				it = m_buffers.erase(it);
-			} else {
-				++it;
+	for (const auto& [begin, bytes]: modified_buffers) {
+		m_gpu_modified_ranges.Subtract(begin, bytes);
+		m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+	}
+	for (const auto& [begin, bytes]: retired_buffers) {
+		m_memory_tracker.MarkRegionAsCpuModified(begin, bytes);
+	}
+	if (!m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
+		EXIT("BufferCache: unmap retained dirty byte ranges\n");
+	}
+	m_memory_tracker.UntrackMemory(vaddr, size);
+	for (auto it = m_buffers.begin(); it != m_buffers.end();) {
+		if (vaddr < it->first + it->second->size && it->first < vaddr + size) {
+			if (it->second->size > m_total_used_memory) {
+				EXIT("BufferCache: allocation accounting underflow\n");
 			}
+			m_total_used_memory -= it->second->size;
+			it = m_buffers.erase(it);
+		} else {
+			++it;
 		}
 	}
 }
@@ -539,29 +504,22 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		(void)m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, true);
 	}
 
-	std::shared_ptr<Buffer> owner;
-	uint64_t                offset = 0;
-	{
-		FaultSafeCacheLock                         lock(this, m_mutex);
-		auto&                                      cached = GetOrCreateBuffer(command, vaddr, size);
-		std::vector<std::pair<uint64_t, uint64_t>> uploads;
-		m_memory_tracker.ForEachUploadRange(
-		    vaddr, size, is_written,
-		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    uploads.emplace_back(address, bytes);
-		    },
-		    [&]() noexcept {
-			    for (const auto& [address, bytes]: uploads) {
-				    Upload(command, *cached.buffer, cached.buffer->Offset(address),
-				           reinterpret_cast<const void*>(address), bytes);
-			    }
-		    });
-		if (is_written) {
-			m_gpu_modified_ranges.Add(vaddr, size);
-		}
-		owner  = cached.buffer;
-		offset = cached.buffer->Offset(vaddr);
+	auto&                                      cached = GetOrCreateBuffer(command, vaddr, size);
+	std::vector<std::pair<uint64_t, uint64_t>> uploads;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, is_written,
+	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
+	    [&]() noexcept {
+		    for (const auto& [address, bytes]: uploads) {
+			    Upload(command, *cached.buffer, cached.buffer->Offset(address),
+			           reinterpret_cast<const void*>(address), bytes);
+		    }
+	    });
+	if (is_written) {
+		m_gpu_modified_ranges.Add(vaddr, size);
 	}
+	auto     owner  = cached.buffer;
+	uint64_t offset = cached.buffer->Offset(vaddr);
 	if (is_formatted && is_read && !is_written) {
 		(void)SynchronizeBufferFromImage(*owner, vaddr, size);
 	}
@@ -569,19 +527,14 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 }
 
 std::shared_ptr<Buffer> BufferCache::ObtainNullBuffer() {
-	std::shared_ptr<Buffer> buffer;
-	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		if (m_null_buffer != nullptr) {
-			return m_null_buffer;
-		}
-		m_null_buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
-		                                         0, AllFlags, 16);
-		buffer        = m_null_buffer;
+	if (m_null_buffer != nullptr) {
+		return m_null_buffer;
 	}
+	m_null_buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	                                         AllFlags, 16);
 	const std::array<uint8_t, 16> zeros {};
-	Upload(m_scheduler.Current(), *buffer, 0, zeros.data(), zeros.size());
-	return buffer;
+	Upload(m_scheduler.Current(), *m_null_buffer, 0, zeros.data(), zeros.size());
+	return m_null_buffer;
 }
 
 ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -599,11 +552,10 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 	};
 
 	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		const bool         cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-		const bool         gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-		const auto         dirty        = m_gpu_modified_ranges.Intersections(vaddr, size);
-		const bool         has_dirty_buffer_source = !dirty.empty();
+		const bool cpu_modified            = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+		const bool gpu_modified            = m_memory_tracker.IsRegionGpuModified(vaddr, size);
+		const auto dirty                   = m_gpu_modified_ranges.Intersections(vaddr, size);
+		const bool has_dirty_buffer_source = !dirty.empty();
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
 		                                           "image source");
 
@@ -674,10 +626,9 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 	}
 	m_staging_buffer.Commit();
 
-	FaultSafeCacheLock lock(this, m_mutex);
-	const auto         dirty                   = m_gpu_modified_ranges.Intersections(vaddr, size);
-	const bool         has_dirty_buffer_source = !dirty.empty();
-	auto               owner                   = find_owner();
+	const auto dirty                   = m_gpu_modified_ranges.Intersections(vaddr, size);
+	const bool has_dirty_buffer_source = !dirty.empty();
+	auto       owner                   = find_owner();
 	if (has_dirty_buffer_source && owner == m_buffers.end()) {
 		EXIT("BufferCache: GPU-dirty image source lost its native owner\n");
 	}
@@ -710,8 +661,7 @@ void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data)
 	}
 	Libs::LibKernel::Memory::WriteBacking(vaddr, data.data(), data.size());
 
-	FaultSafeCacheLock lock(this, m_mutex);
-	const auto         end = vaddr + data.size();
+	const auto end = vaddr + data.size();
 	for (auto& [address, cached]: m_buffers) {
 		const auto cached_end = address + cached->size;
 		const auto begin      = std::max(vaddr, address);
@@ -836,7 +786,6 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid registered-region query\n");
 	}
-	FaultSafeCacheLock lock(this, m_mutex);
 	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query
 	// end is therefore the only possible intersection.
 	const auto candidate = m_buffers.lower_bound(vaddr + size);
@@ -852,7 +801,6 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	FaultSafeCacheLock lock(this, m_mutex);
 	return !m_gpu_modified_ranges.Intersections(vaddr, size).empty();
 }
 
@@ -876,7 +824,6 @@ void BufferCache::RunGarbageCollector() {
 	std::vector<RetiredBuffer>                                       retires;
 	std::vector<std::pair<RetiredBuffer, std::vector<DownloadCopy>>> dirty_retires;
 	{
-		FaultSafeCacheLock    lock(this, m_mutex);
 		std::vector<uint64_t> candidates;
 		for (const auto& [address, owner]: m_buffers) {
 			const auto& cached = *owner;
@@ -924,7 +871,6 @@ void BufferCache::RunGarbageCollector() {
 		QueueGarbageDownload(copies, std::move(retire));
 	}
 
-	FaultSafeCacheLock lock(this, m_mutex);
 	for (const auto& retire: retires) {
 		auto found = m_buffers.find(retire.address);
 		if (found == m_buffers.end() || found->second->size != retire.size ||

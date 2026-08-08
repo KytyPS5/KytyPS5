@@ -1642,6 +1642,7 @@ public:
 			auto&              gpu_scheduler = context.GetCommandScheduler();
 			auto               processor     = std::make_unique<CommandProcessor>(context);
 			gpu.SendCommandSync([&] {
+				processor->BufferInit();
 				SubmitInfo blocked_submit;
 				blocked_submit.AddWait(blocked_timeline, release_tick);
 				gpu_scheduler.Flush(blocked_submit);
@@ -3228,40 +3229,17 @@ public:
 			        "prefix, or transferred ownership");
 
 			auto& buffer_cache = resources.GetBufferCache();
-			Require(name, "formatted lock-handoff fixture",
-			        !buffer_cache.IsRegionRegistered(mip_desc.info.data.address,
-			                                          mip_desc.info.data.size),
-			        "formatted image already had a cached Buffer owner");
-			BufferBinding         mip_formatted;
-			std::binary_semaphore obtain_entered {0};
-			std::binary_semaphore obtain_complete {0};
-			std::binary_semaphore buffer_visible {0};
-			auto                  texture_lock = TextureCacheTestAccess::Lock(texture_cache);
-			gpu.SendCommand([&] {
-				obtain_entered.release();
+			BufferBinding mip_formatted;
+			bool          formatted_owner_was_absent = false;
+			gpu.SendCommandSync([&] {
+				formatted_owner_was_absent =
+				    !buffer_cache.IsRegionRegistered(mip_desc.info.data.address,
+				                                     mip_desc.info.data.size);
 				mip_formatted = buffer_cache.ObtainBuffer(command, mip_desc.info.data.address,
 				                                            mip_desc.info.data.size, false, true, true);
-				obtain_complete.release();
 			});
-			obtain_entered.acquire();
-			std::jthread buffer_probe([&] {
-				while (!buffer_cache.IsRegionRegistered(mip_desc.info.data.address,
-				                                         mip_desc.info.data.size)) {
-					std::this_thread::yield();
-				}
-				buffer_visible.release();
-			});
-			const bool buffer_released_before_texture =
-			    buffer_visible.try_acquire_for(std::chrono::seconds(2));
-			texture_lock.unlock();
-			if (!buffer_released_before_texture) {
-				buffer_visible.acquire();
-			}
-			obtain_complete.acquire();
-			buffer_probe.join();
-			Require(name, "formatted cache lock handoff", buffer_released_before_texture,
-			        "formatted Buffer acquisition retained the BufferCache lock while waiting for "
-			        "TextureCache");
+			Require(name, "formatted cache fixture", formatted_owner_was_absent,
+			        "formatted image already had a cached Buffer owner");
 			Require(name, "formatted Buffer path",
 			        mip_formatted.owner != nullptr && mip_formatted.buffer != nullptr &&
 			            texture_cache.GetImage(mip_image).IsGpuModified(),

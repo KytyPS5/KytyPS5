@@ -119,10 +119,7 @@ int WaitLinux(volatile T* address, T expected, const uint32_t* timeout_micros,
 }
 
 int WakeLinux(volatile void* address, int32_t count) {
-	// A count of 0 must release no waiters, but FUTEX_WAKE does not implement it that way: the
-	// kernel's wake loop tests `if (++ret >= nr_wake) break` *after* waking, so a zero count still
-	// releases one waiter. WakePortable already short-circuits this case, and the two backends of
-	// the same ABI have to agree.
+	// The legacy FUTEX_WAKE path may wake one waiter when count is zero.
 	if (count == 0) {
 		return OK;
 	}

@@ -119,6 +119,11 @@ int WaitLinux(volatile T* address, T expected, const uint32_t* timeout_micros,
 }
 
 int WakeLinux(volatile void* address, int32_t count) {
+	// The legacy FUTEX_WAKE path may wake one waiter when count is zero.
+	if (count == 0) {
+		return OK;
+	}
+
 	const auto result = syscall(SYS_futex, const_cast<void*>(address), FUTEX_WAKE_PRIVATE, count,
 	                            nullptr, nullptr, 0);
 	return result < 0 ? KERNEL_ERROR_EINVAL : OK;

@@ -167,6 +167,19 @@ static JsonObject* JsonObjectNew() {
 	return object;
 }
 
+static void JsonValueSetEmptyType(JsonValue* self, uint32_t type) {
+	if (self == nullptr) {
+		return;
+	}
+	self->type = type;
+	switch (type) {
+		case JsonValueTypeString: self->string = JsonStringNew(""); break;
+		case JsonValueTypeArray: self->array = JsonArrayNew(); break;
+		case JsonValueTypeObject: self->object = JsonObjectNew(); break;
+		default: self->uinteger = 0; break;
+	}
+}
+
 static void JsonValueDelete(JsonValue* self) {
 	if (self != nullptr) {
 		JsonValueClear(self);
@@ -497,6 +510,14 @@ static void* KYTY_SYSV_ABI JsonValueCtor(void* self) {
 	return self;
 }
 
+static JsonValue* KYTY_SYSV_ABI JsonValueTypeCtor(JsonValue* self, uint32_t type) {
+	PRINT_NAME();
+
+	JsonValueInit(self);
+	JsonValueSetEmptyType(self, type);
+	return self;
+}
+
 static JsonValue* KYTY_SYSV_ABI JsonValueBoolCtor(JsonValue* self, bool value) {
 	PRINT_NAME();
 
@@ -637,16 +658,7 @@ static void KYTY_SYSV_ABI JsonValueSetType(JsonValue* self, uint32_t type) {
 	PRINT_NAME();
 
 	JsonValueClear(self);
-	if (self == nullptr) {
-		return;
-	}
-	self->type = type;
-	switch (type) {
-		case JsonValueTypeString: self->string = JsonStringNew(""); break;
-		case JsonValueTypeArray: self->array = JsonArrayNew(); break;
-		case JsonValueTypeObject: self->object = JsonObjectNew(); break;
-		default: self->uinteger = 0; break;
-	}
+	JsonValueSetEmptyType(self, type);
 }
 
 static uint32_t KYTY_SYSV_ABI JsonValueGetType(const JsonValue* self) {
@@ -939,6 +951,7 @@ LIB_DEFINE(InitNet_1_Json2) {
 	LIB_FUNC("OcAgPxcq5Vk", LibJson2::JsonMemAllocatorDtor);
 	LIB_FUNC("qBMjqyBn3OM", LibJson2::JsonValueCtor);
 	LIB_FUNC("-wa17B7TGnw", LibJson2::JsonValueCtor);
+	LIB_FUNC("CbrT3dwDILo", LibJson2::JsonValueTypeCtor);
 	LIB_FUNC("WTtYf+cNnXI", LibJson2::JsonValueDtor);
 	LIB_FUNC("0eUrW9JAxM0", LibJson2::JsonValueDtor);
 	LIB_FUNC("S5JxQnoGF3E", LibJson2::JsonParserParse);

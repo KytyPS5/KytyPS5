@@ -171,6 +171,7 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("vRoArM9zaIk", Gen5::GraphicsSetUcRegIndirectPatchAddRegisters);
 	LIB_FUNC("D9sr1xGUriE", Gen5::GraphicsCreatePrimState);
 	LIB_FUNC("Y3ymLfZ1384", Gen5::GraphicsUpdatePrimState);
+	LIB_FUNC("NKIzURsgV7I", Gen5::GraphicsGetGsOversubscription);
 	LIB_FUNC("HV4j+E0MBHE", Gen5::GraphicsCreateInterpolantMapping);
 	LIB_FUNC("V++UgBtQhn0", Gen5::GraphicsGetDataPacketPayloadAddress);
 	LIB_FUNC("s+VGAMDQ0AQ", Gen5::GraphicsGetDataPacketPayloadRange);

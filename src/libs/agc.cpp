@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <mutex>
@@ -1180,6 +1181,95 @@ int KYTY_SYSV_ABI GraphicsUpdatePrimState(ShaderRegister* cx_regs, ShaderRegiste
 	return OK;
 }
 
+struct GsOccupancyLimits {
+	uint32_t vertex;
+	uint32_t export_count;
+};
+
+static GsOccupancyLimits get_gs_occupancy_limits(const Shader* gs, uint32_t vertex_capacity,
+                                                 uint32_t export_capacity) {
+	const auto* onchip =
+	    find_shader_register(gs->cx_registers, gs->num_cx_registers, Pm4::VGT_GS_ONCHIP_CNTL);
+	const auto* subgroup =
+	    find_shader_register(gs->cx_registers, gs->num_cx_registers, Pm4::GE_NGG_SUBGRP_CNTL);
+	const auto* vs_out =
+	    find_shader_register(gs->cx_registers, gs->num_cx_registers, Pm4::SPI_VS_OUT_CONFIG);
+	const auto* cl_out =
+	    find_shader_register(gs->cx_registers, gs->num_cx_registers, Pm4::PA_CL_VS_OUT_CNTL);
+	const auto* max_output = find_shader_register(gs->cx_registers, gs->num_cx_registers,
+	                                              Pm4::GE_MAX_OUTPUT_PER_SUBGROUP);
+
+	const uint32_t output_words = ((max_output->value & 0x3ffu) + 31u) >> 5u;
+	const uint32_t subgroup_work =
+	    ((((onchip->value >> 11u) & 0x7ffu) * (subgroup->value & 0x1ffu)) + 31u) >> 5u;
+	uint32_t waves = std::max(subgroup_work, output_words);
+	if ((gs->specials->vgt_shader_stages_en.value & 0x00400000u) == 0) {
+		waves >>= 1u;
+	}
+	waves = std::max(waves, 1u);
+
+	const uint32_t exports = 1u + ((cl_out->value >> 21u) & 1u) + ((cl_out->value >> 22u) & 1u) +
+	                         ((cl_out->value >> 23u) & 1u);
+	const uint32_t export_limit = (export_capacity / exports) * 4u;
+	const uint32_t vertex_limit = (vs_out->value & 0x80u) != 0
+	                                  ? 2048u
+	                                  : vertex_capacity / (((vs_out->value >> 2u) & 0xfu) + 1u);
+
+	return {waves * (vertex_limit / output_words), waves * (export_limit / output_words)};
+}
+
+int KYTY_SYSV_ABI GraphicsGetGsOversubscription(ShaderRegister* regs, const Shader* gs,
+                                                uint32_t budget, float factor) {
+	PRINT_NAME();
+
+	constexpr uint32_t FULL_PC_OVERSUBSCRIPTION = 0x7ffu;
+	constexpr uint32_t FULL_SH_OVERSUBSCRIPTION = 0x007f0000u;
+
+	regs[0] = {Pm4::GE_PC_ALLOC, 0u};
+	regs[1] = {Pm4::SPI_SHADER_PGM_RSRC4_GS, 0u};
+
+	if (budget == 0u) {
+		return OK;
+	}
+	if (budget == UINT32_MAX) {
+		regs[0].value |= FULL_PC_OVERSUBSCRIPTION;
+		regs[1].value |= FULL_SH_OVERSUBSCRIPTION;
+		return OK;
+	}
+
+	const auto base     = get_gs_occupancy_limits(gs, 1024u, 128u);
+	const auto expanded = get_gs_occupancy_limits(gs, 2048u, 382u);
+	const auto base_min = std::min(base.vertex, base.export_count);
+	const auto limit_shift =
+	    (gs->specials->vgt_shader_stages_en.value & 0x00400000u) != 0 ? 5u : 6u;
+	const auto expanded_limit =
+	    std::min({expanded.vertex, expanded.export_count, budget >> limit_shift, 1024u});
+	const auto headroom = expanded_limit > base_min ? expanded_limit - base_min : 0u;
+	const auto target   = static_cast<uint32_t>(
+	    std::fma(factor, static_cast<float>(headroom), static_cast<float>(base_min)));
+
+	if (target <= base_min) {
+		return OK;
+	}
+	if (target < base.export_count) {
+		const auto range = std::max(expanded.vertex - base.vertex, 1u);
+		auto       value = static_cast<uint32_t>(
+		    std::min((static_cast<uint64_t>(target - base.vertex) << 10u) / range, 1024ull));
+		value         = std::max(value, 1u);
+		regs[0].value = (regs[0].value & ~FULL_PC_OVERSUBSCRIPTION) |
+		                (((value << 1u) - 1u) & FULL_PC_OVERSUBSCRIPTION);
+		regs[1].value |= FULL_SH_OVERSUBSCRIPTION;
+	} else {
+		const auto range = std::max(expanded.export_count - base.export_count, 1u);
+		const auto value = static_cast<uint32_t>(
+		    std::min((static_cast<uint64_t>(target - base.export_count) * 127u) / range, 127ull));
+		regs[0].value |= FULL_PC_OVERSUBSCRIPTION;
+		regs[1].value = (regs[1].value & ~FULL_SH_OVERSUBSCRIPTION) | (value << 16u);
+	}
+
+	return OK;
+}
+
 static uint32_t shader_semantic_word(const ShaderSemantic& semantic) {
 	return ((semantic.semantic & 0xffu) << 0u) | ((semantic.hardware_mapping & 0xffu) << 8u) |
 	       ((semantic.size_in_elements & 0xfu) << 16u) | ((semantic.is_f16 & 0x3u) << 20u) |
@@ -1466,7 +1556,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbContextStateOp(CommandBuffer* buf, uint32_t o
 
 	buf->DbgDump();
 
-	uint32_t* first = nullptr;
+	uint32_t*  first  = nullptr;
 	const auto append = [&](uint32_t segment_size_dw) {
 		auto* segment = buf->AllocateDW(segment_size_dw);
 		if (segment == nullptr) {

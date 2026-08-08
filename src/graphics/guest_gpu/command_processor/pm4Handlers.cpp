@@ -4441,6 +4441,11 @@ void GraphicsInitJmpTablesUcIndirect() {
 		r.vertex_group_size    = KYTY_PM4_GET(value, GE_CNTL, VERT_GRP_SIZE);
 		cp.GetUcfg().SetGeControl(r);
 	};
+	g_hw_uc_indirect_func[Pm4::GE_PC_ALLOC] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+		(void)cp;
+		(void)cmd_offset;
+		(void)value;
+	};
 
 	g_hw_uc_indirect_func[Pm4::GE_USER_VGPR_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeUserVgprEn r;

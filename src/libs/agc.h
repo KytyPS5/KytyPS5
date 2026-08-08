@@ -56,6 +56,8 @@ int KYTY_SYSV_ABI   GraphicsCreatePrimState(ShaderRegister* cx_regs, ShaderRegis
                                             const Shader* hs, const Shader* gs, uint32_t prim_type);
 int KYTY_SYSV_ABI   GraphicsUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
                                             uint32_t prim_type);
+int KYTY_SYSV_ABI   GraphicsGetGsOversubscription(ShaderRegister* regs, const Shader* gs,
+                                                  uint32_t budget, float factor);
 int KYTY_SYSV_ABI   GraphicsCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
                                                      const Shader* ps);
 int KYTY_SYSV_ABI   GraphicsGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type);

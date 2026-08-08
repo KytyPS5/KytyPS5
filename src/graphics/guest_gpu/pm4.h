@@ -1047,6 +1047,7 @@ constexpr uint32_t GE_USER_VGPR1  = 0x25C;
 constexpr uint32_t GE_USER_VGPR2  = 0x25D;
 constexpr uint32_t GE_USER_VGPR3  = 0x25E;
 constexpr uint32_t GE_STEREO_CNTL = 0x25F;
+constexpr uint32_t GE_PC_ALLOC    = 0x260;
 
 constexpr uint32_t GE_USER_VGPR_EN                     = 0x262;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR1_SHIFT = 0;

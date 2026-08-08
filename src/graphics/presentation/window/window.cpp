@@ -231,7 +231,9 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	if (key.down) {
 		switch (key.key_code) {
 			case SDLK_ESCAPE: game.need_exit = true; break;
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			case SDLK_p:
+				SetPause(game, !game.paused.load(std::memory_order_acquire));
+				break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
@@ -283,6 +285,10 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		}
 
 		HostInputMouseButton(mouse_button, mb.down);
+	}
+
+	if (mb.motion) {
+		HostInputMouseMotion(mb.motion_x, mb.motion_y);
 	}
 }
 
@@ -432,9 +438,11 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 		case SDL_WINDOWEVENT_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
+			SDL_SetRelativeMouseMode(SDL_TRUE);
 			break;
 		case SDL_WINDOWEVENT_FOCUS_LOST:
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
+			SDL_SetRelativeMouseMode(SDL_FALSE);
 			break;
 		case SDL_WINDOWEVENT_CLOSE:
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
@@ -760,7 +768,14 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (SDL_WaitEvent(&loop.event) == 0) {
+		HostInputFrame();
+
+		// Timeout so mouse-look stick can decay without waiting for another event.
+		const int wait = SDL_WaitEventTimeout(&loop.event, 8);
+		if (wait == 0) {
+			continue;
+		}
+		if (wait < 0) {
 			EXIT("%s\n", SDL_GetError());
 		}
 		ProcessEvent(timer.GetTimeS());
@@ -784,6 +799,7 @@ static void WindowCreate(WindowContext& context) {
 	}
 	HostInputInit();
 	InitializeImeDialogInput();
+	SDL_SetRelativeMouseMode(SDL_TRUE);
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 

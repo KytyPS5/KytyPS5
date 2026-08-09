@@ -473,7 +473,6 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (num_bytes == 0) {
 		return;
 	}
-	EXIT_NOT_IMPLEMENTED((num_bytes & 3u) != 0);
 	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(src_cache_policy > 3);
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);

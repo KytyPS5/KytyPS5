@@ -722,8 +722,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
-	    ((dst_vaddr | src_vaddr | size) & 3u) != 0 || size > UINT64_MAX - dst_vaddr ||
-	    size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||
+	    ((dst_gds || src_gds) && ((dst_vaddr | src_vaddr | size) & 3u) != 0) ||
+	    size > UINT64_MAX - dst_vaddr || size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||
 	    (dst_gds == src_gds && src_vaddr < dst_vaddr + size && dst_vaddr < src_vaddr + size) ||
 	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
 	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {

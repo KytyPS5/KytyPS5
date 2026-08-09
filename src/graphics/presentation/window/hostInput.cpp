@@ -18,35 +18,57 @@ namespace Libs::Graphics {
 
 namespace {
 
+struct ControlInfo {
+	std::string_view name;
+	uint32_t         button   = 0;
+	Controller::Axis axis     = Controller::Axis::AxisMax;
+	bool             positive = false;
+};
+
+static constexpr std::array CONTROL_INFO = {
+    ControlInfo {"L3", Controller::PAD_BUTTON_L3},
+    ControlInfo {"R3", Controller::PAD_BUTTON_R3},
+    ControlInfo {"Options", Controller::PAD_BUTTON_OPTIONS},
+    ControlInfo {"Up", Controller::PAD_BUTTON_UP},
+    ControlInfo {"Right", Controller::PAD_BUTTON_RIGHT},
+    ControlInfo {"Down", Controller::PAD_BUTTON_DOWN},
+    ControlInfo {"Left", Controller::PAD_BUTTON_LEFT},
+    ControlInfo {"L2", Controller::PAD_BUTTON_L2},
+    ControlInfo {"R2", Controller::PAD_BUTTON_R2},
+    ControlInfo {"L1", Controller::PAD_BUTTON_L1},
+    ControlInfo {"R1", Controller::PAD_BUTTON_R1},
+    ControlInfo {"Triangle", Controller::PAD_BUTTON_TRIANGLE},
+    ControlInfo {"Circle", Controller::PAD_BUTTON_CIRCLE},
+    ControlInfo {"Cross", Controller::PAD_BUTTON_CROSS},
+    ControlInfo {"Square", Controller::PAD_BUTTON_SQUARE},
+    ControlInfo {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD},
+    ControlInfo {"LeftStickLeft", 0, Controller::Axis::LeftX, false},
+    ControlInfo {"LeftStickRight", 0, Controller::Axis::LeftX, true},
+    ControlInfo {"LeftStickUp", 0, Controller::Axis::LeftY, false},
+    ControlInfo {"LeftStickDown", 0, Controller::Axis::LeftY, true},
+    ControlInfo {"RightStickLeft", 0, Controller::Axis::RightX, false},
+    ControlInfo {"RightStickRight", 0, Controller::Axis::RightX, true},
+    ControlInfo {"RightStickUp", 0, Controller::Axis::RightY, false},
+    ControlInfo {"RightStickDown", 0, Controller::Axis::RightY, true},
+};
+
+constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
+
 struct Binding {
 	SDL_Keycode key          = SDLK_UNKNOWN;
 	uint8_t     mouse_button = 0;
-	uint32_t    pad_button   = 0;
+	std::size_t control      = INVALID_CONTROL;
 };
 
-static constexpr std::array PAD_BUTTONS = {
-    std::pair {std::string_view("L3"), Controller::PAD_BUTTON_L3},
-    std::pair {std::string_view("R3"), Controller::PAD_BUTTON_R3},
-    std::pair {std::string_view("Options"), Controller::PAD_BUTTON_OPTIONS},
-    std::pair {std::string_view("Up"), Controller::PAD_BUTTON_UP},
-    std::pair {std::string_view("Right"), Controller::PAD_BUTTON_RIGHT},
-    std::pair {std::string_view("Down"), Controller::PAD_BUTTON_DOWN},
-    std::pair {std::string_view("Left"), Controller::PAD_BUTTON_LEFT},
-    std::pair {std::string_view("L2"), Controller::PAD_BUTTON_L2},
-    std::pair {std::string_view("R2"), Controller::PAD_BUTTON_R2},
-    std::pair {std::string_view("L1"), Controller::PAD_BUTTON_L1},
-    std::pair {std::string_view("R1"), Controller::PAD_BUTTON_R1},
-    std::pair {std::string_view("Triangle"), Controller::PAD_BUTTON_TRIANGLE},
-    std::pair {std::string_view("Circle"), Controller::PAD_BUTTON_CIRCLE},
-    std::pair {std::string_view("Cross"), Controller::PAD_BUTTON_CROSS},
-    std::pair {std::string_view("Square"), Controller::PAD_BUTTON_SQUARE},
-    std::pair {std::string_view("TouchPad"), Controller::PAD_BUTTON_TOUCH_PAD},
-};
+std::size_t ControlFromName(std::string_view name) {
+	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
+	                               [name](const auto& item) { return item.name == name; });
+	return static_cast<std::size_t>(std::distance(CONTROL_INFO.begin(), info));
+}
 
-uint32_t PadButtonFromName(std::string_view name) {
-	const auto button = std::find_if(PAD_BUTTONS.begin(), PAD_BUTTONS.end(),
-	                                 [name](const auto& item) { return item.first == name; });
-	return button != PAD_BUTTONS.end() ? button->second : 0;
+const ControlInfo& Info(std::size_t control) {
+	EXIT_IF(control >= CONTROL_INFO.size());
+	return CONTROL_INFO[control];
 }
 
 SDL_Keycode NormalizeKey(SDL_Keycode key) {
@@ -74,7 +96,7 @@ uint8_t MouseButtonFromName(std::string_view name) {
 }
 
 bool Conflicts(const Binding& first, const Binding& second) {
-	return first.pad_button == second.pad_button ||
+	return first.control == second.control ||
 	       (first.key != SDLK_UNKNOWN && first.key == second.key) ||
 	       (first.mouse_button != 0 && first.mouse_button == second.mouse_button);
 }
@@ -88,7 +110,7 @@ public:
 
 			Binding binding;
 			if (split != std::string_view::npos) {
-				binding.pad_button    = PadButtonFromName(entry.substr(0, split));
+				binding.control       = ControlFromName(entry.substr(0, split));
 				const auto host_input = entry.substr(split + 1);
 				binding.mouse_button  = MouseButtonFromName(host_input);
 				if (binding.mouse_button == 0) {
@@ -98,7 +120,7 @@ public:
 
 			const bool reserved =
 			    binding.key == SDLK_ESCAPE || binding.key == SDLK_SPACE || binding.key == SDLK_F1;
-			if (binding.pad_button == 0 || reserved ||
+			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
 			}
@@ -107,19 +129,19 @@ public:
 	}
 	[[nodiscard]] bool Custom() const { return m_custom; }
 
-	[[nodiscard]] uint32_t FindKey(int key_code) const {
+	[[nodiscard]] std::size_t FindKey(int key_code) const {
 		key_code = NormalizeKey(static_cast<SDL_Keycode>(key_code));
 		const auto binding =
 		    std::find_if(m_bindings.begin(), m_bindings.begin() + m_size,
 		                 [key_code](const auto& item) { return item.key == key_code; });
-		return binding != m_bindings.begin() + m_size ? binding->pad_button : 0;
+		return binding != m_bindings.begin() + m_size ? binding->control : INVALID_CONTROL;
 	}
 
-	[[nodiscard]] uint32_t FindMouseButton(uint8_t mouse_button) const {
+	[[nodiscard]] std::size_t FindMouseButton(uint8_t mouse_button) const {
 		const auto binding = std::find_if(
 		    m_bindings.begin(), m_bindings.begin() + m_size,
 		    [mouse_button](const auto& item) { return item.mouse_button == mouse_button; });
-		return binding != m_bindings.begin() + m_size ? binding->pad_button : 0;
+		return binding != m_bindings.begin() + m_size ? binding->control : INVALID_CONTROL;
 	}
 
 private:
@@ -135,9 +157,9 @@ private:
 		m_bindings[m_size++] = binding;
 	}
 
-	std::array<Binding, PAD_BUTTONS.size()> m_bindings {};
-	std::size_t                             m_size = 0;
-	bool                                    m_custom;
+	std::array<Binding, CONTROL_INFO.size()> m_bindings {};
+	std::size_t                              m_size = 0;
+	bool                                     m_custom;
 };
 
 const InputMap& GetInputMap() {
@@ -191,6 +213,33 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
+void SetControl(std::size_t control, bool down) {
+	if (control == INVALID_CONTROL) {
+		return;
+	}
+
+	const auto& info = Info(control);
+	if (info.button != 0) {
+		SetButton(info.button, down);
+		return;
+	}
+
+	struct AxisKeys {
+		bool negative = false;
+		bool positive = false;
+	};
+	static std::array<AxisKeys, 4> axes;
+
+	const auto axis = static_cast<std::size_t>(info.axis);
+	EXIT_IF(axis >= axes.size());
+	if (info.positive) {
+		axes[axis].positive = down;
+	} else {
+		axes[axis].negative = down;
+	}
+	SetStickAxis(info.axis, axes[axis].negative, axes[axis].positive);
+}
+
 void DefaultKeyboardInput(int key_code, bool down) {
 	static StickKeys left;
 	static StickKeys right;
@@ -240,7 +289,7 @@ void HostInputInit() {
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
-		SetButton(map.FindKey(key_code), down);
+		SetControl(map.FindKey(key_code), down);
 	} else {
 		DefaultKeyboardInput(key_code, down);
 	}
@@ -249,7 +298,7 @@ void HostInputKey(int key_code, bool down) {
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
-		SetButton(map.FindMouseButton(mouse_button), down);
+		SetControl(map.FindMouseButton(mouse_button), down);
 	}
 }
 

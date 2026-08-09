@@ -18,17 +18,25 @@ namespace {
 
 constexpr int BINDING_COLUMN = 1;
 
-struct PadButton {
+struct PadControl {
 	const char* id;
 	const char* label;
 	const char* default_binding;
 };
 
-constexpr PadButton PAD_BUTTONS[] = {
+constexpr PadControl PAD_CONTROLS[] = {
     {"Up", "D-pad Up", "Up"},
     {"Down", "D-pad Down", "Down"},
     {"Left", "D-pad Left", "Left"},
     {"Right", "D-pad Right", "Right"},
+    {"LeftStickUp", "Left stick Up", "W"},
+    {"LeftStickDown", "Left stick Down", "S"},
+    {"LeftStickLeft", "Left stick Left", "A"},
+    {"LeftStickRight", "Left stick Right", "D"},
+    {"RightStickUp", "Right stick Up", "T"},
+    {"RightStickDown", "Right stick Down", "G"},
+    {"RightStickLeft", "Right stick Left", "F"},
+    {"RightStickRight", "Right stick Right", "H"},
     {"Triangle", "Triangle", "I"},
     {"Circle", "Circle", "L"},
     {"Cross", "Cross", "J"},
@@ -190,16 +198,14 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* parent)
     : QDialog(parent), m_customized(!mapping.isEmpty()) {
 	setWindowTitle(tr("Input Mapping"));
-	resize(440, 520);
+	resize(460, 650);
 
 	auto* layout = new QVBoxLayout(this);
-	layout->addWidget(new QLabel(tr("Map keyboard or mouse input to DualSense buttons.\n"
-	                                "Defaults: left stick W/A/S/D, right stick T/F/G/H."),
-	                             this));
+	layout->addWidget(new QLabel(tr("Map keyboard or mouse input to DualSense controls."), this));
 
 	m_bindings = new QTreeWidget(this);
 	m_bindings->setColumnCount(2);
-	m_bindings->setHeaderLabels({tr("DualSense button"), tr("Host input")});
+	m_bindings->setHeaderLabels({tr("DualSense control"), tr("Host input")});
 	m_bindings->setRootIsDecorated(false);
 	m_bindings->setSelectionMode(QAbstractItemView::SingleSelection);
 	m_bindings->header()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -207,12 +213,12 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	layout->addWidget(m_bindings);
 
 	const auto parsed = ParseMapping(mapping);
-	for (const auto& button: PAD_BUTTONS) {
+	for (const auto& control: PAD_CONTROLS) {
 		auto* item = new QTreeWidgetItem(m_bindings);
-		item->setText(0, tr(button.label));
-		item->setData(0, Qt::UserRole, QString::fromLatin1(button.id));
-		SetBinding(item, m_customized ? parsed.value(QString::fromLatin1(button.id))
-		                              : QString::fromLatin1(button.default_binding));
+		item->setText(0, tr(control.label));
+		item->setData(0, Qt::UserRole, QString::fromLatin1(control.id));
+		SetBinding(item, m_customized ? parsed.value(QString::fromLatin1(control.id))
+		                              : QString::fromLatin1(control.default_binding));
 	}
 	m_bindings->setCurrentItem(m_bindings->topLevelItem(0));
 
@@ -286,7 +292,7 @@ void InputMappingDialog::ClearBinding() {
 void InputMappingDialog::RestoreDefaults() {
 	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
 		SetBinding(m_bindings->topLevelItem(index),
-		           QString::fromLatin1(PAD_BUTTONS[index].default_binding));
+		           QString::fromLatin1(PAD_CONTROLS[index].default_binding));
 	}
 	m_customized = false;
 }

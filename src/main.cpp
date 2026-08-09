@@ -67,7 +67,7 @@ static void PrintUsage() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
-	::printf("  --keymap <Pad=Key>                   DualSense mapping; may be repeated.\n");
+	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 

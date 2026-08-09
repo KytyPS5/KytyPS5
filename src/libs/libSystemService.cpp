@@ -23,6 +23,7 @@ namespace SystemService {
 [[maybe_unused]] constexpr int PARAM_ID_SUMMERTIME          = 5;
 [[maybe_unused]] constexpr int PARAM_ID_SYSTEM_NAME         = 6;
 [[maybe_unused]] constexpr int PARAM_ID_GAME_PARENTAL_LEVEL = 7;
+[[maybe_unused]] constexpr int PARAM_ID_CC_ENABLE           = 100;
 [[maybe_unused]] constexpr int PARAM_ID_SCREEN_READER       = 208;
 [[maybe_unused]] constexpr int PARAM_ID_ENTER_BUTTON_ASSIGN = 1000;
 
@@ -32,6 +33,9 @@ namespace SystemService {
 
 [[maybe_unused]] constexpr int PARAM_TIME_FORMAT_12HOUR = 0;
 [[maybe_unused]] constexpr int PARAM_TIME_FORMAT_24HOUR = 1;
+
+[[maybe_unused]] constexpr int PARAM_CC_DISABLED = 0;
+[[maybe_unused]] constexpr int PARAM_CC_ENABLED  = 1;
 
 [[maybe_unused]] constexpr int MAX_SYSTEM_NAME_LENGTH = 65;
 
@@ -97,9 +101,12 @@ static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 		case PARAM_ID_TIME_ZONE: v = +180; break;
 		case PARAM_ID_SUMMERTIME: v = 0; break;
 		case PARAM_ID_GAME_PARENTAL_LEVEL: v = PARAM_GAME_PARENTAL_OFF; break;
+		case PARAM_ID_CC_ENABLE: v = PARAM_CC_DISABLED; break;
 		case PARAM_ID_SCREEN_READER: v = 0; break;
 		case PARAM_ID_ENTER_BUTTON_ASSIGN: v = PARAM_ENTER_BUTTON_ASSIGN_CROSS; break;
-		default: EXIT("unknown param_id: %d\n", param_id);
+		default:
+			LOGF_COLOR(Log::Color::Yellow, " unsupported param_id %d, using 0\n", param_id);
+			break;
 	}
 
 	LOGF(" %d = %d\n", param_id, v);

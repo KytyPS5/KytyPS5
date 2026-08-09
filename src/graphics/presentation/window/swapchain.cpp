@@ -31,13 +31,12 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/imeDialogOverlay.h"
+#include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/controller.h"
-#include "libs/imeDialog.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -345,17 +344,17 @@ private:
 	void Destroy();
 	void RefreshSurfaceSize();
 
-	WindowContext&                    m_window;
-	vk::SwapchainKHR                  m_handle = nullptr;
-	vk::Format                        m_format = vk::Format::eUndefined;
-	vk::Extent2D                      m_extent {};
-	std::vector<vk::Image>            m_images;
-	std::vector<vk::ImageView>        m_image_views;
-	std::vector<vk::Semaphore>        m_image_acquired;
-	std::vector<vk::Semaphore>        m_render_complete;
-	std::unique_ptr<ImeDialogOverlay> m_ime_overlay;
-	uint32_t                          m_image_index = static_cast<uint32_t>(-1);
-	uint32_t                          m_frame_index = 0;
+	WindowContext&              m_window;
+	vk::SwapchainKHR            m_handle = nullptr;
+	vk::Format                  m_format = vk::Format::eUndefined;
+	vk::Extent2D                m_extent {};
+	std::vector<vk::Image>      m_images;
+	std::vector<vk::ImageView>  m_image_views;
+	std::vector<vk::Semaphore>  m_image_acquired;
+	std::vector<vk::Semaphore>  m_render_complete;
+	std::unique_ptr<ImeOverlay> m_ime_overlay;
+	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
+	uint32_t                    m_frame_index = 0;
 };
 
 struct Presenter::Impl {
@@ -618,7 +617,7 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 
 bool Swapchain::PrepareImeOverlay() {
 	if (m_ime_overlay == nullptr) {
-		m_ime_overlay = std::make_unique<ImeDialogOverlay>(m_window.graphic_ctx);
+		m_ime_overlay = std::make_unique<ImeOverlay>(m_window.graphic_ctx);
 	}
 	return m_ime_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
@@ -807,7 +806,7 @@ bool Presenter::IsGuestPaused() const noexcept {
 }
 
 bool Presenter::NeedsImeRefresh() const noexcept {
-	const auto visual = Dialog::ImeDialog::GetVisualState();
+	const auto visual = GetImeVisualState();
 	return visual.active ||
 	       visual.revision != m_impl->presented_ime_revision.load(std::memory_order_acquire);
 }
@@ -843,7 +842,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 
-	const auto ime_visual = Dialog::ImeDialog::GetVisualState();
+	const auto ime_visual = GetImeVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();

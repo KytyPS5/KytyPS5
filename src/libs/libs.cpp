@@ -34,6 +34,10 @@ namespace LibKeyboard {
 LIB_DEFINE(InitKeyboard_1);
 } // namespace LibKeyboard
 
+namespace Ime {
+LIB_DEFINE(InitPlatform_1_Ime);
+} // namespace Ime
+
 namespace LibUlt {
 LIB_DEFINE(InitUlt_1);
 } // namespace LibUlt
@@ -89,6 +93,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(InitLibKernel_1);
 	LIB_LOAD(LibMouse::InitMouse_1);
 	LIB_LOAD(LibKeyboard::InitKeyboard_1);
+	LIB_LOAD(Ime::InitPlatform_1_Ime);
 	LIB_LOAD(InitNet_1);
 	LIB_LOAD(InitPad_1);
 	LIB_LOAD(InitPlayGo_1);

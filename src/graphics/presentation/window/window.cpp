@@ -31,7 +31,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/imeDialogOverlay.h"
+#include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -477,7 +477,7 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
-	if (ProcessImeDialogInput(*event)) {
+	if (ProcessImeInput(*event)) {
 		return;
 	}
 
@@ -783,7 +783,7 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
-	InitializeImeDialogInput();
+	InitializeImeInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
@@ -938,7 +938,6 @@ void WindowContext::UpdateTitle() {
 	static constexpr auto build_type = "Unknown";
 #endif
 
-
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
@@ -950,11 +949,11 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps = fmt::format("[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL,
-	                       build_type, (has_title ? title : ""), (has_title ? ", " : ""),
-	                       (has_title_id ? title_id : ""), (has_title_id ? ", " : ""),
-	                       (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""), device_name,
-	                       processor_name, frame_num, current_fps);
+	auto fps = fmt::format(
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
+	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
+	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
+	    device_name, processor_name, frame_num, current_fps);
 
 #if defined(__APPLE__)
 	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.

@@ -3804,77 +3804,6 @@ LIB_DEFINE(InitPlatform_1_Random) {
 
 } // namespace LibRandom
 
-namespace LibIme {
-
-LIB_VERSION("Ime", 1, "Ime", 1, 1);
-
-static int KYTY_SYSV_ABI ImeKeyboardOpen(int user_id, const void* param) {
-	PRINT_NAME();
-
-	LOGF("\t user_id = %d\n"
-	     "\t param   = 0x%016" PRIx64 "\n",
-	     user_id, reinterpret_cast<uint64_t>(param));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI ImeKeyboardClose(int user_id) {
-	PRINT_NAME();
-
-	LOGF("\t user_id = %d\n", user_id);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI ImeKeyboardGetResourceId(int user_id, void* resource_id_array) {
-	PRINT_NAME();
-
-	LOGF("\t user_id           = %d\n"
-	     "\t resource_id_array = 0x%016" PRIx64 "\n",
-	     user_id, reinterpret_cast<uint64_t>(resource_id_array));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI ImeKeyboardGetInfo(uint32_t resource_id, void* info) {
-	PRINT_NAME();
-
-	LOGF("\t resource_id = 0x%08" PRIx32 "\n"
-	     "\t info        = 0x%016" PRIx64 "\n",
-	     resource_id, reinterpret_cast<uint64_t>(info));
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI ImeKeyboardSetMode(int user_id, uint32_t mode) {
-	PRINT_NAME();
-
-	LOGF("\t user_id = %d\n"
-	     "\t mode    = 0x%08" PRIx32 "\n",
-	     user_id, mode);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI ImeUpdate(void* handler) {
-	PRINT_NAME();
-
-	// LOGF("\t handler = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(handler));
-
-	return 0;
-}
-
-LIB_DEFINE(InitPlatform_1_Ime) {
-	LIB_FUNC("eaFXjfJv3xs", LibIme::ImeKeyboardOpen);
-	LIB_FUNC("PMVehSlfZ94", LibIme::ImeKeyboardClose);
-	LIB_FUNC("dKadqZFgKKQ", LibIme::ImeKeyboardGetResourceId);
-	LIB_FUNC("VkqLPArfFdc", LibIme::ImeKeyboardGetInfo);
-	LIB_FUNC("ua+13Hk9kKs", LibIme::ImeKeyboardSetMode);
-	LIB_FUNC("-4GCfYdNF1s", LibIme::ImeUpdate);
-}
-
-} // namespace LibIme
-
 namespace LibRemoteplay {
 
 LIB_VERSION("Remoteplay", 1, "Remoteplay", 1, 1);
@@ -3994,7 +3923,6 @@ LIB_DEFINE(InitPlatform_1_SharePlay) {
 
 LIB_DEFINE(InitPlatform_1) {
 	LibRandom::InitPlatform_1_Random(s);
-	LibIme::InitPlatform_1_Ime(s);
 	LibRemoteplay::InitPlatform_1_Remoteplay(s);
 	LibWebBrowserDialog::InitPlatform_1_WebBrowserDialog(s);
 	LibGameLiveStreaming::InitPlatform_1_GameLiveStreaming(s);

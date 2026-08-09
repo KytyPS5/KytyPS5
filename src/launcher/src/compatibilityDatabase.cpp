@@ -21,11 +21,10 @@
 
 namespace {
 
-constexpr char FILE_NAME[] = "compatibility_db.json";
-constexpr char URL[] =
-    "https://github.com/Nmzik/KytyPS5/releases/download/compat-db/compatibility_db.json";
-constexpr int RETRY_COUNT    = 3;
-constexpr int RETRY_DELAY_MS = 750;
+constexpr char FILE_NAME[]    = "compatibility_db.json";
+constexpr char URL[]          = "https://kytyps5.github.io/data/compatibility.json";
+constexpr int  RETRY_COUNT    = 3;
+constexpr int  RETRY_DELAY_MS = 750;
 
 struct LoadResult {
 	QMap<QString, CompatibilityEntry> entries;

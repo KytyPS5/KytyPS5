@@ -31,6 +31,9 @@ macOS support is experimental. The emulator is built for x86-64 and runs on Appl
 Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
 on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
 
+Community game test results are available in the
+[KytyPS5 Compatibility List](https://kytyps5.github.io/).
+
 ## Bugs and Issues
 
 The project is in an early stage, so please be mindful when opening new issues. Expect crashes,

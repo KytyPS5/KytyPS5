@@ -16,6 +16,9 @@ class Presenter;
 
 namespace Libs::VideoOut {
 
+// Special buffer index: flips a blank surface without any registered buffer.
+constexpr int VIDEO_OUT_BUFFER_INDEX_BLANK = -1;
+
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
 struct VideoOutVblankStatus;
@@ -23,6 +26,9 @@ struct VideoOutOutputStatus;
 struct VideoOutOutputOptions;
 struct VideoOutBuffers;
 struct VideoOutColorSettings;
+struct VideoOutResolutionStatus;
+struct VideoOutDeviceCapabilityInfo;
+struct VideoOutVrrStatus;
 
 class VideoOutDriver final {
 public:
@@ -36,6 +42,7 @@ public:
 	                       int64_t flip_arg, uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
+	void CompleteBlankFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot();
 	void WaitFlipDone(int handle, int index);
@@ -99,12 +106,26 @@ KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle);
 KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point);
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
+KYTY_SYSV_ABI int VideoOutGetBufferLabelAddress(int handle, uintptr_t* label_addr);
+// PS5 NID T4ucGB8CsnM — often returns label pointer in rax (a1==0).
+KYTY_SYSV_ABI uint64_t VideoOutT4ucGB8CsnM(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+KYTY_SYSV_ABI int VideoOutGetResolutionStatus(int handle, VideoOutResolutionStatus* status);
+KYTY_SYSV_ABI int VideoOutGetDeviceCapabilityInfo(int handle,
+                                                  VideoOutDeviceCapabilityInfo* info);
+// sceVideoOutAddVrrStatusFlagsPrivilege — same ABI as AddFlipEvent.
+KYTY_SYSV_ABI int VideoOutAddVrrStatusFlagsPrivilege(LibKernel::EventQueue::KernelEqueue eq,
+                                                     int handle, void* udata);
+// Fallback no-op for unknown VideoOutVrrStatus NIDs (must return OK).
+KYTY_SYSV_ABI int VideoOutVrrStatusStub(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
 
-// Lightweight Flip/Register counters (diag). No phase soft-HLE.
-[[nodiscard]] uint64_t FlipStatsSubmitCpu();
-[[nodiscard]] uint64_t FlipStatsSubmitGpu();
-[[nodiscard]] uint64_t FlipStatsPresented();
-[[nodiscard]] uint64_t FlipStatsRegisterBuffers();
+// Hang-watch stub (graphicsRun may call). No-op — diag spam stripped.
+void VideoOutDumpDiagnostics();
+
+// Hold a buffer-group reference across GraphicsSubmitDcb → CpOpFlip so
+// UnregisterBuffers can retire the set instead of wiping it while the GPU
+// still has a queued R_FLIP. Pair every successful pin with UnpinFlipTarget.
+[[nodiscard]] bool VideoOutPinFlipTarget(int handle, int index);
+void               VideoOutUnpinFlipTarget(int handle, int index);
 
 } // namespace Libs::VideoOut
 

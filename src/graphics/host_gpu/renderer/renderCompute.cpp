@@ -197,8 +197,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	ShaderComputeInputInfo    input_info {};
 	std::span<const uint32_t> cs_shader;
 	if (!ShaderCompileInfoCS(cs_regs, sh_regs, input_info, cs_shader)) {
-		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
-		     cs_regs.cs_regs.data_addr);
+		static std::atomic_uint cs_fail_log {0};
+		if (cs_fail_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64
+			     " (skip)\n",
+			     cs_regs.cs_regs.data_addr);
+		}
+		return;
 	}
 
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;

@@ -138,6 +138,8 @@ bool IsPairDwordOpcode(IR::Opcode op) {
 		case IR::Opcode::BitwiseNotU64:
 		case IR::Opcode::BitFieldMaskU64:
 		case IR::Opcode::BitFieldExtractU64:
+		case IR::Opcode::BitClearU64:
+		case IR::Opcode::BitSetU64:
 		case IR::Opcode::BitReplicateB64B32:
 		case IR::Opcode::ShiftLeftLogicalU64:
 		case IR::Opcode::ShiftRightLogicalU64:
@@ -151,6 +153,8 @@ uint32_t PairDwordSourceCount(IR::Opcode op, uint32_t src_count) {
 		case IR::Opcode::BitFieldMaskU64: return 0;
 		case IR::Opcode::BitReplicateB64B32: return 0;
 		case IR::Opcode::BitFieldExtractU64: return 1;
+		case IR::Opcode::BitClearU64:
+		case IR::Opcode::BitSetU64: return 1;
 		case IR::Opcode::ShiftLeftLogicalU64:
 		case IR::Opcode::ShiftRightLogicalU64:
 		case IR::Opcode::BitwiseNotU64:
@@ -184,7 +188,8 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 					CollectSequentialRegisters(registers, inst.src[i], 2);
 				}
 			}
-			if (inst.op == IR::Opcode::BitCountU64 || inst.op == IR::Opcode::FindMsbFromHighU64) {
+			if (inst.op == IR::Opcode::BitCountU64 || inst.op == IR::Opcode::FindLsbU64 ||
+			    inst.op == IR::Opcode::FindMsbFromHighU64) {
 				CollectSequentialRegisters(registers, inst.src[0], 2);
 			}
 			if (IR::IsCompare64Opcode(inst.op)) {
@@ -195,7 +200,8 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 			    inst.dst.reg.file != IR::RegisterFile::Scc) {
 				CollectSequentialRegisters(registers, inst.dst, 2);
 			}
-			if (inst.op == IR::Opcode::IAddCarryU32 || inst.op == IR::Opcode::ISubBorrowU32) {
+			if (inst.op == IR::Opcode::IAddCarryU32 || inst.op == IR::Opcode::ISubBorrowU32 ||
+			    inst.op == IR::Opcode::ISubBorrowCarryU32) {
 				CollectSequentialRegisters(registers, inst.dst2, 2);
 			}
 			if (inst.op == IR::Opcode::UMadU64U32) {

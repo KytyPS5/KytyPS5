@@ -42,6 +42,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -391,6 +393,12 @@ struct Presenter::Impl {
 		const auto image_id   = cache.FindImage(desc);
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
+
+		// Always force guest→host detile for VideoOut present.
+		// Flip buffers are frequently CPU-tiled by the guest after a GPU clear;
+		// trusting IsGpuModified / a GpuModified alias alone keeps a stale black
+		// Vulkan image.
+		image.MarkBufferModified();
 		cache.UpdateImage(image_id);
 		return image;
 	}

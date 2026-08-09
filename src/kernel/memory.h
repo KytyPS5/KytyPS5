@@ -169,6 +169,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
+void     RegisterProgramFlexibleQuota(uint64_t size, const char* name);
+void     UnregisterProgramFlexibleQuota(uint64_t size, const char* name);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,

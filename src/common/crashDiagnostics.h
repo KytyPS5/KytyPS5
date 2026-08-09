@@ -28,6 +28,10 @@ void FlushHleRingToFatal(const char* reason);
 void NoteHaltReason(const char* kind, const char* detail = nullptr);
 const char* GetLastHaltReason();
 
+// Park the calling thread forever after a fatal guest fault, without killing
+// the process (GPU / other guests can keep running under soft-idle ExitProcess).
+[[noreturn]] void SoftIdleCurrentThread(const char* why, const char* detail = nullptr);
+
 // Set when CFG-bitmap soft-continue runs; used by GPU queue_empty stall dump.
 // host_tid / unique_id identify the faulting guest thread for post-CFG RIP snapshot.
 void NoteCfgSoftContinue(uint32_t host_tid = 0, int unique_id = -1);

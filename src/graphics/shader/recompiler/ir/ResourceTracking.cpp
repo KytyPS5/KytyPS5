@@ -52,7 +52,8 @@ bool NeedsSampler(Opcode op) {
 }
 
 bool IsDepthCompare(const Instruction& inst) {
-	return (inst.memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
+	return (inst.memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0 &&
+	       inst.memory.image_dimension != Decoder::ImageDimension::Dim3D;
 }
 
 ImageMipMode MipMode(const Instruction& inst) {

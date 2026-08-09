@@ -3323,6 +3323,46 @@ bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_
 	return true;
 }
 
+bool PthreadGetGuestHostContext(uint64_t* host_rsp, uint64_t* host_rbp) {
+	if (host_rsp == nullptr || host_rbp == nullptr || g_pthread_self == nullptr ||
+	    g_pthread_self->guest_host_rsp == 0 || g_pthread_self->guest_host_rbp == 0) {
+		return false;
+	}
+
+	*host_rsp = static_cast<uint64_t>(g_pthread_self->guest_host_rsp);
+	*host_rbp = static_cast<uint64_t>(g_pthread_self->guest_host_rbp);
+	return true;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void PthreadSaveCurrentHostStackLimits() {
+	if (g_pthread_self == nullptr) {
+		return;
+	}
+
+	uintptr_t host_gs8  = 0;
+	uintptr_t host_gs10 = 0;
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(host_gs8), "=r"(host_gs10)
+	             :
+	             : "memory");
+	g_pthread_self->guest_host_gs8  = host_gs8;
+	g_pthread_self->guest_host_gs10 = host_gs10;
+}
+
+bool PthreadGetGuestHostStackLimits(uint64_t* stack_base, uint64_t* stack_limit) {
+	if (stack_base == nullptr || stack_limit == nullptr || g_pthread_self == nullptr ||
+	    g_pthread_self->guest_host_gs8 == 0 || g_pthread_self->guest_host_gs10 == 0) {
+		return false;
+	}
+
+	*stack_base  = static_cast<uint64_t>(g_pthread_self->guest_host_gs8);
+	*stack_limit = static_cast<uint64_t>(g_pthread_self->guest_host_gs10);
+	return true;
+}
+#endif
+
 int PthreadGetPriorityForKernel(Pthread thread) {
 	if (thread == nullptr) {
 		return 700;

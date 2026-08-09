@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdio>
 #include <deque>
 #include <memory>
 #include <semaphore>
@@ -37,6 +36,23 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GpuState*         g_gpu_state         = nullptr;
+
+namespace {
+
+void LogGpuSyncWrite(uint32_t /*queue_id*/, uint64_t /*submit_id*/, uint64_t /*address*/,
+                     uint64_t /*value*/, uint32_t /*width*/, uint32_t /*event_type*/,
+                     uint32_t /*cache_action*/, uint32_t /*event_index*/, uint32_t /*event_source*/,
+                     uint32_t /*interrupt_selector*/) {}
+
+void LogGpuSyncCopy(uint32_t /*queue_id*/, uint64_t /*submit_id*/, uint64_t /*destination*/,
+                    uint64_t /*source*/, uint32_t /*size*/, bool /*destination_gds*/,
+                    bool /*source_gds*/) {}
+
+void LogGpuSyncWait(uint32_t /*queue_id*/, uint64_t /*submit_id*/, uint64_t /*address*/,
+                    uint64_t /*value*/, uint64_t /*reference*/, uint64_t /*mask*/,
+                    uint32_t /*function*/, uint32_t /*width*/, bool /*satisfied*/) {}
+
+} // namespace
 
 class GpuMutexLock final {
 public:
@@ -71,10 +87,63 @@ struct OwnedCmdBuffer {
 	[[nodiscard]] bool      Empty() const noexcept { return m_words.empty(); }
 	[[nodiscard]] uint32_t  Size() const noexcept { return static_cast<uint32_t>(m_words.size()); }
 	[[nodiscard]] uint32_t* Data() noexcept { return m_words.data(); }
+	[[nodiscard]] const uint32_t* Data() const noexcept { return m_words.data(); }
 
 private:
 	std::vector<uint32_t> m_words;
 };
+
+[[nodiscard]] static bool ContainsSyncProducer(const OwnedCmdBuffer& commands, uint64_t address) {
+	const auto* data = commands.Data();
+	for (uint32_t offset = 0; offset < commands.Size();) {
+		const auto cmd_id = data[offset];
+		const auto length = KYTY_PM4_LEN(cmd_id);
+		if (length == 0 || length > commands.Size() - offset) {
+			break;
+		}
+		const auto opcode = (cmd_id >> 8u) & 0xffu;
+		if (opcode == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_RELEASE_MEM &&
+		    length >= 7u) {
+			const auto target = static_cast<uint64_t>(data[offset + 3u]) |
+			                    (static_cast<uint64_t>(data[offset + 4u]) << 32u);
+			const auto data_sel = (data[offset + 2u] >> 29u) & 0x7u;
+			const auto interrupt = (data[offset + 2u] >> 24u) & 0x7u;
+			if (target == address && data_sel != 0 && interrupt != 4) {
+				return true;
+			}
+		} else if (opcode == Pm4::IT_EVENT_WRITE_EOP && length >= 6u) {
+			const auto target = static_cast<uint64_t>(data[offset + 2u]) |
+			                    (static_cast<uint64_t>(data[offset + 3u] & 0xffffu) << 32u);
+			if (target == address) {
+				return true;
+			}
+		} else if (opcode == Pm4::IT_EVENT_WRITE_EOS && length >= 5u) {
+			const auto target = static_cast<uint64_t>(data[offset + 2u]) |
+			                    (static_cast<uint64_t>(data[offset + 3u] & 0xffffu) << 32u);
+			if (target == address) {
+				return true;
+			}
+		}
+		offset += length;
+	}
+	return false;
+}
+
+[[nodiscard]] static bool ContainsDirectFlip(const OwnedCmdBuffer& commands) {
+	const auto* data = commands.Data();
+	for (uint32_t offset = 0; offset < commands.Size();) {
+		const auto cmd_id = data[offset];
+		const auto length = KYTY_PM4_LEN(cmd_id);
+		if (length == 0 || length > commands.Size() - offset) {
+			break;
+		}
+		if (cmd_id == KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP)) {
+			return true;
+		}
+		offset += length;
+	}
+	return false;
+}
 
 class GpuState {
 public:
@@ -121,6 +190,8 @@ private:
 		bool           command_complete              = false;
 		bool           constant_complete             = false;
 		bool           blocked                       = false;
+		uint32_t       blocked_retries               = 0;
+		uint64_t       blocked_wait_address          = 0;
 		uint64_t       flip_request_id               = 0;
 	};
 
@@ -321,6 +392,7 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+	std::memset(m_scratch_ram, 0, sizeof(m_scratch_ram));
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -401,6 +473,26 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+void CommandProcessor::WriteScratchRam(uint32_t offset, const uint32_t* src, uint32_t dw_num) {
+	EXIT_IF(src == nullptr && dw_num != 0);
+	EXIT_IF((offset & 3u) != 0);
+	constexpr uint32_t scratch_dwords = sizeof(m_scratch_ram) / sizeof(m_scratch_ram[0]);
+	const auto         index          = offset / 4u;
+	EXIT_IF(index >= scratch_dwords);
+	EXIT_IF(dw_num > scratch_dwords - index);
+	memcpy(m_scratch_ram + index, src, static_cast<size_t>(dw_num) * 4);
+}
+
+void CommandProcessor::ReadScratchRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	EXIT_IF(dst == nullptr && dw_num != 0);
+	EXIT_IF((offset & 3u) != 0);
+	constexpr uint32_t scratch_dwords = sizeof(m_scratch_ram) / sizeof(m_scratch_ram[0]);
+	const auto         index          = offset / 4u;
+	EXIT_IF(index >= scratch_dwords);
+	EXIT_IF(dw_num > scratch_dwords - index);
+	memcpy(dst, m_scratch_ram + index, static_cast<size_t>(dw_num) * 4);
+}
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
 		case 0: return true;
@@ -424,8 +516,15 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	const auto value     = *addr;
+	const auto satisfied = TestWaitRegMemValue(value, ref, mask, func);
+	LogGpuSyncWait(m_queue_id, m_submit_id, reinterpret_cast<uint64_t>(addr),
+	               static_cast<uint64_t>(value), static_cast<uint64_t>(ref),
+	               static_cast<uint64_t>(mask), func, sizeof(T), satisfied);
+	if (!satisfied) {
+		EXIT_IF(g_current_execution == nullptr);
+		g_current_execution->m_blocked_wait_valid = true;
+		g_current_execution->m_blocked_wait_address = reinterpret_cast<uint64_t>(addr);
 		SuspendPm4();
 	}
 }
@@ -460,6 +559,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 
 	memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+	uint64_t trace_value = 0;
+	std::memcpy(&trace_value, src, std::min<size_t>(sizeof(trace_value),
+	                                                 static_cast<size_t>(dw_num) *
+	                                                     sizeof(uint32_t)));
+	LogGpuSyncWrite(m_queue_id, m_submit_id, reinterpret_cast<uint64_t>(dst), trace_value,
+	                dw_num * sizeof(uint32_t), 0, 0, 0, dst_sel, 0);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -470,6 +575,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	LogGpuSyncWrite(m_queue_id, m_submit_id, dst_address, value, num_bytes, 0, 0, 0, 4, 0);
 	LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 	     dst_address, value, num_bytes);
 }
@@ -496,6 +602,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
 		switch (selector) {
 			case 0:
+			case 2: // Guest AGC uses 2 for the cache-backed memory destination.
 			case 3: is_gds = false; return true;
 			case 1: is_gds = true; return true;
 			default: return false;
@@ -510,6 +617,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		LogGpuSyncWrite(m_queue_id, m_submit_id, dst_address_or_offset,
+		                static_cast<uint32_t>(src_address_or_offset_or_immediate), num_bytes, 0, 0, 0,
+		                src_sel, 0);
 		return;
 	}
 	bool src_gds = false;
@@ -519,6 +629,12 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
+	if (dst_gds == src_gds && dst_address_or_offset == src_address_or_offset_or_immediate) {
+		// The guest uses an identical DMA range for cache-management commands.
+		return;
+	}
+	LogGpuSyncCopy(m_queue_id, m_submit_id, dst_address_or_offset,
+	               src_address_or_offset_or_immediate, num_bytes, dst_gds, src_gds);
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
 }
@@ -568,12 +684,99 @@ void GpuState::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
-				int selected_queue = -1;
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
+				int    selected_queue = -1;
+				size_t selected_index = 0;
+				for (uint32_t offset = 0; offset < QueueCount && selected_queue < 0; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
+					auto&       queue = gpu->m_queues[id];
+					for (size_t index = 1; index < queue.size(); index++) {
+						const auto& candidate = queue[index];
+						if (!candidate.blocked &&
+						    (ContainsDirectFlip(candidate.commands) ||
+						     ContainsDirectFlip(candidate.constant_commands))) {
+							selected_queue = static_cast<int>(id);
+							selected_index = index;
+							break;
+						}
+					}
+				}
+				for (uint32_t offset = 0; offset < QueueCount; offset++) {
+					if (selected_queue >= 0) {
+						break;
+					}
+					const auto id = (gpu->m_next_queue + offset) % QueueCount;
+					auto& queue = gpu->m_queues[id];
+					if (!queue.empty() && !queue.front().blocked) {
 						selected_queue = static_cast<int>(id);
 						break;
+					}
+				}
+				if (selected_queue < 0) {
+					std::array<uint64_t, QueueCount> blocked_waits {};
+					for (uint32_t id = 0; id < QueueCount; id++) {
+						const auto& queue = gpu->m_queues[id];
+						if (!queue.empty() && queue.front().blocked) {
+							blocked_waits[id] = queue.front().blocked_wait_address;
+						}
+					}
+					for (uint32_t offset = 0; offset < QueueCount && selected_queue < 0; offset++) {
+						const auto id = (gpu->m_next_queue + offset) % QueueCount;
+						auto&       queue = gpu->m_queues[id];
+						for (size_t index = 1; index < queue.size(); index++) {
+							const auto& candidate = queue[index];
+							if (candidate.blocked) {
+								continue;
+							}
+							bool produces_wait = false;
+							for (const auto wait_address: blocked_waits) {
+								if (wait_address != 0 &&
+								    (ContainsSyncProducer(candidate.commands, wait_address) ||
+								     ContainsSyncProducer(candidate.constant_commands, wait_address))) {
+									produces_wait = true;
+									break;
+								}
+							}
+							if (produces_wait) {
+								selected_queue = static_cast<int>(id);
+								selected_index = index;
+								break;
+							}
+						}
+					}
+				}
+				if (selected_queue < 0) {
+					for (uint32_t offset = 0; offset < QueueCount && selected_queue < 0; offset++) {
+						const auto id = (gpu->m_next_queue + offset) % QueueCount;
+						auto&       queue = gpu->m_queues[id];
+						for (size_t index = 1; index < queue.size(); index++) {
+							const auto& candidate = queue[index];
+							if (!candidate.blocked &&
+							    (ContainsDirectFlip(candidate.commands) ||
+							     ContainsDirectFlip(candidate.constant_commands))) {
+								selected_queue = static_cast<int>(id);
+								selected_index = index;
+								break;
+							}
+						}
+					}
+				}
+				if (selected_queue < 0) {
+					// Flip-preparation submissions only record a CPU flip in the
+					// command buffer; they carry no GPU sync dependencies, so a
+					// blocked queue front must not starve them (otherwise a
+					// pending CPU flip never completes and the guest hangs).
+					for (uint32_t offset = 0; offset < QueueCount && selected_queue < 0; offset++) {
+						const auto id = (gpu->m_next_queue + offset) % QueueCount;
+						auto&       queue = gpu->m_queues[id];
+						for (size_t index = 1; index < queue.size(); index++) {
+							const auto& candidate = queue[index];
+							if (!candidate.blocked &&
+							    candidate.type == SubmissionType::FlipPreparation) {
+								selected_queue = static_cast<int>(id);
+								selected_index = index;
+								break;
+							}
+						}
 					}
 				}
 				if (selected_queue < 0) {
@@ -587,8 +790,9 @@ void GpuState::ThreadRun(void* data) {
 					continue;
 				}
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission  = std::move(queue.front());
-				queue.pop_front();
+				auto ready = queue.begin() + selected_index;
+				submission = std::move(*ready);
+				queue.erase(ready);
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
@@ -619,6 +823,7 @@ void GpuState::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
+			submission.blocked_retries++;
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
@@ -638,8 +843,8 @@ void GpuState::ThreadRun(void* data) {
 
 bool GpuState::Process(Submission& submission) {
 	auto&      cp          = GetProcessor(submission.queue_id);
+	cp.SetQueueId(submission.queue_id);
 	const bool first_slice = !submission.started;
-
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
 	}
@@ -728,6 +933,17 @@ bool GpuState::Process(Submission& submission) {
 			break;
 	}
 
+	if (complete) {
+		submission.blocked_wait_address = 0;
+	} else if (submission.type == SubmissionType::Graphics &&
+	           submission.constant_execution.HasBlockedWait()) {
+		submission.blocked_wait_address =
+		    submission.constant_execution.BlockedWaitAddress();
+	} else if (submission.command_execution.HasBlockedWait()) {
+		submission.blocked_wait_address = submission.command_execution.BlockedWaitAddress();
+	} else {
+		submission.blocked_wait_address = 0;
+	}
 	return complete;
 }
 
@@ -740,6 +956,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution& execution, uint32_t* bu
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	execution.m_blocked_wait_valid = false;
+	execution.m_blocked_wait_address = 0;
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -811,7 +1029,52 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			continue;
 		}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		// Some guest command buffers leave zero-filled alignment holes between
+		// otherwise valid PM4 packets. Treat a zero word as padding rather than
+		// dispatching it as an unknown packet header.
+		if (packet_header == 0) {
+			cursor.next_packet++;
+			cursor.remaining_dw--;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		// Orphan trailing dword (e.g. after a soft-continued bad indirect buffer): skip
+		// instead of hard-exiting — a type-3 packet always needs at least header+1 body.
+		if (remaining_dw < 2) {
+			static std::atomic<uint32_t> orphan_log_count {0};
+			if (orphan_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("PM4 desync: orphan trailing dword offset=0x%05" PRIx32
+				     " cmd_id=0x%08" PRIx32 " remaining=%" PRIu32 " — skip\n",
+				     total_dw - remaining_dw, packet_header, remaining_dw);
+			}
+			cursor.next_packet++;
+			cursor.remaining_dw--;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		const auto packet_type = (packet_header >> 30u) & 0x3u;
+		if (packet_type != 3u) {
+			static std::atomic<uint32_t> desync_log_count {0};
+			if (desync_log_count.fetch_add(1, std::memory_order_relaxed) < 256) {
+				const auto offset = total_dw - remaining_dw;
+				LOGF("PM4 desync: non-type3 header offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32
+				     " type=%" PRIu32 " op=0x%02" PRIx32 " remaining=%" PRIu32 " — skip 1 dword\n",
+				     offset, packet_header, packet_type, opcode, remaining_dw);
+				const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
+				const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 8);
+				auto* const base       = packet - offset;
+				for (uint32_t i = dump_begin; i < dump_end; i++) {
+					LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "),
+					     base[i]);
+				}
+			}
+			cursor.next_packet++;
+			cursor.remaining_dw--;
+			execution.m_made_progress = true;
+			continue;
+		}
 
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
@@ -850,19 +1113,30 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		auto handler = g_cp_op_func[opcode];
 
 		if (handler == nullptr) {
-			const auto offset = total_dw - remaining_dw;
-			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
-			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
-			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
-			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
-			auto* const base       = packet - offset;
-			for (uint32_t i = dump_begin; i < dump_end; i++) {
-				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
+			const auto offset    = total_dw - remaining_dw;
+			auto       packet_dw = KYTY_PM4_LEN(packet_header);
+			if (packet_dw == 0 || packet_dw > remaining_dw) {
+				packet_dw = 1;
 			}
-			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
-			     total_dw - remaining_dw, packet_header);
+			static std::atomic<uint32_t> unknown_log_count {0};
+			if (unknown_log_count.fetch_add(1, std::memory_order_relaxed) < 256) {
+				LOGF("unknown PM4 packet (soft-skip): data=0x%016" PRIx64 ", num_dw=%" PRIu32
+				     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32
+				     ", op=0x%02" PRIx32 ", skip=%" PRIu32 "\n",
+				     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
+				     reinterpret_cast<uint64_t>(packet), packet_header, opcode, packet_dw);
+				const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
+				const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+				auto* const base       = packet - offset;
+				for (uint32_t i = dump_begin; i < dump_end; i++) {
+					LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "),
+					     base[i]);
+				}
+			}
+			cursor.next_packet += packet_dw;
+			cursor.remaining_dw -= packet_dw;
+			execution.m_made_progress = true;
+			continue;
 		}
 
 		const auto packet_dw =
@@ -1289,7 +1563,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	CheckBuffer();
-
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);
 		const auto log_width = static_cast<int>(sizeof(T) * 2u);
@@ -1326,6 +1599,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
 		std::memcpy(dst, &data, sizeof(data));
+		LogGpuSyncWrite(m_queue_id, m_submit_id, reinterpret_cast<uint64_t>(dst), data,
+		                sizeof(data), eop_event_type, cache_action, event_index, event_write_source,
+		                interrupt_selector);
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1372,6 +1648,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					std::memcpy(dst, &value, sizeof(value));
+					LogGpuSyncWrite(m_queue_id, m_submit_id, reinterpret_cast<uint64_t>(dst), value,
+					                sizeof(value), eop_event_type, cache_action, event_index,
+					                event_write_source, interrupt_selector);
 
 					if (with_interrupt) {
 						if (with_writeback) {

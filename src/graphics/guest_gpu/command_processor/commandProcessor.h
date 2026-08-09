@@ -25,9 +25,12 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	[[nodiscard]] bool HasBlockedWait() const noexcept { return m_blocked_wait_valid; }
+	[[nodiscard]] uint64_t BlockedWaitAddress() const noexcept { return m_blocked_wait_address; }
 
 private:
 	friend class CommandProcessor;
+	friend class GpuState;
 
 	struct BufferCursor {
 		uint32_t* next_packet         = nullptr;
@@ -39,6 +42,8 @@ private:
 	std::vector<BufferCursor> m_buffer_stack;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	bool                      m_blocked_wait_valid = false;
+	uint64_t                  m_blocked_wait_address = 0;
 };
 
 class CommandProcessor {
@@ -117,6 +122,8 @@ public:
 
 	void WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
 	void DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
+	void WriteScratchRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
+	void ReadScratchRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
@@ -137,6 +144,8 @@ public:
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
+	[[nodiscard]] uint32_t GetQueueId() const { return m_queue_id; }
+	void                   SetQueueId(uint32_t queue_id) { m_queue_id = queue_id; }
 
 private:
 	template <typename T>
@@ -174,10 +183,12 @@ private:
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
 
-	uint32_t m_const_ram[0x3000] = {0};
+	uint32_t m_const_ram[0x3000]   = {0};
+	uint32_t m_scratch_ram[0x200] = {0};
 
 	FlipInfo m_flip;
 	uint64_t m_submit_id      = 0;
+	uint32_t m_queue_id       = 0;
 	bool     m_predicate_skip = false;
 };
 

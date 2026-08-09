@@ -647,6 +647,14 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	    multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
 	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format = descriptor.Format();
+	const DepthFormatPolicy* sampled_depth_policy =
+	    !storage && resource.depth_compare ? FindGuestDepthFormatPolicy(format) : nullptr;
+	if (resource.depth_compare && (sampled_depth_policy == nullptr || !depth_tile)) {
+		EXIT("unsupported sampled depth comparison texture: format=%u tile=%u kind=%u "
+		     "dimension=%u\n",
+		     format, tile, static_cast<uint32_t>(resource.kind),
+		     static_cast<uint32_t>(resource.dimension));
+	}
 	const bool sampled_numeric_class =
 	    storage || ((resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
 	                Prospero::IsUintTextureFormat(format));
@@ -685,14 +693,18 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto pixel_format = TextureGetFormat(format);
+	const auto pixel_format = sampled_depth_policy != nullptr
+	                              ? sampled_depth_policy->depth_attachment_format
+	                              : TextureGetFormat(format);
 	const auto storage_view_format =
 	    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt)
 	        ? vk::Format::eR32Uint
 	        : SrgbStorageViewFormat(pixel_format);
-	const auto              view_format = storage && storage_view_format != vk::Format::eUndefined
-	                                          ? storage_view_format
-	                                          : pixel_format;
+	const auto view_format = sampled_depth_policy != nullptr
+	                              ? sampled_depth_policy->sampled_view_format
+	                              : (storage && storage_view_format != vk::Format::eUndefined
+	                                     ? storage_view_format
+	                                     : pixel_format);
 	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
@@ -702,8 +714,10 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	desc.info.extent       = {width, height, volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
 	desc.info.pitch        = pitch;
-	desc.info.bytes_per_block =
-	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
+	desc.info.bytes_per_block = sampled_depth_policy != nullptr
+	                                ? sampled_depth_policy->bytes_per_element
+	                                : (block_bytes != 0 ? block_bytes
+	                                                    : Prospero::NumBytesPerElement(format));
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
 	if (samples > 1) {
@@ -725,8 +739,8 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateDepthTargetBinding(resource, descriptor, image, pixel_format, size.size);
-		(void)SelectSampledDepthView(image->info.pixel_format, pixel_format,
+		ValidateDepthTargetBinding(resource, descriptor, image, view_format, size.size);
+		(void)SelectSampledDepthView(image->info.pixel_format, view_format,
 		                             descriptor.DstSelXYZW());
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
@@ -750,6 +764,25 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	                                       });
 	if (!depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
+	}
+	// Vulkan forbids LINEAR filters on integer sampled images (e.g. R8_UINT). Guest shaders
+	// sometimes still request bilinear; coerce to point so vkCmdDispatch stays valid.
+	const bool integer_image = std::any_of(
+	    program.info.sampled_pairs.begin(), program.info.sampled_pairs.end(),
+	    [&](const auto& pair) {
+		    return pair.sampler == index && pair.image < program.info.images.size() &&
+		           program.info.images[pair.image].kind ==
+		               ShaderRecompiler::IR::ResourceKind::ImageUint;
+	    });
+	if (integer_image) {
+		// XyMagFilter/XyMinFilter at fields[2] bits 20-23; kPoint = 0.
+		descriptor.fields[2] &= ~((0x3u << 20u) | (0x3u << 22u));
+		const auto mip = (descriptor.fields[2] >> 26u) & 0x3u;
+		if (mip == static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear)) {
+			descriptor.fields[2] =
+			    (descriptor.fields[2] & ~(0x3u << 26u)) |
+			    (static_cast<uint32_t>(Prospero::SamplerMipFilter::kPoint) << 26u);
+		}
 	}
 	return context.GetSamplerCache().GetSampler(descriptor);
 }
@@ -778,9 +811,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (image.info.data.Empty()) {
 		return;
 	}
-	if (image.binding.is_bound) {
-		image.binding.force_general |= storage;
-	}
+	image.binding.force_general |= storage;
 	image.binding.is_bound = true;
 	TrackImageBinding(id);
 }

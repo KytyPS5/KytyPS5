@@ -112,6 +112,11 @@ void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
+bool PthreadGetGuestHostContext(uint64_t* host_rsp, uint64_t* host_rbp);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void PthreadSaveCurrentHostStackLimits();
+bool PthreadGetGuestHostStackLimits(uint64_t* stack_base, uint64_t* stack_limit);
+#endif
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size);

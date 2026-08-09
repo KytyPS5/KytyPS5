@@ -1587,14 +1587,12 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {
-		std::vector<std::string> list;
-		list.push_back(fmt::format("format = {}", format));
-		list.push_back(fmt::format("width  = {}", width));
-		list.push_back(fmt::format("height = {}", height));
-		list.push_back(fmt::format("pitch  = {}", pitch));
-		list.push_back(fmt::format("levels = {}", levels));
-		list.push_back(fmt::format("tile   = {}", tile));
-		EXIT("unknown format:\n%s\n", Common::Concat(list, '\n').c_str());
+		// Soft-fail: TLOU hits unsupported combos (e.g. format=502 tile=22 3x1x12).
+		// EXIT killed the GPU thread mid-submit; leave size=0 for callers to skip.
+		LOGF_COLOR(Log::Color::Yellow,
+		           "TileGetTextureSize: unknown format soft-fail "
+		           "format=%u %ux%u pitch=%u levels=%u tile=%u\n",
+		           format, width, height, pitch, levels, tile);
 	}
 }
 

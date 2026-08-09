@@ -122,11 +122,14 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
 		return BindingType::DepthTarget;
 	}
-	if (image.usage.render_target) {
-		return BindingType::RenderTarget;
-	}
+	// Prefer VideoOut over RenderTarget: flip surfaces often share an RT
+	// address. Present must detile with the guest VideoOut format, not the RT
+	// transfer format, or tiled UI uploads as sparse garbage / clipped text.
 	if (image.usage.video_out) {
 		return BindingType::VideoOut;
+	}
+	if (image.usage.render_target) {
+		return BindingType::RenderTarget;
 	}
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
@@ -1003,6 +1006,7 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& source,
                                uint64_t source_offset) {
 	const auto& info   = image.info;
+	const auto  binding = info.IsDepth() ? BindingType::DepthTarget : desc.type;
 	const auto  upload = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
@@ -1010,13 +1014,13 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	};
 
-	if (desc.type != BindingType::DepthTarget) {
-		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
+	if (binding != BindingType::DepthTarget) {
+		auto plan = BuildColorTransfer(image, binding, TransferDirection::Upload);
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
 			     "pitch=%u levels=%u layers=%u samples=%u\n",
-			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
+			     static_cast<uint32_t>(binding), info.data.address, info.data.size,
 			     info.guest_format, info.tile_mode, static_cast<uint32_t>(plan.layout.tile_family),
 			     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
 			     info.resources.levels, info.resources.layers, info.samples);
@@ -1033,7 +1037,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		return;
 	}
 
-	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
+	if (!info.IsDepth() || info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");

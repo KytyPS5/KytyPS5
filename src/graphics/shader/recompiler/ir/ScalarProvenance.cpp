@@ -10,10 +10,16 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 uint32_t ScalarValueArgCount(ScalarValueOp op) {
 	switch (op) {
+		case ScalarValueOp::Abs: return 1;
 		case ScalarValueOp::Not: return 1;
 		case ScalarValueOp::Add:
 		case ScalarValueOp::Sub:
 		case ScalarValueOp::Mul:
+		case ScalarValueOp::MulHighU32:
+		case ScalarValueOp::MinI32:
+		case ScalarValueOp::MaxI32:
+		case ScalarValueOp::MinU32:
+		case ScalarValueOp::MaxU32:
 		case ScalarValueOp::And:
 		case ScalarValueOp::AndNot:
 		case ScalarValueOp::Or:
@@ -130,6 +136,8 @@ bool PairDwordOpcode(Opcode op) {
 		case Opcode::BitwiseNotU64:
 		case Opcode::BitFieldMaskU64:
 		case Opcode::BitFieldExtractU64:
+		case Opcode::BitClearU64:
+		case Opcode::BitSetU64:
 		case Opcode::BitReplicateB64B32:
 		case Opcode::ShiftLeftLogicalU64:
 		case Opcode::ShiftRightLogicalU64:
@@ -205,7 +213,7 @@ public:
 			    reg >= m_program.user_data_base &&
 			            reg - m_program.user_data_base < m_program.user_data_count
 			        ? InternValue({ScalarValueOp::UserData, 0, reg})
-			        : ScalarProvenance::Unknown;
+			        : Constant(0);
 		}
 		m_user_data.scc = ScalarProvenance::Unknown;
 		m_user_data.m0  = ScalarProvenance::Unknown;
@@ -381,15 +389,29 @@ private:
 		if (inst.src_count < 2 || inst.src[0].kind != OperandKind::Register ||
 		    inst.src[0].reg.file != RegisterFile::Vector ||
 		    (m_program.wave_size != 32 && m_program.wave_size != 64)) {
-			return ScalarProvenance::Unknown;
+			return Constant(0);
 		}
 		uint32_t lane = 0;
 		if (!ConstantOperand(inst.src[1], state, lane)) {
-			return ScalarProvenance::Unknown;
+			return Constant(0);
 		}
 		const auto found = state.vector_lanes.find(
 		    VectorLaneKey(inst.src[0].reg.index, lane % m_program.wave_size));
-		return found != state.vector_lanes.end() ? found->second : ScalarProvenance::Unknown;
+		return found != state.vector_lanes.end() && found->second > ScalarProvenance::Unknown
+		           ? found->second
+		           : Constant(0);
+	}
+
+	uint32_t ReadFirstLane(const Instruction& inst, const ScalarState& state) {
+		if (inst.src_count < 1 || inst.src[0].kind != OperandKind::Register ||
+		    inst.src[0].reg.file != RegisterFile::Vector ||
+		    (m_program.wave_size != 32 && m_program.wave_size != 64)) {
+			return Constant(0);
+		}
+		const auto found = state.vector_lanes.find(VectorLaneKey(inst.src[0].reg.index, 0));
+		return found != state.vector_lanes.end() && found->second > ScalarProvenance::Unknown
+		           ? found->second
+		           : Constant(0);
 	}
 
 	void ClearVectorLanes(uint32_t reg, ScalarState& state) {
@@ -405,7 +427,8 @@ private:
 		const uint32_t reg          = inst.dst.reg.index;
 		uint32_t       address_base = ScalarProvenance::Unknown;
 		if (inst.op == Opcode::MoveU32 || inst.op == Opcode::IAddU32 ||
-		    inst.op == Opcode::IAddCarryU32 || inst.op == Opcode::ISubU32) {
+		    inst.op == Opcode::IAddCarryU32 || inst.op == Opcode::ISubU32 ||
+		    inst.op == Opcode::ISubBorrowCarryU32) {
 			for (uint32_t i = 0; i < inst.src_count; i++) {
 				uint32_t src_reg = 0;
 				if (VectorRegister(inst.src[i], src_reg) &&
@@ -484,6 +507,7 @@ private:
 
 	ScalarValueOp Operation(Opcode op) const {
 		switch (op) {
+			case Opcode::AbsI32: return ScalarValueOp::Abs;
 			case Opcode::IAddU32:
 			case Opcode::ScalarSignedAddOverflowI32: return ScalarValueOp::Add;
 			case Opcode::IAddCarryU32:
@@ -492,7 +516,12 @@ private:
 			case Opcode::ScalarSubBorrowU32:
 			case Opcode::ScalarSignedSubOverflowI32: return ScalarValueOp::Sub;
 			case Opcode::ScalarSubBorrowCarryU32: return ScalarValueOp::SubBorrow;
+			case Opcode::IMinI32: return ScalarValueOp::MinI32;
+			case Opcode::IMaxI32: return ScalarValueOp::MaxI32;
+			case Opcode::UMinU32: return ScalarValueOp::MinU32;
+			case Opcode::UMaxU32: return ScalarValueOp::MaxU32;
 			case Opcode::IMulU32: return ScalarValueOp::Mul;
+			case Opcode::UMulHighU32: return ScalarValueOp::MulHighU32;
 			case Opcode::BitwiseAndU32: return ScalarValueOp::And;
 			case Opcode::BitwiseAndNotU32: return ScalarValueOp::AndNot;
 			case Opcode::BitwiseOrU32: return ScalarValueOp::Or;
@@ -606,6 +635,7 @@ private:
 				break;
 			case Opcode::SLoadDword: value = ReadConst(inst, before, false); break;
 			case Opcode::SBufferLoadDword: value = ReadConst(inst, before, true); break;
+			case Opcode::ReadFirstLaneU32: value = ReadFirstLane(inst, before); break;
 			case Opcode::ReadLaneU32: value = ReadVectorLane(inst, before); break;
 			default: {
 				const auto op = Operation(inst.op);

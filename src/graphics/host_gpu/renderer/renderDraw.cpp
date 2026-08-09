@@ -887,7 +887,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	return true;
 }
 
-static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
+static bool RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	EXIT_IF(draw.name == nullptr);
 	auto& ctx    = buffer.GetRegisters();
@@ -912,19 +912,28 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	}
 	if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
 	                         state.vs_shader)) {
-		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
+		static std::atomic_uint vs_fail_log {0};
+		if (vs_fail_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("ShaderCompileInfoVS failed for draw %s (skip)\n", draw.name);
+		}
+		return false;
 	}
 
 	if (!state.ps_active) {
-		return;
+		return true;
 	}
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
 	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
 	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
-		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
+		static std::atomic_uint ps_fail_log {0};
+		if (ps_fail_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("ShaderCompileInfoPS failed for draw %s (skip)\n", draw.name);
+		}
+		return false;
 	}
+	return true;
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, RenderCommandBuffer& buffer,
@@ -1253,7 +1262,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 		return;
 	}
 
-	RefreshShaders(buffer, draw, true, state);
+	if (!RefreshShaders(buffer, draw, true, state)) {
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
 
@@ -1338,7 +1350,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 		ResetBindings();
 		return;
 	}
-	RefreshShaders(buffer, draw, false, state);
+	if (!RefreshShaders(buffer, draw, false, state)) {
+		ResetBindings();
+		return;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&

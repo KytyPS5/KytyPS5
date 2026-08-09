@@ -227,6 +227,8 @@ namespace Ssl = Network::Ssl;
 LIB_DEFINE(InitNet_1_Ssl) {
 	LIB_FUNC("hdpVEUDFW3s", Ssl::SslInit);
 	LIB_FUNC("0K1yQ6Lv-Yc", Ssl::SslTerm);
+	LIB_FUNC("-PoIzr3PEk0", Ssl::SslGetMemoryPoolStats);
+	LIB_FUNC("Ab7+DH+gYyM", Ssl::SslLoadCert);
 	LIB_FUNC("TDfQqO-gMbY", Ssl::SslGetCaCerts);
 	LIB_FUNC("qIvLs0gYxi0", Ssl::SslFreeCaCerts);
 }
@@ -303,6 +305,10 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 		out->scheme[0]   = '\0';
 		out->hostname[0] = '\0';
 		out->path[0]     = '\0';
+		out->username    = out->path;
+		out->password    = out->path;
+		out->query       = out->path;
+		out->fragment    = out->path;
 	}
 
 	return 0;
@@ -463,6 +469,14 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 			needed += part.len + 1;
 		}
 	}
+	const bool needs_empty_part =
+	    username.begin == nullptr || password.begin == nullptr || hostname.begin == nullptr ||
+	    path.begin == nullptr || query.begin == nullptr || fragment.begin == nullptr;
+	if (needs_empty_part) {
+		// The guest consumes optional URI fields as strings without checking for null. Keep one
+		// shared empty string in the pool for every component absent from the URL.
+		needed++;
+	}
 
 	if (require != nullptr) {
 		*require = needed;
@@ -487,6 +501,28 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 		out->path     = CopyUriPart(dst, path);
 		out->query    = CopyUriPart(dst, query);
 		out->fragment = CopyUriPart(dst, fragment);
+		if (needs_empty_part) {
+			auto* empty = dst;
+			*dst++      = '\0';
+			if (out->username == nullptr) {
+				out->username = empty;
+			}
+			if (out->password == nullptr) {
+				out->password = empty;
+			}
+			if (out->hostname == nullptr) {
+				out->hostname = empty;
+			}
+			if (out->path == nullptr) {
+				out->path = empty;
+			}
+			if (out->query == nullptr) {
+				out->query = empty;
+			}
+			if (out->fragment == nullptr) {
+				out->fragment = empty;
+			}
+		}
 	}
 
 	return 0;
@@ -612,6 +648,85 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 	return 0;
 }
 
+static int KYTY_SYSV_ABI HttpParseResponseHeader(const char* header, uint64_t header_len,
+                                                 const char* field, const char** field_value,
+                                                 uint64_t* value_len) {
+	PRINT_NAME_ENABLE(true);
+	PRINT_NAME();
+	LOGF("\t header = 0x%016" PRIx64 " header_len = %" PRIu64 " field = %s\n",
+	     reinterpret_cast<uint64_t>(header), header_len, field != nullptr ? field : "(null)");
+
+	if (field_value != nullptr) {
+		*field_value = nullptr;
+	}
+	if (value_len != nullptr) {
+		*value_len = 0;
+	}
+
+	if (header == nullptr) {
+		return Network::HTTP_ERROR_PARSE_HTTP_INVALID_RESPONSE;
+	}
+	if (field == nullptr || field_value == nullptr || value_len == nullptr) {
+		return Network::HTTP_ERROR_PARSE_HTTP_INVALID_VALUE;
+	}
+
+	size_t field_len = 0;
+	while (field_len < 0x1000 && field[field_len] != '\0') {
+		field_len++;
+	}
+	if (field_len == 0x1000) {
+		return Network::HTTP_ERROR_PARSE_HTTP_INVALID_VALUE;
+	}
+
+	const auto equals_ignore_case = [](const char* left, const char* right, size_t length) {
+		for (size_t i = 0; i < length; i++) {
+			if (std::tolower(static_cast<unsigned char>(left[i])) !=
+			    std::tolower(static_cast<unsigned char>(right[i]))) {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	size_t line_start = 0;
+	while (line_start < header_len) {
+		size_t line_end = line_start;
+		while (line_end < header_len && header[line_end] != '\r' && header[line_end] != '\n') {
+			line_end++;
+		}
+
+		if (line_end - line_start > field_len && header[line_start + field_len] == ':' &&
+		    equals_ignore_case(field, header + line_start, field_len)) {
+			size_t value_start = line_start + field_len + 1;
+			while (value_start < line_end &&
+			       (header[value_start] == ' ' || header[value_start] == '\t')) {
+				value_start++;
+			}
+
+			*field_value = value_start < line_end ? header + value_start : nullptr;
+			*value_len   = value_start < line_end ? line_end - value_start : 0;
+
+			if (line_end < header_len && header[line_end] == '\r') {
+				line_end++;
+			}
+			if (line_end < header_len && header[line_end] == '\n') {
+				line_end++;
+			}
+			return static_cast<int>(line_end);
+		}
+
+		if (line_end >= header_len) {
+			break;
+		}
+		line_start = line_end + 1;
+		if (header[line_end] == '\r' && line_start < header_len && header[line_start] == '\n') {
+			line_start++;
+		}
+	}
+
+	return Network::HTTP_ERROR_PARSE_HTTP_NOT_FOUND;
+}
+
 LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("A9cVMUtEp4Y", Http::HttpInit);
 	LIB_FUNC("Ik-KpLTlf7Q", Http::HttpTerm);
@@ -647,6 +762,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("yigr4V0-HTM", Http::HttpSetRecvTimeOut);
 	LIB_FUNC("T-mGo9f3Pu4", Http::HttpSetAutoRedirect);
 	LIB_FUNC("qFg2SuyTJJY", Http::HttpSetAuthEnabled);
+	LIB_FUNC("hPTXo3bICzI", LibHttp::HttpParseResponseHeader);
 	LIB_FUNC("IWalAn-guFs", LibHttp::HttpUriParse);
 	LIB_FUNC("YuOW3dDAKYc", LibHttp::HttpUriEscape);
 	LIB_FUNC("5LZA+KPISVA", LibHttp::HttpUriBuild);
@@ -755,6 +871,13 @@ static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t 
 	g_http2_contexts[id] = {libnet_mem_id, libssl_ctx_id, pool_size, max_concurrent_request};
 
 	return id;
+}
+
+static int KYTY_SYSV_ABI Http2GetMemoryPoolStats() {
+	PRINT_NAME_ENABLE(true);
+	PRINT_NAME();
+	LOGF("\t Http2GetMemoryPoolStats\n");
+	return 0;
 }
 
 static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* user_agent,
@@ -1351,6 +1474,7 @@ static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 
 LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("3JCe3lCbQ8A", LibHttp2::Http2Init);
+	LIB_FUNC("otUQuZa-mv0", LibHttp2::Http2GetMemoryPoolStats);
 	LIB_FUNC("YiBUtz-pGkc", LibHttp2::Http2Term);
 	LIB_FUNC("+wCt7fCijgk", LibHttp2::Http2CreateTemplate);
 	LIB_FUNC("pDom5-078DA", LibHttp2::Http2DeleteTemplate);

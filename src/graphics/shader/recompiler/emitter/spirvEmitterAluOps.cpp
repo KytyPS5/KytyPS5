@@ -68,6 +68,37 @@ void EmitFindLsbU32(EmitterState& state, const IR::Instruction& inst) {
 	EmitStoreU32(state, inst.dst, u32);
 }
 
+void EmitFindLsbU64(EmitterState& state, const IR::Instruction& inst) {
+	const auto low            = EmitSequentialValueLoad(state, inst.src[0], 0);
+	const auto high           = EmitSequentialValueLoad(state, inst.src[0], 1);
+	const auto low_i32        = state.builder.AllocateId();
+	const auto low_lsb        = state.builder.AllocateId();
+	const auto low_non_zero   = state.builder.AllocateId();
+	const auto high_i32       = state.builder.AllocateId();
+	const auto high_lsb       = state.builder.AllocateId();
+	const auto high_pos       = state.builder.AllocateId();
+	const auto high_non_zero  = state.builder.AllocateId();
+	const auto high_result    = state.builder.AllocateId();
+	const auto result         = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, state.int_type, low_i32, state.glsl_std450, GlslFindILsb, low});
+	state.builder.AddFunction({OpBitcast, state.uint_type, low_lsb, low_i32});
+	state.builder.AddFunction(
+	    {OpINotEqual, state.bool_type, low_non_zero, low, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpExtInst, state.int_type, high_i32, state.glsl_std450, GlslFindILsb, high});
+	state.builder.AddFunction({OpBitcast, state.uint_type, high_lsb, high_i32});
+	state.builder.AddFunction(
+	    {OpIAdd, state.uint_type, high_pos, high_lsb, ConstantU32(state, 32)});
+	state.builder.AddFunction(
+	    {OpINotEqual, state.bool_type, high_non_zero, high, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpSelect, state.uint_type, high_result, high_non_zero, high_pos,
+	                           ConstantU32(state, 0xffffffffu)});
+	state.builder.AddFunction(
+	    {OpSelect, state.uint_type, result, low_non_zero, low_lsb, high_result});
+	EmitStoreU32(state, inst.dst, result);
+}
+
 void EmitFindMsbFromHighU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto src      = EmitValueLoad(state, inst.src[0]);
 	const auto i32      = state.builder.AllocateId();
@@ -453,6 +484,50 @@ void EmitBitSetU32(EmitterState& state, const IR::Instruction& inst) {
 	EmitStoreU32(state, inst.dst, ret);
 }
 
+void EmitBitModifyU64(EmitterState& state, const IR::Instruction& inst, bool set_bit) {
+	const auto value_low  = EmitSequentialValueLoad(state, inst.src[0], 0);
+	const auto value_high = EmitSequentialValueLoad(state, inst.src[0], 1);
+	const auto bit        = EmitAndConstant(state, EmitValueLoad(state, inst.src[1]), 63u);
+	const auto bit_low    = EmitAndConstant(state, bit, 31u);
+	const auto high_bit   = EmitNotEqualZeroBool(state, EmitAndConstant(state, bit, 32u));
+	const auto mask       = state.builder.AllocateId();
+	const auto inverse    = state.builder.AllocateId();
+	const auto low_set    = state.builder.AllocateId();
+	const auto low_clear  = state.builder.AllocateId();
+	const auto high_set   = state.builder.AllocateId();
+	const auto high_clear = state.builder.AllocateId();
+	const auto low_ret    = state.builder.AllocateId();
+	const auto high_ret   = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, state.uint_type, mask, ConstantU32(state, 1), bit_low});
+	state.builder.AddFunction({OpNot, state.uint_type, inverse, mask});
+	state.builder.AddFunction({OpBitwiseOr, state.uint_type, low_set, value_low, mask});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, low_clear, value_low, inverse});
+	state.builder.AddFunction({OpBitwiseOr, state.uint_type, high_set, value_high, mask});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, high_clear, value_high, inverse});
+	if (set_bit) {
+		state.builder.AddFunction(
+		    {OpSelect, state.uint_type, low_ret, high_bit, value_low, low_set});
+		state.builder.AddFunction(
+		    {OpSelect, state.uint_type, high_ret, high_bit, high_set, value_high});
+	} else {
+		state.builder.AddFunction(
+		    {OpSelect, state.uint_type, low_ret, high_bit, value_low, low_clear});
+		state.builder.AddFunction(
+		    {OpSelect, state.uint_type, high_ret, high_bit, high_clear, value_high});
+	}
+	EmitStoreU32(state, inst.dst, low_ret);
+	EmitStoreU32(state, OffsetRegisterOperand(inst.dst, 1), high_ret);
+}
+
+void EmitBitClearU64(EmitterState& state, const IR::Instruction& inst) {
+	EmitBitModifyU64(state, inst, false);
+}
+
+void EmitBitSetU64(EmitterState& state, const IR::Instruction& inst) {
+	EmitBitModifyU64(state, inst, true);
+}
+
 uint32_t EmitNegateU32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction({OpSNegate, state.uint_type, ret, value});
@@ -586,6 +661,24 @@ void EmitISubBorrowU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto borrow = state.builder.AllocateId();
 	state.builder.AddFunction({OpISub, state.uint_type, result, lhs, rhs});
 	state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow, rhs, lhs});
+	EmitStoreU32(state, inst.dst, result);
+	EmitLaneMaskPairFromBool(state, inst.dst2, borrow);
+}
+
+void EmitISubBorrowCarryU32(EmitterState& state, const IR::Instruction& inst) {
+	const auto lhs       = EmitValueLoad(state, inst.src[0]);
+	const auto rhs       = EmitValueLoad(state, inst.src[1]);
+	const auto borrow_in = EmitAndConstant(state, EmitValueLoad(state, inst.src[2]), 1u);
+	const auto partial   = state.builder.AllocateId();
+	const auto result    = state.builder.AllocateId();
+	const auto borrow0   = state.builder.AllocateId();
+	const auto borrow1   = state.builder.AllocateId();
+	const auto borrow    = state.builder.AllocateId();
+	state.builder.AddFunction({OpISub, state.uint_type, partial, lhs, rhs});
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow0, rhs, lhs});
+	state.builder.AddFunction({OpISub, state.uint_type, result, partial, borrow_in});
+	state.builder.AddFunction({OpUGreaterThan, state.bool_type, borrow1, borrow_in, partial});
+	state.builder.AddFunction({OpLogicalOr, state.bool_type, borrow, borrow0, borrow1});
 	EmitStoreU32(state, inst.dst, result);
 	EmitLaneMaskPairFromBool(state, inst.dst2, borrow);
 }

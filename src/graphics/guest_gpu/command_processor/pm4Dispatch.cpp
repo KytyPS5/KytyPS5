@@ -228,6 +228,8 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_SET_SH_REG]                = CpOpSetShaderReg;
 	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG]           = CpOpSetUconfigReg;
 	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG_INDEX]     = CpOpSetUconfigReg;
+	g_cp_op_func[Pm4::IT_SCRATCH_RAM_WRITE]         = CpOpScratchRamWrite;
+	g_cp_op_func[Pm4::IT_SCRATCH_RAM_READ]          = CpOpScratchRamRead;
 	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG_INDIRECT]  = CpOpIndirectCxRegs;
 	g_cp_op_func[Pm4::IT_SET_SH_REG_INDIRECT]       = CpOpIndirectShRegs;
 	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG_INDIRECT]  = CpOpIndirectUcRegs;

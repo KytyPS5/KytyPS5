@@ -252,23 +252,43 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	return nullptr;
 }
 
-static std::span<const uint32_t> ShaderGetMappedCode(uint64_t shader_addr, const char* label,
-                                                     uint64_t shader_hash) {
+// Soft-fail: missing ShaderMap / null addr / invalid size skip the stage instead of EXIT.
+static bool ShaderGetMappedCode(uint64_t shader_addr, const char* label, uint64_t shader_hash,
+                                std::span<const uint32_t>& code_out) {
+	code_out = {};
+	if (shader_addr == 0) {
+		static std::atomic_uint null_log_count {0};
+		if (null_log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("%s hash=0x%016" PRIx64 " shader_addr=0 (missing ShaderMap / unmapped)\n", label,
+			     shader_hash);
+		}
+		return false;
+	}
+
 	ShaderMappedData data;
 	if (!ShaderGetMappedData(shader_addr, data)) {
-		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64 " is missing from ShaderMap\n", label,
-		     shader_hash, shader_addr);
+		static std::atomic_uint miss_log_count {0};
+		if (miss_log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64 " is missing from ShaderMap\n",
+			     label, shader_hash, shader_addr);
+		}
+		return false;
 	}
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
-		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
-		     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
-		     label, shader_hash, shader_addr, data.code_size_bytes);
+		static std::atomic_uint bad_log_count {0};
+		if (bad_log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
+			     label, shader_hash, shader_addr, data.code_size_bytes);
+		}
+		return false;
 	}
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	LOGF("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64 " using AGC shader_size=0x%08" PRIx32
 	     " (%" PRIu32 " dwords)\n",
 	     label, shader_hash, shader_addr, data.code_size_bytes, code_words);
-	return {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	code_out = {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	return true;
 }
 
 #if 0
@@ -1413,10 +1433,21 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
                           std::vector<uint32_t>& spirv) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::Amber300);
 
-	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0 || regs.gs_regs.chksum == 0);
+	if (regs.es_regs.data_addr == 0 || regs.gs_regs.chksum == 0) {
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("ShaderRecompiler VS skipped: data_addr=0x%016" PRIx64 " chksum=0x%016" PRIx64
+			     "\n",
+			     regs.es_regs.data_addr, regs.gs_regs.chksum);
+		}
+		return false;
+	}
 
-	const uint64_t shader_addr = regs.es_regs.data_addr;
-	const auto code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler VS", regs.gs_regs.chksum);
+	const uint64_t                shader_addr = regs.es_regs.data_addr;
+	std::span<const uint32_t>     code;
+	if (!ShaderGetMappedCode(shader_addr, "ShaderRecompiler VS", regs.gs_regs.chksum, code)) {
+		return false;
+	}
 
 	ShaderRecompiler::CompileOptions options;
 	options.stage                = ShaderType::Vertex;
@@ -1470,7 +1501,19 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 
 	const uint64_t shader_addr = regs.ps_regs.data_addr;
 	const uint64_t shader_hash = regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : shader_addr;
-	const auto     code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler PS", shader_hash);
+	if (shader_addr == 0) {
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("ShaderRecompiler PS missing ShaderMap hash=0x%016" PRIx64 " data_addr=0\n",
+			     shader_hash);
+		}
+		return false;
+	}
+
+	std::span<const uint32_t> code;
+	if (!ShaderGetMappedCode(shader_addr, "ShaderRecompiler PS", shader_hash, code)) {
+		return false;
+	}
 
 	ShaderRecompiler::CompileOptions options;
 	options.stage                = ShaderType::Pixel;
@@ -1520,7 +1563,18 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	KYTY_PROFILER_FUNCTION(profiler::colors::CyanA700);
 
 	const uint64_t shader_addr = regs.cs_regs.data_addr;
-	const auto     code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler CS", shader_addr);
+	if (shader_addr == 0) {
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("ShaderRecompiler CS missing ShaderMap data_addr=0\n");
+		}
+		return false;
+	}
+
+	std::span<const uint32_t> code;
+	if (!ShaderGetMappedCode(shader_addr, "ShaderRecompiler CS", shader_addr, code)) {
+		return false;
+	}
 
 	ShaderRecompiler::CompileOptions options;
 	options.stage                = ShaderType::Compute;

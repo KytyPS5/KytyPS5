@@ -63,6 +63,7 @@ constexpr Vop2OpcodeInfo VOP2_OPS[] = {
     {0x24u, Opcode::VMbcntHiU32B32},
     {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerFullDestination},
     {0x28u, Opcode::VAddcU32},
+    {0x29u, Opcode::VSubbU32},
     {0x26u, Opcode::VSubNcU32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x27u, Opcode::VSubrevNcU32, Vop2SdwaProfile::IntegerFullDestination},
     {0x2bu, Opcode::VMacF32},
@@ -271,6 +272,7 @@ constexpr OpcodeMap VOP3_OPS[] = {
     {0x371u, Opcode::VAndOrB32},        {0x372u, Opcode::VOr3B32},
     {0x377u, Opcode::VPermlane16B32},   {0x378u, Opcode::VPermlanex16B32},
     {0x34bu, Opcode::VFmaF16},          {0x36du, Opcode::VAdd3U32},
+    {0x2ffu, Opcode::VLshlrevB64},
 };
 
 constexpr OpcodeMap VOP3P_OPS[] = {
@@ -965,6 +967,7 @@ bool FinalizeVop2Instruction(uint32_t pc, std::span<const uint32_t> code, uint32
 			inst.src_count = 3;
 			break;
 		case Opcode::VAddcU32:
+		case Opcode::VSubbU32:
 			inst.dst2.kind = OperandKind::VccLo;
 			inst.src2.kind = OperandKind::VccLo;
 			inst.src_count = 3;

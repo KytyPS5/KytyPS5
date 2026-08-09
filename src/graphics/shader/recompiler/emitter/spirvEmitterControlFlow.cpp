@@ -389,6 +389,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::IAddU32: EmitBinaryU32(state, inst, OpIAdd); break;
 		case IR::Opcode::IAddCarryU32: EmitIAddCarryU32(state, inst); break;
 		case IR::Opcode::ISubBorrowU32: EmitISubBorrowU32(state, inst); break;
+		case IR::Opcode::ISubBorrowCarryU32: EmitISubBorrowCarryU32(state, inst); break;
 		case IR::Opcode::ScalarAddCarryU32: EmitScalarAddCarryU32(state, inst); break;
 		case IR::Opcode::ScalarSubBorrowU32: EmitScalarSubBorrowU32(state, inst); break;
 		case IR::Opcode::ScalarSubBorrowCarryU32: EmitScalarSubBorrowCarryU32(state, inst); break;
@@ -451,6 +452,8 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::BitwiseNotU64: EmitUnaryU64(state, inst, OpNot); break;
 		case IR::Opcode::BitClearU32: EmitBitClearU32(state, inst); break;
 		case IR::Opcode::BitSetU32: EmitBitSetU32(state, inst); break;
+		case IR::Opcode::BitClearU64: EmitBitClearU64(state, inst); break;
+		case IR::Opcode::BitSetU64: EmitBitSetU64(state, inst); break;
 		case IR::Opcode::BitReverseU32: EmitUnaryU32(state, inst, OpBitReverse); break;
 		case IR::Opcode::BitCountU32: EmitBitCountU32(state, inst); break;
 		case IR::Opcode::BitCountU64: EmitBitCountU64(state, inst); break;
@@ -459,6 +462,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::MaskedBitCountHighU32: EmitMaskedBitCountU32(state, inst, 1); break;
 		case IR::Opcode::BitReplicateB64B32: EmitBitReplicateB64B32(state, inst); break;
 		case IR::Opcode::FindLsbU32: EmitFindLsbU32(state, inst); break;
+		case IR::Opcode::FindLsbU64: EmitFindLsbU64(state, inst); break;
 		case IR::Opcode::FindMsbFromHighU32: EmitFindMsbFromHighU32(state, inst); break;
 		case IR::Opcode::FindMsbFromHighU64: EmitFindMsbFromHighU64(state, inst); break;
 		case IR::Opcode::BitFieldMaskU32: EmitBitFieldMaskU32(state, inst); break;

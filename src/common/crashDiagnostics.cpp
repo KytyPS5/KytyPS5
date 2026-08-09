@@ -1161,4 +1161,35 @@ void SetSoftIdleKeepAlive(SoftIdleKeepAliveFn fn) {
 	g_soft_idle_keep_alive = fn;
 }
 
+[[noreturn]] void SoftIdleCurrentThread(const char* why, const char* detail) {
+	char reason[192] {};
+	if (detail != nullptr && detail[0] != '\0') {
+		std::snprintf(reason, sizeof(reason), "%s: %s", why != nullptr ? why : "guest_fault",
+		              detail);
+	} else {
+		std::snprintf(reason, sizeof(reason), "%s", why != nullptr ? why : "guest_fault");
+	}
+	NoteHaltReason("guest_thread_soft_idle", reason);
+	char message[384];
+	std::snprintf(message, sizeof(message),
+	              "GuestThread: soft-idle tid=%lu why=%s — process kept alive for GPU/diag",
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	              static_cast<unsigned long>(GetCurrentThreadId()),
+#else
+	              0ul,
+#endif
+	              reason);
+	EmergencyLogRaw(message);
+	LogFatalToFile(message);
+	std::fprintf(stderr, "%s\n", message);
+	std::fflush(stderr);
+	for (;;) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Sleep(1000);
+#else
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+#endif
+	}
+}
+
 } // namespace Common

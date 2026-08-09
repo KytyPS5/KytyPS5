@@ -65,9 +65,27 @@ constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0V
                                               GcrGl1Invalidate | GcrGl2Unshared | GcrGl2Invalidate |
                                               GcrGl2Writeback | GcrOrder012 | GcrOrder210;
 constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
+constexpr uint64_t GuestIndirectBufferFloor = 0x0000000100000000ull;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+// Prospero register-pair buffers live in high guest VA space. Truncated 32-bit values
+// (e.g. 0x26035b80 — looks like an encoded SH offset) must not be followed: soft-continue
+// on those reads poisons the CP and ends in remaining_dw < 2.
+[[nodiscard]] bool IndirectRegBufferAddressOk(uint64_t address, uint32_t num_regs) {
+	if (address == 0 || (address & 0x3u) != 0) {
+		return false;
+	}
+	if (address < GuestIndirectBufferFloor) {
+		return false;
+	}
+	const auto bytes = static_cast<uint64_t>(num_regs) * 8u;
+	if (bytes != 0 && address + bytes < address) {
+		return false;
+	}
+	return true;
 }
 
 // Indirect Cx descriptors retain their selector. Selector 1 offsets 0..31 address the
@@ -98,6 +116,12 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 	if (unknown != 0) {
 		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
 	}
+}
+
+void LogGpuSyncRelease(const CommandProcessor& /*cp*/, uint32_t /*raw0*/, uint32_t /*raw1*/,
+                       uint64_t /*dst_addr*/, uint64_t /*value*/, uint32_t /*data_sel*/,
+                       uint32_t /*interrupt_selector*/, uint32_t /*event_type*/,
+                       uint32_t /*event_index*/, uint32_t /*gcr_cntl*/, const char* /*result*/) {
 }
 
 } // namespace
@@ -2379,6 +2403,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto cx_indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	if (!IndirectRegBufferAddressOk(cx_indirect_address, indirect_num_dw)) {
+		static std::atomic<uint32_t> bad_addr_log {0};
+		if (bad_addr_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("\t temporary: skipping SET_CONTEXT_REG_INDIRECT with invalid buffer "
+			     "addr=0x%016" PRIx64 " num_regs=%" PRIu32 "\n",
+			     cx_indirect_address, indirect_num_dw);
+		}
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the decoded offset only
 		// for register dispatch.
@@ -2442,6 +2476,15 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	if (!IndirectRegBufferAddressOk(indirect_address, indirect_num_dw)) {
+		static std::atomic<uint32_t> bad_addr_log {0};
+		if (bad_addr_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("\t temporary: skipping SET_SH_REG_INDIRECT with invalid buffer "
+			     "addr=0x%016" PRIx64 " num_regs=%" PRIu32 "\n",
+			     indirect_address, indirect_num_dw);
+		}
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2461,24 +2504,38 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			continue;
 		}
 
+		// Match CX indirect: skip unknown/extended offsets instead of hard-exiting. TLOU emits
+		// pairs like raw=0x26015a80 (normalized 0x06015a80) that are outside SH_NUM.
 		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("\t temporary: skipping unknown indirect SH extended offset = 0x%08" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 " index=%" PRIu32 "/%" PRIu32
+				     " regs=0x%016" PRIx64 "\n",
+				     cmd_offset, raw_cmd_offset, value, i, indirect_num_dw, indirect_address);
+				if (log_count.load(std::memory_order_relaxed) == 1) {
+					auto* dump_regs = indirect_buffer - i * 2;
+					for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+						LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32
+						     ", value=0x%08" PRIx32 "\n",
+						     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+					}
+				}
+			}
+			continue;
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
-			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
-			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			static std::atomic<uint32_t> unknown_log_count {0};
+			if (unknown_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("\t temporary: skipping unknown indirect SH register: index=%" PRIu32
+				     "/%" PRIu32 ", regs=0x%016" PRIx64 ", offset=0x%08" PRIx32
+				     ", value=0x%08" PRIx32 "\n",
+				     i, indirect_num_dw, indirect_address, cmd_offset, value);
 			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2503,6 +2560,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
+	}
+	const auto uc_indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	if (!IndirectRegBufferAddressOk(uc_indirect_address, indirect_num_dw)) {
+		static std::atomic<uint32_t> bad_addr_log {0};
+		if (bad_addr_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("\t temporary: skipping SET_UCONFIG_REG_INDIRECT with invalid buffer "
+			     "addr=0x%016" PRIx64 " num_regs=%" PRIu32 "\n",
+			     uc_indirect_address, indirect_num_dw);
+		}
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2664,6 +2731,11 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
 	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
 	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
+	const auto dst_addr            = reinterpret_cast<uint64_t>(dst_gpu_addr);
+	const char* release_result =
+	    data_sel == 0 ? "skip-data-none" : interrupt_selector == 4 ? "skip-interrupt-only" : "dispatch";
+	LogGpuSyncRelease(cp, buffer[0], buffer[1], dst_addr, value, data_sel, interrupt_selector,
+	                  eop_event_type, event_index, gcr_cntl, release_result);
 
 	constexpr uint32_t ReleaseMemDstMemory = 0;
 	constexpr uint32_t ReleaseMemDstTcL2   = 1;
@@ -3014,6 +3086,36 @@ KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
 
 	cp.WriteConstRam(offset, buffer + 1, dw_num);
 
+	return 1 + dw_num;
+}
+
+KYTY_CP_OP_PARSER(CpOpScratchRamWrite) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SCRATCH_RAM_WRITE);
+
+	const auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	const auto offset = buffer[0] & 0xffffu;
+	EXIT_NOT_IMPLEMENTED(dw_num == 0);
+	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+
+	cp.WriteScratchRam(offset, buffer + 1, dw_num);
+	return 1 + dw_num;
+}
+
+KYTY_CP_OP_PARSER(CpOpScratchRamRead) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SCRATCH_RAM_READ);
+
+	const auto dw_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(dw_num < 2);
+	const auto  offset = buffer[0] & 0xffffu;
+	auto* const dst =
+	    reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+
+	cp.ReadScratchRam(dst, offset, 1);
 	return 1 + dw_num;
 }
 

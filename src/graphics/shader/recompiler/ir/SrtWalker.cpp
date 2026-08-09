@@ -50,6 +50,11 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 bool ApplyOperation(ScalarValueOp op, const std::array<uint32_t, 3>& args, uint32_t& result) {
 	const auto shift = args[1] & 31u;
 	switch (op) {
+		case ScalarValueOp::Abs: {
+			const auto value = args[0];
+			result            = (value & 0x80000000u) != 0 ? 0u - value : value;
+			break;
+		}
 		case ScalarValueOp::Add: result = args[0] + args[1]; break;
 		case ScalarValueOp::AddCarry: result = args[0] + args[1] + (args[2] & 1u); break;
 		case ScalarValueOp::Carry:
@@ -61,7 +66,21 @@ bool ApplyOperation(ScalarValueOp op, const std::array<uint32_t, 3>& args, uint3
 		case ScalarValueOp::Borrow:
 			result = static_cast<uint64_t>(args[1]) + (args[2] & 1u) > args[0] ? 1u : 0u;
 			break;
+		case ScalarValueOp::MinI32:
+			result = static_cast<uint32_t>(
+			    std::min(static_cast<int32_t>(args[0]), static_cast<int32_t>(args[1])));
+			break;
+		case ScalarValueOp::MaxI32:
+			result = static_cast<uint32_t>(
+			    std::max(static_cast<int32_t>(args[0]), static_cast<int32_t>(args[1])));
+			break;
+		case ScalarValueOp::MinU32: result = std::min(args[0], args[1]); break;
+		case ScalarValueOp::MaxU32: result = std::max(args[0], args[1]); break;
 		case ScalarValueOp::Mul: result = args[0] * args[1]; break;
+		case ScalarValueOp::MulHighU32:
+			result = static_cast<uint32_t>(
+			    (static_cast<uint64_t>(args[0]) * static_cast<uint64_t>(args[1])) >> 32u);
+			break;
 		case ScalarValueOp::And: result = args[0] & args[1]; break;
 		case ScalarValueOp::AndNot: result = args[0] & ~args[1]; break;
 		case ScalarValueOp::Or: result = args[0] | args[1]; break;

@@ -3801,11 +3801,41 @@ static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dword
 	return false;
 }
 
-static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+static void submit_dcb_graph(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
+	if (dcb != nullptr) {
+		for (uint32_t offset = 0; offset < size_in_dwords;) {
+			const auto cmd_id = dcb[offset];
+			if (cmd_id == KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP)) {
+				const auto handle = static_cast<int>(dcb[offset + 1]);
+				const auto index  = static_cast<int>(dcb[offset + 2]);
+				(void)VideoOut::VideoOutPinFlipTarget(handle, index);
+			}
+			const auto packet_len = KYTY_PM4_LEN(cmd_id);
+			if (packet_len == 0 || packet_len > size_in_dwords - offset) {
+				break;
+			}
+			offset += packet_len;
+		}
+	}
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(dcb, size_in_dwords, nullptr, 0,
 	                            !dcb_has_queued_interrupt(dcb, size_in_dwords));
+}
+
+static void submit_dcb(uint32_t queue, uint32_t* dcb, uint32_t size_in_dwords) {
+	if (queue == 0) {
+		submit_dcb_graph(dcb, size_in_dwords);
+		return;
+	}
+
+	GraphicsDbgDumpDcb("dc", size_in_dwords, dcb);
+	if (dcb == nullptr || size_in_dwords == 0) {
+		return;
+	}
+	EXIT_IF(g_renderer == nullptr);
+	g_renderer->GetGpu().SubmitCompute(queue, dcb, size_in_dwords,
+	                                   !dcb_has_queued_interrupt(dcb, size_in_dwords));
 }
 
 int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
@@ -3818,7 +3848,7 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
 	     "\t dw_num = 0x%08" PRIx32 "\n",
 	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num);
 
-	submit_dcb(packet->addr, packet->dw_num);
+	submit_dcb(0, packet->addr, packet->dw_num);
 
 	return OK;
 }
@@ -3848,7 +3878,7 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 		if (dcb == nullptr) {
 			continue;
 		}
-		submit_dcb(dcb, size_in_dwords);
+		submit_dcb(0, dcb, size_in_dwords);
 	}
 
 	return OK;
@@ -3867,7 +3897,7 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(uint32_t queue, uint32_t* dc
 		return OK;
 	}
 
-	submit_dcb(dcb, size_in_dwords);
+	submit_dcb(queue, dcb, size_in_dwords);
 
 	return OK;
 }

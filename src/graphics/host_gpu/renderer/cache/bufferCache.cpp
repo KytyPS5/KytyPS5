@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -297,6 +298,15 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (Gpu::IsGpuThread()) {
 		ReadMemoryOnGpu(vaddr, size, is_write);
+		return;
+	}
+	// VEH/signal on a guest thread: never block on the GPU command queue (SendCommandSync
+	// from the filter nests into ntdll and SoftIdle's the title thread — TLOU after T4uc).
+	if (Common::HostException::InExceptionFilter()) {
+		if (is_write) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
 		return;
 	}
 	if (CommandScheduler::InDeferredOperation()) {

@@ -442,10 +442,12 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SMovB64: return "s_mov_b64";
 		case Opcode::SMovkI32: return "s_movk_i32";
 		case Opcode::SAbsI32: return "s_abs_i32";
+		case Opcode::SAbsDiffI32: return "s_absdiff_i32";
 		case Opcode::SBrevB32: return "s_brev_b32";
 		case Opcode::SBcnt1I32B32: return "s_bcnt1_i32_b32";
 		case Opcode::SBcnt1I32B64: return "s_bcnt1_i32_b64";
 		case Opcode::SFf1I32B32: return "s_ff1_i32_b32";
+		case Opcode::SFf1I32B64: return "s_ff1_i32_b64";
 		case Opcode::SFlbitI32B64: return "s_flbit_i32_b64";
 		case Opcode::SBitreplicateB64B32: return "s_bitreplicate_b64_b32";
 		case Opcode::SGetpcB64: return "s_getpc_b64";
@@ -467,7 +469,9 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SBitcmp0B32: return "s_bitcmp0_b32";
 		case Opcode::SBitcmp1B32: return "s_bitcmp1_b32";
 		case Opcode::SBitset0B32: return "s_bitset0_b32";
+		case Opcode::SBitset0B64: return "s_bitset0_b64";
 		case Opcode::SBitset1B32: return "s_bitset1_b32";
+		case Opcode::SBitset1B64: return "s_bitset1_b64";
 		case Opcode::SMinI32: return "s_min_i32";
 		case Opcode::SMaxI32: return "s_max_i32";
 		case Opcode::SMinU32: return "s_min_u32";
@@ -670,6 +674,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VMadMixhiF16: return "v_mad_mixhi_f16";
 		case Opcode::VAddNcU32: return "v_add_nc_u32";
 		case Opcode::VAddcU32: return "v_addc_u32";
+		case Opcode::VSubbU32: return "v_subb_u32";
 		case Opcode::VSubNcU32: return "v_sub_nc_u32";
 		case Opcode::VSubrevNcU32: return "v_subrev_nc_u32";
 		case Opcode::VAddNcU16: return "v_add_nc_u16";
@@ -686,6 +691,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VXnorB32: return "v_xnor_b32";
 		case Opcode::VLshlB32: return "v_lshl_b32";
 		case Opcode::VLshlrevB32: return "v_lshlrev_b32";
+		case Opcode::VLshlrevB64: return "v_lshlrev_b64";
 		case Opcode::VLshrB32: return "v_lshr_b32";
 		case Opcode::VLshrrevB32: return "v_lshrrev_b32";
 		case Opcode::VAshrI32: return "v_ashr_i32";
@@ -931,6 +937,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SCbranchVccnz: return "s_cbranch_vccnz";
 		case Opcode::SCbranchExecz: return "s_cbranch_execz";
 		case Opcode::SCbranchExecnz: return "s_cbranch_execnz";
+		case Opcode::SSetprio: return "s_setprio";
 		case Opcode::SSendmsg: return "s_sendmsg";
 		case Opcode::SSetregB32: return "s_setreg_b32";
 		case Opcode::SSleep: return "s_sleep";

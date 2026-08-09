@@ -43,12 +43,35 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
+
+	// Confirmed PS4 NID.
+	LIB_FUNC("OcQybQejHEY", VideoOut::VideoOutGetBufferLabelAddress);
+	// PS5 TLOU import — safe GetBufferLabelAddress when a1 is out-param, else 0.
+	LIB_FUNC("T4ucGB8CsnM", VideoOut::VideoOutT4ucGB8CsnM);
+	// Still-unresolved VideoOut NID seen at relocate; keep as VRR-style no-op.
+	LIB_FUNC("5tRaBjtdTzY", VideoOut::VideoOutVrrStatusStub);
 }
 
 } // namespace LibGen5
 
+namespace LibVideoOutVrrStatus {
+
+LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+
+LIB_DEFINE(InitVideoOutVrrStatus_1) {
+	PRINT_NAME_ENABLE(true);
+
+	// Pure no-ops: do not write out-params (leftover rsi=1 caused early AV).
+	// kP2L8t3j-aM = sceVideoOutAddVrrStatusFlagsPrivilege(eq, handle, udata).
+	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutAddVrrStatusFlagsPrivilege);
+	LIB_FUNC("LibwuIonIBw", VideoOut::VideoOutVrrStatusStub);
+}
+
+} // namespace LibVideoOutVrrStatus
+
 LIB_DEFINE(InitVideoOut_1) {
 	LibGen5::InitVideoOut_1(s);
+	LibVideoOutVrrStatus::InitVideoOutVrrStatus_1(s);
 }
 
 } // namespace Libs

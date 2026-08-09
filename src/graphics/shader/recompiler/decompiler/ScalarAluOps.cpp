@@ -20,7 +20,8 @@ constexpr OpcodeMap SOP2_OPS[] = {
     {0x1du, Opcode::SXnorB64},      {0x1eu, Opcode::SLshlB32},      {0x1fu, Opcode::SLshlB64},
     {0x20u, Opcode::SLshrB32},      {0x21u, Opcode::SLshrB64},      {0x22u, Opcode::SAshrI32},
     {0x24u, Opcode::SBfmB32},       {0x25u, Opcode::SBfmB64},       {0x26u, Opcode::SMulI32},
-    {0x27u, Opcode::SBfeU32},       {0x29u, Opcode::SBfeU64},       {0x2eu, Opcode::SLshl1AddU32},
+    {0x27u, Opcode::SBfeU32},       {0x29u, Opcode::SBfeU64},       {0x2cu, Opcode::SAbsDiffI32},
+    {0x2eu, Opcode::SLshl1AddU32},
     {0x2fu, Opcode::SLshl2AddU32},  {0x30u, Opcode::SLshl3AddU32},  {0x31u, Opcode::SLshl4AddU32},
     {0x32u, Opcode::SPackLlB32B16}, {0x33u, Opcode::SPackLhB32B16}, {0x34u, Opcode::SPackHhB32B16},
     {0x35u, Opcode::SMulHiU32},
@@ -36,9 +37,12 @@ constexpr OpcodeMap SOP1_OPS[] = {
     {0x0fu, Opcode::SBcnt1I32B32},
     {0x10u, Opcode::SBcnt1I32B64},
     {0x13u, Opcode::SFf1I32B32},
+    {0x14u, Opcode::SFf1I32B64},
     {0x16u, Opcode::SFlbitI32B64},
     {0x1bu, Opcode::SBitset0B32},
+    {0x1cu, Opcode::SBitset0B64},
     {0x1du, Opcode::SBitset1B32},
+    {0x1eu, Opcode::SBitset1B64},
     {0x1fu, Opcode::SGetpcB64},
     {0x20u, Opcode::SSetpcB64},
     {0x24u, Opcode::SAndSaveexecB64},
@@ -74,6 +78,7 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x04u, Opcode::SCbranchScc0},  {0x05u, Opcode::SCbranchScc1},  {0x06u, Opcode::SCbranchVccz},
     {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
     {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
+    {0x0fu, Opcode::SSetprio},
     {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x20u, Opcode::SInstPrefetch},
 };
 static_assert(Detail::HasUniqueEncodings(SOP1_OPS));
@@ -260,7 +265,8 @@ bool DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.src0.value      = simm;
 	inst.src0.signed_val = static_cast<int16_t>(simm);
 	inst.src_count = (inst.opcode == Opcode::SNop || inst.opcode == Opcode::SWaitcnt ||
-	                  inst.opcode == Opcode::SSleep || inst.opcode == Opcode::SSendmsg ||
+	                  inst.opcode == Opcode::SSleep || inst.opcode == Opcode::SSetprio ||
+	                  inst.opcode == Opcode::SSendmsg ||
 	                  inst.opcode == Opcode::STtraceData || inst.opcode == Opcode::SInstPrefetch)
 	                     ? 1
 	                     : 0;

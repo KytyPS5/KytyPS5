@@ -2,7 +2,9 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashDiagnostics.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -24,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +55,201 @@ void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
 
 namespace Loader {
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+extern "C" void* __guard_dispatch_icall_fptr;
+extern "C" void* __guard_check_icall_fptr;
+
+extern "C" volatile uint64_t kyty_guard_trace_target       = 0;
+extern "C" volatile uint64_t kyty_guard_trace_rcx          = 0;
+extern "C" volatile uint64_t kyty_guard_trace_return       = 0;
+extern "C" volatile uint64_t kyty_guard_trace_count        = 0;
+extern "C" volatile uint64_t kyty_guard_check_trace_target = 0;
+extern "C" volatile uint64_t kyty_guard_check_trace_rcx    = 0;
+extern "C" volatile uint64_t kyty_guard_check_trace_return = 0;
+extern "C" volatile uint64_t kyty_guard_check_trace_count  = 0;
+extern "C" void*             kyty_guard_dispatch_original = nullptr;
+extern "C" void*             kyty_guard_check_original    = nullptr;
+extern "C" volatile uint64_t kyty_guard_module_dispatch_trace_target = 0;
+extern "C" volatile uint64_t kyty_guard_module_dispatch_trace_rcx    = 0;
+extern "C" volatile uint64_t kyty_guard_module_dispatch_trace_return = 0;
+extern "C" volatile uint64_t kyty_guard_module_dispatch_trace_count  = 0;
+extern "C" volatile uint64_t kyty_guard_module_check_trace_target    = 0;
+extern "C" volatile uint64_t kyty_guard_module_check_trace_rcx       = 0;
+extern "C" volatile uint64_t kyty_guard_module_check_trace_return    = 0;
+extern "C" volatile uint64_t kyty_guard_module_check_trace_count     = 0;
+extern "C" void*             kyty_guard_module_dispatch_original    = nullptr;
+extern "C" void*             kyty_guard_module_check_original       = nullptr;
+extern "C" volatile uint64_t kyty_guest_resume_rip                  = 0;
+extern "C" volatile uint64_t kyty_guest_resume_rcx                  = 0;
+extern "C" volatile uint64_t kyty_guest_resume_r11                  = 0;
+
+extern "C" __attribute__((naked)) void KytyGuardDispatchTrace() {
+	asm volatile("movq %rax, kyty_guard_trace_target(%rip)\n\t"
+	             "movq %rcx, kyty_guard_trace_rcx(%rip)\n\t"
+	             "movq (%rsp), %r11\n\t"
+	             "movq %r11, kyty_guard_trace_return(%rip)\n\t"
+	             "lock incq kyty_guard_trace_count(%rip)\n\t"
+	             "movq kyty_guard_dispatch_original(%rip), %r11\n\t"
+	             "jmp *%r11\n");
+}
+
+extern "C" __attribute__((naked)) void KytyGuardCheckTrace() {
+	asm volatile("movq %rax, kyty_guard_check_trace_target(%rip)\n\t"
+	             "movq %rcx, kyty_guard_check_trace_rcx(%rip)\n\t"
+	             "movq (%rsp), %r11\n\t"
+	             "movq %r11, kyty_guard_check_trace_return(%rip)\n\t"
+	             "lock incq kyty_guard_check_trace_count(%rip)\n\t"
+	             "movq kyty_guard_check_original(%rip), %r11\n\t"
+	             "jmp *%r11\n");
+}
+
+extern "C" __attribute__((naked)) void KytyGuardModuleDispatchTrace() {
+	asm volatile("movq %rax, kyty_guard_module_dispatch_trace_target(%rip)\n\t"
+	             "movq %rcx, kyty_guard_module_dispatch_trace_rcx(%rip)\n\t"
+	             "movq (%rsp), %r11\n\t"
+	             "movq %r11, kyty_guard_module_dispatch_trace_return(%rip)\n\t"
+	             "lock incq kyty_guard_module_dispatch_trace_count(%rip)\n\t"
+	             "movq kyty_guard_module_dispatch_original(%rip), %r11\n\t"
+	             "jmp *%r11\n");
+}
+
+extern "C" __attribute__((naked)) void KytyGuardModuleCheckTrace() {
+	asm volatile("movq %rax, kyty_guard_module_check_trace_target(%rip)\n\t"
+	             "movq %rcx, kyty_guard_module_check_trace_rcx(%rip)\n\t"
+	             "movq (%rsp), %r11\n\t"
+	             "movq %r11, kyty_guard_module_check_trace_return(%rip)\n\t"
+	             "lock incq kyty_guard_module_check_trace_count(%rip)\n\t"
+	             "movq kyty_guard_module_check_original(%rip), %r11\n\t"
+	             "jmp *%r11\n");
+}
+
+// RtlRestoreContext validates RSP against the Windows TEB stack bounds. Guest
+// execution temporarily clears those bounds because its stack is not a native
+// Windows stack. For an emulated illegal instruction, restore the native bounds
+// while ntdll resumes, then clear them in this no-call trampoline immediately
+// before jumping back to the guest RIP.
+extern "C" __attribute__((naked)) void KytyGuestResumeAfterException() {
+	asm volatile("movq %rcx, kyty_guest_resume_rcx(%rip)\n\t"
+	             "movq %r11, kyty_guest_resume_r11(%rip)\n\t"
+	             "xorq %rcx, %rcx\n\t"
+	             "movq %rcx, %gs:0x08\n\t"
+	             "movq %rcx, %gs:0x10\n\t"
+	             "movq kyty_guest_resume_rcx(%rip), %rcx\n\t"
+	             "movq kyty_guest_resume_r11(%rip), %r11\n\t"
+	             "jmp *kyty_guest_resume_rip(%rip)\n");
+}
+
+static void InstallGuardDispatchTrace() {
+	if (__guard_dispatch_icall_fptr == nullptr && __guard_check_icall_fptr == nullptr) {
+		return;
+	}
+
+	DWORD old_protect = 0;
+	if (VirtualProtect(&__guard_dispatch_icall_fptr, 2u * sizeof(void*), PAGE_READWRITE,
+	                   &old_protect) == 0) {
+		LOGF("guard trace: VirtualProtect failed\n");
+		return;
+	}
+
+	if (__guard_dispatch_icall_fptr != nullptr &&
+	    __guard_dispatch_icall_fptr != reinterpret_cast<void*>(&KytyGuardDispatchTrace)) {
+		kyty_guard_dispatch_original = __guard_dispatch_icall_fptr;
+		__guard_dispatch_icall_fptr       = reinterpret_cast<void*>(&KytyGuardDispatchTrace);
+	}
+	if (__guard_check_icall_fptr != nullptr &&
+	    __guard_check_icall_fptr != reinterpret_cast<void*>(&KytyGuardCheckTrace)) {
+		kyty_guard_check_original = __guard_check_icall_fptr;
+		__guard_check_icall_fptr   = reinterpret_cast<void*>(&KytyGuardCheckTrace);
+	}
+
+	DWORD ignored = 0;
+	(void)VirtualProtect(&__guard_dispatch_icall_fptr, 2u * sizeof(void*), old_protect, &ignored);
+
+	auto patch_module_guard_slot = [](const char* module_name, size_t field_offset,
+	                                  const char* slot_name, void* trace, void** original_out) {
+		auto* module = GetModuleHandleA(module_name);
+		if (module == nullptr) {
+			LOGF("guard trace module missing: module=%s\n", module_name);
+			return;
+		}
+
+		auto* dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+		if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) {
+			return;
+		}
+		auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+		    reinterpret_cast<const uint8_t*>(module) + dos_header->e_lfanew);
+		if (nt_headers->Signature != IMAGE_NT_SIGNATURE) {
+			return;
+		}
+
+		const auto& directory =
+		    nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+		// The SDK used by this build omits the CFG pointer field names. The
+		// offsets are stable in IMAGE_LOAD_CONFIG_DIRECTORY64:
+		// check=0x70, dispatch=0x78.
+		if (directory.VirtualAddress == 0 ||
+		    directory.Size < field_offset + sizeof(ULONG_PTR)) {
+			LOGF("guard trace module has no dispatch metadata: module=%s base=%016" PRIx64
+			     " config_rva=%08" PRIx32 " config_size=%08" PRIx32 "\n",
+			     module_name, reinterpret_cast<uint64_t>(module), directory.VirtualAddress,
+			     directory.Size);
+			return;
+		}
+
+		auto* load_config = reinterpret_cast<const IMAGE_LOAD_CONFIG_DIRECTORY64*>(
+		    reinterpret_cast<const uint8_t*>(module) + directory.VirtualAddress);
+		auto** guard_slot = reinterpret_cast<void**>(
+		    *reinterpret_cast<const ULONG_PTR*>(
+		        reinterpret_cast<const uint8_t*>(load_config) + field_offset));
+		LOGF("guard trace module inspect: module=%s kind=%s base=%016" PRIx64
+		     " slot=%016" PRIx64
+		     " value=%016" PRIx64 " original=%016" PRIx64 "\n",
+		     module_name, slot_name, reinterpret_cast<uint64_t>(module),
+		     reinterpret_cast<uint64_t>(guard_slot),
+		     guard_slot != nullptr ? reinterpret_cast<uint64_t>(*guard_slot) : 0,
+		     original_out != nullptr ? reinterpret_cast<uint64_t>(*original_out) : 0);
+		if (guard_slot == nullptr || *guard_slot == nullptr || original_out == nullptr) {
+			return;
+		}
+		if (*original_out == nullptr) {
+			*original_out = *guard_slot;
+		}
+		if (*guard_slot == trace) {
+			return;
+		}
+
+		DWORD slot_protect = 0;
+		if (VirtualProtect(guard_slot, sizeof(*guard_slot), PAGE_READWRITE, &slot_protect) != 0) {
+			*guard_slot = trace;
+			DWORD ignored_protect = 0;
+			(void)VirtualProtect(guard_slot, sizeof(*guard_slot), slot_protect,
+			                     &ignored_protect);
+			LOGF("guard trace module patched: module=%s kind=%s slot=%016" PRIx64 "\n",
+			     module_name, slot_name, reinterpret_cast<uint64_t>(guard_slot));
+		}
+	};
+
+	constexpr size_t guard_cf_check_offset    = 0x70;
+	constexpr size_t guard_cf_dispatch_offset = 0x78;
+	for (const auto* module_name: {"MSVCP140.dll", "VCRUNTIME140.dll", "ucrtbase.dll"}) {
+		patch_module_guard_slot(module_name, guard_cf_dispatch_offset, "dispatch",
+		                        reinterpret_cast<void*>(&KytyGuardModuleDispatchTrace),
+		                        &kyty_guard_module_dispatch_original);
+		patch_module_guard_slot(module_name, guard_cf_check_offset, "check",
+		                        reinterpret_cast<void*>(&KytyGuardModuleCheckTrace),
+		                        &kyty_guard_module_check_original);
+	}
+
+	LOGF("guard trace installed: dispatch_slot=%016" PRIx64 " dispatch_original=%016" PRIx64
+	     " check_slot=%016" PRIx64 " check_original=%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(&__guard_dispatch_icall_fptr),
+	     reinterpret_cast<uint64_t>(kyty_guard_dispatch_original),
+	     reinterpret_cast<uint64_t>(&__guard_check_icall_fptr),
+	     reinterpret_cast<uint64_t>(kyty_guard_check_original));
+}
+#endif
 
 Program::Program() = default;
 
@@ -369,6 +567,10 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Libs::LibKernel::PthreadSaveCurrentHostStackLimits();
+#endif
+
 #if defined(__APPLE__)
 		// Clang on macOS can allocate plain "r" inputs to r12/r13, which the template
 		// clobbers before consuming them. Pin the inputs to registers the SysV guest
@@ -398,8 +600,6 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
 		      "xmm13", "xmm14", "xmm15");
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Windows stack probes use the TEB stack limits during the guest stack switch.
-		// bounds, which describe the host stack and are invalid while RSP is in guest memory.
 		register entry_func_t func_reg asm("rbx")     = func;
 		register uintptr_t    guest_rsp_reg asm("r8") = guest_rsp;
 		register uintptr_t    guest_rbp_reg asm("r9") = guest_rbp;
@@ -797,17 +997,550 @@ static bool IsDumpableRange(uint64_t addr, uint64_t size) {
 #endif
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct GuestAbortSite {
+	uint64_t lea_target  = 0;
+	uint64_t call_target0 = 0;
+	uint64_t call_target1 = 0;
+	char     lea_string[160] {};
+};
+
+static bool AddRel32(uint64_t next_instruction, int32_t displacement, uint64_t* target) {
+	if (target == nullptr) {
+		return false;
+	}
+	if (displacement >= 0) {
+		const auto add = static_cast<uint64_t>(displacement);
+		if (next_instruction > UINT64_MAX - add) {
+			return false;
+		}
+		*target = next_instruction + add;
+		return true;
+	}
+
+	const auto subtract = static_cast<uint64_t>(-static_cast<int64_t>(displacement));
+	if (next_instruction < subtract) {
+		return false;
+	}
+	*target = next_instruction - subtract;
+	return true;
+}
+
+static bool CopyGuestPrintableString(uint64_t address, char* output, size_t output_size) {
+	if (output == nullptr || output_size < 2 || address == 0 || address >= (1ull << 47)) {
+		return false;
+	}
+
+	size_t length = 0;
+	for (; length + 1 < output_size; length++) {
+		if (address > UINT64_MAX - length ||
+		    !IsReadableRange(address + length, sizeof(uint8_t))) {
+			return false;
+		}
+		const auto value = *reinterpret_cast<const uint8_t*>(address + length);
+		if (value == 0) {
+			output[length] = '\0';
+			return length != 0;
+		}
+		if (value < 0x20 || value > 0x7e) {
+			return false;
+		}
+		output[length] = static_cast<char>(value);
+	}
+	output[output_size - 1] = '\0';
+	return false;
+}
+
+static bool DecodeGuestAbortSite(uint64_t rip, GuestAbortSite* site) {
+	if (site == nullptr || rip < 17 || rip > UINT64_MAX - 19) {
+		return false;
+	}
+
+	const auto start = rip - 17;
+	constexpr size_t kSiteSize = 19;
+	if (!IsReadableRange(start, kSiteSize)) {
+		return false;
+	}
+
+	uint8_t bytes[kSiteSize] {};
+	std::memcpy(bytes, reinterpret_cast<const void*>(start), sizeof(bytes));
+
+	// lea rdi,[rip+disp32]; call rel32; call rel32; int 0x41
+	if (bytes[0] != 0x48 || bytes[1] != 0x8d || bytes[2] != 0x3d ||
+	    bytes[7] != 0xe8 || bytes[12] != 0xe8 || bytes[17] != 0xcd || bytes[18] != 0x41) {
+		return false;
+	}
+
+	int32_t lea_displacement   = 0;
+	int32_t call0_displacement  = 0;
+	int32_t call1_displacement  = 0;
+	std::memcpy(&lea_displacement, bytes + 3, sizeof(lea_displacement));
+	std::memcpy(&call0_displacement, bytes + 8, sizeof(call0_displacement));
+	std::memcpy(&call1_displacement, bytes + 13, sizeof(call1_displacement));
+
+	if (!AddRel32(start + 7, lea_displacement, &site->lea_target) ||
+	    !AddRel32(start + 12, call0_displacement, &site->call_target0) ||
+	    !AddRel32(start + 17, call1_displacement, &site->call_target1)) {
+		return false;
+	}
+
+	(void)CopyGuestPrintableString(site->lea_target, site->lea_string, sizeof(site->lea_string));
+	return true;
+}
+
+static bool TryDescribeGuestPlt(const Program* program, uint64_t target, uint32_t* plt_index,
+                                char* nid, size_t nid_size) {
+	if (program == nullptr || program->dynamic_info == nullptr || plt_index == nullptr ||
+	    nid == nullptr || nid_size < 2 || target > UINT64_MAX - 11 ||
+	    !IsReadableRange(target, 11)) {
+		return false;
+	}
+
+	uint8_t stub[11] {};
+	std::memcpy(stub, reinterpret_cast<const void*>(target), sizeof(stub));
+	if (stub[0] != 0xff || stub[1] != 0x25 || stub[6] != 0x68) {
+		return false;
+	}
+
+	std::memcpy(plt_index, stub + 7, sizeof(*plt_index));
+	const auto* dynamic_info = program->dynamic_info.get();
+	if (dynamic_info->jmprela_table == nullptr ||
+	    dynamic_info->jmprela_table_size < sizeof(Elf64_Rela) ||
+	    *plt_index >= dynamic_info->jmprela_table_size / sizeof(Elf64_Rela)) {
+		return false;
+	}
+
+	const auto rela_address = reinterpret_cast<uint64_t>(dynamic_info->jmprela_table) +
+	                          static_cast<uint64_t>(*plt_index) * sizeof(Elf64_Rela);
+	if (rela_address < reinterpret_cast<uint64_t>(dynamic_info->jmprela_table) ||
+	    !IsReadableRange(rela_address, sizeof(Elf64_Rela)) ||
+	    dynamic_info->symbol_table == nullptr ||
+	    dynamic_info->symbol_table_entry_size < sizeof(Elf64_Sym) ||
+	    dynamic_info->symbol_table_total_size < dynamic_info->symbol_table_entry_size) {
+		return false;
+	}
+
+	Elf64_Rela rela {};
+	std::memcpy(&rela, reinterpret_cast<const void*>(rela_address), sizeof(rela));
+	const auto symbol_index = rela.r_info >> 32u;
+	if (symbol_index >= dynamic_info->symbol_table_total_size /
+	                       dynamic_info->symbol_table_entry_size) {
+		return false;
+	}
+
+	const auto symbol_address = reinterpret_cast<uint64_t>(dynamic_info->symbol_table) +
+	                            symbol_index * dynamic_info->symbol_table_entry_size;
+	if (symbol_address < reinterpret_cast<uint64_t>(dynamic_info->symbol_table) ||
+	    !IsReadableRange(symbol_address, sizeof(Elf64_Sym)) ||
+	    dynamic_info->str_table == nullptr || dynamic_info->str_table_size == 0) {
+		return false;
+	}
+
+	Elf64_Sym symbol {};
+	std::memcpy(&symbol, reinterpret_cast<const void*>(symbol_address), sizeof(symbol));
+	if (symbol.st_name >= dynamic_info->str_table_size) {
+		return false;
+	}
+	return CopyGuestPrintableString(reinterpret_cast<uint64_t>(dynamic_info->str_table) +
+	                                    symbol.st_name,
+	                                nid, nid_size);
+}
+#endif
+
+static void LogGuestAbortTrapContext(const Common::HostException::ExceptionInfo& info,
+                                     const char* detail) {
+	char line[768] {};
+	std::snprintf(
+	    line, sizeof(line),
+	    "guest_abort_trap: %s rip=%016" PRIx64 " fault=%016" PRIx64
+	    " rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64
+	    " rsi=%016" PRIx64 " rdi=%016" PRIx64 " rsp=%016" PRIx64 " rbp=%016" PRIx64
+	    " r8=%016" PRIx64 " r9=%016" PRIx64,
+	    detail != nullptr ? detail : "unknown", info.exception_address,
+	    info.access_violation_vaddr, info.rax, info.rbx, info.rcx, info.rdx, info.rsi, info.rdi,
+	    info.rsp, info.rbp, info.r8, info.r9);
+	Common::LogFatalToFile(line);
+	std::fprintf(stderr, "%s\n", line);
+
+	std::snprintf(line, sizeof(line), "guest_abort_trap regs: r10=%016" PRIx64 " r11=%016" PRIx64
+	                                  " r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
+	                                  " r15=%016" PRIx64,
+	              info.r10, info.r11, info.r12, info.r13, info.r14, info.r15);
+	Common::LogFatalToFile(line);
+	std::fprintf(stderr, "%s\n", line);
+
+	auto*   linker  = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto*   program = linker != nullptr ? linker->FindProgramByAddr(info.exception_address) : nullptr;
+	if (program != nullptr && info.exception_address >= program->base_vaddr) {
+		const auto relative_address = info.exception_address - program->base_vaddr;
+		uint64_t   file_offset      = 0;
+		bool       file_offset_valid = false;
+		if (program->elf != nullptr) {
+			const auto* ehdr = program->elf->GetEhdr();
+			const auto* phdr = program->elf->GetPhdr();
+			if (ehdr != nullptr && phdr != nullptr) {
+				for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+					const auto& segment = phdr[i];
+					if ((segment.p_type != PT_LOAD && segment.p_type != PT_OS_RELRO) ||
+					    segment.p_filesz == 0 || relative_address < segment.p_vaddr ||
+					    relative_address - segment.p_vaddr >= segment.p_filesz) {
+						continue;
+					}
+					const auto delta = relative_address - segment.p_vaddr;
+					if (segment.p_offset <= UINT64_MAX - delta) {
+						file_offset       = segment.p_offset + delta;
+						file_offset_valid = true;
+					}
+					break;
+				}
+			}
+		}
+		const auto module_name =
+		    Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name));
+		if (file_offset_valid) {
+			std::snprintf(line, sizeof(line),
+			              "guest_abort_trap location: module=%s vaddr_off=%016" PRIx64
+			              " file_off=%016" PRIx64,
+			              module_name.c_str(), relative_address, file_offset);
+		} else {
+			std::snprintf(line, sizeof(line),
+			              "guest_abort_trap location: module=%s vaddr_off=%016" PRIx64
+			              " file_off=unknown",
+			              module_name.c_str(), relative_address);
+		}
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+	}
+
+	const auto code_start =
+	    info.exception_address >= 16 ? info.exception_address - 16 : info.exception_address;
+	if (IsReadableRange(code_start, 32)) {
+		std::snprintf(line, sizeof(line), "guest_abort_trap code rip=%016" PRIx64 ":",
+		              info.exception_address);
+		auto* code = reinterpret_cast<const uint8_t*>(code_start);
+		for (uint32_t i = 0; i < 32; i++) {
+			const auto length = std::strlen(line);
+			if (length + 4 >= sizeof(line)) {
+				break;
+			}
+			std::snprintf(line + length, sizeof(line) - length, " %02" PRIx32,
+			              static_cast<uint32_t>(code[i]));
+		}
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+	} else {
+		Common::LogFatalToFile("guest_abort_trap code: unavailable");
+		std::fprintf(stderr, "guest_abort_trap code: unavailable\n");
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	GuestAbortSite site {};
+	if (DecodeGuestAbortSite(info.exception_address, &site)) {
+		auto format_target = [&](uint64_t target, char* output, size_t output_size) {
+			if (linker != nullptr) {
+				if (auto* target_program = linker->FindProgramByAddr(target);
+				    target_program != nullptr && target >= target_program->base_vaddr) {
+					const auto target_module = Common::FilenameWithoutDirectory(
+					    Common::PathToGenericString(target_program->file_name));
+					std::snprintf(output, output_size, "%016" PRIx64 " %s+%016" PRIx64, target,
+					              target_module.c_str(), target - target_program->base_vaddr);
+					return;
+				}
+			}
+			std::snprintf(output, output_size, "%016" PRIx64 " module=?", target);
+		};
+
+		char lea_target[160] {};
+		char call_target0[160] {};
+		char call_target1[160] {};
+		format_target(site.lea_target, lea_target, sizeof(lea_target));
+		format_target(site.call_target0, call_target0, sizeof(call_target0));
+		format_target(site.call_target1, call_target1, sizeof(call_target1));
+
+		std::snprintf(line, sizeof(line),
+		              "guest_abort_trap site: lea=%s call0=%s call1=%s string=\"%s\"",
+		              lea_target, call_target0, call_target1, site.lea_string);
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+
+		const auto candidate = std::strstr(site.lea_string, "RAM Cache is being disabled.") != nullptr
+		                           ? "ram_cache_disabled"
+		                           : "lea_call_int41";
+		std::snprintf(line, sizeof(line), "guest_abort_trap cause_candidate=%s", candidate);
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+
+		uint32_t plt_index = 0;
+		char     nid[128] {};
+		if (TryDescribeGuestPlt(program, site.call_target0, &plt_index, nid, sizeof(nid))) {
+			std::snprintf(line, sizeof(line),
+			              "guest_abort_trap plt: target=%016" PRIx64 " index=%" PRIu32
+			              " nid=%s",
+			              site.call_target0, plt_index, nid);
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+		}
+	}
+
+	if (program != nullptr && program->base_vaddr != 0 &&
+	    info.exception_address == program->base_vaddr + 0x1a4ffafu) {
+		auto read_qword = [](uint64_t address, uint64_t* value) {
+			if (value == nullptr || !IsReadableRange(address, sizeof(uint64_t))) {
+				return false;
+			}
+			std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+			return true;
+		};
+
+		const auto read_relative = [&](uint64_t offset, uint64_t* value) {
+			return program->base_vaddr <= UINT64_MAX - offset &&
+			       read_qword(program->base_vaddr + offset, value);
+		};
+
+		uint64_t object = 0;
+		uint64_t vtable = 0;
+		uint64_t method0 = 0;
+		uint64_t code_data = 0;
+		uint64_t section6 = 0;
+		(void)read_relative(0x4ada0e0u, &object);
+		(void)read_relative(0x493c478u, &vtable);
+		(void)read_relative(0x4b1a3f0u, &code_data);
+		(void)read_relative(0x4b1a3e8u, &section6);
+		if (vtable != 0) {
+			(void)read_qword(vtable, &method0);
+		}
+
+		uint64_t method_result = 0;
+		const bool method_result_valid =
+		    code_data <= UINT64_MAX - info.r14 && code_data + info.r14 <= UINT64_MAX - section6;
+		if (method_result_valid) {
+			method_result = code_data + info.r14 + section6;
+		}
+
+		std::snprintf(line, sizeof(line),
+		              "guest_abort_trap ram_cache_state: object=%016" PRIx64
+		              " vtable=%016" PRIx64 " method0=%016" PRIx64
+		              " code_data=%016" PRIx64 " section6=%016" PRIx64
+		              " flexible=%016" PRIx64 " method_result=%016" PRIx64,
+		              object, vtable, method0, code_data, section6, info.r14,
+		              method_result_valid ? method_result : 0);
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+
+		uint32_t flex_plt_index = 0;
+		char     flex_nid[128] {};
+		if (TryDescribeGuestPlt(program, program->base_vaddr + 0x2a4e690u, &flex_plt_index,
+		                        flex_nid, sizeof(flex_nid))) {
+			std::snprintf(line, sizeof(line),
+			              "guest_abort_trap ram_cache_api: target=%016" PRIx64
+			              " index=%" PRIu32 " nid=%s",
+			              program->base_vaddr + 0x2a4e690u, flex_plt_index, flex_nid);
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+		}
+	}
+#endif
+
+	auto log_guest_stack = [&](const char* name, uint64_t stack_address) {
+		constexpr uint64_t kStackWords = 16;
+		if (stack_address == 0 ||
+		    stack_address > UINT64_MAX - kStackWords * sizeof(uint64_t) ||
+		    !IsReadableRange(stack_address, kStackWords * sizeof(uint64_t))) {
+			return;
+		}
+		auto* words = reinterpret_cast<const uint64_t*>(stack_address);
+		for (uint32_t i = 0; i < kStackWords; i++) {
+			const auto value = words[i];
+			char       stack_line[384] {};
+			if (linker != nullptr) {
+				if (auto* stack_program = linker->FindProgramByAddr(value);
+				    stack_program != nullptr && value >= stack_program->base_vaddr) {
+					const auto stack_module = Common::FilenameWithoutDirectory(
+					    Common::PathToGenericString(stack_program->file_name));
+					std::snprintf(stack_line, sizeof(stack_line),
+					              "guest_abort_trap stack=%s[%" PRIu32 "] value=%016" PRIx64
+					              " module=%s off=%016" PRIx64,
+					              name, i, value, stack_module.c_str(),
+					              value - stack_program->base_vaddr);
+				}
+			}
+			if (stack_line[0] == '\0') {
+				std::snprintf(stack_line, sizeof(stack_line),
+				              "guest_abort_trap stack=%s[%" PRIu32 "] value=%016" PRIx64, name,
+				              i, value);
+			}
+			Common::LogFatalToFile(stack_line);
+			std::fprintf(stderr, "%s\n", stack_line);
+		}
+	};
+
+	log_guest_stack("rsp", info.rsp);
+	log_guest_stack("rbp", info.rbp);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto log_guest_cstr = [](const char* name, uint64_t address) {
+		if (address == 0 || address == UINT64_MAX || address >= (1ull << 47)) {
+			return;
+		}
+		char   value[128] {};
+		size_t length = 0;
+		for (; length + 1 < sizeof(value); length++) {
+			if (address > UINT64_MAX - length ||
+			    !IsReadableRange(address + length, sizeof(uint8_t))) {
+				break;
+			}
+			const auto c = *reinterpret_cast<const uint8_t*>(address + length);
+			if (c == 0) {
+				break;
+			}
+			if (c < 0x20 || c > 0x7e) {
+				break;
+			}
+			value[length] = static_cast<char>(c);
+		}
+		if (length == 0) {
+			return;
+		}
+		value[length] = '\0';
+		char line[192] {};
+		std::snprintf(line, sizeof(line), "guest_abort_trap %s=\"%s\"", name, value);
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+	};
+
+	log_guest_cstr("rdi", info.rdi);
+	log_guest_cstr("rsi", info.rsi);
+	log_guest_cstr("rcx", info.rcx);
+	log_guest_cstr("r8", info.r8);
+#endif
+	std::fflush(stderr);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool PrepareGuestResumeAfterIllegalInstruction(CONTEXT* context) {
+	if (context == nullptr) {
+		return false;
+	}
+
+	static std::atomic<uint32_t> illegal_diag_n {0};
+	const auto                   diag_n =
+	    illegal_diag_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	const bool log_diag = diag_n <= 16;
+
+	if (log_diag) {
+		std::fprintf(stderr, "guest illegal prepare: rip=%016" PRIx64 " rsp=%016" PRIx64 "\n",
+		             context->Rip, context->Rsp);
+	}
+	uint64_t host_stack_base  = 0;
+	uint64_t host_stack_limit = 0;
+	if (!Libs::LibKernel::PthreadGetGuestHostStackLimits(&host_stack_base, &host_stack_limit)) {
+		if (log_diag) {
+			std::fprintf(stderr, "guest illegal resume: host TEB stack limits unavailable\n");
+		}
+		return false;
+	}
+
+	constexpr uint64_t resume_margin = 0x200000;
+	const auto         context_limit =
+	    context->Rsp > resume_margin ? context->Rsp - resume_margin : 0;
+	const auto context_base = context->Rsp <= UINT64_MAX - resume_margin
+	                              ? context->Rsp + resume_margin
+	                              : UINT64_MAX;
+	const auto resume_stack_base  = std::max(host_stack_base, context_base);
+	const auto resume_stack_limit = std::min(host_stack_limit, context_limit);
+	if (resume_stack_limit >= resume_stack_base) {
+		if (log_diag) {
+			std::fprintf(stderr,
+			             "guest illegal resume: invalid temporary TEB range host=[%016" PRIx64
+			             ",%016" PRIx64 "] context_rsp=%016" PRIx64 "\n",
+			             host_stack_limit, host_stack_base, context->Rsp);
+		}
+		return false;
+	}
+	if (log_diag) {
+		std::fprintf(stderr,
+		             "guest illegal TEB: host=[%016" PRIx64 ",%016" PRIx64
+		             "] temporary=[%016" PRIx64 ",%016" PRIx64 "] rsp=%016" PRIx64 "\n",
+		             host_stack_limit, host_stack_base, resume_stack_limit, resume_stack_base,
+		             context->Rsp);
+	}
+
+	// TryEmulate has already advanced Rip to the next guest instruction. Keep it
+	// out of the restored CONTEXT and let the trampoline clear GS after ntdll
+	// has completed the restore.
+	kyty_guest_resume_rip = context->Rip;
+	context->Rip           = reinterpret_cast<uint64_t>(&KytyGuestResumeAfterException);
+
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(resume_stack_base), "r"(resume_stack_limit)
+	             : "memory");
+	if (log_diag) {
+		std::fprintf(stderr, "guest illegal prepared: trampoline=%016" PRIx64 "\n",
+		             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+		                 &KytyGuestResumeAfterException)));
+	}
+	return true;
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+	char        guest_abort_detail[160] {};
+	bool        guest_abort_trap = false;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		const auto* context = static_cast<const CONTEXT*>(info->native_context);
+		LOGF("av-enter: tid=%lu exception=%016" PRIx64 " context_rip=%016" PRIx64
+		     " fault=%016" PRIx64 " access=%s rax=%016" PRIx64 " rbx=%016" PRIx64
+		     " rcx=%016" PRIx64 " rdx=%016" PRIx64 " rsi=%016" PRIx64 " rdi=%016" PRIx64
+		     " rbp=%016" PRIx64 " rsp=%016" PRIx64 " r8=%016" PRIx64 " r9=%016" PRIx64
+		     " r10=%016" PRIx64 " r11=%016" PRIx64 " r12=%016" PRIx64 " r13=%016" PRIx64
+		     " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
+		     static_cast<unsigned long>(GetCurrentThreadId()), info->exception_address,
+		     context != nullptr ? context->Rip : 0, info->access_violation_vaddr,
+		     Common::EnumName(info->access_violation_type).c_str(), info->rax, info->rbx,
+		     info->rcx, info->rdx, info->rsi, info->rdi, info->rbp, info->rsp, info->r8,
+		     info->r9, info->r10, info->r11, info->r12, info->r13, info->r14, info->r15);
+		if (context != nullptr && context->Rip >= 48) {
+			static std::atomic<uint32_t> code_pre32_n {0};
+			if (code_pre32_n.fetch_add(1, std::memory_order_relaxed) < 8) {
+				const auto* pre = reinterpret_cast<const uint8_t*>(context->Rip - 32);
+				std::fprintf(stderr, "code-pre32 rip-32=%016" PRIx64 ":", context->Rip - 32);
+				for (int i = 0; i < 40; i++) {
+					std::fprintf(stderr, " %02x", pre[i]);
+				}
+				std::fprintf(stderr, "\n");
+			}
+		}
+	}
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!PrepareGuestResumeAfterIllegalInstruction(
+		        static_cast<PCONTEXT>(info->native_context))) {
+			return false;
+		}
+#endif
 		return true;
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess  = Common::HostException::AccessViolationType;
 		using GpuAccess   = Libs::Graphics::PageFaultAccess;
+		const bool is_write =
+		    info->access_violation_type == CoreAccess::Write;
+		const uint64_t fault_rip = info->exception_address;
+
+		// HandleGpuFault FIRST — host-read soft-continue before it skipped real GPU
+		// page maps (TLOU spam on 0x1021500000 / 0x132820e…) and hung fences.
+		auto* guest_at_rip =
+		    Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(fault_rip);
+
 		const auto access = [&]() {
 			switch (info->access_violation_type) {
 				case CoreAccess::Read: return GpuAccess::Read;
@@ -827,6 +1560,83 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::KernelHandleReservedRangeAccessViolation(
 		        info->access_violation_vaddr)) {
 			return true;
+		}
+
+		if (info->exception_address < (1ull << 47)) {
+			guest_abort_trap = Loader::X64InstructionEmulator::DescribeGuestAbortTrap(
+			    info->exception_address, guest_abort_detail, sizeof(guest_abort_detail));
+		}
+
+		// Poisoned / non-canonical guest pointers (e.g. Read[ffffffffffffffff]).
+		// Skip the faulting memop instead of EXIT — surgical port from Pouare soft-continue.
+		const bool poisonish = info->access_violation_vaddr == 0 ||
+		                       info->access_violation_vaddr == UINT64_MAX ||
+		                       info->access_violation_vaddr >= (1ull << 47);
+		if (poisonish && !guest_abort_trap) {
+			if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+			        info->native_context, info->access_violation_vaddr, is_write)) {
+				return true;
+			}
+		}
+
+		// Guest modules: soft-continue reads+writes.
+		// Host RIP reads (after HandleGpuFault failed): soft-continue.
+		// Host RIP writes: never skip (GpuSync fences).
+		// Guest code often lives at 0x09… even when FindProgramByAddr misses a PHDR edge.
+		if (!guest_abort_trap) {
+			auto* guest_program = guest_at_rip;
+			if (guest_program == nullptr) {
+				guest_program =
+				    Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(
+				        fault_rip);
+			}
+			const bool guest_rip_range = fault_rip >= 0x0000000100000000ull &&
+			                             fault_rip < 0x00007FF000000000ull;
+			const bool allow_soft =
+			    guest_program != nullptr || guest_rip_range || !is_write;
+			if (allow_soft && fault_rip != 0 && fault_rip < 0x00007FF000000000ull) {
+				if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+				        info->native_context, info->access_violation_vaddr, is_write,
+				        /*force=*/true, /*allow_system_module=*/false)) {
+					static std::atomic<uint32_t> force_soft_n {0};
+					const auto                   n =
+					    force_soft_n.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (n <= 16) {
+						std::fprintf(stderr,
+						             "Access violation (force soft-continue n=%u): %s "
+						             "[%016" PRIx64 "] rip=%016" PRIx64 "%s\n",
+						             n, Common::EnumName(info->access_violation_type).c_str(),
+						             info->access_violation_vaddr, fault_rip,
+						             guest_program != nullptr ? ""
+						             : guest_rip_range         ? " guest-range"
+						                                       : " host-read");
+						std::fflush(stderr);
+					}
+					return true;
+				}
+				static std::atomic<uint32_t> force_fail_n {0};
+				if (force_fail_n.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::fprintf(stderr,
+					             "Access violation (force soft-continue FAILED): %s "
+					             "[%016" PRIx64 "] rip=%016" PRIx64 "\n",
+					             Common::EnumName(info->access_violation_type).c_str(),
+					             info->access_violation_vaddr, fault_rip);
+					std::fflush(stderr);
+				}
+			} else if (is_write && fault_rip != 0 && fault_rip < 0x00007FF000000000ull &&
+			           guest_program == nullptr && !guest_rip_range) {
+				static std::atomic<uint32_t> host_rip_av_n {0};
+				const auto                   n =
+				    host_rip_av_n.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 16 || (n % 64) == 0) {
+					std::fprintf(stderr,
+					             "Access violation (host-rip write, no soft-skip n=%u): %s "
+					             "[%016" PRIx64 "] rip=%016" PRIx64 "\n",
+					             n, Common::EnumName(info->access_violation_type).c_str(),
+					             info->access_violation_vaddr, fault_rip);
+					std::fflush(stderr);
+				}
+			}
 		}
 	}
 
@@ -849,10 +1659,76 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		LOGF("exception module: %s\n", module_info.dli_fname);
 	}
 #endif
+	uint64_t context_rip = info->exception_address;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info->native_context != nullptr) {
+		context_rip = static_cast<const CONTEXT*>(info->native_context)->Rip;
+	}
+#endif
+	LOGF("av-context: exception_address=%016" PRIx64 " rip=%016" PRIx64
+	     " fault=%016" PRIx64 " access=%s\n",
+	     info->exception_address, context_rip, info->access_violation_vaddr,
+	     Common::EnumName(info->access_violation_type).c_str());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	LOGF("guard dispatch last: count=%016" PRIx64 " target_rax=%016" PRIx64
+	     " target_rcx=%016" PRIx64 " return=%016" PRIx64 "\n",
+	     kyty_guard_trace_count, kyty_guard_trace_target, kyty_guard_trace_rcx,
+	     kyty_guard_trace_return);
+	LOGF("guard check last: count=%016" PRIx64 " target_rax=%016" PRIx64
+	     " target_rcx=%016" PRIx64 " return=%016" PRIx64 "\n",
+	     kyty_guard_check_trace_count, kyty_guard_check_trace_target,
+	     kyty_guard_check_trace_rcx, kyty_guard_check_trace_return);
+	LOGF("guard module dispatch last: count=%016" PRIx64 " target_rax=%016" PRIx64
+	     " target_rcx=%016" PRIx64 " return=%016" PRIx64 "\n",
+	     kyty_guard_module_dispatch_trace_count,
+	     kyty_guard_module_dispatch_trace_target, kyty_guard_module_dispatch_trace_rcx,
+	     kyty_guard_module_dispatch_trace_return);
+	LOGF("guard module check last: count=%016" PRIx64 " target_rax=%016" PRIx64
+	     " target_rcx=%016" PRIx64 " return=%016" PRIx64 "\n",
+	     kyty_guard_module_check_trace_count, kyty_guard_module_check_trace_target,
+	     kyty_guard_module_check_trace_rcx, kyty_guard_module_check_trace_return);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info->native_context != nullptr) {
+		CONTEXT unwind_context = *static_cast<const CONTEXT*>(info->native_context);
+		for (uint64_t i = 0; i < 64 && unwind_context.Rip != 0; i++) {
+			HMODULE module = nullptr;
+			char    module_name[MAX_PATH] {};
+			uint64_t module_base = 0;
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       reinterpret_cast<LPCSTR>(unwind_context.Rip), &module) != 0 &&
+			    module != nullptr && GetModuleFileNameA(module, module_name, MAX_PATH) != 0) {
+				module_base = reinterpret_cast<uint64_t>(module);
+			}
+
+			LOGF("native exception frame [%" PRIu64 "]: rip=%016" PRIx64 " rsp=%016" PRIx64
+			     " module=%s rva=%016" PRIx64 "\n",
+			     i, unwind_context.Rip, unwind_context.Rsp, module_name,
+			     module_base != 0 ? unwind_context.Rip - module_base : 0);
+
+			ULONG64 image_base     = 0;
+			ULONG64 establisher    = 0;
+			PVOID   handler_data   = nullptr;
+			auto*   runtime_function = RtlLookupFunctionEntry(unwind_context.Rip, &image_base, nullptr);
+			if (runtime_function != nullptr) {
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, unwind_context.Rip,
+				                 runtime_function, &unwind_context, &handler_data, &establisher,
+				                 nullptr);
+			} else if (IsReadableRange(unwind_context.Rsp, sizeof(uint64_t))) {
+				unwind_context.Rip = *reinterpret_cast<const uint64_t*>(unwind_context.Rsp);
+				unwind_context.Rsp += sizeof(uint64_t);
+			} else {
+				break;
+			}
+		}
+	}
+#endif
 	if (info->exception_address != 0) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION mem_info = {};
-		auto* dump_ptr = reinterpret_cast<const uint8_t*>(info->exception_address - 32);
+		auto* dump_ptr =
+		    reinterpret_cast<const uint8_t*>(context_rip >= 32 ? context_rip - 32 : context_rip);
 		if (VirtualQuery(dump_ptr, &mem_info, sizeof(mem_info)) != 0 &&
 		    mem_info.State == MEM_COMMIT && mem_info.Protect != PAGE_NOACCESS &&
 		    (mem_info.Protect & PAGE_GUARD) == 0) {
@@ -862,20 +1738,45 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			const auto dump_size =
 			    (dump_start + 64 <= region_end ? 64u
 			                                   : static_cast<uint32_t>(region_end - dump_start));
-			LOGF("code-32:");
+			LOGF("code-32 rip=%016" PRIx64 ":", context_rip);
 			for (uint32_t i = 0; i < dump_size; i++) {
 				LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
 			}
 			LOGF("\n");
+
+			MEMORY_BASIC_INFORMATION rip_info = {};
+			if (VirtualQuery(reinterpret_cast<const void*>(context_rip), &rip_info,
+			                 sizeof(rip_info)) != 0 &&
+			    rip_info.State == MEM_COMMIT && (rip_info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+				const auto rip_start = context_rip;
+				const auto rip_region_start = reinterpret_cast<uint64_t>(rip_info.BaseAddress);
+				const auto rip_region_size  = static_cast<uint64_t>(rip_info.RegionSize);
+				const auto rip_region_end =
+				    rip_region_start <= UINT64_MAX - rip_region_size
+				        ? rip_region_start + rip_region_size
+				        : UINT64_MAX;
+				const auto rip_size =
+				    rip_start < rip_region_end
+				        ? (rip_region_end - rip_start < 15 ? rip_region_end - rip_start : 15)
+				        : 0;
+				if (rip_size != 0) {
+					LOGF("rip-bytes:");
+					auto* rip_ptr = reinterpret_cast<const uint8_t*>(rip_start);
+					for (uint64_t i = 0; i < rip_size; i++) {
+						LOGF(" %02" PRIx32, static_cast<uint32_t>(rip_ptr[i]));
+					}
+					LOGF("\n");
+				}
+			}
 		} else {
 			LOGF("code-32: unavailable\n");
 		}
 #else
-		const auto fault_addr = info->exception_address;
+		const auto fault_addr = context_rip;
 		const auto dump_start = (fault_addr >= 32 ? fault_addr - 32 : fault_addr);
 		if (IsReadableRange(dump_start, 64)) {
 			auto* dump_ptr = reinterpret_cast<const uint8_t*>(dump_start);
-			LOGF("code-32:");
+			LOGF("code-32 rip=%016" PRIx64 ":", context_rip);
 			for (uint32_t i = 0; i < 64; i++) {
 				LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
 			}
@@ -900,6 +1801,40 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
 	     info->r12, info->r13, info->r14, info->r15);
 
+	if (info->rcx >= 0x0000001000000000ull && info->rcx < 0x0000002000000000ull) {
+		auto read_guest_qword = [](uint64_t address, uint64_t* value) {
+			if (value == nullptr || !IsReadableRange(address, sizeof(uint64_t))) {
+				return false;
+			}
+			*value = *reinterpret_cast<const uint64_t*>(address);
+			return true;
+		};
+
+		constexpr uint64_t main_base             = 0x0000000900000000ull;
+		constexpr uint64_t indirect_object_slot  = main_base + 0x4ba1128u;
+		uint64_t            indirect_object      = 0;
+		uint64_t            indirect_vtable     = 0;
+		uint64_t            indirect_method     = 0;
+		uint64_t            target_word0        = 0;
+		uint64_t            target_word1        = 0;
+		const bool          object_ok           = read_guest_qword(indirect_object_slot, &indirect_object);
+		const bool          vtable_ok           = object_ok && read_guest_qword(indirect_object, &indirect_vtable);
+		const bool          method_ok           = vtable_ok &&
+		                                          read_guest_qword(indirect_vtable + 0x78,
+		                                                           &indirect_method);
+		const bool          target_ok           = read_guest_qword(info->rcx, &target_word0) &&
+		                              read_guest_qword(info->rcx + 8, &target_word1);
+
+		LOGF("guest indirect target diagnostic: target=%016" PRIx64
+		     " target_words=%016" PRIx64 "/%016" PRIx64
+		     " object_slot=%016" PRIx64 " object=%016" PRIx64
+		     " vtable=%016" PRIx64 " method78=%016" PRIx64
+		     " readable=%d/%d/%d/%d\n",
+		     info->rcx, target_word0, target_word1, indirect_object_slot, indirect_object,
+		     indirect_vtable, indirect_method, target_ok ? 1 : 0, object_ok ? 1 : 0,
+		     vtable_ok ? 1 : 0, method_ok ? 1 : 0);
+	}
+
 	if (IsReadableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		LOGF("stack:");
@@ -907,9 +1842,83 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LOGF(" [%02" PRIu64 "]=%016" PRIx64, i, stack[i]);
 		}
 		LOGF("\n");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (IsReadableRange(info->rsp, 256u * sizeof(uint64_t))) {
+			auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			for (uint64_t i = 0; i < 256; i++) {
+				const auto address = stack[i];
+				if (address < 0x10000u) {
+					continue;
+				}
+
+				MEMORY_BASIC_INFORMATION mbi {};
+				if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) == 0 ||
+				    mbi.State != MEM_COMMIT) {
+					continue;
+				}
+
+				HMODULE module = nullptr;
+				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(address), &module) == 0 ||
+				    module == nullptr) {
+					continue;
+				}
+
+				char module_name[MAX_PATH] {};
+				if (GetModuleFileNameA(module, module_name, MAX_PATH) == 0) {
+					continue;
+				}
+
+				LOGF("host stack module [%" PRIu64 "]: address=%016" PRIx64
+				     " base=%016" PRIx64 " rva=%016" PRIx64 " module=%s\n",
+				     i, address, reinterpret_cast<uint64_t>(module),
+				     address - reinterpret_cast<uint64_t>(module), module_name);
+			}
+		}
+#endif
 	} else {
 		LOGF("stack: unavailable\n");
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t saved_host_rsp = 0;
+	uint64_t saved_host_rbp = 0;
+	if (Libs::LibKernel::PthreadGetGuestHostContext(&saved_host_rsp, &saved_host_rbp)) {
+		LOGF("saved host context: rsp=%016" PRIx64 " rbp=%016" PRIx64 "\n", saved_host_rsp,
+		     saved_host_rbp);
+
+		if (IsReadableRange(saved_host_rsp, 16u * sizeof(uint64_t))) {
+			auto* host_stack = reinterpret_cast<const uint64_t*>(saved_host_rsp);
+			LOGF("saved host stack:");
+			for (uint64_t i = 0; i < 16; i++) {
+				LOGF(" [%02" PRIu64 "]=%016" PRIx64, i, host_stack[i]);
+			}
+			LOGF("\n");
+		}
+
+		uint64_t frame = saved_host_rbp;
+		for (uint64_t i = 0; i < 20; i++) {
+			if (!IsReadableRange(frame, 2u * sizeof(uint64_t))) {
+				break;
+			}
+
+			const auto* frame_words = reinterpret_cast<const uint64_t*>(frame);
+			const auto  next_frame  = frame_words[0];
+			const auto  return_addr = frame_words[1];
+			LOGF("saved host frame [%" PRIu64 "]: frame=%016" PRIx64 " next=%016" PRIx64
+			     " return=%016" PRIx64 "\n",
+			     i, frame, next_frame, return_addr);
+
+			if (next_frame <= frame || next_frame - frame > 1024u * 1024u) {
+				break;
+			}
+			frame = next_frame;
+		}
+	} else {
+		LOGF("saved host context: unavailable\n");
+	}
+#endif
 
 	auto dump_guest_code = [](const char* name, uint64_t addr) {
 		auto* p = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(addr);
@@ -948,6 +1957,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	dump_guest_code("guest rax[0]", info->rax);
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
+	dump_guest_code("guest rdx[0]", info->rdx);
 	dump_guest_code("guest rsi[0]", info->rsi);
 	if (IsDumpableRange(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
@@ -1007,6 +2017,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest rbx", info->rbx);
 		dump_guest_qwords("guest rax", info->rax);
 		dump_guest_qwords("guest rcx", info->rcx);
+		dump_guest_qwords("guest rdx", info->rdx);
 		dump_guest_qwords("guest rsi", info->rsi);
 		dump_guest_qwords("guest rdi", info->rdi);
 		dump_guest_qwords("guest r8 ", info->r8);
@@ -1025,9 +2036,136 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			dump_guest_qwords("vorbis len", info->rcx);
 		}
 
-		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
-		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,
-		     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)" : ""));
+		if (guest_abort_trap) {
+			LogGuestAbortTrapContext(*info, guest_abort_detail);
+			Common::NoteHaltReason("guest_abort_trap", guest_abort_detail);
+			Common::FlushHleRingToFatal("guest_abort_trap");
+			char detail[256] {};
+			std::snprintf(detail, sizeof(detail), "%s rip=%016" PRIx64, guest_abort_detail,
+			              info->exception_address);
+			std::fprintf(stderr, "guest_abort_trap (thread soft-idle): %s\n", detail);
+			std::fflush(stderr);
+			// Keep the process alive so GPU / VideoOut can finish in-flight flips
+			// after titles abort a worker or main thread with int 0x41.
+			Common::SoftIdleCurrentThread("guest_abort_trap", detail);
+		}
+
+		{
+			auto* program = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(
+			    info->exception_address);
+			char location[160] {};
+			if (program != nullptr) {
+				std::snprintf(
+				    location, sizeof(location), "module=%s vaddr_off=%016" PRIx64,
+				    Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name))
+				        .c_str(),
+				    info->exception_address - program->base_vaddr);
+			} else {
+				std::snprintf(location, sizeof(location), "module=???");
+			}
+
+			using CoreAccess = Common::HostException::AccessViolationType;
+			const bool     is_write = info->access_violation_type == CoreAccess::Write;
+			const uint64_t rip      = info->exception_address;
+			const bool     system_rip = rip >= 0x00007FF000000000ull;
+
+			// Nested AVs inside ntdll must not SoftIdle (parks guest mid-fault → kills the
+			// producing thread → nobody signals mid-IB fences → GPU hangs). Host/system
+			// RIP reads: soft-continue (skip the load) instead. Only SoftIdle for system
+			// writes (cannot safely skip a store) or when the read can't be decoded.
+			if (system_rip) {
+				if (!is_write &&
+				    Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+				        info->native_context, info->access_violation_vaddr,
+				        /*is_write=*/false, /*force=*/true,
+				        /*allow_system_module=*/true)) {
+					static std::atomic<uint32_t> sys_soft_n {0};
+					const auto                   sn =
+					    sys_soft_n.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (sn <= 8 || (sn % 64) == 0) {
+						std::fprintf(stderr,
+						             "Access violation (system-read soft-continue n=%u): %s "
+						             "[%016" PRIx64 "] rip=%016" PRIx64 "\n",
+						             sn, Common::EnumName(info->access_violation_type).c_str(),
+						             info->access_violation_vaddr, rip);
+						std::fflush(stderr);
+					}
+					return true;
+				}
+				static std::atomic<uint32_t> sys_idle_n {0};
+				const auto                   n =
+				    sys_idle_n.fetch_add(1, std::memory_order_relaxed) + 1;
+				char detail[192] {};
+				std::snprintf(detail, sizeof(detail),
+				              "system-rip %s [%016" PRIx64 "] rip=%016" PRIx64, 
+				              Common::EnumName(info->access_violation_type).c_str(),
+				              info->access_violation_vaddr, rip);
+				if (n <= 8 || (n % 64) == 0) {
+					std::fprintf(stderr, "Access violation (system soft-idle n=%u): %s\n", n,
+					             detail);
+					std::fflush(stderr);
+				}
+				Common::FlushHleRingToFatal("guest_av_system");
+				Common::SoftIdleCurrentThread("guest_av_system", detail);
+			}
+
+			// Guest RIP: soft-continue. Host RIP reads: soft-continue. Host writes: never skip.
+			auto* guest_program =
+			    Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(rip);
+			const bool guest_rip_range =
+			    rip >= 0x0000000100000000ull && rip < 0x00007FF000000000ull;
+			const bool allow_soft =
+			    guest_program != nullptr || guest_rip_range || !is_write;
+			if (allow_soft) {
+				if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+				        info->native_context, info->access_violation_vaddr, is_write,
+				        /*force=*/true, /*allow_system_module=*/false)) {
+					static std::atomic<uint32_t> force_soft_n {0};
+					const auto                   n =
+					    force_soft_n.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (n <= 16) {
+						std::fprintf(stderr,
+						             "Access violation (force soft-continue n=%u): %s "
+						             "[%016" PRIx64 "] rip=%016" PRIx64 " %s%s\n",
+						             n, Common::EnumName(info->access_violation_type).c_str(),
+						             info->access_violation_vaddr, rip, location,
+						             guest_program != nullptr ? ""
+						             : guest_rip_range         ? " guest-range"
+						                                       : " host-read");
+						std::fflush(stderr);
+					}
+					return true;
+				}
+
+				if (guest_program != nullptr || guest_rip_range) {
+					char detail[256] {};
+					std::snprintf(detail, sizeof(detail),
+					              "%s [%016" PRIx64 "] rip=%016" PRIx64 " %s %s",
+					              Common::EnumName(info->access_violation_type).c_str(),
+					              info->access_violation_vaddr, rip, location,
+					              (info->access_violation_vaddr == g_invalid_memory
+					                   ? "(Unpatched object)"
+					                   : ""));
+					LOGF("Access violation (thread soft-idle): %s\n", detail);
+					std::fprintf(stderr, "Access violation (thread soft-idle): %s\n", detail);
+					std::fflush(stderr);
+					Common::FlushHleRingToFatal("guest_av");
+					Common::SoftIdleCurrentThread("guest_av", detail);
+				}
+			}
+
+			static std::atomic<uint32_t> host_rip_late_n {0};
+			const auto                   hn =
+			    host_rip_late_n.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (hn <= 16 || (hn % 64) == 0) {
+				std::fprintf(stderr,
+				             "Access violation (host-rip write late, no soft-skip n=%u): %s "
+				             "[%016" PRIx64 "] rip=%016" PRIx64 " %s\n",
+				             hn, Common::EnumName(info->access_violation_type).c_str(),
+				             info->access_violation_vaddr, rip, location);
+				std::fflush(stderr);
+			}
+		}
 		return false;
 	}
 
@@ -2214,6 +3352,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(program->base_vaddr == 0);
 	EXIT_IF(program->base_size_aligned < program->base_size);
+	const auto module_name = Common::PathToString(program->file_name.filename());
+	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(program->base_size_aligned,
+	                                                       module_name.c_str());
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
 	     "base_size_aligned      = 0x%016" PRIx64 "\n"
@@ -2226,6 +3367,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	InstallGuardDispatchTrace();
+#endif
 
 	// program->elf->SetBaseVAddr(program->base_vaddr);
 
@@ -2283,6 +3427,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			EXIT_IF(phdr[i].p_vaddr >= program->base_size);
 
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
+			program->proc_param_size  = phdr[i].p_memsz;
+			LOGF("proc_param_vaddr = 0x%016" PRIx64 " size = 0x%016" PRIx64 "\n",
+			     program->proc_param_vaddr, program->proc_param_size);
 		}
 	}
 
@@ -2311,6 +3458,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
+		const auto module_name = Common::PathToString(program->file_name.filename());
+		Libs::LibKernel::Memory::UnregisterProgramFlexibleQuota(
+		    program->base_size_aligned, module_name.c_str());
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
 	}

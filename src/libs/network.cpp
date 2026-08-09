@@ -2182,6 +2182,18 @@ int KYTY_SYSV_ABI SslTerm(int ssl_ctx_id) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI SslGetMemoryPoolStats() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslLoadCert() {
+	PRINT_NAME();
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI SslGetCaCerts(int ssl_ctx_id, void* ca_certs) {
 	PRINT_NAME();
 

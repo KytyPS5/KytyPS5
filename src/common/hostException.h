@@ -39,6 +39,10 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// True while the vectored/signal host fault filter is on the call stack for this
+// thread. GPU fault handling must not SendCommandSync from this context.
+[[nodiscard]] bool InExceptionFilter() noexcept;
+
 } // namespace Common::HostException
 
 #endif /* KYTY_COMMON_HOST_EXCEPTION_H_ */

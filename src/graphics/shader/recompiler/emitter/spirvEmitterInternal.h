@@ -1133,6 +1133,12 @@ void EmitUnaryU64(EmitterState& state, const IR::Instruction& inst, uint32_t opc
 
 void EmitFindLsbU32(EmitterState& state, const IR::Instruction& inst);
 
+void EmitFindLsbU64(EmitterState& state, const IR::Instruction& inst);
+
+void EmitBitClearU64(EmitterState& state, const IR::Instruction& inst);
+
+void EmitBitSetU64(EmitterState& state, const IR::Instruction& inst);
+
 void EmitFindMsbFromHighU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitFindMsbFromHighU64(EmitterState& state, const IR::Instruction& inst);
@@ -1211,6 +1217,8 @@ void EmitPerInvocationMask(EmitterState& state, const IR::Operand& dst, uint32_t
 void EmitIAddCarryU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitISubBorrowU32(EmitterState& state, const IR::Instruction& inst);
+
+void EmitISubBorrowCarryU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitScalarAddCarryU32(EmitterState& state, const IR::Instruction& inst);
 

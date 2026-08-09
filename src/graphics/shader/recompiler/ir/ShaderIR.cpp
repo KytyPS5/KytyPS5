@@ -589,6 +589,29 @@ bool LowerScalarBinaryScc(const Decoder::Instruction& decoded, BasicBlock& block
 	return true;
 }
 
+bool LowerScalarAbsDiff(const Decoder::Instruction& decoded, BasicBlock& block,
+                        std::string* error) {
+	Instruction subtract;
+	subtract.pc        = decoded.pc;
+	subtract.op        = Opcode::ISubU32;
+	subtract.src_count = 2;
+	if (!LowerRegisterOperand(decoded.dst, subtract.dst, error) ||
+	    !LowerSourceOperand(decoded.src0, subtract.src[0], error) ||
+	    !LowerSourceOperand(decoded.src1, subtract.src[1], error)) {
+		return false;
+	}
+	block.instructions.push_back(subtract);
+
+	Instruction absolute;
+	absolute.pc        = decoded.pc;
+	absolute.op        = Opcode::AbsI32;
+	absolute.src_count = 1;
+	absolute.dst       = subtract.dst;
+	absolute.src[0]    = subtract.dst;
+	block.instructions.push_back(absolute);
+	return AppendScalarResultSccNonZero(decoded, block, error);
+}
+
 bool LowerScalarBitset0B32(const Decoder::Instruction& decoded, BasicBlock& block,
                            std::string* error) {
 	Instruction inst;
@@ -717,6 +740,23 @@ bool LowerVectorAddCarry(const Decoder::Instruction& decoded, BasicBlock& block,
 	Instruction inst;
 	inst.pc        = decoded.pc;
 	inst.op        = Opcode::IAddCarryU32;
+	inst.src_count = 3;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerRegisterOperand(decoded.dst2, inst.dst2, error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src1, inst.src[1], error) ||
+	    !LowerSourceOperand(decoded.src2, inst.src[2], error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
+bool LowerVectorSubBorrowCarry(const Decoder::Instruction& decoded, BasicBlock& block,
+                               std::string* error) {
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = Opcode::ISubBorrowCarryU32;
 	inst.src_count = 3;
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
 	    !LowerRegisterOperand(decoded.dst2, inst.dst2, error) ||
@@ -970,6 +1010,7 @@ bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& bl
 			return LowerControlMarker(decoded, block, Opcode::Sendmsg, true, error);
 		case Decoder::Opcode::SSetregB32:
 		case Decoder::Opcode::SSleep:
+		case Decoder::Opcode::SSetprio:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
 		case Decoder::Opcode::STtraceData:
 			return LowerControlMarker(decoded, block, Opcode::TtraceData, true, error);
@@ -1046,6 +1087,7 @@ bool IsControlOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::SSendmsg:
 		case Decoder::Opcode::SSetregB32:
 		case Decoder::Opcode::SSleep:
+		case Decoder::Opcode::SSetprio:
 		case Decoder::Opcode::STtraceData:
 		case Decoder::Opcode::SInstPrefetch: return true;
 		default: return false;
@@ -1106,11 +1148,13 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 			return LowerScalarBinaryScc(inst, block, Opcode::ScalarSignedAddOverflowI32, error);
 		case Decoder::Opcode::SSubI32:
 			return LowerScalarBinaryScc(inst, block, Opcode::ScalarSignedSubOverflowI32, error);
+		case Decoder::Opcode::SAbsDiffI32: return LowerScalarAbsDiff(inst, block, error);
 		case Decoder::Opcode::VCndmaskB32: return LowerVectorCndmask(inst, block, error);
 		case Decoder::Opcode::VMovB32: return LowerVectorMoveB32(inst, block, error);
 		case Decoder::Opcode::VMovreldB32: return LowerVectorMoveRelDestination(inst, block, error);
 		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
 		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);
+		case Decoder::Opcode::VSubbU32: return LowerVectorSubBorrowCarry(inst, block, error);
 		case Decoder::Opcode::VMadU64U32: return LowerVectorMadU64U32(inst, block, error);
 		case Decoder::Opcode::VMacF32: return LowerVectorMacF32(inst, block, error);
 		case Decoder::Opcode::VPkFmacF16: return LowerVectorPkFmacF16(inst, block, error);

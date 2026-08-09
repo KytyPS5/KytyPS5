@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <fmt/format.h>
 #include <map>
 #include <span>
@@ -670,6 +671,16 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!Decoder::DecodeProgram(code, decoded, error)) {
 		return false;
 	}
+	if (options.stage == ShaderType::Pixel && options.shader_hash == 0x000000000673627aull) {
+		for (auto& instruction: decoded.instructions) {
+			instruction.image_sample_flags &= ~Decoder::ImageSampleFlagCompare;
+		}
+	}
+	for (auto& instruction: decoded.instructions) {
+		if (instruction.image_dimension == Decoder::ImageDimension::Dim3D) {
+			instruction.image_sample_flags &= ~Decoder::ImageSampleFlagCompare;
+		}
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -773,7 +784,39 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		ir.fallback_reason = dispatcher_reason;
 	}
 
-	if (!IR::PatchSrtReads(ir, error) || !IR::TrackResources(ir, error)) {
+	if (!IR::PatchSrtReads(ir, error)) {
+		return false;
+	}
+	if (!IR::TrackResources(ir, error)) {
+		if (options.stage == ShaderType::Compute) {
+			std::string provenance_dump =
+			    fmt::format("user_data_base={} user_data_count={}\n", ir.user_data_base,
+			                ir.user_data_count);
+			for (uint32_t id = 0; id < ir.provenance.values.size(); id++) {
+				const auto& value = ir.provenance.values[id];
+				provenance_dump += fmt::format(
+				    "id={} op={} pc=0x{:08x} imm=0x{:08x} args=[{},{},{},{},{},{}] text={}\n", id,
+				    static_cast<uint32_t>(value.op), value.pc, value.imm, value.args[0],
+				    value.args[1], value.args[2], value.args[3], value.args[4], value.args[5],
+				    IR::ScalarValueToString(ir.provenance, id));
+			}
+			const auto fallback_decode_dump =
+			    decoded_dump.empty() ? Decoder::ProgramToString(decoded) : decoded_dump;
+			const auto fallback_ir_dump = MakeIrDump(cfg, ir);
+			std::fprintf(stderr, "%s targeted resource-tracking provenance:\n%s\n",
+			             GetDumpLabel(options), provenance_dump.c_str());
+			std::fprintf(stderr, "%s targeted resource-tracking decode:\n%s\n",
+			             GetDumpLabel(options), fallback_decode_dump.c_str());
+			std::fprintf(stderr, "%s targeted resource-tracking IR:\n%s\n",
+			             GetDumpLabel(options), fallback_ir_dump.c_str());
+			LOGF("%s targeted resource-tracking provenance:\n%s\n", GetDumpLabel(options),
+			     provenance_dump.c_str());
+			LOGF("%s targeted resource-tracking decode:\n%s\n", GetDumpLabel(options),
+			     decoded_dump.empty() ? Decoder::ProgramToString(decoded).c_str()
+			                           : decoded_dump.c_str());
+			LOGF("%s targeted resource-tracking IR:\n%s\n", GetDumpLabel(options),
+			     MakeIrDump(cfg, ir).c_str());
+		}
 		return false;
 	}
 	if (options.stage == ShaderType::Vertex) {

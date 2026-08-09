@@ -25,6 +25,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::SBcnt1I32B32, Opcode::BitCountU32},
     {Decoder::Opcode::SBcnt1I32B64, Opcode::BitCountU64},
     {Decoder::Opcode::SFf1I32B32, Opcode::FindLsbU32},
+    {Decoder::Opcode::SFf1I32B64, Opcode::FindLsbU64},
     {Decoder::Opcode::SFlbitI32B64, Opcode::FindMsbFromHighU64},
     {Decoder::Opcode::SBitreplicateB64B32, Opcode::BitReplicateB64B32},
     {Decoder::Opcode::SNotB32, Opcode::BitwiseNotU32},
@@ -33,6 +34,8 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::SSubU32, Opcode::ISubU32},
     {Decoder::Opcode::SAddI32, Opcode::IAddU32},
     {Decoder::Opcode::SSubI32, Opcode::ISubU32},
+    {Decoder::Opcode::SBitset0B64, Opcode::BitClearU64},
+    {Decoder::Opcode::SBitset1B64, Opcode::BitSetU64},
     {Decoder::Opcode::SMinI32, Opcode::IMinI32},
     {Decoder::Opcode::SMaxI32, Opcode::IMaxI32},
     {Decoder::Opcode::SMinU32, Opcode::UMinU32},
@@ -172,6 +175,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VOr3B32, Opcode::BitwiseOr3U32},
     {Decoder::Opcode::VXor3B32, Opcode::BitwiseXor3U32},
     {Decoder::Opcode::VAddNcU32, Opcode::IAddU32},
+    {Decoder::Opcode::VSubbU32, Opcode::ISubBorrowCarryU32},
     {Decoder::Opcode::VSubNcU32, Opcode::ISubU32},
     {Decoder::Opcode::VSubrevNcU32, Opcode::ISubU32},
     {Decoder::Opcode::VAddNcU16, Opcode::IAddU16},
@@ -238,6 +242,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VMbcntHiU32B32, Opcode::MaskedBitCountHighU32},
     {Decoder::Opcode::VLshlB32, Opcode::ShiftLeftLogicalU32},
     {Decoder::Opcode::VLshlrevB32, Opcode::ShiftLeftLogicalU32},
+    {Decoder::Opcode::VLshlrevB64, Opcode::ShiftLeftLogicalU64},
     {Decoder::Opcode::VLshlrevB16, Opcode::ShiftLeftLogicalU16},
     {Decoder::Opcode::VLshrB32, Opcode::ShiftRightLogicalU32},
     {Decoder::Opcode::VLshrrevB32, Opcode::ShiftRightLogicalU32},
@@ -451,6 +456,7 @@ bool IsReversedBinary(Decoder::Opcode opcode) {
 		case Decoder::Opcode::VSubrevF16:
 		case Decoder::Opcode::VSubrevNcU32:
 		case Decoder::Opcode::VLshlrevB32:
+		case Decoder::Opcode::VLshlrevB64:
 		case Decoder::Opcode::VLshrrevB32:
 		case Decoder::Opcode::VAshrrevI32:
 		case Decoder::Opcode::VLshlrevB16:
@@ -473,6 +479,7 @@ bool IsVectorCarryOutOpcode(Decoder::Opcode opcode) {
 bool ScalarResultWritesSccNonZero(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::SAbsI32:
+		case Decoder::Opcode::SAbsDiffI32:
 		case Decoder::Opcode::SBcnt1I32B32:
 		case Decoder::Opcode::SBcnt1I32B64:
 		case Decoder::Opcode::SAndB32:

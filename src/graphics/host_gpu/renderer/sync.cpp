@@ -14,6 +14,7 @@
 #include "libs/errno.h"
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -249,21 +250,43 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+	constexpr int REJECT_RETRY_ATTEMPTS = 200;
+
+	auto& video_out = buffer.GetContext().GetVideoOut();
+	int   attempts  = 0;
 	for (;;) {
-		uint64_t   request_id = 0;
-		auto&      video_out  = buffer.GetContext().GetVideoOut();
+		uint64_t request_id = 0;
 		const auto result =
 		    video_out.SubmitFlipFromGpu(buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
+			// FlipQueue::Reserve now holds the group ref; drop the submit pin.
+			VideoOut::VideoOutUnpinFlipTarget(handle, index);
 			return request_id;
 		}
-		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
-			EXIT("GPU flip submission failed, result=%d handle=%d index=%d mode=%d arg=%" PRId64
-			     "\n",
-			     result, handle, index, flip_mode, flip_arg);
+		if (result == VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
+			video_out.WaitForSubmitSlot();
+			continue;
 		}
-		video_out.WaitForSubmitSlot();
+		if (result == VideoOut::VIDEO_OUT_ERROR_INVALID_INDEX &&
+		    index != VideoOut::VIDEO_OUT_BUFFER_INDEX_BLANK) {
+			// The guest unregistered/re-registered the surface concurrently with
+			// this flip; retry briefly, then degrade to a blank frame instead of
+			// killing the process. Keep the submit pin across retries so a
+			// retiring group is not torn down before Reserve succeeds.
+			if (++attempts < REJECT_RETRY_ATTEMPTS) {
+				Common::Thread::SleepMicro(500);
+				continue;
+			}
+			VideoOut::VideoOutUnpinFlipTarget(handle, index);
+			index    = VideoOut::VIDEO_OUT_BUFFER_INDEX_BLANK;
+			attempts = 0;
+			continue;
+		}
+		VideoOut::VideoOutUnpinFlipTarget(handle, index);
+		EXIT("GPU flip submission failed, result=%d handle=%d index=%d mode=%d arg=%" PRId64
+		     "\n",
+		     result, handle, index, flip_mode, flip_arg);
 	}
 }
 

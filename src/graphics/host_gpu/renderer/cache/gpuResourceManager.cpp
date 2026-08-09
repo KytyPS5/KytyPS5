@@ -1,8 +1,14 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/hostException.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -15,6 +21,15 @@ GpuResourceManager::~GpuResourceManager() = default;
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	constexpr uint64_t fault_size = 8;
 	if (!IsMapped(fault_vaddr, fault_size)) {
+		return false;
+	}
+	// Guest CPU faults in VEH/signal must not SendCommandSync (nests into ntdll → SoftIdle).
+	// Non-GPU-thread accesses (reads *and* writes): decline so the ExceptionHandler soft-continue
+	// skips the faulting memop instead of handing the page to the CPU. Handing a guest write to
+	// the CPU (acquire no-sync) poisons GPU-tracked memory (e.g. a C++ object that aliases VRAM),
+	// which later nests into ntdll → SoftIdle → no one signals mid-IB fences → hang. Only the GPU
+	// host thread (GpuSync fences) may take the mapped path below.
+	if (!Gpu::IsGpuThread() && Common::HostException::InExceptionFilter()) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {

@@ -74,6 +74,10 @@ static Handler LoadInstalledHandler() noexcept {
 	}
 	return handler;
 }
+
+bool InExceptionFilter() noexcept {
+	return g_in_exception_filter;
+}
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -91,6 +95,26 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	if (exception_record->ExceptionCode == 0x406D1388) {
 		// Set a thread name.
 		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	static std::atomic_uint32_t exception_trace_count {0};
+	const auto                  trace_index = exception_trace_count.fetch_add(1);
+	if (trace_index < 128) {
+		const auto info0 = exception_record->NumberParameters > 0
+		                       ? exception_record->ExceptionInformation[0]
+		                       : 0ull;
+		const auto info1 = exception_record->NumberParameters > 1
+		                       ? exception_record->ExceptionInformation[1]
+		                       : 0ull;
+		std::fprintf(stderr,
+		             "host exception enter: code=%08" PRIx32 " exception=%016" PRIx64
+		             " rip=%016" PRIx64 " rsp=%016" PRIx64 " info0=%016" PRIx64
+		             " info1=%016" PRIx64 " tid=%lu\n",
+		             static_cast<uint32_t>(exception_record->ExceptionCode),
+		             reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
+		             exception->ContextRecord != nullptr ? exception->ContextRecord->Rip : 0,
+		             exception->ContextRecord != nullptr ? exception->ContextRecord->Rsp : 0,
+		             info0, info1, static_cast<unsigned long>(GetCurrentThreadId()));
 	}
 
 	ExceptionInfo info {};
@@ -138,7 +162,19 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 
 	const auto handler = LoadInstalledHandler();
 
-	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	if (info.type == ExceptionType::IllegalInstruction) {
+		std::fprintf(stderr, "host illegal dispatch: rip=%016" PRIx64 " rsp=%016" PRIx64 "\n",
+		             info.exception_address, info.rsp);
+	}
+	const bool resolved = handler(info);
+	if (info.type == ExceptionType::IllegalInstruction) {
+		std::fprintf(stderr, "host illegal result: resolved=%d rip=%016" PRIx64 " rsp=%016" PRIx64
+		             "\n",
+		             resolved ? 1 : 0,
+		             exception->ContextRecord != nullptr ? exception->ContextRecord->Rip : 0,
+		             exception->ContextRecord != nullptr ? exception->ContextRecord->Rsp : 0);
+	}
+	return resolved ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 #elif defined(__APPLE__)
@@ -168,6 +204,10 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 		return AccessViolationType::Write;
 	}
 	return AccessViolationType::Read;
+}
+
+bool InExceptionFilter() noexcept {
+	return g_in_exception_filter;
 }
 
 // POSIX signal handler that mirrors the Windows vectored handler: build an ExceptionInfo

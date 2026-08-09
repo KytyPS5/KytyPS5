@@ -5,6 +5,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
@@ -39,6 +40,9 @@ namespace LibC {
 LIB_VERSION("libc", 1, "libc", 1, 1);
 
 static uint32_t g_need_flag = 1;
+
+static std::mutex                          g_guest_malloc_mutex;
+static std::unordered_map<uint64_t, size_t> g_guest_malloc_sizes;
 
 using cxa_destructor_func_t = KYTY_SYSV_ABI void (*)(void*);
 using atexit_func_t         = KYTY_SYSV_ABI void (*)();
@@ -259,6 +263,37 @@ static KYTY_SYSV_ABI int* libc_error() {
 	PRINT_NAME();
 
 	return Posix::GetErrorAddr();
+}
+
+static KYTY_SYSV_ABI void* libc_malloc(size_t size) {
+	const auto ptr = LibKernel::Memory::AllocateRuntimeMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "libc_malloc");
+	if (ptr != 0) {
+		std::lock_guard lock(g_guest_malloc_mutex);
+		g_guest_malloc_sizes.emplace(ptr, size);
+	}
+
+	return reinterpret_cast<void*>(ptr);
+}
+
+static KYTY_SYSV_ABI void libc_free(void* ptr) {
+	if (ptr == nullptr) {
+		return;
+	}
+
+	const auto address = reinterpret_cast<uint64_t>(ptr);
+	size_t     size    = 0;
+	{
+		std::lock_guard lock(g_guest_malloc_mutex);
+		const auto      it = g_guest_malloc_sizes.find(address);
+		if (it == g_guest_malloc_sizes.end()) {
+			return;
+		}
+		size = it->second;
+		g_guest_malloc_sizes.erase(it);
+	}
+
+	EXIT_IF(!LibKernel::Memory::FreeGuestMemory(address, size));
 }
 
 static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
@@ -891,6 +926,8 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("uMei1W9uyNo", LibC::exit);
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
 	LIB_FUNC("9BcDykPmo1I", LibC::libc_error);
+	LIB_FUNC("gQX+4GDQjpM", LibC::libc_malloc);
+	LIB_FUNC("tIhsqj0qsFE", LibC::libc_free);
 	LIB_FUNC("bzQExy189ZI", LibC::init_env);
 	LIB_FUNC("8G2LB+A3rzg", LibC::atexit);
 	LIB_FUNC("hcuQgD53UxM", LibC::libc_printf);

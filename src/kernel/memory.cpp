@@ -65,11 +65,20 @@ constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
-constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t PS5_TOTAL_MEMORY_SIZE =
+    static_cast<uint64_t>(16384) * 1024ull * 1024ull; // 16 GiB guest address space
+constexpr uint64_t PS5_DIRECT_MEMORY_SIZE =
+    static_cast<uint64_t>(13824) * 1024ull * 1024ull; // sceKernelGetDirectMemorySize()
+// TLOU and similar titles expect ~512 MiB flexible; 1 GiB triggers "RAM Cache is being disabled".
+constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE =
+    static_cast<uint64_t>(512) * 1024ull * 1024ull;
 
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
+static uint64_t                      g_flexible_program_code_bytes = 0;
 static Graphics::GpuResourceManager* g_gpu_resources               = nullptr;
+
+static bool CountsTowardFlexibleProgramQuota(const char* name);
 
 static Graphics::GpuResourceManager& GetGpuResources() {
 	EXIT_IF(g_gpu_resources == nullptr);
@@ -677,11 +686,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
-	static uint64_t           Size() {
-		EXIT_IF(g_flexible_memory_size >= TotalSize());
-		return TotalSize() - g_flexible_memory_size;
-	}
+	static constexpr uint64_t TotalSize() { return PS5_TOTAL_MEMORY_SIZE; }
+	static constexpr uint64_t Size() { return PS5_DIRECT_MEMORY_SIZE; }
 
 	bool Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
 	           uint64_t* phys_addr_out, int memory_type, bool pool_expansion = false);
@@ -978,6 +984,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 KYTY_SUBSYSTEM_INIT(Memory) {
 	g_flexible_memory_size_frozen = true;
+	g_flexible_program_code_bytes = 0;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
@@ -996,6 +1003,7 @@ KYTY_SUBSYSTEM_DESTROY(Memory) {
 	g_physical_memory.reset();
 	g_virtual_ranges.reset();
 	g_guest_address_space.reset();
+	g_flexible_program_code_bytes = 0;
 }
 
 struct AlignedPos {
@@ -1081,6 +1089,13 @@ void ApplyMemoryRegionsFromProcParam(uint64_t flex_scalar) {
 	SyncFlexibleMemoryFromProcParam(flex_scalar);
 
 	const auto direct = PhysicalMemory::Size();
+	const auto max_configured =
+	    direct < PS5_TOTAL_MEMORY_SIZE ? PS5_TOTAL_MEMORY_SIZE - direct : 0ull;
+	if (configured > max_configured) {
+		LOGF("ApplyMemoryRegionsFromProcParam: direct 0x%016" PRIx64
+		     " + flex 0x%016" PRIx64 " exceeds total 0x%016" PRIx64 "\n",
+		     direct, configured, PS5_TOTAL_MEMORY_SIZE);
+	}
 	LOGF("ApplyMemoryRegionsFromProcParam: direct=0x%016" PRIx64 " (%" PRIu64 " MiB)"
 	     " flexible=0x%016" PRIx64 " (%" PRIu64 " MiB) scalar=0x%016" PRIx64 "\n",
 	     direct, direct / (1024ull * 1024ull), configured, configured / (1024ull * 1024ull),
@@ -1641,13 +1656,18 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
                          GpuAccessMode gpu_mode, const char* name) {
 	Common::LockGuard lock(m_mutex);
 
-	const auto available = (Size() >= m_allocated_total ? Size() - m_allocated_total : 0);
+	const auto program_code_used = std::min(Size(), g_flexible_program_code_bytes);
+	const auto available =
+	    m_allocated_total >= Size() - program_code_used
+	        ? 0
+	        : Size() - program_code_used - m_allocated_total;
 	if (len == 0 || len > available) {
 		LOGF_COLOR(Log::Color::Red,
 		           "\t flexible memory exhausted: configured = 0x%016" PRIx64
 		           ", allocated = 0x%016" PRIx64 ", available = 0x%016" PRIx64
-		           ", requested = 0x%016" PRIx64 "\n",
-		           Size(), m_allocated_total, available, static_cast<uint64_t>(len));
+		           ", program_code = 0x%016" PRIx64 ", requested = 0x%016" PRIx64 "\n",
+		           Size(), m_allocated_total, available, program_code_used,
+		           static_cast<uint64_t>(len));
 		return false;
 	}
 
@@ -1982,7 +2002,53 @@ void PhysicalMemory::SetVirtualRangeMemoryType(uint64_t vaddr, uint64_t len, int
 uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
-	return (Size() >= m_allocated_total ? Size() - m_allocated_total : 0);
+	const auto program_code_used = std::min(Size(), g_flexible_program_code_bytes);
+	if (m_allocated_total >= Size() - program_code_used) {
+		return 0;
+	}
+	return Size() - program_code_used - m_allocated_total;
+}
+
+static bool CountsTowardFlexibleProgramQuota(const char* name) {
+	if (name == nullptr) {
+		return true;
+	}
+
+	const auto lower = Common::ToLower(name);
+	return !Common::EndsWith(lower, "libc.prx") && !Common::EndsWith(lower, "libkernel.prx") &&
+	       !Common::EndsWith(lower, "libkernel_sys.prx");
+}
+
+void RegisterProgramFlexibleQuota(uint64_t size, const char* name) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (!CountsTowardFlexibleProgramQuota(name)) {
+		return;
+	}
+	if (size > UINT64_MAX - g_flexible_program_code_bytes) {
+		g_flexible_program_code_bytes = UINT64_MAX;
+	} else {
+		g_flexible_program_code_bytes += size;
+	}
+	LOGF("RegisterProgramFlexibleQuota: %s +0x%016" PRIx64 " total=0x%016" PRIx64 "\n",
+	     name != nullptr ? name : "<unnamed>", size, g_flexible_program_code_bytes);
+}
+
+void UnregisterProgramFlexibleQuota(uint64_t size, const char* name) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (!CountsTowardFlexibleProgramQuota(name)) {
+		return;
+	}
+	if (size > g_flexible_program_code_bytes) {
+		LOGF_COLOR(Log::Color::Yellow,
+		           "UnregisterProgramFlexibleQuota: size 0x%016" PRIx64
+		           " exceeds total 0x%016" PRIx64 ", clamping\n",
+		           size, g_flexible_program_code_bytes);
+		g_flexible_program_code_bytes = 0;
+	} else {
+		g_flexible_program_code_bytes -= size;
+	}
 }
 
 void PooledMemory::AddFreeUnlocked(uint64_t start, uint64_t size) {
@@ -3560,7 +3626,12 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 
 	*size = g_flexible_memory->Available();
 
-	LOGF("\t *size = 0x%016" PRIx64 "\n", *size);
+	LOGF("\t configured = 0x%016" PRIx64 "\n"
+	     "\t program_code = 0x%016" PRIx64 "\n"
+	     "\t flexible_allocated = 0x%016" PRIx64 "\n"
+	     "\t *size = 0x%016" PRIx64 "\n",
+	     FlexibleMemory::Size(), g_flexible_program_code_bytes,
+	     FlexibleMemory::Size() >= *size ? FlexibleMemory::Size() - *size : 0ull, *size);
 
 	return OK;
 }

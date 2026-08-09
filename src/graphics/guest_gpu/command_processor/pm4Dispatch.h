@@ -154,6 +154,8 @@ uint32_t CpOpIndirectShRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32
 uint32_t CpOpIndirectUcRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWriteConstRam(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDumpConstRam(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpScratchRamWrite(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpScratchRamRead(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIncrementCeCounter(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIncrementDeCounter(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitOnCeCounter(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

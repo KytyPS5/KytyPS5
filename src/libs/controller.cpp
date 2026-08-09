@@ -356,6 +356,18 @@ int KYTY_SYSV_ABI PadInit() {
 	return OK;
 }
 
+static bool PadOpenArgsAreValid(int user_id, int type, int index) {
+	constexpr int user_id_initial    = 1000;
+	constexpr int user_id_system     = 0xff;
+	constexpr int port_type_standard = 0;
+	constexpr int port_type_special  = 2;
+	constexpr int port_type_remote   = 16;
+	const bool    personal_port =
+	    user_id == user_id_initial && (type == port_type_standard || type == port_type_special);
+	const bool system_remote_control = user_id == user_id_system && type == port_type_remote;
+	return index == 0 && (personal_port || system_remote_control);
+}
+
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	PRINT_NAME();
 
@@ -367,7 +379,7 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 
 	constexpr int pad_error_invalid_arg = -2137915391; /* 0x80920001 */
 
-	if (user_id != 1000 || (type != 0 && type != 2 && type != 16) || index != 0) {
+	if (!PadOpenArgsAreValid(user_id, type, index)) {
 		return pad_error_invalid_arg;
 	}
 
@@ -386,7 +398,7 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 
 	constexpr int pad_error_device_no_handle = -2137915384; /* 0x80920008 */
 
-	if (user_id != 1000 || (type != 0 && type != 2 && type != 16) || index != 0) {
+	if (!PadOpenArgsAreValid(user_id, type, index)) {
 		return pad_error_device_no_handle;
 	}
 

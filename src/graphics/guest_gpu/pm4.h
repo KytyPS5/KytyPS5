@@ -372,6 +372,7 @@ constexpr uint32_t PA_CL_UCP_0_X          = 0x16F;
 constexpr uint32_t PA_CL_UCP_0_Y          = 0x170;
 constexpr uint32_t PA_CL_UCP_0_Z          = 0x171;
 constexpr uint32_t PA_CL_UCP_0_W          = 0x172;
+constexpr uint32_t PA_CL_UCP_5_W          = 0x186;
 constexpr uint32_t SPI_PS_INPUT_CNTL_0    = 0x191;
 constexpr uint32_t SPI_PS_INPUT_CNTL_31   = 0x1B0;
 constexpr uint32_t SPI_VS_OUT_CONFIG      = 0x1B1;

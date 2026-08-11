@@ -337,21 +337,23 @@ std::filesystem::path MountPoints::GetRealDirectory(const std::string& mounted_d
 	return mounted_directory;
 }
 
-KYTY_SUBSYSTEM_INIT(FileSystem) {
+void Initialize() {
 	g_mount_points = new MountPoints;
 	g_files        = new FileDescriptors;
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(FileSystem) {
+void EmergencyShutdown() {
 	if (g_files != nullptr) {
 		g_files->CloseAll();
 	}
 }
 
-KYTY_SUBSYSTEM_DESTROY(FileSystem) {
-	if (g_files != nullptr) {
-		g_files->CloseAll();
-	}
+void Shutdown() {
+	EmergencyShutdown();
+	delete g_files;
+	delete g_mount_points;
+	g_files        = nullptr;
+	g_mount_points = nullptr;
 }
 
 void Mount(const std::filesystem::path& folder, const std::string& point) {

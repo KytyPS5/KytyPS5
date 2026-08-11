@@ -4,17 +4,18 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/dateTime.h"
-#include "common/subsystems.h"
-
 namespace Loader::Timer {
-
-KYTY_SUBSYSTEM_DEFINE(Timer);
 
 void         Start();
 double       GetTimeMs();
 Common::Time GetTime();
 uint64_t     GetCounter();
 uint64_t     GetFrequency();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Timer";
+	static constexpr auto        initialize = Loader::Timer::Start;
+};
 
 } // namespace Loader::Timer
 

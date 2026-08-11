@@ -181,15 +181,13 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 
 } // namespace AudioInternal
 
-KYTY_SUBSYSTEM_INIT(Audio) {
+void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
 	g_audio = new Audio;
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Audio) {}
-
-KYTY_SUBSYSTEM_DESTROY(Audio) {
+void Shutdown() {
 	delete g_audio;
 	g_audio = nullptr;
 }
@@ -1461,14 +1459,14 @@ struct Ngs2CustomSamplerRackOption {
 };
 
 union Ngs2RackOptionUnion {
-	Ngs2RackOption               common;
-	Ngs2SamplerRackOption        sampler;
-	Ngs2MasteringRackOption      mastering;
-	Ngs2SubmixerRackOption       submixer;
-	Ngs2ReverbRackOption         reverb;
-	Ngs2CustomSubmixerRackOption custom_submixer;
+	Ngs2RackOption                common;
+	Ngs2SamplerRackOption         sampler;
+	Ngs2MasteringRackOption       mastering;
+	Ngs2SubmixerRackOption        submixer;
+	Ngs2ReverbRackOption          reverb;
+	Ngs2CustomSubmixerRackOption  custom_submixer;
 	Ngs2CustomMasteringRackOption custom_mastering;
-	Ngs2CustomSamplerRackOption  custom_sampler;
+	Ngs2CustomSamplerRackOption   custom_sampler;
 };
 
 struct Ngs2ContextBufferInfo {
@@ -2653,8 +2651,8 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 	switch (voice->rack->type) {
 		case Ngs2RackType::Submixer: {
 			EXIT_NOT_IMPLEMENTED(state_size != sizeof(Ngs2SubmixerVoiceState));
-			auto* submixer = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
-			*submixer     = {};
+			auto* submixer                    = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
+			*submixer                         = {};
 			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
 			LOGF("\t state_flags = %u\n", submixer->voice_state.state_flags);
 			break;

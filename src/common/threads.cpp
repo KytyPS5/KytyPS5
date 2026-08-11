@@ -252,14 +252,10 @@ static thread_id_t      g_main_thread;
 static int              g_main_thread_int;
 static std::atomic<int> g_thread_counter = 0;
 
-KYTY_SUBSYSTEM_INIT(Threads) {
+void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
 }
-
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Threads) {}
-
-KYTY_SUBSYSTEM_DESTROY(Threads) {}
 
 Thread::Thread(thread_func_t func, void* arg)
     : m_thread(std::make_unique<ThreadPrivate>(func, arg)) {

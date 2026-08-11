@@ -32,64 +32,21 @@ namespace DialogIme = Libs::Dialog::ImeDialog;
 
 namespace Ime {
 
-enum class Type : uint32_t { Default = 0, BasicLatin = 1, Url = 2, Mail = 3, Number = 4 };
-enum class EnterLabel : uint32_t { Default = 0, Send = 1, Search = 2, Go = 3 };
-enum class Alignment : uint32_t { Start = 0, Center = 1, End = 2 };
-enum class ExternalAction : uint8_t {
-	None,
-	Text,
-	Backspace,
-	MoveLeft,
-	MoveRight,
-	Cancel,
-	Accept,
-	Newline,
-};
+using Type           = ImeCommon::Type;
+using EnterLabel     = ImeCommon::EnterLabel;
+using Alignment      = ImeCommon::Alignment;
+using ExternalAction = ImeCommon::ExternalAction;
+using ExternalInput  = ImeCommon::ExternalInput;
+using HostSnapshot   = ImeCommon::HostSnapshot;
 
-struct Keycode {
-	uint16_t keycode     = 0;
-	char16_t character   = u'\0';
-	uint32_t status      = 0;
-	uint32_t type        = 0;
-	int32_t  user_id     = 0;
-	uint32_t resource_id = 0;
-	uint64_t timestamp   = 0;
-};
-
-struct ExternalInput {
-	Keycode        key;
-	ExternalAction action = ExternalAction::None;
-	std::u16string text;
-};
-
-struct HostSnapshot {
-	uint64_t       generation           = 0;
-	Type           type                 = Type::Default;
-	EnterLabel     enter_label          = EnterLabel::Default;
-	uint32_t       option               = 0;
-	uint32_t       max_text_length      = 0;
-	uint32_t       cursor               = 0;
-	uint32_t       disable_device       = 0;
-	bool           key_panel_visible    = true;
-	float          posx                 = 0.0f;
-	float          posy                 = 0.0f;
-	Alignment      horizontal_alignment = Alignment::Start;
-	Alignment      vertical_alignment   = Alignment::Start;
-	uint32_t       panel_width          = 0;
-	uint32_t       panel_height         = 0;
-	std::u16string text;
-	std::u16string title;
-	std::u16string placeholder;
-};
-
-constexpr uint32_t OPTION_MULTILINE            = 0x00000001;
-constexpr uint32_t OPTION_NO_AUTO_CAPITALIZE   = 0x00000002;
-constexpr uint32_t OPTION_PASSWORD             = 0x00000004;
-constexpr uint32_t OPTION_FIXED_POSITION       = 0x00000040;
-constexpr uint32_t OPTION_DISABLE_POSITION_ADJ = 0x00000800;
-constexpr uint32_t OPTION_USE_OVER_2K          = 0x00004000;
-constexpr uint32_t DISABLE_DEVICE_CONTROLLER   = 0x00000001;
-constexpr uint32_t DISABLE_DEVICE_EXT_KEYBOARD = 0x00000002;
+constexpr uint32_t OPTION_MULTILINE            = ImeCommon::OPTION_MULTILINE;
+constexpr uint32_t OPTION_NO_AUTO_CAPITALIZE   = ImeCommon::OPTION_NO_AUTO_CAPITALIZE;
+constexpr uint32_t OPTION_PASSWORD             = ImeCommon::OPTION_PASSWORD;
+constexpr uint32_t OPTION_FIXED_POSITION       = ImeCommon::OPTION_FIXED_POSITION;
+constexpr uint32_t OPTION_DISABLE_POSITION_ADJ = ImeCommon::OPTION_DISABLE_POSITION_ADJUST;
+constexpr uint32_t OPTION_USE_OVER_2K          = ImeCommon::OPTION_USE_OVER_2K;
+constexpr uint32_t DISABLE_DEVICE_CONTROLLER   = ImeCommon::DISABLE_DEVICE_CONTROLLER;
+constexpr uint32_t DISABLE_DEVICE_EXT_KEYBOARD = ImeCommon::DISABLE_DEVICE_EXT_KEYBOARD;
 constexpr uint64_t CORE_GENERATION_BIT         = uint64_t {1} << 63;
 
 uint64_t PackCoreGeneration(uint64_t generation) {
@@ -108,49 +65,11 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 	if (snapshot == nullptr) {
 		return false;
 	}
-	CoreIme::HostSnapshot core;
-	if (CoreIme::GetHostSnapshot(&core)) {
-		snapshot->generation           = PackCoreGeneration(core.generation);
-		snapshot->type                 = static_cast<Type>(core.type);
-		snapshot->enter_label          = static_cast<EnterLabel>(core.enter_label);
-		snapshot->option               = core.option;
-		snapshot->max_text_length      = core.max_text_length;
-		snapshot->cursor               = core.cursor;
-		snapshot->disable_device       = core.disable_device;
-		snapshot->key_panel_visible    = core.key_panel_visible;
-		snapshot->posx                 = core.posx;
-		snapshot->posy                 = core.posy;
-		snapshot->horizontal_alignment = static_cast<Alignment>(core.horizontal_alignment);
-		snapshot->vertical_alignment   = static_cast<Alignment>(core.vertical_alignment);
-		snapshot->panel_width          = core.panel_width;
-		snapshot->panel_height         = core.panel_height;
-		snapshot->text                 = std::move(core.text);
-		snapshot->title.clear();
-		snapshot->placeholder.clear();
+	if (CoreIme::GetHostSnapshot(snapshot)) {
+		snapshot->generation = PackCoreGeneration(snapshot->generation);
 		return true;
 	}
-	DialogIme::HostSnapshot dialog;
-	if (!DialogIme::GetHostSnapshot(&dialog)) {
-		return false;
-	}
-	snapshot->generation           = dialog.generation;
-	snapshot->type                 = static_cast<Type>(dialog.type);
-	snapshot->enter_label          = static_cast<EnterLabel>(dialog.enter_label);
-	snapshot->option               = dialog.option;
-	snapshot->max_text_length      = dialog.max_text_length;
-	snapshot->cursor               = dialog.cursor;
-	snapshot->disable_device       = dialog.disable_device;
-	snapshot->key_panel_visible    = dialog.key_panel_visible;
-	snapshot->posx                 = dialog.posx;
-	snapshot->posy                 = dialog.posy;
-	snapshot->horizontal_alignment = static_cast<Alignment>(dialog.horizontal_alignment);
-	snapshot->vertical_alignment   = static_cast<Alignment>(dialog.vertical_alignment);
-	snapshot->panel_width          = dialog.panel_width;
-	snapshot->panel_height         = dialog.panel_height;
-	snapshot->text                 = std::move(dialog.text);
-	snapshot->title                = std::move(dialog.title);
-	snapshot->placeholder          = std::move(dialog.placeholder);
-	return true;
+	return DialogIme::GetHostSnapshot(snapshot);
 }
 
 bool HostInsertText(uint64_t generation, std::u16string_view text) {
@@ -175,30 +94,9 @@ bool HostCancel(uint64_t generation) {
 }
 
 bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
-	if (!IsCoreGeneration(generation)) {
-		DialogIme::ExternalInput dialog;
-		dialog.key.keycode     = input.key.keycode;
-		dialog.key.character   = input.key.character;
-		dialog.key.status      = input.key.status;
-		dialog.key.type        = input.key.type;
-		dialog.key.user_id     = input.key.user_id;
-		dialog.key.resource_id = input.key.resource_id;
-		dialog.key.timestamp   = input.key.timestamp;
-		dialog.action          = static_cast<DialogIme::ExternalAction>(input.action);
-		dialog.text            = std::move(input.text);
-		return DialogIme::HostQueueExternalInput(generation, std::move(dialog));
-	}
-	CoreIme::ExternalInput core;
-	core.key.keycode     = input.key.keycode;
-	core.key.character   = input.key.character;
-	core.key.status      = input.key.status;
-	core.key.type        = input.key.type;
-	core.key.user_id     = input.key.user_id;
-	core.key.resource_id = input.key.resource_id;
-	core.key.timestamp   = input.key.timestamp;
-	core.action          = static_cast<CoreIme::ExternalAction>(input.action);
-	core.text            = std::move(input.text);
-	return CoreIme::HostQueueExternalInput(UnpackGeneration(generation), std::move(core));
+	return IsCoreGeneration(generation)
+	           ? CoreIme::HostQueueExternalInput(UnpackGeneration(generation), std::move(input))
+	           : DialogIme::HostQueueExternalInput(generation, std::move(input));
 }
 
 } // namespace Ime

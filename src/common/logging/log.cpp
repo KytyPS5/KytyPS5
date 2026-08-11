@@ -149,7 +149,7 @@ void WriteFatal(fmt::text_style style, std::string_view text) {
 	Flush();
 }
 
-KYTY_SUBSYSTEM_INIT(Log) {
+void Initialize() {
 	g_initialized = true;
 	switch (Config::GetPrintfDirection()) {
 		case Config::OutputDirection::Silent: g_direction = Direction::Silent; break;
@@ -161,13 +161,7 @@ KYTY_SUBSYSTEM_INIT(Log) {
 	SetupLogger();
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Log) {
-	Flush();
-	std::lock_guard lock(g_logger_mutex);
-	g_logger.reset();
-}
-
-KYTY_SUBSYSTEM_DESTROY(Log) {
+void Shutdown() {
 	Flush();
 	std::lock_guard lock(g_logger_mutex);
 	g_logger.reset();

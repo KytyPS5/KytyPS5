@@ -2,14 +2,13 @@
 #define KYTY_COMMON_THREADS_H_
 
 #include "common/common.h"
-#include "common/subsystems.h"
 
 #include <memory>
 #include <string>
 
 namespace Common {
 
-KYTY_SUBSYSTEM_DEFINE(Threads);
+void InitializeThreads();
 
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();

@@ -3,7 +3,6 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/subsystems.h"
 
 // IWYU pragma: no_include <pthread.h>
 
@@ -19,7 +18,12 @@ namespace Libs {
 
 namespace LibKernel {
 
-KYTY_SUBSYSTEM_DEFINE(Pthread);
+void Initialize();
+
+struct PthreadLifecycle {
+	static constexpr const char* name       = "Pthread";
+	static constexpr auto        initialize = Libs::LibKernel::Initialize;
+};
 
 struct PthreadAttrPrivate;
 struct PthreadPrivate;

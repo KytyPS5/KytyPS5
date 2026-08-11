@@ -976,7 +976,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
-KYTY_SUBSYSTEM_INIT(Memory) {
+void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
@@ -988,9 +988,7 @@ KYTY_SUBSYSTEM_INIT(Memory) {
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Memory) {}
-
-KYTY_SUBSYSTEM_DESTROY(Memory) {
+void Shutdown() {
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();

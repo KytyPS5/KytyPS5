@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -344,12 +345,13 @@ void SetIdentityInterpolatorSettings(ShaderPixelInputInfo* input_info) {
 void EnsureConfigInitialized() {
 	static bool config_initialized = false;
 	if (!config_initialized) {
-		Common::ThreadsSubsystem::Instance()->Init(nullptr);
-		Config::ConfigSubsystem::Instance()->Init(nullptr);
+		static Common::Subsystems subsystems;
+		Common::InitializeThreads();
+		subsystems.Initialize<Config::Lifecycle>();
 		Config::ConfigOptions options;
 		options.printf_direction = Config::OutputDirection::Silent;
 		Config::Load(options);
-		Log::LogSubsystem::Instance()->Init(nullptr);
+		subsystems.Initialize<Log::Lifecycle>();
 		ShaderInit();
 		config_initialized = true;
 	}

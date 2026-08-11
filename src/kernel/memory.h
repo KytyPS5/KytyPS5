@@ -3,7 +3,6 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/subsystems.h"
 #include "common/virtualMemory.h"
 
 namespace Libs::Graphics {
@@ -13,7 +12,14 @@ enum class PageFaultAccess;
 
 namespace Libs::LibKernel::Memory {
 
-KYTY_SUBSYSTEM_DEFINE(Memory);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Memory";
+	static constexpr auto        initialize = Libs::LibKernel::Memory::Initialize;
+	static constexpr auto        shutdown   = Libs::LibKernel::Memory::Shutdown;
+};
 
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 

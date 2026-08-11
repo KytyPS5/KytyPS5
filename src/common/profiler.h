@@ -2,7 +2,6 @@
 #define KYTY_COMMON_PROFILER_H_
 
 #include "common/common.h"
-#include "common/subsystems.h"
 
 #include <cstdint>
 #include <optional>
@@ -42,7 +41,15 @@ private:
 void EndBlock();
 void SetThreadName(const char* name);
 
-KYTY_SUBSYSTEM_DEFINE(Profiler);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name               = "Profiler";
+	static constexpr auto        initialize         = Profiler::Initialize;
+	static constexpr auto        shutdown           = Profiler::Shutdown;
+	static constexpr auto        emergency_shutdown = Profiler::Shutdown;
+};
 
 } // namespace Profiler
 

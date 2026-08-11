@@ -237,15 +237,16 @@ private:
 
 static Network* g_net = nullptr;
 
-KYTY_SUBSYSTEM_INIT(Network) {
+void Initialize() {
 	EXIT_IF(g_net != nullptr);
 
 	g_net = new Network;
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Network) {}
-
-KYTY_SUBSYSTEM_DESTROY(Network) {}
+void Shutdown() {
+	delete g_net;
+	g_net = nullptr;
+}
 
 int Network::PoolCreate(const char* name, int size) {
 	Common::LockGuard lock(m_mutex);

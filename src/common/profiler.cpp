@@ -1,7 +1,6 @@
 #include "common/profiler.h"
 
 #include "common/emulatorConfig.h"
-#include "common/subsystems.h"
 
 #include <algorithm>
 #include <common/TracyProtocol.hpp>
@@ -55,13 +54,7 @@ void SetThreadName(const char* name) {
 	}
 }
 
-void Close() {
-	if (tracy::ProfilerAvailable()) {
-		tracy::ShutdownProfiler();
-	}
-}
-
-KYTY_SUBSYSTEM_INIT(Profiler) {
+void Initialize() {
 	switch (Config::GetProfilerDirection()) {
 		case Config::ProfilerDirection::Network:
 			if (!tracy::ProfilerAvailable()) {
@@ -78,12 +71,10 @@ KYTY_SUBSYSTEM_INIT(Profiler) {
 	}
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Profiler) {
-	Close();
-}
-
-KYTY_SUBSYSTEM_DESTROY(Profiler) {
-	Close();
+void Shutdown() {
+	if (tracy::ProfilerAvailable()) {
+		tracy::ShutdownProfiler();
+	}
 }
 
 } // namespace Profiler

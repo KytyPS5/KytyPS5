@@ -3,11 +3,16 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/subsystems.h"
-
 namespace Libs::Controller {
 
-KYTY_SUBSYSTEM_DEFINE(Controller);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Controller";
+	static constexpr auto        initialize = Libs::Controller::Initialize;
+	static constexpr auto        shutdown   = Libs::Controller::Shutdown;
+};
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
 

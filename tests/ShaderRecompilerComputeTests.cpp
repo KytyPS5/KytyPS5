@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -706,13 +707,14 @@ void Require(const char* shader_name, const char* stage, bool value, const std::
 void EnsureConfigInitialized() {
 	static bool config_initialized = false;
 	if (!config_initialized) {
-		Common::ThreadsSubsystem::Instance()->Init(nullptr);
-		Config::ConfigSubsystem::Instance()->Init(nullptr);
+		static Common::Subsystems subsystems;
+		Common::InitializeThreads();
+		subsystems.Initialize<Config::Lifecycle>();
 		Config::ConfigOptions options;
 		options.printf_direction = Config::OutputDirection::Silent;
 		Config::Load(options);
-		Log::LogSubsystem::Instance()->Init(nullptr);
-		Libs::LibKernel::Memory::MemorySubsystem::Instance()->Init(nullptr);
+		subsystems.Initialize<Log::Lifecycle>();
+		subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 		config_initialized = true;
 	}
 }

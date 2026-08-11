@@ -2,7 +2,6 @@
 #define KYTY_COMMON_LOGGING_LOG_H_
 
 #include "common/common.h"
-#include "common/subsystems.h"
 
 #include <fmt/color.h>
 #include <fmt/printf.h>
@@ -10,7 +9,15 @@
 
 namespace Log {
 
-KYTY_SUBSYSTEM_DEFINE(Log);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name               = "Log";
+	static constexpr auto        initialize         = Log::Initialize;
+	static constexpr auto        shutdown           = Log::Shutdown;
+	static constexpr auto        emergency_shutdown = Log::Shutdown;
+};
 
 enum class Direction { Silent, Console, File };
 

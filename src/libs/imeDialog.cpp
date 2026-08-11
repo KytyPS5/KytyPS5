@@ -53,9 +53,8 @@ struct State {
 	ExtendedParam              extended {};
 	bool                       input_changed  = false;
 	bool                       commit_pending = false;
-	uint32_t                   cursor         = 0;
 	std::u16string             original_text;
-	std::u16string             current_text;
+	ImeCommon::TextEditEngine  editor;
 	std::u16string             title;
 	std::u16string             placeholder;
 	std::vector<ExternalInput> external_inputs;
@@ -71,8 +70,6 @@ bool AllZero(const int8_t* data, size_t size) {
 	return std::all_of(data, data + size, [](int8_t value) { return value == 0; });
 }
 
-bool IsValidUtf16(std::u16string_view text);
-
 bool ReadBounded(const char16_t* text, uint32_t limit, std::u16string* out) {
 	out->clear();
 	if (text == nullptr) {
@@ -82,7 +79,7 @@ bool ReadBounded(const char16_t* text, uint32_t limit, std::u16string* out) {
 	for (uint32_t i = 0; i <= limit; ++i) {
 		const char16_t value = text[i];
 		if (value == u'\0') {
-			return IsValidUtf16(*out);
+			return ImeCommon::IsValidUtf16(*out);
 		}
 		if (i == limit) {
 			return false;
@@ -90,128 +87,6 @@ bool ReadBounded(const char16_t* text, uint32_t limit, std::u16string* out) {
 		out->push_back(value);
 	}
 	return false;
-}
-
-bool IsValidUtf16(std::u16string_view text) {
-	for (size_t i = 0; i < text.size(); i++) {
-		const char16_t current = text[i];
-		if (current >= 0xd800 && current <= 0xdbff) {
-			if (++i >= text.size() || text[i] < 0xdc00 || text[i] > 0xdfff) {
-				return false;
-			}
-		} else if (current >= 0xdc00 && current <= 0xdfff) {
-			return false;
-		}
-	}
-	return true;
-}
-
-bool IsAllowedInput(char16_t value, Type type, uint32_t option) {
-	if (value == u'\r') {
-		return false;
-	}
-	if (value == u'\n') {
-		return (option & OPTION_MULTILINE) != 0;
-	}
-	if (value == u'\0') {
-		return false;
-	}
-	if (type == Type::Number) {
-		return (value >= u'0' && value <= u'9') || value == u',' || value == u'-' || value == u'.';
-	}
-	if (type == Type::BasicLatin) {
-		return value >= u' ' && value <= u'~';
-	}
-	return true;
-}
-
-char16_t HidCharacter(uint16_t keycode, uint32_t status) {
-	const bool shift = (status & 0x00002200) != 0;
-	const bool caps  = (status & 0x00020000) != 0;
-	if (keycode >= 4 && keycode <= 29) {
-		const bool upper = shift != caps;
-		return static_cast<char16_t>((upper ? u'A' : u'a') + keycode - 4);
-	}
-	if (keycode >= 30 && keycode <= 39) {
-		static constexpr char16_t plain[]   = u"1234567890";
-		static constexpr char16_t shifted[] = u"!@#$%^&*()";
-		return (shift ? shifted : plain)[keycode - 30];
-	}
-	if (keycode == 44) {
-		return u' ';
-	}
-	if (keycode >= 45 && keycode <= 56) {
-		static constexpr char16_t plain[]   = u"-=[]\\#;'`,./";
-		static constexpr char16_t shifted[] = u"_+{}|~:\"~<>?";
-		return (shift ? shifted : plain)[keycode - 45];
-	}
-	if (keycode >= 89 && keycode <= 98) {
-		static constexpr char16_t keypad[] = u"1234567890";
-		return keypad[keycode - 89];
-	}
-	if (keycode == 99) {
-		return u'.';
-	}
-	return u'\0';
-}
-
-bool ApplyKeyboardFilterOutput(ExternalInput* input, uint16_t keycode, uint32_t status,
-                               bool multiline) {
-	constexpr uint32_t KEYCODE_VALID   = 0x00000001;
-	constexpr uint32_t CHARACTER_VALID = 0x00000002;
-	if (keycode == input->key.keycode && status == input->key.status) {
-		return true;
-	}
-	if ((status & KEYCODE_VALID) == 0 || keycode == 0) {
-		return input->action == ExternalAction::Text && (status & CHARACTER_VALID) != 0;
-	}
-	input->key.keycode = keycode;
-	input->key.status  = status;
-	input->text.clear();
-	switch (keycode) {
-		case 40:
-		case 88:
-		case 158:
-			input->action = multiline ? ExternalAction::Newline : ExternalAction::Accept;
-			break;
-		case 41: input->action = ExternalAction::Cancel; break;
-		case 42:
-		case 187: input->action = ExternalAction::Backspace; break;
-		case 43:
-		case 186: input->action = ExternalAction::None; break;
-		case 79: input->action = ExternalAction::MoveRight; break;
-		case 80: input->action = ExternalAction::MoveLeft; break;
-		default: {
-			const char16_t character = HidCharacter(keycode, status);
-			if (character == u'\0') {
-				return false;
-			}
-			input->action        = ExternalAction::Text;
-			input->key.character = character;
-			input->text.push_back(character);
-			break;
-		}
-	}
-	return true;
-}
-
-void ClampText(std::u16string* text, uint32_t limit) {
-	if (text->size() <= limit) {
-		return;
-	}
-	text->resize(limit);
-	if (!text->empty() && text->back() >= 0xd800 && text->back() <= 0xdbff) {
-		text->pop_back();
-	}
-}
-
-uint32_t NormalizeCursor(std::u16string_view text, uint32_t cursor) {
-	cursor = std::min<uint32_t>(cursor, static_cast<uint32_t>(text.size()));
-	if (cursor > 0 && cursor < text.size() && text[cursor - 1] >= 0xd800 &&
-	    text[cursor - 1] <= 0xdbff && text[cursor] >= 0xdc00 && text[cursor] <= 0xdfff) {
-		cursor++;
-	}
-	return cursor;
 }
 
 void WriteGuestText(const State& state, const std::u16string& text) {
@@ -355,7 +230,7 @@ void ApplyFilterAndCommit() {
 			return;
 		}
 		filter                = g_state.input_changed ? g_state.param.filter : nullptr;
-		source                = g_state.current_text;
+		source                = g_state.editor.GetText();
 		max_length            = g_state.param.max_text_length;
 		generation            = g_state.generation;
 		revision              = g_state.revision;
@@ -363,14 +238,10 @@ void ApplyFilterAndCommit() {
 	}
 
 	if (filter != nullptr) {
-		std::vector<char16_t> output(IME_DIALOG_MAX_TEXT_LENGTH + 1, u'\0');
-		uint32_t              output_length = IME_DIALOG_MAX_TEXT_LENGTH;
-		if (filter(output.data(), &output_length, source.c_str(),
-		           static_cast<uint32_t>(source.size())) == 0 &&
-		    output_length <= IME_DIALOG_MAX_TEXT_LENGTH &&
-		    IsValidUtf16(std::u16string_view(output.data(), output_length))) {
-			source.assign(output.data(), output.data() + output_length);
-			ClampText(&source, max_length);
+		std::u16string filtered;
+		if (ImeCommon::RunTextFilter(filter, source, IME_DIALOG_MAX_TEXT_LENGTH, &filtered)) {
+			source = std::move(filtered);
+			ImeCommon::ClampText(&source, max_length);
 		}
 	}
 
@@ -386,13 +257,12 @@ void ApplyFilterAndCommit() {
 		return;
 	}
 	if (!g_state.input_changed) {
-		g_state.current_text = std::move(source);
-		g_state.cursor       = NormalizeCursor(g_state.current_text, g_state.cursor);
+		g_state.editor.ReplaceText(std::move(source), g_state.editor.GetCursor());
 	}
 	const auto& committed =
 	    g_state.status == Status::Finished && g_state.end_status != EndStatus::Ok
 	        ? g_state.original_text
-	        : g_state.current_text;
+	        : g_state.editor.GetText();
 	WriteGuestText(g_state, committed);
 	g_state.commit_pending = false;
 }
@@ -451,8 +321,8 @@ void ApplyExternalInputs() {
 			uint16_t output_keycode = input.key.keycode;
 			uint32_t output_status  = input.key.status;
 			if (filter(&input.key, &output_keycode, &output_status, nullptr) == 0) {
-				accepted =
-				    ApplyKeyboardFilterOutput(&input, output_keycode, output_status, multiline);
+				accepted = ImeCommon::ApplyKeyboardFilterOutput(&input, output_keycode,
+				                                                output_status, multiline);
 			}
 		}
 		if (!accepted) {
@@ -528,9 +398,9 @@ int KYTY_SYSV_ABI ImeDialogInit(const Param* param, const ExtendedParam* extende
 		if (extended != nullptr) {
 			g_state.extended = *extended;
 		}
-		g_state.original_text  = initial;
-		g_state.current_text   = std::move(initial);
-		g_state.cursor         = static_cast<uint32_t>(g_state.current_text.size());
+		g_state.original_text = initial;
+		g_state.editor.Reset(param->type, param->option, param->max_text_length,
+		                     std::move(initial));
 		g_state.title          = std::move(title);
 		g_state.placeholder    = std::move(placeholder);
 		g_state.commit_pending = true;
@@ -664,7 +534,7 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 	snapshot->enter_label          = g_state.param.enter_label;
 	snapshot->option               = g_state.param.option;
 	snapshot->max_text_length      = g_state.param.max_text_length;
-	snapshot->cursor               = g_state.cursor;
+	snapshot->cursor               = g_state.editor.GetCursor();
 	snapshot->disable_device       = g_state.extended.disable_device;
 	snapshot->key_panel_visible    = (g_state.param.option & OPTION_EXT_KEYBOARD) == 0 ||
 	                                 (g_state.extended.option & 0x00000400) == 0;
@@ -674,7 +544,7 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 	snapshot->vertical_alignment   = g_state.param.vertical_alignment;
 	ComputePanelSize(g_state.param, &g_state.extended, &snapshot->panel_width,
 	                 &snapshot->panel_height);
-	snapshot->text        = g_state.current_text;
+	snapshot->text        = g_state.editor.GetText();
 	snapshot->title       = g_state.title;
 	snapshot->placeholder = g_state.placeholder;
 	return true;
@@ -682,38 +552,9 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 
 bool HostInsertText(uint64_t generation, std::u16string_view text) {
 	std::scoped_lock lock(g_mutex);
-	if (!MatchRunningGeneration(generation) || text.empty()) {
+	if (!MatchRunningGeneration(generation) || !g_state.editor.Insert(text)) {
 		return false;
 	}
-	if (!IsValidUtf16(text)) {
-		return false;
-	}
-	std::u16string allowed;
-	allowed.reserve(text.size());
-	for (const char16_t value: text) {
-		if (IsAllowedInput(value, g_state.param.type, g_state.param.option)) {
-			allowed.push_back(value);
-		}
-	}
-	if (allowed.empty()) {
-		return false;
-	}
-	const size_t available = g_state.param.max_text_length - g_state.current_text.size();
-	if (available == 0) {
-		return false;
-	}
-	std::u16string insertion(std::u16string_view(allowed).substr(0, available));
-	if (insertion.size() < allowed.size() && !insertion.empty() && insertion.back() >= 0xd800 &&
-	    insertion.back() <= 0xdbff) {
-		insertion.pop_back();
-	}
-	if (insertion.empty()) {
-		return false;
-	}
-	std::u16string candidate = g_state.current_text;
-	candidate.insert(g_state.cursor, insertion);
-	g_state.current_text = std::move(candidate);
-	g_state.cursor += static_cast<uint32_t>(insertion.size());
 	g_state.input_changed  = true;
 	g_state.commit_pending = true;
 	return true;
@@ -721,17 +562,9 @@ bool HostInsertText(uint64_t generation, std::u16string_view text) {
 
 bool HostBackspace(uint64_t generation) {
 	std::scoped_lock lock(g_mutex);
-	if (!MatchRunningGeneration(generation) || g_state.cursor == 0) {
+	if (!MatchRunningGeneration(generation) || !g_state.editor.Backspace()) {
 		return false;
 	}
-	uint32_t first = g_state.cursor - 1;
-	if (first > 0 && g_state.current_text[first] >= 0xdc00 &&
-	    g_state.current_text[first] <= 0xdfff && g_state.current_text[first - 1] >= 0xd800 &&
-	    g_state.current_text[first - 1] <= 0xdbff) {
-		first--;
-	}
-	g_state.current_text.erase(first, g_state.cursor - first);
-	g_state.cursor         = first;
 	g_state.input_changed  = true;
 	g_state.commit_pending = true;
 	return true;
@@ -739,26 +572,7 @@ bool HostBackspace(uint64_t generation) {
 
 bool HostMoveCursor(uint64_t generation, int delta) {
 	std::scoped_lock lock(g_mutex);
-	if (!MatchRunningGeneration(generation) || delta == 0) {
-		return false;
-	}
-	int next = std::clamp(static_cast<int>(g_state.cursor) + delta, 0,
-	                      static_cast<int>(g_state.current_text.size()));
-	if (delta < 0 && next > 0 && next < static_cast<int>(g_state.current_text.size()) &&
-	    g_state.current_text[next] >= 0xdc00 && g_state.current_text[next] <= 0xdfff &&
-	    g_state.current_text[next - 1] >= 0xd800 && g_state.current_text[next - 1] <= 0xdbff) {
-		next--;
-	} else if (delta > 0 && next > 0 && next < static_cast<int>(g_state.current_text.size()) &&
-	           g_state.current_text[next - 1] >= 0xd800 &&
-	           g_state.current_text[next - 1] <= 0xdbff && g_state.current_text[next] >= 0xdc00 &&
-	           g_state.current_text[next] <= 0xdfff) {
-		next++;
-	}
-	if (next == static_cast<int>(g_state.cursor)) {
-		return false;
-	}
-	g_state.cursor = static_cast<uint32_t>(next);
-	return true;
+	return MatchRunningGeneration(generation) && g_state.editor.MoveCursor(delta);
 }
 
 bool HostAccept(uint64_t generation) {

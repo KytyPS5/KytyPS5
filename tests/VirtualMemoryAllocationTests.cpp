@@ -1,4 +1,3 @@
-#include "common/commonSubsystem.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -97,28 +96,16 @@ void InitSubsystems() {
 		return;
 	}
 
-	static char  arg0[] = "virtual_memory_allocation_tests";
-	static char* argv[] = {arg0};
-
-	auto* slist  = Common::SubsystemsList::Instance();
-	auto* core   = Common::CommonSubsystem::Instance();
-	auto* config = Config::ConfigSubsystem::Instance();
-	auto* log    = Log::LogSubsystem::Instance();
-	auto* memory = Libs::LibKernel::Memory::MemorySubsystem::Instance();
-	auto* thread = Common::ThreadsSubsystem::Instance();
-
-	slist->SetArgs(1, argv);
-	slist->Add(thread, {});
-	slist->Add(core, {});
-	slist->Add(config, {core});
-	Check("InitSubsystems", slist->InitAll(false), "failed to initialize base subsystems");
+	static Common::Subsystems subsystems;
+	Common::VirtualMemory::Init();
+	Common::InitializeThreads();
+	subsystems.Initialize<Config::Lifecycle>();
 
 	Config::ConfigOptions options;
 	options.printf_direction = Config::OutputDirection::Silent;
 	Config::Load(options);
 
-	slist->Add(log, {core, config});
-	Check("InitSubsystems", slist->InitAll(false), "failed to initialize logging subsystem");
+	subsystems.Initialize<Log::Lifecycle>();
 
 	const auto param_json = std::filesystem::temp_directory_path() /
 	                        ("kyty_virtual_memory_" +
@@ -140,8 +127,7 @@ void InitSubsystems() {
 	      "failed to read flexible memory size from param.json");
 	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
-	slist->Add(memory, {core, log, thread});
-	Check("InitSubsystems", slist->InitAll(false), "failed to initialize memory subsystem");
+	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
 	initialized = true;
 }

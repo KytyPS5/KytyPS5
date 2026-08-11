@@ -3,7 +3,6 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/subsystems.h"
 #include "kernel/eventQueue.h"
 
 namespace Libs::Graphics {
@@ -21,7 +20,14 @@ struct MemoryRange {
 	uint64_t m_size;
 };
 
-KYTY_SUBSYSTEM_DEFINE(Graphics);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Graphics";
+	static constexpr auto        initialize = Libs::Graphics::Initialize;
+	static constexpr auto        shutdown   = Libs::Graphics::Shutdown;
+};
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer);
 

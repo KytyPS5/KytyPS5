@@ -3,11 +3,16 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/subsystems.h"
-
 namespace Libs::Network {
 
-KYTY_SUBSYSTEM_DEFINE(Network);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Network";
+	static constexpr auto        initialize = Libs::Network::Initialize;
+	static constexpr auto        shutdown   = Libs::Network::Shutdown;
+};
 
 namespace Net {
 

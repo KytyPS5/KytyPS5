@@ -1,7 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_LIBS_IME_H_
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_IME_H_
 
-#include "common/abi.h"
+#include "libs/imeCommon.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,28 +11,19 @@
 namespace Libs::Ime {
 
 constexpr uint32_t WORK_BUFFER_SIZE = 20 * 1024;
-constexpr uint32_t MAX_TEXT_LENGTH  = 2048;
+constexpr uint32_t MAX_TEXT_LENGTH  = ImeCommon::MAX_TEXT_LENGTH;
 
-enum class Type : uint32_t { Default = 0, BasicLatin = 1, Url = 2, Mail = 3, Number = 4 };
-enum class EnterLabel : uint32_t { Default = 0, Send = 1, Search = 2, Go = 3 };
-enum class Alignment : uint32_t { Start = 0, Center = 1, End = 2 };
+using Type       = ImeCommon::Type;
+using EnterLabel = ImeCommon::EnterLabel;
+using Alignment  = ImeCommon::Alignment;
 
 struct Event;
-struct Keycode;
 
-using TextFilter        = int32_t(KYTY_SYSV_ABI*)(char16_t* out_text, uint32_t* out_text_length,
-                                                  const char16_t* source_text,
-                                                  uint32_t        source_text_length);
+using Keycode           = ImeCommon::Keycode;
+using TextFilter        = ImeCommon::TextFilter;
 using EventHandler      = void(KYTY_SYSV_ABI*)(void* arg, const Event* event);
-using ExtKeyboardFilter = int(KYTY_SYSV_ABI*)(const Keycode* source_keycode, uint16_t* out_keycode,
-                                              uint32_t* out_status, void* reserved);
-
-struct Color {
-	uint8_t r;
-	uint8_t g;
-	uint8_t b;
-	uint8_t a;
-};
+using ExtKeyboardFilter = ImeCommon::ExtKeyboardFilter;
+using Color             = ImeCommon::Color;
 
 struct Caret {
 	float    x;
@@ -75,16 +66,6 @@ struct KeyboardResourceIdArray {
 	uint32_t resource_id[5];
 };
 
-struct Keycode {
-	uint16_t keycode;
-	char16_t character;
-	uint32_t status;
-	uint32_t type;
-	int32_t  user_id;
-	uint32_t resource_id;
-	uint64_t timestamp;
-};
-
 union EventParam {
 	Rect                    rect;
 	EditText                text;
@@ -119,24 +100,7 @@ struct Param {
 	int8_t       reserved[8];
 };
 
-struct ExtendedParam {
-	uint32_t          option;
-	Color             color_base;
-	Color             color_line;
-	Color             color_text_field;
-	Color             color_preedit;
-	Color             color_button_default;
-	Color             color_button_function;
-	Color             color_button_symbol;
-	Color             color_text;
-	Color             color_special;
-	uint32_t          priority;
-	const char*       additional_dictionary_path;
-	ExtKeyboardFilter ext_keyboard_filter;
-	uint32_t          disable_device;
-	uint32_t          ext_keyboard_mode;
-	int8_t            reserved[60];
-};
+using ExtendedParam = ImeCommon::ExtendedParam;
 
 struct KeyboardParam {
 	uint32_t     option;
@@ -156,22 +120,8 @@ struct KeyboardInfo {
 	int8_t   reserved[12];
 };
 
-enum class ExternalAction : uint8_t {
-	None,
-	Text,
-	Backspace,
-	MoveLeft,
-	MoveRight,
-	Cancel,
-	Accept,
-	Newline,
-};
-
-struct ExternalInput {
-	Keycode        key;
-	ExternalAction action;
-	std::u16string text;
-};
+using ExternalAction = ImeCommon::ExternalAction;
+using ExternalInput  = ImeCommon::ExternalInput;
 
 static_assert(sizeof(Caret) == 0x10);
 static_assert(sizeof(TextGeometry) == 0x10);
@@ -192,30 +142,9 @@ static_assert(sizeof(KeyboardResourceIdArray) == 0x18);
 static_assert(sizeof(KeyboardInfo) == 0x24);
 static_assert(sizeof(Keycode) == 0x20);
 
-struct VisualState {
-	bool     active;
-	uint64_t revision;
-};
-
-struct HostSnapshot {
-	uint64_t       generation;
-	Type           type;
-	EnterLabel     enter_label;
-	uint32_t       option;
-	uint32_t       max_text_length;
-	uint32_t       cursor;
-	uint32_t       disable_device;
-	bool           key_panel_visible;
-	float          posx;
-	float          posy;
-	Alignment      horizontal_alignment;
-	Alignment      vertical_alignment;
-	uint32_t       panel_width;
-	uint32_t       panel_height;
-	std::u16string text;
-};
-
-using VisibilityCallback = void (*)(bool visible, uint64_t generation);
+using VisualState        = ImeCommon::VisualState;
+using HostSnapshot       = ImeCommon::HostSnapshot;
+using VisibilityCallback = ImeCommon::VisibilityCallback;
 
 void KYTY_SYSV_ABI ImeParamInit(Param* param);
 int KYTY_SYSV_ABI  ImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* height);

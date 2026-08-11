@@ -1124,7 +1124,7 @@ void* PthreadCreateMainGuestStack() {
 	return stack_top;
 }
 
-KYTY_SUBSYSTEM_INIT(Pthread) {
+void Initialize() {
 	PRINT_NAME_ENABLE(false);
 
 	EXIT_IF(g_pthread_context != nullptr);
@@ -1156,10 +1156,6 @@ KYTY_SUBSYSTEM_INIT(Pthread) {
 	Common::Thread thread(FreeDetachedThreads, nullptr);
 	thread.Detach();
 }
-
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Pthread) {}
-
-KYTY_SUBSYSTEM_DESTROY(Pthread) {}
 
 static int PthreadAttrCopy(PthreadAttr* dst, const PthreadAttr* src) {
 	if (dst == nullptr || *dst == nullptr || src == nullptr || *src == nullptr) {

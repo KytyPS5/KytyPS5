@@ -4,7 +4,6 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/stringUtils.h"
-#include "common/subsystems.h"
 #include "kernel/pthread.h"
 
 #include <filesystem>
@@ -33,7 +32,16 @@ struct FileStat {
 	unsigned int: (8 / 2) * (16 - static_cast<int>(sizeof(KernelTimespec)));
 };
 
-KYTY_SUBSYSTEM_DEFINE(FileSystem);
+void Initialize();
+void Shutdown();
+void EmergencyShutdown();
+
+struct Lifecycle {
+	static constexpr const char* name        = "FileSystem";
+	static constexpr auto        initialize  = Libs::LibKernel::FileSystem::Initialize;
+	static constexpr auto        shutdown    = Libs::LibKernel::FileSystem::Shutdown;
+	static constexpr auto emergency_shutdown = Libs::LibKernel::FileSystem::EmergencyShutdown;
+};
 
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
 void                  Umount(const std::string& folder_or_point);

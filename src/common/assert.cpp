@@ -35,7 +35,7 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
-	SubsystemsListSingleton::Instance()->ShutdownAll();
+	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
 

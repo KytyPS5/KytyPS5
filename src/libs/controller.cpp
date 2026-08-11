@@ -112,16 +112,17 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->device_unique_data_len = 0;
 }
 
-KYTY_SUBSYSTEM_INIT(Controller) {
+void Initialize() {
 	EXIT_IF(g_controller != nullptr);
 
 	g_controller = new GameController;
 	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Controller) {}
-
-KYTY_SUBSYSTEM_DESTROY(Controller) {}
+void Shutdown() {
+	delete g_controller;
+	g_controller = nullptr;
+}
 
 void GameController::Connect(int id) {
 	Common::LockGuard lock(m_mutex);

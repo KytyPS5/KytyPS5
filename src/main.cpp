@@ -1,5 +1,4 @@
 #include "common/common.h"
-#include "common/commonSubsystem.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
@@ -7,6 +6,7 @@
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -275,46 +275,28 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
-	auto& slist = *SubsystemsList::Instance();
-
-	slist.SetArgs(argc, argv);
-
-	auto* core    = CommonSubsystem::Instance();
-	auto* threads = ThreadsSubsystem::Instance();
-
-	slist.Add(core, {});
-	slist.Add(threads, {core});
-
-	if (!slist.InitAll(false)) {
-		::printf("Failed to initialize '%s' subsystem: %s\n", slist.GetFailName(),
-		         slist.GetFailMsg());
-		return 1;
-	}
+	VirtualMemory::Init();
+	InitializeThreads();
 
 	RunOptions options;
 	bool       show_help = false;
 
 	if (argc < 2) {
 		PrintUsage();
-		slist.DestroyAll(false);
 		return 0;
 	}
 
 	if (!ParseArgs(argc, argv, options, show_help)) {
 		PrintUsage();
-		slist.DestroyAll(false);
 		return 1;
 	}
 
 	if (show_help) {
 		PrintUsage();
-		slist.DestroyAll(false);
 		return 0;
 	}
 
 	Run(options);
-
-	slist.DestroyAll(false);
 
 	return 0;
 }

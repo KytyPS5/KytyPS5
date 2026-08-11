@@ -2,7 +2,6 @@
 #define KYTY_COMMON_EMULATOR_CONFIG_H_
 
 #include "common/common.h"
-#include "common/subsystems.h"
 
 #include <filesystem>
 #include <string>
@@ -10,7 +9,14 @@
 
 namespace Config {
 
-KYTY_SUBSYSTEM_DEFINE(Config);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Config";
+	static constexpr auto        initialize = Config::Initialize;
+	static constexpr auto        shutdown   = Config::Shutdown;
+};
 
 enum class ShaderOptimizationType { None, Size, Performance };
 

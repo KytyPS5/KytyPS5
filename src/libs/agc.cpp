@@ -43,7 +43,7 @@ namespace Libs::Graphics {
 
 static RenderContext* g_renderer = nullptr;
 
-KYTY_SUBSYSTEM_INIT(Graphics) {
+void Initialize() {
 	// Some games lock up if this is not called first
 	if (Config::RenderDocEnabled()) {
 		RenderDocInit();
@@ -59,9 +59,7 @@ KYTY_SUBSYSTEM_INIT(Graphics) {
 	ShaderInit();
 }
 
-KYTY_SUBSYSTEM_UNEXPECTED_SHUTDOWN(Graphics) {}
-
-KYTY_SUBSYSTEM_DESTROY(Graphics) {
+void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->ShutdownGpu();
 	VideoOut::VideoOutShutdown();

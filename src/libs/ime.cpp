@@ -55,13 +55,13 @@ constexpr uint32_t VALID_KEYBOARD_OPTIONS  = 0x0000003f;
 constexpr uint32_t VALID_KEYBOARD_MODE     = 0x0000007f;
 constexpr uint64_t VALID_LANGUAGES         = 0x00000001ff1fffffULL;
 
-constexpr uint32_t OPTION_MULTILINE        = 0x00000001;
-constexpr uint32_t OPTION_PASSWORD         = 0x00000004;
-constexpr uint32_t OPTION_EXT_KEYBOARD     = 0x00000010;
-constexpr uint32_t OPTION_EXPANDED_PREEDIT = 0x00001000;
-constexpr uint32_t OPTION_USE_OVER_2K      = 0x00004000;
+constexpr uint32_t OPTION_MULTILINE        = ImeCommon::OPTION_MULTILINE;
+constexpr uint32_t OPTION_PASSWORD         = ImeCommon::OPTION_PASSWORD;
+constexpr uint32_t OPTION_EXT_KEYBOARD     = ImeCommon::OPTION_EXT_KEYBOARD;
+constexpr uint32_t OPTION_EXPANDED_PREEDIT = ImeCommon::OPTION_EXPANDED_PREEDIT;
+constexpr uint32_t OPTION_USE_OVER_2K      = ImeCommon::OPTION_USE_OVER_2K;
 
-constexpr uint32_t EXT_OPTION_HIDE_KEY_PANEL = 0x00000400;
+constexpr uint32_t EXT_OPTION_HIDE_KEY_PANEL = ImeCommon::EXT_OPTION_HIDE_KEY_PANEL;
 constexpr size_t   EVENT_QUEUE_CAPACITY      = 128;
 
 struct QueuedEvent {
@@ -71,18 +71,15 @@ struct QueuedEvent {
 };
 
 struct State {
-	bool                       open            = false;
-	bool                       event_overflow  = false;
-	uint64_t                   generation      = 0;
-	uint64_t                   revision        = 0;
-	uint32_t                   option          = 0;
-	uint32_t                   max_text_length = 0;
-	uint32_t                   cursor          = 0;
+	bool                       open           = false;
+	bool                       event_overflow = false;
+	uint64_t                   generation     = 0;
+	uint64_t                   revision       = 0;
 	Param                      param {};
 	ExtendedParam              extended {};
 	void*                      arg     = nullptr;
 	EventHandler               handler = nullptr;
-	std::u16string             text;
+	ImeCommon::TextEditEngine  editor;
 	std::deque<QueuedEvent>    events;
 	std::vector<ExternalInput> external_inputs;
 };
@@ -130,97 +127,6 @@ bool ValidateText(const char16_t* text, uint32_t length, bool multiline, uint32_
 	return true;
 }
 
-bool IsAllowedInput(char16_t value, Type type, uint32_t option) {
-	if (value == u'\r' || value == u'\0') {
-		return false;
-	}
-	if (value == u'\n') {
-		return (option & OPTION_MULTILINE) != 0;
-	}
-	if (type == Type::Number) {
-		return (value >= u'0' && value <= u'9') || value == u',' || value == u'-' || value == u'.';
-	}
-	if (type == Type::BasicLatin) {
-		return value >= u' ' && value <= u'~';
-	}
-	return true;
-}
-
-char16_t HidCharacter(uint16_t keycode, uint32_t status) {
-	const bool shift = (status & 0x00002200) != 0;
-	const bool caps  = (status & 0x00020000) != 0;
-	if (keycode >= 4 && keycode <= 29) {
-		return static_cast<char16_t>(((shift != caps) ? u'A' : u'a') + keycode - 4);
-	}
-	if (keycode >= 30 && keycode <= 39) {
-		static constexpr char16_t plain[]   = u"1234567890";
-		static constexpr char16_t shifted[] = u"!@#$%^&*()";
-		return (shift ? shifted : plain)[keycode - 30];
-	}
-	if (keycode == 44) {
-		return u' ';
-	}
-	if (keycode >= 45 && keycode <= 56) {
-		static constexpr char16_t plain[]   = u"-=[]\\#;'`,./";
-		static constexpr char16_t shifted[] = u"_+{}|~:\"~<>?";
-		return (shift ? shifted : plain)[keycode - 45];
-	}
-	if (keycode >= 89 && keycode <= 98) {
-		static constexpr char16_t keypad[] = u"1234567890";
-		return keypad[keycode - 89];
-	}
-	return keycode == 99 ? u'.' : u'\0';
-}
-
-bool ApplyKeyboardFilterOutput(ExternalInput* input, uint16_t keycode, uint32_t status,
-                               bool multiline) {
-	constexpr uint32_t KEYCODE_VALID   = 0x00000001;
-	constexpr uint32_t CHARACTER_VALID = 0x00000002;
-	if (keycode == input->key.keycode && status == input->key.status) {
-		return true;
-	}
-	if ((status & KEYCODE_VALID) == 0 || keycode == 0) {
-		return input->action == ExternalAction::Text && (status & CHARACTER_VALID) != 0;
-	}
-	input->key.keycode = keycode;
-	input->key.status  = status;
-	input->text.clear();
-	switch (keycode) {
-		case 40:
-		case 88:
-		case 158:
-			input->action = multiline ? ExternalAction::Newline : ExternalAction::Accept;
-			break;
-		case 41: input->action = ExternalAction::Cancel; break;
-		case 42:
-		case 187: input->action = ExternalAction::Backspace; break;
-		case 43:
-		case 186: input->action = ExternalAction::None; break;
-		case 79: input->action = ExternalAction::MoveRight; break;
-		case 80: input->action = ExternalAction::MoveLeft; break;
-		default: {
-			const char16_t character = HidCharacter(keycode, status);
-			if (character == u'\0') {
-				return false;
-			}
-			input->action        = ExternalAction::Text;
-			input->key.character = character;
-			input->text.push_back(character);
-			break;
-		}
-	}
-	return true;
-}
-
-uint32_t NormalizeCursor(std::u16string_view text, uint32_t cursor) {
-	cursor = std::min<uint32_t>(cursor, static_cast<uint32_t>(text.size()));
-	if (cursor > 0 && cursor < text.size() && text[cursor - 1] >= 0xd800 &&
-	    text[cursor - 1] <= 0xdbff && text[cursor] >= 0xdc00 && text[cursor] <= 0xdfff) {
-		cursor++;
-	}
-	return cursor;
-}
-
 void NotifyVisibility(bool visible, uint64_t generation) {
 	if (const auto callback = g_visibility_callback.load(std::memory_order_acquire);
 	    callback != nullptr) {
@@ -247,7 +153,7 @@ void SyncGuestText(char16_t* work, char16_t* input, uint32_t max_length, std::u1
 
 void SyncTextBuffersLocked() {
 	SyncGuestText(static_cast<char16_t*>(g_state.param.work), g_state.param.input_text_buffer,
-	              g_state.max_text_length, g_state.text);
+	              g_state.editor.GetMaxLength(), g_state.editor.GetText());
 }
 
 bool QueueEventLocked(QueuedEvent event) {
@@ -263,53 +169,33 @@ QueuedEvent MakeTextEventLocked(uint32_t id, uint32_t edit_index, int32_t edit_l
 	QueuedEvent queued;
 	queued.event.id                      = id;
 	queued.event.param.text.str          = static_cast<char16_t*>(g_state.param.work);
-	queued.event.param.text.caret_index  = g_state.cursor;
+	queued.event.param.text.caret_index  = g_state.editor.GetCursor();
 	queued.event.param.text.area_num     = 1;
 	queued.event.param.text.text_area[0] = {TextAreaMode::Edit, edit_index, edit_length};
 	queued.text_payload                  = true;
-	queued.text                          = g_state.text;
+	queued.text                          = g_state.editor.GetText();
 	return queued;
 }
 
 bool CommitFilteredText(uint64_t generation, uint64_t revision, std::u16string old_text,
-                        std::u16string candidate, uint32_t cursor, TextFilter filter,
-                        uint32_t max_length, bool multiline) {
+                        ImeCommon::TextEditEngine candidate, TextFilter filter, bool multiline) {
 	if (filter != nullptr) {
-		std::vector<char16_t> output(max_length + 1, u'\0');
-		uint32_t              output_length = max_length;
-		if (filter(output.data(), &output_length, candidate.c_str(),
-		           static_cast<uint32_t>(candidate.size())) == 0 &&
-		    output_length <= max_length) {
-			uint32_t actual_length = 0;
-			if (ValidateText(output.data(), output_length, multiline, &actual_length) &&
-			    actual_length == output_length) {
-				candidate.assign(output.data(), output.data() + output_length);
-			}
+		std::u16string filtered;
+		if (ImeCommon::RunTextFilter(filter, candidate.GetText(), candidate.GetMaxLength(),
+		                             &filtered) &&
+		    ImeCommon::IsValidInputText(filtered, multiline)) {
+			candidate.ReplaceText(std::move(filtered), candidate.GetCursor());
 		}
 	}
 
 	std::scoped_lock lock(g_mutex);
 	if (!g_state.open || g_state.generation != generation || g_state.revision != revision ||
-	    g_state.text != old_text || candidate == old_text) {
+	    g_state.editor.GetText() != old_text || candidate.GetText() == old_text) {
 		return false;
 	}
-	size_t prefix = 0;
-	while (prefix < old_text.size() && prefix < candidate.size() &&
-	       old_text[prefix] == candidate[prefix]) {
-		prefix++;
-	}
-	size_t old_tail = old_text.size();
-	size_t new_tail = candidate.size();
-	while (old_tail > prefix && new_tail > prefix &&
-	       old_text[old_tail - 1] == candidate[new_tail - 1]) {
-		old_tail--;
-		new_tail--;
-	}
-	const int32_t edit_length =
-	    static_cast<int32_t>(new_tail - prefix) - static_cast<int32_t>(old_tail - prefix);
-	g_state.text   = std::move(candidate);
-	g_state.cursor = NormalizeCursor(g_state.text, cursor);
-	QueueEventLocked(MakeTextEventLocked(1, static_cast<uint32_t>(prefix), edit_length));
+	const auto edit = ImeCommon::ComputeEditDelta(old_text, candidate.GetText());
+	g_state.editor  = std::move(candidate);
+	QueueEventLocked(MakeTextEventLocked(1, edit.index, edit.length));
 	UpdateRevisionLocked();
 	return true;
 }
@@ -475,16 +361,13 @@ int KYTY_SYSV_ABI ImeOpen(const Param* param, const ExtendedParam* extended) {
 		g_state.open                   = true;
 		g_state.generation             = next_generation;
 		g_state.revision               = next_revision;
-		g_state.option                 = param->option;
-		g_state.max_text_length        = param->max_text_length;
-		g_state.cursor                 = static_cast<uint32_t>(text.size());
 		g_state.param                  = *param;
 		if (extended != nullptr) {
 			g_state.extended = *extended;
 		}
 		g_state.arg     = param->arg;
 		g_state.handler = param->handler;
-		g_state.text    = std::move(text);
+		g_state.editor.Reset(param->type, param->option, param->max_text_length, std::move(text));
 		std::memset(param->work, 0, WORK_BUFFER_SIZE);
 		SyncTextBuffersLocked();
 
@@ -550,7 +433,7 @@ int KYTY_SYSV_ABI ImeUpdate(EventHandler handler) {
 			while (!g_state.events.empty()) {
 				dispatch.push_back({g_state.arg, std::move(g_state.events.front()),
 				                    static_cast<char16_t*>(g_state.param.work),
-				                    g_state.param.input_text_buffer, g_state.max_text_length,
+				                    g_state.param.input_text_buffer, g_state.editor.GetMaxLength(),
 				                    g_state.generation});
 				g_state.events.pop_front();
 			}
@@ -607,14 +490,14 @@ int KYTY_SYSV_ABI ImeSetText(const char16_t* text, uint32_t length) {
 	if (text == nullptr) {
 		return ERROR_INVALID_ADDRESS;
 	}
-	const uint32_t clamped_length = std::min(length, g_state.max_text_length);
+	const uint32_t clamped_length = std::min(length, g_state.editor.GetMaxLength());
 	uint32_t       actual_length  = 0;
-	if (!ValidateText(text, clamped_length, (g_state.option & OPTION_MULTILINE) != 0,
+	if (!ValidateText(text, clamped_length, (g_state.editor.GetOption() & OPTION_MULTILINE) != 0,
 	                  &actual_length)) {
 		return ERROR_INVALID_TEXT;
 	}
-	g_state.text.assign(text, text + actual_length);
-	g_state.cursor = NormalizeCursor(g_state.text, g_state.cursor);
+	g_state.editor.ReplaceText(std::u16string(text, text + actual_length),
+	                           g_state.editor.GetCursor());
 	SyncTextBuffersLocked();
 	UpdateRevisionLocked();
 	return OK;
@@ -628,10 +511,10 @@ int KYTY_SYSV_ABI ImeSetCaret(const Caret* caret) {
 	if (caret == nullptr) {
 		return ERROR_INVALID_ADDRESS;
 	}
-	if (caret->index > g_state.text.size()) {
+	if (caret->index > g_state.editor.GetText().size()) {
 		return ERROR_INVALID_PARAM;
 	}
-	g_state.cursor = NormalizeCursor(g_state.text, caret->index);
+	g_state.editor.SetCursor(caret->index);
 	UpdateRevisionLocked();
 	return OK;
 }
@@ -644,7 +527,7 @@ int KYTY_SYSV_ABI ImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geom
 	if (geometry == nullptr) {
 		return ERROR_INVALID_ADDRESS;
 	}
-	const bool  over_2k = (g_state.option & OPTION_USE_OVER_2K) != 0;
+	const bool  over_2k = (g_state.editor.GetOption() & OPTION_USE_OVER_2K) != 0;
 	const float max_x   = over_2k ? 3840.0f : 1920.0f;
 	const float max_y   = over_2k ? 2160.0f : 1080.0f;
 	if (!std::isfinite(geometry->x) || !std::isfinite(geometry->y) || geometry->x < 0.0f ||
@@ -754,11 +637,11 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 	snapshot->generation           = g_state.generation;
 	snapshot->type                 = g_state.param.type;
 	snapshot->enter_label          = g_state.param.enter_label;
-	snapshot->option               = g_state.option;
-	snapshot->max_text_length      = g_state.max_text_length;
-	snapshot->cursor               = g_state.cursor;
+	snapshot->option               = g_state.editor.GetOption();
+	snapshot->max_text_length      = g_state.editor.GetMaxLength();
+	snapshot->cursor               = g_state.editor.GetCursor();
 	snapshot->disable_device       = g_state.extended.disable_device;
-	snapshot->key_panel_visible    = (g_state.option & OPTION_EXT_KEYBOARD) == 0 ||
+	snapshot->key_panel_visible    = (g_state.editor.GetOption() & OPTION_EXT_KEYBOARD) == 0 ||
 	                                 (g_state.extended.option & EXT_OPTION_HIDE_KEY_PANEL) == 0;
 	snapshot->posx                 = g_state.param.posx;
 	snapshot->posy                 = g_state.param.posy;
@@ -766,92 +649,65 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 	snapshot->vertical_alignment   = g_state.param.vertical_alignment;
 	snapshot->panel_width          = g_state.param.type == Type::Number ? 370 : 793;
 	snapshot->panel_height         = g_state.param.type == Type::Number ? 402 : 408;
-	if ((g_state.option & OPTION_USE_OVER_2K) != 0) {
+	if ((g_state.editor.GetOption() & OPTION_USE_OVER_2K) != 0) {
 		snapshot->panel_width *= 2;
 		snapshot->panel_height *= 2;
 	}
-	snapshot->text = g_state.text;
+	snapshot->text = g_state.editor.GetText();
+	snapshot->title.clear();
+	snapshot->placeholder.clear();
 	return true;
 }
 
 static bool ApplyInsertText(uint64_t generation, std::u16string_view text) {
-	uint64_t       revision   = 0;
-	uint32_t       cursor     = 0;
-	uint32_t       max_length = 0;
-	bool           multiline  = false;
-	TextFilter     filter     = nullptr;
-	std::u16string old_text;
-	std::u16string candidate;
+	uint64_t                  revision  = 0;
+	bool                      multiline = false;
+	TextFilter                filter    = nullptr;
+	std::u16string            old_text;
+	ImeCommon::TextEditEngine candidate;
 	{
 		std::scoped_lock lock(g_mutex);
 		if (!g_state.open || g_state.generation != generation || text.empty()) {
 			return false;
 		}
-		uint32_t valid_length = 0;
-		multiline             = (g_state.option & OPTION_MULTILINE) != 0;
-		if (!ValidateText(text.data(), static_cast<uint32_t>(text.size()), multiline,
-		                  &valid_length) ||
-		    valid_length != text.size()) {
+		multiline = (g_state.editor.GetOption() & OPTION_MULTILINE) != 0;
+		if (!ImeCommon::IsValidInputText(text, multiline)) {
 			return false;
 		}
-		std::u16string allowed;
-		for (const char16_t value: text) {
-			if (IsAllowedInput(value, g_state.param.type, g_state.option)) {
-				allowed.push_back(value);
-			}
-		}
-		const size_t available = g_state.max_text_length - g_state.text.size();
-		if (allowed.empty() || available == 0) {
+		candidate = g_state.editor;
+		if (!candidate.Insert(text)) {
 			return false;
 		}
-		allowed.resize(std::min(allowed.size(), available));
-		if (!allowed.empty() && allowed.back() >= 0xd800 && allowed.back() <= 0xdbff) {
-			allowed.pop_back();
-		}
-		if (allowed.empty()) {
-			return false;
-		}
-		revision   = g_state.revision;
-		max_length = g_state.max_text_length;
-		filter     = g_state.param.filter;
-		old_text   = g_state.text;
-		candidate  = old_text;
-		candidate.insert(g_state.cursor, allowed);
-		cursor = g_state.cursor + static_cast<uint32_t>(allowed.size());
+		revision = g_state.revision;
+		filter   = g_state.param.filter;
+		old_text = g_state.editor.GetText();
 	}
 	return CommitFilteredText(generation, revision, std::move(old_text), std::move(candidate),
-	                          cursor, filter, max_length, multiline);
+	                          filter, multiline);
 }
 
 static bool ApplyBackspace(uint64_t generation) {
-	uint64_t       revision   = 0;
-	uint32_t       cursor     = 0;
-	uint32_t       max_length = 0;
-	bool           multiline  = false;
-	TextFilter     filter     = nullptr;
-	std::u16string old_text;
-	std::u16string candidate;
+	uint64_t                  revision  = 0;
+	bool                      multiline = false;
+	TextFilter                filter    = nullptr;
+	std::u16string            old_text;
+	ImeCommon::TextEditEngine candidate;
 	{
 		std::scoped_lock lock(g_mutex);
-		if (!g_state.open || g_state.generation != generation || g_state.cursor == 0) {
+		if (!g_state.open || g_state.generation != generation) {
 			return false;
 		}
-		uint32_t first = g_state.cursor - 1;
-		if (first > 0 && g_state.text[first] >= 0xdc00 && g_state.text[first] <= 0xdfff &&
-		    g_state.text[first - 1] >= 0xd800 && g_state.text[first - 1] <= 0xdbff) {
-			first--;
+		candidate = g_state.editor;
+		if (!candidate.Backspace()) {
+			return false;
 		}
-		revision   = g_state.revision;
-		max_length = g_state.max_text_length;
-		multiline  = (g_state.option & OPTION_MULTILINE) != 0;
-		filter     = g_state.param.filter;
-		old_text   = g_state.text;
-		candidate  = old_text;
-		candidate.erase(first, g_state.cursor - first);
-		cursor = first;
+		revision  = g_state.revision;
+		multiline = (g_state.editor.GetOption() & OPTION_MULTILINE) != 0;
+		filter    = g_state.param.filter;
+		old_text  = g_state.editor.GetText();
 	}
 	return CommitFilteredText(generation, revision, std::move(old_text), std::move(candidate),
-	                          cursor, filter, max_length, multiline);
+	                          filter, multiline);
 }
 
 static bool ApplyMoveCursor(uint64_t generation, int delta) {
@@ -859,25 +715,14 @@ static bool ApplyMoveCursor(uint64_t generation, int delta) {
 	if (!g_state.open || g_state.generation != generation || delta == 0) {
 		return false;
 	}
-	const uint32_t old_cursor = g_state.cursor;
-	int            next =
-	    std::clamp(static_cast<int>(old_cursor) + delta, 0, static_cast<int>(g_state.text.size()));
-	if (delta < 0 && next > 0 && next < static_cast<int>(g_state.text.size()) &&
-	    g_state.text[next] >= 0xdc00 && g_state.text[next] <= 0xdfff &&
-	    g_state.text[next - 1] >= 0xd800 && g_state.text[next - 1] <= 0xdbff) {
-		next--;
-	} else if (delta > 0 && next > 0 && next < static_cast<int>(g_state.text.size()) &&
-	           g_state.text[next - 1] >= 0xd800 && g_state.text[next - 1] <= 0xdbff &&
-	           g_state.text[next] >= 0xdc00 && g_state.text[next] <= 0xdfff) {
-		next++;
-	}
-	g_state.cursor = static_cast<uint32_t>(next);
-	if (g_state.cursor == old_cursor) {
+	const uint32_t old_cursor = g_state.editor.GetCursor();
+	if (!g_state.editor.MoveCursor(delta)) {
 		return false;
 	}
-	const uint32_t direction = g_state.cursor > old_cursor ? 2 : 1;
-	const uint32_t steps     = static_cast<uint32_t>(
-	    std::abs(static_cast<int>(g_state.cursor) - static_cast<int>(old_cursor)));
+	const uint32_t new_cursor = g_state.editor.GetCursor();
+	const uint32_t direction  = new_cursor > old_cursor ? 2 : 1;
+	const uint32_t steps      = static_cast<uint32_t>(
+	    std::abs(static_cast<int>(new_cursor) - static_cast<int>(old_cursor)));
 	for (uint32_t i = 0; i < steps; i++) {
 		QueuedEvent event;
 		event.event.id               = 2;
@@ -962,7 +807,7 @@ void ApplyExternalInputs() {
 		generation = g_state.generation;
 		filter     = g_state.extended.ext_keyboard_filter;
 		user_id    = g_state.param.user_id;
-		multiline  = (g_state.option & OPTION_MULTILINE) != 0;
+		multiline  = (g_state.editor.GetOption() & OPTION_MULTILINE) != 0;
 		inputs.swap(g_state.external_inputs);
 	}
 	for (auto& input: inputs) {
@@ -978,7 +823,7 @@ void ApplyExternalInputs() {
 			uint16_t keycode = input.key.keycode;
 			uint32_t status  = input.key.status;
 			if (filter(&input.key, &keycode, &status, nullptr) == 0) {
-				accepted = ApplyKeyboardFilterOutput(&input, keycode, status, multiline);
+				accepted = ImeCommon::ApplyKeyboardFilterOutput(&input, keycode, status, multiline);
 			}
 		}
 		if (!accepted) {
@@ -999,6 +844,8 @@ void ApplyExternalInputs() {
 
 } // namespace
 
+#if !defined(KYTY_IME_TESTS)
+
 LIB_VERSION("Ime", 1, "Ime", 1, 1);
 
 LIB_DEFINE(InitPlatform_1_Ime) {
@@ -1016,5 +863,7 @@ LIB_DEFINE(InitPlatform_1_Ime) {
 	LIB_FUNC("VkqLPArfFdc", ImeKeyboardGetInfo);
 	LIB_FUNC("ua+13Hk9kKs", ImeKeyboardSetMode);
 }
+
+#endif
 
 } // namespace Libs::Ime

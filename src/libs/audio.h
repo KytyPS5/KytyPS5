@@ -3,11 +3,16 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "common/subsystems.h"
-
 namespace Libs::Audio {
 
-KYTY_SUBSYSTEM_DEFINE(Audio);
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Audio";
+	static constexpr auto        initialize = Libs::Audio::Initialize;
+	static constexpr auto        shutdown   = Libs::Audio::Shutdown;
+};
 
 namespace AudioOut {
 

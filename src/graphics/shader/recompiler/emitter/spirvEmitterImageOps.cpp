@@ -4,6 +4,18 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 namespace {
 
+// Whether this instruction's image was specialized to need a shader-side sRGB decode.
+// The resource index is bounds-checked because it is not guaranteed to address the images
+// table - StorageImageSwizzle guards the same index and treats an out-of-range value as an
+// error. Here an unknown resource simply decodes nothing, which leaves the emitted SPIR-V
+// exactly as it was before this existed rather than adding a new way to abort.
+bool ImageNeedsSrgbDecode(const EmitterState& state, const IR::Instruction& inst) {
+	if (inst.memory.resource >= state.program.info.images.size()) {
+		return false;
+	}
+	return state.program.info.images[inst.memory.resource].srgb_decode;
+}
+
 uint32_t ConstantVec2I32(EmitterState& state, int32_t x, int32_t y) {
 	const auto value = state.builder.AllocateId();
 	state.builder.AddType({OpConstantComposite, state.vec2_int_type, value, ConstantI32(state, x),
@@ -146,6 +158,9 @@ void EmitImageLoad(EmitterState& state, const IR::Instruction& inst) {
 		     coord, ImageOperandsLodMask, EmitImageMipLodU32(state, inst, inst.src[0], view)});
 	}
 
+	// Hoisted so the ordinary path allocates no ids and touches no constants.
+	const bool srgb = !integer && ImageNeedsSrgbDecode(state, inst);
+
 	const auto dmask     = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
 	uint32_t   dst_index = 0;
 	for (uint32_t component_index = 0; component_index < 4u; component_index++) {
@@ -155,9 +170,14 @@ void EmitImageLoad(EmitterState& state, const IR::Instruction& inst) {
 		const auto component = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeExtract, integer ? state.uint_type : state.float_type,
 		                           component, color, component_index});
-		const auto bits = integer ? component : state.builder.AllocateId();
+		// Decode before the bitcast: the bitcast reinterprets the float as an integer bit
+		// pattern for VGPR storage, so decoding after it would corrupt the value. Alpha is
+		// never decoded, matching Vulkan's own sRGB sampling semantics.
+		const auto decoded =
+		    srgb && component_index < 3u ? EmitSrgbToLinearF32(state, component) : component;
+		const auto bits = integer ? decoded : state.builder.AllocateId();
 		if (!integer) {
-			state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+			state.builder.AddFunction({OpBitcast, state.uint_type, bits, decoded});
 		}
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), bits);
 	}
@@ -187,6 +207,10 @@ void EmitImageSampleResult(EmitterState& state, const IR::Instruction& inst, uin
 		return;
 	}
 
+	// Hoisted so the ordinary path allocates no ids and touches no constants. The dref case
+	// has already returned above: it yields comparison results, not texels.
+	const bool srgb = !integer && ImageNeedsSrgbDecode(state, inst);
+
 	const auto dmask     = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
 	uint32_t   dst_index = 0;
 	for (uint32_t component_index = 0; component_index < 4u; component_index++) {
@@ -196,9 +220,14 @@ void EmitImageSampleResult(EmitterState& state, const IR::Instruction& inst, uin
 		const auto component = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeExtract, integer ? state.uint_type : state.float_type,
 		                           component, sample, component_index});
-		const auto bits = integer ? component : state.builder.AllocateId();
+		// Decode before the bitcast: the bitcast reinterprets the float as an integer bit
+		// pattern for VGPR storage, so decoding after it would corrupt the value. Alpha is
+		// never decoded, matching Vulkan's own sRGB sampling semantics.
+		const auto decoded =
+		    srgb && component_index < 3u ? EmitSrgbToLinearF32(state, component) : component;
+		const auto bits = integer ? decoded : state.builder.AllocateId();
 		if (!integer) {
-			state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+			state.builder.AddFunction({OpBitcast, state.uint_type, bits, decoded});
 		}
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), bits);
 	}
@@ -327,13 +356,20 @@ void EmitImageGather4(EmitterState& state, const IR::Instruction& inst) {
 	AddImageGatherOperands(state, inst, layout, view, words);
 	state.builder.AddFunction(words);
 
+	// Gather4 returns one channel of four neighbouring texels, so the decode applies to all
+	// of them and the alpha exclusion is decided once, on that chosen channel. Excluded for
+	// dref, which returns comparison results rather than texels.
+	const bool srgb = !dref && !integer && ImageNeedsSrgbDecode(state, inst) &&
+	                  ImageGatherComponent(inst.memory.dmask) < 3u;
+
 	for (uint32_t i = 0; i < inst.memory.data_dwords; i++) {
 		const auto component = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeExtract, integer ? state.uint_type : state.float_type,
 		                           component, texels, i});
-		const auto bits = integer ? component : state.builder.AllocateId();
+		const auto decoded = srgb ? EmitSrgbToLinearF32(state, component) : component;
+		const auto bits    = integer ? decoded : state.builder.AllocateId();
 		if (!integer) {
-			state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+			state.builder.AddFunction({OpBitcast, state.uint_type, bits, decoded});
 		}
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), bits);
 	}

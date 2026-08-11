@@ -186,8 +186,10 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			if (image.atomic) {
 				canonical_kind = image.kind == ResourceKind::StorageImageUint;
 			}
+			// srgb_decode is part of the null check too: a program specialized to decode
+			// sRGB must not be handed a null descriptor, which carries no format at all.
 			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
-			    !canonical_kind) {
+			    !canonical_kind || image.srgb_decode) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "image descriptor {} no longer matches canonical null specialization", i);
@@ -235,6 +237,19 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 					    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
 					    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
 					    descriptor.dwords[6], descriptor.dwords[7]);
+				}
+				return false;
+			}
+			// The program cache key holds no image data at all, so this is the only thing
+			// stopping a draw that samples an sRGB plane from reusing a permutation compiled
+			// without the decode - or the reverse. The uint check above cannot stand in for
+			// it: k8UNorm and k8Srgb are both non-uint and so are indistinguishable to it.
+			const bool srgb_descriptor = image.kind == ResourceKind::Image &&
+			                             Prospero::IsShaderDecodedSrgbTextureFormat(format);
+			if (srgb_descriptor != image.srgb_decode) {
+				if (error != nullptr) {
+					*error = fmt::format(
+					    "image descriptor {} no longer matches specialized sRGB decode", i);
 				}
 				return false;
 			}
@@ -429,6 +444,10 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 				default: break;
 			}
 		}
+		// After the promotion, so kind is final. Restricted to plain sampled images: storage
+		// images are written as well as read, and uint images carry no transfer function.
+		image.srgb_decode = image.kind == ResourceKind::Image &&
+		                    Prospero::IsShaderDecodedSrgbTextureFormat(format);
 	}
 	struct ImagePatch {
 		std::reference_wrapper<Instruction> inst;

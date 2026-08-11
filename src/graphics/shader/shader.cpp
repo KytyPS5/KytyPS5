@@ -1015,9 +1015,10 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& image = program.info.images[i];
-		ret += fmt::format(" i{}[kind={} dim={} swizzle=0x{:03x}]", i,
+		ret += fmt::format(" i{}[kind={} dim={} swizzle=0x{:03x} srgb={}]", i,
 		                   static_cast<uint32_t>(image.kind),
-		                   static_cast<uint32_t>(image.dimension), image.storage_swizzle);
+		                   static_cast<uint32_t>(image.dimension), image.storage_swizzle,
+		                   image.srgb_decode ? 1 : 0);
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		ret += fmt::format(" a{}[base=0x{:x}]", i, program.info.addresses[i].specialized_base);
@@ -1055,6 +1056,9 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 		ids.push_back(static_cast<uint32_t>(image.dimension));
 		ids.push_back(static_cast<uint32_t>(image.mip_mode));
 		ids.push_back(image.storage_swizzle);
+		// Two modules that differ only in the sRGB decode produce different SPIR-V, so they
+		// must not collide on one pipeline key.
+		ids.push_back(image.srgb_decode ? 1u : 0u);
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.addresses.size()));
 	for (const auto& address: program.info.addresses) {

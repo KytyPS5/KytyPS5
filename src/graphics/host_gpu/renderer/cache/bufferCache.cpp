@@ -732,13 +732,36 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
-	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
-	    ((dst_gds || src_gds) && ((dst_vaddr | src_vaddr | size) & 3u) != 0) ||
-	    size > UINT64_MAX - dst_vaddr || size > UINT64_MAX - src_vaddr || (dst_gds && src_gds) ||
-	    (dst_gds == src_gds && src_vaddr < dst_vaddr + size && dst_vaddr < src_vaddr + size) ||
-	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
+	const auto reject = [&](const char* reason) {
+		EXIT("BufferCache: %s: dst=0x%016" PRIx64 " (gds=%d) src=0x%016" PRIx64
+		     " (gds=%d) size=0x%016" PRIx64 " gds_size=0x%016" PRIx64 "\n",
+		     reason, dst_vaddr, static_cast<int>(dst_gds), src_vaddr, static_cast<int>(src_gds),
+		     size, m_gds_buffer.Size());
+	};
+	if (size == 0) {
+		reject("copy of zero bytes");
+	}
+	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0)) {
+		reject("copy with a null memory address");
+	}
+	if (size > UINT64_MAX - dst_vaddr || size > UINT64_MAX - src_vaddr) {
+		reject("copy range overflows");
+	}
+	if (dst_gds && src_gds) {
+		reject("GDS-to-GDS copy");
+	}
+	if ((dst_gds || src_gds) && ((dst_vaddr | src_vaddr | size) & 3u) != 0) {
+		reject("GDS copy is not dword aligned");
+	}
+	if ((dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
 	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {
-		EXIT("BufferCache: invalid or overlapping copy range\n");
+		reject("GDS copy is out of bounds");
+	}
+	if (dst_gds == src_gds && src_vaddr < dst_vaddr + size && dst_vaddr < src_vaddr + size) {
+		if (src_vaddr == dst_vaddr) {
+			return;
+		}
+		reject("copy ranges overlap partially");
 	}
 	if (src_memory || dst_memory) {
 		const auto src_region =

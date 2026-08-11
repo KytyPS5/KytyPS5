@@ -213,7 +213,34 @@ void GraphicContext::DeleteBuffer(VulkanBuffer& buffer) {
 	buffer.memory.offset          = 0;
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+std::string GraphicContext::DescribeMemoryBudget() const {
+	if (allocator == nullptr || physical_device == nullptr) {
+		return "unavailable";
+	}
+	const auto& properties = GetPhysicalDeviceMemoryProperties();
+	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	std::string text;
+	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		text += fmt::format("[heap {} usage={} budget={} allocated={} blocks={}]", i,
+		                    static_cast<uint64_t>(budgets[i].usage),
+		                    static_cast<uint64_t>(budgets[i].budget),
+		                    static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
+		                    static_cast<uint64_t>(budgets[i].statistics.blockBytes));
+	}
+	for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+		const auto bytes = g_memory_stats.allocated[i].load(std::memory_order_relaxed);
+		const auto count = g_memory_stats.count[i].load(std::memory_order_relaxed);
+		if (count != 0) {
+			text += fmt::format("[type {} heap {} count={} bytes={}]", i,
+			                    properties.memoryTypes[i].heapIndex, count, bytes);
+		}
+	}
+	return text;
+}
+
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                 vk::Result* out_result) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.memory.allocation != nullptr);
 
@@ -228,6 +255,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &memory.allocation, &memory.allocation_info));
 	image.image = native_image;
+	if (out_result != nullptr) {
+		*out_result = result;
+	}
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;

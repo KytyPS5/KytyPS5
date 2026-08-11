@@ -91,11 +91,25 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	if (stride != 0 && records > UINT64_MAX / stride) {
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
-	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || size == 0) {
+	const auto footprint = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	if (address == 0 || footprint == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
+
+	uint64_t accessible = 0;
+	if (!HostMemoryQueryRange(address, footprint, HostMemoryAccess::Mapped, accessible)) {
+		static std::atomic_int unmapped_count = 0;
+		if (unmapped_count++ < 32) {
+			LOGF("storage buffer descriptor is not host-accessible: base=0x%016" PRIx64
+			     ", size=0x%016" PRIx64 "\n",
+			     address, footprint);
+		}
+		BindNullStorageBuffer(context, result);
+		return result;
+	}
+	const auto size = std::min(footprint, accessible);
+
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||

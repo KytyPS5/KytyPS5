@@ -1007,7 +1007,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	};
 
-	if (desc.type != BindingType::DepthTarget) {
+	if (!info.IsDepth() && desc.type != BindingType::DepthTarget) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
@@ -1031,10 +1031,15 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		return;
 	}
 
-	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
+	if (!info.IsDepth() || info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		EXIT("TextureCache: invalid depth upload: binding=%u format=%u bytes_per_block=%u "
+		     "samples=%u/%u layers=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     static_cast<uint32_t>(desc.type), static_cast<uint32_t>(info.guest_format),
+		     info.bytes_per_block,
+		     info.samples, image.backing.samples, info.resources.layers, info.data.address,
+		     info.data.size);
 	}
 	TileBlockLayout block {};
 	EXIT_NOT_IMPLEMENTED(

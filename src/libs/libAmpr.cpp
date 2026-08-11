@@ -2517,12 +2517,6 @@ static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_
                                                      uint64_t* multimap_va_end) {
 	PRINT_NAME();
 
-	void* reserve_addr = reinterpret_cast<void*>(AMM_VA_START);
-	if (LibKernel::Memory::KernelReserveVirtualRange(&reserve_addr, AMM_VA_SIZE, AMM_MAP_FIXED,
-	                                                 0x10000) == OK) {
-		(void)LibKernel::Memory::KernelSetVirtualRangeName(reserve_addr, AMM_VA_SIZE, "AMM");
-	}
-
 	if (va_start != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start), AMM_VA_START);
 	}

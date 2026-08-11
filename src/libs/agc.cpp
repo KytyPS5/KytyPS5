@@ -3884,6 +3884,9 @@ static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dword
 }
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	if (dcb == nullptr) {
+		return;
+	}
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(dcb, size_in_dwords, nullptr, 0,

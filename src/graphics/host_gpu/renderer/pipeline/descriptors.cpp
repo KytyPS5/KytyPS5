@@ -713,9 +713,18 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+
+	const auto* depth_policy =
+	    !storage && resource.depth_compare && IsSupportedSampledDepthResource(resource)
+	        ? FindGuestDepthFormatPolicy(format)
+	        : nullptr;
+	if (depth_policy != nullptr && depth_policy->sampled_view_format != pixel_format) {
+		depth_policy = nullptr;
+	}
 	TextureCache::ImageDesc desc {};
-	desc.info.data         = {address, size.size};
-	desc.info.pixel_format = pixel_format;
+	desc.info.data = {address, size.size};
+	desc.info.pixel_format =
+	    depth_policy != nullptr ? depth_policy->depth_attachment_format : pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
 	desc.info.extent       = {width, height, volume ? depth : 1u};

@@ -226,7 +226,7 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 	PrintAbortPointerArrayCandidate("arg5", arg5);
 
 	if (rbp != 0) {
-		Common::Singleton<Loader::RuntimeLinker>::Instance()->StackTrace(rbp);
+		Common::Singleton<Loader::RuntimeLinker>::Instance()->StackTrace(rbp, rsp);
 	}
 
 	if (rsp != 0) {

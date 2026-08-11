@@ -183,7 +183,7 @@ public:
 	static uint8_t* TlsGetAddr(Program* program);
 	static void     DeleteTls(Program* program, int thread_id);
 
-	void StackTrace(uint64_t frame_ptr);
+	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:
 	static void LoadProgramToMemory(Program* program);

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 
+#include "common/platform/sysDbg.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
@@ -52,20 +53,20 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
 	std::fputc('\n', stderr);
+#if !defined(__APPLE__)
+	void* frames[16] {};
+	int   frame_count = static_cast<int>(std::size(frames));
+	SysStackWalk(frames, &frame_count);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	void*      frames[16] {};
-	const auto frame_count =
-	    CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)), frames, nullptr);
 	const auto image_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-	for (uint16_t i = 0; i < frame_count; i++) {
+	for (int i = 0; i < frame_count; i++) {
 		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
-		std::fprintf(stderr, "  frame[%u]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR "\n", i,
+		std::fprintf(stderr, "  frame[%d]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR "\n", i,
 		             address, address >= image_base ? address - image_base : 0);
 	}
-#elif !defined(__APPLE__)
-	void*     frames[16] {};
-	const int frame_count = ::backtrace(frames, static_cast<int>(std::size(frames)));
+#else
 	::backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+#endif
 #endif
 	std::fflush(stderr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

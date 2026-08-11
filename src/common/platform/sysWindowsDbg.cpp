@@ -15,56 +15,8 @@
 #include "common/assert.h"
 #include "common/platform/sysDbg.h"
 
-struct FrameS {
-	struct FrameS* next;
-	void*          ret_addr;
-};
-
-int WalkStack(int z_stack_depth, void** z_stack_trace) {
-	CONTEXT context;
-	//	KNONVOLATILE_CONTEXT_POINTERS NvContext;
-	PRUNTIME_FUNCTION runtime_function  = nullptr;
-	PVOID             handler_data      = nullptr;
-	ULONG64           establisher_frame = 0;
-	ULONG64           image_base        = 0;
-
-	RtlCaptureContext(&context);
-
-	int frame = 0;
-
-	while (true) {
-		if (frame >= z_stack_depth) {
-			break;
-		}
-
-		z_stack_trace[frame] = reinterpret_cast<void*>(context.Rip);
-
-		frame++;
-
-		runtime_function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-
-		if (runtime_function == nullptr) {
-			break;
-		}
-
-		// RtlZeroMemory(&NvContext, sizeof(KNONVOLATILE_CONTEXT_POINTERS));
-		RtlVirtualUnwind(0, image_base, context.Rip, runtime_function, &context, &handler_data,
-		                 &establisher_frame, nullptr /*&NvContext*/);
-
-		if (context.Rip == 0u) {
-			break;
-		}
-	}
-
-	return frame;
-}
-
 void SysStackWalk(void** stack, int* depth) {
-	int n  = WalkStack(*depth, stack);
-	*depth = n;
-	//	unwind_info_t info = {stack, 0, *depth};
-	//	 _Unwind_Backtrace(&trace_fcn, &info);
-	//	 *depth = info.depth;
+	*depth = static_cast<int>(CaptureStackBackTrace(0, static_cast<DWORD>(*depth), stack, nullptr));
 }
 
 void SysStackUsagePrint(sys_dbg_stack_info_t& stack) {

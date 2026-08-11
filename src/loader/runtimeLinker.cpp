@@ -672,48 +672,39 @@ static Common::VirtualMemory::Mode GetMode(Elf64_Word flags) {
 	}
 }
 
-struct FrameS {
-	FrameS*   next;
-	uintptr_t ret_addr;
+struct GuestStackFrame {
+	GuestStackFrame* next;
+	uintptr_t        return_address;
 };
 
-static void KYTY_SYSV_ABI StackwalkX86(uint64_t rbp, void** stack, int* depth, uintptr_t stack_addr,
-                                       size_t stack_size, uintptr_t code_addr, size_t code_size) {
-	auto* frame = reinterpret_cast<FrameS*>(rbp);
+static bool IsReadableRange(uint64_t addr, uint64_t size);
 
-	int d = *depth;
-	int i = 0;
+static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
+	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
+	const uintptr_t     code_start = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	const uintptr_t     stack_end  = rsp + STACK_SIZE;
+	if (stack == nullptr || capacity <= 0 || rsp == 0 || rbp < rsp || stack_end < rsp ||
+	    g_desired_base_addr <= code_start) {
+		return 0;
+	}
 
-	for (; i < d; i++) {
-		if (!(reinterpret_cast<uintptr_t>(frame) >= stack_addr &&
-		      reinterpret_cast<uintptr_t>(frame) < stack_addr + stack_size)) {
+	auto* frame = reinterpret_cast<GuestStackFrame*>(rbp);
+
+	int depth = 0;
+	while (depth < capacity) {
+		const auto frame_addr = reinterpret_cast<uintptr_t>(frame);
+		if (frame_addr < rsp || frame_addr > stack_end - sizeof(GuestStackFrame) ||
+		    !IsReadableRange(frame_addr, sizeof(GuestStackFrame)) ||
+		    frame->return_address < code_start || frame->return_address >= g_desired_base_addr) {
 			break;
 		}
-
-		if (!(frame->ret_addr >= code_addr && frame->ret_addr < code_addr + code_size)) {
+		stack[depth++] = reinterpret_cast<void*>(frame->return_address);
+		if (reinterpret_cast<uintptr_t>(frame->next) <= frame_addr) {
 			break;
 		}
-
-		stack[i] = reinterpret_cast<void*>(frame->ret_addr);
-
 		frame = frame->next;
 	}
-
-	*depth = i;
-}
-
-static void KYTY_SYSV_ABI SysStackWalkX86(uint64_t rbp, uint64_t rsp, void** stack, int* depth) {
-	if (rsp == 0 || rbp < rsp) {
-		*depth = 0;
-		return;
-	}
-
-	StackwalkX86(rbp, stack, depth, rsp, 1024u * 1024u, SYSTEM_RESERVED + CODE_BASE_OFFSET,
-	             g_desired_base_addr - (SYSTEM_RESERVED + CODE_BASE_OFFSET));
-}
-
-void KYTY_SYSV_ABI SysStackWalkX86(uint64_t rbp, void** stack, int* depth) {
-	SysStackWalkX86(rbp, rbp, stack, depth);
+	return depth;
 }
 
 // Probe diagnostic ranges without raising another fault.
@@ -961,22 +952,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		if (info->rbp != 0) {
-			void* stack[20];
-			int   depth = 20;
-			SysStackWalkX86(info->rbp, info->rsp, stack, &depth);
-
-			LOGF("Stack trace [thread = %d]:\n", Common::Thread::GetThreadIdUnique());
-			for (int i = 0; i < depth; i++) {
-				auto  vaddr = reinterpret_cast<uint64_t>(stack[i]);
-				auto* p =
-				    Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(vaddr);
-				LOGF("[%d] %016" PRIx64 ", off=%016" PRIx64 ", %s\n", i, vaddr,
-				     (p == nullptr ? 0 : vaddr - p->base_vaddr),
-				     (p == nullptr ? "???"
-				                   : Common::FilenameWithoutDirectory(
-				                         Common::PathToGenericString(p->file_name))
-				                         .c_str()));
-			}
+			Common::Singleton<Loader::RuntimeLinker>::Instance()->StackTrace(info->rbp, info->rsp);
 		}
 
 		auto dump_guest_qwords = [](const char* name, uint64_t addr) {
@@ -1896,11 +1872,9 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	return nullptr;
 }
 
-void RuntimeLinker::StackTrace(uint64_t frame_ptr) {
+void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 	void* stack[20];
-	int   depth = 20;
-
-	SysStackWalkX86(frame_ptr, stack, &depth);
+	int   depth = WalkGuestStack(frame_ptr, stack_ptr, stack, static_cast<int>(std::size(stack)));
 
 	LOGF("Stack trace [thread = %d]:\n", Common::Thread::GetThreadIdUnique());
 

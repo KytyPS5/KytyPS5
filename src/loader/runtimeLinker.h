@@ -209,6 +209,14 @@ private:
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
 
+struct UnwindHostBoundaryStats {
+	uint64_t count     = 0;
+	uint64_t last_addr = 0;
+};
+
+void                    RecordUnwindHostBoundary(uint64_t addr);
+UnwindHostBoundaryStats GetUnwindHostBoundaryStats();
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();

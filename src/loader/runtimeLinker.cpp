@@ -789,6 +789,33 @@ static bool IsDumpableRange(uint64_t addr, uint64_t size) {
 #endif
 }
 
+static std::atomic<uint64_t> g_unwind_boundary_count {0};
+static std::atomic<uint64_t> g_unwind_boundary_last {0};
+
+void RecordUnwindHostBoundary(uint64_t addr) {
+	g_unwind_boundary_count.fetch_add(1, std::memory_order_relaxed);
+	g_unwind_boundary_last.store(addr, std::memory_order_relaxed);
+}
+
+UnwindHostBoundaryStats GetUnwindHostBoundaryStats() {
+	return {g_unwind_boundary_count.load(std::memory_order_relaxed),
+	        g_unwind_boundary_last.load(std::memory_order_relaxed)};
+}
+
+static std::string GuestAddressName(uint64_t addr) {
+	if (addr == 0) {
+		return "0";
+	}
+	const auto* program = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(addr);
+	if (program == nullptr || addr < program->base_vaddr) {
+		return fmt::format("{:016x}", addr);
+	}
+	return fmt::format(
+	    "{:016x} {}+0x{:x}", addr,
+	    Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name)),
+	    addr - program->base_vaddr);
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -1008,7 +1035,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return false;
 	}
 
-	EXIT("Unknown exception!!! (%08" PRIx32 ")", info->native_code);
+	std::string bytes;
+	bool        guest_trap = false;
+	if (info->exception_address != 0 && IsReadableRange(info->exception_address, 16)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+		for (uint32_t i = 0; i < 16; i++) {
+			bytes += fmt::format("{:02x} ", code[i]);
+		}
+		guest_trap = code[0] == 0x0f && code[1] == 0x0b;
+	}
+	std::string frames;
+	if (info->rbp != 0) {
+		void*     stack[20];
+		const int depth =
+		    WalkGuestStack(info->rbp, info->rsp, stack, static_cast<int>(std::size(stack)));
+		for (int i = 0; i < depth; i++) {
+			frames += fmt::format("\n\t[{}] {}", i,
+			                      GuestAddressName(reinterpret_cast<uint64_t>(stack[i])));
+		}
+	}
+
+	if (guest_trap) {
+		const auto boundaries = GetUnwindHostBoundaryStats();
+		EXIT("Guest aborted: ud2 at %016" PRIx64
+		     " (%s)\n\ta noreturn abort/terminate returned into the compiler's unreachable "
+		     "marker\n\tunwind host boundaries hit: %" PRIu64 " (last %016" PRIx64
+		     ")\n\tcode: %s\n\tguest stack:%s\n",
+		     info->exception_address, GuestAddressName(info->exception_address).c_str(),
+		     boundaries.count, boundaries.last_addr, bytes.c_str(), frames.c_str());
+		return false;
+	}
+
+	EXIT("Unknown exception!!! (%08" PRIx32 ") at %016" PRIx64 " (%s)\n\tcode: %s\n\tguest "
+	     "stack:%s\n",
+	     info->native_code, info->exception_address,
+	     GuestAddressName(info->exception_address).c_str(), bytes.c_str(), frames.c_str());
 	return false;
 }
 

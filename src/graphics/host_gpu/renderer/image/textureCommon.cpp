@@ -14,152 +14,64 @@
 namespace Libs::Graphics {
 namespace {
 
-struct RenderTargetFormatMapping {
-	Prospero::ChannelLayout layout;
-	Prospero::ChannelType   type;
-	Prospero::ChannelOrder  order;
-	RenderTargetFormatInfo  info;
+// Rows are channel order; columns are the number of physical components minus one. Unused
+// selectors complete each entry to a permutation so logical write masks can be inverted.
+constexpr Prospero::ColorComponentMapping kRenderTargetColorMappings[4][4] = {
+    {Prospero::ColorMappingRgba, Prospero::ColorMappingRgba, Prospero::ColorMappingRgba,
+     Prospero::ColorMappingRgba},
+    {Prospero::ColorMappingGr, Prospero::ColorMappingRabg, Prospero::ColorMappingRgab,
+     Prospero::ColorMappingBgra},
+    {Prospero::ColorMappingBgra, Prospero::ColorMappingGr, Prospero::ColorMappingBgra,
+     Prospero::ColorMappingAbgr},
+    {Prospero::ColorMappingAgba, Prospero::ColorMappingArbg, Prospero::ColorMappingAgbr,
+     Prospero::ColorMappingArgb},
 };
 
-constexpr RenderTargetFormatMapping kRenderTargetFormats[] = {
-    {Prospero::ChannelLayout::k8,
-     Prospero::ChannelType::kUInt,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR8Uint, 1}},
-    {Prospero::ChannelLayout::k8_8,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR8G8Unorm, 2}},
-    {Prospero::ChannelLayout::k8_8_8_8,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR8G8B8A8Unorm, 4}},
-    {Prospero::ChannelLayout::k8_8_8_8,
-     Prospero::ChannelType::kSNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR8G8B8A8Snorm, 4}},
-    {Prospero::ChannelLayout::k8_8_8_8,
-     Prospero::ChannelType::kSrgb,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR8G8B8A8Srgb, 4}},
-    {Prospero::ChannelLayout::k8_8_8_8,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kAlt,
-     {vk::Format::eB8G8R8A8Unorm, 4}},
-    {Prospero::ChannelLayout::k8_8_8_8,
-     Prospero::ChannelType::kSNorm,
-     Prospero::ChannelOrder::kAlt,
-     {vk::Format::eB8G8R8A8Snorm, 4}},
-    {Prospero::ChannelLayout::k8_8_8_8,
-     Prospero::ChannelType::kSrgb,
-     Prospero::ChannelOrder::kAlt,
-     {vk::Format::eB8G8R8A8Srgb, 4}},
-    {Prospero::ChannelLayout::k5_5_5_1,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR5G5B5A1UnormPack16, 2}},
-    {Prospero::ChannelLayout::k4_4_4_4,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kReversed,
-     {vk::Format::eB4G4R4A4UnormPack16, 2}},
-    {Prospero::ChannelLayout::k10_10_10_2,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eA2B10G10R10UnormPack32, 4}},
-    {Prospero::ChannelLayout::k10_10_10_2,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kAlt,
-     {vk::Format::eA2R10G10B10UnormPack32, 4}},
-    {Prospero::ChannelLayout::k11_11_10,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eB10G11R11UfloatPack32, 4}},
-    {Prospero::ChannelLayout::k5_6_5,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eB5G6R5UnormPack16, 2}},
-    {Prospero::ChannelLayout::k16,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16Unorm, 2}},
-    {Prospero::ChannelLayout::k16,
-     Prospero::ChannelType::kUInt,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16Uint, 2}},
-    {Prospero::ChannelLayout::k16,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16Sfloat, 2}},
-    {Prospero::ChannelLayout::k16_16,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16Unorm, 4}},
-    {Prospero::ChannelLayout::k16_16,
-     Prospero::ChannelType::kSNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16Snorm, 4}},
-    {Prospero::ChannelLayout::k16_16,
-     Prospero::ChannelType::kUInt,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16Uint, 4}},
-    {Prospero::ChannelLayout::k16_16,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16Sfloat, 4}},
-    {Prospero::ChannelLayout::k16_16_16_16,
-     Prospero::ChannelType::kUNorm,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16B16A16Unorm, 8}},
-    {Prospero::ChannelLayout::k16_16_16_16,
-     Prospero::ChannelType::kUInt,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16B16A16Uint, 8}},
-    {Prospero::ChannelLayout::k16_16_16_16,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR16G16B16A16Sfloat, 8}},
-    {Prospero::ChannelLayout::k16_16_16_16,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kAlt,
-     {vk::Format::eR16G16B16A16Sfloat, 8, Prospero::ColorMappingBgra}},
-    {Prospero::ChannelLayout::k16_16_16_16,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kReversed,
-     {vk::Format::eR16G16B16A16Sfloat, 8, Prospero::ColorMappingAbgr}},
-    {Prospero::ChannelLayout::k32,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR32Sfloat, 4}},
-    {Prospero::ChannelLayout::k32_32,
-     Prospero::ChannelType::kUInt,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR32G32Uint, 8}},
-    {Prospero::ChannelLayout::k32_32,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR32G32Sfloat, 8}},
-    {Prospero::ChannelLayout::k32_32_32_32,
-     Prospero::ChannelType::kFloat,
-     Prospero::ChannelOrder::kStandard,
-     {vk::Format::eR32G32B32A32Sfloat, 16}},
+struct RenderTargetHostFormatInfo {
+	vk::Format                      format = vk::Format::eUndefined;
+	Prospero::ColorComponentMapping host_to_storage;
 };
+
+RenderTargetHostFormatInfo ResolveRenderTargetHostFormat(Prospero::BufferFormat guest_format,
+                                                         Prospero::ChannelOrder order) {
+	if (order == Prospero::ChannelOrder::kAlt) {
+		switch (guest_format) {
+			case Prospero::BufferFormat::k8_8_8_8UNorm:
+				return {vk::Format::eB8G8R8A8Unorm, Prospero::ColorMappingBgra};
+			case Prospero::BufferFormat::k8_8_8_8SNorm:
+				return {vk::Format::eB8G8R8A8Snorm, Prospero::ColorMappingBgra};
+			case Prospero::BufferFormat::k8_8_8_8Srgb:
+				return {vk::Format::eB8G8R8A8Srgb, Prospero::ColorMappingBgra};
+			case Prospero::BufferFormat::k10_10_10_2UNorm:
+				return {vk::Format::eA2R10G10B10UnormPack32, Prospero::ColorMappingBgra};
+			default: break;
+		}
+	}
+	switch (guest_format) {
+		case Prospero::BufferFormat::k5_5_5_1UNorm:
+			return {vk::Format::eA1R5G5B5UnormPack16, Prospero::ColorMappingBgra};
+		case Prospero::BufferFormat::k1_5_5_5UNorm:
+			return {vk::Format::eR5G5B5A1UnormPack16, Prospero::ColorMappingAbgr};
+		case Prospero::BufferFormat::k4_4_4_4UNorm:
+			return {vk::Format::eR4G4B4A4UnormPack16, Prospero::ColorMappingAbgr};
+		default: return {VulkanFormat(Prospero::GpuEnumValue(guest_format)), {}};
+	}
+}
 
 } // namespace
 
-// TODO: cleanup!
 RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_t raw_type,
                                                     uint32_t raw_order) {
-	const auto layout = static_cast<Prospero::ChannelLayout>(raw_layout);
-	const auto type   = static_cast<Prospero::ChannelType>(raw_type);
-	const auto order  = static_cast<Prospero::ChannelOrder>(raw_order);
-
-	if (layout == Prospero::ChannelLayout::k8 && type == Prospero::ChannelType::kUNorm &&
-	    raw_order <= Prospero::GpuEnumValue(Prospero::ChannelOrder::kAltReversed)) {
-		return {vk::Format::eR8Unorm, 1};
-	}
-	for (const auto& mapping: kRenderTargetFormats) {
-		if (mapping.layout == layout && mapping.type == type && mapping.order == order) {
-			return mapping.info;
+	const auto encoding = Prospero::ResolveRenderTargetFormat(raw_layout, raw_type);
+	if (encoding.IsValid() && encoding.SupportsOrder(raw_order)) {
+		const auto order = static_cast<Prospero::ChannelOrder>(raw_order);
+		const auto host  = ResolveRenderTargetHostFormat(encoding.buffer_format, order);
+		const auto bytes =
+		    Prospero::RenderTargetBytesPerElement(Prospero::GpuEnumValue(encoding.buffer_format));
+		if (host.format != vk::Format::eUndefined && bytes != 0) {
+			const auto order_mapping =
+			    kRenderTargetColorMappings[raw_order][encoding.components - 1u];
+			return {host.format, bytes, host.host_to_storage.Then(order_mapping)};
 		}
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n", raw_layout,

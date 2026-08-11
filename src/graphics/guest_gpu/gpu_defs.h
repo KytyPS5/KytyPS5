@@ -115,32 +115,52 @@ enum class ChannelOrder : uint32_t {
 	kAltReversed = 3,
 };
 
-// Maps a shader's logical RGBA export to the host color-attachment components. Two bits per
-// component keep this cheap to carry in shader and pipeline keys.
+// Selects the logical shader component written to each physical color-attachment component.
+// Two bits per component keep this cheap to carry in shader and pipeline keys.
 struct ColorComponentMapping {
-	uint8_t packed = 0xe4u; // RGBA: 0, 1, 2, 3
+	static constexpr uint8_t kIdentity = 0xe4u;
+
+	uint8_t packed = kIdentity;
 
 	[[nodiscard]] constexpr uint32_t Map(uint32_t component) const {
 		return component < 4u ? (packed >> (component * 2u)) & 0x3u : component;
 	}
 
-	[[nodiscard]] constexpr uint32_t ApplyMask(uint32_t mask) const {
+	[[nodiscard]] constexpr uint32_t ApplyMask(uint32_t logical_mask) const {
 		uint32_t mapped = 0;
-		for (uint32_t component = 0; component < 4u; component++) {
-			mapped |= ((mask >> component) & 1u) << Map(component);
+		for (uint32_t physical_component = 0; physical_component < 4u; physical_component++) {
+			mapped |= ((logical_mask >> Map(physical_component)) & 1u) << physical_component;
 		}
 		return mapped;
 	}
 
-	[[nodiscard]] constexpr bool IsIdentity() const { return packed == 0xe4u; }
+	// This mapping selects an intermediate component; next selects the final logical component.
+	[[nodiscard]] constexpr ColorComponentMapping Then(ColorComponentMapping next) const {
+		ColorComponentMapping result {0u};
+		for (uint32_t physical_component = 0; physical_component < 4u; physical_component++) {
+			result.packed |= static_cast<uint8_t>(next.Map(Map(physical_component))
+			                                      << (physical_component * 2u));
+		}
+		return result;
+	}
+
+	[[nodiscard]] constexpr bool IsIdentity() const { return packed == kIdentity; }
 
 	bool operator==(const ColorComponentMapping&) const = default;
 };
 
 static_assert(sizeof(ColorComponentMapping) == sizeof(uint8_t));
 
-inline constexpr ColorComponentMapping ColorMappingAbgr {0x1bu}; // 3, 2, 1, 0
+inline constexpr ColorComponentMapping ColorMappingRgba {ColorComponentMapping::kIdentity};
+inline constexpr ColorComponentMapping ColorMappingGr {0xe1u};   // 1, 0, 2, 3
+inline constexpr ColorComponentMapping ColorMappingRabg {0x6cu}; // 0, 3, 2, 1
+inline constexpr ColorComponentMapping ColorMappingRgab {0xb4u}; // 0, 1, 3, 2
 inline constexpr ColorComponentMapping ColorMappingBgra {0xc6u}; // 2, 1, 0, 3
+inline constexpr ColorComponentMapping ColorMappingAbgr {0x1bu}; // 3, 2, 1, 0
+inline constexpr ColorComponentMapping ColorMappingAgba {0x27u}; // 3, 1, 2, 0
+inline constexpr ColorComponentMapping ColorMappingArbg {0x63u}; // 3, 0, 2, 1
+inline constexpr ColorComponentMapping ColorMappingAgbr {0x87u}; // 3, 1, 0, 2
+inline constexpr ColorComponentMapping ColorMappingArgb {0x93u}; // 3, 0, 1, 2
 
 enum class DepthFormat : uint32_t {
 	kInvalid = 0,
@@ -388,9 +408,11 @@ enum class BufferFormat : uint32_t {
 	k8Srgb              = 128,
 	k8_8Srgb            = 129,
 	k8_8_8_8Srgb        = 130,
+	k10_10_10_2Float    = 131,
 	k9_9_9_5Float       = 132,
 	k5_6_5UNorm         = 133,
 	k5_5_5_1UNorm       = 134,
+	k1_5_5_5UNorm       = 135,
 	k4_4_4_4UNorm       = 136,
 	kFmask8_S4_F4       = 161,
 	kBc1UNorm           = 169,

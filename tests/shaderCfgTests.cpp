@@ -6484,7 +6484,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 	CheckSpirvBinaryValidates(uint16_result.spirv);
 }
 
-void TestRenderTargetReverseFloat16ExportMapping() {
+void TestRenderTargetReverseExportMapping() {
 	const auto format =
 	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k16_16_16_16),
 	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kFloat),
@@ -6506,6 +6506,116 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
 	Check(legacy_alt.format == vk::Format::eB8G8R8A8Unorm && legacy_alt.export_mapping.IsIdentity(),
 	      "legacy BGRA render target acquired a duplicate shader export mapping");
+	const auto gr32 =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k32_32),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kFloat),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kReversed));
+	Check(gr32.format == vk::Format::eR32G32Sfloat && gr32.bytes_per_element == 8u &&
+	          gr32.export_mapping == Prospero::ColorMappingGr,
+	      "reverse GR32F render target did not retain its native host format, "
+	      "size, and mapping");
+
+	struct MappingCase {
+		Prospero::ChannelLayout layout;
+		Prospero::ChannelType   type;
+		vk::Format              format;
+		uint32_t                bytes;
+		std::array<Prospero::ColorComponentMapping, 4> mappings;
+	};
+	const MappingCase mapping_cases[] = {
+	    {Prospero::ChannelLayout::k8,
+	     Prospero::ChannelType::kUInt,
+	     vk::Format::eR8Uint,
+	     1,
+	     {Prospero::ColorMappingRgba, Prospero::ColorMappingGr, Prospero::ColorMappingBgra,
+	      Prospero::ColorMappingAgba}},
+	    {Prospero::ChannelLayout::k32_32,
+	     Prospero::ChannelType::kFloat,
+	     vk::Format::eR32G32Sfloat,
+	     8,
+	     {Prospero::ColorMappingRgba, Prospero::ColorMappingRabg, Prospero::ColorMappingGr,
+	      Prospero::ColorMappingArbg}},
+	    {Prospero::ChannelLayout::k5_6_5,
+	     Prospero::ChannelType::kUNorm,
+	     vk::Format::eB5G6R5UnormPack16,
+	     2,
+	     {Prospero::ColorMappingRgba, Prospero::ColorMappingRgab, Prospero::ColorMappingBgra,
+	      Prospero::ColorMappingAgbr}},
+	    {Prospero::ChannelLayout::k16_16_16_16,
+	     Prospero::ChannelType::kFloat,
+	     vk::Format::eR16G16B16A16Sfloat,
+	     8,
+	     {Prospero::ColorMappingRgba, Prospero::ColorMappingBgra, Prospero::ColorMappingAbgr,
+	      Prospero::ColorMappingArgb}},
+	};
+	for (const auto& mapping_case: mapping_cases) {
+		for (uint32_t order = 0; order < 4u; order++) {
+			const auto info =
+			    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(mapping_case.layout),
+			                                 Prospero::GpuEnumValue(mapping_case.type), order);
+			Check(info.format == mapping_case.format &&
+			          info.bytes_per_element == mapping_case.bytes &&
+			          info.export_mapping == mapping_case.mappings[order],
+			      "render-target channel order did not use the component-count "
+			      "mapping");
+			for (uint32_t physical = 0; physical < 4u; physical++) {
+				const auto logical = info.export_mapping.Map(physical);
+				Check(info.export_mapping.ApplyMask(1u << logical) == (1u << physical),
+				      "logical color write mask was not mapped to the inverse physical "
+				      "component");
+			}
+		}
+	}
+
+	const auto alt_1010102 =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k10_10_10_2),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
+	Check(alt_1010102.format == vk::Format::eA2R10G10B10UnormPack32 &&
+	          alt_1010102.export_mapping.IsIdentity(),
+	      "native alternate 10:10:10:2 render target acquired a shader mapping");
+	const auto reversed_4444 =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k4_4_4_4),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kReversed));
+	Check(reversed_4444.format == vk::Format::eR4G4B4A4UnormPack16 &&
+	          reversed_4444.export_mapping.IsIdentity(),
+	      "reversed 4:4:4:4 render target did not compose storage and channel "
+	      "order");
+	const auto standard_4444 =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k4_4_4_4),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kStandard));
+	Check(standard_4444.format == vk::Format::eR4G4B4A4UnormPack16 &&
+	          standard_4444.export_mapping == Prospero::ColorMappingAbgr,
+	      "standard 4:4:4:4 render target did not compensate host packed-bit "
+	      "order");
+	const auto standard_5551 =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k5_5_5_1),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kStandard));
+	Check(standard_5551.format == vk::Format::eA1R5G5B5UnormPack16 &&
+	          standard_5551.export_mapping == Prospero::ColorMappingBgra,
+	      "5:5:5:1 render target did not preserve its high one-bit component");
+	const auto standard_1555 =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k1_5_5_5),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kStandard));
+	Check(standard_1555.format == vk::Format::eR5G5B5A1UnormPack16 &&
+	          standard_1555.export_mapping == Prospero::ColorMappingAbgr,
+	      "1:5:5:5 render target did not preserve its low one-bit component");
+
+	const auto argb =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k16_16_16_16),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kFloat),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kAltReversed));
+	Check(argb.export_mapping == Prospero::ColorMappingArgb &&
+	          argb.export_mapping.ApplyMask(0x1u) == 0x2u &&
+	          argb.export_mapping.ApplyMask(0x2u) == 0x4u &&
+	          argb.export_mapping.ApplyMask(0x4u) == 0x8u &&
+	          argb.export_mapping.ApplyMask(0x8u) == 0x1u,
+	      "alternate-reversed render-target mapping did not invert its "
+	      "non-involutive cycle");
 
 	const uint32_t shader[] = {
 	    EncodeExp0(0x00, 0xf),
@@ -6532,6 +6642,21 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	      "reverse MRT export did not emit a WZYX component shuffle");
 	CheckSpirvBinaryValidates(reversed_result.spirv);
 
+	reversed_info.target_export_mapping[0] = gr32.export_mapping;
+	ShaderRecompiler::CompileResult gr32_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, gr32_result, &error), error.c_str());
+	Check(SpirvContainsVectorShuffle(gr32_result.spirv, {1u, 0u, 2u, 3u}),
+	      "reverse GR32F MRT export did not emit a YXZW component shuffle");
+	CheckSpirvBinaryValidates(gr32_result.spirv);
+
+	reversed_info.target_export_mapping[0] = argb.export_mapping;
+	ShaderRecompiler::CompileResult argb_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, argb_result, &error), error.c_str());
+	Check(SpirvContainsVectorShuffle(argb_result.spirv, {3u, 0u, 1u, 2u}),
+	      "alternate-reversed MRT export did not emit an ARGB component shuffle");
+	CheckSpirvBinaryValidates(argb_result.spirv);
+	reversed_info.target_export_mapping[0] = gr32.export_mapping;
+
 	HW::PixelShaderInfo regs {};
 	Check(ShaderGetIdPS(regs, identity_info, false) != ShaderGetIdPS(regs, reversed_info, false),
 	      "pixel shader cache identity omitted the render-target export mapping");
@@ -6545,17 +6670,18 @@ void TestRenderTargetReverseFloat16ExportMapping() {
 	ShaderVertexInputInfo vs_info {};
 	vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
 	std::array<Prospero::ColorComponentMapping, 8> mappings {};
-	mappings[0] = format.export_mapping;
+	mappings[0] = gr32.export_mapping;
 	ShaderPixelInputInfo      compiled_info {};
 	std::span<const uint32_t> compiled_spirv;
 	Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave, vs_info, mappings,
 	                          compiled_info, compiled_spirv) &&
 	          compiled_info.target_export_mapping[0].IsIdentity(),
-	      "inactive reverse MRT mapping was not normalized out of the shader cache key");
+	      "inactive reverse MRT mapping was not normalized out of the shader "
+	      "cache key");
 	sh.target_output_mode[0] = 4;
 	Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave, vs_info, mappings,
 	                          compiled_info, compiled_spirv) &&
-	          compiled_info.target_export_mapping[0] == format.export_mapping,
+	          compiled_info.target_export_mapping[0] == gr32.export_mapping,
 	      "active reverse MRT mapping was lost before shader specialization");
 }
 
@@ -7625,7 +7751,7 @@ int main() {
 	TestNewShaderRecompilerVertexExportUsesLaneExecMask();
 	TestNewShaderRecompilerPerInvocationMasks();
 	TestNewShaderRecompilerExpPixelOutputs();
-	TestRenderTargetReverseFloat16ExportMapping();
+	TestRenderTargetReverseExportMapping();
 	TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
 	TestScalarProvenanceRealWideMoveLowering();
 	TestScalarProvenanceRealCarryAndScalarLoads();

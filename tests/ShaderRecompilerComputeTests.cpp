@@ -15970,7 +15970,7 @@ void CheckEmbeddedFetchVertexOffset() {
 }
 
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
-	(void)TextureGetRenderTargetFormat(12u, 7u, 3u);
+	(void)TextureGetRenderTargetFormat(12u, 6u, 0u);
 	std::_Exit(0x7f);
 }
 
@@ -16010,6 +16010,26 @@ void CheckRenderTargetFormatContract() {
 	            format.export_mapping.ApplyMask(0xfu) == 0xfu,
 	        "reverse RGBA16F component mask was not mapped exactly once");
 
+	const auto rg32 = TextureGetRenderTargetFormat(11u, 7u, 2u);
+	Require("ReverseRenderTarget", "GR32 float",
+	        rg32.format == vk::Format::eR32G32Sfloat && rg32.bytes_per_element == 8u &&
+	            rg32.export_mapping == Prospero::ColorMappingGr &&
+	            rg32.export_mapping.ApplyMask(0x1u) == 0x2u &&
+	            rg32.export_mapping.ApplyMask(0x2u) == 0x1u &&
+	            rg32.export_mapping.ApplyMask(0x3u) == 0x3u &&
+	            rg32.export_mapping.ApplyMask(0xfu) == 0xfu,
+	        "reverse GR32F render-target export or write-mask mapping is incorrect");
+
+	const auto argb = TextureGetRenderTargetFormat(12u, 7u, 3u);
+	Require("ReverseRenderTarget", "ARGB float",
+	        argb.format == vk::Format::eR16G16B16A16Sfloat &&
+	            argb.export_mapping == Prospero::ColorMappingArgb &&
+	            argb.export_mapping.ApplyMask(0x1u) == 0x2u &&
+	            argb.export_mapping.ApplyMask(0x2u) == 0x4u &&
+	            argb.export_mapping.ApplyMask(0x4u) == 0x8u &&
+	            argb.export_mapping.ApplyMask(0x8u) == 0x1u,
+	        "alternate-reversed render-target mapping did not invert its ARGB cycle");
+
 	char path[MAX_PATH] {};
 	Require("ReverseRenderTarget", "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
 	        "GetModuleFileName failed");
@@ -16030,7 +16050,7 @@ void CheckRenderTargetFormatContract() {
 	CloseHandle(process.hThread);
 	CloseHandle(process.hProcess);
 	Require("ReverseRenderTarget", "hard failure", exited && exit_code == 321,
-	        "adjacent unproven render-target tuple did not retain the fatal guard");
+	        "invalid render-target tuple did not retain the fatal guard");
 	std::printf("[host]    %-32s ok\n", "RenderTargetFormat");
 }
 #endif

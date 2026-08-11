@@ -563,6 +563,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		sync_on_address_tests
+		audio_out2_port_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 	)

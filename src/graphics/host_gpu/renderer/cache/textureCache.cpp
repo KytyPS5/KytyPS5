@@ -1942,7 +1942,7 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		const uint64_t age       = std::min<uint64_t>(aggressive ? 16 : pressured ? 80 : 160, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -1963,13 +1963,14 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
+				const bool keep_tiled = safe && owner->info.IsTiled();
+				if (keep_tiled && !aggressive) {
 					continue;
 				}
 				if (safe && !pressured) {
 					continue;
 				}
-				if (safe && !TryDownloadImage(id)) {
+				if (safe && !keep_tiled && !TryDownloadImage(id)) {
 					continue;
 				}
 				ClearGpuModified(id);

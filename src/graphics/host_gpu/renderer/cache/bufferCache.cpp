@@ -87,6 +87,7 @@ struct BufferCache::DownloadRange {
 	uint64_t address = 0;
 	uint64_t size    = 0;
 	uint64_t offset  = 0;
+	std::shared_ptr<Buffer> staging;
 };
 
 struct BufferCache::RetiredBuffer {
@@ -131,11 +132,18 @@ BufferCache::RecordDownloads(std::span<const DownloadCopy> copies) {
 		return {};
 	}
 
-	auto& download                   = m_download_buffer;
-	const auto [mapped, base_offset] = download.Map(reservation_size, DOWNLOAD_ALIGNMENT);
+	auto [mapped, base_offset] = m_download_buffer.Map(reservation_size, DOWNLOAD_ALIGNMENT);
+	std::shared_ptr<Buffer> staging;
 	if (mapped == nullptr) {
-		EXIT("BufferCache: download batch could not reserve the shared stream\n");
+		staging = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                   AllFlags, reservation_size);
+		if (staging->Mapped().empty()) {
+			EXIT("BufferCache: download batch could not reserve %" PRIu64 " bytes of staging\n",
+			     reservation_size);
+		}
+		base_offset = 0;
 	}
+	Buffer& download = staging != nullptr ? *staging : m_download_buffer;
 
 	std::vector<DownloadRange> downloads;
 	downloads.reserve(copies.size());
@@ -147,18 +155,21 @@ BufferCache::RecordDownloads(std::span<const DownloadCopy> copies) {
 		                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
 		                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 		                  vk::AccessFlagBits::eHostRead);
-		downloads.push_back({copy.address, copy.size, base_offset + cursor + prefix});
+		downloads.push_back({copy.address, copy.size, base_offset + cursor + prefix, staging});
 		cursor += AlignDownload(envelope_size);
 	}
-	download.Commit();
+	if (staging == nullptr) {
+		m_download_buffer.Commit();
+	}
 	return downloads;
 }
 
 void BufferCache::PublishDownloads(std::span<const DownloadRange> downloads) {
 	for (const auto& range: downloads) {
-		m_download_buffer.Invalidate(range.offset, range.size);
+		Buffer& source = range.staging != nullptr ? *range.staging : m_download_buffer;
+		source.Invalidate(range.offset, range.size);
 		Libs::LibKernel::Memory::WriteBacking(
-		    range.address, m_download_buffer.Mapped().data() + range.offset, range.size);
+		    range.address, source.Mapped().data() + range.offset, range.size);
 	}
 }
 

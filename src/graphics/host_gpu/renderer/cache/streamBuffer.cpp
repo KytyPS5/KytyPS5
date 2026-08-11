@@ -310,13 +310,13 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
-void StreamBuffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(Usage() != MemoryUsage::Download || offset > Size() || size > Size() - offset);
-	if (IsCoherent() || size == 0) {
+void Buffer::Invalidate(uint64_t offset, uint64_t size) {
+	EXIT_IF(m_usage != MemoryUsage::Download || offset > m_size || size > m_size - offset);
+	if (m_is_coherent || size == 0) {
 		return;
 	}
-	const auto result = vmaInvalidateAllocation(Graphics().allocator,
-	                                            NativeBuffer().memory.allocation, offset, size);
+	const auto result =
+	    vmaInvalidateAllocation(m_graphics->allocator, m_buffer->memory.allocation, offset, size);
 	EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 }
 

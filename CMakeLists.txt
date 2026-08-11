@@ -388,6 +388,7 @@ target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeDialog.cpp"
 )
 target_include_directories(ime_dialog_tests PRIVATE ${inc_headers})

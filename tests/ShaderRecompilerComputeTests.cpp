@@ -1611,13 +1611,14 @@ public:
 
 		{
 			const auto make_release_mem = [](uint32_t data_sel, uint32_t interrupt_selector,
-			                                 void* destination, uint64_t value) {
+			                                 void* destination, uint64_t value,
+			                                 uint32_t action = 0x28u,
+			                                 uint32_t gcr_cntl = 1u << 9u) {
 				std::array<uint32_t, 8> packet {};
-				const auto              address = reinterpret_cast<uint64_t>(destination);
-				constexpr uint32_t       eop_none = 0x28u;
-				constexpr uint32_t       gcr_gl2_writeback = 1u << 9u;
+				const auto              address     = reinterpret_cast<uint64_t>(destination);
+				const auto              event_index = (action >= 0x2fu ? 6u : 5u);
 				packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
-				packet[1] = eop_none | (gcr_gl2_writeback << 12u);
+				packet[1] = action | (event_index << 8u) | (gcr_cntl << 12u);
 				packet[2] = (interrupt_selector << 24u) | (data_sel << 29u);
 				packet[3] = static_cast<uint32_t>(address);
 				packet[4] = static_cast<uint32_t>(address >> 32u);
@@ -1652,6 +1653,7 @@ public:
 
 			std::binary_semaphore parser_complete {0};
 			alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
+			alignas(uint64_t) uint64_t cb_db_release_label       = UINT64_MAX;
 			bool                       parser_kept_nonblocking_boundaries = false;
 			std::jthread               no_gpu_wait([&] {
 				gpu.SendCommandSync([&] {
@@ -1666,6 +1668,15 @@ public:
 					    result == Pm4ProcessResult::Complete &&
 					    gpu_scheduler.CurrentTick() == tick_before;
 
+					const auto cb_db_tick = gpu_scheduler.CurrentTick();
+					auto cb_db_release = make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
+					Pm4Execution cb_db_execution;
+					const auto   cb_db_result = processor->Process(
+					    cb_db_execution, cb_db_release.data(), cb_db_release.size());
+					const bool cb_db_release_did_not_submit =
+					    cb_db_result == Pm4ProcessResult::Complete && cb_db_release_label == 0 &&
+					    gpu_scheduler.CurrentTick() == cb_db_tick;
+
 					auto gds_interrupt_only =
 					    make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
 					Pm4Execution gds_interrupt_execution;
@@ -1673,7 +1684,7 @@ public:
 					const auto   interrupt_result = processor->Process(
 					    gds_interrupt_execution, gds_interrupt_only.data(), gds_interrupt_only.size());
 					parser_kept_nonblocking_boundaries =
-					    cache_and_counter_did_not_submit &&
+					    cache_and_counter_did_not_submit && cb_db_release_did_not_submit &&
 					    interrupt_result == Pm4ProcessResult::Complete &&
 					    gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
 					    interrupt_only_gds_label == UINT64_MAX;

@@ -1384,9 +1384,14 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					case 0x00:
 						switch (eop_event_type) {
 							case 0x04:
+								if (event_index == 0x05) {
+									write64(false);
+									return;
+								}
+								break;
+							case 0x14:
 							case 0x28:
-								if ((eop_event_type == 0x04 && event_index == 0x05) ||
-								    (eop_event_type == 0x28 && event_index == 0x00)) {
+								if (event_index == 0x00) {
 									write64(false);
 									return;
 								}

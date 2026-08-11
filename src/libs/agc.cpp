@@ -1254,7 +1254,7 @@ int KYTY_SYSV_ABI GraphicsGetGsOversubscription(ShaderRegister* regs, const Shad
 	if (target < base.export_count) {
 		const auto range = std::max(expanded.vertex - base.vertex, 1u);
 		auto       value = static_cast<uint32_t>(
-		    std::min((static_cast<uint64_t>(target - base.vertex) << 10u) / range, 1024ull));
+		    std::min<uint64_t>((static_cast<uint64_t>(target - base.vertex) << 10u) / range, 1024));
 		value         = std::max(value, 1u);
 		regs[0].value = (regs[0].value & ~FULL_PC_OVERSUBSCRIPTION) |
 		                (((value << 1u) - 1u) & FULL_PC_OVERSUBSCRIPTION);
@@ -1262,7 +1262,7 @@ int KYTY_SYSV_ABI GraphicsGetGsOversubscription(ShaderRegister* regs, const Shad
 	} else {
 		const auto range = std::max(expanded.export_count - base.export_count, 1u);
 		const auto value = static_cast<uint32_t>(
-		    std::min((static_cast<uint64_t>(target - base.export_count) * 127u) / range, 127ull));
+		    std::min<uint64_t>((static_cast<uint64_t>(target - base.export_count) * 127u) / range, 127));
 		regs[0].value |= FULL_PC_OVERSUBSCRIPTION;
 		regs[1].value = (regs[1].value & ~FULL_SH_OVERSUBSCRIPTION) | (value << 16u);
 	}

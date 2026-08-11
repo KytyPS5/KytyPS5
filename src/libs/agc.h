@@ -291,17 +291,27 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetFlip(CommandBuffer* buf, uint32_t video_ou
 
 namespace Gen5Driver {
 
-struct Packet;
+struct Packet {
+	uint32_t* addr;
+	uint32_t  dw_num;
+	uint8_t   flags;
+	uint8_t   reserved[3];
+};
+
+static_assert(sizeof(Packet) == 0x10);
+static_assert(offsetof(Packet, addr) == 0x0);
+static_assert(offsetof(Packet, dw_num) == 0x8);
+static_assert(offsetof(Packet, flags) == 0xc);
 
 int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet);
 int KYTY_SYSV_ABI GraphicsDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                                 const uint32_t*  dcb_sizes_in_dwords,
                                                 uint32_t         count);
-int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(uint32_t queue, uint32_t* dcb,
-                                                    uint32_t size_in_dwords);
-int KYTY_SYSV_ABI GraphicsDriverSubmitMultiCommandBuffers(uint32_t queue, uint32_t* const* dcbs,
-                                                          const uint32_t* sizes_in_dwords,
-                                                          uint32_t        count);
+int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(void* queue_context, const Packet* packet);
+int KYTY_SYSV_ABI GraphicsDriverSubmitMultiCommandBuffers(void*            queue_context,
+                                                          uint32_t* const* command_buffers,
+                                                          const uint32_t*  sizes_in_dwords,
+                                                          uint32_t         count);
 int KYTY_SYSV_ABI GraphicsDriverSubmitAcb(uint32_t queue, const Packet* packet);
 int KYTY_SYSV_ABI GraphicsDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs,
                                                 const uint32_t* sizes_in_dwords, uint32_t count);

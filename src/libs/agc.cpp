@@ -1259,8 +1259,8 @@ int KYTY_SYSV_ABI GraphicsGetGsOversubscription(ShaderRegister* regs, const Shad
 		regs[1].value |= FULL_SH_OVERSUBSCRIPTION;
 	} else {
 		const auto range = std::max(expanded.export_count - base.export_count, 1u);
-		const auto value = static_cast<uint32_t>(
-		    std::min<uint64_t>((static_cast<uint64_t>(target - base.export_count) * 127u) / range, 127));
+		const auto value = static_cast<uint32_t>(std::min<uint64_t>(
+		    (static_cast<uint64_t>(target - base.export_count) * 127u) / range, 127));
 		regs[0].value |= FULL_PC_OVERSUBSCRIPTION;
 		regs[1].value = (regs[1].value & ~FULL_SH_OVERSUBSCRIPTION) | (value << 16u);
 	}
@@ -3857,12 +3857,6 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
-struct Packet {
-	uint32_t* addr;
-	uint32_t  dw_num;
-	uint8_t   pad[4];
-};
-
 static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dwords) {
 	if (dcb == nullptr) {
 		return false;
@@ -3900,11 +3894,11 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
-	EXIT_NOT_IMPLEMENTED(packet->pad[0] != 0);
 
 	LOGF("\t addr   = 0x%016" PRIx64 "\n"
-	     "\t dw_num = 0x%08" PRIx32 "\n",
-	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num);
+	     "\t dw_num = 0x%08" PRIx32 "\n"
+	     "\t flags  = 0x%02" PRIx8 "\n",
+	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
 	submit_dcb(packet->addr, packet->dw_num);
 
@@ -3933,51 +3927,9 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 		     "\t size[%" PRIu32 "] = 0x%08" PRIx32 "\n",
 		     i, reinterpret_cast<uint64_t>(dcb), i, size_in_dwords);
 
-		if (dcb == nullptr) {
-			continue;
+		if (dcb != nullptr) {
+			submit_dcb(dcb, size_in_dwords);
 		}
-		submit_dcb(dcb, size_in_dwords);
-	}
-
-	return OK;
-}
-
-int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(uint32_t queue, uint32_t* dcb,
-                                                    uint32_t size_in_dwords) {
-	PRINT_NAME();
-
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
-	     "\t dcb   = 0x%016" PRIx64 "\n"
-	     "\t size  = 0x%08" PRIx32 "\n",
-	     queue, reinterpret_cast<uint64_t>(dcb), size_in_dwords);
-
-	if (dcb == nullptr || size_in_dwords == 0) {
-		return OK;
-	}
-
-	submit_dcb(dcb, size_in_dwords);
-
-	return OK;
-}
-
-int KYTY_SYSV_ABI GraphicsDriverSubmitMultiCommandBuffers(uint32_t queue, uint32_t* const* dcbs,
-                                                          const uint32_t* sizes_in_dwords,
-                                                          uint32_t        count) {
-	PRINT_NAME();
-
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
-	     "\t count = %" PRIu32 "\n",
-	     queue, count);
-
-	if (count == 0) {
-		return OK;
-	}
-	if (dcbs == nullptr || sizes_in_dwords == nullptr) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
-	}
-
-	for (uint32_t i = 0; i < count; i++) {
-		GraphicsDriverSubmitCommandBuffer(queue, dcbs[i], sizes_in_dwords[i]);
 	}
 
 	return OK;
@@ -4016,10 +3968,74 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	g_renderer->GetGpu().SubmitCompute(queue, acb, size_in_dwords, trigger_interrupt_on_done);
 }
 
+static uint32_t get_driver_queue(const void* queue_context) {
+	uint32_t queue = 0;
+	std::memcpy(&queue, static_cast<const uint8_t*>(queue_context) + 4, sizeof(queue));
+	return queue;
+}
+
+static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t size_in_dwords) {
+	if (commands == nullptr || size_in_dwords == 0) {
+		return;
+	}
+
+	if (queue >= 0x20 && queue < 0x58) {
+		submit_acb(queue, commands, size_in_dwords);
+	} else {
+		submit_dcb(commands, size_in_dwords);
+	}
+}
+
+int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
+	PRINT_NAME();
+
+	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
+	     "\t packet        = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
+
+	if (queue_context == nullptr || packet == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	const uint32_t queue = get_driver_queue(queue_context);
+	LOGF("\t queue = 0x%08" PRIx32 "\n"
+	     "\t addr  = 0x%016" PRIx64 "\n"
+	     "\t size  = 0x%08" PRIx32 "\n"
+	     "\t flags = 0x%02" PRIx8 "\n",
+	     queue, reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+
+	submit_command_buffer(queue, packet->addr, packet->dw_num);
+	return OK;
+}
+
+int KYTY_SYSV_ABI GraphicsDriverSubmitMultiCommandBuffers(void*            queue_context,
+                                                          uint32_t* const* command_buffers,
+                                                          const uint32_t*  sizes_in_dwords,
+                                                          uint32_t         count) {
+	PRINT_NAME();
+
+	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
+	     "\t count         = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(queue_context), count);
+
+	if (count == 0) {
+		return OK;
+	}
+	if (queue_context == nullptr || command_buffers == nullptr || sizes_in_dwords == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	const uint32_t queue = get_driver_queue(queue_context);
+	for (uint32_t i = 0; i < count; i++) {
+		submit_command_buffer(queue, command_buffers[i], sizes_in_dwords[i]);
+	}
+	return OK;
+}
+
 int KYTY_SYSV_ABI GraphicsDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 	PRINT_NAME();
 
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
+	LOGF("\t queue  = 0x%08" PRIx32 "\n"
 	     "\t packet = 0x%016" PRIx64 "\n",
 	     queue, reinterpret_cast<uint64_t>(packet));
 
@@ -4029,10 +4045,9 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitAcb(uint32_t queue, const Packet* packet) 
 	LOGF("\t acb   = 0x%016" PRIx64 "\n"
 	     "\t size  = 0x%08" PRIx32 "\n"
 	     "\t flags = 0x%02" PRIx8 "\n",
-	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->pad[0]);
+	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
 	submit_acb(queue, packet->addr, packet->dw_num);
-
 	return OK;
 }
 

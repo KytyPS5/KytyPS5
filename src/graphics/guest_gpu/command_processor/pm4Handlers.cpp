@@ -103,6 +103,128 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 
 } // namespace
 
+static HW::BlendControl DecodeBlendControl(uint32_t value) {
+	HW::BlendControl r {};
+
+	r.color_srcblend       = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, COLOR_SRCBLEND);
+	r.color_comb_fcn       = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, COLOR_COMB_FCN);
+	r.color_destblend      = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, COLOR_DESTBLEND);
+	r.alpha_srcblend       = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
+	r.alpha_comb_fcn       = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+	r.alpha_destblend      = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
+	r.separate_alpha_blend = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, SEPARATE_ALPHA_BLEND) != 0;
+	r.enable               = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ENABLE) != 0;
+
+	return r;
+}
+
+static HW::ClipControl DecodeClipControl(uint32_t value) {
+	HW::ClipControl r {};
+
+	r.user_clip_planes          = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, UCP_ENA);
+	r.user_clip_plane_mode      = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, PS_UCP_MODE);
+	r.dx_clip_space             = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, DX_CLIP_SPACE_DEF) != 0;
+	r.vertex_kill_any           = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, VTX_KILL_OR) != 0;
+	r.min_z_clip_disable        = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, ZCLIP_NEAR_DISABLE) != 0;
+	r.max_z_clip_disable        = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, ZCLIP_FAR_DISABLE) != 0;
+	r.user_clip_plane_negate_y  = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, PS_UCP_Y_SCALE_NEG) != 0;
+	r.clip_disable              = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, CLIP_DISABLE) != 0;
+	r.user_clip_plane_cull_only = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, UCP_CULL_ONLY_ENA) != 0;
+	r.cull_on_clipping_error_disable =
+	    KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, DIS_CLIP_ERR_DETECT) != 0;
+	r.linear_attribute_clip_enable =
+	    KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, DX_LINEAR_ATTR_CLIP_ENA) != 0;
+	r.force_viewport_index_from_vs_enable =
+	    KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE) != 0;
+
+	return r;
+}
+
+static HW::ColorControl DecodeColorControl(uint32_t value) {
+	HW::ColorControl r {};
+	r.mode = KYTY_PM4_GET(value, CB_COLOR_CONTROL, MODE);
+	r.op   = KYTY_PM4_GET(value, CB_COLOR_CONTROL, ROP3);
+	return r;
+}
+
+static HW::DepthControl DecodeDepthControl(uint32_t value) {
+	HW::DepthControl r {};
+
+	r.stencil_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
+	r.z_enable            = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_ENABLE) != 0;
+	r.z_write_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
+	r.depth_bounds_enable = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, DEPTH_BOUNDS_ENABLE) != 0;
+	r.zfunc               = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, ZFUNC);
+	r.backface_enable     = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, BACKFACE_ENABLE) != 0;
+	r.stencilfunc         = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCILFUNC);
+	r.stencilfunc_bf      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCILFUNC_BF);
+	r.color_writes_on_depth_fail_enable =
+	    KYTY_PM4_GET(value, DB_DEPTH_CONTROL, ENABLE_COLOR_WRITES_ON_DEPTH_FAIL) != 0;
+	r.color_writes_on_depth_pass_disable =
+	    KYTY_PM4_GET(value, DB_DEPTH_CONTROL, DISABLE_COLOR_WRITES_ON_DEPTH_PASS) != 0;
+
+	return r;
+}
+
+static HW::ModeControl DecodeModeControl(uint32_t value) {
+	HW::ModeControl r {};
+
+	r.cull_front           = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, CULL_FRONT) != 0;
+	r.cull_back            = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, CULL_BACK) != 0;
+	r.face                 = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, FACE) != 0;
+	r.poly_mode            = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLY_MODE);
+	r.polymode_front_ptype = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLYMODE_FRONT_PTYPE);
+	r.polymode_back_ptype  = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLYMODE_BACK_PTYPE);
+	r.poly_offset_front_enable =
+	    KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLY_OFFSET_FRONT_ENABLE) != 0;
+	r.poly_offset_back_enable =
+	    KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLY_OFFSET_BACK_ENABLE) != 0;
+	r.vtx_window_offset_enable =
+	    KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, VTX_WINDOW_OFFSET_ENABLE) != 0;
+	r.provoking_vtx_last = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, PROVOKING_VTX_LAST) != 0;
+	r.persp_corr_dis     = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, PERSP_CORR_DIS) != 0;
+
+	return r;
+}
+
+static HW::RenderControl DecodeRenderControl(uint32_t value) {
+	HW::RenderControl r {};
+
+	r.depth_clear_enable   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_CLEAR_ENABLE) != 0;
+	r.stencil_clear_enable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_CLEAR_ENABLE) != 0;
+	r.resummarize_enable   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, RESUMMARIZE_ENABLE) != 0;
+	r.stencil_compress_disable =
+	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
+	r.depth_compress_disable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
+	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
+	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
+
+	return r;
+}
+
+static HW::ScanModeControl DecodeScanModeControl(uint32_t value) {
+	HW::ScanModeControl r {};
+
+	r.msaa_enable          = KYTY_PM4_GET(value, PA_SC_MODE_CNTL_0, MSAA_ENABLE) != 0;
+	r.vport_scissor_enable = KYTY_PM4_GET(value, PA_SC_MODE_CNTL_0, VPORT_SCISSOR_ENABLE) != 0;
+	r.line_stipple_enable  = KYTY_PM4_GET(value, PA_SC_MODE_CNTL_0, LINE_STIPPLE_ENABLE) != 0;
+
+	return r;
+}
+
+static HW::StencilControl DecodeStencilControl(uint32_t value) {
+	HW::StencilControl r {};
+
+	r.stencil_fail     = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILFAIL);
+	r.stencil_zpass    = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZPASS);
+	r.stencil_zfail    = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZFAIL);
+	r.stencil_fail_bf  = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILFAIL_BF);
+	r.stencil_zpass_bf = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZPASS_BF);
+	r.stencil_zfail_bf = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZFAIL_BF);
+
+	return r;
+}
+
 static HW::AaConfig ParseAaConfig(uint32_t value) {
 	HW::AaConfig r;
 
@@ -429,26 +551,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetBlendControl) {
 
 	uint32_t param = (cmd_offset - Pm4::CB_BLEND0_CONTROL) / 1;
 
-	HW::BlendControl r;
-
-	r.color_srcblend       = (buffer[0] >> Pm4::CB_BLEND0_CONTROL_COLOR_SRCBLEND_SHIFT) &
-	                         Pm4::CB_BLEND0_CONTROL_COLOR_SRCBLEND_MASK;
-	r.color_comb_fcn       = (buffer[0] >> Pm4::CB_BLEND0_CONTROL_COLOR_COMB_FCN_SHIFT) &
-	                         Pm4::CB_BLEND0_CONTROL_COLOR_COMB_FCN_MASK;
-	r.color_destblend      = (buffer[0] >> Pm4::CB_BLEND0_CONTROL_COLOR_DESTBLEND_SHIFT) &
-	                         Pm4::CB_BLEND0_CONTROL_COLOR_DESTBLEND_MASK;
-	r.alpha_srcblend       = (buffer[0] >> Pm4::CB_BLEND0_CONTROL_ALPHA_SRCBLEND_SHIFT) &
-	                         Pm4::CB_BLEND0_CONTROL_ALPHA_SRCBLEND_MASK;
-	r.alpha_comb_fcn       = (buffer[0] >> Pm4::CB_BLEND0_CONTROL_ALPHA_COMB_FCN_SHIFT) &
-	                         Pm4::CB_BLEND0_CONTROL_ALPHA_COMB_FCN_MASK;
-	r.alpha_destblend      = (buffer[0] >> Pm4::CB_BLEND0_CONTROL_ALPHA_DESTBLEND_SHIFT) &
-	                         Pm4::CB_BLEND0_CONTROL_ALPHA_DESTBLEND_MASK;
-	r.separate_alpha_blend = ((buffer[0] >> Pm4::CB_BLEND0_CONTROL_SEPARATE_ALPHA_BLEND_SHIFT) &
-	                          Pm4::CB_BLEND0_CONTROL_SEPARATE_ALPHA_BLEND_MASK) != 0;
-	r.enable               = ((buffer[0] >> Pm4::CB_BLEND0_CONTROL_ENABLE_SHIFT) &
-	                          Pm4::CB_BLEND0_CONTROL_ENABLE_MASK) != 0;
-
-	cp.GetCtx().SetBlendControl(param, r);
+	cp.GetCtx().SetBlendControl(param, DecodeBlendControl(buffer[0]));
 
 	return 1;
 }
@@ -457,38 +560,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetClipControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_CL_CLIP_CNTL);
 
-	HW::ClipControl r;
-
-	//	r.user_clip_planes                    = buffer[0] & 0x3fu;
-	//	r.user_clip_plane_mode                = (buffer[0] >> 14u) & 0x3u;
-	//	r.clip_space                          = (buffer[0] >> 19u) & 0x1u;
-	//	r.vertex_kill_mode                    = (buffer[0] >> 21u) & 0x1u;
-	//	r.min_z_clip_enable                   = (buffer[0] >> 26u) & 0x1u;
-	//	r.max_z_clip_enable                   = (buffer[0] >> 27u) & 0x1u;
-	//	r.user_clip_plane_negate_y            = (buffer[0] & 0x00002000u) != 0;
-	//	r.clip_enable                         = (buffer[0] & 0x00010000u) != 0;
-	//	r.user_clip_plane_cull_only           = (buffer[0] & 0x00020000u) != 0;
-	//	r.cull_on_clipping_error_disable      = (buffer[0] & 0x00100000u) != 0;
-	//	r.linear_attribute_clip_enable        = (buffer[0] & 0x01000000u) != 0;
-	//	r.force_viewport_index_from_vs_enable = (buffer[0] & 0x02000000u) != 0;
-
-	r.user_clip_planes          = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, UCP_ENA);
-	r.user_clip_plane_mode      = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, PS_UCP_MODE);
-	r.dx_clip_space             = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, DX_CLIP_SPACE_DEF) != 0;
-	r.vertex_kill_any           = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, VTX_KILL_OR) != 0;
-	r.min_z_clip_disable        = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, ZCLIP_NEAR_DISABLE) != 0;
-	r.max_z_clip_disable        = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, ZCLIP_FAR_DISABLE) != 0;
-	r.user_clip_plane_negate_y  = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, PS_UCP_Y_SCALE_NEG) != 0;
-	r.clip_disable              = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, CLIP_DISABLE) != 0;
-	r.user_clip_plane_cull_only = KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, UCP_CULL_ONLY_ENA) != 0;
-	r.cull_on_clipping_error_disable =
-	    KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, DIS_CLIP_ERR_DETECT) != 0;
-	r.linear_attribute_clip_enable =
-	    KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, DX_LINEAR_ATTR_CLIP_ENA) != 0;
-	r.force_viewport_index_from_vs_enable =
-	    KYTY_PM4_GET(buffer[0], PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE) != 0;
-
-	cp.GetCtx().SetClipControl(r);
+	cp.GetCtx().SetClipControl(DecodeClipControl(buffer[0]));
 
 	return 1;
 }
@@ -497,12 +569,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetColorControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::CB_COLOR_CONTROL);
 
-	HW::ColorControl r;
-
-	r.mode = KYTY_PM4_GET(buffer[0], CB_COLOR_CONTROL, MODE);
-	r.op   = KYTY_PM4_GET(buffer[0], CB_COLOR_CONTROL, ROP3);
-
-	cp.GetCtx().SetColorControl(r);
+	cp.GetCtx().SetColorControl(DecodeColorControl(buffer[0]));
 
 	return 1;
 }
@@ -563,22 +630,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_DEPTH_CONTROL);
 
-	HW::DepthControl r;
-
-	r.stencil_enable      = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
-	r.z_enable            = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, Z_ENABLE) != 0;
-	r.z_write_enable      = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
-	r.depth_bounds_enable = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, DEPTH_BOUNDS_ENABLE) != 0;
-	r.zfunc               = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, ZFUNC);
-	r.backface_enable     = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, BACKFACE_ENABLE) != 0;
-	r.stencilfunc         = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, STENCILFUNC);
-	r.stencilfunc_bf      = KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, STENCILFUNC_BF);
-	r.color_writes_on_depth_fail_enable =
-	    KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, ENABLE_COLOR_WRITES_ON_DEPTH_FAIL) != 0;
-	r.color_writes_on_depth_pass_disable =
-	    KYTY_PM4_GET(buffer[0], DB_DEPTH_CONTROL, DISABLE_COLOR_WRITES_ON_DEPTH_PASS) != 0;
-
-	cp.GetCtx().SetDepthControl(r);
+	cp.GetCtx().SetDepthControl(DecodeDepthControl(buffer[0]));
 
 	return 1;
 }
@@ -882,24 +934,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetModeControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SU_SC_MODE_CNTL);
 
-	HW::ModeControl r;
-
-	r.cull_front           = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, CULL_FRONT) != 0;
-	r.cull_back            = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, CULL_BACK) != 0;
-	r.face                 = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, FACE) != 0;
-	r.poly_mode            = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, POLY_MODE);
-	r.polymode_front_ptype = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, POLYMODE_FRONT_PTYPE);
-	r.polymode_back_ptype  = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, POLYMODE_BACK_PTYPE);
-	r.poly_offset_front_enable =
-	    KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, POLY_OFFSET_FRONT_ENABLE) != 0;
-	r.poly_offset_back_enable =
-	    KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, POLY_OFFSET_BACK_ENABLE) != 0;
-	r.vtx_window_offset_enable =
-	    KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, VTX_WINDOW_OFFSET_ENABLE) != 0;
-	r.provoking_vtx_last = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, PROVOKING_VTX_LAST) != 0;
-	r.persp_corr_dis     = KYTY_PM4_GET(buffer[0], PA_SU_SC_MODE_CNTL, PERSP_CORR_DIS) != 0;
-
-	cp.GetCtx().SetModeControl(r);
+	cp.GetCtx().SetModeControl(DecodeModeControl(buffer[0]));
 
 	return 1;
 }
@@ -965,19 +1000,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetRenderControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_RENDER_CONTROL);
 
-	HW::RenderControl r;
-
-	r.depth_clear_enable   = KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, DEPTH_CLEAR_ENABLE) != 0;
-	r.stencil_clear_enable = KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, STENCIL_CLEAR_ENABLE) != 0;
-	r.resummarize_enable   = KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, RESUMMARIZE_ENABLE) != 0;
-	r.stencil_compress_disable =
-	    KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
-	r.depth_compress_disable =
-	    KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
-	r.copy_centroid = KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, COPY_CENTROID) != 0;
-	r.copy_sample   = KYTY_PM4_GET(buffer[0], DB_RENDER_CONTROL, COPY_SAMPLE);
-
-	cp.GetCtx().SetRenderControl(r);
+	cp.GetCtx().SetRenderControl(DecodeRenderControl(buffer[0]));
 
 	return 1;
 }
@@ -1170,13 +1193,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetScanModeControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SC_MODE_CNTL_0);
 
-	HW::ScanModeControl r;
-
-	r.msaa_enable          = KYTY_PM4_GET(buffer[0], PA_SC_MODE_CNTL_0, MSAA_ENABLE) != 0;
-	r.vport_scissor_enable = KYTY_PM4_GET(buffer[0], PA_SC_MODE_CNTL_0, VPORT_SCISSOR_ENABLE) != 0;
-	r.line_stipple_enable  = KYTY_PM4_GET(buffer[0], PA_SC_MODE_CNTL_0, LINE_STIPPLE_ENABLE) != 0;
-
-	cp.GetCtx().SetScanModeControl(r);
+	cp.GetCtx().SetScanModeControl(DecodeScanModeControl(buffer[0]));
 
 	return 1;
 }
@@ -1216,16 +1233,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetStencilControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_STENCIL_CONTROL);
 
-	HW::StencilControl r;
-
-	r.stencil_fail     = KYTY_PM4_GET(buffer[0], DB_STENCIL_CONTROL, STENCILFAIL);
-	r.stencil_zpass    = KYTY_PM4_GET(buffer[0], DB_STENCIL_CONTROL, STENCILZPASS);
-	r.stencil_zfail    = KYTY_PM4_GET(buffer[0], DB_STENCIL_CONTROL, STENCILZFAIL);
-	r.stencil_fail_bf  = KYTY_PM4_GET(buffer[0], DB_STENCIL_CONTROL, STENCILFAIL_BF);
-	r.stencil_zpass_bf = KYTY_PM4_GET(buffer[0], DB_STENCIL_CONTROL, STENCILZPASS_BF);
-	r.stencil_zfail_bf = KYTY_PM4_GET(buffer[0], DB_STENCIL_CONTROL, STENCILZFAIL_BF);
-
-	cp.GetCtx().SetStencilControl(r);
+	cp.GetCtx().SetStencilControl(DecodeStencilControl(buffer[0]));
 
 	return 1;
 }
@@ -3705,39 +3713,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		g_hw_ctx_indirect_func[Pm4::CB_BLEND0_CONTROL + slot] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			uint32_t param = cmd_offset - Pm4::CB_BLEND0_CONTROL;
-
-			HW::BlendControl r;
-			r.color_srcblend  = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, COLOR_SRCBLEND);
-			r.color_comb_fcn  = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, COLOR_COMB_FCN);
-			r.color_destblend = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, COLOR_DESTBLEND);
-			r.alpha_srcblend  = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
-			r.alpha_comb_fcn  = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
-			r.alpha_destblend = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
-			r.separate_alpha_blend =
-			    KYTY_PM4_GET(value, CB_BLEND0_CONTROL, SEPARATE_ALPHA_BLEND) != 0;
-			r.enable = KYTY_PM4_GET(value, CB_BLEND0_CONTROL, ENABLE) != 0;
-
-			cp.GetCtx().SetBlendControl(param, r);
+			cp.GetCtx().SetBlendControl(param, DecodeBlendControl(value));
 		};
 	}
 
 	g_hw_ctx_indirect_func[Pm4::PA_SU_SC_MODE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::ModeControl r;
-		r.cull_front           = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, CULL_FRONT) != 0;
-		r.cull_back            = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, CULL_BACK) != 0;
-		r.face                 = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, FACE) != 0;
-		r.poly_mode            = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLY_MODE);
-		r.polymode_front_ptype = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLYMODE_FRONT_PTYPE);
-		r.polymode_back_ptype  = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLYMODE_BACK_PTYPE);
-		r.poly_offset_front_enable =
-		    KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLY_OFFSET_FRONT_ENABLE) != 0;
-		r.poly_offset_back_enable =
-		    KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, POLY_OFFSET_BACK_ENABLE) != 0;
-		r.vtx_window_offset_enable =
-		    KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, VTX_WINDOW_OFFSET_ENABLE) != 0;
-		r.provoking_vtx_last = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, PROVOKING_VTX_LAST) != 0;
-		r.persp_corr_dis     = KYTY_PM4_GET(value, PA_SU_SC_MODE_CNTL, PERSP_CORR_DIS) != 0;
-		cp.GetCtx().SetModeControl(r);
+		cp.GetCtx().SetModeControl(DecodeModeControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3905,28 +3886,11 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_STENCIL_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::StencilControl r;
-		r.stencil_fail     = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILFAIL);
-		r.stencil_zpass    = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZPASS);
-		r.stencil_zfail    = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZFAIL);
-		r.stencil_fail_bf  = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILFAIL_BF);
-		r.stencil_zpass_bf = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZPASS_BF);
-		r.stencil_zfail_bf = KYTY_PM4_GET(value, DB_STENCIL_CONTROL, STENCILZFAIL_BF);
-		cp.GetCtx().SetStencilControl(r);
+		cp.GetCtx().SetStencilControl(DecodeStencilControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_RENDER_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::RenderControl r;
-		r.depth_clear_enable   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_CLEAR_ENABLE) != 0;
-		r.stencil_clear_enable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_CLEAR_ENABLE) != 0;
-		r.resummarize_enable   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, RESUMMARIZE_ENABLE) != 0;
-		r.stencil_compress_disable =
-		    KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
-		r.depth_compress_disable =
-		    KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
-		r.copy_centroid = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
-		r.copy_sample   = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
-		cp.GetCtx().SetRenderControl(r);
+		cp.GetCtx().SetRenderControl(DecodeRenderControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_STENCILREFMASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3948,23 +3912,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_CL_CLIP_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::ClipControl r;
-		r.user_clip_planes          = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, UCP_ENA);
-		r.user_clip_plane_mode      = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, PS_UCP_MODE);
-		r.dx_clip_space             = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, DX_CLIP_SPACE_DEF) != 0;
-		r.vertex_kill_any           = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, VTX_KILL_OR) != 0;
-		r.min_z_clip_disable        = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, ZCLIP_NEAR_DISABLE) != 0;
-		r.max_z_clip_disable        = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, ZCLIP_FAR_DISABLE) != 0;
-		r.user_clip_plane_negate_y  = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, PS_UCP_Y_SCALE_NEG) != 0;
-		r.clip_disable              = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, CLIP_DISABLE) != 0;
-		r.user_clip_plane_cull_only = KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, UCP_CULL_ONLY_ENA) != 0;
-		r.cull_on_clipping_error_disable =
-		    KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, DIS_CLIP_ERR_DETECT) != 0;
-		r.linear_attribute_clip_enable =
-		    KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, DX_LINEAR_ATTR_CLIP_ENA) != 0;
-		r.force_viewport_index_from_vs_enable =
-		    KYTY_PM4_GET(value, PA_CL_CLIP_CNTL, VTE_VPORT_PROVOKE_DISABLE) != 0;
-		cp.GetCtx().SetClipControl(r);
+		cp.GetCtx().SetClipControl(DecodeClipControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SU_LINE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3992,11 +3940,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_MODE_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::ScanModeControl r;
-		r.msaa_enable          = KYTY_PM4_GET(value, PA_SC_MODE_CNTL_0, MSAA_ENABLE) != 0;
-		r.vport_scissor_enable = KYTY_PM4_GET(value, PA_SC_MODE_CNTL_0, VPORT_SCISSOR_ENABLE) != 0;
-		r.line_stipple_enable  = KYTY_PM4_GET(value, PA_SC_MODE_CNTL_0, LINE_STIPPLE_ENABLE) != 0;
-		cp.GetCtx().SetScanModeControl(r);
+		cp.GetCtx().SetScanModeControl(DecodeScanModeControl(value));
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_MODE_CNTL_1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreScanModeControl1(value);
@@ -4055,27 +3999,11 @@ void GraphicsInitJmpTablesCxIndirect() {
 		HwCtxIgnoreAlphaToMaskRegister(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::CB_COLOR_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::ColorControl r;
-		r.mode = KYTY_PM4_GET(value, CB_COLOR_CONTROL, MODE);
-		r.op   = KYTY_PM4_GET(value, CB_COLOR_CONTROL, ROP3);
-		cp.GetCtx().SetColorControl(r);
+		cp.GetCtx().SetColorControl(DecodeColorControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HW::DepthControl r;
-		r.stencil_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
-		r.z_enable            = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_ENABLE) != 0;
-		r.z_write_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
-		r.depth_bounds_enable = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, DEPTH_BOUNDS_ENABLE) != 0;
-		r.zfunc               = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, ZFUNC);
-		r.backface_enable     = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, BACKFACE_ENABLE) != 0;
-		r.stencilfunc         = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCILFUNC);
-		r.stencilfunc_bf      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCILFUNC_BF);
-		r.color_writes_on_depth_fail_enable =
-		    KYTY_PM4_GET(value, DB_DEPTH_CONTROL, ENABLE_COLOR_WRITES_ON_DEPTH_FAIL) != 0;
-		r.color_writes_on_depth_pass_disable =
-		    KYTY_PM4_GET(value, DB_DEPTH_CONTROL, DISABLE_COLOR_WRITES_ON_DEPTH_PASS) != 0;
-		cp.GetCtx().SetDepthControl(r);
+		cp.GetCtx().SetDepthControl(DecodeDepthControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_EQAA] = [](KYTY_HW_CTX_INDIRECT_ARGS) {

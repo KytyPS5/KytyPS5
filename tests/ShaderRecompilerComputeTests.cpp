@@ -16763,6 +16763,21 @@ void CheckSampledDepthDescriptor(RenderContext& renderer) {
 	            IsSupportedDepthTargetDescriptor(descriptor, image),
 	        "normalized depth image rejected a valid padded descriptor");
 
+	const ShaderTextureResource disabled_sampler_tweaks {{
+	    0x05135600u,
+	    0xc1600000u,
+	    0x010dc1dfu,
+	    0x91800924u,
+	    0x00000000u,
+	    0x00000000u,
+	    0x00000000u,
+	    0x00000000u,
+	}};
+	Require("SampledDepthDescriptor", "disabled sampler tweaks",
+	        disabled_sampler_tweaks.PerfMod5() == 0 &&
+	            IsSupportedDepthTextureEncoding(disabled_sampler_tweaks, image),
+	        "valid sampler modulation factor zero was rejected");
+
 	const ShaderTextureResource uncompressed_msaa {{
 	    0x00705d00u,
 	    0xc1600000u,
@@ -17222,6 +17237,21 @@ void CheckBasicStorageTextureDescriptor() {
 	}
 	Require("BasicStorageTexture", "all write swizzles", valid_storage_swizzles == 1296,
 	        "valid write-only storage image mappings were rejected");
+
+	const ShaderTextureResource cube {{0x025bca00u, 0xc4700000u, 0x003fc03fu, 0xb1b00facu,
+	                                     0x00000005u, 0x00700080u, 0x00000000u, 0x00000000u}};
+	auto                        cube_resource = BasicArrayStorageTextureResource();
+	cube_resource.cube                        = true;
+	Require("BasicStorageTexture", "PPSA07429 cube descriptor",
+	        cube.Base40() == 0x25bca0000ull && cube.Width5() + 1u == 256 &&
+	            cube.Height5() + 1u == 256 && cube.Depth() + 1u == 6 &&
+	            cube.BaseArray5() == 0 && cube.MaxMip() == 8 &&
+	            cube.Type() == Prospero::ImageType::kCube &&
+	            cube.Format() == Prospero::BufferFormat::k16_16_16_16Float &&
+	            cube.TileMode() == Prospero::TileMode::kRenderTarget &&
+	            cube.DstSelXYZW() == DstSel(4, 5, 6, 7),
+	        "PPSA07429 cube storage descriptor fixture is malformed");
+	ValidateStorageTexture(cube_resource, cube, 0x420000);
 
 	const auto array = BasicArrayStorageTextureDescriptor();
 	Require("BasicStorageTexture", "2D-array descriptor",

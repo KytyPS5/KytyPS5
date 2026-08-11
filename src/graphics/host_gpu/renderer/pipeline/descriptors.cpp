@@ -282,13 +282,13 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
-	const uint32_t     field5_expected =
-	    0x00700000u | (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
-	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
-	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	                    descriptor.fields[3] == field3_expected &&
-	                    descriptor.fields[4] == field4_expected &&
-	                    descriptor.fields[5] == field5_expected;
+	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
+	const bool         common          = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
+	                                     (descriptor.fields[2] & field2_reserved_mask) == 0 &&
+	                                     descriptor.fields[3] == field3_expected &&
+	                                     descriptor.fields[4] == field4_expected &&
+	                                     descriptor.fields[5] == field5_expected;
 	if (!common || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0)) {
 		return false;
 	}
@@ -362,9 +362,14 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    (is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth());
 	const bool is_2d =
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D && valid_2d_slice;
+	const bool is_cube = resource.cube && descriptor.Type() == Prospero::ImageType::kCube &&
+	                     descriptor.Width5() == descriptor.Height5() &&
+	                     descriptor.BaseArray5() <= descriptor.Depth() &&
+	                     (descriptor.Depth() - descriptor.BaseArray5() + 1u) % 6u == 0;
 	const bool is_2d_array =
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
-	    is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth();
+	    ((!resource.cube && is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth()) ||
+	     is_cube);
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::ImageType::kColor3D &&
 	                   descriptor.BaseArray5() == 0;

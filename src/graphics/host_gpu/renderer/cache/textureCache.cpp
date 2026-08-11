@@ -701,7 +701,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
 	bool       recreate      = cached.info.resources < requested.resources;
 	switch (binding) {
-		case BindingType::Texture: recreate |= requested.IsDepth() && !cached.info.IsDepth(); break;
+		case BindingType::Texture:
+			recreate |= requested.IsDepth() && !cached.info.IsDepth();
+			if (!requested.IsDepth() && cached.info.IsDepth() &&
+			    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.guest_format,
+			                                   requested.pixel_format)) {
+				return {};
+			}
+			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
 		case BindingType::DepthTarget:

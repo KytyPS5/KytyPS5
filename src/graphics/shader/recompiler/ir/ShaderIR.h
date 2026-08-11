@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
@@ -276,17 +277,17 @@ struct SrtPlan {
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 
-	uint32_t source            = 0;
-	uint32_t first_use_pc      = 0;
-	uint32_t max_byte_extent   = 0;
-	uint32_t packed_stride     = 0;
-	uint32_t descriptor_format = 0;
-	uint32_t image_alias       = NoImageAlias;
-	bool     read              = false;
-	bool     written           = false;
-	bool     atomic            = false;
-	bool     formatted         = false;
-	bool     scalar            = false;
+	uint32_t               source            = 0;
+	uint32_t               first_use_pc      = 0;
+	uint32_t               max_byte_extent   = 0;
+	uint32_t               packed_stride     = 0;
+	Prospero::BufferFormat descriptor_format = Prospero::BufferFormat::kInvalid;
+	uint32_t               image_alias       = NoImageAlias;
+	bool                   read              = false;
+	bool                   written           = false;
+	bool                   atomic            = false;
+	bool                   formatted         = false;
+	bool                   scalar            = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };

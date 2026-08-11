@@ -64,26 +64,26 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 	}
 
 	switch (state.vertex_input_info->resources[location].Format()) {
-		case 5:
-		case 11:
-		case 18:
-		case 20:
-		case 27:
-		case 60:
-		case 62:
-		case 69:
-		case 72:
-		case 75: return VertexInputScalarKind::Uint;
-		case 6:
-		case 12:
-		case 19:
-		case 21:
-		case 28:
-		case 61:
-		case 63:
-		case 70:
-		case 73:
-		case 76: return VertexInputScalarKind::Sint;
+		case Prospero::BufferFormat::k8UInt:
+		case Prospero::BufferFormat::k16UInt:
+		case Prospero::BufferFormat::k8_8UInt:
+		case Prospero::BufferFormat::k32UInt:
+		case Prospero::BufferFormat::k16_16UInt:
+		case Prospero::BufferFormat::k8_8_8_8UInt:
+		case Prospero::BufferFormat::k32_32UInt:
+		case Prospero::BufferFormat::k16_16_16_16UInt:
+		case Prospero::BufferFormat::k32_32_32UInt:
+		case Prospero::BufferFormat::k32_32_32_32UInt: return VertexInputScalarKind::Uint;
+		case Prospero::BufferFormat::k8SInt:
+		case Prospero::BufferFormat::k16SInt:
+		case Prospero::BufferFormat::k8_8SInt:
+		case Prospero::BufferFormat::k32SInt:
+		case Prospero::BufferFormat::k16_16SInt:
+		case Prospero::BufferFormat::k8_8_8_8SInt:
+		case Prospero::BufferFormat::k32_32SInt:
+		case Prospero::BufferFormat::k16_16_16_16SInt:
+		case Prospero::BufferFormat::k32_32_32SInt:
+		case Prospero::BufferFormat::k32_32_32_32SInt: return VertexInputScalarKind::Sint;
 		default: return VertexInputScalarKind::Float;
 	}
 }

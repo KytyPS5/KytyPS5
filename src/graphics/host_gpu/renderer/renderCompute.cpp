@@ -93,7 +93,7 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
 	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
 	    resource.scalar || resource.max_byte_extent != 16 || descriptor.Stride() != 16 ||
-	    descriptor.Format() != Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32UInt) ||
+	    descriptor.Format() != Prospero::BufferFormat::k32_32_32_32UInt ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
 	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
 	    program.user_data_base != 0 || resources.user_data.size() != 8) {
@@ -246,7 +246,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 			LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
 			     " stride=%u records=%u format=%u\n",
 			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
-			     r.Stride(), r.NumRecords(), r.Format());
+			     r.Stride(), r.NumRecords(), r.RawFormat());
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			const auto& image = program.info.images[i];
@@ -258,13 +258,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 			      image.kind == ShaderRecompiler::IR::ResourceKind::ImageUint)
 			         ? "true"
 			         : "false",
-			     r.Base40(), static_cast<uint32_t>(r.Type()), r.Format(),
+			     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
 			     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
 			     static_cast<uint32_t>(r.Depth()) + 1u,
 			     std::max<uint32_t>(static_cast<uint32_t>(r.LastLevel()),
 			                        static_cast<uint32_t>(r.MaxMip())) +
 			         1u,
-			     r.TileMode());
+			     static_cast<uint32_t>(r.TileMode()));
 		}
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i]);

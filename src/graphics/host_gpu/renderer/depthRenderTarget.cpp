@@ -67,9 +67,8 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 }
 
 static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
-	return fail == Prospero::GpuEnumValue(Prospero::StencilOp::kReplaceOp) ||
-	       pass == Prospero::GpuEnumValue(Prospero::StencilOp::kReplaceOp) ||
-	       depth_fail == Prospero::GpuEnumValue(Prospero::StencilOp::kReplaceOp);
+	constexpr auto replace_op = static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
+	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
 }
 
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const RenderCommandBuffer& buffer,
@@ -103,15 +102,14 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
                                               RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
 	(void)submit_id;
-	const auto& hw = buffer.GetRegisters();
-	const auto& z  = hw.GetDepthRenderTarget();
-	const auto& rc = hw.GetRenderControl();
-	const auto& dc = hw.GetDepthControl();
-	const auto& sc = hw.GetStencilControl();
-	const auto& sm = hw.GetStencilMask();
-	const bool  has_stencil =
-	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
-	const bool depth_active =
+	const auto& hw          = buffer.GetRegisters();
+	const auto& z           = hw.GetDepthRenderTarget();
+	const auto& rc          = hw.GetRenderControl();
+	const auto& dc          = hw.GetDepthControl();
+	const auto& sc          = hw.GetStencilControl();
+	const auto& sm          = hw.GetStencilMask();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const bool  depth_active =
 	    dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || rc.depth_clear_enable;
 	const bool stencil_active = has_stencil && (dc.stencil_enable || rc.stencil_clear_enable);
 	if (!depth_active && !stencil_active) {
@@ -122,9 +120,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		DepthFatal("invalid PS5 depth texture-compatibility encoding");
 	}
 	const bool attachment_unbound =
-	    z.z_info.format == Prospero::GpuEnumValue(Prospero::DepthFormat::kInvalid) &&
-	    z.stencil_info.format == Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid) &&
-	    z.z_info.num_samples == 0 &&
+	    z.z_info.format == Prospero::DepthFormat::kInvalid &&
+	    z.stencil_info.format == Prospero::StencilFormat::kInvalid && z.z_info.num_samples == 0 &&
 	    z.z_info.texture_compatibility == Prospero::TextureCompatiblePlaneCompression::kDisable &&
 	    !z.z_info.expclear_enabled && !z.z_info.partially_resident && z.z_info.max_mip_level == 0 &&
 	    z.stencil_info.texture_compatibility == Prospero::TextureCompatibleStencil::kDisable &&
@@ -186,8 +183,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		DepthFatal("unsupported depth register state");
 	}
 	if (has_stencil) {
-		if (z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt) ||
-		    !htile_stencil_compat || z.stencil_read_base_addr == 0 ||
+		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
+		    z.stencil_read_base_addr == 0 ||
 		    z.stencil_write_base_addr != z.stencil_read_base_addr ||
 		    (z.stencil_read_base_addr & 0xffffu) != 0 || z.depth_view.stencil_write_disable) {
 			DepthFatal("unsupported stencil attachment state");
@@ -229,7 +226,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		DepthFatal("no host depth/stencil format supports required usage for %s",
 		           VulkanToString(ideal_format).c_str());
 	}
-	const uint32_t guest_format = Prospero::GpuEnumValue(policy->guest_format);
+	const auto     guest_format = policy->guest_format;
 	const uint32_t bytes        = policy->bytes_per_element;
 	const auto     pitch        = TileGetDepthPitch(width, bytes, z.z_info.num_samples);
 	if (z.pitch_height_valid && ((static_cast<uint64_t>(z.pitch_div8_minus1) + 1u) * 8u != pitch ||
@@ -343,7 +340,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	desc.info.pitch           = pitch;
 	desc.info.bytes_per_block = bytes;
 	desc.info.samples         = samples;
-	desc.info.tile_mode       = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+	desc.info.tile_mode       = Prospero::TileMode::kDepth;
 	desc.info.mip_layout[0]   = {0, r.depth_buffer_size, pitch, height};
 	desc.info.metadata.range  = {r.htile_buffer_vaddr, r.htile_buffer_size};
 	desc.info.metadata.kind   = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;

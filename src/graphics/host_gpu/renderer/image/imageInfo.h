@@ -67,14 +67,14 @@ struct ImageInfo {
 	ImageMetadataInfo            metadata;
 	uint32_t                     htile_clear_mask = UINT32_MAX;
 	vk::Format                   pixel_format     = vk::Format::eUndefined;
-	uint32_t                     guest_format     = 0;
+	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;
 	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
 	vk::Extent3D                 extent           = {1, 1, 1};
 	ImageSubresources            resources;
 	uint32_t                     pitch           = 0;
 	uint32_t                     bytes_per_block = 0;
 	uint32_t                     samples         = 1;
-	uint32_t                     tile_mode       = 0;
+	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
@@ -86,9 +86,7 @@ struct ImageInfo {
 	[[nodiscard]] bool IsBlock() const noexcept {
 		return Prospero::BlockCompressedBytesPerBlock(guest_format) != 0;
 	}
-	[[nodiscard]] bool IsTiled() const noexcept {
-		return tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	}
+	[[nodiscard]] bool IsTiled() const noexcept { return tile_mode != Prospero::TileMode::kLinear; }
 	[[nodiscard]] constexpr bool IsVolume() const noexcept {
 		return type == Prospero::ImageType::kColor3D;
 	}
@@ -235,9 +233,9 @@ inline constexpr std::array<DepthFormatPolicy, 2> DEPTH_FORMAT_POLICIES {{
 }};
 
 [[nodiscard]] inline constexpr const DepthFormatPolicy*
-FindDepthFormatPolicy(uint32_t depth_format) noexcept {
+FindDepthFormatPolicy(Prospero::DepthFormat depth_format) noexcept {
 	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
-		if (Prospero::GpuEnumValue(policy.depth_format) == depth_format) {
+		if (policy.depth_format == depth_format) {
 			return &policy;
 		}
 	}
@@ -245,9 +243,9 @@ FindDepthFormatPolicy(uint32_t depth_format) noexcept {
 }
 
 [[nodiscard]] inline constexpr const DepthFormatPolicy*
-FindGuestDepthFormatPolicy(uint32_t guest_format) noexcept {
+FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
-		if (Prospero::GpuEnumValue(policy.guest_format) == guest_format) {
+		if (policy.guest_format == guest_format) {
 			return &policy;
 		}
 	}
@@ -269,10 +267,11 @@ FindGuestDepthFormatPolicy(uint32_t guest_format) noexcept {
 	return has_stencil ? policy.stencil_attachment_formats.front() : policy.depth_attachment_format;
 }
 
-[[nodiscard]] inline constexpr vk::Format DepthAttachmentFormat(uint32_t depth_format,
-                                                                uint32_t stencil_format) noexcept {
+[[nodiscard]] inline constexpr vk::Format
+DepthAttachmentFormat(Prospero::DepthFormat   depth_format,
+                      Prospero::StencilFormat stencil_format) noexcept {
 	bool has_stencil = false;
-	switch (static_cast<Prospero::StencilFormat>(stencil_format)) {
+	switch (stencil_format) {
 		case Prospero::StencilFormat::kInvalid: break;
 		case Prospero::StencilFormat::k8UInt: has_stencil = true; break;
 		default: return vk::Format::eUndefined;
@@ -318,9 +317,9 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
 }
 
-[[nodiscard]] inline constexpr bool IsSupportedSampledDepthFormat(vk::Format image_format,
-                                                                  uint32_t   guest_format,
-                                                                  vk::Format view_format) noexcept {
+[[nodiscard]] inline constexpr bool
+IsSupportedSampledDepthFormat(vk::Format image_format, Prospero::BufferFormat guest_format,
+                              vk::Format view_format) noexcept {
 	const auto* policy = FindGuestDepthFormatPolicy(guest_format);
 	return policy != nullptr && view_format == policy->sampled_view_format &&
 	       (image_format == policy->depth_attachment_format ||
@@ -330,8 +329,7 @@ inline bool ImageInfo::IsDepth() const noexcept {
 [[nodiscard]] inline constexpr bool IsSupportedSampledDepthFormat(vk::Format image_format,
                                                                   vk::Format view_format) noexcept {
 	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
-		if (IsSupportedSampledDepthFormat(image_format, Prospero::GpuEnumValue(policy.guest_format),
-		                                  view_format)) {
+		if (IsSupportedSampledDepthFormat(image_format, policy.guest_format, view_format)) {
 			return true;
 		}
 	}
@@ -383,10 +381,10 @@ CanUseVideoOutNativeWithoutUpload(VideoOutCompression compression, bool render_t
 }
 
 struct VideoOutPixelFormatInfo {
-	vk::Format format            = vk::Format::eUndefined;
-	uint32_t   guest_format      = 0;
-	uint32_t   bytes_per_element = 0;
-	bool       bgra16            = false;
+	vk::Format             format            = vk::Format::eUndefined;
+	Prospero::BufferFormat guest_format      = Prospero::BufferFormat::kInvalid;
+	uint32_t               bytes_per_element = 0;
+	bool                   bgra16            = false;
 };
 
 struct VideoOutFormatPolicy {
@@ -396,23 +394,17 @@ struct VideoOutFormatPolicy {
 
 inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
-     {vk::Format::eR8G8B8A8Srgb, Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb), 4,
-      false}},
+     {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
-     {vk::Format::eB8G8R8A8Srgb, Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb), 4,
-      false}},
+     {vk::Format::eB8G8R8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8100000022000000ull,
-     {vk::Format::eA2B10G10R10UnormPack32,
-      Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm), 4, false}},
+     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
-     {vk::Format::eA2R10G10B10UnormPack32,
-      Prospero::GpuEnumValue(Prospero::BufferFormat::k10_10_10_2UNorm), 4, false}},
+     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0xc001000622000000ull,
-     {vk::Format::eR16G16B16A16Sfloat,
-      Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float), 8, false}},
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
-     {vk::Format::eR16G16B16A16Sfloat,
-      Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float), 8, true}},
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
 }};
 
 [[nodiscard]] inline bool DecodeVideoOutPixelFormat(uint64_t                 pixel_format,
@@ -439,15 +431,15 @@ inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {
 }
 
 [[nodiscard]] inline constexpr bool
-IsSupportedDisplayRenderTargetTileMode(uint32_t tile_mode) noexcept {
-	return tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
+	return tile_mode == Prospero::TileMode::kRenderTarget;
 }
 
 [[nodiscard]] inline constexpr bool IsSupportedStandard64RenderTarget(const ImageInfo& info) {
-	if (info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) ||
-	    info.data.address == 0 || (info.data.address & 0xffffu) != 0 || info.extent.width == 0 ||
-	    info.extent.height == 0 || info.bytes_per_block != 4 || info.resources.levels != 1 ||
-	    info.resources.layers != 1 || info.samples != 1) {
+	if (info.tile_mode != Prospero::TileMode::kStandard64KB || info.data.address == 0 ||
+	    (info.data.address & 0xffffu) != 0 || info.extent.width == 0 || info.extent.height == 0 ||
+	    info.bytes_per_block != 4 || info.resources.levels != 1 || info.resources.layers != 1 ||
+	    info.samples != 1) {
 		return false;
 	}
 	const auto expected_pitch =
@@ -460,7 +452,7 @@ IsSupportedDisplayRenderTargetTileMode(uint32_t tile_mode) noexcept {
 }
 
 [[nodiscard]] inline constexpr bool IsTiledRenderTarget(const ImageInfo& info) noexcept {
-	return info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	return info.tile_mode == Prospero::TileMode::kRenderTarget ||
 	       IsSupportedStandard64RenderTarget(info);
 }
 

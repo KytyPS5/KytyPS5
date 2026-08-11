@@ -893,7 +893,8 @@ uint32_t EmitByteAddress(EmitterState& state, const IR::Instruction& inst, uint3
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem,
                                    uint32_t use_pc);
 
-uint32_t StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc);
+Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
+                                           uint32_t use_pc);
 
 bool ShouldApplyBufferAddTid(const IR::Instruction& inst);
 

@@ -10,6 +10,8 @@
 #define VMA_STATIC_VULKAN_FUNCTIONS  0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 
+#include "graphics/guest_gpu/gpu_defs.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -29,7 +31,7 @@ std::string VulkanToString(vk::Result value);
 std::string VulkanToString(vk::Format value);
 std::string VulkanToString(vk::ImageLayout value);
 std::string VulkanToString(vk::QueueFlags value);
-vk::Format  VulkanFormat(uint32_t guest_format);
+vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 
 template <typename T, typename Enumerator>

@@ -870,8 +870,8 @@ void TestMaterializationSharesReadConstEvaluation() {
 	for (uint32_t i = 0; i < memory.words.size(); i++) {
 		memory.words[i] = 0x100 + i;
 	}
-	memory.words[1] |= Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
-	memory.words[3] |= Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u;
+	memory.words[1] |= static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
+	memory.words[3] |= static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
 	std::array<uint32_t, 32> user_data {};
 	user_data[16] = static_cast<uint32_t>(memory.base);
 	user_data[17] = static_cast<uint32_t>(memory.base >> 32u);
@@ -911,7 +911,7 @@ void TestInvalidImagesMaterializeAsNull() {
 	std::string                       error;
 	for (uint32_t type = 0; type < 8; type++) {
 		auto descriptor = stale;
-		descriptor[1] |= Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
+		descriptor[1] |= static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
 		descriptor[3]   = (descriptor[3] & 0x0fffffffu) | (type << 28u);
 		ResourceSnapshot snapshot;
 		Check(MaterializeResources(sampled, {descriptor}, snapshot, &error) &&
@@ -951,7 +951,7 @@ void TestInvalidImagesMaterializeAsNull() {
 			std::array<uint32_t, 8> msaa {};
 			msaa[0] = 1;
 			msaa[1] = 36u << 20u;
-			msaa[3] = (Prospero::GpuEnumValue(type) << 28u) | (test.base_level << 12u) |
+			msaa[3] = (static_cast<uint32_t>(type) << 28u) | (test.base_level << 12u) |
 			          (test.fragments << 16u);
 			msaa[5] = test.max_mip << 4u;
 			ResourceSnapshot msaa_snapshot;
@@ -970,7 +970,7 @@ void TestInvalidImagesMaterializeAsNull() {
 
 	std::array<uint32_t, 8> invalid_format {};
 	invalid_format[0] = 1;
-	invalid_format[3] = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u;
+	invalid_format[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
 	ResourceSnapshot invalid_format_snapshot;
 	Check(MaterializeResources(sampled, {invalid_format}, invalid_format_snapshot, &error) &&
 	          std::all_of(invalid_format_snapshot.images[0].dwords.begin(),
@@ -979,9 +979,9 @@ void TestInvalidImagesMaterializeAsNull() {
 	      "invalid-format image descriptor was not normalized to null");
 
 	auto valid = stale;
-	valid[1] |= Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) << 20u;
+	valid[1] |= static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
 	valid[3] =
-	    (valid[3] & 0x0fffffffu) | (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u);
+	    (valid[3] & 0x0fffffffu) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
 	ResourceSnapshot valid_snapshot;
 	Check(MaterializeResources(sampled, {valid}, valid_snapshot, &error) &&
 	          std::equal(valid.begin(), valid.end(), valid_snapshot.images[0].dwords.begin()),
@@ -1099,7 +1099,7 @@ void TestResourceSpecializationIsTypedAndTransactional() {
 	array_snapshot.images.resize(1);
 	array_snapshot.images[0].dword_count = 8;
 	array_snapshot.images[0].dwords[0]   = 0x1000;
-	array_snapshot.images[0].dwords[3] = Prospero::GpuEnumValue(Prospero::ImageType::kColor1DArray)
+	array_snapshot.images[0].dwords[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1DArray)
 	                                     << 28u;
 	Check(SpecializeResources(array_view, array_snapshot, &error) &&
 	          array_view.info.images[0].dimension == Decoder::ImageDimension::Dim1D &&
@@ -1132,7 +1132,7 @@ void TestResourceSpecializationIsTypedAndTransactional() {
 	Prepare(cross_family_2d_array);
 	auto array_2d_snapshot = array_snapshot;
 	array_2d_snapshot.images[0].dwords[3] =
-	    Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u;
+	    static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u;
 	Check(SpecializeResources(cross_family_2d_array, array_2d_snapshot, &error) &&
 	          cross_family_2d_array.info.images[0].dimension == Decoder::ImageDimension::Dim2DArray,
 	      "array MIMG intent did not produce a 2D-array view");
@@ -1144,7 +1144,7 @@ void TestResourceSpecializationIsTypedAndTransactional() {
 	                                             Decoder::ImageDimension::Dim2DArray)};
 	Prepare(cube_view);
 	auto cube_snapshot                = array_2d_snapshot;
-	cube_snapshot.images[0].dwords[3] = Prospero::GpuEnumValue(Prospero::ImageType::kCube) << 28u;
+	cube_snapshot.images[0].dwords[3] = static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u;
 	Check(SpecializeResources(cube_view, cube_snapshot, &error) &&
 	          ValidateResourceSpecialization(cube_view, cube_snapshot, &error) &&
 	          cube_view.info.images[0].cube &&
@@ -1152,7 +1152,7 @@ void TestResourceSpecializationIsTypedAndTransactional() {
 	      "cube descriptor identity did not reach the specialized image and IR");
 	auto array_after_cube = cube_snapshot;
 	array_after_cube.images[0].dwords[3] =
-	    Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u;
+	    static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u;
 	Check(!ValidateResourceSpecialization(cube_view, array_after_cube, &error),
 	      "2D-array descriptor reused a cube-coordinate specialization");
 	auto null_after_cube = cube_snapshot;
@@ -1185,9 +1185,9 @@ void TestResourceSpecializationIsTypedAndTransactional() {
 
 	snapshot.images[0].dword_count = 8;
 	snapshot.images[0].dwords[0]   = 0x1000;
-	snapshot.images[0].dwords[1]   = Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 20u;
+	snapshot.images[0].dwords[1]   = static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u;
 	snapshot.images[0].dwords[3] =
-	    (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u) | 0x3acu;
+	    (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u) | 0x3acu;
 	Check(SpecializeResources(program, snapshot, &error), error.c_str());
 	const auto& image = program.info.images[0];
 	const auto& inst  = program.blocks[0].instructions[0];
@@ -1235,7 +1235,7 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
 	buffer_snapshot.buffers[0].dword_count = 4;
 	buffer_snapshot.buffers[0].dwords[1]   = (16u << 16u) | (1u << 31u);
 	buffer_snapshot.buffers[0].dwords[3] =
-	    (Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) << 12u) | (2u << 21u) |
+	    (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u) | (2u << 21u) |
 	    (1u << 23u);
 	std::string error;
 	Check(SpecializeResources(buffer_program, buffer_snapshot, &error) &&
@@ -1244,7 +1244,7 @@ void TestRuntimeSpecializationCoversBakedBufferAndAddressFields() {
 	Check(buffer_program.info.buffers[0].packed_stride ==
 	              (16u | (1u << 14u) | (2u << 16u) | (1u << 20u)) &&
 	          buffer_program.info.buffers[0].descriptor_format ==
-	              Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt),
+	              Prospero::BufferFormat::k32UInt,
 	      "buffer specialization omitted SPIR-V-baked descriptor fields");
 	auto stale_buffer = buffer_snapshot;
 	stale_buffer.buffers[0].dwords[1] ^= 4u << 16u;

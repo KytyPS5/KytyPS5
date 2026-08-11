@@ -1076,18 +1076,18 @@ int KYTY_SYSV_ABI GraphicsSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint3
 static uint32_t GraphicsPrimitiveTypeToGsOut(uint32_t prim_type) {
 	switch (static_cast<Prospero::PrimitiveType>(prim_type)) {
 		case Prospero::PrimitiveType::kPointList:
-			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kPoints);
+			return static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kPoints);
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kLineListAdjacency:
 		case Prospero::PrimitiveType::kLineStripAdjacency:
 		case Prospero::PrimitiveType::kLineLoop:
-			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kLines);
+			return static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kLines);
 		case Prospero::PrimitiveType::kRectList:
-			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::k2dRectangle);
+			return static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::k2dRectangle);
 		case Prospero::PrimitiveType::kRectListLegacy:
-			return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kRectList);
-		default: return Prospero::GpuEnumValue(Prospero::GsOutputPrimitiveType::kTriangles);
+			return static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kRectList);
+		default: return static_cast<uint32_t>(Prospero::GsOutputPrimitiveType::kTriangles);
 	}
 }
 

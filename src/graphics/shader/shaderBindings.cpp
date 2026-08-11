@@ -29,7 +29,7 @@ ResourceDescriptorType ShaderClassifyResourceDescriptor(const uint32_t* desc) {
 		default: break;
 	}
 
-	return (raw_type & Prospero::GpuEnumValue(Prospero::ImageType::kColor1D)) == 0
+	return (raw_type & static_cast<uint32_t>(Prospero::ImageType::kColor1D)) == 0
 	           ? ResourceDescriptorType::Buffer
 	           : ResourceDescriptorType::Unused;
 }

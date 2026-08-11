@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 
 namespace Libs::Graphics {
 
@@ -65,14 +66,14 @@ enum class TileSurfaceDimension : uint32_t {
 };
 
 struct TileSurfaceDescription {
-	uint32_t             format    = 0;
-	uint32_t             tile_mode = 0;
-	TileSurfaceDimension dimension = TileSurfaceDimension::Dim2D;
-	uint32_t             width     = 0;
-	uint32_t             height    = 0;
-	uint32_t             depth     = 1;
-	uint32_t             levels    = 1;
-	uint32_t             layers    = 1;
+	Prospero::BufferFormat format    = Prospero::BufferFormat::kInvalid;
+	Prospero::TileMode     tile_mode = Prospero::TileMode::kLinear;
+	TileSurfaceDimension   dimension = TileSurfaceDimension::Dim2D;
+	uint32_t               width     = 0;
+	uint32_t               height    = 0;
+	uint32_t               depth     = 1;
+	uint32_t               levels    = 1;
+	uint32_t               layers    = 1;
 };
 
 // Width/height fields are measured in addressable elements, not texture texels.
@@ -98,8 +99,8 @@ struct TileSurfaceLayout {
 
 bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
                         TileBlockLayout& layout);
-bool TileGetTextureElementLayout(uint32_t format, TileTextureElementLayout& layout);
-bool TileGetTextureBlockLayout(uint32_t format, uint32_t tile, bool volume,
+bool TileGetTextureElementLayout(Prospero::BufferFormat format, TileTextureElementLayout& layout);
+bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode tile, bool volume,
                                TileTextureBlockLayout& layout);
 bool TileGetTiledTextureLayout(const TileSurfaceDescription& description,
                                TileSurfaceLayout&            layout);
@@ -110,10 +111,10 @@ bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t b
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
                      uint32_t block_z, uint32_t& byte_offset);
 
-bool     TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch, uint32_t z_format,
-                          uint32_t stencil_format, bool htile, TileSizeAlign& stencil_size,
-                          TileSizeAlign& htile_size, TileSizeAlign& depth_size,
-                          uint32_t num_fragments_log2 = 0);
+bool     TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch,
+                          Prospero::DepthFormat z_format, Prospero::StencilFormat stencil_format,
+                          bool htile, TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
+                          TileSizeAlign& depth_size, uint32_t num_fragments_log2 = 0);
 uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
                                   uint32_t num_fragments_log2 = 0);
 uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,
@@ -125,13 +126,14 @@ bool     TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t 
                                       uint32_t bytes_per_element, uint32_t levels,
                                       TileSizeAlign& total_size, TileSizeOffset* level_sizes,
                                       TilePaddedSize* padded_size);
-void     TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32_t levels,
-                            uint32_t tile, TileSizeAlign* total_size, TileSizeOffset* level_sizes,
-                            TilePaddedSize* padded_size);
-void     TileGetTextureTotalSize(uint32_t format, uint32_t width, uint32_t height, uint32_t depth,
-                                 uint32_t levels, uint32_t tile, bool volume_texture,
-                                 TileSizeAlign& total_size);
-uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t tile);
+void     TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                            uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
+                            TileSizeOffset* level_sizes, TilePaddedSize* padded_size);
+void     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                                 uint32_t depth, uint32_t levels, Prospero::TileMode tile,
+                                 bool volume_texture, TileSizeAlign& total_size);
+uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
+                             Prospero::TileMode tile);
 
 } // namespace Libs::Graphics
 

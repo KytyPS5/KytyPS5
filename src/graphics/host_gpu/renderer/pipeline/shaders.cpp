@@ -24,6 +24,8 @@
 namespace Libs::Graphics {
 
 // IDK: maybe we can remove it?
+constexpr uint8_t kTemporaryVertexAttribFormat113 =
+    static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
 constexpr uint32_t kTemporaryPs5BufferFormat121 = 121u;
 
 static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_components) {
@@ -88,8 +90,9 @@ static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_
 
 static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
                            uint32_t used_components) {
-	auto fmt = res.Format();
-	if (fmt == Prospero::GpuEnumValue(Prospero::VertexAttribFormat::k16_16SInt)) {
+	const auto fmt        = res.Format();
+	const auto raw_format = res.RawFormat();
+	if (raw_format == kTemporaryVertexAttribFormat113) {
 		static bool logged_113 = false;
 		if (!logged_113) {
 			LOGF("InputFormat: temporary: accepting invalid PS5 buffer format 113 as "
@@ -99,12 +102,12 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		format = vk::Format::eR32G32B32A32Sfloat;
 		size   = 4;
 		if (NarrowInputFormat(format, size, used_components)) {
-			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", fmt,
+			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
 			     VulkanToString(format).c_str(), used_components);
 		}
 		return;
 	}
-	if (fmt == kTemporaryPs5BufferFormat121) {
+	if (raw_format == kTemporaryPs5BufferFormat121) {
 		static bool logged_121 = false;
 		if (!logged_121) {
 			LOGF("InputFormat: accepting PS5 buffer format 121 as vk::Format::eR16G16Sfloat\n");
@@ -113,13 +116,13 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		format = vk::Format::eR16G16Sfloat;
 		size   = 2;
 		if (NarrowInputFormat(format, size, used_components)) {
-			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", fmt,
+			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
 			     VulkanToString(format).c_str(), used_components);
 		}
 		return;
 	}
 
-	switch (static_cast<Prospero::BufferFormat>(fmt)) {
+	switch (fmt) {
 		case Prospero::BufferFormat::k32_32_32_32Float:
 			format = vk::Format::eR32G32B32A32Sfloat;
 			size   = 4;
@@ -329,7 +332,7 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 			size   = 1;
 			break;
 		default:
-			EXIT("unknown format: fmt = %u\n", fmt);
+			EXIT("unknown format: fmt = %u\n", raw_format);
 			format = vk::Format::eUndefined;
 			size   = 4;
 			break;

@@ -535,7 +535,8 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
-static uint32_t VertexAttribFormatToBufferFormat(uint32_t format) {
+static Prospero::BufferFormat
+VertexAttribFormatToBufferFormat(Prospero::VertexAttribFormat format) {
 	struct FormatMap {
 		Prospero::VertexAttribFormat vertex;
 		Prospero::BufferFormat       buffer;
@@ -633,12 +634,12 @@ static uint32_t VertexAttribFormatToBufferFormat(uint32_t format) {
 	};
 
 	for (const auto& entry: format_map) {
-		if (format == Prospero::GpuEnumValue(entry.vertex)) {
-			return Prospero::GpuEnumValue(entry.buffer);
+		if (format == entry.vertex) {
+			return entry.buffer;
 		}
 	}
 
-	return format;
+	return static_cast<Prospero::BufferFormat>(static_cast<uint32_t>(format));
 }
 
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
@@ -659,8 +660,9 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib[in.semantic]);
 
-		size_t   index       = attrib[in.semantic] & 0x1fu;
-		uint32_t format      = (attrib[in.semantic] >> 5u) & 0x1ffu;
+		size_t index = attrib[in.semantic] & 0x1fu;
+		auto   format =
+		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
 		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
 		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
 
@@ -690,17 +692,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[1]       = sharp[1];
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
-		if (format != 0) {
+		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			auto                         buffer_format = VertexAttribFormatToBufferFormat(format);
 			static std::atomic<uint64_t> log_count     = 0;
 			auto                         log_id        = log_count.fetch_add(1);
 			if (log_id < 64) {
 				LOGF("\t temporary: PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
 				     "format %u, offset %u, buffer index %zu\n",
-				     static_cast<uint32_t>(in.semantic), format, buffer_format, offset, index);
+				     static_cast<uint32_t>(in.semantic), static_cast<uint32_t>(format),
+				     static_cast<uint32_t>(buffer_format), offset, index);
 			}
+			const auto buffer_format_raw = static_cast<uint32_t>(buffer_format);
 			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
-			              ((buffer_format & 0x7fu) << 12u) | DstSel(4, 5, 6, 7);
+			              ((buffer_format_raw & 0x7fu) << 12u) | DstSel(4, 5, 6, 7);
 		}
 		if (offset != 0) {
 			r.UpdateAddress48(r.Base48() + offset);
@@ -1011,7 +1015,7 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& buffer = program.info.buffers[i];
 		ret += fmt::format(" b{}[stride={} format={}]", i, buffer.packed_stride,
-		                   buffer.descriptor_format);
+		                   static_cast<uint32_t>(buffer.descriptor_format));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& image = program.info.images[i];
@@ -1047,7 +1051,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 	ids.push_back(static_cast<uint32_t>(program.info.buffers.size()));
 	for (const auto& buffer: program.info.buffers) {
 		ids.push_back(buffer.packed_stride);
-		ids.push_back(buffer.descriptor_format);
+		ids.push_back(static_cast<uint32_t>(buffer.descriptor_format));
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.images.size()));
 	for (const auto& image: program.info.images) {
@@ -1250,7 +1254,7 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 		     r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW());
 		LOGF("\t\t Format()         = %" PRIu8 "\n"
 		     "\t\t OutOfBounds()    = %" PRIu8 "\n",
-		     r.Format(), r.OutOfBounds());
+		     r.RawFormat(), r.OutOfBounds());
 		LOGF("\t\t AddTid()         = %s\n", r.AddTid() ? "true" : "false");
 	}
 
@@ -1596,7 +1600,7 @@ ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInput
 		ret.ids.push_back(r.DstSelY());
 		ret.ids.push_back(r.DstSelZ());
 		ret.ids.push_back(r.DstSelW());
-		ret.ids.push_back(r.Format());
+		ret.ids.push_back(r.RawFormat());
 		ret.ids.push_back(r.OutOfBounds());
 		ret.ids.push_back(static_cast<uint32_t>(r.AddTid()));
 	}

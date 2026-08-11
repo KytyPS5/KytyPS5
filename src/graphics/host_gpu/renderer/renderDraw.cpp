@@ -123,7 +123,7 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 	    log_id, draw_name, RenderColorTypeName(color.type), color.base_addr, color.buffer_size,
 	    color.image_id ? "yes" : "no", VulkanToString(depth.format).c_str(),
 	    depth.image_id ? "yes" : "no", depth.vaddr_num, ctx.GetRenderTargetMask(),
-	    ucfg.GetPrimType(), index_count, flags);
+	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
 }
 
 static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer,
@@ -179,10 +179,12 @@ static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32
 		     " width=%u height=%u tile=%u"
 		     " blend=%s src=%u dst=%u alpha_src=%u alpha_dst=%u\n",
-		     log_id, i, rt.base.addr, ctm, csm, ps_input_info.target_output_mode[i], rt.info.format,
-		     rt.info.channel_type, rt.info.channel_order, rt.attrib2.width + 1,
-		     rt.attrib2.height + 1, rt.attrib3.tile_mode, bc.enable ? "true" : "false",
-		     bc.color_srcblend, bc.color_destblend, bc.alpha_srcblend, bc.alpha_destblend);
+		     log_id, i, rt.base.addr, ctm, csm, ps_input_info.target_output_mode[i],
+		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
+		     static_cast<uint32_t>(rt.info.channel_order), rt.attrib2.width + 1,
+		     rt.attrib2.height + 1, static_cast<uint32_t>(rt.attrib3.tile_mode),
+		     bc.enable ? "true" : "false", bc.color_srcblend, bc.color_destblend, bc.alpha_srcblend,
+		     bc.alpha_destblend);
 	}
 }
 
@@ -225,7 +227,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    "scissor=(%d,%d)-(%d,%d)\n",
 	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name,
 	    RenderColorTypeName(color.type), color.base_addr, extent.width, extent.height,
-	    ucfg.GetPrimType(), index_count, flags, ctx.GetRenderTargetMask(),
+	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
 	    color.color_clear_enable ? "true" : "false", color.color_clear_value.float32[0],
 	    color.color_clear_value.float32[1], color.color_clear_value.float32[2],
 	    color.color_clear_value.float32[3], cc.mode, cc.op, bc.enable ? "true" : "false",
@@ -289,8 +291,7 @@ static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderCol
 					const auto& rd        = vs_input_info.resources_dst[res_index];
 					const auto  offset    = b.attr_offsets[ai];
 					if (offset + 4u <= b.stride &&
-					    r.Format() ==
-					        Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm)) {
+					    r.Format() == Prospero::BufferFormat::k8_8_8_8UNorm) {
 						uint32_t packed = 0;
 						std::memcpy(&packed, rec_bytes + offset, sizeof(packed));
 						const auto r8 = (packed >> 0u) & 0xffu;
@@ -844,7 +845,7 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 
 	topology = vk::PrimitiveTopology::ePointList;
 
-	switch (static_cast<Prospero::PrimitiveType>(ucfg.GetPrimType())) {
+	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kNone: return false;
 		case Prospero::PrimitiveType::kPointList:
 			topology = vk::PrimitiveTopology::ePointList;
@@ -867,14 +868,14 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
 			if (!auto_draw) {
-				EXIT("unknown primitive type: %u\n", ucfg.GetPrimType());
+				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 			}
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
 			break;
-		default: EXIT("unknown primitive type: %u\n", ucfg.GetPrimType());
+		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 	}
 
 	return true;
@@ -1051,7 +1052,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
                                const DrawEmitInfo& emit) {
 	EXIT_IF(draw.name == nullptr);
 
-	switch (static_cast<Prospero::PrimitiveType>(ucfg.GetPrimType())) {
+	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
@@ -1069,7 +1070,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
 			if (emit.indexed) {
-				EXIT("unknown primitive type: %u\n", ucfg.GetPrimType());
+				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 			}
 			// Sarah
 			EXIT_NOT_IMPLEMENTED(!(draw.index_count == 3 && vs_input_info.buffers_num == 0));
@@ -1087,7 +1088,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				}
 			}
 			break;
-		default: EXIT("unknown primitive type: %u\n", ucfg.GetPrimType());
+		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 	}
 }
 
@@ -1387,9 +1388,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, false,
-	                     ucfg.GetPrimType() ==
-	                         Prospero::GpuEnumValue(Prospero::PrimitiveType::kRectListLegacy),
-	                     0, nullptr);
+	                     ucfg.GetPrimType() == Prospero::PrimitiveType::kRectListLegacy, 0,
+	                     nullptr);
 
 	const auto   vertex_offset = ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
 	                             static_cast<int32_t>(first_vertex);

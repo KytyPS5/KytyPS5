@@ -83,11 +83,11 @@ constexpr FormatMapping kFormatMappings[] = {
 };
 
 constexpr auto MakeFormatLookup() {
-	constexpr auto kMaxFormat = Prospero::GpuEnumValue(Prospero::BufferFormat::kBc7Srgb);
+	constexpr auto kMaxFormat = static_cast<size_t>(Prospero::BufferFormat::kBc7Srgb);
 	std::array<vk::Format, kMaxFormat + 1> lookup {};
 	lookup.fill(vk::Format::eUndefined);
 	for (const auto& mapping: kFormatMappings) {
-		lookup[Prospero::GpuEnumValue(mapping.guest)] = mapping.host;
+		lookup[static_cast<size_t>(mapping.guest)] = mapping.host;
 	}
 	return lookup;
 }
@@ -112,9 +112,9 @@ std::string VulkanToString(vk::QueueFlags value) {
 	return vk::to_string(value);
 }
 
-vk::Format VulkanFormat(uint32_t guest_format) {
-	return guest_format < kFormatLookup.size() ? kFormatLookup[guest_format]
-	                                           : vk::Format::eUndefined;
+vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
+	const auto index = static_cast<size_t>(guest_format);
+	return index < kFormatLookup.size() ? kFormatLookup[index] : vk::Format::eUndefined;
 }
 
 void RequireVulkanSuccess(vk::Result result, const char* operation) {

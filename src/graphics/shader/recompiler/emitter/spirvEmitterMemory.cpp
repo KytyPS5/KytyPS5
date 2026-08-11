@@ -153,8 +153,8 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 	return state.program.info.buffers[mem.resource].packed_stride;
 }
 
-uint32_t StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
-                             uint32_t use_pc) {
+Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
+                                           uint32_t use_pc) {
 	(void)use_pc;
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -749,8 +749,7 @@ Prospero::BufferFormat FormattedBufferFormat(const EmitterState&    state,
                                              const IR::Instruction& inst) {
 	return inst.memory.typed
 	           ? Format::DecodeTBufferFormat(inst.memory.data_format, inst.memory.number_format)
-	           : static_cast<Prospero::BufferFormat>(
-	                 StorageBufferFormat(state, inst.memory, inst.pc));
+	           : StorageBufferFormat(state, inst.memory, inst.pc);
 }
 
 IR::Instruction WithFormatComponentByteOffset(const IR::Instruction& inst,

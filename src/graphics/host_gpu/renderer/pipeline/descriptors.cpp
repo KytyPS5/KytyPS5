@@ -59,7 +59,7 @@ static void CopyNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& so
 }
 
 static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) {
-	const auto type = static_cast<Prospero::ImageType>(descriptor.Type());
+	const auto type = descriptor.Type();
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
 }
 
@@ -227,14 +227,14 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 	return image.usage.video_out && image.info.resources.layers == 1 &&
 	       IsSupportedSampledColorResource(resource) &&
 	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
-	       descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
-	       descriptor.Depth() == 0 && descriptor.BaseArray5() == 0;
+	       descriptor.Type() == Prospero::ImageType::kColor2D && descriptor.Depth() == 0 &&
+	       descriptor.BaseArray5() == 0;
 }
 
 bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, const Image& image) {
 	const auto width        = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height       = static_cast<uint32_t>(descriptor.Height5()) + 1u;
-	const auto type         = static_cast<Prospero::ImageType>(descriptor.Type());
+	const auto type         = descriptor.Type();
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto samples      = multisampled ? 1u << descriptor.LastLevel() : 1u;
 	const auto pitch =
@@ -269,9 +269,8 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	       (supported_2d || supported_array || supported_cube || supported_msaa_2d ||
 	        supported_msaa_array) &&
 	       levels_ok && descriptor.MinLod() == 0 &&
-	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
-	       descriptor.BCSwizzle() == 0 && (!descriptor.MsaaDepth() || multisampled) &&
-	       pitch >= width && pitch == image.info.pitch;
+	       descriptor.TileMode() == Prospero::TileMode::kDepth && descriptor.BCSwizzle() == 0 &&
+	       (!descriptor.MsaaDepth() || multisampled) && pitch >= width && pitch == image.info.pitch;
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, const Image& image) {
@@ -300,8 +299,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
 	return (descriptor.fields[6] & 0x00ffffffu) == expected_control && metadata_addr != 0 &&
-	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
-	       image.info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
+	       descriptor.TileMode() == Prospero::TileMode::kDepth &&
+	       image.info.tile_mode == Prospero::TileMode::kDepth &&
 	       image.info.metadata.kind == ImageMetadataKind::Htile &&
 	       image.info.metadata.range.Valid() && image.info.metadata.range.address == metadata_addr;
 }
@@ -332,23 +331,21 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	     resource_ok, descriptor_ok, encoding_ok, format_ok, static_cast<uint32_t>(resource.kind),
 	     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
 	     resource.read, resource.written, resource.atomic, resource.depth_compare,
-	     descriptor.Format(), descriptor.DstSelXYZW(),
+	     static_cast<uint32_t>(descriptor.Format()), descriptor.DstSelXYZW(),
 	     image == nullptr ? static_cast<int>(vk::Format::eUndefined)
 	                      : static_cast<int>(image->info.pixel_format),
 	     static_cast<int>(view_format), image == nullptr ? 0u : image->info.resources.layers,
-	     descriptor.Type(), descriptor.BaseArray5(), descriptor.Depth(), descriptor_pitch,
-	     image == nullptr ? 0u : image->info.pitch, descriptor.Base40(), size, descriptor.fields[0],
-	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
-	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	     static_cast<uint32_t>(descriptor.Type()), descriptor.BaseArray5(), descriptor.Depth(),
+	     descriptor_pitch, image == nullptr ? 0u : image->info.pitch, descriptor.Base40(), size,
+	     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+	     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
                                                 const ShaderTextureResource& descriptor) {
-	const auto tile = descriptor.TileMode();
-	const bool is_color_1d =
-	    descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor1D);
-	const bool is_color_1d_array =
-	    descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor1DArray);
+	const auto tile              = descriptor.TileMode();
+	const bool is_color_1d       = descriptor.Type() == Prospero::ImageType::kColor1D;
+	const bool is_color_1d_array = descriptor.Type() == Prospero::ImageType::kColor1DArray;
 	const bool valid_1d_slice =
 	    (is_color_1d && descriptor.Depth() == 0 && descriptor.BaseArray5() == 0) ||
 	    (is_color_1d_array && descriptor.BaseArray5() <= descriptor.Depth());
@@ -358,10 +355,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray &&
 	    is_color_1d_array && descriptor.Height5() == 0 &&
 	    descriptor.BaseArray5() <= descriptor.Depth();
-	const bool is_color_2d =
-	    descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
-	const bool is_color_2d_array =
-	    descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+	const bool is_color_2d       = descriptor.Type() == Prospero::ImageType::kColor2D;
+	const bool is_color_2d_array = descriptor.Type() == Prospero::ImageType::kColor2DArray;
 	const bool valid_2d_slice =
 	    (is_color_2d && descriptor.Depth() == 0 && descriptor.BaseArray5() == 0) ||
 	    (is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth());
@@ -371,11 +366,11 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
 	    is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth();
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
-	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D) &&
+	                   descriptor.Type() == Prospero::ImageType::kColor3D &&
 	                   descriptor.BaseArray5() == 0;
 	TileTextureBlockLayout tile_layout {};
 	bool                   supported_tile = false;
-	switch (static_cast<Prospero::TileMode>(tile)) {
+	switch (tile) {
 		case Prospero::TileMode::kLinear: supported_tile = true; break;
 		case Prospero::TileMode::kDepth:
 			supported_tile =
@@ -435,14 +430,12 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(descriptor);
 	const bool uint_resource =
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-	const bool raw_sint_storage =
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) && uint_resource &&
-	    resource.written && !resource.read && !resource.atomic;
+	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
+	                              resource.written && !resource.read && !resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage ||
-	    (Prospero::IsSupportedTextureFormat(format) &&
-	     uint_resource == Prospero::IsUintTextureFormat(format) &&
-	     (!resource.atomic || format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt)));
+	    raw_sint_storage || (Prospero::IsSupportedTextureFormat(format) &&
+	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
+	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -461,24 +454,23 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     IsValidImageSwizzle(descriptor.DstSelXYZW()), descriptor.Base40(), size,
 	     static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	     static_cast<uint32_t>(descriptor.Height5()) + 1u,
-	     static_cast<uint32_t>(descriptor.Depth()) + 1u, descriptor.Type(), format,
-	     descriptor.TileMode(), descriptor.DstSelXYZW(), resource.read, resource.written,
-	     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
-	     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	     static_cast<uint32_t>(descriptor.Depth()) + 1u, static_cast<uint32_t>(descriptor.Type()),
+	     static_cast<uint32_t>(format), static_cast<uint32_t>(descriptor.TileMode()),
+	     descriptor.DstSelXYZW(), resource.read, resource.written, descriptor.fields[0],
+	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
 struct NullImageSpec {
-	vk::Format format;
-	uint32_t   guest_format;
+	vk::Format             format;
+	Prospero::BufferFormat guest_format;
 };
 
 static NullImageSpec NullTextureSpec(const ShaderRecompiler::IR::ImageResource& resource) {
 	const bool uint_image = resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint ||
 	                        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-	return uint_image ? NullImageSpec {vk::Format::eR32Uint,
-	                                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt)}
-	                  : NullImageSpec {vk::Format::eR32Sfloat,
-	                                   Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float)};
+	return uint_image ? NullImageSpec {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt}
+	                  : NullImageSpec {vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float};
 }
 
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
@@ -504,7 +496,7 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 }
 
 static void PopulateTextureMipLayout(ImageInfo& info) {
-	if (info.IsVolume() && info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kLinear)) {
+	if (info.IsVolume() && info.tile_mode != Prospero::TileMode::kLinear) {
 		TileSurfaceLayout            surface {};
 		const TileSurfaceDescription description {
 		    info.guest_format,  info.tile_mode,    TileSurfaceDimension::Dim3D, info.extent.width,
@@ -631,10 +623,9 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
 	const auto tile         = descriptor.TileMode();
-	const bool depth_tile   = tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
-	const bool msaa_tile =
-	    depth_tile || tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
+	const bool depth_tile   = tile == Prospero::TileMode::kDepth;
+	const bool msaa_tile    = depth_tile || tile == Prospero::TileMode::kRenderTarget;
+	const bool msaa_array   = type == Prospero::ImageType::kColor2DMsaaArray;
 	if ((!multisampled && (base_level > last_level || last_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
@@ -644,7 +635,8 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "kind=%u dimension=%u mip_mode=%u read=%d written=%d "
 		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(), descriptor.Type(), tile,
+		     base_level, last_level, levels, descriptor.MaxMip(),
+		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
 		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
 		     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written,
 		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
@@ -664,7 +656,7 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	     resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: kind=%u format=%u addr=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(resource.kind), format, address);
+		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(format), address);
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;
@@ -694,15 +686,14 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto pixel_format = TextureGetFormat(format);
-	const auto storage_view_format =
-	    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt)
-	        ? vk::Format::eR32Uint
-	        : SrgbStorageViewFormat(pixel_format);
-	const auto              view_format = storage && storage_view_format != vk::Format::eUndefined
-	                                          ? storage_view_format
-	                                          : pixel_format;
-	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
+	const auto pixel_format        = TextureGetFormat(format);
+	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
+	                                     ? vk::Format::eR32Uint
+	                                     : SrgbStorageViewFormat(pixel_format);
+	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
+	                                     ? storage_view_format
+	                                     : pixel_format;
+	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
 	desc.info.pixel_format = pixel_format;

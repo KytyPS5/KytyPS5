@@ -101,8 +101,9 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 			     " attrib3_tile=0x%08" PRIx32 " attrib3_dim=0x%08" PRIx32 " fmt=0x%08" PRIx32
 			     " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 "\n",
 			     rt_slot, rt.base.addr, mask, rt.attrib2.width, rt.attrib2.height,
-			     rt.attrib3.tile_mode, rt.attrib3.dimension, rt.info.format, rt.info.channel_type,
-			     rt.info.channel_order);
+			     static_cast<uint32_t>(rt.attrib3.tile_mode), rt.attrib3.dimension,
+			     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
+			     static_cast<uint32_t>(rt.info.channel_order));
 		}
 	}
 
@@ -129,17 +130,16 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	if (volume && samples != 1) {
 		EXIT("multisampled 3D render targets are unsupported\n");
 	}
-	const uint32_t depth = volume ? rt.attrib3.depth + 1u : 1u;
-	const bool     standard64 =
-	    rt.attrib3.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+	const uint32_t depth      = volume ? rt.attrib3.depth + 1u : 1u;
+	const bool     standard64 = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
 
 	switch (rt.attrib3.tile_mode) {
-		case Prospero::GpuEnumValue(Prospero::TileMode::kLinear):
-		case Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB):
-		case Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget):
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kRenderTarget:
 			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
 			break;
-		default: EXIT("unknown tile mode: %u\n", rt.attrib3.tile_mode);
+		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}
 	if (!tile && levels > 1) {
 		EXIT("linear mipmapped render targets are unsupported\n");
@@ -180,8 +180,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		if (volume) {
 			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 		} else if (standard64) {
-			pitch = TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
-			                            width, rt.attrib3.tile_mode);
+			pitch =
+			    TileGetTexturePitch(Prospero::BufferFormat::k32Float, width, rt.attrib3.tile_mode);
 		} else {
 			pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
 		}
@@ -207,7 +207,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		                                          1};
 		if (!tile || !TileGetTiledTextureLayout(description, volume_layout)) {
 			EXIT("unsupported 3D render-target layout: %ux%ux%u levels=%u tile=%u\n", width, height,
-			     depth, levels, rt.attrib3.tile_mode);
+			     depth, levels, static_cast<uint32_t>(rt.attrib3.tile_mode));
 		}
 		size         = volume_layout.block_slice_size;
 		backing_size = volume_layout.total_size;
@@ -215,9 +215,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
 		if (standard64) {
-			TileGetTextureSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), width,
-			                   height, levels, rt.attrib3.tile_mode, &layout, mip_sizes,
-			                   mip_padded);
+			TileGetTextureSize(Prospero::BufferFormat::k32Float, width, height, levels,
+			                   rt.attrib3.tile_mode, &layout, mip_sizes, mip_padded);
 			valid_layout = layout.size != 0 && layout.align == 65536;
 		} else {
 			valid_layout =
@@ -278,8 +277,9 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
 		     rt_slot, rt.base.addr, backing_size, width, height, depth, rt.view.current_mip_level,
-		     view_extent.width, view_extent.height, levels, pitch, rt.info.format,
-		     rt.info.channel_type, rt.info.channel_order, samples, tile ? "tiled" : "linear");
+		     view_extent.width, view_extent.height, levels, pitch,
+		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
+		     static_cast<uint32_t>(rt.info.channel_order), samples, tile ? "tiled" : "linear");
 	}
 
 	TextureCache::ImageDesc desc {};

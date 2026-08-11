@@ -34,7 +34,7 @@ void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
 void                     sh_print(const char* func, const HW::Shader& uc);
 std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt);
-bool                     RenderIsColorTileModeLinear(uint32_t tile_mode);
+bool                     RenderIsColorTileModeLinear(Prospero::TileMode tile_mode);
 void                     hw_print(const RenderCommandBuffer& buffer);
 void                     hw_check(const RenderCommandBuffer& buffer);
 void                     LogDrawPhase(const char* draw_name, const char* phase);

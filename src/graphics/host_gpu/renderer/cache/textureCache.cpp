@@ -516,7 +516,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.pitch           = 1;
 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
 	info.samples         = 1;
-	info.tile_mode       = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
 	m_null_images.emplace(format, id);
@@ -822,7 +822,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     requested.data.address, requested.resources.levels, requested.resources.layers,
 		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
-		     static_cast<uint32_t>(cached.info.type), requested.tile_mode, cached.info.tile_mode);
+		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
+		     static_cast<uint32_t>(cached.info.tile_mode));
 	}
 
 	if (requested.data.address > cached.info.data.address) {
@@ -905,7 +906,7 @@ TextureCache::ColorTransferPlan
 TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
                                  TransferDirection direction) const {
 	const auto& info             = image.info;
-	uint32_t    format           = info.guest_format;
+	auto        format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
 	bool        volume           = info.IsVolume();
 	bool        allow_depth_tile = direction == TransferDirection::Upload;
@@ -957,8 +958,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	plan.regions = TextureBuildImageCopies(plan.layout);
-	plan.tiled   = static_cast<Prospero::TileMode>(plan.layout.surface.description.tile_mode) !=
-	               Prospero::TileMode::kLinear;
+	plan.tiled   = plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear;
 	if (plan.tiled) {
 		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,
 		                              info.resources.levels, plan.tiles)) {
@@ -1007,7 +1007,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
 			     "pitch=%u levels=%u layers=%u samples=%u\n",
 			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
-			     info.guest_format, info.tile_mode,
+			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
 			     static_cast<uint32_t>(plan.layout.surface.texture.block.family), info.extent.width,
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
@@ -1045,7 +1045,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		copy.bufferImageHeight = info.extent.height;
 		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
 		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
-		if (static_cast<Prospero::TileMode>(info.tile_mode) != Prospero::TileMode::kLinear) {
+		if (info.tile_mode != Prospero::TileMode::kLinear) {
 			tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
 			                 full_slice_size, 0, info.extent.width, info.extent.height, 1,
 			                 info.pitch});

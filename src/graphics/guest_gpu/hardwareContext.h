@@ -29,27 +29,27 @@ struct ColorView {
 struct ColorInfo {
 	bool fmask_compression_enable = false;
 	// uint32_t fmask_compression_mode   = 0;
-	bool     fmask_data_compression_disable = false;
-	bool     fmask_one_frag_mode            = false;
-	bool     cmask_fast_clear_enable        = false;
-	bool     dcc_compression_enable         = false;
-	bool     blend_clamp                    = false;
-	bool     blend_bypass                   = false;
-	bool     round_mode                     = false;
-	uint32_t cmask_is_linear                = 0;
-	uint32_t cmask_addr_type                = 0;
-	bool     alt_tile_mode                  = false;
-	uint32_t format                         = 0;
-	uint32_t channel_type                   = 0;
-	uint32_t channel_order                  = 0;
+	bool                    fmask_data_compression_disable = false;
+	bool                    fmask_one_frag_mode            = false;
+	bool                    cmask_fast_clear_enable        = false;
+	bool                    dcc_compression_enable         = false;
+	bool                    blend_clamp                    = false;
+	bool                    blend_bypass                   = false;
+	bool                    round_mode                     = false;
+	uint32_t                cmask_is_linear                = 0;
+	uint32_t                cmask_addr_type                = 0;
+	bool                    alt_tile_mode                  = false;
+	Prospero::ChannelLayout format                         = Prospero::ChannelLayout::kInvalid;
+	Prospero::ChannelType   channel_type                   = Prospero::ChannelType::kUNorm;
+	Prospero::ChannelOrder  channel_order                  = Prospero::ChannelOrder::kStandard;
 };
 
 struct ColorAttrib {
-	bool     force_dest_alpha_to_one = false;
-	uint32_t tile_mode               = 0;
-	uint32_t fmask_tile_mode         = 0;
-	uint32_t num_samples             = 0;
-	uint32_t num_fragments           = 0;
+	bool               force_dest_alpha_to_one = false;
+	Prospero::TileMode tile_mode               = Prospero::TileMode::kLinear;
+	Prospero::TileMode fmask_tile_mode         = Prospero::TileMode::kLinear;
+	uint32_t           num_samples             = 0;
+	uint32_t           num_fragments           = 0;
 };
 
 struct ColorAttrib2 {
@@ -59,11 +59,11 @@ struct ColorAttrib2 {
 };
 
 struct ColorAttrib3 {
-	uint32_t depth              = 0;
-	uint32_t tile_mode          = 0;
-	uint32_t dimension          = 0;
-	bool     cmask_pipe_aligned = false;
-	bool     dcc_pipe_aligned   = false;
+	uint32_t           depth              = 0;
+	Prospero::TileMode tile_mode          = Prospero::TileMode::kLinear;
+	uint32_t           dimension          = 0;
+	bool               cmask_pipe_aligned = false;
+	bool               dcc_pipe_aligned   = false;
 };
 
 struct ColorDccControl {
@@ -132,7 +132,7 @@ struct RenderTarget {
 };
 
 struct DepthZInfo {
-	uint32_t                                    format      = 0;
+	Prospero::DepthFormat                       format      = Prospero::DepthFormat::kInvalid;
 	uint32_t                                    num_samples = 0;
 	Prospero::TextureCompatiblePlaneCompression texture_compatibility =
 	    Prospero::TextureCompatiblePlaneCompression::kDisable;
@@ -144,16 +144,16 @@ struct DepthZInfo {
 
 	[[nodiscard]] static DepthZInfo Decode(uint32_t value) {
 		DepthZInfo info;
-		info.format                = value & 0x3u;
+		info.format                = static_cast<Prospero::DepthFormat>(value & 0x3u);
 		info.num_samples           = (value >> 2u) & 0x3u;
 		info.texture_compatibility = static_cast<Prospero::TextureCompatiblePlaneCompression>(
-		    value & Prospero::GpuEnumValue(Prospero::TextureCompatiblePlaneCompression::kBitMask));
+		    value & static_cast<uint32_t>(Prospero::TextureCompatiblePlaneCompression::kBitMask));
 		info.partially_resident = (value & 0x00001000u) != 0;
 		info.max_mip_level      = static_cast<uint8_t>((value >> 16u) & 0x0fu);
 		info.expclear_enabled   = (value & 0x08000000u) != 0;
 		info.htile_acceleration = (value & 0x20000000u) != 0;
 		info.z_compare_base     = static_cast<Prospero::ZCompareBase>(
-		    value & Prospero::GpuEnumValue(Prospero::ZCompareBase::kBitMask));
+		    value & static_cast<uint32_t>(Prospero::ZCompareBase::kBitMask));
 		return info;
 	}
 
@@ -167,7 +167,7 @@ struct DepthZInfo {
 };
 
 struct DepthStencilInfo {
-	uint32_t                           format = 0;
+	Prospero::StencilFormat            format = Prospero::StencilFormat::kInvalid;
 	Prospero::TextureCompatibleStencil texture_compatibility =
 	    Prospero::TextureCompatibleStencil::kDisable;
 	bool expclear_enabled       = false;
@@ -176,9 +176,9 @@ struct DepthStencilInfo {
 
 	[[nodiscard]] static DepthStencilInfo Decode(uint32_t value) {
 		DepthStencilInfo info;
-		info.format                = value & 0x1u;
+		info.format                = static_cast<Prospero::StencilFormat>(value & 0x1u);
 		info.texture_compatibility = static_cast<Prospero::TextureCompatibleStencil>(
-		    value & Prospero::GpuEnumValue(Prospero::TextureCompatibleStencil::kBitMask));
+		    value & static_cast<uint32_t>(Prospero::TextureCompatibleStencil::kBitMask));
 		info.partially_resident     = (value & 0x00001000u) != 0;
 		info.expclear_enabled       = (value & 0x08000000u) != 0;
 		info.htile_stencil_disabled = (value & 0x20000000u) != 0;
@@ -1029,8 +1029,8 @@ public:
 
 	void Reset() { *this = UserConfig(); }
 
-	void                   SetPrimitiveType(uint32_t prim_type) { m_prim_type = prim_type; }
-	[[nodiscard]] uint32_t GetPrimType() const { return m_prim_type; }
+	void SetPrimitiveType(Prospero::PrimitiveType prim_type) { m_prim_type = prim_type; }
+	[[nodiscard]] Prospero::PrimitiveType GetPrimType() const { return m_prim_type; }
 	void                   SetIndexOffset(uint32_t index_offset) { m_index_offset = index_offset; }
 	[[nodiscard]] uint32_t GetIndexOffset() const { return m_index_offset; }
 	void                   SetObjectId(uint32_t object_id) { m_object_id = object_id; }
@@ -1049,9 +1049,9 @@ public:
 	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
 
 private:
-	uint32_t m_prim_type    = 0;
-	uint32_t m_index_offset = 0;
-	uint32_t m_object_id    = 0;
+	Prospero::PrimitiveType m_prim_type    = Prospero::PrimitiveType::kNone;
+	uint32_t                m_index_offset = 0;
+	uint32_t                m_object_id    = 0;
 
 	GeControl    m_ge_cntl;
 	GeUserVgprEn m_ge_user_vgpr_en;

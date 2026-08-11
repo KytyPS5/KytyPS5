@@ -526,9 +526,12 @@ KYTY_HW_CTX_PARSER(HwCtxSetColorInfo) {
 	//	r.format                         = (buffer[4] >> 2u) & 0x1fu;
 	//	r.channel_type                   = (buffer[4] >> 8u) & 0x7u;
 	//	r.channel_order                  = (buffer[4] >> 11u) & 0x3u;
-	r.format                   = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FORMAT);
-	r.channel_type             = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, NUMBER_TYPE);
-	r.channel_order            = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, COMP_SWAP);
+	r.format =
+	    static_cast<Prospero::ChannelLayout>(KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FORMAT));
+	r.channel_type =
+	    static_cast<Prospero::ChannelType>(KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, NUMBER_TYPE));
+	r.channel_order =
+	    static_cast<Prospero::ChannelOrder>(KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, COMP_SWAP));
 	r.cmask_fast_clear_enable  = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FAST_CLEAR) != 0;
 	r.fmask_compression_enable = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, COMPRESSION) != 0;
 	r.blend_clamp              = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, BLEND_CLAMP) != 0;
@@ -1042,9 +1045,12 @@ KYTY_HW_CTX_PARSER(HwCtxSetRenderTarget) {
 	//	info.format                  = (buffer[4] >> 2u) & 0x1fu;
 	//	info.channel_type            = (buffer[4] >> 8u) & 0x7u;
 	//	info.channel_order           = (buffer[4] >> 11u) & 0x3u;
-	info.format                   = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FORMAT);
-	info.channel_type             = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, NUMBER_TYPE);
-	info.channel_order            = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, COMP_SWAP);
+	info.format =
+	    static_cast<Prospero::ChannelLayout>(KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FORMAT));
+	info.channel_type =
+	    static_cast<Prospero::ChannelType>(KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, NUMBER_TYPE));
+	info.channel_order =
+	    static_cast<Prospero::ChannelOrder>(KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, COMP_SWAP));
 	info.cmask_fast_clear_enable  = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FAST_CLEAR) != 0;
 	info.fmask_compression_enable = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, COMPRESSION) != 0;
 	info.blend_clamp              = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, BLEND_CLAMP) != 0;
@@ -1066,10 +1072,12 @@ KYTY_HW_CTX_PARSER(HwCtxSetRenderTarget) {
 	//	attrib.num_fragments            = (buffer[5] >> 15u) & 0x3u;
 	attrib.force_dest_alpha_to_one =
 	    KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, FORCE_DST_ALPHA_1) != 0;
-	attrib.tile_mode       = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, TILE_MODE_INDEX);
-	attrib.fmask_tile_mode = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, FMASK_TILE_MODE_INDEX);
-	attrib.num_samples     = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, NUM_SAMPLES);
-	attrib.num_fragments   = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, NUM_FRAGMENTS);
+	attrib.tile_mode =
+	    static_cast<Prospero::TileMode>(KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, TILE_MODE_INDEX));
+	attrib.fmask_tile_mode = static_cast<Prospero::TileMode>(
+	    KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, FMASK_TILE_MODE_INDEX));
+	attrib.num_samples   = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, NUM_SAMPLES);
+	attrib.num_fragments = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, NUM_FRAGMENTS);
 
 	//	dcc.max_uncompressed_block_size = (buffer[6] >> 2u) & 0x3u;
 	//	dcc.max_compressed_block_size   = (buffer[6] >> 5u) & 0x3u;
@@ -1568,7 +1576,7 @@ KYTY_HW_UC_PARSER(HwUcSetPrimitiveType) {
 
 	uint32_t prim_type = KYTY_PM4_GET(buffer[0], VGT_PRIMITIVE_TYPE, PRIM_TYPE);
 
-	cp.GetUcfg().SetPrimitiveType(prim_type);
+	cp.GetUcfg().SetPrimitiveType(static_cast<Prospero::PrimitiveType>(prim_type));
 
 	return 1;
 }
@@ -3106,9 +3114,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			uint32_t      slot = (cmd_offset - Pm4::CB_COLOR0_INFO) / 15;
 			HW::ColorInfo info;
-			info.format                   = KYTY_PM4_GET(value, CB_COLOR0_INFO, FORMAT);
-			info.channel_type             = KYTY_PM4_GET(value, CB_COLOR0_INFO, NUMBER_TYPE);
-			info.channel_order            = KYTY_PM4_GET(value, CB_COLOR0_INFO, COMP_SWAP);
+			info.format =
+			    static_cast<Prospero::ChannelLayout>(KYTY_PM4_GET(value, CB_COLOR0_INFO, FORMAT));
+			info.channel_type = static_cast<Prospero::ChannelType>(
+			    KYTY_PM4_GET(value, CB_COLOR0_INFO, NUMBER_TYPE));
+			info.channel_order =
+			    static_cast<Prospero::ChannelOrder>(KYTY_PM4_GET(value, CB_COLOR0_INFO, COMP_SWAP));
 			info.cmask_fast_clear_enable  = KYTY_PM4_GET(value, CB_COLOR0_INFO, FAST_CLEAR) != 0;
 			info.fmask_compression_enable = KYTY_PM4_GET(value, CB_COLOR0_INFO, COMPRESSION) != 0;
 			info.blend_clamp              = KYTY_PM4_GET(value, CB_COLOR0_INFO, BLEND_CLAMP) != 0;
@@ -3133,10 +3144,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 			HW::ColorAttrib attrib;
 			attrib.force_dest_alpha_to_one =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, FORCE_DST_ALPHA_1) != 0;
-			attrib.tile_mode       = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, TILE_MODE_INDEX);
-			attrib.fmask_tile_mode = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, FMASK_TILE_MODE_INDEX);
-			attrib.num_samples     = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, NUM_SAMPLES);
-			attrib.num_fragments   = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, NUM_FRAGMENTS);
+			attrib.tile_mode = static_cast<Prospero::TileMode>(
+			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, TILE_MODE_INDEX));
+			attrib.fmask_tile_mode = static_cast<Prospero::TileMode>(
+			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, FMASK_TILE_MODE_INDEX));
+			attrib.num_samples   = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, NUM_SAMPLES);
+			attrib.num_fragments = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, NUM_FRAGMENTS);
 			cp.GetCtx().SetColorAttrib(slot, attrib);
 		};
 	}
@@ -3290,8 +3303,9 @@ void GraphicsInitJmpTablesCxIndirect() {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			uint32_t         slot = (cmd_offset - Pm4::CB_COLOR0_ATTRIB3);
 			HW::ColorAttrib3 attrib3;
-			attrib3.depth              = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, MIP0_DEPTH);
-			attrib3.tile_mode          = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, COLOR_SW_MODE);
+			attrib3.depth     = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, MIP0_DEPTH);
+			attrib3.tile_mode = static_cast<Prospero::TileMode>(
+			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, COLOR_SW_MODE));
 			attrib3.dimension          = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, RESOURCE_TYPE);
 			attrib3.cmask_pipe_aligned = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, CMASK_PIPE_ALIGNED);
 			attrib3.dcc_pipe_aligned   = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, DCC_PIPE_ALIGNED);
@@ -4467,7 +4481,7 @@ void GraphicsInitJmpTablesUcIndirect() {
 
 	g_hw_uc_indirect_func[Pm4::VGT_PRIMITIVE_TYPE] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		uint32_t prim_type = KYTY_PM4_GET(value, VGT_PRIMITIVE_TYPE, PRIM_TYPE);
-		cp.GetUcfg().SetPrimitiveType(prim_type);
+		cp.GetUcfg().SetPrimitiveType(static_cast<Prospero::PrimitiveType>(prim_type));
 	};
 	g_hw_uc_indirect_func[Pm4::VGT_INDEX_TYPE] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		cp.SetIndexType(value & 0x3u);

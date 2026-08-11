@@ -188,8 +188,8 @@ private:
 
 namespace ImageOps {
 
-void                   Validate(const ImageInfo& info);
-[[nodiscard]] uint32_t RenderTargetTransferFormat(uint32_t bytes_per_element);
+void                                 Validate(const ImageInfo& info);
+[[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
 
 } // namespace ImageOps
 

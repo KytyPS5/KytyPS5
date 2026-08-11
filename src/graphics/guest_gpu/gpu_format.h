@@ -21,24 +21,29 @@ struct RenderTargetFormatEncoding {
 		       order_support != ChannelOrderSupport::kNone;
 	}
 
-	[[nodiscard]] constexpr bool SupportsOrder(uint32_t raw_order) const {
+	[[nodiscard]] constexpr bool SupportsOrder(ChannelOrder order) const {
 		switch (order_support) {
-			case ChannelOrderSupport::kStandardOnly:
-				return raw_order == GpuEnumValue(ChannelOrder::kStandard);
+			case ChannelOrderSupport::kStandardOnly: return order == ChannelOrder::kStandard;
 			case ChannelOrderSupport::kAll:
-				return raw_order <= GpuEnumValue(ChannelOrder::kAltReversed);
+				switch (order) {
+					case ChannelOrder::kStandard:
+					case ChannelOrder::kAlt:
+					case ChannelOrder::kReversed:
+					case ChannelOrder::kAltReversed: return true;
+				}
+				return false;
 			default: return false;
 		}
 	}
 };
 
-RenderTargetFormatEncoding ResolveRenderTargetFormat(uint32_t layout, uint32_t type);
-uint32_t                   NumBytesPerElement(uint32_t format);
-uint32_t                   BlockCompressedBytesPerBlock(uint32_t format);
-uint32_t                   RenderTargetBytesPerElement(uint32_t format);
-bool                       IsSupportedTextureFormat(uint32_t format);
-bool                       IsUintTextureFormat(uint32_t format);
-bool                       IsFmaskTextureFormat(uint32_t format);
+RenderTargetFormatEncoding ResolveRenderTargetFormat(ChannelLayout layout, ChannelType type);
+uint32_t                   NumBytesPerElement(BufferFormat format);
+uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
+uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
+bool                       IsSupportedTextureFormat(BufferFormat format);
+bool                       IsUintTextureFormat(BufferFormat format);
+bool                       IsFmaskTextureFormat(BufferFormat format);
 
 } // namespace Libs::Graphics::Prospero
 

@@ -534,8 +534,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
 		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
 	}
-	const auto tile_mode =
-	    Graphics::Prospero::GpuEnumValue(Graphics::Prospero::TileMode::kRenderTarget);
+	const auto tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
 	const auto pitch =
 	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
 	Graphics::TileSizeAlign total {};

@@ -3,14 +3,7 @@
 
 #include "common/common.h"
 
-#include <type_traits>
-
 namespace Libs::Graphics::Prospero {
-
-template <typename T>
-constexpr auto GpuEnumValue(T value) {
-	return static_cast<std::underlying_type_t<T>>(value);
-}
 
 enum class PrimitiveType : uint32_t {
 	kNone               = 0,

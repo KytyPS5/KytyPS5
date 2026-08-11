@@ -646,13 +646,13 @@ void Validate(const ImageInfo& info) {
 	}
 }
 
-uint32_t RenderTargetTransferFormat(uint32_t bytes_per_element) {
+Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 	switch (bytes_per_element) {
-		case 1: return Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm);
-		case 2: return Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm);
-		case 4: return Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
-		case 8: return Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float);
-		case 16: return Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float);
+		case 1: return Prospero::BufferFormat::k8UNorm;
+		case 2: return Prospero::BufferFormat::k16UNorm;
+		case 4: return Prospero::BufferFormat::k32Float;
+		case 8: return Prospero::BufferFormat::k16_16_16_16Float;
+		case 16: return Prospero::BufferFormat::k32_32_32_32Float;
 		default: EXIT("unsupported render-target element size: %u\n", bytes_per_element);
 	}
 }

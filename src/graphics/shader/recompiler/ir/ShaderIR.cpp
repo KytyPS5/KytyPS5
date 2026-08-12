@@ -863,19 +863,25 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock& block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
-	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value != 2u) {
-		if (error != nullptr) {
-			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
-			                     decoded.src0.value, decoded.pc);
+	auto interp = InterpParameter::P0;
+	if (decoded.opcode == Decoder::Opcode::VInterpMovF32) {
+		if (decoded.src0.value > 2u) {
+			if (error != nullptr) {
+				*error = fmt::format("v_interp_mov_f32 mode {} is not a parameter selector "
+				                     "at pc 0x{:08x}",
+				                     decoded.src0.value, decoded.pc);
+			}
+			return false;
 		}
-		return false;
+		interp = static_cast<InterpParameter>(decoded.src0.value);
 	}
 
 	Instruction inst;
 	inst.pc              = decoded.pc;
-	inst.op              = Opcode::LoadInputF32;
-	inst.input_info.attr = decoded.src1.value;
-	inst.input_info.chan = decoded.src2.value;
+	inst.op                = Opcode::LoadInputF32;
+	inst.input_info.attr   = decoded.src1.value;
+	inst.input_info.chan   = decoded.src2.value;
+	inst.input_info.interp = interp;
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
 		return false;
 	}
@@ -957,13 +963,39 @@ bool LowerControlMarker(const Decoder::Instruction& decoded, BasicBlock& block, 
 	return true;
 }
 
+bool LowerWaitcnt(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
+	Instruction inst;
+	inst.pc           = decoded.pc;
+	inst.op           = Opcode::Waitcnt;
+	inst.dst.kind     = OperandKind::Null;
+	inst.src_count    = 1u;
+	inst.waitcnt_kind = WaitcntKind::Packed;
+	if (decoded.opcode == Decoder::Opcode::SWaitcntDepctr) {
+		inst.waitcnt_kind = WaitcntKind::Depctr;
+	} else if (decoded.family == Decoder::Family::SOPK) {
+		switch (decoded.opcode_id) {
+			case 0x17u: inst.waitcnt_kind = WaitcntKind::Vscnt; break;
+			case 0x18u: inst.waitcnt_kind = WaitcntKind::Vmcnt; break;
+			case 0x19u: inst.waitcnt_kind = WaitcntKind::Expcnt; break;
+			case 0x1au: inst.waitcnt_kind = WaitcntKind::Lgkmcnt; break;
+			default: return false;
+		}
+	}
+	if (!LowerSourceOperand(decoded.src0, inst.src[0], error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& block,
                              std::string* error) {
 	switch (decoded.opcode) {
 		case Decoder::Opcode::SNop:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
 		case Decoder::Opcode::SWaitcnt:
-			return LowerControlMarker(decoded, block, Opcode::Waitcnt, true, error);
+		case Decoder::Opcode::SWaitcntDepctr:
+			return LowerWaitcnt(decoded, block, error);
 		case Decoder::Opcode::SBarrier:
 			return LowerControlMarker(decoded, block, Opcode::Barrier, false, error);
 		case Decoder::Opcode::SSendmsg:
@@ -1042,6 +1074,7 @@ bool IsControlOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::SNop:
 		case Decoder::Opcode::SWaitcnt:
+		case Decoder::Opcode::SWaitcntDepctr:
 		case Decoder::Opcode::SBarrier:
 		case Decoder::Opcode::SSendmsg:
 		case Decoder::Opcode::SSetregB32:

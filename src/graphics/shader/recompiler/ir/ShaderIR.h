@@ -154,14 +154,23 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// v_interp_mov_f32's source selects which of a parameter's three LDS values to load, in the
+// order the ISA lists them: 0 = P10, 1 = P20, 2 = P0. P0 is the value at the provoking vertex
+// and the other two are deltas, so a shader reconstructs the interpolated value as
+// `P0 + P10 * I + P20 * J`. Only P0 is available from an ordinary interpolated input.
+enum class InterpParameter : uint32_t { P10 = 0, P20 = 1, P0 = 2 };
+
 struct InputInfo {
-	uint32_t attr = 0;
-	uint32_t chan = 0;
+	uint32_t        attr   = 0;
+	uint32_t        chan   = 0;
+	InterpParameter interp = InterpParameter::P0;
 
 	bool operator==(const InputInfo& other) const = default;
 };
 
 enum class SaveexecMode { And, Orn2, Andn1 };
+
+enum class WaitcntKind { Packed, Vscnt, Vmcnt, Expcnt, Lgkmcnt, Depctr };
 
 struct Instruction {
 	uint32_t     pc = 0;
@@ -176,6 +185,7 @@ struct Instruction {
 	ExportInfo   export_info;
 	InputInfo    input_info;
 	SaveexecMode saveexec_mode = SaveexecMode::And;
+	WaitcntKind  waitcnt_kind  = WaitcntKind::Packed;
 
 	bool operator==(const Instruction& other) const = default;
 };
@@ -358,6 +368,9 @@ struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;
 	uint32_t       location        = 0;
 	uint32_t       component_count = 1;
+	// The shader asked for this parameter's P10 or P20, which only exist per vertex. Such an
+	// input is declared as a three-element array rather than one interpolated value.
+	bool           per_vertex      = false;
 	std::string    debug_name;
 
 	bool operator==(const StageInput& other) const = default;

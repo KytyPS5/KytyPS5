@@ -865,9 +865,9 @@ void CheckRectListShaders() {
 
 	auto program = std::make_shared<ShaderRecompiler::IR::Program>();
 	program->info.inputs.push_back(
-	    {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, "in_param_0"});
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, false, "in_param_0"});
 	program->info.inputs.push_back(
-	    {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
+	    {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, false, "in_param_1"});
 
 	ShaderVertexInputInfo vertex {};
 	vertex.param_export_mask = 1u;

@@ -75,6 +75,7 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
     {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
     {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x20u, Opcode::SInstPrefetch},
+    {0x23u, Opcode::SWaitcntDepctr},
 };
 static_assert(Detail::HasUniqueEncodings(SOP1_OPS));
 static_assert(Detail::HasUniqueEncodings(SOP2_OPS));
@@ -260,6 +261,7 @@ bool DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.src0.value      = simm;
 	inst.src0.signed_val = static_cast<int16_t>(simm);
 	inst.src_count = (inst.opcode == Opcode::SNop || inst.opcode == Opcode::SWaitcnt ||
+	                  inst.opcode == Opcode::SWaitcntDepctr ||
 	                  inst.opcode == Opcode::SSleep || inst.opcode == Opcode::SSendmsg ||
 	                  inst.opcode == Opcode::STtraceData || inst.opcode == Opcode::SInstPrefetch)
 	                     ? 1

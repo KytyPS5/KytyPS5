@@ -15,7 +15,7 @@ bool HasInput(const ShaderInfo& info, StageInputKind kind, uint32_t location) {
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
               std::string name) {
 	if (!HasInput(info, kind, location)) {
-		info.inputs.push_back({kind, location, components, std::move(name)});
+		info.inputs.push_back({kind, location, components, false, std::move(name)});
 	}
 }
 
@@ -129,6 +129,26 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 	}
 }
 
+// A parameter read as P10 or P20 cannot come from an interpolated input - those two are deltas
+// between vertices, and only the per-vertex values can produce them. Mark the ones that need it
+// so the module declares them as three-element arrays instead.
+void MarkPerVertexInputs(const Program& program, ShaderInfo& info) {
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op != Opcode::LoadInputF32 ||
+			    inst.input_info.interp == InterpParameter::P0) {
+				continue;
+			}
+			for (auto& input: info.inputs) {
+				if (input.kind == StageInputKind::Parameter &&
+				    input.location == inst.input_info.attr) {
+					input.per_vertex = true;
+				}
+			}
+		}
+	}
+}
+
 void CollectComputeInputs(const Program& program, const ShaderComputeInputInfo* compute,
                           ShaderInfo& info) {
 	if (compute != nullptr) {
@@ -222,7 +242,10 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
-		case ShaderType::Pixel: CollectPixelInputs(options.pixel, next); break;
+		case ShaderType::Pixel:
+			CollectPixelInputs(options.pixel, next);
+			MarkPerVertexInputs(program, next);
+			break;
 		case ShaderType::Compute: CollectComputeInputs(program, options.compute, next); break;
 		default: return false;
 	}

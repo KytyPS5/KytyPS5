@@ -308,6 +308,13 @@ uint32_t EmitSelectValueU32(EmitterState& state, uint32_t cond, uint32_t true_va
 }
 
 void EmitStoreSccBool(EmitterState& state, uint32_t cond) {
+	// Per-invocation logical masks keep the lane predicate until SCC is consumed.
+	// Reducing here would introduce a workgroup barrier for dead SCC definitions,
+	// including definitions reached by only some guest waves. A semantic SCC read
+	// performs the per-wave reduction instead.
+	if (!IsLogicalWaveWorkgroup(state)) {
+		cond = EmitLogicalWaveAnyBool(state, cond);
+	}
 	const auto value =
 	    EmitSelectValueU32(state, cond, ConstantU32(state, 1), ConstantU32(state, 0));
 	EmitStoreU32(state, SccOperand(), value);
@@ -870,9 +877,12 @@ uint32_t EmitRightAlignedMaskU32(EmitterState& state, uint32_t count) {
 void EmitBitFieldMaskU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto count  = EmitAndConstant(state, EmitValueLoad(state, inst.src[0]), 31u);
 	const auto offset = EmitAndConstant(state, EmitValueLoad(state, inst.src[1]), 31u);
+	const auto mask   = EmitRightAlignedMaskU32(state, count);
 	const auto ret    = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitFieldInsert, state.uint_type, ret, ConstantU32(state, 0),
-	                           ConstantU32(state, 0xffffffffu), offset, count});
+	// Prospero defines V_BFM_B32 as ((1 << size[4:0]) - 1) << offset[4:0].
+	// OpBitFieldInsert is undefined when offset + count exceeds 32, while the native
+	// operation deliberately permits that case and truncates the shifted result.
+	state.builder.AddFunction({OpShiftLeftLogical, state.uint_type, ret, mask, offset});
 	EmitStoreU32(state, inst.dst, ret);
 }
 
@@ -958,19 +968,39 @@ void EmitBitFieldExtractU32(EmitterState& state, const IR::Instruction& inst) {
 }
 
 void EmitBitFieldExtract3U32(EmitterState& state, const IR::Instruction& inst, bool signed_value) {
-	const auto src    = EmitValueLoad(state, inst.src[0]);
-	const auto offset = EmitAndConstant(state, EmitValueLoad(state, inst.src[1]), 31u);
-	const auto count  = EmitAndConstant(state, EmitValueLoad(state, inst.src[2]), 31u);
-	const auto ret    = state.builder.AllocateId();
-	if (signed_value) {
-		const auto shifted = state.builder.AllocateId();
-		const auto mask    = EmitRightAlignedMaskU32(state, count);
-		state.builder.AddFunction({OpShiftRightArithmetic, state.uint_type, shifted, src, offset});
-		state.builder.AddFunction({OpBitwiseAnd, state.uint_type, ret, shifted, mask});
-		EmitStoreU32(state, inst.dst, ret);
+	const auto src     = EmitValueLoad(state, inst.src[0]);
+	const auto offset  = EmitAndConstant(state, EmitValueLoad(state, inst.src[1]), 31u);
+	const auto count   = EmitAndConstant(state, EmitValueLoad(state, inst.src[2]), 31u);
+	const auto shifted = state.builder.AllocateId();
+	const auto mask    = EmitRightAlignedMaskU32(state, count);
+	const auto field   = state.builder.AllocateId();
+	state.builder.AddFunction({OpShiftRightLogical, state.uint_type, shifted, src, offset});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, field, shifted, mask});
+	if (!signed_value) {
+		EmitStoreU32(state, inst.dst, field);
 		return;
 	}
-	state.builder.AddFunction({OpBitFieldUExtract, state.uint_type, ret, src, offset, count});
+
+	// The SCE ISA sign-extends the field selected by size[4:0]. It does not clamp
+	// that size to 32 - offset. Clamping changes crossing fields such as offset=28,
+	// size=8 from +15 into -1. Explicit shifts also define the architectural size=0
+	// result without relying on SPIR-V's bit-field edge-case restrictions.
+	const auto extension_shift     = state.builder.AllocateId();
+	const auto extension_shift_mod = state.builder.AllocateId();
+	const auto left                = state.builder.AllocateId();
+	const auto left_i32            = state.builder.AllocateId();
+	const auto extended_i32        = state.builder.AllocateId();
+	const auto ret                 = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpISub, state.uint_type, extension_shift, ConstantU32(state, 32), count});
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, extension_shift_mod, extension_shift,
+	                           ConstantU32(state, 31)});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, state.uint_type, left, field, extension_shift_mod});
+	state.builder.AddFunction({OpBitcast, state.int_type, left_i32, left});
+	state.builder.AddFunction(
+	    {OpShiftRightArithmetic, state.int_type, extended_i32, left_i32, extension_shift_mod});
+	state.builder.AddFunction({OpBitcast, state.uint_type, ret, extended_i32});
 	EmitStoreU32(state, inst.dst, ret);
 }
 
@@ -1374,7 +1404,7 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	uint32_t match = EmitClassMaskBitMatch(state, mask, 0, snan);
 	match          = EmitLogicalOrBool(state, match, EmitClassMaskBitMatch(state, mask, 1, qnan));
 	match          = EmitLogicalOrBool(
-	    state, match, EmitClassMaskBitMatch(state, mask, 2, EmitLogicalAndBool(state, inf, sign)));
+        state, match, EmitClassMaskBitMatch(state, mask, 2, EmitLogicalAndBool(state, inf, sign)));
 	match = EmitLogicalOrBool(
 	    state, match,
 	    EmitClassMaskBitMatch(state, mask, 3, EmitLogicalAndBool(state, normal, sign)));
@@ -1435,10 +1465,7 @@ void EmitMinMaxF32(EmitterState& state, const IR::Instruction& inst, bool max_va
 
 void EmitCompareResult(EmitterState& state, const IR::Operand& dst, uint32_t cond) {
 	if (IsSccOperand(dst)) {
-		const auto ret = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {OpSelect, state.uint_type, ret, cond, ConstantU32(state, 1), ConstantU32(state, 0)});
-		EmitStoreU32(state, dst, ret);
+		EmitStoreSccBool(state, cond);
 		return;
 	}
 
@@ -1500,6 +1527,19 @@ void EmitCompareU64(EmitterState& state, const IR::Instruction& inst) {
 	state.builder.AddFunction({compare_op, state.bool_type, high, lhs_high, rhs_high});
 	state.builder.AddFunction(
 	    {equal ? OpLogicalAnd : OpLogicalOr, state.bool_type, cond, low, high});
+	if (equal && IsLogicalWaveWorkgroup(state) && IsSccOperand(inst.dst)) {
+		// Per-invocation EXEC/VCC represents one bit of a guest 64-bit mask in
+		// each invocation. S_CMP_EQ_U64 is true only if every guest bit is equal;
+		// reducing the local equality with Any would incorrectly accept a single
+		// matching lane. Express All(equal) as !Any(!equal) across the workgroup.
+		const auto different = state.builder.AllocateId();
+		const auto all_equal = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalNot, state.bool_type, different, cond});
+		const auto any_different = EmitLogicalWaveAnyBool(state, different);
+		state.builder.AddFunction({OpLogicalNot, state.bool_type, all_equal, any_different});
+		EmitCompareResult(state, inst.dst, all_equal);
+		return;
+	}
 	EmitCompareResult(state, inst.dst, cond);
 }
 

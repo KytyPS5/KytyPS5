@@ -18,8 +18,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 
@@ -832,6 +835,13 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	    options.pixel_input_info != nullptr ? options.pixel_input_info : &default_pixel;
 	info_options.compute =
 	    options.compute_input_info != nullptr ? options.compute_input_info : &default_compute;
+	ir.compute_linear_local64 =
+	    ir.stage == ShaderType::Compute && info_options.compute->threads_num[0] == 64u &&
+	    info_options.compute->threads_num[1] == 1u &&
+	    info_options.compute->threads_num[2] == 1u && info_options.compute->group_id[0] &&
+	    info_options.compute->thread_ids_num >= 1;
+	ir.compute_workgroup_register = info_options.compute->workgroup_register;
+	ir.compute_thread_ids_num     = info_options.compute->thread_ids_num;
 	if (!IR::CollectShaderInfo(ir, info_options, error)) {
 		return false;
 	}

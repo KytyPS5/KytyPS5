@@ -25,6 +25,9 @@ enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute };
 
 enum class ShaderLaneMaskMode { NativeWave, PerInvocation };
 
+// Writes a compact, opt-in shader/pipeline trace when KYTY_SHADER_TRACE_FILE is set.
+// Each call is flushed so the final completed boundary survives an abnormal process exit.
+
 namespace ShaderRecompiler::IR {
 struct Program;
 struct ResourceSnapshot;
@@ -86,6 +89,7 @@ struct ShaderVertexInputInfo {
 struct ShaderComputeInputInfo {
 	uint32_t           threads_num[3]             = {0, 0, 0};
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	uint32_t           lds_size_dwords            = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	uint32_t           wave_size                  = 64;
@@ -240,7 +244,9 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                          ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv);
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& input_info, std::span<const uint32_t>& spirv);
+	                     uint32_t guest_wave_size, ShaderLaneMaskMode lane_mask_mode,
+	                     ShaderComputeInputInfo& input_info,
+                         std::span<const uint32_t>& spirv);
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
                           std::vector<uint32_t>& spirv);
@@ -248,7 +254,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
                           ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo& input_info,
                           std::vector<uint32_t>& spirv);
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
+	                      ShaderLaneMaskMode lane_mask_mode,
+	                      ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);
 
 } // namespace Libs::Graphics

@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <semaphore>
@@ -1163,10 +1164,32 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	static const bool isolate_compute_dispatch = [] {
+		const char* const value = std::getenv("KYTY_DEBUG_ISOLATE_COMPUTE_DISPATCH");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	static std::atomic<uint64_t> isolate_dispatch_sequence {0};
+	uint64_t isolate_sequence = 0;
+	if (isolate_compute_dispatch) {
+		isolate_sequence = isolate_dispatch_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
 	// uint32_t local_y   = 1;
 	// uint32_t local_z   = 1;
+
+	if (isolate_compute_dispatch) {
+		LOGF("Compute dispatch isolation: #%-6" PRIu64 " pre-wait submit=%" PRIu64
+		     " groups=%ux%ux%u mode=0x%08" PRIx32 " cs=0x%016" PRIx64 "\n",
+		     isolate_sequence, m_submit_id, thread_group_x, thread_group_y, thread_group_z, mode,
+		     m_sh_ctx.GetCs().cs_regs.data_addr);
+		std::printf("Compute dispatch isolation: #%-6" PRIu64 " pre-wait submit=%" PRIu64
+		            " groups=%ux%ux%u mode=0x%08" PRIx32 " cs=0x%016" PRIx64 "\n",
+		            isolate_sequence, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
+		            mode, m_sh_ctx.GetCs().cs_regs.data_addr);
+		std::fflush(stdout);
+		BufferFlushAndWait();
+	}
 
 	{
 		CheckBuffer();
@@ -1176,13 +1199,14 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
 				const auto& cs = m_sh_ctx.GetCs().cs_regs;
 				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
+				const auto  wave_size = Pm4::GetComputeWaveSizeFromDispatchModifier(mode);
 				LOGF("QueuePoint DispatchDirect: frame=%u submit=%" PRIu64
 				     " groups=%ux%ux%u local=%ux%ux%u mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
 				     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32
 				     "\n",
 				     frame_num, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
-				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
+				     std::max(cs.num_thread_z, 1u), mode, wave_size,
 				     cs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
 				     oa.IsCounterEnabled() ? "true" : "false", oa.GetAddressBytes(),
 				     oa.GetSpaceAvailable());
@@ -1193,7 +1217,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
-		if (cs.wave_size == 64u) {
+		if (Pm4::GetComputeWaveSizeFromDispatchModifier(mode) == 64u) {
 			static std::atomic_bool logged_wave64_shader {false};
 			if (!logged_wave64_shader.exchange(true, std::memory_order_relaxed)) {
 				LOGF("warning: executing wave64 compute shader cs=0x%016" PRIx64 "\n",
@@ -1206,6 +1230,19 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+	}
+
+	if (isolate_compute_dispatch) {
+		BufferFlushAndWait();
+		LOGF("Compute dispatch isolation: #%-6" PRIu64 " completed submit=%" PRIu64
+		     " groups=%ux%ux%u mode=0x%08" PRIx32 " cs=0x%016" PRIx64 "\n",
+		     isolate_sequence, m_submit_id, thread_group_x, thread_group_y, thread_group_z, mode,
+		     m_sh_ctx.GetCs().cs_regs.data_addr);
+		std::printf("Compute dispatch isolation: #%-6" PRIu64 " completed submit=%" PRIu64
+		            " groups=%ux%ux%u mode=0x%08" PRIx32 " cs=0x%016" PRIx64 "\n",
+		            isolate_sequence, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
+		            mode, m_sh_ctx.GetCs().cs_regs.data_addr);
+		std::fflush(stdout);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;

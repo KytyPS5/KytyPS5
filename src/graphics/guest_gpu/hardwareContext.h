@@ -555,7 +555,6 @@ struct CsStageRegisters {
 	bool     fp16_overflow             = false;
 	bool     bulky                     = false;
 	bool     threadgroup_configuration = false;
-	uint8_t  wave_size                 = 64;
 	bool     scratch_en                = false;
 	uint8_t  user_sgpr                 = 0;
 	bool     tgid_x_en                 = false;

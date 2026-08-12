@@ -18,6 +18,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <span>
 
@@ -418,17 +419,64 @@ static void CreateLayout(DescriptorCache&                   descriptor_cache,
 static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStageFlagBits vk_stage,
                                   const ShaderRecompiler::IR::Program&                   program,
                                   vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo& required,
-                                  vk::PipelineShaderStageCreateInfo&                     stage) {
-	const auto config =
-	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program);
+                                  vk::PipelineShaderStageCreateInfo&                     stage,
+                                  uint32_t local_threads = 0) {
+	auto config =
+	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program,
+	                            local_threads);
+	if (config.mode == ShaderSubgroupMode::Unsupported &&
+	    vk_stage == vk::ShaderStageFlagBits::eCompute && program.wave_size == 64u &&
+	    program.lane_mask_mode == ShaderLaneMaskMode::NativeWave &&
+	    local_threads > program.wave_size) {
+		const char* fallback = std::getenv("KYTY_DEBUG_ALLOW_SPLIT_WAVE64");
+		if (fallback != nullptr && fallback[0] == '1' && fallback[1] == '\0') {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DEBUG ONLY: splitting %u-lane compute shader 0x%016" PRIx64
+				     " across subgroup32 for a %u-thread workgroup\n",
+				     program.wave_size, program.shader_hash, local_threads);
+			}
+			return;
+		}
+	}
 	switch (config.mode) {
 		case ShaderSubgroupMode::Natural: return;
+		case ShaderSubgroupMode::PartialWave: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running %u active lanes of a %u-lane guest compute wave "
+				     "inside one %u-lane host subgroup\n",
+				     local_threads, program.wave_size, graphics.subgroup_size);
+			}
+			return;
+		}
 		case ShaderSubgroupMode::PerInvocationGraphics: {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
 				LOGF("Vulkan running %u-lane graphics shader stage 0x%08x with per-invocation "
 				     "EXEC/VCC on the host-native subgroup\n",
 				     program.wave_size, static_cast<uint32_t>(vk_stage));
+			}
+			return;
+		}
+		case ShaderSubgroupMode::LogicalSingleWaveWorkgroup: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running one %u-lane guest compute wave as a full workgroup "
+				     "with per-invocation EXEC/VCC\n",
+				     program.wave_size);
+			}
+			return;
+		}
+		case ShaderSubgroupMode::LogicalMultiWaveWorkgroup: {
+			// The emitter represents each guest wave with per-invocation masks and
+			// workgroup-indexed summaries. It does not require a host subgroup size.
+			return;
+		}
+		case ShaderSubgroupMode::HalfWaveIndependent: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running one separable wave64 as two independent subgroup32 halves\n");
 			}
 			return;
 		}
@@ -444,9 +492,12 @@ static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStag
 		case ShaderSubgroupMode::Controlled: break;
 		case ShaderSubgroupMode::Unsupported:
 		default:
-			EXIT("Vulkan cannot run %u-lane shader stage 0x%08x: default=%u min=%u max=%u "
+			EXIT("Vulkan cannot run shader 0x%016" PRIx64
+			     " (%u-lane, mask_mode=%u) stage 0x%08x: default=%u min=%u max=%u "
 			     "controlled_stages=0x%08x\n",
-			     program.wave_size, static_cast<uint32_t>(vk_stage), graphics.subgroup_size,
+			     program.shader_hash, program.wave_size,
+			     static_cast<uint32_t>(program.lane_mask_mode),
+			     static_cast<uint32_t>(vk_stage), graphics.subgroup_size,
 			     graphics.min_subgroup_size, graphics.max_subgroup_size,
 			     static_cast<vk::ShaderStageFlags::MaskType>(
 			         graphics.required_subgroup_size_stages));
@@ -530,7 +581,6 @@ void CreatePipelineInternal(
 
 	vk::PipelineShaderStageCreateInfo                     vert_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo vert_subgroup_size {};
-
 	vert_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 	vert_shader_stage_info.pNext               = nullptr;
 	vert_shader_stage_info.flags               = {};
@@ -1046,7 +1096,6 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
                             const ShaderComputeInputInfo&   input_info,
                             std::span<const uint32_t>       cs_shader) {
 	vk::ShaderModule comp_shader_module = nullptr;
-
 	vk::ShaderModuleCreateInfo create_info {};
 
 	create_info.sType    = vk::StructureType::eShaderModuleCreateInfo;
@@ -1073,8 +1122,11 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	comp_shader_stage_info.pName               = "main";
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
+	const auto local_threads = std::max(input_info.threads_num[0], 1u) *
+	                           std::max(input_info.threads_num[1], 1u) *
+	                           std::max(input_info.threads_num[2], 1u);
 	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute, *input_info.stage.program,
-	                      comp_subgroup_size, comp_shader_stage_info);
+	                      comp_subgroup_size, comp_shader_stage_info, local_threads);
 
 	vk::DescriptorSetLayout set_layouts[1]  = {};
 	uint32_t                set_layouts_num = 0;

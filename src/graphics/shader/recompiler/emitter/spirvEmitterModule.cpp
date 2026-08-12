@@ -12,6 +12,25 @@ uint32_t DescriptorCount(const EmitterState& state, IR::DescriptorBindingKind ki
 	return binding != nullptr ? static_cast<uint32_t>(binding->resources.size()) : 0;
 }
 
+bool StorageImageClassUsesAtomics(const EmitterState& state, bool integer,
+	                              ImageViewKind view) {
+	const auto* binding = DescriptorBinding(state, StorageBindingKind(integer, view));
+	if (binding == nullptr) {
+		return false;
+	}
+	return std::any_of(binding->resources.begin(), binding->resources.end(),
+	                   [&](uint32_t resource) {
+		                   return resource < state.program.info.images.size() &&
+		                          state.program.info.images[resource].atomic;
+	                   });
+}
+
+bool StorageImageClassIsFormatless(const EmitterState& state, uint32_t index) {
+	const auto view    = static_cast<ImageViewKind>(index % StorageImageViewKindCount);
+	const bool integer = index >= StorageImageViewKindCount;
+	return !integer || !StorageImageClassUsesAtomics(state, true, view);
+}
+
 uint32_t ConstantU32(EmitterState& state, uint32_t value) {
 	if (auto it = state.constants.find(value); it != state.constants.end()) {
 		return it->second;
@@ -181,9 +200,17 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
+	bool needs_per_vertex = false;
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
+		needs_per_vertex = needs_per_vertex || binding.per_vertex;
+	}
+	if (needs_per_vertex) {
+		state.bary_coord_variable = state.builder.AllocateId();
+		state.bary_coord_no_persp_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.bary_coord_variable);
+		state.interface_variables.push_back(state.bary_coord_no_persp_variable);
 	}
 	if (state.needs_subgroup_local_invocation_id) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
@@ -241,6 +268,14 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 }
 
 void AddInputAnnotationsAndNames(EmitterState& state) {
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddName(state.bary_coord_variable, "gl_BaryCoordKHR");
+		state.builder.AddAnnotation({OpDecorate, state.bary_coord_variable, DecorationBuiltIn,
+		                             BuiltInBaryCoordKHR});
+		state.builder.AddName(state.bary_coord_no_persp_variable, "gl_BaryCoordNoPerspKHR");
+		state.builder.AddAnnotation({OpDecorate, state.bary_coord_no_persp_variable,
+		                             DecorationBuiltIn, BuiltInBaryCoordNoPerspKHR});
+	}
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddName(state.subgroup_local_invocation_id_variable,
 		                      "gl_SubgroupInvocationID");
@@ -254,6 +289,14 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Parameter) {
+			if (input.per_vertex) {
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationPerVertexKHR});
+				const auto location = PixelParameterLocation(state, input.location);
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationLocation, location});
+				continue;
+			}
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
@@ -282,7 +325,12 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 		state.builder.AddName(state.per_vertex_variable, "outPerVertex");
 		state.builder.AddAnnotation(
 		    {OpMemberDecorate, state.per_vertex_type, 0, DecorationBuiltIn, BuiltInPosition});
+		state.builder.AddAnnotation({OpMemberDecorate, state.per_vertex_type, 1,
+		                             DecorationBuiltIn, BuiltInClipDistance});
 		state.builder.AddAnnotation({OpDecorate, state.per_vertex_type, DecorationBlock});
+		state.builder.AddName(state.synthetic_depth_clip, "syntheticDepthClip");
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.synthetic_depth_clip, DecorationSpecId, 0});
 	}
 	if (state.depth_variable != 0) {
 		state.builder.AddName(state.depth_variable, "gl_FragDepth");
@@ -426,6 +474,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.ptr_input_vec3_uint          = state.builder.AllocateId();
 	state.ptr_input_vec4_uint          = state.builder.AllocateId();
 	state.ptr_input_vec4_float         = state.builder.AllocateId();
+	if (state.bary_coord_variable != 0) {
+		state.per_vertex_input_array_type = state.builder.AllocateId();
+		state.ptr_input_per_vertex_array  = state.builder.AllocateId();
+	}
 	state.sample_mask_array_type       = state.builder.AllocateId();
 	state.ptr_output_int               = state.builder.AllocateId();
 	state.ptr_output_sample_mask_array = state.builder.AllocateId();
@@ -434,6 +486,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	const auto ptr_output_vec4_uint    = state.builder.AllocateId();
 	state.per_vertex_type              = state.builder.AllocateId();
 	state.ptr_output_per_vertex        = state.builder.AllocateId();
+	if (state.per_vertex_variable != 0) {
+		state.clip_distance_array_type = state.builder.AllocateId();
+		state.synthetic_depth_clip     = state.builder.AllocateId();
+	}
 	state.storage_runtime_array_type   = state.builder.AllocateId();
 	state.storage_buffer_type          = state.builder.AllocateId();
 	state.ptr_storage_buffer           = state.builder.AllocateId();
@@ -454,6 +510,14 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.ptr_workgroup_array = state.builder.AllocateId();
 	state.ptr_workgroup_uint  = state.builder.AllocateId();
 	state.lds_variable        = state.builder.AllocateId();
+	if (IsLogicalWaveWorkgroup(state)) {
+		state.logical_wave_summary_variable = state.builder.AllocateId();
+		state.logical_wave_summary_array_type = state.builder.AllocateId();
+		state.ptr_logical_wave_summary_array = state.builder.AllocateId();
+		state.logical_wave_lane_array_type  = state.builder.AllocateId();
+		state.ptr_logical_wave_lane_array   = state.builder.AllocateId();
+		state.logical_wave_lane_variable    = state.builder.AllocateId();
+	}
 	for (auto& image: state.sampled_images) {
 		image.image_type         = state.builder.AllocateId();
 		image.sampled_image_type = state.builder.AllocateId();
@@ -478,15 +542,24 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.glsl_std450               = state.builder.AllocateId();
 
 	state.builder.AddCapability({CapabilityShader});
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddCapability({CapabilityFragmentBarycentricKHR});
+		state.builder.AddExtension("SPV_KHR_fragment_shader_barycentric");
+	}
+	if (state.per_vertex_variable != 0) {
+		state.builder.AddCapability({CapabilityClipDistance});
+	}
 	state.builder.AddCapability({CapabilitySampled1D});
 	state.builder.AddCapability({CapabilityImage1D});
 	state.builder.AddCapability({CapabilityImageQuery});
 	if (state.needs_image_gather_extended) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
-	if (std::any_of(state.storage_images.begin(),
-	                state.storage_images.begin() + StorageImageViewKindCount,
-	                [](const auto& image) { return image.variable != 0; })) {
+	if (std::any_of(state.storage_images.begin(), state.storage_images.end(),
+	                [&](const auto& image) {
+		                const auto index = static_cast<uint32_t>(&image - state.storage_images.data());
+		                return image.variable != 0 && StorageImageClassIsFormatless(state, index);
+	                })) {
 		state.builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
 		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
 	}
@@ -499,6 +572,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	}
 	if (state.needs_subgroup_shuffle) {
 		state.builder.AddCapability({CapabilityGroupNonUniformShuffle});
+	}
+	if (state.needs_sampled_image_nonuniform) {
+		state.builder.AddCapability({CapabilitySampledImageArrayNonUniformIndexing});
+		state.builder.AddExtension("SPV_EXT_descriptor_indexing");
 	}
 	if (state.needs_compute_derivatives && state.stage == ShaderType::Compute) {
 		state.builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
@@ -539,6 +616,12 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.builder.AddName(state.main_func, "main");
 	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
 		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
+	if (state.logical_wave_summary_variable != 0) {
+		state.builder.AddName(state.logical_wave_summary_variable, "logical_wave_summary");
+	}
+	if (state.logical_wave_lane_variable != 0) {
+		state.builder.AddName(state.logical_wave_lane_variable, "logical_wave_lanes");
 	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);
@@ -593,6 +676,16 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	    {OpTypePointer, state.ptr_input_vec4_uint, StorageClassInput, state.vec4_uint_type});
 	state.builder.AddType(
 	    {OpTypePointer, state.ptr_input_vec4_float, StorageClassInput, state.vec4_float_type});
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddType({OpTypeArray, state.per_vertex_input_array_type,
+		                       state.vec4_float_type, ConstantU32(state, 3)});
+		state.builder.AddType({OpTypePointer, state.ptr_input_per_vertex_array,
+		                       StorageClassInput, state.per_vertex_input_array_type});
+		state.builder.AddType({OpVariable, state.ptr_input_vec3_float,
+		                       state.bary_coord_variable, StorageClassInput});
+		state.builder.AddType({OpVariable, state.ptr_input_vec3_float,
+		                       state.bary_coord_no_persp_variable, StorageClassInput});
+	}
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddType({OpVariable, state.ptr_input_uint,
 		                       state.subgroup_local_invocation_id_variable, StorageClassInput});
@@ -610,7 +703,9 @@ void EmitHeaderAndTypes(EmitterState& state) {
 			case IR::StageInputKind::FragCoord: ptr_type = state.ptr_input_vec4_float; break;
 			case IR::StageInputKind::FrontFacing: ptr_type = state.ptr_input_bool; break;
 			case IR::StageInputKind::Parameter:
-				if (state.stage == ShaderType::Vertex) {
+				if (input.per_vertex) {
+					ptr_type = state.ptr_input_per_vertex_array;
+				} else if (state.stage == ShaderType::Vertex) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
 					const auto components = VertexParameterComponentCount(state, input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);
@@ -631,11 +726,16 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.builder.AddType(
 	    {OpTypePointer, ptr_output_vec4_uint, StorageClassOutput, state.vec4_uint_type});
 	if (state.per_vertex_variable != 0) {
-		state.builder.AddType({OpTypeStruct, state.per_vertex_type, state.vec4_float_type});
+		state.builder.AddType({OpTypeArray, state.clip_distance_array_type, state.float_type,
+		                       ConstantU32(state, 1)});
+		state.builder.AddType({OpTypeStruct, state.per_vertex_type, state.vec4_float_type,
+		                       state.clip_distance_array_type});
 		state.builder.AddType({OpTypePointer, state.ptr_output_per_vertex, StorageClassOutput,
 		                       state.per_vertex_type});
 		state.builder.AddType({OpVariable, state.ptr_output_per_vertex, state.per_vertex_variable,
 		                       StorageClassOutput});
+		state.builder.AddType(
+		    {OpSpecConstant, state.uint_type, state.synthetic_depth_clip, 0});
 	}
 	for (const auto& binding: state.outputs) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
@@ -716,7 +816,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
 		const auto storage_class =
 		    state.needs_function_lds ? StorageClassFunction : StorageClassWorkgroup;
-		const auto lds_size = ConstantU32(state, state.needs_function_lds ? 8192u : 1024u);
+		const auto lds_size = ConstantU32(state, GetLdsDwordCount(state));
 		state.builder.AddType({OpTypeArray, state.lds_array_type, state.uint_type, lds_size});
 		state.builder.AddType(
 		    {OpTypePointer, state.ptr_workgroup_array, storage_class, state.lds_array_type});
@@ -725,6 +825,28 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		if (state.stage == ShaderType::Compute) {
 			state.builder.AddType(
 			    {OpVariable, state.ptr_workgroup_array, state.lds_variable, StorageClassWorkgroup});
+			if (state.logical_wave_summary_variable != 0) {
+				const auto logical_wave_count =
+				    ConstantU32(state, std::max(state.logical_wave_count, 1u));
+				state.builder.AddType({OpTypeArray, state.logical_wave_summary_array_type,
+				                       state.uint_type, logical_wave_count});
+				state.builder.AddType({OpTypePointer, state.ptr_logical_wave_summary_array,
+				                       StorageClassWorkgroup,
+				                       state.logical_wave_summary_array_type});
+				state.builder.AddType({OpVariable, state.ptr_logical_wave_summary_array,
+				                       state.logical_wave_summary_variable,
+				                       StorageClassWorkgroup});
+			}
+			if (state.logical_wave_lane_variable != 0) {
+				const auto logical_wave_size =
+				    ConstantU32(state, std::max(state.logical_local_threads, 64u) * 2u);
+				state.builder.AddType({OpTypeArray, state.logical_wave_lane_array_type,
+				                       state.uint_type, logical_wave_size});
+				state.builder.AddType({OpTypePointer, state.ptr_logical_wave_lane_array,
+				                       StorageClassWorkgroup, state.logical_wave_lane_array_type});
+				state.builder.AddType({OpVariable, state.ptr_logical_wave_lane_array,
+				                       state.logical_wave_lane_variable, StorageClassWorkgroup});
+			}
 		}
 	}
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
@@ -765,7 +887,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		const auto view      = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
 		const bool integer   = i >= StorageImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
-		const auto format    = integer ? ImageFormatR32ui : ImageFormatUnknown;
+		const auto format = StorageImageClassIsFormatless(state, i) ? ImageFormatUnknown
+		                                                             : ImageFormatR32ui;
 		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
 		                       0, ImageSpirvArrayed(view), 0, 2, format});
 		state.builder.AddType(

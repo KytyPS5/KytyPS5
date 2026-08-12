@@ -804,6 +804,29 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return !m_gpu_modified_ranges.Intersections(vaddr, size).empty();
 }
 
+void BufferCache::DiscardGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid GPU-dirty discard range\n");
+	}
+	if (!HasGpuDirtyBytes(vaddr, size)) {
+		return;
+	}
+
+	// The page tracker is conservative, while the range set records exact byte ownership. Remove
+	// the bytes superseded by the image, then rebuild the affected page envelope so unrelated
+	// dirty buffer bytes on either edge remain protected.
+	const auto page_begin = vaddr & ~(TRACKER_PAGE_SIZE - 1u);
+	const auto range_end  = vaddr + size;
+	const auto page_end = std::min<uint64_t>(
+	    (range_end + TRACKER_PAGE_SIZE - 1u) & ~(TRACKER_PAGE_SIZE - 1u), TRACKER_ADDRESS_SIZE);
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+	for (const auto range: m_gpu_modified_ranges.Intersections(page_begin, page_end - page_begin)) {
+		m_memory_tracker.MarkRegionAsGpuModified(range.address, range.size);
+	}
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }

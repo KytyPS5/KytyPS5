@@ -5814,6 +5814,14 @@ public:
 			std::copy(std::begin(storage.fields), std::end(storage.fields),
 			          storage_descriptor.dwords.begin());
 			storage_descriptor.dword_count = 8;
+			auto clamped_mip_descriptor = storage_descriptor;
+			clamped_mip_descriptor.dwords[3] |= 1u << 16u;
+			const auto clamped_mip_binding = RenderExecutorTestAccess::ResolveTexture(
+			    executor, storage_resource, clamped_mip_descriptor);
+			Require(name, "clamped storage mip view",
+			        clamped_mip_binding.desc.view_info.base_level == 0 &&
+			            clamped_mip_binding.desc.view_info.level_count == 1,
+			        "storage view did not clamp LAST_LEVEL to its allocated backing mips");
 			auto           srgb_storage    = storage;
 			constexpr auto srgb_format =
 			    static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb);
@@ -16333,6 +16341,10 @@ void CheckSampledColorViews() {
 	Require("SampledColorViews", "atomic uint 2D storage resource",
 	        IsSupportedStorageImageResource(storage_resource),
 	        "atomic uint storage resource was rejected");
+	auto dynamic_storage_resource     = storage_resource;
+	dynamic_storage_resource.atomic   = false;
+	dynamic_storage_resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	ValidateStorageImageResource(dynamic_storage_resource, 1, 1);
 
 	char path[MAX_PATH] {};
 	Require("SampledColorViews", "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -16341,7 +16353,7 @@ void CheckSampledColorViews() {
 	     {"sampled-invalid-selector", "sampled-incompatible-format", "sampled-invalid-high",
 	      "sampled-depth-format", "sampled-depth-swizzle", "storage-incompatible-format",
 	      "storage-kind", "storage-no-write", "storage-nonuint-atomic", "storage-compare",
-	      "storage-mip", "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
+	      "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
 		std::string       command = std::string("\"") + path + "\" --image-view-death " + kind;
 		std::vector<char> mutable_command(command.begin(), command.end());
 		mutable_command.push_back('\0');
@@ -17177,6 +17189,16 @@ void CheckBasicStorageTextureDescriptor() {
 	        mip_one.BaseLevel() == 1 && mip_one.LastLevel() == 1 && mip_one.MaxMip() == 5,
 	        "PPSA01530 mip-one storage descriptor fixture is malformed");
 	ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one, 0x20000);
+	auto mip_range = max_mip;
+	mip_range.fields[3] |= (1u << 12u) | (3u << 16u);
+	Require("BasicStorageTexture", "multi-mip descriptor",
+	        mip_range.BaseLevel() == 1 && mip_range.LastLevel() == 3 &&
+	            mip_range.MaxMip() == 5,
+	        "multi-mip storage descriptor fixture is malformed");
+	ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_range, 0x20000);
+	auto dynamic_mip_resource     = Ppsa01530MaxMipStorageTextureResource();
+	dynamic_mip_resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	ValidateStorageTexture(dynamic_mip_resource, mip_one, 0x20000);
 
 	const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
 	Require("BasicStorageTexture", "PPSA02527 R16F descriptor",

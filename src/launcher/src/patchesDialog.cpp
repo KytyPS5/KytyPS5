@@ -59,8 +59,15 @@ void PatchesDialog::Load() {
 		return;
 	}
 
-	const auto patches =
-	    QJsonDocument::fromJson(file.readAll()).object().value(QStringLiteral("patches")).toArray();
+	const auto document = QJsonDocument::fromJson(file.readAll());
+	if (document.isNull() || !document.isObject()) {
+		m_status->setText(tr("Invalid patch JSON in %1.").arg(file.fileName()));
+		m_apply->setEnabled(false);
+		return;
+	}
+
+	const auto root    = document.object();
+	const auto patches = root.value(QStringLiteral("patches")).toArray();
 	for (const auto& value: patches) {
 		const auto patch = value.toObject();
 		auto* item = new QListWidgetItem(patch.value(QStringLiteral("name")).toString(), m_patches);
@@ -70,6 +77,22 @@ void PatchesDialog::Load() {
 	}
 
 	m_apply->setEnabled(!patches.isEmpty());
+	if (patches.isEmpty()) {
+		// shadPS4/ETAHen cheat files use "mods"; Kyty only reads a "patches" array.
+		if (root.contains(QStringLiteral("mods"))) {
+			m_status->setText(
+			    tr("This file uses a \"mods\" list. Kyty expects a top-level \"patches\" "
+			       "array in %1.")
+			        .arg(file.fileName()));
+		} else if (!root.contains(QStringLiteral("patches"))) {
+			m_status->setText(
+			    tr("No \"patches\" array in %1.").arg(file.fileName()));
+		} else {
+			m_status->setText(tr("Loaded 0 patch(es) from %1.").arg(file.fileName()));
+		}
+		return;
+	}
+
 	m_status->setText(tr("Loaded %1 patch(es) from %2.").arg(patches.size()).arg(file.fileName()));
 }
 

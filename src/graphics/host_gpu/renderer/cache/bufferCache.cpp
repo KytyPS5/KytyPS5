@@ -844,6 +844,8 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	// Runs at a submission boundary, the one point where flushing the recorded work is safe.
+	m_scheduler.ThrottleDeviceMemory();
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

@@ -102,6 +102,9 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	m_buffers.reserve(CommandBufferGrowStep);
 	m_buffer_ticks.reserve(CommandBufferGrowStep);
+	if (m_graphics.CanReportMemoryUsage()) {
+		m_memory_throttle_bytes = (m_graphics.GetTotalMemoryBudget() / 4) * 3;
+	}
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -238,6 +241,48 @@ void CommandScheduler::PopPendingOperations() {
 	PopPendingOperations(true);
 }
 
+void CommandScheduler::ThrottleDeviceMemory() {
+	// A deferred callback must never block; its caller is the drain loop.
+	if (m_memory_throttle_bytes == 0 || g_deferred_callback_scheduler == this || !Active() ||
+	    !m_recording) {
+		return;
+	}
+	// Bounded so a working set that genuinely exceeds the budget stalls rather than spins.
+	for (int attempt = 0; attempt < 4; attempt++) {
+		if (m_graphics.GetDeviceMemoryUsage() <= m_memory_throttle_bytes) {
+			return;
+		}
+		FinishCurrent();
+	}
+}
+
+void CommandScheduler::ThrottlePendingOperations() {
+	// A deferred callback must never block: the drain loop that would release it is its caller.
+	if (g_deferred_callback_scheduler == this) {
+		return;
+	}
+	for (;;) {
+		uint64_t oldest_tick = 0;
+		size_t   pending     = 0;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			pending = m_pending_operations.size();
+			if (pending <= MaxPendingOperations) {
+				return;
+			}
+			oldest_tick = m_pending_operations.front().tick;
+		}
+		// Must not skip ticks belonging to the buffer still being recorded: a burst queues its
+		// destroys inside one submission, so that is the whole backlog. Wait() submits it first.
+		Wait(oldest_tick);
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.size() >= pending) {
+			// No progress; do not spin.
+			return;
+		}
+	}
+}
+
 void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
 	if (refresh_gpu_tick) {
 		m_master.Refresh();
@@ -260,6 +305,7 @@ void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
 	EXIT_IF(!operation);
+	ThrottlePendingOperations();
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
 		m_pending_operations.push({std::move(operation), CurrentTick()});

@@ -54,6 +54,7 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	void                      ThrottleDeviceMemory();
 
 	[[nodiscard]] bool            Active() const noexcept { return m_current >= 0; }
 	void                          CheckActive() const;
@@ -65,6 +66,16 @@ public:
 
 private:
 	static constexpr size_t CommandBufferGrowStep = 4;
+
+	// Deferred destroys are the only thing releasing device memory, and they run only once the
+	// GPU passes their tick. Unbounded, a streaming burst allocates far past the budget while
+	// nothing can be reclaimed. Measured 0-1 in steady state, 83 at the point of exhaustion.
+	static constexpr size_t MaxPendingOperations = 32;
+
+	void ThrottlePendingOperations();
+
+	// Bytes, not object counts: pinned resources range from kilobytes to tens of megabytes.
+	uint64_t m_memory_throttle_bytes = 0;
 
 	class CommandPool {
 	public:

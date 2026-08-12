@@ -659,16 +659,24 @@ static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer,
 	const auto& ctx    = buffer.GetRegisters();
 	const auto& sh_ctx = buffer.GetShaders();
 
+	const auto& sh_regs = ctx.GetShaderRegisters();
+	const auto& ps      = sh_ctx.GetPs();
+
+	// A pixel shader that is not bound cannot be active, whatever the render targets are.
+	// This was checked only on the depth-only path below, so a draw with colour targets and
+	// no pixel shader reported active and then aborted looking up shader address 0 in the
+	// ShaderMap. Double Dragon Gaiden issues exactly that.
+	if (!ShaderAddressValid(ps.ps_regs.data_addr)) {
+		return false;
+	}
+
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count != 0 || !with_depth) {
 		return true;
 	}
 
-	const auto& sh_regs = ctx.GetShaderRegisters();
-	const auto& ps      = sh_ctx.GetPs();
-	return ShaderAddressValid(ps.ps_regs.data_addr) &&
-	       PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
+	return PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
 }
 
 enum class CbColorMode : uint8_t {

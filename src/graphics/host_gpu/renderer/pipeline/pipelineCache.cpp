@@ -131,7 +131,13 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	}
 
 	const auto& clip_control = ctx.GetClipControl();
-	EXIT_NOT_IMPLEMENTED(!clip_control.IsZClipModeRepresentable());
+	// A split z clip mode - near and far clipped differently - used to abort here. Vulkan
+	// exposes a single depthClipEnable (via VK_EXT_depth_clip_enable) covering both planes,
+	// so the split case cannot be expressed exactly without emitting a clip distance from the
+	// shader. IsZClipEnabled() already reads only the near plane, so approximating with it
+	// leaves every representable case bit-identical and costs accuracy only on the far plane
+	// of titles that split them. Aborting was strictly worse than approximating. ClipCheck
+	// logs the pair once.
 	static_params.negative_one_to_one = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable   = clip_control.IsZClipEnabled();
 	static_params.topology            = topology;

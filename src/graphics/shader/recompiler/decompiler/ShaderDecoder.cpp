@@ -646,6 +646,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCvtPknormI16F32: return "v_cvt_pknorm_i16_f32";
 		case Opcode::VCvtPknormU16F32: return "v_cvt_pknorm_u16_f32";
 		case Opcode::VCvtPkU16U32: return "v_cvt_pk_u16_u32";
+		case Opcode::VCvtPkI16I32: return "v_cvt_pk_i16_i32";
 		case Opcode::VPkMadI16: return "v_pk_mad_i16";
 		case Opcode::VPkMulLoU16: return "v_pk_mul_lo_u16";
 		case Opcode::VPkAddI16: return "v_pk_add_i16";
@@ -923,6 +924,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VInterpMovF32: return "v_interp_mov_f32";
 		case Opcode::SNop: return "s_nop";
 		case Opcode::SWaitcnt: return "s_waitcnt";
+		case Opcode::SWaitcntDepctr: return "s_waitcnt_depctr";
 		case Opcode::SBarrier: return "s_barrier";
 		case Opcode::SBranch: return "s_branch";
 		case Opcode::SCbranchScc0: return "s_cbranch_scc0";
@@ -1035,6 +1037,7 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src1).c_str()));
 		case Opcode::SNop:
 		case Opcode::SWaitcnt:
+		case Opcode::SWaitcntDepctr:
 		case Opcode::SSleep:
 		case Opcode::SSendmsg:
 		case Opcode::STtraceData:

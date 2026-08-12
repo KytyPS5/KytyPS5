@@ -174,6 +174,11 @@ uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputS
 	}
 }
 
+bool HasPerVertexInput(const EmitterState& state) {
+	return std::any_of(state.inputs.begin(), state.inputs.end(),
+	                   [](const auto& input) { return input.per_vertex; });
+}
+
 static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 	return state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr &&
 	       index < std::size(state.pixel_input_info->target_output_mode) &&
@@ -254,14 +259,22 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Parameter) {
-			const auto flat = PixelParameterIsFlat(state, input.location);
-			if (flat) {
-				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
-			}
-			if (state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr &&
-			    state.pixel_input_info->ps_no_perspective && !flat) {
+			// PerVertexKHR delivers one value per vertex of the primitive, indexed 0..2, instead
+			// of one interpolated value. Flat and NoPerspective describe how to interpolate, so
+			// they say nothing about a value that is never interpolated and must not be applied.
+			if (input.per_vertex) {
 				state.builder.AddAnnotation(
-				    {OpDecorate, input.variable_id, DecorationNoPerspective});
+				    {OpDecorate, input.variable_id, DecorationPerVertexKHR});
+			} else {
+				const auto flat = PixelParameterIsFlat(state, input.location);
+				if (flat) {
+					state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
+				}
+				if (state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr &&
+				    state.pixel_input_info->ps_no_perspective && !flat) {
+					state.builder.AddAnnotation(
+					    {OpDecorate, input.variable_id, DecorationNoPerspective});
+				}
 			}
 			const auto location = PixelParameterLocation(state, input.location);
 			state.builder.AddAnnotation(
@@ -426,6 +439,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.ptr_input_vec3_uint          = state.builder.AllocateId();
 	state.ptr_input_vec4_uint          = state.builder.AllocateId();
 	state.ptr_input_vec4_float         = state.builder.AllocateId();
+	state.vec4x3_float_type            = state.builder.AllocateId();
+	state.ptr_input_vec4x3_float       = state.builder.AllocateId();
 	state.sample_mask_array_type       = state.builder.AllocateId();
 	state.ptr_output_int               = state.builder.AllocateId();
 	state.ptr_output_sample_mask_array = state.builder.AllocateId();
@@ -478,6 +493,11 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.glsl_std450               = state.builder.AllocateId();
 
 	state.builder.AddCapability({CapabilityShader});
+	// A per-vertex fragment input needs both the capability and its extension.
+	if (HasPerVertexInput(state)) {
+		state.builder.AddCapability({CapabilityFragmentBarycentricKHR});
+		state.builder.AddExtension("SPV_KHR_fragment_shader_barycentric");
+	}
 	state.builder.AddCapability({CapabilitySampled1D});
 	state.builder.AddCapability({CapabilityImage1D});
 	state.builder.AddCapability({CapabilityImageQuery});
@@ -593,6 +613,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	    {OpTypePointer, state.ptr_input_vec4_uint, StorageClassInput, state.vec4_uint_type});
 	state.builder.AddType(
 	    {OpTypePointer, state.ptr_input_vec4_float, StorageClassInput, state.vec4_float_type});
+	state.builder.AddType(
+	    {OpTypeArray, state.vec4x3_float_type, state.vec4_float_type, ConstantU32(state, 3)});
+	state.builder.AddType({OpTypePointer, state.ptr_input_vec4x3_float, StorageClassInput,
+	                       state.vec4x3_float_type});
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddType({OpVariable, state.ptr_input_uint,
 		                       state.subgroup_local_invocation_id_variable, StorageClassInput});
@@ -615,7 +639,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 					const auto components = VertexParameterComponentCount(state, input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);
 				} else {
-					ptr_type = state.ptr_input_vec4_float;
+					ptr_type = input.per_vertex ? state.ptr_input_vec4x3_float
+					                            : state.ptr_input_vec4_float;
 				}
 				break;
 			default: break;

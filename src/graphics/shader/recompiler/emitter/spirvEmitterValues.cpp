@@ -483,12 +483,44 @@ void EmitLoadInputF32(EmitterState& state, const IR::Instruction& inst) {
 		return;
 	}
 
+	const auto chan = inst.input_info.chan & 3u;
+
+	if (input->per_vertex) {
+		// The input is one vec4 per vertex, indexed 0..2. P0 is vertex 0's value; P10 and P20 are
+		// the deltas the shader will scale by the barycentric weights, so they are differences
+		// against that same vertex - exactly the `P0 + P10*I + P20*J` the ISA describes.
+		const auto load_vertex = [&](uint32_t vertex) {
+			const auto ptr   = state.builder.AllocateId();
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, state.ptr_input_float, ptr,
+			                           input->variable_id, ConstantU32(state, vertex),
+			                           ConstantU32(state, chan)});
+			state.builder.AddFunction({OpLoad, state.float_type, value, ptr});
+			return value;
+		};
+
+		const auto base = load_vertex(0);
+		uint32_t   result = base;
+		if (inst.input_info.interp != IR::InterpParameter::P0) {
+			const auto vertex =
+			    inst.input_info.interp == IR::InterpParameter::P10 ? 1u : 2u;
+			const auto delta = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpFSub, state.float_type, delta, load_vertex(vertex), base});
+			result = delta;
+		}
+		const auto per_vertex_bits = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitcast, state.uint_type, per_vertex_bits, result});
+		EmitStoreU32(state, inst.dst, per_vertex_bits);
+		return;
+	}
+
 	const auto input_value = state.builder.AllocateId();
 	const auto component   = state.builder.AllocateId();
 	const auto bits        = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, state.vec4_float_type, input_value, input->variable_id});
 	state.builder.AddFunction(
-	    {OpCompositeExtract, state.float_type, component, input_value, inst.input_info.chan & 3u});
+	    {OpCompositeExtract, state.float_type, component, input_value, chan});
 	state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
 	EmitStoreU32(state, inst.dst, bits);
 }

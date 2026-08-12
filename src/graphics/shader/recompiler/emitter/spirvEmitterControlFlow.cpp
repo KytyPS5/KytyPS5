@@ -508,6 +508,7 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 		case IR::Opcode::PackLowHighU16: EmitPackU16(state, inst, false, true); break;
 		case IR::Opcode::PackHighHighU16: EmitPackU16(state, inst, true, true); break;
 		case IR::Opcode::PackU16U32: EmitPackU16(state, inst, false, false); break;
+		case IR::Opcode::PackI16I32: EmitPackU16(state, inst, false, false); break;
 		case IR::Opcode::CompareFalse: EmitCompareConstant(state, inst, false); break;
 		case IR::Opcode::CompareTrue: EmitCompareConstant(state, inst, true); break;
 		case IR::Opcode::CompareEqU32: EmitCompareU32(state, inst, OpIEqual); break;

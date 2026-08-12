@@ -864,6 +864,7 @@ void TestNewShaderRecompilerSoppMarkers() {
 	    EncodeSopp(0x10, 0x0f), // s_sendmsg 15
 	    EncodeSopp(0x16, 0x2a), // s_ttracedata 42
 	    EncodeSopp(0x20, 1),    // s_inst_prefetch 1
+	    EncodeSopp(0x23, 0xffe3), // s_waitcnt_depctr 0xffe3
 	    EncodeSopp(0x0a, 0),    // s_barrier
 	    EncodeSopp(0x01, 0),    // s_endpgm
 	};
@@ -885,6 +886,8 @@ void TestNewShaderRecompilerSoppMarkers() {
 	      "new decoder did not decode SOPP s_ttracedata");
 	Check(Common::ContainsStr(result.decoded_dump, "s_inst_prefetch 0x00000001"),
 	      "new decoder did not decode SOPP s_inst_prefetch");
+	Check(Common::ContainsStr(result.decoded_dump, "s_waitcnt_depctr 0x0000ffe3"),
+	      "new decoder did not decode SOPP s_waitcnt_depctr");
 	Check(Common::ContainsStr(result.decoded_dump, "s_barrier"),
 	      "new decoder did not decode SOPP s_barrier");
 	Check(Common::ContainsStr(result.ir_dump, "ControlNop null, 0x00000003"),
@@ -897,6 +900,9 @@ void TestNewShaderRecompilerSoppMarkers() {
 	      "SOPP s_ttracedata did not lower to an IR marker");
 	Check(Common::ContainsStr(result.ir_dump, "InstPrefetch null, 0x00000001"),
 	      "SOPP s_inst_prefetch did not lower to an IR marker");
+	Check(Common::ContainsStr(result.ir_dump,
+	                          "Waitcnt null, 0x0000ffe3 ; wait_kind=depctr"),
+	      "SOPP s_waitcnt_depctr did not lower to an ordering marker");
 	Check(Common::ContainsStr(result.ir_dump, "Barrier null"),
 	      "SOPP s_barrier did not lower to an IR marker");
 	Check(SpirvContainsOpcode(result.spirv, 224),
@@ -930,6 +936,13 @@ void TestNewShaderRecompilerSopkWaitcntMarkers() {
 	      "SOPK waitcnt did not lower to an IR marker");
 	Check(Common::ContainsStr(result.ir_dump, "Waitcnt null, 0x0000ffff"),
 	      "SOPK waitcnt marker immediate was not lowered as 16-bit unsigned");
+	Check(Common::ContainsStr(result.ir_dump, "wait_kind=vscnt") &&
+	          Common::ContainsStr(result.ir_dump, "wait_kind=vmcnt") &&
+	          Common::ContainsStr(result.ir_dump, "wait_kind=expcnt") &&
+	          Common::ContainsStr(result.ir_dump, "wait_kind=lgkmcnt"),
+	      "SOPK wait-counter identity was not retained in IR");
+	Check(SpirvInstructionOpcodeCount(result.spirv, 225u) == 1u,
+	      "only the constrained lgkmcnt wait should emit an LDS memory barrier");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -1133,6 +1146,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	    EncodeVop1(0x12, 66, 5 + 256),    // v_cvt_f32_ubyte1 v66, v5
 	    EncodeVop1(0x13, 67, 5 + 256),    // v_cvt_f32_ubyte2 v67, v5
 	    EncodeVop1(0x14, 68, 5 + 256),    // v_cvt_f32_ubyte3 v68, v5
+	    0x7e0822f9u,
+	    0x00040609u,                       // v_cvt_f32_ubyte0 v4, v9.word0
 	    EncodeVop1(0x2a, 11, 6 + 256),    // v_rcp_f32 v11, v6
 	    EncodeVop1(0x20, 12, 6 + 256),    // v_fract_f32 v12, v6
 	    EncodeVop1(0x21, 13, 6 + 256),    // v_trunc_f32 v13, v6
@@ -1428,6 +1443,9 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	      "new decoder did not decode old-backed V_CVT_OFF_F32_I4");
 	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte0 v65"),
 	      "new decoder did not decode old-backed V_CVT_F32_UBYTE0");
+	Check(Common::ContainsStr(result.decoded_dump,
+	                          "v_cvt_f32_ubyte0 v4, v9.sdwa(sel=4"),
+	      "new decoder did not decode V_CVT_F32_UBYTE0 SDWA source selection");
 	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte1 v66"),
 	      "new decoder did not decode old-backed V_CVT_F32_UBYTE1");
 	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_f32_ubyte2 v67"),
@@ -1731,6 +1749,9 @@ void TestNewShaderRecompilerMoreAluFamilies() {
 	      "V_CVT_F16_F32 did not lower to shared half-pack IR");
 	Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToF32 v100, v99"),
 	      "V_CVT_F32_F16 did not lower to shared half-unpack IR");
+	Check(Common::ContainsStr(result.ir_dump,
+	                          "ConvertByteU32ToF32 v4, v9.sdwa(sel=4"),
+	      "V_CVT_F32_UBYTE0 SDWA source selection did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "ConvertF16ToF32 v8, v2.sdwa(sel=5") &&
 	          Common::ContainsStr(result.ir_dump, "v2.sdwa(sel=5,sext=0).abs"),
 	      "V_CVT_F32_F16 SDWA source selector modifier did not lower to IR");
@@ -2430,6 +2451,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	    0x0686128du, // v_sub_nc_u32 v11.byte2, 13, v11; preserve other destination bytes
 	    0x261418f9u,
 	    0x0686149fu, // v_min_u32 v10.word0, 31, v12; preserve upper destination word
+	    0x4a3606f9u,
+	    0x06061506u, // v_add_nc_u32 v27.word1, v6, v3; preserve lower destination word
 	    0xbf810000u,
 	};
 
@@ -2482,6 +2505,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	      "new decoder did not decode V_SUB_NC_U32 SDWA byte-2 destination");
 	Check(Common::ContainsStr(result.decoded_dump, "v_min_u32 v10.sdwa(sel=4"),
 	      "new decoder did not decode V_MIN_U32 SDWA low-word destination");
+	Check(Common::ContainsStr(result.decoded_dump, "v_add_nc_u32 v27.sdwa(sel=5"),
+	      "new decoder did not decode V_ADD_NC_U32 SDWA high-word destination");
 	Check(!Common::ContainsStr(result.decoded_dump, "unsupported family=VOP2 opcode=0x00"),
 	      "literal/SDWA extension words were decoded as phantom VOP2 instructions");
 	Check(!Common::ContainsStr(result.decoded_dump,
@@ -2519,6 +2544,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
 	      "V_SUB_NC_U32 SDWA byte-2 destination did not lower to IR");
 	Check(Common::ContainsStr(result.ir_dump, "UMinU32 v10.sdwa(sel=4"),
 	      "V_MIN_U32 SDWA low-word destination did not lower to IR");
+	Check(Common::ContainsStr(result.ir_dump, "IAddU32 v27.sdwa(sel=5"),
+	      "V_ADD_NC_U32 SDWA high-word destination did not lower to IR");
 	Check(SpirvContainsOpcode(result.spirv, 128),
 	      "SPIR-V binary does not contain OpIAdd for U16 operations");
 	Check(SpirvContainsOpcode(result.spirv, 202),
@@ -2814,6 +2841,50 @@ void TestNewShaderRecompilerSignedMinShiftAlu() {
 	Check(SpirvContainsOpcode(result.spirv, 177), "SPIR-V binary does not contain OpSLessThan");
 	Check(SpirvContainsOpcode(result.spirv, 195),
 	      "SPIR-V binary does not contain OpShiftRightArithmetic");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerAshrrevSdwaSource() {
+	const uint32_t shader[] = {
+	    0x303202f9u,
+	    0x0c860686u, // v_ashrrev_i32 v25, s6, sign-extended v1.word0
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.decoded_dump, "v_ashrrev_i32 v25") &&
+	          Common::ContainsStr(result.decoded_dump, "v1.sdwa(sel=4,sext=1"),
+	      "V_ASHRREV_I32 did not decode its sign-extended SDWA word source");
+	Check(Common::ContainsStr(result.ir_dump, "ShiftRightArithmeticI32 v25") &&
+	          Common::ContainsStr(result.ir_dump, "v1.sdwa(sel=4,sext=1"),
+	      "V_ASHRREV_I32 did not lower its sign-extended SDWA word source");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCvtPkI16I32() {
+	const uint32_t shader[] = {
+	    0xd76b0005u,
+	    0x00022107u, // v_cvt_pk_i16_i32 v5, v7, v16
+	    0xbf810000u,
+	};
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage   = ShaderType::Compute;
+	options.dump_ir = true;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(Common::ContainsStr(result.decoded_dump, "v_cvt_pk_i16_i32 v5, v7, v16"),
+	      "V_CVT_PK_I16_I32 did not decode both signed input operands");
+	Check(Common::ContainsStr(result.ir_dump, "PackI16I32 v5, v7, v16"),
+	      "V_CVT_PK_I16_I32 did not lower to signed 16-bit packing IR");
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -4087,6 +4158,8 @@ void TestNewShaderRecompilerVintrpLowering() {
 	    EncodeVintrp(0, 10, 1, 2, 4), // v_interp_p1_f32 v10, v4, attr1.z
 	    EncodeVintrp(1, 11, 1, 2, 4), // v_interp_p2_f32 v11, v4, attr1.z
 	    EncodeVintrp(2, 12, 0, 3, 2), // v_interp_mov_f32 v12, p0, attr0.w
+	    EncodeVintrp(2, 13, 0, 0, 0), // v_interp_mov_f32 v13, p10, attr0.x
+	    EncodeVintrp(2, 14, 0, 1, 1), // v_interp_mov_f32 v14, p20, attr0.y
 	    0xbf810000u,
 	};
 
@@ -4125,6 +4198,10 @@ void TestNewShaderRecompilerVintrpLowering() {
 	Check(SpirvContainsOpcode(result.spirv, 81),
 	      "SPIR-V binary does not contain input component extraction");
 	Check(SpirvContainsOpcode(result.spirv, 124), "SPIR-V binary does not contain input bitcast");
+	Check(SpirvContainsCapability(result.spirv, 5284u),
+	      "VINTRP P10/P20 SPIR-V does not request FragmentBarycentricKHR");
+	Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u),
+	      "VINTRP P10/P20 input is not declared PerVertexKHR");
 	CheckSpirvBinaryValidates(result.spirv);
 
 	const uint32_t remapped_shader[] = {
@@ -7673,6 +7750,8 @@ int main() {
 	TestNewShaderRecompilerScalarB64Alu();
 	TestNewShaderRecompilerSignedCompareAlu();
 	TestNewShaderRecompilerSignedMinShiftAlu();
+	TestNewShaderRecompilerAshrrevSdwaSource();
+	TestNewShaderRecompilerCvtPkI16I32();
 	TestNewShaderRecompilerScalarBitfieldAlu();
 	TestNewShaderRecompilerMemoryFamilyLowering();
 	TestNewShaderRecompilerImageQueryLowering();

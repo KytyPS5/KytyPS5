@@ -365,8 +365,28 @@ void EmitControlNop(EmitterState& state, const IR::Instruction& inst) {
 }
 
 void EmitWaitcnt(EmitterState& state, const IR::Instruction& inst) {
-	(void)state;
-	(void)inst;
+	if (inst.src_count == 0 || inst.src[0].kind != IR::OperandKind::ImmediateU32) {
+		return;
+	}
+
+	const uint32_t immediate = inst.src[0].imm & 0xffffu;
+	bool           waits_for_lds = false;
+	switch (inst.waitcnt_kind) {
+		case IR::WaitcntKind::Packed:
+			waits_for_lds = ((immediate >> 8u) & 0x3fu) != 0x3fu;
+			break;
+		case IR::WaitcntKind::Lgkmcnt: waits_for_lds = immediate != 0xffffu; break;
+		case IR::WaitcntKind::Vscnt:
+		case IR::WaitcntKind::Vmcnt:
+		case IR::WaitcntKind::Expcnt:
+		case IR::WaitcntKind::Depctr: break;
+	}
+
+	if (waits_for_lds) {
+		const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+		state.builder.AddFunction(
+		    {OpMemoryBarrier, ConstantU32(state, ScopeSubgroup), ConstantU32(state, semantics)});
+	}
 }
 
 void EmitBarrier(EmitterState& state, const IR::Instruction& inst) {

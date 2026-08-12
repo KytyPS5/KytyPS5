@@ -44,6 +44,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
+	CapabilityFragmentBarycentricKHR         = 5284,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
@@ -61,6 +62,7 @@ enum : uint32_t {
 	DecorationBlock         = 2,
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
+	DecorationPerVertexKHR  = 5285,
 	DecorationFlat          = 14,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
@@ -275,6 +277,7 @@ struct InputBinding {
 	uint32_t           location        = 0;
 	uint32_t           component_count = 1;
 	uint32_t           variable_id     = 0;
+	bool               per_vertex      = false;
 	std::string        debug_name;
 };
 
@@ -352,6 +355,9 @@ struct EmitterState {
 	uint32_t                                         ptr_input_vec3_uint          = 0;
 	uint32_t                                         ptr_input_vec4_uint          = 0;
 	uint32_t                                         ptr_input_vec4_float         = 0;
+	// A per-vertex fragment input is one vec4 per vertex of the primitive.
+	uint32_t                                         vec4x3_float_type            = 0;
+	uint32_t                                         ptr_input_vec4x3_float       = 0;
 	uint32_t                                         sample_mask_array_type       = 0;
 	uint32_t                                         ptr_output_int               = 0;
 	uint32_t                                         ptr_output_sample_mask_array = 0;
@@ -708,6 +714,8 @@ uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool
                                     uint32_t use_pc, ImageViewKind view = ImageViewKind::Dim2D);
 
 uint32_t ExecutionModelForStage(ShaderType stage);
+
+bool HasPerVertexInput(const EmitterState& state);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 

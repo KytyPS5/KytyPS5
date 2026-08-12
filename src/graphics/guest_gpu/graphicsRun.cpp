@@ -1182,7 +1182,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 				     "\n",
 				     frame_num, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
-				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
+				     std::max(cs.num_thread_z, 1u), mode,
+				     Pm4::GetComputeWaveSizeFromDispatchModifier(mode),
 				     cs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
 				     oa.IsCounterEnabled() ? "true" : "false", oa.GetAddressBytes(),
 				     oa.GetSpaceAvailable());
@@ -1193,7 +1194,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
-		if (cs.wave_size == 64u) {
+		if (Pm4::GetComputeWaveSizeFromDispatchModifier(mode) == 64u) {
 			static std::atomic_bool logged_wave64_shader {false};
 			if (!logged_wave64_shader.exchange(true, std::memory_order_relaxed)) {
 				LOGF("warning: executing wave64 compute shader cs=0x%016" PRIx64 "\n",

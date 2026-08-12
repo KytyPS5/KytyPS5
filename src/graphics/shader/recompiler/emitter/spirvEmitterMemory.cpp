@@ -482,7 +482,7 @@ uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index) {
 
 uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index) {
 	const auto in_bounds = state.builder.AllocateId();
-	const auto dwords    = state.needs_function_lds ? 8192u : 1024u;
+	const auto dwords    = GetLdsDwordCount(state);
 	state.builder.AddFunction(
 	    {OpULessThan, state.bool_type, in_bounds, index, ConstantU32(state, dwords)});
 	return in_bounds;

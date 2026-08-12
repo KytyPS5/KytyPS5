@@ -121,6 +121,36 @@ bool SpirvContainsOpcode(const std::vector<uint32_t>& binary, uint32_t opcode) {
 	return false;
 }
 
+bool SpirvContainsArrayLength(const std::vector<uint32_t>& binary, uint32_t length) {
+	std::vector<uint32_t> length_ids;
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t opcode     = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (opcode == 43u && word_count == 4u && binary[i + 3] == length) {
+			length_ids.push_back(binary[i + 2]);
+		}
+		i += word_count;
+	}
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t opcode     = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (opcode == 28u && word_count == 4u &&
+		    std::find(length_ids.begin(), length_ids.end(), binary[i + 3]) != length_ids.end()) {
+			return true;
+		}
+		i += word_count;
+	}
+	return false;
+}
+
 uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t>& binary, uint32_t opcode) {
 	uint32_t count = 0;
 	for (size_t i = 5; i < binary.size();) {
@@ -5995,22 +6025,45 @@ void TestNewShaderRecompilerExecMaskHelpers() {
 }
 
 void TestComputeShaderInputWaveSize() {
-	const auto decode_wave_size = [](uint32_t rsrc1) {
-		const bool wave32 = (((rsrc1 >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-		                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u);
-		return wave32 ? 32u : 64u;
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x00000001u) == 64u,
+	      "DispatchModifier without bit 15 did not select wave64");
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x00000041u) == 64u,
+	      "DispatchModifier base flags changed wave64 selection");
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x00008001u) == 32u,
+	      "DispatchModifier bit 15 did not select wave32");
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x00008041u) == 32u,
+	      "DispatchModifier flags changed wave32 selection");
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x80000041u) == 64u,
+	      "unrelated DispatchModifier high bit changed wave selection");
+}
+
+void TestComputeShaderInputLdsReservation() {
+	const uint32_t shader[] = {
+	    EncodeDs0(0x0d), EncodeDs1(0, 0, 1), // ds_write_b32 v0, v1
+	    0xbf810000u,
 	};
 
-	constexpr uint32_t observed_wave32_rsrc1_a = 0x402c0146u;
-	constexpr uint32_t observed_wave32_rsrc1_b = 0x402c00c1u;
-	Check(decode_wave_size(observed_wave32_rsrc1_a) == 32u,
-	      "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value A");
-	Check(decode_wave_size(observed_wave32_rsrc1_b) == 32u,
-	      "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value B");
+	ShaderComputeInputInfo input_info = RegressionComputeInputInfo();
+	input_info.lds_size_dwords        = 9u * 128u;
 
-	constexpr uint32_t w32_en_bit = 1u << Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT;
-	Check(decode_wave_size(observed_wave32_rsrc1_a & ~w32_en_bit) == 64u,
-	      "cleared COMPUTE_PGM_RSRC1 W32_EN bit did not decode as wave64");
+	ShaderRecompiler::CompileOptions options;
+	options.stage              = ShaderType::Compute;
+	options.compute_input_info = &input_info;
+
+	ShaderRecompiler::CompileResult result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, result, &error), error.c_str());
+	Check(SpirvContainsArrayLength(result.spirv, 1152u),
+	      "compute SPIR-V LDS array did not use the hardware reservation size");
+	CheckSpirvBinaryValidates(result.spirv);
+
+	std::array<uint32_t, 1> shader_id_code {};
+	HW::ComputeShaderInfo   regs {};
+	regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader_id_code.data());
+	auto smaller_info       = input_info;
+	smaller_info.lds_size_dwords = 5u * 128u;
+	Check(ShaderGetIdCS(regs, input_info, false) != ShaderGetIdCS(regs, smaller_info, false),
+	      "compute shaders with different LDS reservations shared a shader cache ID");
 }
 
 void TestNewShaderRecompilerWave32MasksExecHighStores() {
@@ -7740,6 +7793,7 @@ int main() {
 	TestNewShaderRecompilerCfgIrreducibleDispatcher();
 	TestNewShaderRecompilerExecMaskHelpers();
 	TestComputeShaderInputWaveSize();
+	TestComputeShaderInputLdsReservation();
 	TestNewShaderRecompilerWave32MasksExecHighStores();
 	TestNewShaderRecompilerWave32VccHighScalarStores();
 	TestNewShaderRecompilerCompareMaskIsFullWaveBallot();

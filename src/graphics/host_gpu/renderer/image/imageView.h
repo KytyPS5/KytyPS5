@@ -2,9 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEVIEW_H_
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
+
+#include <atomic>
 
 namespace Libs::Graphics {
 
@@ -127,8 +130,51 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	       !resource.depth_compare;
 }
 
-inline void
-ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
+// A Vulkan storage image view targets exactly ONE mip level, so a shader that selects the level
+// at runtime (ImageMipMode::DynamicStorage) cannot be served exactly by widening a check. But
+// when the DESCRIPTOR exposes a single level the runtime index is degenerate - only one value
+// can be valid - so binding that level is correct by construction, not an approximation.
+[[nodiscard]] inline bool
+IsDegenerateDynamicMip(const ShaderRecompiler::IR::ImageResource& resource, uint32_t base_level,
+                       uint32_t last_level) noexcept {
+	return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
+	       base_level == last_level;
+}
+
+inline void ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource,
+                                         uint32_t base_level = 0,
+                                         uint32_t last_level = 0) noexcept {
+	if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+		auto relaxed     = resource;
+		relaxed.mip_mode = ShaderRecompiler::IR::ImageMipMode::None;
+		if (IsSupportedStorageImageResource(relaxed)) {
+			if (!IsDegenerateDynamicMip(resource, base_level, last_level)) {
+				// APPROXIMATION, and it is worth being precise about what is approximated.
+				// SPIR-V's OpImageWrite has no LOD operand, and the emitter reflects that:
+				// EmitImageMipLodU32 (spirvEmitterImageHelpers.cpp:241) has exactly ONE caller,
+				// EmitImageLoad's OpImageFetch (spirvEmitterImageOps.cpp:146) - the STORE path
+				// never reads it. So a dynamic-mip store already writes to whichever level the
+				// view targets; the mip operand is discarded regardless. Rejecting the resource
+				// never made that correct, it only turned an existing approximation into an
+				// abort.
+				//
+				// Serving it properly needs one view per level bound as a descriptor array and
+				// a switch in the shader. Until that exists, allow the write and say so: a
+				// mip-generation shader will fill one level repeatedly instead of the chain,
+				// which is a visible artefact, not corruption. Titles that do not use
+				// dynamic-mip storage images never reach this path, so nothing that works
+				// today is affected.
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+					LOGF("[img] dynamic-mip storage write over levels %u..%u is served by the "
+					     "view's own level; mip selection is ignored (needs a per-level view "
+					     "array)\n",
+					     base_level, last_level);
+				}
+			}
+			return;
+		}
+	}
 	if (!IsSupportedStorageImageResource(resource)) {
 		EXIT("unsupported storage color image resource: kind=%u dimension=%u mip=%u "
 		     "read=%d written=%d atomic=%d depth_compare=%d\n",

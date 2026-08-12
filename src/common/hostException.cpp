@@ -79,7 +79,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
-	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
+	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C ||
+	    exception_record->ExceptionCode == 0xE06D7363) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 

@@ -14944,7 +14944,7 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
 	test.name           = "ImageSampleA16CompareBiasRdna2AddressOrder";
 	test.code           = code;
 	test.opcodes        = {O::VMovB32, O::ImageSample, O::SEndpgm};
-	test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+	test.required_spirv = {"OpImageSampleExplicitLod", "UnpackHalf2x16"};
 	test.compile_only   = true;
 	return test;
 }
@@ -14982,7 +14982,7 @@ TestCase ImageGatherCompareOpcodes() {
 	test.code           = code;
 	test.opcodes        = {O::VMovB32,        O::ImageGather4C,    O::ImageGather4CLz,
 	                       O::ImageGather4CO, O::ImageGather4CLzO, O::SEndpgm};
-	test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
+	test.required_spirv = {"OpImageGather", "OpBitFieldSExtract"};
 	test.compile_only   = true;
 	return test;
 }

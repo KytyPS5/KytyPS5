@@ -45,6 +45,63 @@ uint32_t LoadStorageImageDescriptorAtIndex(EmitterState& state, uint32_t resourc
 	return image;
 }
 
+uint32_t SamplerCompareFunc(const EmitterState& state, const IR::Instruction& inst) {
+	if (inst.memory.sampler >= state.resources.samplers.size()) {
+		return 3u;
+	}
+	const auto& sampler = state.resources.samplers[inst.memory.sampler];
+	if (sampler.dword_count == 0) {
+		return 3u;
+	}
+	return (sampler.dwords[0] >> 12u) & 0x7u;
+}
+
+bool ImageUsesAluDepthCompare(const EmitterState& state, const IR::Instruction& inst) {
+	if (inst.memory.resource < state.program.info.images.size() &&
+	    state.program.info.images[inst.memory.resource].alu_depth_compare) {
+		return true;
+	}
+	// Color SAMPLE_C: only compare when the guest sampler actually has a depth-compare op.
+	// zfunc 0 (Never) is treated as a regular color sample — bitmap fonts use SAMPLE_C with
+	// a non-comparison sampler and expect the texel, not 0/1 coverage.
+	if (inst.memory.sampler >= state.resources.samplers.size()) {
+		return false;
+	}
+	const auto& sampler = state.resources.samplers[inst.memory.sampler];
+	if (sampler.dword_count == 0) {
+		return false;
+	}
+	return ((sampler.dwords[0] >> 12u) & 0x7u) != 0u;
+}
+
+uint32_t EmitAluDepthCompareF32(EmitterState& state, uint32_t sampled, uint32_t dref,
+                                uint32_t compare_func) {
+	const auto one  = ConstantF32Value(state, 1.0f);
+	const auto zero = EmitZeroF32(state);
+	switch (compare_func) {
+		case 0: return zero;
+		case 7: return one;
+		default: break;
+	}
+
+	uint32_t opcode = OpFOrdLessThanEqual;
+	switch (compare_func) {
+		case 1: opcode = OpFOrdLessThan; break;
+		case 2: opcode = OpFOrdEqual; break;
+		case 3: opcode = OpFOrdLessThanEqual; break;
+		case 4: opcode = OpFOrdGreaterThan; break;
+		case 5: opcode = OpFOrdNotEqual; break;
+		case 6: opcode = OpFOrdGreaterThanEqual; break;
+		default: break;
+	}
+
+	const auto pass = state.builder.AllocateId();
+	state.builder.AddFunction({opcode, state.bool_type, pass, sampled, dref});
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, state.float_type, result, pass, one, zero});
+	return result;
+}
+
 } // namespace
 
 uint32_t EmitImageGetResinfoComponent(EmitterState& state, uint32_t image, uint32_t size,
@@ -245,39 +302,42 @@ void AddImageSampleOperands(EmitterState& state, const IR::Instruction& inst,
 }
 
 uint32_t ImageSampleOpcode(const EmitterState& state, const IR::Instruction& inst) {
-	const auto flags        = inst.memory.image_sample_flags;
-	const bool dref         = (flags & Decoder::ImageSampleFlagCompare) != 0;
-	const bool explicit_lod = ImageSampleNeedsExplicitLod(state, inst);
-	if (explicit_lod) {
-		return dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod;
-	}
-	return dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod;
+	// GCN IMAGE_SAMPLE_C compares the sampled red/depth channel in the shader. Host sampled
+	// views are color formats (including depth sampled as R16/R32), which do not support
+	// VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT, so Vulkan Dref ops are illegal.
+	return ImageSampleNeedsExplicitLod(state, inst) ? OpImageSampleExplicitLod
+	                                                : OpImageSampleImplicitLod;
 }
 
 void EmitImageSample(EmitterState& state, const IR::Instruction& inst) {
 	const auto view          = SampledImageViewKind(state, inst.memory, inst.pc);
 	const auto sampled_image = MakeSampledImage(state, inst.memory, inst.pc, view);
 
-	const auto layout      = MakeImageSampleLayout(inst, view);
-	const auto base_coord  = EmitImageCoordF32(state, inst, layout, view);
-	const auto sample      = state.builder.AllocateId();
-	const auto dref        = HasImageSampleFlag(inst, Decoder::ImageSampleFlagCompare);
-	const bool integer     = inst.memory.kind == IR::ResourceKind::ImageUint;
-	uint32_t   result_type = state.vec4_float_type;
-	if (dref) {
-		result_type = state.float_type;
-	} else if (integer) {
-		result_type = state.vec4_uint_type;
-	}
+	const auto            layout       = MakeImageSampleLayout(inst, view);
+	const auto            base_coord   = EmitImageCoordF32(state, inst, layout, view);
+	const auto            sample       = state.builder.AllocateId();
+	const auto            dref         = HasImageSampleFlag(inst, Decoder::ImageSampleFlagCompare);
+	const bool            integer      = inst.memory.kind == IR::ResourceKind::ImageUint;
+	const auto            result_type  = integer ? state.vec4_uint_type : state.vec4_float_type;
 	const auto            explicit_lod = ImageSampleNeedsExplicitLod(state, inst);
 	const auto            opcode       = ImageSampleOpcode(state, inst);
 	std::vector<uint32_t> words        = {opcode, result_type, sample, sampled_image, base_coord};
-	if (dref) {
-		words.push_back(EmitImageDrefF32(state, inst, layout));
-	}
 	AddImageSampleOperands(state, inst, layout, explicit_lod, words);
 	state.builder.AddFunction(words);
-	EmitImageSampleResult(state, inst, sample, dref, integer);
+
+	const bool alu_compare =
+	    dref && !integer && ImageUsesAluDepthCompare(state, inst);
+	if (!alu_compare) {
+		EmitImageSampleResult(state, inst, sample, false, integer);
+		return;
+	}
+
+	const auto red = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, state.float_type, red, sample, 0});
+	const auto compared =
+	    EmitAluDepthCompareF32(state, red, EmitImageDrefF32(state, inst, layout),
+	                           SamplerCompareFunc(state, inst));
+	EmitImageSampleResult(state, inst, compared, true, false);
 }
 
 uint32_t ImageGatherComponent(uint32_t dmask) {
@@ -307,33 +367,34 @@ void EmitImageGather4(EmitterState& state, const IR::Instruction& inst) {
 	const auto view          = SampledImageViewKind(state, inst.memory, inst.pc);
 	const auto sampled_image = MakeSampledImage(state, inst.memory, inst.pc, view);
 
-	const auto            layout      = MakeImageSampleLayout(inst, view);
-	const auto            coord       = EmitImageCoordF32(state, inst, layout, view);
-	const auto            texels      = state.builder.AllocateId();
-	const auto            dref        = HasImageSampleFlag(inst, Decoder::ImageSampleFlagCompare);
-	const bool            integer     = inst.memory.kind == IR::ResourceKind::ImageUint;
-	const auto            result_type = integer ? state.vec4_uint_type : state.vec4_float_type;
-	std::vector<uint32_t> words =
-	    dref ? std::vector<uint32_t> {OpImageDrefGather,
-	                                  state.vec4_float_type,
-	                                  texels,
-	                                  sampled_image,
-	                                  coord,
-	                                  EmitImageDrefF32(state, inst, layout)}
-	         : std::vector<uint32_t> {
-	               OpImageGather, result_type,
-	               texels,        sampled_image,
-	               coord,         ConstantU32(state, ImageGatherComponent(inst.memory.dmask))};
+	const auto            layout       = MakeImageSampleLayout(inst, view);
+	const auto            coord        = EmitImageCoordF32(state, inst, layout, view);
+	const auto            texels       = state.builder.AllocateId();
+	const auto            dref         = HasImageSampleFlag(inst, Decoder::ImageSampleFlagCompare);
+	const bool            integer      = inst.memory.kind == IR::ResourceKind::ImageUint;
+	const auto            result_type  = integer ? state.vec4_uint_type : state.vec4_float_type;
+	const auto            component    = dref && ImageUsesAluDepthCompare(state, inst)
+	                                         ? 0u
+	                                         : ImageGatherComponent(inst.memory.dmask);
+	std::vector<uint32_t> words = {OpImageGather, result_type, texels, sampled_image, coord,
+	                               ConstantU32(state, component)};
 	AddImageGatherOperands(state, inst, layout, view, words);
 	state.builder.AddFunction(words);
 
+	const bool alu_compare =
+	    dref && !integer && ImageUsesAluDepthCompare(state, inst);
+	const auto dref_value   = alu_compare ? EmitImageDrefF32(state, inst, layout) : 0;
+	const auto compare_func = alu_compare ? SamplerCompareFunc(state, inst) : 0;
 	for (uint32_t i = 0; i < inst.memory.data_dwords; i++) {
-		const auto component = state.builder.AllocateId();
+		const auto gathered = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeExtract, integer ? state.uint_type : state.float_type,
-		                           component, texels, i});
-		const auto bits = integer ? component : state.builder.AllocateId();
+		                           gathered, texels, i});
+		const auto compared =
+		    alu_compare ? EmitAluDepthCompareF32(state, gathered, dref_value, compare_func)
+		                : gathered;
+		const auto bits = integer ? compared : state.builder.AllocateId();
 		if (!integer) {
-			state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+			state.builder.AddFunction({OpBitcast, state.uint_type, bits, compared});
 		}
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), bits);
 	}

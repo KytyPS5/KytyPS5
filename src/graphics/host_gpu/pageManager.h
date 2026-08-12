@@ -24,8 +24,10 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
-	void OnGpuMap(uint64_t vaddr, uint64_t size);
-	void OnGpuUnmap(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasWatchers(uint64_t vaddr) const;
+	void               ReapplyProtection(uint64_t vaddr, uint64_t size);
+	void               OnGpuMap(uint64_t vaddr, uint64_t size);
+	void               OnGpuUnmap(uint64_t vaddr, uint64_t size);
 
 private:
 	struct Impl;

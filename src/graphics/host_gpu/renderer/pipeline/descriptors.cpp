@@ -742,20 +742,13 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	return {id, nullptr, std::move(desc)};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
-                                 const ShaderRecompiler::IR::Program& program, uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+static vk::Sampler NativeSampler(RenderContext& context, const ShaderRecompiler::IR::Program&,
+                                 uint32_t, const ShaderRecompiler::IR::DescriptorValue& value) {
 	ShaderSamplerResource descriptor;
 	CopyNativeDescriptor(value, descriptor.fields);
-	const bool depth_compare = std::any_of(program.info.sampled_pairs.begin(),
-	                                       program.info.sampled_pairs.end(), [&](const auto& pair) {
-		                                       return pair.sampler == index &&
-		                                              pair.image < program.info.images.size() &&
-		                                              program.info.images[pair.image].depth_compare;
-	                                       });
-	if (!depth_compare) {
-		descriptor.fields[0] &= ~(0x7u << 12u);
-	}
+	// SAMPLE_C is lowered to a regular sample plus an ALU compare. A comparison sampler is
+	// illegal with non-Dref SPIR-V, and host sampled views are color formats anyway.
+	descriptor.fields[0] &= ~(0x7u << 12u);
 	return context.GetSamplerCache().GetSampler(descriptor);
 }
 

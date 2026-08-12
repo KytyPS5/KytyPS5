@@ -23,7 +23,10 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
+#include <Zydis/Zydis.h>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -806,11 +809,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				case CoreAccess::Write: return GpuAccess::Write;
 				case CoreAccess::Execute: return GpuAccess::Execute;
 				case CoreAccess::Unknown:
-					EXIT("unknown access type for page fault at 0x%016" PRIx64 "\n",
-					     info->access_violation_vaddr);
+					return GpuAccess::Read;
 			}
-			EXIT("invalid access type for page fault at 0x%016" PRIx64 "\n",
-			     info->access_violation_vaddr);
+			return GpuAccess::Read;
 		}();
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
@@ -1002,13 +1003,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			dump_guest_qwords("vorbis len", info->rcx);
 		}
 
-		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
-		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,
-		     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)" : ""));
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "Access violation: %s [%016" PRIx64 "] %s\n",
+		           Common::EnumName(info->access_violation_type).c_str(),
+		           info->access_violation_vaddr,
+		           (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)" : ""));
 		return false;
 	}
 
-	EXIT("Unknown exception!!! (%08" PRIx32 ")", info->native_code);
+	LOGF("Unknown exception!!! (%08" PRIx32 ")\n", info->native_code);
 	return false;
 }
 
@@ -1345,6 +1348,47 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 					std::memset(ptr, 0x90, 12);
 				}
 			}
+		}
+	}
+
+	if (size >= 2) {
+		// Only patch real `int $0x29` instructions. A byte scan false-positives inside
+		// immediates/displacements (e.g. `mov rax, [rip+0x0529CD48]` contains CD 29).
+		static ZydisDecoder decoder = [] {
+			ZydisDecoder value {};
+			ZydisDecoderInit(&value, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+			return value;
+		}();
+
+		auto* const start_ptr = reinterpret_cast<uint8_t*>(address);
+		auto*       ptr       = start_ptr;
+		auto* const end_ptr   = start_ptr + size;
+		while (ptr + 2 <= end_ptr) {
+			ZydisDecodedInstruction                                  instruction {};
+			std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands {};
+			if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+			        &decoder, ptr, static_cast<ZyanUSize>(end_ptr - ptr), &instruction,
+			        operands.data())) ||
+			    instruction.length == 0) {
+				ptr++;
+				continue;
+			}
+
+			if (instruction.mnemonic == ZYDIS_MNEMONIC_INT &&
+			    instruction.operand_count_visible >= 1 &&
+			    operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+			    operands[0].imm.value.u == 0x29) {
+				LOGF("Patch int $0x29 at addr: [%016" PRIx64 "]\n",
+				     reinterpret_cast<uint64_t>(ptr));
+				if (ptr >= start_ptr + 5 && ptr[-5] == 0xb9 && ptr[-4] == 0x0d &&
+				    ptr[-3] == 0x00 && ptr[-2] == 0x00 && ptr[-1] == 0x00) {
+					ptr[-5] = 0xc3;
+					std::memset(ptr - 4, 0x90, 4 + instruction.length);
+				} else {
+					std::memset(ptr, 0x90, instruction.length);
+				}
+			}
+			ptr += instruction.length;
 		}
 	}
 

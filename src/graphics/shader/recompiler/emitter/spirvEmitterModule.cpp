@@ -520,6 +520,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.needs_subgroup_shuffle) {
 		state.builder.AddCapability({CapabilityGroupNonUniformShuffle});
 	}
+	if (state.needs_sampled_image_nonuniform) {
+		state.builder.AddCapability({CapabilitySampledImageArrayNonUniformIndexing});
+		state.builder.AddExtension("SPV_EXT_descriptor_indexing");
+	}
 	if (state.needs_compute_derivatives && state.stage == ShaderType::Compute) {
 		state.builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
 		state.builder.AddExtension("SPV_KHR_compute_shader_derivatives");

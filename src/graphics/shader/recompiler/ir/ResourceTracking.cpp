@@ -181,12 +181,17 @@ public:
 				}
 			}
 		}
+		if (!LinkDynamicImageTables(error)) {
+			return false;
+		}
 		LinkImageAliases();
 		m_program.info = std::move(m_info);
 		for (const auto& patch: m_patches) {
 			auto& inst                  = patch.inst.get();
 			inst.memory.resource        = patch.resource;
 			inst.memory.sampler         = patch.sampler;
+			inst.memory.dynamic_resource_offset = patch.dynamic_resource_offset;
+			inst.memory.dynamic_resource_base_offset = patch.dynamic_resource_base_offset;
 			inst.memory.resource_source = ScalarProvenance::Undefined;
 			inst.memory.sampler_source  = ScalarProvenance::Undefined;
 		}
@@ -195,10 +200,20 @@ public:
 	}
 
 private:
+	struct DynamicImagePattern {
+		uint32_t table_source = ScalarProvenance::Undefined;
+		Operand  offset;
+		uint32_t base_offset = 0;
+		uint32_t table_address_offset = 0;
+		uint32_t table_address_count = 0;
+	};
+
 	struct Patch {
 		std::reference_wrapper<Instruction> inst;
 		uint32_t                            resource = 0;
 		uint32_t                            sampler  = 0;
+		Operand                             dynamic_resource_offset;
+		uint32_t                            dynamic_resource_base_offset = 0;
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& reason) const {
@@ -209,11 +224,211 @@ private:
 		return false;
 	}
 
-	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error) const {
+	uint32_t FindDescriptorSource(const DescriptorValue& descriptor) const {
+		for (uint32_t i = 0; i < m_program.provenance.descriptors.size(); i++) {
+			if (m_program.provenance.descriptors[i] == descriptor) {
+				return i + 2u;
+			}
+		}
+		return ScalarProvenance::Undefined;
+	}
+
+	const Instruction* FindScalarLoadProducer(uint32_t value) const {
+		for (const auto& block: m_program.blocks) {
+			for (const auto& inst: block.instructions) {
+				if ((inst.op == Opcode::SBufferLoadDword || inst.op == Opcode::SLoadDword) &&
+				    inst.scalar_value == value &&
+				    inst.src_count == 1) {
+					return &inst;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	bool ConstantValue(uint32_t id, uint32_t& result) const {
+		if (id >= m_program.provenance.values.size()) {
+			return false;
+		}
+		const auto& value = m_program.provenance.values[id];
+		if (value.op != ScalarValueOp::Constant) {
+			return false;
+		}
+		result = value.imm;
+		return true;
+	}
+
+	bool DecodeDirectTableOffset(uint32_t id, uint32_t& index, uint32_t& count,
+	                             uint32_t& constant) const {
+		if (id >= m_program.provenance.values.size()) {
+			return false;
+		}
+		const auto& value = m_program.provenance.values[id];
+		if (value.op == ScalarValueOp::Add) {
+			uint32_t folded = 0;
+			if (ConstantValue(value.args[0], folded) &&
+			    DecodeDirectTableOffset(value.args[1], index, count, constant)) {
+				constant += folded;
+				return true;
+			}
+			if (ConstantValue(value.args[1], folded) &&
+			    DecodeDirectTableOffset(value.args[0], index, count, constant)) {
+				constant += folded;
+				return true;
+			}
+			return false;
+		}
+		if (value.op != ScalarValueOp::ShiftLeft) {
+			return false;
+		}
+		uint32_t shift = 0;
+		if (!ConstantValue(value.args[1], shift) || shift != 5u ||
+		    value.args[0] >= m_program.provenance.values.size() ||
+		    m_program.provenance.values[value.args[0]].op != ScalarValueOp::FindLsbU32) {
+			return false;
+		}
+		// The official Prospero ISA operation s_ff1_i32_b32 selects a bit from a
+		// 32-bit source. A non-zero source therefore yields a descriptor index in [0, 31].
+		index    = value.args[0];
+		count    = 32;
+		constant = 0;
+		return true;
+	}
+
+	bool DetectDirectImageTable(const DescriptorValue& descriptor,
+	                            DynamicImagePattern& result) const {
+		if (descriptor.dword_count != 8) {
+			return false;
+		}
+		DescriptorValue table;
+		table.dword_count = 2;
+		uint32_t common_index = ScalarProvenance::Undefined;
+		uint32_t descriptor_count = 0;
+		uint32_t table_offset = 0;
+		Operand  offset_operand;
+		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
+			const auto id = descriptor.dwords[i];
+			if (id >= m_program.provenance.values.size()) {
+				return false;
+			}
+			const auto& value = m_program.provenance.values[id];
+			if (value.op != ScalarValueOp::ReadConst) {
+				return false;
+			}
+			uint32_t index = 0;
+			uint32_t count = 0;
+			uint32_t offset = 0;
+			if (!DecodeDirectTableOffset(value.args[2], index, count, offset)) {
+				return false;
+			}
+			offset += value.imm;
+			const auto* producer = FindScalarLoadProducer(id);
+			if (producer == nullptr || producer->src[0].kind != OperandKind::Register) {
+				return false;
+			}
+			if (i == 0) {
+				table.dwords[0] = value.args[0];
+				table.dwords[1] = value.args[1];
+				common_index     = index;
+				descriptor_count = count;
+				table_offset     = offset;
+				offset_operand   = producer->src[0];
+			} else if (value.args[0] != table.dwords[0] ||
+			           value.args[1] != table.dwords[1] || index != common_index ||
+			           count != descriptor_count || offset != table_offset + i * sizeof(uint32_t)) {
+				return false;
+			}
+		}
+		const auto table_source = FindDescriptorSource(table);
+		if (table_source == ScalarProvenance::Undefined ||
+		    !DescriptorSourceResolved(m_program, table_source)) {
+			return false;
+		}
+		result.table_source         = table_source;
+		result.offset               = offset_operand;
+		result.base_offset          = 0u - table_offset;
+		result.table_address_offset = table_offset;
+		result.table_address_count  = descriptor_count;
+		return true;
+	}
+
+	bool DetectDynamicImageTable(const DescriptorValue& descriptor,
+	                             DynamicImagePattern& result) const {
+		if (DetectDirectImageTable(descriptor, result)) {
+			return true;
+		}
+		if (descriptor.dword_count != 8) {
+			return false;
+		}
+		DescriptorValue table;
+		table.dword_count = 4;
+		uint32_t common_offset = ScalarProvenance::Undefined;
+		Operand  offset_operand;
+		uint32_t base_offset = 0;
+		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
+			const auto id = descriptor.dwords[i];
+			if (id >= m_program.provenance.values.size()) {
+				return false;
+			}
+			const auto& value = m_program.provenance.values[id];
+			if (value.op != ScalarValueOp::ReadConstBuffer) {
+				return false;
+			}
+			if (i == 0) {
+				std::copy_n(value.args.begin(), 4, table.dwords.begin());
+				common_offset = value.args[4];
+				base_offset   = value.imm;
+				const auto* producer = FindScalarLoadProducer(id);
+				if (producer == nullptr) {
+					return false;
+				}
+				offset_operand = producer->src[0];
+			} else {
+				if (!std::equal(value.args.begin(), value.args.begin() + 4,
+				                table.dwords.begin()) || value.args[4] != common_offset ||
+				    value.imm != base_offset + i * sizeof(uint32_t)) {
+					return false;
+				}
+				const auto* producer = FindScalarLoadProducer(id);
+				if (producer == nullptr || producer->src[0] != offset_operand) {
+					return false;
+				}
+			}
+		}
+		if ((base_offset & 31u) != 0 || offset_operand.kind != OperandKind::Register) {
+			return false;
+		}
+		std::vector<uint8_t> visited(m_program.provenance.values.size());
+		std::vector<uint32_t> path;
+		if (!ContainsUnknown(m_program.provenance, common_offset, visited, path)) {
+			return false;
+		}
+		const auto& offset_value = m_program.provenance.values[common_offset];
+		const auto shift_id = offset_value.args[1];
+		if (offset_value.op != ScalarValueOp::ShiftLeft ||
+		    shift_id >= m_program.provenance.values.size() ||
+		    m_program.provenance.values[shift_id].op != ScalarValueOp::Constant ||
+		    m_program.provenance.values[shift_id].imm != 5u) {
+			return false;
+		}
+		const auto table_source = FindDescriptorSource(table);
+		if (table_source == ScalarProvenance::Undefined ||
+		    !DescriptorSourceResolved(m_program, table_source)) {
+			return false;
+		}
+		result = {table_source, offset_operand, base_offset};
+		return true;
+	}
+
+	bool ValidateSource(uint32_t source, uint32_t dwords, uint32_t pc, std::string* error,
+	                    DynamicImagePattern* dynamic_image = nullptr) const {
 		const auto* descriptor = GetDescriptorSource(m_program, source);
 		if (descriptor == nullptr || descriptor->dword_count != dwords) {
 			return Fail(pc, error,
 			            fmt::format("descriptor source {} is missing or has wrong width", source));
+		}
+		if (dynamic_image != nullptr && DetectDynamicImageTable(*descriptor, *dynamic_image)) {
+			return true;
 		}
 		std::vector<uint8_t> visited(m_program.provenance.values.size());
 		for (uint32_t i = 0; i < descriptor->dword_count; i++) {
@@ -311,6 +526,28 @@ private:
 				}
 			}
 		}
+	}
+
+	bool LinkDynamicImageTables(std::string* error) {
+		for (auto& image: m_info.images) {
+			if (image.dynamic_table_source == ScalarProvenance::Undefined) {
+				continue;
+			}
+			if (image.dynamic_table_address_count != 0) {
+				continue;
+			}
+			const auto found = std::find_if(m_info.buffers.begin(), m_info.buffers.end(),
+			                                [&](const auto& buffer) {
+				                                return buffer.source == image.dynamic_table_source;
+			                                });
+			if (found == m_info.buffers.end()) {
+				return Fail(image.first_use_pc, error,
+				            "dynamic image table has no tracked scalar-buffer resource");
+			}
+			image.dynamic_table_buffer =
+			    static_cast<uint32_t>(found - m_info.buffers.begin());
+		}
+		return true;
 	}
 
 	uint32_t AddImage(const Instruction& inst) {
@@ -423,8 +660,9 @@ private:
 		if (!IsBuffer(inst) && !IsImage(inst)) {
 			return true;
 		}
+		DynamicImagePattern dynamic_image;
 		if (!ValidateSource(inst.memory.resource_source, IsBuffer(inst) ? 4u : 8u, inst.pc,
-		                    error)) {
+		                    error, IsImage(inst) ? &dynamic_image : nullptr)) {
 			return false;
 		}
 		const auto resource = IsBuffer(inst) ? AddBuffer(inst) : AddImage(inst);
@@ -432,6 +670,25 @@ private:
 			return Fail(inst.pc, error,
 			            IsBuffer(inst) ? "buffer resource limit exceeded"
 			                           : "image resource limit exceeded");
+		}
+		if (dynamic_image.table_source != ScalarProvenance::Undefined) {
+			auto& image = m_info.images[resource];
+			if (image.written || image.atomic || image.mip_mode != ImageMipMode::None) {
+				return Fail(inst.pc, error,
+				            "GPU-selected storage-image descriptor tables are unsupported");
+			}
+			if (image.dynamic_table_source != ScalarProvenance::Undefined &&
+			    image.dynamic_table_source != dynamic_image.table_source) {
+				return Fail(inst.pc, error, "dynamic image resource changed descriptor table");
+			}
+			if (image.dynamic_table_source != ScalarProvenance::Undefined &&
+			    (image.dynamic_table_address_offset != dynamic_image.table_address_offset ||
+			     image.dynamic_table_address_count != dynamic_image.table_address_count)) {
+				return Fail(inst.pc, error, "dynamic image resource changed descriptor table range");
+			}
+			image.dynamic_table_source = dynamic_image.table_source;
+			image.dynamic_table_address_offset = dynamic_image.table_address_offset;
+			image.dynamic_table_address_count = dynamic_image.table_address_count;
 		}
 		uint32_t sampler = 0;
 		if (NeedsSampler(inst.op)) {
@@ -446,7 +703,8 @@ private:
 				return false;
 			}
 		}
-		m_patches.push_back({std::ref(inst), resource, sampler});
+		m_patches.push_back({std::ref(inst), resource, sampler, dynamic_image.offset,
+		                     dynamic_image.base_offset});
 		return true;
 	}
 

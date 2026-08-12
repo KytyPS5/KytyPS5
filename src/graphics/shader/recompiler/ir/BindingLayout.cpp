@@ -269,7 +269,11 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 			}
 			return false;
 		}
-		image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())].push_back(i);
+		auto& resources = image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())];
+		const auto descriptor_count = program.info.images[i].HasDynamicTable()
+		                                ? program.info.images[i].dynamic_descriptor_count + 1u
+		                                : 1u;
+		resources.insert(resources.end(), descriptor_count, i);
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {

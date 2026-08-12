@@ -120,7 +120,7 @@ Instruction Export(uint32_t pc, ExportTargetKind kind, uint32_t index = 0, uint3
 
 struct TestMemory {
 	uint64_t                base = 0x1000;
-	std::array<uint32_t, 8> words {};
+	std::array<uint32_t, 256> words {};
 	uint32_t                reads      = 0;
 	uint32_t                fail_after = UINT32_MAX;
 };
@@ -1887,6 +1887,164 @@ void TestNativeBindingLayoutHonorsUserDataBase() {
 	      "native binding plan did not retain physical shifted user-SGPR indices");
 }
 
+void TestGpuSelectedImageDescriptorTable() {
+	Program program;
+	program.stage = ShaderType::Compute;
+	program.blocks.resize(1);
+	auto& insts = program.blocks[0].instructions;
+	insts.push_back(MoveImmediate(0x00, 20, 0x1000));
+	insts.push_back(MoveImmediate(0x04, 21, 32u << 16u));
+	insts.push_back(MoveImmediate(0x08, 22, 2));
+	insts.push_back(MoveImmediate(0x0c, 23, 0));
+	Instruction first_lane;
+	first_lane.pc = 0x10;
+	first_lane.op = Opcode::ReadFirstLaneU32;
+	first_lane.dst = Sgpr(26);
+	first_lane.src[0].kind = OperandKind::Register;
+	first_lane.src[0].reg = {RegisterFile::Vector, 0};
+	first_lane.src_count = 1;
+	insts.push_back(first_lane);
+	Instruction offset;
+	offset.pc = 0x14;
+	offset.op = Opcode::ShiftLeftLogicalU32;
+	offset.dst = Sgpr(26);
+	offset.src[0] = Sgpr(26);
+	offset.src[1] = Imm(5);
+	offset.src_count = 2;
+	insts.push_back(offset);
+	for (uint32_t i = 0; i < 8; i++) {
+		auto load = ScalarBufferLoad(0x18, i, 5, i * 4);
+		load.src[0] = Sgpr(26);
+		load.src_count = 1;
+		load.memory.component_index = i;
+		load.memory.component_count = 8;
+		insts.push_back(load);
+	}
+	for (uint32_t i = 0; i < 4; i++) {
+		insts.push_back(MoveImmediate(0x20 + i * 4, 8 + i, 0));
+	}
+	insts.push_back(ImageUse(0x40, Opcode::ImageSample, ResourceKind::Image,
+	                         Decoder::ImageDimension::Dim2D));
+	std::string error;
+	Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error) &&
+	          PatchSrtReads(program, &error) && TrackResources(program, &error),
+	      error.c_str());
+	Check(program.info.images.size() == 1 && program.info.buffers.size() == 1 &&
+	          program.info.images[0].dynamic_table_buffer == 0 &&
+	          insts.back().memory.dynamic_resource_offset == Sgpr(26),
+	      "GPU-selected image table was not preserved as a dense dynamic resource");
+	TestMemory memory;
+	const std::array<uint32_t, 8> texture = {
+	    0x0294dc00, 0xc4700000, 0x00b3c13f, 0x91b31fac,
+	    0x00000000, 0x00700030, 0xb07b0000, 0x0002ac3c};
+	std::copy(texture.begin(), texture.end(), memory.words.begin());
+	memory.words[13] = 3u << 27u;
+	std::array<uint32_t, 64> user_data {};
+	SrtRuntime runtime {user_data, 0, ReadTestMemory, &memory};
+	ResourceSnapshot snapshot;
+	Check(MaterializeResources(program, runtime, snapshot, &error), error.c_str());
+	Check(snapshot.image_tables.size() == 1 && snapshot.image_tables[0].size() == 3 &&
+	          snapshot.image_tables[0][0].dwords == texture &&
+	          std::all_of(snapshot.image_tables[0][1].dwords.begin(),
+	                      snapshot.image_tables[0][1].dwords.end(),
+	                      [](uint32_t value) { return value == 0; }),
+	      "dynamic image snapshot did not preserve textures and null mixed entries");
+	Check(SpecializeResources(program, snapshot, &error), error.c_str());
+	ShaderComputeInputInfo compute;
+	compute.thread_ids_num = 1;
+	Check(program.info.images[0].dynamic_descriptor_count == 2 &&
+	          CollectShaderInfo(program, {.compute = &compute}, &error) &&
+	          AllocateBindings(program, {}, &error),
+	      error.c_str());
+	const auto* binding = FindBinding(program.bindings, DescriptorBindingKind::Sampled2D);
+	Check(binding != nullptr && binding->resources == std::vector<uint32_t>({0, 0, 0}),
+	      "dynamic image table did not allocate entries plus a null sentinel");
+}
+
+void TestGpuSelectedPointerImageDescriptorTable() {
+	Program program;
+	program.stage = ShaderType::Pixel;
+	program.blocks.resize(1);
+	auto& insts = program.blocks[0].instructions;
+	insts.push_back(MoveImmediate(0x00, 26, 0x1000));
+	insts.push_back(MoveImmediate(0x04, 27, 0));
+	Instruction first_set;
+	first_set.pc = 0x08;
+	first_set.op = Opcode::FindLsbU32;
+	first_set.dst = Sgpr(19);
+	first_set.src[0] = Sgpr(100);
+	first_set.src_count = 1;
+	insts.push_back(first_set);
+	Instruction shift;
+	shift.pc = 0x0c;
+	shift.op = Opcode::ShiftLeftLogicalU32;
+	shift.dst = Sgpr(30);
+	shift.src[0] = Sgpr(19);
+	shift.src[1] = Imm(5);
+	shift.src_count = 2;
+	insts.push_back(shift);
+	Instruction base;
+	base.pc = 0x10;
+	base.op = Opcode::IAddU32;
+	base.dst = Sgpr(30);
+	base.src[0] = Sgpr(30);
+	base.src[1] = Imm(344);
+	base.src_count = 2;
+	insts.push_back(base);
+	Instruction high = base;
+	high.pc = 0x14;
+	high.dst = Sgpr(31);
+	high.src[1] = Imm(16);
+	insts.push_back(high);
+	for (uint32_t i = 0; i < 4; i++) {
+		auto load = ScalarLoad(0x18, 4 + i, 26, i * 4);
+		load.src[0] = Sgpr(30);
+		load.src_count = 1;
+		load.memory.component_index = i;
+		load.memory.component_count = 4;
+		insts.push_back(load);
+	}
+	for (uint32_t i = 0; i < 4; i++) {
+		auto load = ScalarLoad(0x20, 8 + i, 26, i * 4);
+		load.src[0] = Sgpr(31);
+		load.src_count = 1;
+		load.memory.component_index = i;
+		load.memory.component_count = 4;
+		insts.push_back(load);
+	}
+	for (uint32_t i = 0; i < 4; i++) {
+		insts.push_back(MoveImmediate(0x28 + i * 4, 12 + i, 0));
+	}
+	insts.push_back(ImageUse(0x40, Opcode::ImageSample, ResourceKind::Image,
+	                         Decoder::ImageDimension::Dim2D, 1, 3));
+	std::string error;
+	Check(BuildScalarProvenance(program, &error) && BuildSrtPlan(program, &error) &&
+	          PatchSrtReads(program, &error) && TrackResources(program, &error),
+	      error.c_str());
+	Check(program.info.images.size() == 1 && program.info.buffers.empty() &&
+	          program.info.images[0].dynamic_table_buffer == ImageResource::NoDynamicTable &&
+	          program.info.images[0].dynamic_table_address_offset == 344 &&
+	          program.info.images[0].dynamic_table_address_count == 32 &&
+	          insts.back().memory.dynamic_resource_offset == Sgpr(30) &&
+	          insts.back().memory.dynamic_resource_base_offset == 0u - 344u,
+	      "pointer-backed GPU image table was not tracked with its descriptor stride");
+	TestMemory memory;
+	memory.base = 0x1000 + 344;
+	const std::array<uint32_t, 8> texture = {
+	    0x0294dc00, 0xc4700000, 0x00b3c13f, 0x91b31fac,
+	    0x00000000, 0x00700030, 0xb07b0000, 0x0002ac3c};
+	std::copy(texture.begin(), texture.end(), memory.words.begin());
+	std::array<uint32_t, 1> user_data {};
+	SrtRuntime runtime {user_data, 0, ReadTestMemory, &memory};
+	ResourceSnapshot snapshot;
+	Check(MaterializeResources(program, runtime, snapshot, &error) &&
+	          snapshot.image_tables.size() == 1 && snapshot.image_tables[0].size() == 33 &&
+	          snapshot.image_tables[0][0].dwords == texture &&
+	          SpecializeResources(program, snapshot, &error) &&
+	          program.info.images[0].dynamic_descriptor_count == 32,
+	      error.c_str());
+}
+
 void TestTextureNullDescriptorUsesAddressBits() {
 	ShaderTextureResource texture;
 	const uint32_t        captured[8] = {0x00000000, 0xc3800000, 0x0059c09f, 0x91b00fac,
@@ -1947,6 +2105,8 @@ int main() {
 		RUN(TestNativeBindingLayoutUsesExplicitFlatMemory);
 		RUN(TestNativeBindingLayoutHonorsUserDataCount);
 		RUN(TestNativeBindingLayoutHonorsUserDataBase);
+		RUN(TestGpuSelectedImageDescriptorTable);
+		RUN(TestGpuSelectedPointerImageDescriptorTable);
 		RUN(TestTextureNullDescriptorUsesAddressBits);
 		std::cout << "ResourceTrackingTests: all cases passed\n";
 		return 0;

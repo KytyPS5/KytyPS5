@@ -43,6 +43,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniform                = 61,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
+	CapabilitySampledImageArrayNonUniformIndexing = 5307,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	StorageClassUniformConstant              = 0,
@@ -69,6 +70,7 @@ enum : uint32_t {
 	DecorationBinding       = 33,
 	DecorationDescriptorSet = 34,
 	DecorationOffset        = 35,
+	DecorationNonUniform    = 5300,
 };
 
 enum : uint32_t {
@@ -418,6 +420,7 @@ struct EmitterState {
 	bool                                             needs_subgroup_local_invocation_id    = false;
 	bool                                             needs_compute_derivatives             = false;
 	bool                                             needs_image_gather_extended           = false;
+	bool                                             needs_sampled_image_nonuniform        = false;
 	bool                                             needs_function_lds                    = false;
 	bool                                             needs_pixel_valid_mask                = false;
 	bool                                             unsupported_ir_instruction            = false;
@@ -681,6 +684,11 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
                                   const char* variable_name);
+
+uint32_t DescriptorElementPointerId(EmitterState& state, uint32_t result_ptr_type,
+                                    uint32_t variable_id, uint32_t array_index_id,
+                                    IR::DescriptorBindingKind kind, uint32_t resource,
+                                    const char* variable_name);
 
 ImageViewKind SampledImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
                                    uint32_t use_pc);

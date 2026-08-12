@@ -10,7 +10,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 uint32_t ScalarValueArgCount(ScalarValueOp op) {
 	switch (op) {
-		case ScalarValueOp::Not: return 1;
+		case ScalarValueOp::Not:
+		case ScalarValueOp::FindLsbU32: return 1;
 		case ScalarValueOp::Add:
 		case ScalarValueOp::Sub:
 		case ScalarValueOp::Mul:
@@ -509,6 +510,7 @@ private:
 			case Opcode::AddShiftLeftU32: return ScalarValueOp::AddShiftLeft;
 			case Opcode::XorAddU32: return ScalarValueOp::XorAdd;
 			case Opcode::ShiftLeftOrU32: return ScalarValueOp::ShiftLeftOr;
+			case Opcode::FindLsbU32: return ScalarValueOp::FindLsbU32;
 			default: return ScalarValueOp::Unknown;
 		}
 	}
@@ -956,6 +958,7 @@ std::string ScalarValueToString(const ScalarProvenance& provenance, uint32_t val
 		case ScalarValueOp::Phi: return fmt::format("phi{}", value);
 		case ScalarValueOp::BitFieldMaskU32:
 			return fmt::format("bfm_u32({}, {})", node.args[0], node.args[1]);
+		case ScalarValueOp::FindLsbU32: return fmt::format("ff1_u32({})", node.args[0]);
 		default: return fmt::format("value{}", value);
 	}
 }

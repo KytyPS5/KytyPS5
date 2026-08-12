@@ -176,6 +176,9 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 					CollectRegister(registers, inst.src[i].reg);
 				}
 			}
+			if (inst.memory.dynamic_resource_offset.kind == IR::OperandKind::Register) {
+				CollectRegister(registers, inst.memory.dynamic_resource_offset.reg);
+			}
 			if (IsPairDwordOpcode(inst.op)) {
 				CollectSequentialRegisters(registers, inst.dst, 2);
 				const uint32_t first_pair_src = inst.op == IR::Opcode::SelectU64 ? 1u : 0u;
@@ -450,12 +453,20 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
                                   const char* variable_name) {
+	return DescriptorElementPointerId(state, result_ptr_type, variable_id,
+	                                  ConstantU32(state, array_index), kind, resource,
+	                                  variable_name);
+}
+
+uint32_t DescriptorElementPointerId(EmitterState& state, uint32_t result_ptr_type,
+	                                uint32_t variable_id, uint32_t array_index_id,
+	                                IR::DescriptorBindingKind kind, uint32_t resource,
+	                                const char* variable_name) {
 	if (variable_id == 0) {
 		ExitDescriptorBindingFailure(state, kind, resource, variable_name);
 	}
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpAccessChain, result_ptr_type, pointer, variable_id, ConstantU32(state, array_index)});
+	state.builder.AddFunction({OpAccessChain, result_ptr_type, pointer, variable_id, array_index_id});
 	return pointer;
 }
 
@@ -548,11 +559,37 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& m
 	const auto  kind        = SampledBindingKind(integer, view);
 	const auto  binding     = ResourceForDescriptor(state, kind, mem.resource);
 	const auto& descriptors = state.sampled_images[SampledImageIndex(integer, view)];
-	const auto  pointer     = DescriptorElementPointer(
-	    state, descriptors.pointer_type, descriptors.variable, binding.array_index, kind,
+	auto descriptor_index = ConstantU32(state, binding.array_index);
+	const auto& resource   = state.program.info.images.at(mem.resource);
+	const bool dynamic     = resource.HasDynamicTable();
+	if (dynamic) {
+		auto byte_offset = EmitValueLoad(state, mem.dynamic_resource_offset);
+		if (mem.dynamic_resource_base_offset != 0) {
+			byte_offset = EmitAddU32(state, byte_offset,
+			                         ConstantU32(state, mem.dynamic_resource_base_offset));
+		}
+		const auto guest_index = state.builder.AllocateId();
+		state.builder.AddFunction({OpShiftRightLogical, state.uint_type, guest_index, byte_offset,
+		                           ConstantU32(state, 5)});
+		const auto in_bounds = state.builder.AllocateId();
+		state.builder.AddFunction({OpULessThan, state.bool_type, in_bounds, guest_index,
+		                           ConstantU32(state, resource.dynamic_descriptor_count)});
+		const auto safe_index = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, state.uint_type, safe_index, in_bounds, guest_index,
+		                           ConstantU32(state, resource.dynamic_descriptor_count)});
+		descriptor_index = EmitAddU32(state, descriptor_index, safe_index);
+	}
+	const auto pointer = DescriptorElementPointerId(
+	    state, descriptors.pointer_type, descriptors.variable, descriptor_index, kind,
 	    mem.resource, "sampled image descriptor array was not emitted");
+	if (dynamic) {
+		state.builder.AddAnnotation({OpDecorate, pointer, DecorationNonUniform});
+	}
 	const auto image = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, ImageViewImageType(state, view, integer), image, pointer});
+	if (dynamic) {
+		state.builder.AddAnnotation({OpDecorate, image, DecorationNonUniform});
+	}
 	return image;
 }
 
@@ -581,6 +618,9 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 	    {OpSampledImage,
 	     ImageViewSampledImageType(state, view, mem.kind == IR::ResourceKind::ImageUint),
 	     sampled_image, image, sampler});
+	if (state.program.info.images.at(mem.resource).HasDynamicTable()) {
+		state.builder.AddAnnotation({OpDecorate, sampled_image, DecorationNonUniform});
+	}
 	return sampled_image;
 }
 

@@ -87,6 +87,8 @@ private:
 	[[nodiscard]] static bool ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept;
 	void Upload(CommandBuffer& command, Buffer& destination, uint64_t destination_offset,
 	            const void* source, uint64_t size);
+	void UploadGuestBacking(CommandBuffer& command, Buffer& destination,
+	                        uint64_t destination_offset, uint64_t source_address, uint64_t size);
 	[[nodiscard]] CachedBuffer& GetOrCreateBuffer(CommandBuffer& command, uint64_t vaddr,
 	                                              uint64_t size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);

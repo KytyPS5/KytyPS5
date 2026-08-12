@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -931,6 +932,65 @@ static bool IsInPrtAperture(uint64_t address) {
 	}
 
 	return false;
+}
+
+static bool IsInPrtAperture(uint64_t address, uint64_t size) {
+	if (size == 0 || size > UINT64_MAX - address) {
+		return false;
+	}
+
+	Common::LockGuard lock(g_prt_aperture_mutex);
+	for (const auto& aperture: g_prt_apertures) {
+		if (aperture.size != 0 && address >= aperture.address &&
+		    size <= aperture.address + aperture.size - address) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool TryReadGpuBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr || data == nullptr ||
+	    size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+
+	// Do not take g_memory_operation_mutex here. Guest map/unmap calls can hold it while waiting
+	// synchronously for the GPU command lane. The range and backing stores synchronize their own
+	// queries, while GPU unmapping is serialized behind the active command.
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		return false;
+	}
+
+	const bool sparse = IsInPrtAperture(vaddr, size);
+	if (!sparse && std::any_of(ranges.begin(), ranges.end(),
+	                          [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
+		return false;
+	}
+
+	// PS5 PRT reads preserve resident spans and define unresident spans as zero for the GPU.
+	// Direct/flexible mappings use shared backing; private committed runtime mappings are read
+	// from their validated guest virtual addresses.
+	auto* destination = static_cast<uint8_t*>(data);
+	if (sparse) {
+		std::memset(destination, 0, static_cast<size_t>(size));
+	}
+	for (const auto& range: ranges) {
+		if (!IsCommittedRangeType(range.type)) {
+			continue;
+		}
+		auto* range_destination = destination + range.start - vaddr;
+		if (g_guest_address_space->TryReadBacking(range.start, range_destination, range.size)) {
+			continue;
+		}
+		if (!Graphics::HostMemoryRangeIsReadable(range.start, range.size)) {
+			return false;
+		}
+		std::memcpy(range_destination, reinterpret_cast<const void*>(range.start),
+		            static_cast<size_t>(range.size));
+	}
+	return true;
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {

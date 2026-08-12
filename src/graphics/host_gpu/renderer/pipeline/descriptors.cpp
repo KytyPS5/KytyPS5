@@ -27,6 +27,7 @@
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -78,6 +79,57 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+static BufferRange StorageBufferRange(RenderContext& context,
+                                      const ShaderBufferResource& descriptor) {
+	const auto address = descriptor.Base48();
+	const auto stride  = descriptor.Stride();
+	const auto records = descriptor.NumRecords();
+	if (stride != 0 && records > UINT64_MAX / stride) {
+		EXIT("storage buffer descriptor footprint overflow\n");
+	}
+	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	if (address == 0 || requested_size == 0) {
+		return {};
+	}
+	const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+	const auto& graphics  = context.GetGraphics();
+	const auto  alignment = graphics.StorageMinAlignment();
+	if (alignment == 0 || size == 0 ||
+	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
+		EXIT("storage buffer range or device alignment is unsupported\n");
+	}
+	return {.address = address, .size = size};
+}
+
+static BufferRange AddressBufferRange(
+    RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
+    const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
+	if (address.binding_base == 0) {
+		return {};
+	}
+	if (resource.written) {
+		EXIT("writable address resources are unsupported\n");
+	}
+	const auto limit =
+	    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
+	        ? ShaderRecompiler::IR::FlatAddressWindowSize
+	        : static_cast<uint64_t>(
+	              context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	uint64_t size = 0;
+	if (!HostMemoryQueryRange(address.binding_base, limit, HostMemoryAccess::Mapped, size)) {
+		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
+		     address.binding_base);
+	}
+	const auto& graphics  = context.GetGraphics();
+	const auto  alignment = graphics.StorageMinAlignment();
+	if (alignment == 0 || size == 0 ||
+	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
+	    BufferCache::GetBufferOffset(address.binding_base) % alignment != 0) {
+		EXIT("address resource range or alignment is unsupported\n");
+	}
+	return {.address = address.binding_base, .size = size};
+}
+
 static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& command_buffer,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -85,17 +137,13 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	BufferView result;
 	buffer_offset = 0;
 
-	const auto address = descriptor.Base48();
-	const auto stride  = descriptor.Stride();
-	const auto records = descriptor.NumRecords();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("storage buffer descriptor footprint overflow\n");
-	}
-	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || size == 0) {
+	const auto range = StorageBufferRange(context, descriptor);
+	if (range.address == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
+	const auto address = range.address;
+	const auto size    = range.size;
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||
@@ -123,38 +171,35 @@ NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
                     const ShaderRecompiler::IR::AddressResource&           resource,
                     const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
 	BufferView result;
-	if (address.binding_base == 0) {
+	const auto range = AddressBufferRange(context, resource, address);
+	if (range.address == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
-	if (resource.written) {
-		EXIT("writable address resources are unsupported\n");
-	}
-	const auto limit =
-	    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
-	        ? ShaderRecompiler::IR::FlatAddressWindowSize
-	        : static_cast<uint64_t>(
-	              context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
-	uint64_t   size   = 0;
-	const auto access = HostMemoryAccess::Mapped;
-	if (!HostMemoryQueryRange(address.binding_base, limit, access, size)) {
-		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
-		     address.binding_base);
-	}
-	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
-	    BufferCache::GetBufferOffset(address.binding_base) % alignment != 0) {
-		EXIT("address resource range or alignment is unsupported\n");
-	}
-	auto binding =
-	    context.GetBufferCache().ObtainBuffer(command_buffer, address.binding_base, size);
+	auto binding = context.GetBufferCache().ObtainBuffer(command_buffer, range.address, range.size);
 	result.owner  = std::move(binding.owner);
 	result.buffer = binding.buffer;
 	result.offset = binding.offset;
-	result.range  = static_cast<vk::DeviceSize>(size);
+	result.range  = static_cast<vk::DeviceSize>(range.size);
 	return result;
+}
+
+static void CollectNativeBufferRanges(RenderContext& context,
+                                      const DescriptorCache::PreparedBindings& prepared,
+                                      std::vector<BufferRange>& ranges) {
+	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
+	const auto& program  = *prepared.program;
+	const auto& snapshot = *prepared.snapshot;
+	ranges.reserve(ranges.size() + program.info.buffers.size() + program.info.addresses.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		ShaderBufferResource descriptor;
+		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
+		ranges.push_back(StorageBufferRange(context, descriptor));
+	}
+	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
+		ranges.push_back(
+		    AddressBufferRange(context, program.info.addresses[i], snapshot.addresses[i]));
+	}
 }
 
 static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageResource& resource) {
@@ -404,8 +449,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
-	       descriptor.BaseLevel() == descriptor.LastLevel() &&
-	       descriptor.LastLevel() <= descriptor.MaxMip() && descriptor.MinLod() == 0 &&
+	       descriptor.BaseLevel() <= descriptor.LastLevel() &&
+	       descriptor.BaseLevel() <= descriptor.MaxMip() && descriptor.MinLod() == 0 &&
 	       supported_swizzle && descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
@@ -429,8 +474,17 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
-	const auto format        = descriptor.Format();
-	const bool resource_ok   = IsSupportedStorageImageResource(resource);
+	const auto format = descriptor.Format();
+	// Same allowance as ValidateStorageImageResource: a dynamic-mip storage write is served by
+	// the view's own level, because OpImageWrite carries no LOD operand and the emitter never
+	// reads the mip for stores. This call site uses the raw predicate, so relaxing only the
+	// wrapper would leave it aborting here and the fix would read as no fix at all - the two
+	// must agree.
+	auto resource_for_check = resource;
+	if (resource_for_check.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+		resource_for_check.mip_mode = ShaderRecompiler::IR::ImageMipMode::None;
+	}
+	const bool resource_ok   = IsSupportedStorageImageResource(resource_for_check);
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(descriptor);
 	const bool uint_resource =
@@ -608,7 +662,14 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	CopyNativeDescriptor(value, descriptor.fields);
 	const bool storage = resource.written;
 	if (storage) {
-		ValidateStorageImageResource(resource);
+		// Clamp the descriptor's last level to the chain it declares before asking whether the
+		// runtime mip selection is degenerate; the hardware clamps LAST_LEVEL to MAX_MIP, so a
+		// descriptor naming last=9 over max_mip=8 addresses a single real level and must not
+		// look like a multi-level selection here.
+		const uint32_t base_level = descriptor.BaseLevel();
+		const uint32_t last_level =
+		    std::min<uint32_t>(descriptor.LastLevel(), descriptor.MaxMip());
+		ValidateStorageImageResource(resource, base_level, last_level);
 	}
 
 	auto& texture_cache = m_context.GetTextureCache();
@@ -627,11 +688,13 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
+	const auto effective_last_level =
+	    multisampled ? last_level : std::min<uint32_t>(last_level, levels - 1u);
 	const auto tile         = descriptor.TileMode();
 	const bool depth_tile   = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile    = depth_tile || tile == Prospero::TileMode::kRenderTarget;
 	const bool msaa_array   = type == Prospero::ImageType::kColor2DMsaaArray;
-	if ((!multisampled && (base_level > last_level || last_level >= levels)) ||
+	if ((!multisampled && (base_level > last_level || base_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
 	      descriptor.MaxMip() != last_level || !msaa_tile ||
@@ -650,7 +713,7 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
-	    multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
+	    multisampled ? 1u : static_cast<uint32_t>(effective_last_level - base_level) + 1u;
 	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format = descriptor.Format();
 	const bool sampled_numeric_class =
@@ -824,10 +887,20 @@ DescriptorCache::PreparedBindings RenderExecutor::PrepareBindings(CommandBuffer&
 	auto& descriptors     = prepared.resources;
 	descriptors.buffers.reserve(program.info.buffers.size());
 	descriptors.images.reserve(program.info.images.size());
+	descriptors.image_tables.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		descriptors.images.push_back(binding);
+		if (program.info.images[i].HasDynamicTable()) {
+			auto& table = descriptors.image_tables[i];
+			table.reserve(snapshot.image_tables[i].size());
+			for (const auto& value: snapshot.image_tables[i]) {
+				auto entry = ResolveTexture(program.info.images[i], value);
+				BindImage(entry.image_id, false);
+				table.push_back(std::move(entry));
+			}
+		}
 	}
 	descriptors.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -859,6 +932,9 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
+	std::vector<BufferRange> ranges;
+	CollectNativeBufferRanges(m_context, prepared, ranges);
+	m_context.GetBufferCache().PrepareBufferRanges(buffer, ranges);
 
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
@@ -890,24 +966,37 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 	const auto& snapshot = *prepared.snapshot;
 	auto&       images   = prepared.resources.images;
 	EXIT_IF(images.size() != program.info.images.size());
+	EXIT_IF(prepared.resources.image_tables.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.ResolveOwner(images[i].image_id);
+	const auto Rebind = [&](const ShaderRecompiler::IR::ImageResource& resource,
+	                        const ShaderRecompiler::IR::DescriptorValue& value,
+	                        DescriptorCache::TextureBinding& binding) {
+		const auto old_image = texture_cache.ResolveOwner(binding.image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+			binding = ResolveTexture(resource, value);
+			BindImage(binding.image_id,
+			          binding.desc.type == TextureCache::BindingType::Storage);
 		}
-		auto& binding      = images[i];
 		binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+	};
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		Rebind(program.info.images[i], snapshot.images[i], images[i]);
+		if (!program.info.images[i].HasDynamicTable()) {
+			continue;
+		}
+		auto& table = prepared.resources.image_tables[i];
+		EXIT_IF(table.size() != snapshot.image_tables[i].size());
+		for (uint32_t entry = 0; entry < table.size(); entry++) {
+			Rebind(program.info.images[i], snapshot.image_tables[i][entry], table[entry]);
+		}
 	}
 }
 
@@ -918,11 +1007,19 @@ RenderExecutor::PrepareGraphicsBindings(CommandBuffer& buffer, const ShaderStage
 	    .vertex = PrepareBindings(buffer, vertex, vk::ShaderStageFlagBits::eVertex,
 	                              DescriptorCache::Stage::Vertex),
 	};
-	RebindBuffers(buffer, bindings.vertex);
-	RebindImages(buffer, bindings.vertex);
 	if (pixel_active) {
 		bindings.pixel.emplace(PrepareBindings(buffer, pixel, vk::ShaderStageFlagBits::eFragment,
 		                                       DescriptorCache::Stage::Pixel));
+	}
+	std::vector<BufferRange> ranges;
+	CollectNativeBufferRanges(m_context, bindings.vertex, ranges);
+	if (bindings.pixel.has_value()) {
+		CollectNativeBufferRanges(m_context, *bindings.pixel, ranges);
+	}
+	m_context.GetBufferCache().PrepareBufferRanges(buffer, ranges);
+	RebindBuffers(buffer, bindings.vertex);
+	RebindImages(buffer, bindings.vertex);
+	if (bindings.pixel.has_value()) {
 		RebindBuffers(buffer, *bindings.pixel);
 		RebindImages(buffer, *bindings.pixel);
 	}
@@ -977,9 +1074,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 	}
 
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto&       image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
-		auto&       binding = descriptors.images[i];
+	const auto TransitBinding = [&](DescriptorCache::TextureBinding& binding) {
+		auto&       image   = m_context.GetTextureCache().GetImage(binding.image_id);
 		const auto& view    = binding.desc.view_info;
 		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 		                                   view.layer_count};
@@ -1007,6 +1103,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 		}
 		binding.layout = image.backing.state.layout;
+	};
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		TransitBinding(descriptors.images[i]);
+		if (!program.info.images[i].HasDynamicTable()) {
+			continue;
+		}
+		for (auto& binding: descriptors.image_tables[i]) {
+			TransitBinding(binding);
+		}
 	}
 
 	if (!program.bindings.descriptors.empty()) {

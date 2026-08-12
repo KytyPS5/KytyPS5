@@ -26,6 +26,11 @@ struct BufferBinding {
 	uint64_t              offset = 0;
 };
 
+struct BufferRange {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
 struct ImageBufferSource {
 	Buffer*  buffer = nullptr;
 	uint64_t offset = 0;
@@ -49,6 +54,7 @@ public:
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,
 	                                         bool is_formatted = false);
+	void PrepareBufferRanges(CommandBuffer& command, std::span<const BufferRange> ranges);
 	[[nodiscard]] StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept;
 	[[nodiscard]] Buffer&       GetGdsBuffer() noexcept { return m_gds_buffer; }
 	[[nodiscard]] const Buffer& GetGdsBuffer() const noexcept { return m_gds_buffer; }

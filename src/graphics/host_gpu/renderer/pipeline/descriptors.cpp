@@ -30,9 +30,11 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -91,7 +93,7 @@ static BufferRange StorageBufferRange(RenderContext& context,
 	if (address == 0 || requested_size == 0) {
 		return {};
 	}
-	const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+	const auto size       = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 || size == 0 ||
@@ -146,10 +148,6 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	const auto size    = range.size;
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range or device alignment is unsupported\n");
-	}
 	auto binding = context.GetBufferCache().ObtainBuffer(
 	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
 	const auto aligned_offset = binding.offset - binding.offset % alignment;
@@ -197,8 +195,8 @@ static void CollectNativeBufferRanges(RenderContext& context,
 		ranges.push_back(StorageBufferRange(context, descriptor));
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
-		ranges.push_back(
-		    AddressBufferRange(context, program.info.addresses[i], snapshot.addresses[i]));
+		ranges.push_back(AddressBufferRange(context, program.info.addresses[i],
+		                                    snapshot.addresses[i]));
 	}
 }
 
@@ -285,9 +283,9 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	const auto pitch =
 	    multisampled ? TileGetDepthPitch(width, image.info.bytes_per_block, descriptor.LastLevel())
 	                 : TileGetTexturePitch(descriptor.Format(), width, descriptor.TileMode());
-	const bool supported_2d    = type == Prospero::ImageType::kColor2D &&
-	                             image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
-	                             descriptor.BaseArray5() == 0;
+	const bool supported_2d = type == Prospero::ImageType::kColor2D &&
+	                          image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
+	                          descriptor.BaseArray5() == 0;
 	const bool supported_array = type == Prospero::ImageType::kColor2DArray &&
 	                             descriptor.BaseArray5() <= descriptor.Depth() &&
 	                             descriptor.Depth() < image.info.resources.layers;
@@ -296,9 +294,9 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	    image.info.resources.layers % 6u == 0 &&
 	    static_cast<uint32_t>(descriptor.Depth()) + 1u == image.info.resources.layers &&
 	    descriptor.BaseArray5() == 0;
-	const bool supported_msaa_2d    = type == Prospero::ImageType::kColor2DMsaa &&
-	                                  image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
-	                                  descriptor.BaseArray5() == 0;
+	const bool supported_msaa_2d = type == Prospero::ImageType::kColor2DMsaa &&
+	                               image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
+	                               descriptor.BaseArray5() == 0;
 	const bool supported_msaa_array = type == Prospero::ImageType::kColor2DMsaaArray &&
 	                                  descriptor.BaseArray5() <= descriptor.Depth() &&
 	                                  descriptor.Depth() < image.info.resources.layers;
@@ -459,12 +457,12 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	constexpr uint32_t field5_expected      = 0x00700000u;
 	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
-	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
-	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
-	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
-	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
-	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
-	const uint32_t     expected_field4 =
+	const uint32_t     expected_field3      = descriptor.DstSelXYZW() |
+	                                 (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
+	                                 (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
+	                                 (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
+	                                 (static_cast<uint32_t>(descriptor.Type()) << 28u);
+	const uint32_t expected_field4 =
 	    descriptor.Depth() | (static_cast<uint32_t>(descriptor.BaseArray5()) << 16u);
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
@@ -474,17 +472,8 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
-	const auto format = descriptor.Format();
-	// Same allowance as ValidateStorageImageResource: a dynamic-mip storage write is served by
-	// the view's own level, because OpImageWrite carries no LOD operand and the emitter never
-	// reads the mip for stores. This call site uses the raw predicate, so relaxing only the
-	// wrapper would leave it aborting here and the fix would read as no fix at all - the two
-	// must agree.
-	auto resource_for_check = resource;
-	if (resource_for_check.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
-		resource_for_check.mip_mode = ShaderRecompiler::IR::ImageMipMode::None;
-	}
-	const bool resource_ok   = IsSupportedStorageImageResource(resource_for_check);
+	const auto format        = descriptor.Format();
+	const bool resource_ok   = IsSupportedStorageImageResource(resource);
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(descriptor);
 	const bool uint_resource =
@@ -662,14 +651,7 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	CopyNativeDescriptor(value, descriptor.fields);
 	const bool storage = resource.written;
 	if (storage) {
-		// Clamp the descriptor's last level to the chain it declares before asking whether the
-		// runtime mip selection is degenerate; the hardware clamps LAST_LEVEL to MAX_MIP, so a
-		// descriptor naming last=9 over max_mip=8 addresses a single real level and must not
-		// look like a multi-level selection here.
-		const uint32_t base_level = descriptor.BaseLevel();
-		const uint32_t last_level =
-		    std::min<uint32_t>(descriptor.LastLevel(), descriptor.MaxMip());
-		ValidateStorageImageResource(resource, base_level, last_level);
+		ValidateStorageImageResource(resource);
 	}
 
 	auto& texture_cache = m_context.GetTextureCache();
@@ -688,12 +670,16 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
+	// Agc::Core::Texture keeps the allocated mip count (MAX_MIP) separate from the
+	// addressable range (BASE_LEVEL/LAST_LEVEL). Official SDK code, including psfx_ssr,
+	// can set LAST_LEVEL one past MAX_MIP; the texture unit clamps that range to the
+	// allocated chain. Mirror that behavior when constructing the bounded Vulkan view.
 	const auto effective_last_level =
 	    multisampled ? last_level : std::min<uint32_t>(last_level, levels - 1u);
-	const auto tile         = descriptor.TileMode();
-	const bool depth_tile   = tile == Prospero::TileMode::kDepth;
-	const bool msaa_tile    = depth_tile || tile == Prospero::TileMode::kRenderTarget;
-	const bool msaa_array   = type == Prospero::ImageType::kColor2DMsaaArray;
+	const auto tile       = descriptor.TileMode();
+	const bool depth_tile = tile == Prospero::TileMode::kDepth;
+	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
+	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
 	if ((!multisampled && (base_level > last_level || base_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
@@ -727,10 +713,10 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(format), address);
 	}
 
-	const bool    volume       = type == Prospero::ImageType::kColor3D;
-	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
-	                             type == Prospero::ImageType::kColor2DArray ||
-	                             type == Prospero::ImageType::kColor2DMsaaArray;
+	const bool volume  = type == Prospero::ImageType::kColor3D;
+	const bool layered = type == Prospero::ImageType::kColor1DArray ||
+	                     type == Prospero::ImageType::kColor2DArray ||
+	                     type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
 	uint32_t      pitch        = 0;
 	TileSizeAlign size {};
@@ -744,6 +730,49 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		}
 		size.size *= image_layers;
 	} else {
+		// The SDK reports texture SizeAlign sizes as uint64_t, while Kyty's legacy tiler result is
+		// still 32-bit. Inspect the 64-bit tiled layout before entering that compatibility API so a
+		// valid-but-unsupported large SDK texture produces an actionable descriptor diagnostic
+		// rather than the generic TileGetTextureTotalSize overflow assertion.
+		uint64_t required_size = 0;
+		if (tile != Prospero::TileMode::kLinear) {
+			TileSurfaceLayout            layout {};
+			const TileSurfaceDescription description {
+			    format,
+			    tile,
+			    volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+			    width,
+			    height,
+			    volume ? depth : 1u,
+			    levels,
+			    volume ? 1u : image_layers,
+			};
+			if (TileGetTiledTextureLayout(description, layout)) {
+				required_size = layout.total_size;
+			}
+		} else {
+			TileTextureElementLayout element {};
+			if (TileGetTextureElementLayout(format, element)) {
+				const auto elements_w =
+				    (static_cast<uint64_t>(width) + element.texel_width - 1u) / element.texel_width;
+				const auto elements_h =
+				    (static_cast<uint64_t>(height) + element.texel_height - 1u) /
+				    element.texel_height;
+				required_size =
+				    elements_w * elements_h * element.bytes * (volume ? depth : image_layers);
+			}
+		}
+		if (required_size > UINT32_MAX) {
+			EXIT("unsupported texture footprint: required=0x%016" PRIx64
+			     " legacy_limit=0xffffffff extent=%ux%ux%u levels=%u layers=%u format=%u "
+			     "tile=%u type=%u dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     required_size, width, height, volume ? depth : 1u, levels, image_layers,
+			     static_cast<uint32_t>(format), static_cast<uint32_t>(tile),
+			     static_cast<uint32_t>(descriptor.Type()), descriptor.fields[0],
+			     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+			     descriptor.fields[7]);
+		}
 		pitch = TileGetTexturePitch(format, width, tile);
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels, tile,
 		                        volume, size);
@@ -779,8 +808,9 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, storage, view_levels,
-	                                 desc.info.resources.layers);
+	const auto descriptor_view_levels = storage ? 1u : view_levels;
+	desc.view_info                    = TextureViewInfo(resource, descriptor, view_format, storage,
+	                                                    descriptor_view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc);
@@ -802,7 +832,11 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	DescriptorCache::TextureBinding binding {id, nullptr, std::move(desc)};
+	if (storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+		binding.storage_mip_count = view_levels;
+	}
+	return binding;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -967,25 +1001,36 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 	auto&       images   = prepared.resources.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	EXIT_IF(prepared.resources.image_tables.size() != program.info.images.size());
-	auto& texture_cache = m_context.GetTextureCache();
-	const auto Rebind = [&](const ShaderRecompiler::IR::ImageResource& resource,
-	                        const ShaderRecompiler::IR::DescriptorValue& value,
-	                        DescriptorCache::TextureBinding& binding) {
-		const auto old_image = texture_cache.ResolveOwner(binding.image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
-			binding = ResolveTexture(resource, value);
-			BindImage(binding.image_id,
-			          binding.desc.type == TextureCache::BindingType::Storage);
-		}
-		binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
-		auto&      image   = texture_cache.GetImage(binding.image_id);
-		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		image.usage.storage |= storage;
-		image.usage.texture |= !storage;
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto Rebind        = [&](const ShaderRecompiler::IR::ImageResource&   resource,
+                            const ShaderRecompiler::IR::DescriptorValue& value,
+                            DescriptorCache::TextureBinding&             binding) {
+        const auto old_image = texture_cache.ResolveOwner(binding.image_id);
+        if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
+            old_image->binding.needs_rebind) {
+            if (old_image != nullptr) {
+                old_image->binding = {};
+            }
+            binding = ResolveTexture(resource, value);
+            BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+        }
+        binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+        binding.storage_mip_views.fill(binding.image_view);
+        for (uint32_t mip = 1; mip < binding.storage_mip_count; mip++) {
+            auto mip_desc                  = binding.desc;
+            mip_desc.view_info.base_level  = binding.desc.view_info.base_level + mip;
+            mip_desc.view_info.level_count = 1;
+            binding.storage_mip_views[mip] = texture_cache.FindTexture(binding.image_id, mip_desc);
+        }
+        for (uint32_t mip = binding.storage_mip_count;
+             mip < ShaderRecompiler::IR::MaxStorageImageMipLevels; mip++) {
+            binding.storage_mip_views[mip] =
+                binding.storage_mip_views[binding.storage_mip_count - 1u];
+        }
+        auto&      image   = texture_cache.GetImage(binding.image_id);
+        const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+        image.usage.storage |= storage;
+        image.usage.texture |= !storage;
 	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		Rebind(program.info.images[i], snapshot.images[i], images[i]);
@@ -1075,11 +1120,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	const auto TransitBinding = [&](DescriptorCache::TextureBinding& binding) {
-		auto&       image   = m_context.GetTextureCache().GetImage(binding.image_id);
-		const auto& view    = binding.desc.view_info;
-		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+		auto&       image       = m_context.GetTextureCache().GetImage(binding.image_id);
+		const auto& view        = binding.desc.view_info;
+		const bool  storage     = binding.desc.type == TextureCache::BindingType::Storage;
+		const auto  level_count = storage ? binding.storage_mip_count : view.level_count;
+		const ImageSubresourceRange range {view.base_level, level_count, view.base_layer,
 		                                   view.layer_count};
-		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		if (image.info.data.Empty()) {
 			image.Transit(vk::ImageLayout::eGeneral,
 			              storage

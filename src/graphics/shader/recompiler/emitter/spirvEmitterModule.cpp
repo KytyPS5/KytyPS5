@@ -12,6 +12,24 @@ uint32_t DescriptorCount(const EmitterState& state, IR::DescriptorBindingKind ki
 	return binding != nullptr ? static_cast<uint32_t>(binding->resources.size()) : 0;
 }
 
+static bool StorageImageClassUsesAtomics(const EmitterState& state, bool integer,
+	                                     ImageViewKind view) {
+	const auto* binding = DescriptorBinding(state, StorageBindingKind(integer, view));
+	if (binding == nullptr) {
+		return false;
+	}
+	return std::any_of(binding->resources.begin(), binding->resources.end(), [&](uint32_t resource) {
+		return resource < state.program.info.images.size() &&
+		       state.program.info.images[resource].atomic;
+	});
+}
+
+static bool StorageImageClassIsFormatless(const EmitterState& state, uint32_t index) {
+	const auto view    = static_cast<ImageViewKind>(index % StorageImageViewKindCount);
+	const bool integer = index >= StorageImageViewKindCount;
+	return !integer || !StorageImageClassUsesAtomics(state, true, view);
+}
+
 uint32_t ConstantU32(EmitterState& state, uint32_t value) {
 	if (auto it = state.constants.find(value); it != state.constants.end()) {
 		return it->second;
@@ -504,9 +522,12 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.needs_image_gather_extended) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
-	if (std::any_of(state.storage_images.begin(),
-	                state.storage_images.begin() + StorageImageViewKindCount,
-	                [](const auto& image) { return image.variable != 0; })) {
+	if (std::any_of(state.storage_images.begin(), state.storage_images.end(),
+	                [&](const auto& image) {
+		                const auto index =
+		                    static_cast<uint32_t>(&image - state.storage_images.data());
+		                return image.variable != 0 && StorageImageClassIsFormatless(state, index);
+	                })) {
 		state.builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
 		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
 	}
@@ -745,7 +766,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
 		const auto storage_class =
 		    state.needs_function_lds ? StorageClassFunction : StorageClassWorkgroup;
-		const auto lds_size = ConstantU32(state, state.needs_function_lds ? 8192u : 1024u);
+		const auto lds_size = ConstantU32(state, GetLdsDwordCount(state));
 		state.builder.AddType({OpTypeArray, state.lds_array_type, state.uint_type, lds_size});
 		state.builder.AddType(
 		    {OpTypePointer, state.ptr_workgroup_array, storage_class, state.lds_array_type});
@@ -794,7 +815,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		const auto view      = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
 		const bool integer   = i >= StorageImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
-		const auto format    = integer ? ImageFormatR32ui : ImageFormatUnknown;
+		const auto format = StorageImageClassIsFormatless(state, i) ? ImageFormatUnknown
+		                                                             : ImageFormatR32ui;
 		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
 		                       0, ImageSpirvArrayed(view), 0, 2, format});
 		state.builder.AddType(

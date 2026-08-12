@@ -884,7 +884,9 @@ static void ShaderGetStaticInputInfoPS(
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
+	                                   uint32_t guest_wave_size,
                                        ShaderComputeInputInfo& info) {
+	EXIT_NOT_IMPLEMENTED(guest_wave_size != 32u && guest_wave_size != 64u);
 	info = {};
 
 	info.threads_num[0] = regs.cs_regs.num_thread_x;
@@ -893,9 +895,11 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.group_id[0]    = regs.cs_regs.tgid_x_en != 0;
 	info.group_id[1]    = regs.cs_regs.tgid_y_en != 0;
 	info.group_id[2]    = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size      = regs.cs_regs.wave_size;
+	info.wave_size      = guest_wave_size;
 	info.thread_ids_num = regs.cs_regs.tidig_comp_cnt + 1;
 	info.tg_size_en     = regs.cs_regs.tg_size_en != 0;
+	// COMPUTE_PGM_RSRC2 encodes LDS_SIZE in 512-byte (128-dword) units.
+	info.lds_size_dwords = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
@@ -1182,10 +1186,11 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& info, std::span<const uint32_t>& spirv) {
+	                     uint32_t guest_wave_size, ShaderComputeInputInfo& info,
+	                     std::span<const uint32_t>& spirv) {
 	spirv = {};
 
-	ShaderGetStaticInputInfoCS(regs, sh, info);
+	ShaderGetStaticInputInfoCS(regs, sh, guest_wave_size, info);
 	const auto shader_hash = regs.cs_regs.data_addr;
 	const auto program_id  = ShaderGetIdCS(regs, info, false);
 	const auto key         = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id,
@@ -1701,6 +1706,7 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 	ret.ids.push_back(input_info.workgroup_register);
 	ret.ids.push_back(input_info.wave_size);
 	ret.ids.push_back(input_info.thread_ids_num);
+	ret.ids.push_back(input_info.lds_size_dwords);
 
 	for (int i = 0; i < 3; i++) {
 		ret.ids.push_back(input_info.threads_num[i]);

@@ -437,6 +437,18 @@ struct EmitterState {
 	std::map<uint32_t, uint32_t>                     float_constants;
 };
 
+inline uint32_t GetLdsDwordCount(const EmitterState& state) {
+	if (state.needs_function_lds) {
+		return 8192u;
+	}
+	if (state.stage == ShaderType::Compute && state.compute_input_info != nullptr) {
+		// SPIR-V does not permit a zero-length OpTypeArray.
+		return std::max(state.compute_input_info->lds_size_dwords, 1u);
+	}
+	// Preserve the standalone recompiler default when no hardware state was supplied.
+	return 1024u;
+}
+
 enum class VertexInputScalarKind { Float, Sint, Uint };
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;

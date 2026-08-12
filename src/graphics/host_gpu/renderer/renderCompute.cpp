@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
@@ -193,10 +194,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
+	const uint32_t guest_wave_size = Pm4::GetComputeWaveSizeFromDispatchModifier(mode);
 
 	ShaderComputeInputInfo    input_info {};
 	std::span<const uint32_t> cs_shader;
-	if (!ShaderCompileInfoCS(cs_regs, sh_regs, input_info, cs_shader)) {
+	if (!ShaderCompileInfoCS(cs_regs, sh_regs, guest_wave_size, input_info, cs_shader)) {
 		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
 		     cs_regs.cs_regs.data_addr);
 	}

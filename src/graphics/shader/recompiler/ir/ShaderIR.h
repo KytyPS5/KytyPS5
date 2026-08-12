@@ -159,22 +159,19 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
-// v_interp_mov_f32's source selects which of a parameter's three LDS values to load, in the
-// order the ISA lists them: 0 = P10, 1 = P20, 2 = P0. P0 is the value at the provoking vertex
-// and the other two are deltas, so a shader reconstructs the interpolated value as
-// `P0 + P10 * I + P20 * J`. Only P0 is available from an ordinary interpolated input.
-enum class InterpParameter : uint32_t { P10 = 0, P20 = 1, P0 = 2 };
-
 struct InputInfo {
-	uint32_t        attr   = 0;
-	uint32_t        chan   = 0;
-	InterpParameter interp = InterpParameter::P0;
+	uint32_t attr         = 0;
+	uint32_t chan         = 0;
+	uint32_t vertex_index = UINT32_MAX;
 
 	bool operator==(const InputInfo& other) const = default;
 };
 
 enum class SaveexecMode { And, Orn2, Andn1 };
 
+// RDNA2 exposes separate outstanding-operation counters. Keep the encoded wait
+// class through IR lowering so the SPIR-V backend does not confuse an LDS wait
+// with a VM, export, store, or dependency wait.
 enum class WaitcntKind { Packed, Vscnt, Vmcnt, Expcnt, Lgkmcnt, Depctr };
 
 struct Instruction {
@@ -310,6 +307,10 @@ struct BufferResource {
 
 enum class ImageMipMode { None, DynamicStorage };
 
+// Native image descriptors encode mip levels in four bits. Dynamic storage-image
+// operations therefore need at most one Vulkan descriptor per possible guest mip.
+constexpr uint32_t MaxStorageImageMipLevels = 16;
+
 constexpr uint32_t StorageImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
@@ -321,11 +322,11 @@ struct ImageResource {
 	Decoder::ImageDimension dimension       = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode        = ImageMipMode::None;
 	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
-	uint32_t                dynamic_table_source         = ScalarProvenance::Undefined;
-	uint32_t                dynamic_table_buffer         = NoDynamicTable;
+	uint32_t                dynamic_table_source = ScalarProvenance::Undefined;
+	uint32_t                dynamic_table_buffer = NoDynamicTable;
 	uint32_t                dynamic_table_address_offset = 0;
-	uint32_t                dynamic_table_address_count  = 0;
-	uint32_t                dynamic_descriptor_count     = 0;
+	uint32_t                dynamic_table_address_count = 0;
+	uint32_t                dynamic_descriptor_count = 0;
 	bool                    read            = false;
 	bool                    written         = false;
 	bool                    atomic          = false;
@@ -385,10 +386,8 @@ struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;
 	uint32_t       location        = 0;
 	uint32_t       component_count = 1;
-	// The shader asked for this parameter's P10 or P20, which only exist per vertex. Such an
-	// input is declared as a three-element array rather than one interpolated value.
-	bool           per_vertex      = false;
 	std::string    debug_name;
+	bool           per_vertex = false;
 
 	bool operator==(const StageInput& other) const = default;
 };
@@ -487,6 +486,9 @@ struct Program {
 	uint32_t                wave_size           = 64;
 	uint32_t                user_data_base      = 0;
 	uint32_t                user_data_count     = 64;
+	bool                    compute_linear_local64 = false;
+	int32_t                 compute_workgroup_register = -1;
+	int32_t                 compute_thread_ids_num     = 0;
 	bool                    dispatcher_fallback = false;
 	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
 	std::string             fallback_reason;

@@ -54,6 +54,7 @@ public:
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);
+	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size,
 	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
@@ -93,9 +94,6 @@ public:
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
-	// Download mappings become visible to the CPU only after their GPU completion tick is free.
-	// Call this from the scheduler's deferred completion operation before reading Mapped().
-	void                   Invalidate(uint64_t offset, uint64_t size);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
 private:

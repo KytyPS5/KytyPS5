@@ -17,8 +17,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -293,6 +296,63 @@ void TextureCache::DeleteImages(std::span<const ImageId> ids,
 		}
 		DeleteImage(id);
 	}
+}
+
+// Preserve the hardware memory model across an incompatible view of the same guest address.
+// A descriptor changes how bytes are interpreted; it does not discard bytes rendered through
+// the previous descriptor. Download supported images before deletion so the successor uploads
+// current content. If this shape cannot be read back, park it instead of destroying its only
+// current copy; unregistering removes it from overlap lookup while retaining its native pixels.
+void TextureCache::DeleteImagePreservingGuest(ImageId id) {
+	const auto owner = ResolveOwner(id);
+	if (owner == nullptr) {
+		return;
+	}
+	if (owner->IsGpuModified()) {
+		if (TryDownloadImage(id)) {
+			m_scheduler.FinishCurrent();
+			m_scheduler.DrainPriorityOperations();
+		} else {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				const auto range = owner->info.data;
+				// This is a recoverable cache-policy event, not a process error. Keep it on the
+				// regular logger: Windows PowerShell converts every native stderr line into a
+				// NativeCommandError record when the launch script tees merged output.
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "[alias] rendered content kept across reinterpretation: "
+				           "addr=0x%010llx %ux%u vkfmt=%u guestfmt=%u bpb=%u tile=%u "
+				           "gpu=%d buffer=%d cpu=%d buffer_dirty=%d compression=%u "
+				           "rt=%d storage=%d texture=%d\n",
+				           static_cast<unsigned long long>(owner->info.data.address),
+				           owner->info.extent.width, owner->info.extent.height,
+				           static_cast<uint32_t>(owner->info.pixel_format),
+				           static_cast<uint32_t>(owner->info.guest_format),
+				           owner->info.bytes_per_block, static_cast<uint32_t>(owner->info.tile_mode),
+				           owner->IsGpuModified() ? 1 : 0,
+				           owner->IsBufferModified() ? 1 : 0, owner->IsCpuDirty() ? 1 : 0,
+				           m_buffer_cache.HasGpuDirtyBytes(range.address, range.size) ? 1 : 0,
+				           static_cast<uint32_t>(owner->info.metadata.compression),
+				           owner->usage.render_target ? 1 : 0, owner->usage.storage ? 1 : 0,
+				           owner->usage.texture ? 1 : 0);
+			}
+			if (owner->registered) {
+				UnregisterImage(id);
+			}
+			return;
+		}
+		ClearGpuModified(id);
+	}
+	DeleteImage(id);
+}
+
+// Large GPU-owned surfaces at an incompatible interpretation represent a transient-pool pass
+// boundary. Resolve them immediately; leaving both interpretations registered creates a stale
+// split. Small hot resources retain the existing age-gated behavior to avoid serializing every
+// draw in ping-pong workloads.
+static bool ReinterpretsRenderedSurface(const Image& cached) {
+	return cached.IsGpuModified() && cached.info.extent.width >= 128 &&
+	       cached.info.extent.height >= 128;
 }
 
 void TextureCache::RetainImage(CommandBuffer& command, ImageId id) {
@@ -781,8 +841,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 		if (requested.BlockExtent() != cached.info.BlockExtent() ||
 		    requested_block != cached_block) {
-			if (safe_to_delete) {
-				DeleteImages(std::array {cached_id}, cached_id);
+			if (safe_to_delete || ReinterpretsRenderedSurface(cached)) {
+				DeleteImagePreservingGuest(cached_id);
 			}
 			return {merged_id};
 		}
@@ -798,8 +858,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.tile_mode != cached.info.tile_mode) {
-			if (safe_to_delete) {
-				DeleteImages(std::array {cached_id}, cached_id);
+			if (safe_to_delete || ReinterpretsRenderedSurface(cached)) {
+				DeleteImagePreservingGuest(cached_id);
 			}
 			return {merged_id};
 		}
@@ -835,7 +895,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			}
 		}
 		if (safe_to_delete) {
-			DeleteImages(std::array {cached_id}, cached_id);
+			DeleteImagePreservingGuest(cached_id);
 		}
 		return {};
 	}
@@ -849,7 +909,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				if (merged_id) {
 					ResolveImage(merged_id).binding.is_target = true;
 				}
-				DeleteImages(std::array {cached_id}, cached_id);
+				DeleteImagePreservingGuest(cached_id);
 				return {merged_id};
 			}
 			if (merged_id) {
@@ -1410,9 +1470,10 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	if (!image.info.data.Empty()) {
-		// Render and storage writes make the image the newest representation of these guest bytes.
-		// Keeping an older overlapping buffer dirty would later resurrect stale data when the
-		// allocation is read through another image interpretation.
+		// A bound render/storage target becomes the newest representation of these unified guest
+		// bytes. RefreshImage has already imported any preceding buffer writes. Retaining that older
+		// buffer ownership would later block image readback and resurrect stale data when the same
+		// allocation is reinterpreted with another image descriptor.
 		m_buffer_cache.DiscardGpuDirtyBytes(image.info.data.address, image.info.data.size);
 	}
 	image.MarkGpuModified();
@@ -1733,8 +1794,8 @@ std::pair<uint8_t*, uint64_t> TextureCache::MapDownload(uint64_t size, uint64_t 
 	return mapping;
 }
 
-void TextureCache::QueueDownload(GuestRange range, StreamBuffer& download, uint8_t* mapped,
-                                 uint64_t offset) {
+void TextureCache::QueueDownload(GuestRange range, Buffer& download, uint8_t* mapped,
+	                             uint64_t offset, std::shared_ptr<Buffer> lifetime) {
 	vk::BufferMemoryBarrier barrier {};
 	barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
@@ -1749,7 +1810,8 @@ void TextureCache::QueueDownload(GuestRange range, StreamBuffer& download, uint8
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation(
+	    [&download, range, mapped, offset, lifetime = std::move(lifetime)] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
@@ -1764,17 +1826,32 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	if (!plan.valid || !SafeToDownload(image)) {
 		return false;
 	}
-	const auto range      = image.info.data;
-	auto [mapped, offset] = MapDownload(range.size, image.info.bytes_per_block);
-	auto& download        = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto range = image.info.data;
+	auto&      shared_download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	std::shared_ptr<Buffer> dedicated_download;
+	Buffer*                 download = &shared_download;
+	uint8_t*                mapped   = nullptr;
+	uint64_t                offset   = 0;
+	if (range.size > shared_download.Size()) {
+		dedicated_download = std::make_shared<Buffer>(m_graphics, m_scheduler,
+		                                               MemoryUsage::Download, 0, AllFlags,
+		                                               range.size);
+		download = dedicated_download.get();
+		mapped   = download->Mapped().data();
+		if (mapped == nullptr) {
+			EXIT("TextureCache: failed to map dedicated image download buffer\n");
+		}
+	} else {
+		std::tie(mapped, offset) = MapDownload(range.size, image.info.bytes_per_block);
+	}
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	download->Flush(offset, range.size);
 
-	DownloadImageData(image, download, offset, range.size, std::move(plan));
+	DownloadImageData(image, *download, offset, range.size, std::move(plan));
 
-	QueueDownload(range, download, mapped, offset);
+	QueueDownload(range, *download, mapped, offset, std::move(dedicated_download));
 	return true;
 }
 
@@ -1994,6 +2071,229 @@ void TextureCache::ProcessDownloadImages() {
 		}
 	}
 	m_download_images.clear();
+}
+
+namespace {
+
+std::atomic<uint64_t> g_probe_frames {0};
+std::atomic<uint64_t> g_probe_armed_frame {0};
+std::atomic<bool>     g_probe_armed {false};
+
+uint64_t SurfaceProbeInterval() {
+	static const uint64_t interval = [] {
+		const char* const text = std::getenv("KYTY_PROBE_INTERVAL");
+		const long        value = text != nullptr ? std::atol(text) : 0;
+		return value > 0 ? static_cast<uint64_t>(value) : 0ULL;
+	}();
+	return interval;
+}
+
+uint64_t SurfaceProbeDumpSample() {
+	static const uint64_t sample = [] {
+		const char* const text = std::getenv("KYTY_PROBE_DUMP_SAMPLE");
+		return text != nullptr ? static_cast<uint64_t>(std::strtoull(text, nullptr, 10))
+		                       : UINT64_MAX;
+	}();
+	return sample;
+}
+
+const char* SurfaceProbeDumpDirectory() {
+	static const char* const directory = std::getenv("KYTY_PROBE_DUMP_DIR");
+	return directory;
+}
+
+bool SurfaceProbeAddressRequested(uint64_t address) {
+	const char* current = std::getenv("KYTY_PROBE_ADDRESS_FILTER");
+	if (current == nullptr || current[0] == '\0') {
+		return true;
+	}
+	while (*current != '\0') {
+		while (*current == ' ' || *current == '\t' || *current == ',' || *current == ';') {
+			current++;
+		}
+		if (*current == '\0') {
+			break;
+		}
+		char*              end   = nullptr;
+		const auto         value = std::strtoull(current, &end, 0);
+		if (end == current) {
+			return false;
+		}
+		if (value == address) {
+			return true;
+		}
+		current = end;
+	}
+	return false;
+}
+
+void DumpProbeSurface(const Image& image, const void* mapped, uint64_t bytes, uint64_t sample) {
+	const char* const directory = SurfaceProbeDumpDirectory();
+	if (directory == nullptr || directory[0] == '\0' || sample != SurfaceProbeDumpSample() ||
+	    !image.usage.storage || (image.info.bytes_per_block != 1 && image.info.bytes_per_block != 2)) {
+		return;
+	}
+
+	char path[1024] {};
+	const int length = std::snprintf(
+	    path, sizeof(path), "%s\\surface-%llu-%010" PRIx64 "-%ux%u-bpb%u-fmt%d.raw", directory,
+	    static_cast<unsigned long long>(sample), image.info.data.address, image.info.extent.width,
+	    image.info.extent.height, image.info.bytes_per_block,
+	    static_cast<int>(image.info.pixel_format));
+	if (length <= 0 || static_cast<size_t>(length) >= sizeof(path)) {
+		std::fprintf(stderr, "[ivsample] dump path too long for addr=0x%010" PRIx64 "\n",
+		             image.info.data.address);
+		return;
+	}
+
+	FILE* const file = std::fopen(path, "wb");
+	if (file == nullptr) {
+		std::fprintf(stderr, "[ivsample] dump open failed path=%s\n", path);
+		return;
+	}
+	const size_t written = std::fwrite(mapped, 1, static_cast<size_t>(bytes), file);
+	std::fclose(file);
+	std::fprintf(stderr, "[ivsample] dump path=%s bytes=%llu written=%zu\n", path,
+	             static_cast<unsigned long long>(bytes), written);
+}
+
+} // namespace
+
+void TextureCache::MarkPresentedFrame() {
+	const uint64_t interval = SurfaceProbeInterval();
+	if (interval == 0) {
+		return;
+	}
+	const uint64_t frame = g_probe_frames.fetch_add(1, std::memory_order_relaxed);
+	if (frame % interval == 0) {
+		g_probe_armed_frame.store(frame, std::memory_order_relaxed);
+		g_probe_armed.store(true, std::memory_order_release);
+	}
+}
+
+void TextureCache::SampleIntervalContent() {
+	if (!g_probe_armed.exchange(false, std::memory_order_acquire)) {
+		return;
+	}
+	const uint64_t frame = g_probe_armed_frame.load(std::memory_order_relaxed);
+	static std::atomic<uint64_t> sample_counter {0};
+	const uint64_t sample = sample_counter.fetch_add(1, std::memory_order_relaxed);
+
+	constexpr uint32_t MinWidth = 1280;
+	constexpr uint32_t MinHeight = 720;
+	constexpr size_t MaxDistinct = 16;
+	constexpr size_t MaxSurfaces = 64;
+
+	CacheLock lock(*this, m_lock);
+	std::vector<std::shared_ptr<Image>> targets;
+	std::set<uint64_t>                  seen_images;
+	size_t                              qualifying = 0;
+	for (const auto& slot: m_slots) {
+		const auto& image = slot.image;
+		if (image == nullptr || image->backing.image == nullptr || image->info.IsDepth() ||
+		    image->info.IsBlock() || image->info.bytes_per_block == 0 ||
+		    image->info.samples != 1 || image->info.resources.layers != 1 ||
+		    image->info.extent.width < MinWidth || image->info.extent.height < MinHeight ||
+		    !SurfaceProbeAddressRequested(image->info.data.address)) {
+			continue;
+		}
+		const uint64_t image_key = reinterpret_cast<uint64_t>(
+		    static_cast<VkImage>(image->backing.image));
+		if (!seen_images.insert(image_key).second) {
+			continue;
+		}
+		qualifying++;
+		if (targets.size() < MaxSurfaces) {
+			targets.push_back(image);
+		}
+	}
+
+	std::fprintf(stderr, "[ivsample] begin n=%llu frame=%llu surfaces=%zu of=%zu\n",
+	             static_cast<unsigned long long>(sample),
+	             static_cast<unsigned long long>(frame), targets.size(), qualifying);
+	for (const auto& target: targets) {
+		Image&         image  = *target;
+		const uint32_t width  = image.info.extent.width;
+		const uint32_t height = image.info.extent.height;
+		const uint64_t bytes  = static_cast<uint64_t>(width) * height * image.info.bytes_per_block;
+		if (bytes == 0 || bytes > static_cast<uint64_t>(SIZE_MAX)) {
+			continue;
+		}
+
+		VulkanBuffer staging {};
+		staging.usage = vk::BufferUsageFlagBits::eTransferDst;
+		staging.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
+		                          vk::MemoryPropertyFlagBits::eHostCoherent;
+		m_graphics.CreateBuffer(bytes, staging);
+		if (staging.buffer == nullptr) {
+			std::fprintf(stderr, "[ivsample] addr=0x%010" PRIx64 " %ux%u alloc-failed\n",
+			             image.info.data.address, width, height);
+			continue;
+		}
+
+		vk::BufferImageCopy copy {};
+		copy.bufferRowLength      = width;
+		copy.bufferImageHeight    = height;
+		copy.imageSubresource     = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent          = {width, height, 1};
+		image.Download({&copy, 1}, staging.buffer, 0, bytes);
+		m_scheduler.FinishCurrent();
+		m_scheduler.DrainPriorityOperations();
+
+		void* mapped = nullptr;
+		m_graphics.MapMemory(staging.memory, mapped);
+		if (mapped != nullptr) {
+			DumpProbeSurface(image, mapped, bytes, sample);
+			const auto* words = static_cast<const uint32_t*>(mapped);
+			const size_t word_count = static_cast<size_t>(bytes / sizeof(uint32_t));
+			uint64_t nonzero = 0;
+			uint32_t first_value = 0;
+			uint64_t first_index = 0;
+			bool first_found = false;
+			std::array<uint32_t, MaxDistinct> distinct {};
+			size_t distinct_count = 0;
+			bool distinct_capped = false;
+			for (size_t i = 0; i < word_count; i++) {
+				const uint32_t word = words[i];
+				if (word != 0) {
+					nonzero++;
+					if (!first_found) {
+						first_found = true;
+						first_value = word;
+						first_index = i;
+					}
+				}
+				if (!distinct_capped &&
+				    std::find(distinct.begin(), distinct.begin() + distinct_count, word) ==
+				        distinct.begin() + distinct_count) {
+					if (distinct_count == distinct.size()) {
+						distinct_capped = true;
+					} else {
+						distinct[distinct_count++] = word;
+					}
+				}
+			}
+			std::fprintf(stderr,
+			             "[ivsample] n=%llu image=0x%016llx addr=0x%010" PRIx64
+			             " %ux%u fmt=%d bpb=%u tile=%u rt=%d storage=%d gpu=%d words=%llu "
+			             "nonzero=%llu distinct=%zu%s first=0x%08" PRIx32 "@%llu\n",
+			             static_cast<unsigned long long>(sample),
+			             static_cast<unsigned long long>(reinterpret_cast<uint64_t>(
+			                 static_cast<VkImage>(image.backing.image))),
+			             image.info.data.address, width, height,
+			             static_cast<int>(image.info.pixel_format), image.info.bytes_per_block,
+			             image.info.tile_mode, image.usage.render_target ? 1 : 0,
+			             image.usage.storage ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			             static_cast<unsigned long long>(word_count),
+			             static_cast<unsigned long long>(nonzero), distinct_count,
+			             distinct_capped ? "+" : "", first_value,
+			             static_cast<unsigned long long>(first_index));
+			m_graphics.UnmapMemory(staging.memory);
+		}
+		m_graphics.DeleteBuffer(staging);
+	}
+	std::fprintf(stderr, "[ivsample] end n=%llu\n", static_cast<unsigned long long>(sample));
+	std::fflush(stderr);
 }
 
 } // namespace Libs::Graphics

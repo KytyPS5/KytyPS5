@@ -22,6 +22,7 @@ const char* StageName(ShaderType stage) {
 bool IsAtomic(Opcode op) {
 	switch (op) {
 		case Opcode::AtomicSwapU32:
+		case Opcode::AtomicCompareSwapU32:
 		case Opcode::AtomicAddU32:
 		case Opcode::AtomicSubU32:
 		case Opcode::AtomicSMinI32:

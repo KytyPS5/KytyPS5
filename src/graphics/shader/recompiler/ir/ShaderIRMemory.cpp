@@ -184,6 +184,26 @@ bool LowerBufferAtomicDword(const Decoder::Instruction& decoded, BasicBlock& blo
 	return true;
 }
 
+bool LowerBufferAtomicCompareSwap(const Decoder::Instruction& decoded, BasicBlock& block,
+                                  std::string* error) {
+	Instruction inst;
+	inst.pc       = decoded.pc;
+	inst.op       = Opcode::AtomicCompareSwapU32;
+	inst.memory   = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	inst.dst.kind = OperandKind::Null;
+	// Prospero buffer_atomic_cmpswap uses vdata[0] as the replacement value and
+	// vdata[1] as the comparison value. With GLC, the pre-operation value is
+	// returned through vdata[0].
+	if ((decoded.glc && !LowerRegisterOperand(decoded.dst, inst.dst, error)) ||
+	    !LowerSourceOperand(decoded.dst, inst.src[0], error) ||
+	    !LowerSourceOperand(OffsetDecodedRegister(decoded.dst, 1), inst.src[1], error) ||
+	    !LowerBufferAddressSources(decoded, inst, 2, error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
 	return decoded.gds ? ResourceKind::Gds : ResourceKind::Lds;
 }
@@ -209,6 +229,7 @@ bool LowerDsRead(const Decoder::Instruction& decoded, BasicBlock& block, std::st
 bool LowerDsRead2(const Decoder::Instruction& decoded, BasicBlock& block, uint32_t dwords_per_read,
                   std::string* error) {
 	const uint32_t offsets[] = {decoded.offset, decoded.secondary_offset};
+	const uint32_t component_count = 2u * dwords_per_read;
 	for (uint32_t read = 0; read < 2u; read++) {
 		for (uint32_t dword = 0; dword < dwords_per_read; dword++) {
 			const auto  index = read * dwords_per_read + dword;
@@ -218,6 +239,11 @@ bool LowerDsRead2(const Decoder::Instruction& decoded, BasicBlock& block, uint32
 			inst.src_count = 1;
 			inst.memory =
 			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[read] + dword * 4u);
+			// DS_READ2 captures VADDR once and completes every component before any VDST
+			// write becomes visible. Preserve that instruction boundary after lowering so
+			// the emitter can defer stores when VDST overlaps VADDR.
+			inst.memory.component_index = index;
+			inst.memory.component_count = component_count;
 			if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, index), inst.dst, error) ||
 			    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
 				return false;
@@ -451,14 +477,21 @@ bool LowerDsWrite2(const Decoder::Instruction& decoded, BasicBlock& block,
                    uint32_t dwords_per_write, std::string* error) {
 	const Decoder::Operand* data[]    = {&decoded.src1, &decoded.src2};
 	const uint32_t          offsets[] = {decoded.offset, decoded.secondary_offset};
+	const uint32_t          component_count = 2u * dwords_per_write;
 	for (uint32_t write = 0; write < 2u; write++) {
 		for (uint32_t dword = 0; dword < dwords_per_write; dword++) {
+			const auto index = write * dwords_per_write + dword;
 			Instruction inst;
 			inst.pc        = decoded.pc;
 			inst.op        = Opcode::DsWriteB32;
 			inst.src_count = 2;
 			inst.memory =
 			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[write] + dword * 4u);
+			// Keep the native DS_WRITE2/B64 instruction as one LDS phase after
+			// lowering. Logical wave64 workgroup synchronization must occur once,
+			// never between its component stores.
+			inst.memory.component_index = index;
+			inst.memory.component_count = component_count;
 			inst.dst.kind = OperandKind::Null;
 			if (!LowerSourceOperand(OffsetDecodedRegister(*data[write], dword), inst.src[0],
 			                        error) ||
@@ -551,6 +584,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 			return LowerBufferStore(decoded, block, error);
 		case Decoder::Opcode::BufferAtomicSwap:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSwapU32, error);
+		case Decoder::Opcode::BufferAtomicCmpSwap:
+			return LowerBufferAtomicCompareSwap(decoded, block, error);
 		case Decoder::Opcode::BufferAtomicAdd:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAddU32, error);
 		case Decoder::Opcode::BufferAtomicSub:
@@ -729,6 +764,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::TBufferStoreFormatXyz:
 		case Decoder::Opcode::TBufferStoreFormatXyzw:
 		case Decoder::Opcode::BufferAtomicSwap:
+		case Decoder::Opcode::BufferAtomicCmpSwap:
 		case Decoder::Opcode::BufferAtomicAdd:
 		case Decoder::Opcode::BufferAtomicSub:
 		case Decoder::Opcode::BufferAtomicSMin:

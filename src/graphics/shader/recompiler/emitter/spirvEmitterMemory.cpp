@@ -1,6 +1,83 @@
 #include "graphics/shader/recompiler/emitter/spirvEmitterInternal.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+bool BinkTraceEnabled(const EmitterState& state) {
+	const char* const directory = std::getenv("KYTY_BINK_TRACE_DIR");
+	return directory != nullptr && directory[0] != '\0' && state.gds_variable != 0 &&
+	       state.program.shader_hash == 0x0000000208a64d00ULL;
+}
+
+void EmitBinkTraceRecord(EmitterState& state, uint32_t site, uint32_t pc, uint32_t value0,
+	                     uint32_t value1, uint32_t value2, uint32_t value3) {
+	if (!BinkTraceEnabled(state)) {
+		return;
+	}
+	const char* const requested_site_text = std::getenv("KYTY_BINK_TRACE_SITE");
+	const auto requested_site = requested_site_text != nullptr
+	                                ? static_cast<uint32_t>(std::strtoul(
+	                                      requested_site_text, nullptr, 10))
+	                                : 2u;
+	if (site != requested_site) {
+		return;
+	}
+
+	uint32_t selected_x = 60;
+	uint32_t selected_y = 34;
+	uint32_t selected_z = 0;
+	if (const char* const text = std::getenv("KYTY_BINK_TRACE_GROUP"); text != nullptr) {
+		(void)std::sscanf(text, "%u,%u,%u", &selected_x, &selected_y, &selected_z);
+	}
+	const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+	const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+	const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
+	const auto equals = [&](uint32_t value, uint32_t expected) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpIEqual, state.bool_type, result, value, ConstantU32(state, expected)});
+		return result;
+	};
+	const auto xy = state.builder.AllocateId();
+	const auto xyz = state.builder.AllocateId();
+	const auto selected = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLogicalAnd, state.bool_type, xy, equals(group_x, selected_x), equals(group_y, selected_y)});
+	state.builder.AddFunction(
+	    {OpLogicalAnd, state.bool_type, xyz, xy, equals(group_z, selected_z)});
+	state.builder.AddFunction(
+	    {OpLogicalAnd, state.bool_type, selected, xyz, EmitExecActiveBool(state)});
+
+	const auto write_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction({OpBranchConditional, selected, write_label, merge_label});
+	state.builder.AddFunction({OpLabel, write_label});
+
+	const auto local = EmitBinaryU32(state, OpBitwiseAnd, EmitLocalInvocationIndex(state),
+	                                ConstantU32(state, 63u));
+	const auto iteration = EmitBinaryU32(
+	    state, OpBitwiseAnd, EmitRegisterLoad(state, {IR::RegisterFile::Scalar, 41}),
+	    ConstantU32(state, 3u));
+	const auto site_iteration = EmitAddU32(
+	    state, ConstantU32(state, site * 4u), iteration);
+	const auto record = EmitAddU32(
+	    state,
+	    EmitBinaryU32(state, OpShiftLeftLogical, site_iteration, ConstantU32(state, 6u)), local);
+	const auto base =
+	    EmitBinaryU32(state, OpShiftLeftLogical, record, ConstantU32(state, 3u));
+	const uint32_t values[] = {ConstantU32(state, 0xb17c0000u | site),
+	                           ConstantU32(state, pc), local, iteration,
+	                           value0, value1, value2, value3};
+	for (uint32_t i = 0; i < std::size(values); i++) {
+		const auto index = EmitAddU32(state, base, ConstantU32(state, i));
+		state.builder.AddFunction({OpStore, EmitGdsElementPointer(state, index), values[i]});
+	}
+	state.builder.AddFunction({OpBranch, merge_label});
+	state.builder.AddFunction({OpLabel, merge_label});
+}
 
 uint32_t EmitDppWriteActiveBool(EmitterState& state, const IR::Operand& dst) {
 	const auto exec_active = EmitExecActiveBool(state);
@@ -269,10 +346,10 @@ uint32_t EmitBufferByteAddress(EmitterState& state, const IR::Instruction& inst,
 	const auto end               = first_src + src_count;
 	auto       cursor            = first_src;
 	auto       LoadAddressSource = [&]() {
-		if (cursor >= end) {
-			return ConstantU32(state, 0);
-		}
-		return EmitValueLoad(state, inst.src[cursor++]);
+        if (cursor >= end) {
+            return ConstantU32(state, 0);
+        }
+        return EmitValueLoad(state, inst.src[cursor++]);
 	};
 
 	uint32_t index = ConstantU32(state, 0);
@@ -506,9 +583,9 @@ uint32_t EmitMemoryLoadDwordValueU32(EmitterState& state, const IR::Instruction&
 	mem.kind                   = kind;
 	const auto index           = EmitMemoryDwordIndex(state, inst, mem, first_src, src_count);
 	auto       LoadFromPointer = [&](uint32_t pointer) {
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
-		return value;
+        const auto value = state.builder.AllocateId();
+        state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
+        return value;
 	};
 	if (mem.kind == IR::ResourceKind::Lds) {
 		return LoadFromPointer(EmitLdsElementPointer(state, index));
@@ -641,7 +718,7 @@ void EmitMemoryStoreU32(EmitterState& state, const IR::Instruction& inst, IR::Re
 
 template <typename Fn>
 uint32_t EmitAtomicUpdateU32(EmitterState& state, uint32_t pointer, IR::ResourceKind kind,
-                             Fn&& desired_value) {
+                             Fn&& desired_value, bool emit_memory_barrier = true) {
 	const auto scope          = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 	const auto memory         = kind == IR::ResourceKind::Lds ? MemorySemanticsWorkgroupMemory
 	                                                          : MemorySemanticsUniformMemory;
@@ -672,9 +749,11 @@ uint32_t EmitAtomicUpdateU32(EmitterState& state, uint32_t pointer, IR::Resource
 	state.builder.AddFunction({OpLabel, continue_label});
 	state.builder.AddFunction({OpBranch, header});
 	state.builder.AddFunction({OpLabel, merge});
-	const auto semantics = MemorySemanticsAcquireRelease | memory;
-	state.builder.AddFunction(
-	    {OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, semantics)});
+	if (emit_memory_barrier) {
+		const auto semantics = MemorySemanticsAcquireRelease | memory;
+		state.builder.AddFunction(
+		    {OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, semantics)});
+	}
 	return observed;
 }
 
@@ -725,14 +804,14 @@ void EmitMemoryStoreSubDwordU32(EmitterState& state, const IR::Instruction& inst
 			    {OpBitwiseOr, state.uint_type, merged, cleared, value_shifted});
 			return merged;
 		};
-		if (store_inst.memory.kind == IR::ResourceKind::Lds ||
-		    store_inst.memory.kind == IR::ResourceKind::Gds) {
-			EmitAtomicUpdateU32(state, pointer, store_inst.memory.kind, Merge);
-		} else {
-			const auto word = state.builder.AllocateId();
-			state.builder.AddFunction({OpLoad, state.uint_type, word, pointer});
-			state.builder.AddFunction({OpStore, pointer, Merge(word)});
-		}
+		// A guest sub-dword store updates only its selected byte or halfword. Multiple
+		// invocations may therefore target different fields of the same host dword.
+		// Preserve both updates with one atomic read/modify/write for LDS, GDS, and
+		// storage-buffer-backed memory alike.
+		const auto preserve_guest_ds_order = store_inst.memory.kind == IR::ResourceKind::Lds ||
+		                                     store_inst.memory.kind == IR::ResourceKind::Gds;
+		EmitAtomicUpdateU32(state, pointer, store_inst.memory.kind, Merge,
+		                    preserve_guest_ds_order);
 	});
 }
 
@@ -1134,15 +1213,15 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 		const auto in_bounds = EmitStorageBufferElementInBounds(state, inst.memory, index, inst.pc);
 		const auto value     = EmitValueLoad(state, inst.src[0]);
 		const auto old       = EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
-			const auto pointer =
-			    EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
-			const auto result = state.builder.AllocateId();
-			state.builder.AddFunction({opcode, state.uint_type, result, pointer,
-			                           ConstantU32(state, ScopeDevice),
-			                           ConstantU32(state, MemorySemanticsNone), value});
-			EmitDeviceAtomicMemoryBarrier(state);
-			return result;
-		});
+            const auto pointer =
+                EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
+            const auto result = state.builder.AllocateId();
+            state.builder.AddFunction({opcode, state.uint_type, result, pointer,
+                                       ConstantU32(state, ScopeDevice),
+                                       ConstantU32(state, MemorySemanticsNone), value});
+            EmitDeviceAtomicMemoryBarrier(state);
+            return result;
+        });
 		EmitStoreU32(state, inst.dst, old);
 		return;
 	}
@@ -1151,14 +1230,14 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 		const auto in_bounds = EmitGdsElementInBounds(state, index);
 		const auto value     = EmitValueLoad(state, inst.src[0]);
 		const auto old       = EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
-			const auto pointer = EmitGdsElementPointer(state, index);
-			const auto result  = state.builder.AllocateId();
-			state.builder.AddFunction({opcode, state.uint_type, result, pointer,
-			                           ConstantU32(state, ScopeDevice),
-			                           ConstantU32(state, MemorySemanticsNone), value});
-			EmitDeviceAtomicMemoryBarrier(state);
-			return result;
-		});
+            const auto pointer = EmitGdsElementPointer(state, index);
+            const auto result  = state.builder.AllocateId();
+            state.builder.AddFunction({opcode, state.uint_type, result, pointer,
+                                       ConstantU32(state, ScopeDevice),
+                                       ConstantU32(state, MemorySemanticsNone), value});
+            EmitDeviceAtomicMemoryBarrier(state);
+            return result;
+        });
 		EmitStoreU32(state, inst.dst, old);
 		return;
 	}
@@ -1181,6 +1260,25 @@ void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t op
 	EmitStoreU32(state, inst.dst, old);
 }
 
+void EmitAtomicCompareSwapU32(EmitterState& state, const IR::Instruction& inst) {
+	const auto index =
+	    EmitMemoryDwordIndex(state, inst, inst.memory, 2, AddressSourceCount(inst, 2));
+	const auto in_bounds   = EmitStorageBufferElementInBounds(state, inst.memory, index, inst.pc);
+	const auto replacement = EmitValueLoad(state, inst.src[0]);
+	const auto compare     = EmitValueLoad(state, inst.src[1]);
+	const auto old         = EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
+        const auto pointer = EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
+        const auto result  = state.builder.AllocateId();
+        state.builder.AddFunction({OpAtomicCompareExchange, state.uint_type, result, pointer,
+                                   ConstantU32(state, ScopeDevice),
+                                   ConstantU32(state, MemorySemanticsNone),
+                                   ConstantU32(state, MemorySemanticsNone), replacement, compare});
+        EmitDeviceAtomicMemoryBarrier(state);
+        return result;
+    });
+	EmitStoreU32(state, inst.dst, old);
+}
+
 namespace {
 
 uint32_t EmitF32BitsOrderedCompare(EmitterState& state, uint32_t lhs_bits, uint32_t rhs_bits,
@@ -1198,10 +1296,10 @@ uint32_t EmitF32BitsOrderedCompare(EmitterState& state, uint32_t lhs_bits, uint3
 		const auto     exponent_max =
 		    EmitCompareU32Constant(state, OpIEqual, exponent_bits, 0x7f800000u);
 		const auto mantissa_nonzero = EmitCompareU32Constant(state, OpINotEqual, mantissa_bits, 0);
-		const auto negative = EmitCompareU32Constant(state, OpINotEqual,
-		                                             EmitAndConstant(state, bits, 0x80000000u), 0);
-		const auto negative_key = state.builder.AllocateId();
-		const auto positive_key = state.builder.AllocateId();
+		const auto negative         = EmitCompareU32Constant(state, OpINotEqual,
+		                                                     EmitAndConstant(state, bits, 0x80000000u), 0);
+		const auto negative_key     = state.builder.AllocateId();
+		const auto positive_key     = state.builder.AllocateId();
 		// Map all non-NaN IEEE-754 encodings to monotonically increasing unsigned keys.
 		state.builder.AddFunction({OpNot, state.uint_type, negative_key, bits});
 		state.builder.AddFunction(
@@ -1231,16 +1329,16 @@ void EmitAtomicFMinMaxF32(EmitterState& state, const IR::Instruction& inst,
 	const auto in_bounds = EmitStorageBufferElementInBounds(state, inst.memory, index, inst.pc);
 	const auto src_u32   = EmitValueLoad(state, inst.src[0]);
 	const auto old       = EmitValueOrZeroIfCondition(state, in_bounds, [&]() {
-		const auto pointer = EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
-		return EmitAtomicUpdateU32(state, pointer, inst.memory.kind, [&](uint32_t old_u32) {
-			const auto replace_old = state.builder.AllocateId();
-			const auto replace =
-			    EmitF32BitsOrderedCompare(state, src_u32, old_u32, comparison_opcode);
-			state.builder.AddFunction(
-			    {OpSelect, state.uint_type, replace_old, replace, src_u32, old_u32});
-			return replace_old;
-		});
-	});
+        const auto pointer = EmitStorageBufferElementPointer(state, inst.memory, index, inst.pc);
+        return EmitAtomicUpdateU32(state, pointer, inst.memory.kind, [&](uint32_t old_u32) {
+            const auto replace_old = state.builder.AllocateId();
+            const auto replace =
+                EmitF32BitsOrderedCompare(state, src_u32, old_u32, comparison_opcode);
+            state.builder.AddFunction(
+                {OpSelect, state.uint_type, replace_old, replace, src_u32, old_u32});
+            return replace_old;
+        });
+    });
 	EmitStoreU32(state, inst.dst, old);
 }
 
@@ -1355,6 +1453,141 @@ void EmitBufferLoadDwordGroup(EmitterState& state, const IR::Instruction* instru
 	});
 }
 
+bool UseBinkWave64WorkgroupBarrier(const EmitterState& state, uint32_t guest_pc) {
+	if (std::getenv("KYTY_BINK_WORKGROUP_LDS_BARRIER") == nullptr) {
+		return false;
+	}
+	if (state.program.shader_hash == 0x0000000208a63b00ULL) {
+		// Diagnostic phase boundaries for the 64-thread intra-frame Bink kernel.
+		// Each site follows reconvergence/restoration of EXEC and is reached by the
+		// complete workgroup before later data-dependent transform branches.
+		switch (guest_pc) {
+			case 0x00000220u:
+			case 0x000002c4u:
+			case 0x00000364u:
+			case 0x00000408u:
+			case 0x000004acu:
+			case 0x00000550u:
+			case 0x000005f4u:
+			case 0x00000698u:
+			case 0x0000077cu: return true;
+			default: return false;
+		}
+	}
+	if (state.program.shader_hash != 0x0000000208a64d00ULL) {
+		return false;
+	}
+	switch (guest_pc) {
+		case 0x000003e4u:
+		case 0x0000049cu:
+		case 0x0000053cu:
+		case 0x000005dcu:
+		case 0x0000067cu:
+		case 0x0000071cu:
+		case 0x000007bcu:
+		case 0x0000085cu:
+		case 0x0000098cu:
+		case 0x00000af0u:
+		case 0x00000d54u:
+		case 0x00000df0u:
+		case 0x00000e90u:
+		case 0x00000f30u:
+		case 0x00000fd0u:
+		case 0x00001070u:
+		case 0x00001110u:
+		case 0x000011b0u:
+		case 0x00001284u:
+		case 0x00001414u:
+		case 0x00001bc0u:
+		case 0x00002084u:
+		case 0x0000221cu: return true;
+		default: return false;
+	}
+}
+
+void EmitDsReadVisibilityBarrier(EmitterState& state, IR::ResourceKind kind,
+                                 uint32_t guest_pc) {
+	if (kind != IR::ResourceKind::Lds || state.stage != ShaderType::Compute ||
+	    state.needs_function_lds) {
+		return;
+	}
+	// Logical single-wave lowering synchronizes once at the start of every
+	// complete guest LDS instruction in EmitBlockInstructions. Do not insert a
+	// second barrier for the split components of a wide read here.
+	if (IsLogicalWaveWorkgroup(state)) {
+		return;
+	}
+
+	// A guest wave issues earlier DS writes before its following DS read. SPIR-V
+	// workgroup loads otherwise have no peer-lane visibility guarantee, and the
+	// later s_waitcnt only waits for the already-issued read result. Synchronize
+	// the guest wave before issuing the host LDS load without rendezvousing the
+	// other wave that may share the workgroup.
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	const auto scope = UseBinkWave64WorkgroupBarrier(state, guest_pc) ? ScopeWorkgroup
+	                                                               : ScopeSubgroup;
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, scope),
+	                           ConstantU32(state, scope), ConstantU32(state, semantics)});
+}
+
+void EmitLogicalWaveLdsInstructionBarrier(EmitterState& state,
+                                          const IR::Instruction& inst) {
+	if (!state.logical_single_wave_workgroup || inst.memory.kind != IR::ResourceKind::Lds) {
+		return;
+	}
+	// ResourceKind::Lds is only assigned by DS/LDS lowering, including the
+	// generic Atomic* IR opcodes used for DS_ADD/AND/etc. Keying on the memory
+	// kind avoids maintaining a second, incomplete opcode list here.
+	if (inst.memory.component_count > 1u && inst.memory.component_index != 0u) {
+		return;
+	}
+
+	// A guest wave issues each LDS instruction as one lockstep phase. Mapping it
+	// to two independently scheduled host subgroup32 waves requires a rendezvous
+	// before reads *and* writes: a fast half must not begin the next write/reset
+	// while the slow half still consumes the previous phase.
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, semantics)});
+}
+
+void EmitDsAtomicPhaseBarrier(EmitterState& state, IR::ResourceKind kind) {
+	// One guest DS atomic instruction is issued wave-wide before the next DS
+	// instruction. Host invocations execute independently, so rendezvous the
+	// guest wave before starting the next atomic phase. The caller emits this
+	// outside the EXEC guard so inactive guest lanes still reach the barrier.
+	EmitDsReadVisibilityBarrier(state, kind);
+}
+
+void EmitDsReadB32Group(EmitterState& state, const IR::Instruction* instructions, uint32_t count) {
+	if (instructions == nullptr || count == 0u) {
+		return;
+	}
+	EmitDsReadVisibilityBarrier(state, instructions[0].memory.kind, instructions[0].pc);
+
+	// DS_READ2 and the wider DS reads capture VADDR before any VDST component is
+	// written. Lowering expands them into one IR read per dword, so defer every
+	// destination write until all LDS values have been loaded. This matters when
+	// VDST overlaps VADDR (for example, ds_read2_b32 v1, v1).
+	std::vector<uint32_t> values;
+	values.reserve(count);
+	for (uint32_t i = 0; i < count; i++) {
+		const auto& inst = instructions[i];
+		values.push_back(EmitMemoryLoadDwordValueU32(state, inst, inst.memory.kind, 0, 1));
+	}
+	if (BinkTraceEnabled(state) && instructions[0].pc == 0x221cu) {
+		const auto value = [&](uint32_t i) {
+			return i < values.size() ? values[i] : ConstantU32(state, 0);
+		};
+		EmitBinkTraceRecord(state, 1, instructions[0].pc, value(0), value(1), value(2),
+		                    value(3));
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		EmitStoreU32(state, instructions[i].dst, values[i]);
+	}
+}
+
 void EmitBufferStoreDword(EmitterState& state, const IR::Instruction& inst) {
 	if (EmitBufferIntegerFormatStore(state, inst)) {
 		return;
@@ -1440,7 +1673,8 @@ void EmitDsWriteAddtidB32(EmitterState& state, const IR::Instruction& inst) {
 }
 
 void EmitDsReadAddtidB32(EmitterState& state, const IR::Instruction& inst) {
-	const auto index   = EmitDsAddtidDwordIndex(state, inst, 0);
+	const auto index = EmitDsAddtidDwordIndex(state, inst, 0);
+	EmitDsReadVisibilityBarrier(state, inst.memory.kind, inst.pc);
 	const auto pointer = EmitLdsElementPointer(state, index);
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});

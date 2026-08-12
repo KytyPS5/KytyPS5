@@ -210,6 +210,12 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency();
 
 namespace Posix {
 
+// MinGW's pthread header exposes this unsupported host operation as a macro.
+// Do not let it rewrite the guest PS5 ABI declaration below.
+#ifdef pthread_attr_getguardsize
+#undef pthread_attr_getguardsize
+#endif
+
 int KYTY_SYSV_ABI  pthread_create(LibKernel::Pthread* thread, const LibKernel::PthreadAttr* attr,
                                   LibKernel::pthread_entry_func_t entry, void* arg);
 int KYTY_SYSV_ABI  pthread_create_name_np(LibKernel::Pthread*             thread,

@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/emitter/spirvEmitterInternal.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 void ComputeReachableBlocks(EmitterState& state, const IR::Program& program) {
@@ -160,6 +162,22 @@ uint32_t InitialRegisterValue(const EmitterState& state, IR::Register reg) {
 	if (reg.file == IR::RegisterFile::Exec) {
 		if (state.per_invocation_masks) {
 			return reg.index == 0 ? 1u : 0u;
+		}
+		if (state.stage == ShaderType::Compute && state.compute_input_info != nullptr) {
+			const auto local_threads =
+			    std::max(state.compute_input_info->threads_num[0], 1u) *
+			    std::max(state.compute_input_info->threads_num[1], 1u) *
+			    std::max(state.compute_input_info->threads_num[2], 1u);
+			if (local_threads < state.wave_size) {
+				const auto active_bits = reg.index == 0
+				                             ? std::min(local_threads, 32u)
+				                             : (local_threads > 32u
+				                                    ? std::min(local_threads - 32u, 32u)
+				                                    : 0u);
+				return active_bits == 32u
+				           ? 0xffffffffu
+				           : (active_bits == 0u ? 0u : (1u << active_bits) - 1u);
+			}
 		}
 		if (reg.index == 0) {
 			return 0xffffffffu;
@@ -747,39 +765,55 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 			EmitGuardedByExec(state, [&]() { EmitBufferStoreDword(state, inst); });
 			break;
 		case IR::Opcode::AtomicSwapU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicExchange); });
 			break;
+		case IR::Opcode::AtomicCompareSwapU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
+			EmitGuardedByExec(state, [&]() { EmitAtomicCompareSwapU32(state, inst); });
+			break;
 		case IR::Opcode::AtomicAddU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicIAdd); });
 			break;
 		case IR::Opcode::AtomicSubU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicISub); });
 			break;
 		case IR::Opcode::AtomicSMinI32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicSMin); });
 			break;
 		case IR::Opcode::AtomicUMinU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicUMin); });
 			break;
 		case IR::Opcode::AtomicSMaxI32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicSMax); });
 			break;
 		case IR::Opcode::AtomicUMaxU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicUMax); });
 			break;
 		case IR::Opcode::AtomicAndU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicAnd); });
 			break;
 		case IR::Opcode::AtomicOrU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicOr); });
 			break;
 		case IR::Opcode::AtomicXorU32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicXor); });
 			break;
 		case IR::Opcode::AtomicFMinF32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicFMinF32(state, inst); });
 			break;
 		case IR::Opcode::AtomicFMaxF32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitAtomicFMaxF32(state, inst); });
 			break;
 		case IR::Opcode::FlatLoadUbyte: EmitFlatLoadUbyte(state, inst); break;
@@ -805,26 +839,41 @@ void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {
 			});
 			break;
 		case IR::Opcode::DsReadUbyte:
+			EmitDsReadVisibilityBarrier(state, inst.memory.kind, inst.pc);
 			EmitMemoryLoadSubDwordU32(state, inst, inst.memory.kind, 0, 1, 8, false);
 			break;
 		case IR::Opcode::DsReadSbyte:
+			EmitDsReadVisibilityBarrier(state, inst.memory.kind, inst.pc);
 			EmitMemoryLoadSubDwordU32(state, inst, inst.memory.kind, 0, 1, 8, true);
 			break;
 		case IR::Opcode::DsReadUshort:
+			EmitDsReadVisibilityBarrier(state, inst.memory.kind, inst.pc);
 			EmitMemoryLoadSubDwordU32(state, inst, inst.memory.kind, 0, 1, 16, false);
 			break;
 		case IR::Opcode::DsReadSshort:
+			EmitDsReadVisibilityBarrier(state, inst.memory.kind, inst.pc);
 			EmitMemoryLoadSubDwordU32(state, inst, inst.memory.kind, 0, 1, 16, true);
 			break;
-		case IR::Opcode::DsReadB32: EmitMemoryLoadU32(state, inst, inst.memory.kind, 0, 1); break;
+		case IR::Opcode::DsReadB32:
+			EmitDsReadVisibilityBarrier(state, inst.memory.kind, inst.pc);
+			EmitMemoryLoadU32(state, inst, inst.memory.kind, 0, 1);
+			break;
 		case IR::Opcode::DsSwizzleB32: EmitDsSwizzleB32(state, inst); break;
-		case IR::Opcode::DsConsume: EmitDsAppendConsume(state, inst, OpAtomicISub); break;
-		case IR::Opcode::DsAppend: EmitDsAppendConsume(state, inst, OpAtomicIAdd); break;
+		case IR::Opcode::DsConsume:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
+			EmitDsAppendConsume(state, inst, OpAtomicISub);
+			break;
+		case IR::Opcode::DsAppend:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
+			EmitDsAppendConsume(state, inst, OpAtomicIAdd);
+			break;
 		case IR::Opcode::DsReadAddtidB32: EmitDsReadAddtidB32(state, inst); break;
 		case IR::Opcode::DsMinF32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitDsFloatMinMaxF32(state, inst, false); });
 			break;
 		case IR::Opcode::DsMaxF32:
+			EmitDsAtomicPhaseBarrier(state, inst.memory.kind);
 			EmitGuardedByExec(state, [&]() { EmitDsFloatMinMaxF32(state, inst, true); });
 			break;
 		case IR::Opcode::DsWriteByte:
@@ -1039,9 +1088,10 @@ void EmitDispatcherSwitch(EmitterState& state, const IR::Program& program) {
 	EmitDispatcherExit(state);
 }
 
-size_t BufferLoadGroupSize(const IR::BasicBlock& block, size_t first_index) {
+size_t SplitLoadGroupSize(const IR::BasicBlock& block, size_t first_index,
+                          IR::Opcode expected_opcode) {
 	const auto& first = block.instructions[first_index];
-	if (first.op != IR::Opcode::BufferLoadDword || first.memory.component_index != 0u ||
+	if (first.op != expected_opcode || first.memory.component_index != 0u ||
 	    first.memory.component_count <= 1u) {
 		return 1u;
 	}
@@ -1050,9 +1100,10 @@ size_t BufferLoadGroupSize(const IR::BasicBlock& block, size_t first_index) {
 	while (first_index + count < block.instructions.size() &&
 	       count < first.memory.component_count) {
 		const auto& next = block.instructions[first_index + count];
-		if (next.op != IR::Opcode::BufferLoadDword || next.pc != first.pc ||
+		if (next.op != expected_opcode || next.pc != first.pc ||
 		    next.memory.component_index != count ||
-		    next.memory.component_count != first.memory.component_count) {
+		    next.memory.component_count != first.memory.component_count ||
+		    next.memory.kind != first.memory.kind) {
 			break;
 		}
 		count++;
@@ -1062,12 +1113,51 @@ size_t BufferLoadGroupSize(const IR::BasicBlock& block, size_t first_index) {
 
 void EmitBlockInstructions(EmitterState& state, const IR::BasicBlock& block) {
 	for (size_t i = 0; i < block.instructions.size();) {
-		const auto count = BufferLoadGroupSize(block, i);
-		if (count > 1u) {
+		const auto& instruction = block.instructions[i];
+		EmitLogicalWaveLdsInstructionBarrier(state, instruction);
+		if (std::getenv("KYTY_BINK_WORKGROUP_LDS_BARRIER") != nullptr &&
+		    state.program.shader_hash == 0x0000000208a63b00ULL &&
+		    (instruction.pc == 0x000001d4u || instruction.pc == 0x0000092cu)) {
+			// Diagnostic wave64 phase boundary: all 64 invocations have reconverged
+			// before a new decode-loop iteration or the second transform partition.
+			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, semantics)});
+		}
+		const char* const trace_pc_text = std::getenv("KYTY_BINK_TRACE_PC");
+		const bool trace_instruction =
+		    BinkTraceEnabled(state) && trace_pc_text != nullptr &&
+		    static_cast<uint32_t>(std::strtoul(trace_pc_text, nullptr, 0)) == instruction.pc &&
+		    instruction.dst.kind == IR::OperandKind::Register;
+		uint32_t trace_old  = 0;
+		uint32_t trace_src0 = 0;
+		uint32_t trace_src1 = 0;
+		if (trace_instruction) {
+			trace_old  = EmitRegisterLoad(state, instruction.dst.reg);
+			trace_src0 = instruction.src_count > 0u ? EmitValueLoad(state, instruction.src[0])
+			                                            : ConstantU32(state, 0);
+			trace_src1 = instruction.src_count > 1u ? EmitValueLoad(state, instruction.src[1])
+			                                            : ConstantU32(state, 0);
+		}
+		const auto buffer_count =
+		    SplitLoadGroupSize(block, i, IR::Opcode::BufferLoadDword);
+		const auto ds_count = buffer_count == 1u
+		                          ? SplitLoadGroupSize(block, i, IR::Opcode::DsReadB32)
+		                          : 1u;
+		const auto count = std::max(buffer_count, ds_count);
+		if (buffer_count > 1u) {
 			EmitBufferLoadDwordGroup(state, block.instructions.data() + i,
 			                         static_cast<uint32_t>(count));
+		} else if (ds_count > 1u) {
+			EmitDsReadB32Group(state, block.instructions.data() + i,
+			                   static_cast<uint32_t>(count));
 		} else {
-			EmitInstruction(state, block.instructions[i]);
+			EmitInstruction(state, instruction);
+		}
+		if (trace_instruction) {
+			EmitBinkTraceRecord(state, 6u, instruction.pc, trace_old, trace_src0, trace_src1,
+			                    EmitRegisterLoad(state, instruction.dst.reg));
 		}
 		i += count;
 	}
@@ -1101,6 +1191,52 @@ void EmitDispatcherFunction(EmitterState& state, const IR::Program& program) {
 	EmitDispatcherLoopTail(state);
 }
 
+bool EmitConditionalLoopBlock(EmitterState& state, const IR::BasicBlock& block) {
+	const auto& term = block.terminator;
+	if (!term.loop_header || term.kind != CFG::TerminatorKind::ConditionalBranch) {
+		return false;
+	}
+
+	const auto header_label = BlockLabel(state, block.id);
+	const auto merge_label  = BlockLabel(state, term.merge_block);
+	const auto cfg_continue = BlockLabel(state, term.continue_block);
+	const auto cfg_true     = BlockLabel(state, term.true_block);
+	const auto cfg_false    = BlockLabel(state, term.false_block);
+	if (header_label == 0 || merge_label == 0 || cfg_continue == 0 || cfg_true == 0 ||
+	    cfg_false == 0) {
+		EmitReturn(state);
+		return true;
+	}
+
+	// Branch conditions may lower to a small structured selection (for example,
+	// a logical-wave EXEC/VCC reduction). Keep all such lowering in a loop-body
+	// block so the original CFG label remains the SPIR-V loop header and owns
+	// OpLoopMerge. A self-loop additionally needs a dedicated continue block:
+	// making the conditional block itself the back-edge violates the rule that
+	// the continue construct is structurally post-dominated by its back-edge.
+	const bool self_continue = term.continue_block == block.id;
+	const auto body_label    = state.builder.AllocateId();
+	const auto continue_label =
+	    self_continue ? state.builder.AllocateId() : cfg_continue;
+	state.builder.AddFunction({OpLoopMerge, merge_label, continue_label, LoopControlNone});
+	state.builder.AddFunction({OpBranch, body_label});
+	state.builder.AddFunction({OpLabel, body_label});
+	EmitBlockInstructions(state, block);
+
+	const auto condition = EmitBranchCondition(state, term.condition);
+	const auto true_label =
+	    self_continue && term.true_block == block.id ? continue_label : cfg_true;
+	const auto false_label =
+	    self_continue && term.false_block == block.id ? continue_label : cfg_false;
+	state.builder.AddFunction({OpBranchConditional, condition, true_label, false_label});
+
+	if (self_continue) {
+		state.builder.AddFunction({OpLabel, continue_label});
+		state.builder.AddFunction({OpBranch, header_label});
+	}
+	return true;
+}
+
 void EmitFunction(EmitterState& state, const IR::Program& program) {
 	state.builder.AddFunction(
 	    {OpFunction, state.void_type, state.main_func, FunctionControlNone, state.func_type});
@@ -1129,6 +1265,9 @@ void EmitFunction(EmitterState& state, const IR::Program& program) {
 			continue;
 		}
 		state.builder.AddFunction({OpLabel, BlockLabel(state, block.id)});
+		if (EmitConditionalLoopBlock(state, block)) {
+			continue;
+		}
 		EmitBlockInstructions(state, block);
 		EmitTerminator(state, block.terminator);
 	}

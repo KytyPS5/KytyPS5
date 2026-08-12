@@ -321,9 +321,22 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 
 } // namespace LibGen5Driver
 
+namespace LibAgcDriver {
+
+LIB_VERSION("AgcDriver", 1, "AgcDriver", 1, 1);
+
+namespace AgcDriver = Graphics::AgcDriver;
+
+LIB_DEFINE(InitGraphicsDriver_1) {
+	LIB_FUNC("ZLJk9r2+2Aw", AgcDriver::UnregisterOwnerAndResources);
+}
+
+} // namespace LibAgcDriver
+
 LIB_DEFINE(InitGraphicsDriver_1) {
 	LibGen5::InitGraphicsDriver_1(s);
 	LibGen5Driver::InitGraphicsDriver_1(s);
+	LibAgcDriver::InitGraphicsDriver_1(s);
 }
 
 } // namespace Libs

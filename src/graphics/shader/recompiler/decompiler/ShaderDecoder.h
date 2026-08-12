@@ -426,6 +426,7 @@ enum class Opcode {
 	TBufferStoreFormatXyz,
 	TBufferStoreFormatXyzw,
 	BufferAtomicSwap,
+	BufferAtomicCmpSwap,
 	BufferAtomicAdd,
 	BufferAtomicSub,
 	BufferAtomicSMin,
@@ -538,6 +539,7 @@ enum class Opcode {
 	SSleep,
 	STtraceData,
 	SInstPrefetch,
+	SSceBreak,
 	SEndpgm,
 	Exp
 };

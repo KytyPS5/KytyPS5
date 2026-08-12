@@ -38,6 +38,7 @@ enum : uint32_t {
 	CapabilitySampled1D                      = 43,
 	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
+	CapabilityClipDistance                   = 32,
 	CapabilityStorageImageReadWithoutFormat  = 55,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
@@ -45,7 +46,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilitySampledImageArrayNonUniformIndexing = 5307,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
-	CapabilityFragmentBarycentricKHR         = 5284,
+	CapabilityFragmentBarycentricKHR          = 5284,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
@@ -61,9 +62,9 @@ enum : uint32_t {
 
 enum : uint32_t {
 	DecorationBlock         = 2,
+	DecorationSpecId        = 1,
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
-	DecorationPerVertexKHR  = 5285,
 	DecorationFlat          = 14,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
@@ -71,10 +72,12 @@ enum : uint32_t {
 	DecorationDescriptorSet = 34,
 	DecorationOffset        = 35,
 	DecorationNonUniform    = 5300,
+	DecorationPerVertexKHR  = 5285,
 };
 
 enum : uint32_t {
 	BuiltInPosition                  = 0,
+	BuiltInClipDistance              = 3,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
 	BuiltInSampleMask                = 20,
@@ -86,6 +89,8 @@ enum : uint32_t {
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
+	BuiltInBaryCoordKHR              = 5286,
+	BuiltInBaryCoordNoPerspKHR       = 5287,
 };
 
 enum : uint32_t {
@@ -133,6 +138,7 @@ enum : uint32_t {
 	OpTypeFunction                 = 33,
 	OpConstant                     = 43,
 	OpConstantComposite            = 44,
+	OpSpecConstant                 = 50,
 	OpFunction                     = 54,
 	OpFunctionEnd                  = 56,
 	OpVariable                     = 59,
@@ -279,8 +285,8 @@ struct InputBinding {
 	uint32_t           location        = 0;
 	uint32_t           component_count = 1;
 	uint32_t           variable_id     = 0;
-	bool               per_vertex      = false;
 	std::string        debug_name;
+	bool               per_vertex = false;
 };
 
 struct OutputBinding {
@@ -327,6 +333,17 @@ struct EmitterState {
 	uint32_t                                         wave_size          = 64;
 	bool                                             exact_subgroup_operations    = false;
 	bool                                             per_invocation_masks         = false;
+	// A single 64-lane guest compute wave can be represented by all 64
+	// invocations of one host workgroup when the host cannot provide subgroup64.
+	// This is deliberately narrower than general per-invocation mask lowering:
+	// workgroup collectives are only valid when the complete workgroup is one
+	// guest wave.
+	bool                                             logical_single_wave_workgroup = false;
+	// Multiple guest wave64s may share a workgroup when every workgroup
+	// collective is proven to occur in dynamically uniform control flow.
+	bool                                             logical_multi_wave_workgroup  = false;
+	uint32_t                                         logical_wave_count            = 0;
+	uint32_t                                         logical_local_threads         = 0;
 	uint32_t                                         void_type                    = 0;
 	uint32_t                                         bool_type                    = 0;
 	uint32_t                                         uint_type                    = 0;
@@ -357,9 +374,10 @@ struct EmitterState {
 	uint32_t                                         ptr_input_vec3_uint          = 0;
 	uint32_t                                         ptr_input_vec4_uint          = 0;
 	uint32_t                                         ptr_input_vec4_float         = 0;
-	// A per-vertex fragment input is one vec4 per vertex of the primitive.
-	uint32_t                                         vec4x3_float_type            = 0;
-	uint32_t                                         ptr_input_vec4x3_float       = 0;
+	uint32_t                                         per_vertex_input_array_type  = 0;
+	uint32_t                                         ptr_input_per_vertex_array   = 0;
+	uint32_t                                         bary_coord_variable          = 0;
+	uint32_t                                         bary_coord_no_persp_variable = 0;
 	uint32_t                                         sample_mask_array_type       = 0;
 	uint32_t                                         ptr_output_int               = 0;
 	uint32_t                                         ptr_output_sample_mask_array = 0;
@@ -367,6 +385,8 @@ struct EmitterState {
 	uint32_t                                         ptr_output_vec4_float        = 0;
 	uint32_t                                         per_vertex_type              = 0;
 	uint32_t                                         ptr_output_per_vertex        = 0;
+	uint32_t                                         clip_distance_array_type     = 0;
+	uint32_t                                         synthetic_depth_clip         = 0;
 	uint32_t                                         storage_runtime_array_type   = 0;
 	uint32_t                                         storage_buffer_type          = 0;
 	uint32_t                                         ptr_storage_buffer           = 0;
@@ -390,6 +410,12 @@ struct EmitterState {
 	uint32_t                                         ptr_workgroup_array       = 0;
 	uint32_t                                         ptr_workgroup_uint        = 0;
 	uint32_t                                         lds_variable              = 0;
+	uint32_t                                         logical_wave_summary_variable = 0;
+	uint32_t                                         logical_wave_summary_array_type = 0;
+	uint32_t                                         ptr_logical_wave_summary_array  = 0;
+	uint32_t                                         logical_wave_lane_array_type  = 0;
+	uint32_t                                         ptr_logical_wave_lane_array   = 0;
+	uint32_t                                         logical_wave_lane_variable    = 0;
 	std::array<SampledImageDescriptors, 14>          sampled_images;
 	std::array<StorageImageDescriptors, 10>          storage_images;
 	uint32_t                                         sampler_type                          = 0;
@@ -437,15 +463,21 @@ struct EmitterState {
 	std::map<uint32_t, uint32_t>                     float_constants;
 };
 
+inline bool IsLogicalWaveWorkgroup(const EmitterState& state) {
+	return state.logical_single_wave_workgroup || state.logical_multi_wave_workgroup;
+}
+
 inline uint32_t GetLdsDwordCount(const EmitterState& state) {
 	if (state.needs_function_lds) {
 		return 8192u;
 	}
 	if (state.stage == ShaderType::Compute && state.compute_input_info != nullptr) {
-		// SPIR-V does not permit a zero-length OpTypeArray.
+		// SPIR-V does not permit a zero-length OpTypeArray. A one-dword declaration is
+		// harmless for compute programs whose hardware LDS reservation is zero.
 		return std::max(state.compute_input_info->lds_size_dwords, 1u);
 	}
-	// Preserve the standalone recompiler default when no hardware state was supplied.
+	// Preserve the standalone recompiler's historical default when no hardware state
+	// was supplied by a caller (primarily decoder/emitter unit tests).
 	return 1024u;
 }
 
@@ -735,8 +767,6 @@ uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool
 
 uint32_t ExecutionModelForStage(ShaderType stage);
 
-bool HasPerVertexInput(const EmitterState& state);
-
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t ConstantI32(EmitterState& state, int32_t value);
@@ -802,6 +832,16 @@ uint32_t EmitMaskActiveBool(EmitterState& state, IR::RegisterFile file);
 uint32_t EmitMaskZeroBool(EmitterState& state, IR::RegisterFile file, bool zero);
 
 uint32_t EmitMaskSummaryZeroBool(EmitterState& state, IR::RegisterFile file, bool zero);
+
+uint32_t EmitLogicalWaveAnyBool(EmitterState& state, uint32_t value_bool);
+
+uint32_t EmitLogicalWaveIndex(EmitterState& state);
+
+uint32_t EmitLogicalWaveLaneIndex(EmitterState& state);
+
+uint32_t EmitLogicalWaveSummaryPointer(EmitterState& state);
+
+uint32_t EmitLogicalWaveLaneArrayIndex(EmitterState& state, uint32_t guest_lane);
 
 uint32_t EmitExecActiveBool(EmitterState& state);
 
@@ -968,6 +1008,11 @@ uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index);
 
 uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index);
 
+bool BinkTraceEnabled(const EmitterState& state);
+
+void EmitBinkTraceRecord(EmitterState& state, uint32_t site, uint32_t pc, uint32_t value0,
+	                     uint32_t value1, uint32_t value2, uint32_t value3);
+
 uint32_t EmitMemoryElementPointer(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
                                   uint32_t use_pc);
 
@@ -1042,6 +1087,7 @@ uint32_t EmitAtomicPointer(EmitterState& state, const IR::Instruction& inst);
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 
 void EmitAtomicU32(EmitterState& state, const IR::Instruction& inst, uint32_t opcode);
+void EmitAtomicCompareSwapU32(EmitterState& state, const IR::Instruction& inst);
 
 void EmitAtomicFMinF32(EmitterState& state, const IR::Instruction& inst);
 void EmitAtomicFMaxF32(EmitterState& state, const IR::Instruction& inst);
@@ -1062,6 +1108,15 @@ void EmitBufferLoadDword(EmitterState& state, const IR::Instruction& inst);
 
 void EmitBufferLoadDwordGroup(EmitterState& state, const IR::Instruction* instructions,
                               uint32_t count);
+
+void EmitDsReadVisibilityBarrier(EmitterState& state, IR::ResourceKind kind,
+                                 uint32_t guest_pc = UINT32_MAX);
+void EmitDsAtomicPhaseBarrier(EmitterState& state, IR::ResourceKind kind);
+
+void EmitLogicalWaveLdsInstructionBarrier(EmitterState& state,
+                                          const IR::Instruction& inst);
+
+void EmitDsReadB32Group(EmitterState& state, const IR::Instruction* instructions, uint32_t count);
 
 void EmitBufferStoreDword(EmitterState& state, const IR::Instruction& inst);
 

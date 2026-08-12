@@ -659,24 +659,16 @@ static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer,
 	const auto& ctx    = buffer.GetRegisters();
 	const auto& sh_ctx = buffer.GetShaders();
 
-	const auto& sh_regs = ctx.GetShaderRegisters();
-	const auto& ps      = sh_ctx.GetPs();
-
-	// A pixel shader that is not bound cannot be active, whatever the render targets are.
-	// This was checked only on the depth-only path below, so a draw with colour targets and
-	// no pixel shader reported active and then aborted looking up shader address 0 in the
-	// ShaderMap. Double Dragon Gaiden issues exactly that.
-	if (!ShaderAddressValid(ps.ps_regs.data_addr)) {
-		return false;
-	}
-
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count != 0 || !with_depth) {
 		return true;
 	}
 
-	return PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
+	const auto& sh_regs = ctx.GetShaderRegisters();
+	const auto& ps      = sh_ctx.GetPs();
+	return ShaderAddressValid(ps.ps_regs.data_addr) &&
+	       PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
 }
 
 enum class CbColorMode : uint8_t {
@@ -688,16 +680,29 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const RenderCommandBuffer& buffer) {
-	const auto& ctx  = buffer.GetRegisters();
-	const auto  mode = ctx.GetColorControl().mode;
+static bool ConsumeMetadataOperation(const RenderCommandBuffer& buffer) {
+	const auto& ctx    = buffer.GetRegisters();
+	const auto& sh_ctx = buffer.GetShaders();
+	const auto  mode   = ctx.GetColorControl().mode;
 	// These AGC CB modes run color-buffer metadata/decompression operations. The shader is a
 	// dummy vehicle for the CB, and its exported color must not be applied as a normal draw.
 	// Kyty currently stores host images as expanded Vulkan images and does not track CMASK/DCC
 	// metadata state, so the matching host operation is a no-op.
-	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
-	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
-	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
+	const bool color_metadata = mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
+	                            mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	                            mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
+	// DB resummarization similarly rebuilds the guest HTile summary using a geometry-only draw.
+	// Vulkan maintains its own depth-compression metadata, so a resummarization draw with no PS
+	// has no host-visible work. Keep PS-backed draws on the normal guarded path.
+	const bool depth_metadata = ctx.GetRenderControl().resummarize_enable &&
+	                            !ShaderAddressValid(sh_ctx.GetPs().ps_regs.data_addr);
+	if (depth_metadata) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: consumed guest HTile resummarization draw\n");
+		}
+	}
+	return color_metadata || depth_metadata;
 }
 
 struct DrawEmitInfo {
@@ -1201,7 +1206,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer)) {
+	if (ConsumeMetadataOperation(buffer)) {
 		ResetBindings();
 		return;
 	}
@@ -1330,7 +1335,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer)) {
+	if (ConsumeMetadataOperation(buffer)) {
 		ResetBindings();
 		return;
 	}

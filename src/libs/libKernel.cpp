@@ -2329,9 +2329,50 @@ static thread_local FiberObject*                  g_thread_return_fiber = nullpt
 static thread_local FiberObject*                  g_starting_fiber      = nullptr;
 static thread_local FiberObject*                  g_pending_idle_fiber  = nullptr;
 static thread_local FiberCpuContext               g_thread_fiber_context {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct FiberWindowsStackBounds {
+	uintptr_t base;
+	uintptr_t limit;
+};
+static thread_local FiberWindowsStackBounds       g_thread_stack_bounds {};
+#endif
 static std::mutex                                 g_fiber_owner_mutex;
 static std::unordered_map<FiberObject*, uint64_t> g_fiber_owner_thread;
 static std::unordered_map<uint64_t, FiberObject*> g_fiber_current_by_thread;
+
+static void FiberCaptureThreadStackBounds() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(g_thread_stack_bounds.base), "=r"(g_thread_stack_bounds.limit)
+	             :
+	             : "memory");
+#endif
+}
+
+static void FiberActivateThreadStack() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(g_thread_stack_bounds.base), "r"(g_thread_stack_bounds.limit)
+	             : "memory");
+#endif
+}
+
+static void FiberActivateGuestStack(const FiberObject* fiber) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto stack_limit = reinterpret_cast<uintptr_t>(fiber->addr_context);
+	const auto stack_base  = stack_limit + static_cast<uintptr_t>(fiber->size_context);
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(stack_base), "r"(stack_limit)
+	             : "memory");
+#else
+	(void)fiber;
+#endif
+}
 
 static uint32_t FiberLoadState(const FiberObject* fiber) {
 	auto& state = const_cast<uint32_t&>(fiber->state);
@@ -2458,47 +2499,52 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-__attribute__((noinline, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
-	int ret = 0;
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq %%rbx, 0(%%r10)\n\t"
-	             "movq %%rbp, 8(%%r10)\n\t"
-	             "movq %%rdi, 16(%%r10)\n\t"
-	             "movq %%rsi, 24(%%r10)\n\t"
-	             "movq %%r12, 32(%%r10)\n\t"
-	             "movq %%r13, 40(%%r10)\n\t"
-	             "movq %%r14, 48(%%r10)\n\t"
-	             "movq %%r15, 56(%%r10)\n\t"
-	             "leaq 8(%%rsp), %%r11\n\t"
-	             "movq %%r11, 64(%%r10)\n\t"
-	             "movq (%%rsp), %%r11\n\t"
-	             "movq %%r11, 72(%%r10)\n\t"
-	             "xorl %%eax, %%eax\n\t"
-	             : "=a"(ret)
-	             : [ctx] "r"(ctx)
-	             : "memory", "r10", "r11");
-	return ret;
+// These helpers must not have compiler-generated prologues. The saved RSP/RIP are the caller's
+// continuation, so reading them after a frame-pointer push would save the caller's RBP as RIP.
+__attribute__((naked, returns_twice)) static int FiberSaveContext(FiberCpuContext* /*ctx*/) {
+	asm volatile(
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	    "movq %rcx, %r10\n\t"
+#else
+	    "movq %rdi, %r10\n\t"
+#endif
+	    "movq %rbx, 0(%r10)\n\t"
+	    "movq %rbp, 8(%r10)\n\t"
+	    "movq %rdi, 16(%r10)\n\t"
+	    "movq %rsi, 24(%r10)\n\t"
+	    "movq %r12, 32(%r10)\n\t"
+	    "movq %r13, 40(%r10)\n\t"
+	    "movq %r14, 48(%r10)\n\t"
+	    "movq %r15, 56(%r10)\n\t"
+	    "leaq 8(%rsp), %r11\n\t"
+	    "movq %r11, 64(%r10)\n\t"
+	    "movq (%rsp), %r11\n\t"
+	    "movq %r11, 72(%r10)\n\t"
+	    "xorl %eax, %eax\n\t"
+	    "retq\n\t");
 }
 
-__attribute__((noreturn, noinline)) static void FiberRestoreContext(FiberCpuContext* ctx,
-                                                                    uint64_t         ret) {
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq 72(%%r10), %%r11\n\t"
-	             "movq 0(%%r10), %%rbx\n\t"
-	             "movq 8(%%r10), %%rbp\n\t"
-	             "movq 16(%%r10), %%rdi\n\t"
-	             "movq 24(%%r10), %%rsi\n\t"
-	             "movq 32(%%r10), %%r12\n\t"
-	             "movq 40(%%r10), %%r13\n\t"
-	             "movq 48(%%r10), %%r14\n\t"
-	             "movq 56(%%r10), %%r15\n\t"
-	             "movq 64(%%r10), %%rsp\n\t"
-	             "movq %[ret], %%rax\n\t"
-	             "jmp *%%r11\n\t"
-	             :
-	             : [ctx] "r"(ctx), [ret] "r"(ret)
-	             : "memory", "rax", "r10", "r11");
-	__builtin_unreachable();
+__attribute__((naked, noreturn)) static void FiberRestoreContext(FiberCpuContext* /*ctx*/,
+                                                                 uint64_t /*ret*/) {
+	asm volatile(
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	    "movq %rcx, %r10\n\t"
+	    "movq %rdx, %rax\n\t"
+#else
+	    "movq %rdi, %r10\n\t"
+	    "movq %rsi, %rax\n\t"
+#endif
+	    "movq 72(%r10), %r11\n\t"
+	    "movq 0(%r10), %rbx\n\t"
+	    "movq 8(%r10), %rbp\n\t"
+	    "movq 16(%r10), %rdi\n\t"
+	    "movq 24(%r10), %rsi\n\t"
+	    "movq 32(%r10), %r12\n\t"
+	    "movq 40(%r10), %r13\n\t"
+	    "movq 48(%r10), %r14\n\t"
+	    "movq 56(%r10), %r15\n\t"
+	    "movq 64(%r10), %rsp\n\t"
+	    "jmp *%r11\n\t");
 }
 #else
 static int FiberSaveContext(FiberCpuContext* ctx) {
@@ -2530,6 +2576,7 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 
 	g_starting_fiber = fiber;
+	FiberActivateGuestStack(fiber);
 	FiberRestoreContext(&ctx, 1);
 }
 
@@ -2551,6 +2598,7 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	g_thread_return_fiber = fiber;
 	FiberSetCurrentFiber(nullptr);
 
+	FiberActivateThreadStack();
 	FiberRestoreContext(&g_thread_fiber_context, 1);
 }
 
@@ -2672,8 +2720,10 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	fiber->arg_on_return  = 0;
 	g_thread_return_fiber = nullptr;
 
+	FiberCaptureThreadStackBounds();
 	if (FiberSaveContext(&g_thread_fiber_context) == 0) {
 		if (fiber->context_valid) {
+			FiberActivateGuestStack(fiber);
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
@@ -2722,6 +2772,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 		FiberSetContextValid(caller, true);
 		FiberDeferIdle(caller);
 		if (fiber->context_valid) {
+			FiberActivateGuestStack(fiber);
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
@@ -2764,6 +2815,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 		FiberSetContextValid(fiber, true);
 		g_thread_return_fiber = fiber;
 		FiberDeferIdle(fiber);
+		FiberActivateThreadStack();
 		FiberRestoreContext(&g_thread_fiber_context, 1);
 	}
 

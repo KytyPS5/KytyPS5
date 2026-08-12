@@ -126,7 +126,10 @@ std::string InputInfoToString(Opcode op, const InputInfo& input) {
 	if (op != Opcode::LoadInputF32) {
 		return "";
 	}
-	return fmt::format(" ; input_attr={} input_chan={}", input.attr, input.chan);
+	return input.vertex_index == UINT32_MAX
+	           ? fmt::format(" ; input_attr={} input_chan={}", input.attr, input.chan)
+	           : fmt::format(" ; input_attr={} input_chan={} input_vertex={}", input.attr,
+	                         input.chan, input.vertex_index);
 }
 
 std::string WaitcntInfoToString(const Instruction& inst) {

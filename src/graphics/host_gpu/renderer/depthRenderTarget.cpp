@@ -166,65 +166,24 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
-	// Twenty-five independent conditions collapsed into one message that named none of them,
-	// which made every abort here a research project. Report the first offender.
-	struct DepthReject {
-		const char* name;
-		bool        hit;
-	};
-	const DepthReject rejects[] = {
-	    // resummarize_enable is deliberately absent: it asks the hardware to recompute HTILE's
-	    // min/max depth metadata after a direct depth write. This emulator never emulates
-	    // HTILE - the clear mask is fixed at zero and htile_acceleration is only read for
-	    // compatibility checks - so depth is stored uncompressed and there is neither metadata
-	    // to recompute nor a consumer that would read it. Ignoring the request is correct
-	    // here rather than merely convenient.
-	    {"copy_centroid", rc.copy_centroid},
-	    {"copy_sample", rc.copy_sample != 0},
-	    {"z expclear_enabled", z.z_info.expclear_enabled},
-	    {"stencil expclear_enabled", z.stencil_info.expclear_enabled},
-	    {"z partially_resident", z.z_info.partially_resident},
-	    {"stencil partially_resident", z.stencil_info.partially_resident},
-	    {"z max_mip_level != 0", z.z_info.max_mip_level != 0},
-	    {"depth_view current_mip_level != 0", z.depth_view.current_mip_level != 0},
-	    {"addr5_swizzle_mask", z.depth_info.addr5_swizzle_mask != 0},
-	    {"array_mode", z.depth_info.array_mode != 0},
-	    {"pipe_config", z.depth_info.pipe_config != 0},
-	    {"bank_width", z.depth_info.bank_width != 0},
-	    {"bank_height", z.depth_info.bank_height != 0},
-	    {"macro_tile_aspect", z.depth_info.macro_tile_aspect != 0},
-	    {"num_banks", z.depth_info.num_banks != 0},
-	    {"htile linear", z.htile_surface.linear != 0},
-	    {"htile full_cache", z.htile_surface.full_cache != 0},
-	    {"htile uses_preload_win", z.htile_surface.htile_uses_preload_win != 0},
-	    {"htile preload", z.htile_surface.preload != 0},
-	    {"htile prefetch_width", z.htile_surface.prefetch_width != 0},
-	    {"htile prefetch_height", z.htile_surface.prefetch_height != 0},
-	    {"htile dst_outside_zero_to_one", z.htile_surface.dst_outside_zero_to_one != 0},
-	    {"z_read_base_addr is zero", z.z_read_base_addr == 0},
-	    {"z write and read base addresses differ", z.z_write_base_addr != z.z_read_base_addr},
-	    {"z_read_base_addr is not 64K aligned", (z.z_read_base_addr & 0xffffu) != 0},
-	    {"zfunc out of range", dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)},
-	};
-	if (rc.resummarize_enable) {
-		static std::atomic<bool> resummarize_reported {false};
-		if (!resummarize_reported.exchange(true)) {
-			LOGF("DepthTarget: ignoring HTILE resummarize request; depth is stored uncompressed "
-			     "and no HTILE metadata is emulated\n");
-		}
-	}
-	const char* depth_offender = nullptr;
-	for (const auto& r: rejects) {
-		if (r.hit) {
-			depth_offender = r.name;
-			break;
-		}
-	}
-	if (depth_offender != nullptr) {
-		DepthFatal("%s (z_read=0x%016" PRIx64 " z_write=0x%016" PRIx64 " zfunc=%u "
-		           "has_stencil=%d)",
-		           depth_offender, z.z_read_base_addr, z.z_write_base_addr,
-		           static_cast<uint32_t>(dc.zfunc), static_cast<int>(has_stencil));
+	// The SCE SDK defines RESUMMARIZE_ENABLE as an HTile summary update policy for touched
+	// tiles. Vulkan maintains equivalent host depth metadata internally, and dedicated guest
+	// resummarization draws are consumed before attachment resolution.
+	if (rc.copy_centroid || rc.copy_sample != 0 ||
+	    z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
+	    z.depth_info.addr5_swizzle_mask != 0 || z.depth_info.array_mode != 0 ||
+	    z.depth_info.pipe_config != 0 || z.depth_info.bank_width != 0 ||
+	    z.depth_info.bank_height != 0 || z.depth_info.macro_tile_aspect != 0 ||
+	    z.depth_info.num_banks != 0 || z.htile_surface.linear != 0 ||
+	    z.htile_surface.full_cache != 0 || z.htile_surface.htile_uses_preload_win != 0 ||
+	    z.htile_surface.preload != 0 || z.htile_surface.prefetch_width != 0 ||
+	    z.htile_surface.prefetch_height != 0 || z.htile_surface.dst_outside_zero_to_one != 0 ||
+	    z.z_read_base_addr == 0 || z.z_write_base_addr != z.z_read_base_addr ||
+	    (z.z_read_base_addr & 0xffffu) != 0 ||
+	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
+		DepthFatal("unsupported depth register state");
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||

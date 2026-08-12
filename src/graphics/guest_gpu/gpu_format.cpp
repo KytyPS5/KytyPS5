@@ -164,6 +164,10 @@ const FormatInfo* FindFormatInfo(BufferFormat format) {
 
 } // namespace
 
+bool IsValidBufferFormat(BufferFormat format) {
+	return FindFormatInfo(format) != nullptr;
+}
+
 RenderTargetFormatEncoding ResolveRenderTargetFormat(ChannelLayout layout, ChannelType type) {
 	const auto* layout_info = FindRenderTargetLayout(layout);
 	const auto  raw_type    = static_cast<uint32_t>(type);

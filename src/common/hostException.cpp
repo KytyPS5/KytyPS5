@@ -24,6 +24,9 @@
 
 namespace Common::HostException {
 
+static std::atomic_uint32_t g_external_exception_passthrough {0};
+static_assert(decltype(g_external_exception_passthrough)::is_always_lock_free);
+
 #if !defined(__APPLE__)
 
 static std::atomic<Handler> g_handler {nullptr};
@@ -74,6 +77,11 @@ static Handler LoadInstalledHandler() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
+	// A later handler owned by an active instrumentation tool may deliberately resolve this fault.
+	// Do not turn its nested first-chance exception into a Kyty fail-fast.
+	if (g_in_exception_filter && ExternalExceptionPassthroughEnabled()) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 	FilterScope filter_scope;
 
 	auto* exception_record = exception->ExceptionRecord;
@@ -358,6 +366,25 @@ bool InstallHandler(Handler handler) {
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;
+}
+
+void BeginExternalExceptionPassthrough() noexcept {
+	g_external_exception_passthrough.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void EndExternalExceptionPassthrough() noexcept {
+	auto count = g_external_exception_passthrough.load(std::memory_order_acquire);
+	while (count != 0 &&
+	       !g_external_exception_passthrough.compare_exchange_weak(
+	           count, count - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+	}
+	if (count == 0) {
+		FailFast("external exception passthrough underflow");
+	}
+}
+
+bool ExternalExceptionPassthroughEnabled() noexcept {
+	return g_external_exception_passthrough.load(std::memory_order_acquire) != 0;
 }
 
 } // namespace Common::HostException

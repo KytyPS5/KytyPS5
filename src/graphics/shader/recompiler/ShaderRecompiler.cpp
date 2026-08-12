@@ -18,8 +18,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 
@@ -56,6 +59,34 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
+void DumpRawShaderIfRequested(std::span<const uint32_t> code, const CompileOptions& options) {
+	const char* const directory = std::getenv("KYTY_SHADER_RAW_DUMP_DIR");
+	if (directory == nullptr || directory[0] == '\0') {
+		return;
+	}
+
+	static std::mutex dump_mutex;
+	std::lock_guard    lock(dump_mutex);
+	const auto filename = fmt::format("{}/shader-{}-{:016x}-{}-words.bin", directory,
+	                                  StageName(options.stage), options.shader_hash, code.size());
+	if (auto* existing = std::fopen(filename.c_str(), "rb"); existing != nullptr) {
+		std::fclose(existing);
+		return;
+	}
+
+	auto* output = std::fopen(filename.c_str(), "wb");
+	if (output == nullptr) {
+		LOGF("%s raw shader dump failed: file=%s\n", GetDumpLabel(options), filename.c_str());
+		return;
+	}
+	const auto written = std::fwrite(code.data(), sizeof(uint32_t), code.size(), output);
+	std::fclose(output);
+	LOGF("%s raw shader dump: stage=%s hash=0x%016" PRIx64
+	     " words=%" PRIu64 " file=%s wrote=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(code.size()), filename.c_str(), static_cast<uint64_t>(written));
+}
+
 std::string FormatCfgFailure(const CFG::Graph& cfg, const CompileOptions& options,
                              const std::string& reason) {
 	const auto block_id = cfg.failure_block != UINT32_MAX ? cfg.failure_block : cfg.entry_block;
@@ -75,6 +106,7 @@ bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
 		case IR::Opcode::BufferStoreShort:
 		case IR::Opcode::BufferStoreDword:
 		case IR::Opcode::AtomicSwapU32:
+		case IR::Opcode::AtomicCompareSwapU32:
 		case IR::Opcode::AtomicAddU32:
 		case IR::Opcode::AtomicSubU32:
 		case IR::Opcode::AtomicSMinI32:
@@ -662,6 +694,10 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		                                 .count());
 	};
 
+	DumpRawShaderIfRequested(code, options);
+	ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "recompile_begin",
+	                      code.size());
+
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
@@ -670,6 +706,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!Decoder::DecodeProgram(code, decoded, error)) {
 		return false;
 	}
+	ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "decode_end",
+	                      decoded.instructions.size());
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -689,6 +727,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!CFG::BuildGraph(decoded, cfg, error)) {
 		return false;
 	}
+	ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "cfg_build_end",
+	                      cfg.blocks.size());
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -703,7 +743,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		LOGF("%s irreducible CFG detected: %s\n", GetDumpLabel(options), diagnostic.c_str());
 	} else {
 		std::string structure_error;
+		ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "cfg_copy_begin",
+		                      cfg.blocks.size());
 		const auto  unstructured_cfg = cfg;
+		ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "cfg_copy_end",
+		                      unstructured_cfg.blocks.size());
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		if (!CFG::Structurize(cfg, &structure_error)) {
@@ -722,6 +766,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
 		}
+		ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "cfg_structurize_end",
+		                      cfg.blocks.size());
 		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -735,6 +781,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, ir, error)) {
 		return false;
 	}
+	ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "ir_lower_end",
+	                      ir.blocks.size());
 	ir.lane_mask_mode  = options.lane_mask_mode;
 	ir.shader_hash     = options.shader_hash;
 	ir.user_data_base  = options.user_data_base;
@@ -832,6 +880,13 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	    options.pixel_input_info != nullptr ? options.pixel_input_info : &default_pixel;
 	info_options.compute =
 	    options.compute_input_info != nullptr ? options.compute_input_info : &default_compute;
+	ir.compute_linear_local64 =
+	    ir.stage == ShaderType::Compute && info_options.compute->threads_num[0] == 64u &&
+	    info_options.compute->threads_num[1] == 1u &&
+	    info_options.compute->threads_num[2] == 1u && info_options.compute->group_id[0] &&
+	    info_options.compute->thread_ids_num >= 1;
+	ir.compute_workgroup_register = info_options.compute->workgroup_register;
+	ir.compute_thread_ids_num     = info_options.compute->thread_ids_num;
 	if (!IR::CollectShaderInfo(ir, info_options, error)) {
 		return false;
 	}
@@ -869,6 +924,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
+	ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "spirv_emit_end",
+	                      spirv.size());
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -887,6 +944,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		result.decoded_dump.clear();
 		result.ir_dump.clear();
 	}
+	ShaderDiagnosticTrace(StageName(options.stage), options.shader_hash, "recompile_end",
+	                      result.spirv.size());
 	return true;
 }
 

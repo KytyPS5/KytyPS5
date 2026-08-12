@@ -869,6 +869,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		RenderDocOnPresent();
 		m_impl->presented_ime_revision.store(ime_visual.revision, std::memory_order_release);
 		window.UpdateTitle();
+		m_impl->renderer.GetTextureCache().MarkPresentedFrame();
 		m_impl->frames.Release(&frame, true);
 		return;
 	}

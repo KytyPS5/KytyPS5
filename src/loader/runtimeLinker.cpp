@@ -530,7 +530,7 @@ static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
 bool TestMainEntryUsesGuestStack() {
 	constexpr uint64_t stack_size = 0x10000;
 	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
-	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "main_entry_stack_test");
+        0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "main_entry_stack_test");
 	if (stack_base == 0) {
 		return false;
 	}
@@ -579,7 +579,7 @@ bool TestModuleRelocationUsesWritableHostMapping() {
 	constexpr uint64_t page_size = 0x4000;
 	constexpr uint64_t value     = 0x4b59545950415443;
 	const auto         base      = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0, page_size, Common::VirtualMemory::Mode::ReadWrite, "host_only_patch_test");
+        0, page_size, Common::VirtualMemory::Mode::ReadWrite, "host_only_patch_test");
 	if (base == 0) {
 		return false;
 	}
@@ -781,7 +781,8 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 }
 
 static bool IsDumpableRange(uint64_t addr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || defined(__APPLE__) ||                                \
+    KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	return IsReadableRange(addr, size);
 #else
 	(void)size;
@@ -820,6 +821,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+	}
+
+	if (Common::HostException::ExternalExceptionPassthroughEnabled()) {
+		return false;
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);
@@ -2097,7 +2102,7 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
 		const auto alloc_size = AlignUp(tcb_offset, TCB_ALIGN) + TCB_SIZE;
 		tls.ptr        = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
-		    0, alloc_size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
+            0, alloc_size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
 		tls.free_func  = nullptr;
 		tls.vm_alloc   = true;
 		tls.alloc_size = alloc_size;

@@ -3,6 +3,7 @@
 #include "SDL_syswm.h"
 #include "SDL_version.h"
 #include "SDL_video.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 
 #include <array>
@@ -45,7 +46,16 @@ enum RenderDocInputButton {
 	eRENDERDOC_Key_F1,
 };
 
-using pRENDERDOC_SetCaptureKeys             = void(__cdecl*)(RenderDocInputButton* keys, int num);
+enum RenderDocCaptureOption {
+	eRENDERDOC_Option_APIValidation      = 2,
+	eRENDERDOC_Option_CaptureCallstacks  = 3,
+	eRENDERDOC_Option_RefAllResources    = 8,
+	eRENDERDOC_Option_CaptureAllCmdLists = 10,
+	eRENDERDOC_Option_SoftMemoryLimit    = 13,
+};
+
+using pRENDERDOC_SetCaptureOptionU32 = int(__cdecl*)(RenderDocCaptureOption option, uint32_t value);
+using pRENDERDOC_SetCaptureKeys      = void(__cdecl*)(RenderDocInputButton* keys, int num);
 using pRENDERDOC_SetCaptureFilePathTemplate = void(__cdecl*)(const char* pathtemplate);
 using pRENDERDOC_GetCaptureFilePathTemplate = const char*(__cdecl*)();
 using pRENDERDOC_GetNumCaptures             = uint32_t(__cdecl*)();
@@ -53,17 +63,17 @@ using pRENDERDOC_GetCapture = uint32_t(__cdecl*)(uint32_t idx, char* filename, u
                                                  uint64_t* timestamp);
 using pRENDERDOC_UnloadCrashHandler = void(__cdecl*)();
 using pRENDERDOC_SetActiveWindow    = void(__cdecl*)(RenderDocDevicePointer device,
-                                                     RenderDocWindowHandle  wndHandle);
+                                                  RenderDocWindowHandle  wndHandle);
 using pRENDERDOC_StartFrameCapture  = void(__cdecl*)(RenderDocDevicePointer device,
-                                                     RenderDocWindowHandle  wndHandle);
+                                                    RenderDocWindowHandle  wndHandle);
 using pRENDERDOC_IsFrameCapturing   = uint32_t(__cdecl*)();
 using pRENDERDOC_EndFrameCapture    = uint32_t(__cdecl*)(RenderDocDevicePointer device,
-                                                         RenderDocWindowHandle  wndHandle);
+                                                      RenderDocWindowHandle  wndHandle);
 using pRENDERDOC_GetAPI = int(__cdecl*)(RenderDocVersion version, void** out_api_pointers);
 
 struct RenderDocApi {
 	void*                                 GetAPIVersion;
-	void*                                 SetCaptureOptionU32;
+	pRENDERDOC_SetCaptureOptionU32        SetCaptureOptionU32;
 	void*                                 SetCaptureOptionF32;
 	void*                                 GetCaptureOptionU32;
 	void*                                 GetCaptureOptionF32;
@@ -108,7 +118,30 @@ static RenderDocDevicePointer GetRenderDocDevicePointer(vk::Instance instance) {
 		return nullptr;
 	}
 
-	return VulkanHandleToPointer(instance);
+	// RenderDoc's RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE dereferences the instance once to obtain
+	// Vulkan's dispatch-table pointer. The raw VkInstance is not a RenderDoc device pointer.
+	auto* native_instance = VulkanHandleToPointer(instance);
+	return *static_cast<void**>(native_instance);
+}
+
+static void ConfigureCaptureOptions() {
+	const struct {
+		RenderDocCaptureOption option;
+		uint32_t               value;
+		const char*            name;
+	} options[] = {
+	    {eRENDERDOC_Option_APIValidation, 0, "API validation"},
+	    {eRENDERDOC_Option_CaptureCallstacks, 0, "callstacks"},
+	    {eRENDERDOC_Option_RefAllResources, 0, "all resources"},
+	    {eRENDERDOC_Option_CaptureAllCmdLists, 0, "all command lists"},
+	    // Stream large initial contents to disk instead of allowing an unbounded RAM spike.
+	    {eRENDERDOC_Option_SoftMemoryLimit, 1024, "soft memory limit"},
+	};
+	for (const auto& option: options) {
+		if (g_api->SetCaptureOptionU32(option.option, option.value) == 0) {
+			LOGF("RenderDoc: capture option %s=%u was rejected\n", option.name, option.value);
+		}
+	}
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -127,6 +160,7 @@ static bool BindRenderDocApi(HMODULE module) {
 	g_module = module;
 	g_api    = static_cast<RenderDocApi*>(api);
 
+	ConfigureCaptureOptions();
 	g_api->SetCaptureFilePathTemplate("_RenderDoc/kyty");
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
@@ -168,6 +202,7 @@ static bool BindRenderDocApi(HMODULE module) {
 	g_module = module;
 	g_api    = static_cast<RenderDocApi*>(api);
 
+	ConfigureCaptureOptions();
 	g_api->SetCaptureFilePathTemplate("_RenderDoc/kyty");
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
@@ -355,19 +390,22 @@ void RenderDocOnPresent() {
 				return;
 			}
 
-			g_api->StartFrameCapture(nullptr, nullptr);
+			Common::HostException::BeginExternalExceptionPassthrough();
+			g_state.store(RenderDocState::Capturing);
+			g_api->StartFrameCapture(g_device, g_window);
 			if (g_api->IsFrameCapturing() == 0) {
 				LOGF("RenderDoc: StartFrameCapture returned, but RenderDoc is not capturing\n");
+				Common::HostException::EndExternalExceptionPassthrough();
 				g_state.store(RenderDocState::Idle);
 				return;
 			}
-			g_state.store(RenderDocState::Capturing);
 			LOGF("RenderDoc: capture started\n");
 			return;
 		case RenderDocState::Capturing: break;
 	}
 
-	const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
+	const auto ok = g_api->EndFrameCapture(g_device, g_window);
+	Common::HostException::EndExternalExceptionPassthrough();
 	g_state.store(RenderDocState::Idle);
 
 	if (ok != 0) {

@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fmt/format.h>
@@ -44,6 +46,23 @@
 #endif
 
 namespace Libs::Graphics {
+
+void ShaderDiagnosticTrace(const char* stage, uint64_t shader_hash, const char* boundary,
+                           uint64_t value) {
+	const char* const filename = std::getenv("KYTY_SHADER_TRACE_FILE");
+	if (filename == nullptr || filename[0] == '\0') {
+		return;
+	}
+	static std::mutex trace_mutex;
+	std::scoped_lock  lock(trace_mutex);
+	if (auto* output = std::fopen(filename, "ab"); output != nullptr) {
+		std::fprintf(output, "%s hash=0x%016" PRIx64 " boundary=%s value=%" PRIu64 "\n",
+		             stage != nullptr ? stage : "unknown", shader_hash,
+		             boundary != nullptr ? boundary : "unknown", value);
+		std::fflush(output);
+		std::fclose(output);
+	}
+}
 
 namespace {
 
@@ -231,8 +250,57 @@ static bool SpirvValidateBinary(const char* label, uint64_t shader_hash,
 	SpirvDisassemble(spirv.data(), spirv.size(), &disassembly);
 	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
 	           label, shader_hash, messages.c_str());
+	std::fprintf(stderr, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", label,
+	             shader_hash, messages.c_str());
+	std::fflush(stderr);
 	LOGF("%s\n", disassembly.c_str());
 	return false;
+}
+
+static bool SpirvOptimizeBinary(const char* label, uint64_t shader_hash,
+                                std::vector<uint32_t>& spirv, std::string* error) {
+	const auto optimization = Config::GetShaderOptimizationType();
+	if (optimization == Config::ShaderOptimizationType::None) {
+		return true;
+	}
+
+	spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+	std::string         messages;
+	optimizer.SetMessageConsumer(
+	    [&messages](spv_message_level_t /*level*/, const char* /*source*/,
+	                const spv_position_t& position, const char* message) {
+		    messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
+		                            static_cast<int>(position.column),
+		                            static_cast<int>(position.index), message);
+	    });
+
+	switch (optimization) {
+		case Config::ShaderOptimizationType::Size: optimizer.RegisterSizePasses(); break;
+		case Config::ShaderOptimizationType::Performance:
+			optimizer.RegisterPerformancePasses();
+			break;
+		case Config::ShaderOptimizationType::None: return true;
+		default:
+			if (error != nullptr) {
+				*error = "unknown shader optimization type";
+			}
+			return false;
+	}
+
+	std::vector<uint32_t> optimized;
+	if (!optimizer.Run(spirv.data(), spirv.size(), &optimized)) {
+		if (error != nullptr) {
+			*error = messages.empty() ? "SPIR-V optimizer failed" : messages;
+		}
+		return false;
+	}
+
+	LOGF("%s SPIR-V optimization hash=0x%016" PRIx64 " words=%" PRIu64 " -> %" PRIu64
+	     "\n",
+	     label, shader_hash, static_cast<uint64_t>(spirv.size()),
+	     static_cast<uint64_t>(optimized.size()));
+	spirv = std::move(optimized);
+	return true;
 }
 
 static void ExitShaderRecompilerFailure(const char* label, uint64_t shader_hash,
@@ -884,7 +952,7 @@ static void ShaderGetStaticInputInfoPS(
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
-	                                   uint32_t guest_wave_size,
+                                       uint32_t guest_wave_size,
                                        ShaderComputeInputInfo& info) {
 	EXIT_NOT_IMPLEMENTED(guest_wave_size != 32u && guest_wave_size != 64u);
 	info = {};
@@ -898,7 +966,8 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.wave_size      = guest_wave_size;
 	info.thread_ids_num = regs.cs_regs.tidig_comp_cnt + 1;
 	info.tg_size_en     = regs.cs_regs.tg_size_en != 0;
-	// COMPUTE_PGM_RSRC2 encodes LDS_SIZE in 512-byte (128-dword) units.
+	// Prospero AGC ShShaderResource2Cs::getLdsSize() exposes the register reservation in
+	// dwords. The encoded COMPUTE_PGM_RSRC2 field is in 512-byte (128-dword) units.
 	info.lds_size_dwords = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
@@ -1023,9 +1092,10 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& image = program.info.images[i];
-		ret += fmt::format(" i{}[kind={} dim={} swizzle=0x{:03x}]", i,
+		ret += fmt::format(" i{}[kind={} dim={} swizzle=0x{:03x} dynamic={}]", i,
 		                   static_cast<uint32_t>(image.kind),
-		                   static_cast<uint32_t>(image.dimension), image.storage_swizzle);
+		                   static_cast<uint32_t>(image.dimension), image.storage_swizzle,
+		                   image.dynamic_descriptor_count);
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		ret += fmt::format(" a{}[base=0x{:x}]", i, program.info.addresses[i].specialized_base);
@@ -1063,6 +1133,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 		ids.push_back(static_cast<uint32_t>(image.dimension));
 		ids.push_back(static_cast<uint32_t>(image.mip_mode));
 		ids.push_back(image.storage_swizzle);
+		ids.push_back(image.dynamic_descriptor_count);
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.addresses.size()));
 	for (const auto& address: program.info.addresses) {
@@ -1186,15 +1257,16 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-	                     uint32_t guest_wave_size, ShaderComputeInputInfo& info,
-	                     std::span<const uint32_t>& spirv) {
+	                     uint32_t guest_wave_size, ShaderLaneMaskMode lane_mask_mode,
+	                     ShaderComputeInputInfo& info,
+                         std::span<const uint32_t>& spirv) {
 	spirv = {};
 
 	ShaderGetStaticInputInfoCS(regs, sh, guest_wave_size, info);
 	const auto shader_hash = regs.cs_regs.data_addr;
 	const auto program_id  = ShaderGetIdCS(regs, info, false);
 	const auto key         = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id,
-	                                                   ShaderLaneMaskMode::NativeWave);
+	                                                   lane_mask_mode);
 
 	{
 		std::scoped_lock lock(g_shader_program_cache_mutex);
@@ -1211,7 +1283,7 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 	}
 
 	std::vector<uint32_t> compiled_spirv;
-	if (!ShaderCompileSpirvCS(regs, sh, info, compiled_spirv)) {
+	if (!ShaderCompileSpirvCS(regs, sh, lane_mask_mode, info, compiled_spirv)) {
 		return false;
 	}
 
@@ -1316,10 +1388,12 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	LOGF("\t workgroup_register = %d\n"
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
+	     "\t lds_size_dwords    = %u\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
-	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.threads_num[0],
-	     info.threads_num[1], info.threads_num[2], info.tg_size_en ? "true" : "false");
+	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
+	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
+	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
 }
@@ -1330,15 +1404,77 @@ static bool ShaderRecompilerTextDumpEnabled() {
 	return Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
 }
 
+static bool TargetedSpirvDumpRequested(uint64_t shader_hash) {
+	const char* current = std::getenv("KYTY_SHADER_SPIRV_DUMP_HASHES");
+	if (current == nullptr || current[0] == '\0') {
+		return false;
+	}
+	while (*current != '\0') {
+		while (*current == ' ' || *current == '\t' || *current == ',' || *current == ';') {
+			current++;
+		}
+		if (*current == '\0') {
+			break;
+		}
+		char*              end   = nullptr;
+		const auto         value = std::strtoull(current, &end, 0);
+		if (end == current) {
+			return false;
+		}
+		if (value == shader_hash) {
+			return true;
+		}
+		current = end;
+	}
+	return false;
+}
+
+static void RequestRenderDocCaptureForShader(uint64_t shader_hash) {
+	const char* current = std::getenv("KYTY_RENDERDOC_CAPTURE_SHADER_HASHES");
+	if (current == nullptr || current[0] == '\0') {
+		return;
+	}
+	bool matches = false;
+	while (*current != '\0') {
+		while (*current == ' ' || *current == '\t' || *current == ',' || *current == ';') {
+			current++;
+		}
+		if (*current == '\0') {
+			break;
+		}
+		char*              end   = nullptr;
+		const auto         value = std::strtoull(current, &end, 0);
+		if (end == current) {
+			return;
+		}
+		if (value == shader_hash) {
+			matches = true;
+			break;
+		}
+		current = end;
+	}
+	static std::atomic_bool requested = false;
+	if (matches && !requested.exchange(true)) {
+		LOGF("RenderDoc: shader-triggered capture matched hash=0x%016" PRIx64 "\n", shader_hash);
+		RenderDocRequestCapture();
+	}
+}
+
 static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
                                       const std::vector<uint32_t>& bin) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	const bool  graphics_dump = Config::GraphicsDebugDumpEnabled();
+	const char* targeted_dir  = std::getenv("KYTY_SHADER_SPIRV_DUMP_DIR");
+	const bool  targeted_dump = targeted_dir != nullptr && targeted_dir[0] != '\0' &&
+	                            TargetedSpirvDumpRequested(shader_hash);
+	if (!graphics_dump && !targeted_dump) {
 		return;
 	}
 
 	static std::atomic_int id = 0;
 
-	const auto base_name = Config::GetShaderLogFolder() /
+	const auto dump_dir  = graphics_dump ? Config::GetShaderLogFolder()
+	                                     : std::filesystem::path(targeted_dir);
+	const auto base_name = dump_dir /
 	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
 	Common::File::CreateDirectories(base_name.parent_path());
 
@@ -1447,12 +1583,18 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash, error.c_str());
 	}
+	ShaderDiagnosticTrace("VS", options.shader_hash, "compile_return", result.spirv.size());
 	DumpShaderRecompilerOriginal("vs", options.shader_hash, code, result.decoded_dump);
+	if (!SpirvOptimizeBinary("ShaderRecompiler VS", options.shader_hash, result.spirv, &error)) {
+		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash, error.c_str());
+	}
+	ShaderDiagnosticTrace("VS", options.shader_hash, "optimization_return", result.spirv.size());
 	if (!SpirvValidateBinary("ShaderRecompiler VS", options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv("vs", options.shader_hash, result.spirv);
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash,
 		                            "SPIR-V validation failed");
 	}
+	ShaderDiagnosticTrace("VS", options.shader_hash, "validation_return", result.spirv.size());
 
 	input_info.stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
@@ -1460,6 +1602,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	    std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(std::move(result.resources));
 	ApplyVertexOutputs(input_info, *input_info.stage.program);
 	spirv = std::move(result.spirv);
+	ShaderDiagnosticTrace("VS", options.shader_hash, "stage_runtime_return", spirv.size());
 	DumpShaderRecompilerSpirv("vs", options.shader_hash, spirv);
 
 	if (options.dump_ir) {
@@ -1500,18 +1643,25 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash, error.c_str());
 	}
+	ShaderDiagnosticTrace("PS", options.shader_hash, "compile_return", result.spirv.size());
 	DumpShaderRecompilerOriginal("ps", options.shader_hash, code, result.decoded_dump);
+	if (!SpirvOptimizeBinary("ShaderRecompiler PS", options.shader_hash, result.spirv, &error)) {
+		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash, error.c_str());
+	}
+	ShaderDiagnosticTrace("PS", options.shader_hash, "optimization_return", result.spirv.size());
 	if (!SpirvValidateBinary("ShaderRecompiler PS", options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv("ps", options.shader_hash, result.spirv);
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash,
 		                            "SPIR-V validation failed");
 	}
+	ShaderDiagnosticTrace("PS", options.shader_hash, "validation_return", result.spirv.size());
 	input_info.stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
 	input_info.stage.resources =
 	    std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(std::move(result.resources));
 	ApplyPixelOutputs(input_info, *input_info.stage.program);
 	spirv = std::move(result.spirv);
+	ShaderDiagnosticTrace("PS", options.shader_hash, "stage_runtime_return", spirv.size());
 	DumpShaderRecompilerSpirv("ps", options.shader_hash, spirv);
 
 	if (options.dump_ir) {
@@ -1525,7 +1675,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 }
 
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv) {
+	                      ShaderLaneMaskMode lane_mask_mode,
+	                      ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::CyanA700);
 
 	const uint64_t shader_addr = regs.cs_regs.data_addr;
@@ -1541,6 +1692,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.push_constant_offset = 0;
 	options.compute_input_info   = &input_info;
 	options.wave_size            = input_info.wave_size;
+	options.lane_mask_mode       = lane_mask_mode;
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";
@@ -1550,18 +1702,26 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
 	}
+	ShaderDiagnosticTrace("CS", options.shader_hash, "compile_return", result.spirv.size());
 	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump);
+	if (!SpirvOptimizeBinary("ShaderRecompiler CS", options.shader_hash, result.spirv, &error)) {
+		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
+	}
+	ShaderDiagnosticTrace("CS", options.shader_hash, "optimization_return", result.spirv.size());
 	if (!SpirvValidateBinary("ShaderRecompiler CS", options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv("cs", options.shader_hash, result.spirv);
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash,
 		                            "SPIR-V validation failed");
 	}
+	ShaderDiagnosticTrace("CS", options.shader_hash, "validation_return", result.spirv.size());
 	input_info.stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
 	input_info.stage.resources =
 	    std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(std::move(result.resources));
 	spirv = std::move(result.spirv);
+	ShaderDiagnosticTrace("CS", options.shader_hash, "stage_runtime_return", spirv.size());
 	DumpShaderRecompilerSpirv("cs", options.shader_hash, spirv);
+	RequestRenderDocCaptureForShader(options.shader_hash);
 
 	if (options.dump_ir) {
 		if (!options.early_dump) {

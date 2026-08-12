@@ -141,6 +141,16 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	}
 }
 
+void Buffer::Invalidate(uint64_t offset, uint64_t size) {
+	EXIT_IF(Usage() != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	if (IsCoherent() || size == 0) {
+		return;
+	}
+	const auto result = vmaInvalidateAllocation(Graphics().allocator,
+	                                            NativeBuffer().memory.allocation, offset, size);
+	EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
+}
+
 vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
                                         vk::AccessFlags destination) const {
 	if (Handle() == nullptr || size == 0 || offset > m_size || size > m_size - offset) {
@@ -308,16 +318,6 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
-}
-
-void StreamBuffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(Usage() != MemoryUsage::Download || offset > Size() || size > Size() - offset);
-	if (IsCoherent() || size == 0) {
-		return;
-	}
-	const auto result = vmaInvalidateAllocation(Graphics().allocator,
-	                                            NativeBuffer().memory.allocation, offset, size);
-	EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

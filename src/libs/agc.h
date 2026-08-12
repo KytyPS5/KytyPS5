@@ -328,6 +328,12 @@ int KYTY_SYSV_ABI      GraphicsDriverUnknownU9ueyEhSkF4();
 
 } // namespace Gen5Driver
 
+namespace AgcDriver {
+
+int KYTY_SYSV_ABI UnregisterOwnerAndResources(uint32_t owner_handle);
+
+} // namespace AgcDriver
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_LIBS_AGC_H_ */

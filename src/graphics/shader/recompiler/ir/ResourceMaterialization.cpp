@@ -11,7 +11,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+constexpr uint64_t AddressMask                 = 0x0000ffffffffffffull;
 constexpr uint32_t DynamicImageDescriptorBytes = 8u * sizeof(uint32_t);
 constexpr uint32_t MaxDynamicImageDescriptors  = 65536;
 
@@ -52,7 +52,19 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 bool ValidImageDescriptor(const DescriptorValue& descriptor) {
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
+	if (type < Prospero::ImageType::kColor1D || !Prospero::IsValidBufferFormat(format)) {
+		return false;
+	}
+	// Agc::Core::Texture::setArrayView defines these as absolute first/last array-slice indices and
+	// the GNMP interop wrapper applies it only to array/cubemap descriptor types.
+	const auto base_array = (descriptor.dwords[4] >> 16u) & 0x1fffu;
+	const auto last_array = descriptor.dwords[4] & 0x1fffu;
+	const bool array_view = type == Prospero::ImageType::kCube ||
+	                        type == Prospero::ImageType::kColor1DArray ||
+	                        type == Prospero::ImageType::kColor2DArray ||
+	                        type == Prospero::ImageType::kColor2DMsaaArray;
+	if (array_view && (base_array > last_array || (type == Prospero::ImageType::kCube &&
+	                                               (last_array - base_array + 1u) % 6u != 0))) {
 		return false;
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
@@ -62,7 +74,12 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor) {
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
 		return base_level == 0 && fragments >= 1 && fragments <= 3 && max_mip == fragments;
 	}
-	return true;
+	// Agc::Core::Texture::setMipLevelRange requires an absolute base level no greater than the
+	// absolute last level. Resource-table storage is frequently reused, so rejecting this relation
+	// here prevents stale non-texture words from reaching Vulkan image-view construction.
+	const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
+	const auto last_level = (descriptor.dwords[3] >> 16u) & 0xfu;
+	return base_level <= last_level;
 }
 
 bool DynamicDescriptorIsTexture(const DescriptorValue& descriptor) {
@@ -71,8 +88,8 @@ bool DynamicDescriptorIsTexture(const DescriptorValue& descriptor) {
 	return descriptor.dword_count == 8 && ((descriptor.dwords[5] >> 27u) & 0x3u) == 0;
 }
 
-bool CompatibleDynamicImageDescriptor(const ImageResource& image,
-	                                  const DescriptorValue& descriptor) {
+bool CompatibleDynamicImageDescriptor(const ImageResource&   image,
+                                      const DescriptorValue& descriptor) {
 	if (!DynamicDescriptorIsTexture(descriptor)) {
 		return false;
 	}
@@ -113,11 +130,9 @@ bool ReadRuntimeDword(const SrtRuntime& runtime, uint64_t address, uint32_t& res
 	return true;
 }
 
-bool MaterializeDynamicImageTable(const ImageResource& image,
-	                              const DescriptorValue& table_value,
-	                              const SrtRuntime& runtime,
-	                              std::vector<DescriptorValue>& result,
-	                              std::string* error) {
+bool MaterializeDynamicImageTable(const ImageResource& image, const DescriptorValue& table_value,
+                                  const SrtRuntime& runtime, std::vector<DescriptorValue>& result,
+                                  std::string* error) {
 	ShaderBufferResource table;
 	if (!DecodeBufferDescriptor(table_value, table)) {
 		if (error != nullptr) {
@@ -161,8 +176,8 @@ bool MaterializeDynamicImageTable(const ImageResource& image,
 		DescriptorValue descriptor;
 		descriptor.dword_count = 8;
 		for (uint32_t dword = 0; dword < descriptor.dword_count; dword++) {
-			const auto address = base + entry * DynamicImageDescriptorBytes +
-			                     dword * sizeof(uint32_t);
+			const auto address =
+			    base + entry * DynamicImageDescriptorBytes + dword * sizeof(uint32_t);
 			if (!ReadRuntimeDword(runtime, address, descriptor.dwords[dword])) {
 				if (error != nullptr) {
 					*error = fmt::format("dynamic image table read failed at 0x{:016x}", address);
@@ -182,11 +197,10 @@ bool MaterializeDynamicImageTable(const ImageResource& image,
 	return true;
 }
 
-bool MaterializeDynamicImageAddressTable(const ImageResource& image,
-	                                      const DescriptorValue& table_address,
-	                                      const SrtRuntime& runtime,
-	                                      std::vector<DescriptorValue>& result,
-	                                      std::string* error) {
+bool MaterializeDynamicImageAddressTable(const ImageResource&          image,
+                                         const DescriptorValue&        table_address,
+                                         const SrtRuntime&             runtime,
+                                         std::vector<DescriptorValue>& result, std::string* error) {
 	if (table_address.dword_count != 2 || image.dynamic_table_address_count == 0) {
 		if (error != nullptr) {
 			*error = "dynamic image address table has invalid metadata";
@@ -196,8 +210,8 @@ bool MaterializeDynamicImageAddressTable(const ImageResource& image,
 	const auto pointer = (static_cast<uint64_t>(table_address.dwords[0]) |
 	                      static_cast<uint64_t>(table_address.dwords[1]) << 32u) &
 	                     AddressMask;
-	const auto bytes = static_cast<uint64_t>(image.dynamic_table_address_count) *
-	                   DynamicImageDescriptorBytes;
+	const auto bytes =
+	    static_cast<uint64_t>(image.dynamic_table_address_count) * DynamicImageDescriptorBytes;
 	if (pointer == 0 || image.dynamic_table_address_offset > AddressMask - pointer ||
 	    bytes > AddressMask - (pointer + image.dynamic_table_address_offset)) {
 		if (error != nullptr) {
@@ -205,15 +219,14 @@ bool MaterializeDynamicImageAddressTable(const ImageResource& image,
 		}
 		return false;
 	}
-	const auto base = pointer + image.dynamic_table_address_offset;
+	const auto                   base = pointer + image.dynamic_table_address_offset;
 	std::vector<DescriptorValue> next;
 	next.reserve(static_cast<size_t>(image.dynamic_table_address_count) + 1u);
 	for (uint32_t entry = 0; entry < image.dynamic_table_address_count; entry++) {
 		DescriptorValue descriptor;
 		descriptor.dword_count = 8;
 		for (uint32_t dword = 0; dword < descriptor.dword_count; dword++) {
-			const auto address = base + static_cast<uint64_t>(entry) *
-			                                DynamicImageDescriptorBytes +
+			const auto address = base + static_cast<uint64_t>(entry) * DynamicImageDescriptorBytes +
 			                     dword * sizeof(uint32_t);
 			if (!ReadRuntimeDword(runtime, address, descriptor.dwords[dword])) {
 				if (error != nullptr) {
@@ -253,9 +266,8 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		return false;
 	}
 	const bool has_dynamic_images =
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.HasDynamicTable();
-	    });
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& image) { return image.HasDynamicTable(); });
 	if (snapshot.buffers.size() != program.info.buffers.size() ||
 	    snapshot.images.size() != program.info.images.size() ||
 	    (snapshot.image_tables.size() != program.info.images.size() &&
@@ -294,7 +306,7 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		}
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto& image = program.info.images[i];
+		const auto&                        image = program.info.images[i];
 		const std::vector<DescriptorValue> empty_table;
 		const auto& table = snapshot.image_tables.empty() ? empty_table : snapshot.image_tables[i];
 		if (!image.HasDynamicTable()) {
@@ -378,8 +390,8 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				                 return CompatibleDynamicImageDescriptor(image, value);
 			                 })) {
 				if (error != nullptr) {
-					*error = fmt::format("dynamic image descriptor table {} no longer matches specialization",
-					                     i);
+					*error = fmt::format(
+					    "dynamic image descriptor table {} no longer matches specialization", i);
 				}
 				return false;
 			}
@@ -425,13 +437,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
-			const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-			const bool raw_sint_storage =
-			    storage && format == Prospero::BufferFormat::k32SInt &&
-			    !image.read && !image.atomic;
-			const bool uint_descriptor = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-			const auto uint_program    = image.kind == ResourceKind::ImageUint ||
-			                             image.kind == ResourceKind::StorageImageUint;
+			const auto format =
+			    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+			const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
+			                              !image.read && !image.atomic;
+			const bool uint_descriptor  = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+			const auto uint_program     = image.kind == ResourceKind::ImageUint ||
+			                              image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
 				if (error != nullptr) {
 					*error = fmt::format(
@@ -525,8 +537,8 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 				}
 			} else if (image.dynamic_table_buffer >= next.buffers.size() ||
 			           !MaterializeDynamicImageTable(image,
-			                                         next.buffers[image.dynamic_table_buffer], runtime,
-			                                         next.image_tables[i], error)) {
+			                                         next.buffers[image.dynamic_table_buffer],
+			                                         runtime, next.image_tables[i], error)) {
 				return false;
 			}
 		} else {
@@ -543,8 +555,8 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		if (address.source != ScalarProvenance::Unknown) {
 			const auto value = *cursor++;
 			auto       base  = (static_cast<uint64_t>(value.dwords[0]) |
-			                    static_cast<uint64_t>(value.dwords[1]) << 32u) &
-			                   AddressMask;
+                         static_cast<uint64_t>(value.dwords[1]) << 32u) &
+			            AddressMask;
 			if (address.kind == ResourceKind::ScalarBuffer) {
 				base &= ~uint64_t {3};
 			}
@@ -655,12 +667,12 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		    image.kind == ResourceKind::StorageImageUint) {
 			image.storage_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		const auto format  = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		const auto format =
+		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 		const bool storage = image.kind == ResourceKind::StorageImage ||
 		                     image.kind == ResourceKind::StorageImageUint;
 		const bool raw_sint_storage =
-		    storage && format == Prospero::BufferFormat::k32SInt &&
-		    !image.read && !image.atomic;
+		    storage && format == Prospero::BufferFormat::k32SInt && !image.read && !image.atomic;
 		const bool uint_image = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
 		if (uint_image) {
 			switch (image.kind) {

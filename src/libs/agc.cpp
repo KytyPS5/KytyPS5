@@ -4166,4 +4166,20 @@ int KYTY_SYSV_ABI GraphicsDriverUnknownU9ueyEhSkF4() {
 
 } // namespace Gen5Driver
 
+namespace AgcDriver {
+
+LIB_NAME("AgcDriver", "AgcDriver");
+
+int KYTY_SYSV_ABI UnregisterOwnerAndResources(uint32_t owner_handle) {
+	PRINT_NAME();
+
+	LOGF("\t owner_handle = 0x%08" PRIx32 "\n", owner_handle);
+
+	// Prospero SDK 10.000 documents this result for every resource-registration API when
+	// PA Debug is disabled. Kyty does not expose a PA Debug resource-registration service.
+	return static_cast<int>(0x8a6c9018u);
+}
+
+} // namespace AgcDriver
+
 } // namespace Libs::Graphics

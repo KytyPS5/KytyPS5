@@ -675,8 +675,11 @@ struct Standard64KB16Tables {
 	}
 };
 
+// Prospero render-target element mapping. These equations are also used with absolute x/y
+// coordinates by TileGetBlockXor to retain the address contribution of neighboring blocks.
+// Keep the fixed vectors below synchronized with SCE AgcGpuAddress::computeTiledElementByteOffset.
 template <typename T>
-static uint32_t Gen5RenderTargetOffsetInBlock(uint32_t x, uint32_t y) {
+static constexpr uint32_t Gen5RenderTargetOffsetInBlock(uint32_t x, uint32_t y) {
 	uint32_t offset = 0;
 
 	if constexpr (sizeof(T) == 1) {
@@ -744,6 +747,17 @@ static uint32_t Gen5RenderTargetOffsetInBlock(uint32_t x, uint32_t y) {
 
 	return offset;
 }
+
+static_assert(Gen5RenderTargetOffsetInBlock<uint8_t>(3, 5) == 0x0033u);
+static_assert(Gen5RenderTargetOffsetInBlock<uint8_t>(256, 0) == 0x0000u);
+static_assert(Gen5RenderTargetOffsetInBlock<uint16_t>(3, 5) == 0x0056u);
+static_assert(Gen5RenderTargetOffsetInBlock<uint16_t>(0, 128) == 0x0000u);
+static_assert(Gen5RenderTargetOffsetInBlock<uint32_t>(3, 5) == 0x005cu);
+static_assert(Gen5RenderTargetOffsetInBlock<uint32_t>(128, 0) == 0x0000u);
+static_assert(Gen5RenderTargetOffsetInBlock<uint64_t>(3, 5) == 0x1038u);
+static_assert(Gen5RenderTargetOffsetInBlock<uint64_t>(0, 64) == 0x0800u);
+static_assert(Gen5RenderTargetOffsetInBlock<Uint128>(3, 5) == 0x1070u);
+static_assert(Gen5RenderTargetOffsetInBlock<Uint128>(64, 0) == 0x0400u);
 
 static const Standard64KB16Tables& GetStandard64KB16Tables() {
 	static constexpr Standard64KB16Tables tables;
@@ -993,13 +1007,20 @@ bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t b
 	    layout.block_depth != expected.block_depth) {
 		return false;
 	}
-	if (layout.family == TileBlockFamily::Depth64KB && layout.bytes_per_element == 8) {
+	if (layout.family == TileBlockFamily::Depth64KB) {
 		if (block_x > UINT32_MAX / layout.block_width ||
 		    block_y > UINT32_MAX / layout.block_height) {
 			return false;
 		}
-		byte_offset = Depth64KB64XOffsetBytes(block_x * layout.block_width) ^
-		              Depth64KB64YOffsetBytes(block_y * layout.block_height);
+		const auto x = block_x * layout.block_width;
+		const auto y = block_y * layout.block_height;
+		switch (layout.bytes_per_element) {
+			case 1: byte_offset = Depth64KB8XOffsetBytes(x) ^ Depth64KB8YOffsetBytes(y); break;
+			case 2: byte_offset = Depth64KB16XOffsetBytes(x) ^ Depth64KB16YOffsetBytes(y); break;
+			case 4: byte_offset = Depth64KB32XOffsetBytes(x) ^ Depth64KB32YOffsetBytes(y); break;
+			case 8: byte_offset = Depth64KB64XOffsetBytes(x) ^ Depth64KB64YOffsetBytes(y); break;
+			default: return false;
+		}
 	} else if (layout.family == TileBlockFamily::RenderTarget64KB) {
 		if (block_x > UINT32_MAX / layout.block_width ||
 		    block_y > UINT32_MAX / layout.block_height) {
@@ -1029,79 +1050,100 @@ bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t b
 static constexpr uint32_t Depth64KB8XOffsetBytes(uint32_t x) {
 	uint32_t offset = 0;
 	offset ^= x & 0x0001u;
-	offset ^= (x << 1u) & 0x0004u;
+	offset ^= (x << 1u) & 0x0104u;
 	offset ^= (x << 2u) & 0x0010u;
 	offset ^= (x << 3u) & 0x0040u;
-	offset ^= (x << 5u) & 0x0300u;
 	offset ^= (x << 4u) & 0x0400u;
-	offset ^= (x << 6u) & 0x0800u;
-	offset ^= (x << 7u) & 0x2000u;
-	offset ^= (x << 8u) & 0x8000u;
+	offset ^= (x << 5u) & 0x0200u;
+	offset ^= (x << 6u) & 0x1800u;
+	offset ^= (x << 7u) & 0xc000u;
 	return offset;
 }
 
 static constexpr uint32_t Depth64KB8YOffsetBytes(uint32_t y) {
 	uint32_t offset = 0;
-	offset ^= (y << 1u) & 0x0002u;
+	offset ^= (y << 1u) & 0x0102u;
 	offset ^= (y << 2u) & 0x0008u;
-	offset ^= (y << 3u) & 0x00a0u;
-	offset ^= (y << 5u) & 0x0f00u;
-	offset ^= (y << 6u) & 0x1000u;
-	offset ^= (y << 7u) & 0x4000u;
+	offset ^= (y << 3u) & 0x0020u;
+	offset ^= (y << 4u) & 0x0180u;
+	offset ^= (y << 5u) & 0x0e00u;
+	offset ^= (y << 6u) & 0x4000u;
+	offset ^= (y << 7u) & 0x2000u;
+	offset ^= (y << 8u) & 0x8000u;
 	return offset;
 }
 
 static constexpr uint32_t Depth64KB16XOffsetBytes(uint32_t x) {
 	uint32_t offset = 0;
-	offset ^= (x << 1u) & 0x0002u;
+	offset ^= (x << 1u) & 0x0102u;
 	offset ^= (x << 2u) & 0x0008u;
 	offset ^= (x << 3u) & 0x0020u;
 	offset ^= (x << 4u) & 0x0480u;
-	offset ^= (x << 5u) & 0x0300u;
+	offset ^= (x << 5u) & 0x0200u;
 	offset ^= (x << 6u) & 0x0800u;
-	offset ^= (x << 7u) & 0x2000u;
-	offset ^= (x << 8u) & 0x8000u;
+	offset ^= (x << 7u) & 0xe000u;
 	return offset;
 }
 
 static constexpr uint32_t Depth64KB16YOffsetBytes(uint32_t y) {
 	uint32_t offset = 0;
+	offset ^= (y << 1u) & 0x0100u;
 	offset ^= (y << 2u) & 0x0004u;
 	offset ^= (y << 3u) & 0x0010u;
-	offset ^= (y << 4u) & 0x0040u;
-	offset ^= (y << 5u) & 0x0f00u;
-	offset ^= (y << 8u) & 0x5000u;
+	offset ^= (y << 4u) & 0x0140u;
+	offset ^= (y << 5u) & 0x0e00u;
+	offset ^= (y << 7u) & 0x4000u;
+	offset ^= (y << 9u) & 0x9000u;
 	return offset;
 }
 
 static constexpr uint32_t Depth64KB32XOffsetBytes(uint32_t x) {
 	uint32_t offset = 0;
+	offset ^= (x << 1u) & 0x0100u;
 	offset ^= (x << 2u) & 0x0004u;
 	offset ^= (x << 3u) & 0x0010u;
 	offset ^= (x << 4u) & 0x0440u;
-	offset ^= (x << 5u) & 0x0300u;
+	offset ^= (x << 5u) & 0x0200u;
 	offset ^= (x << 6u) & 0x0800u;
-	offset ^= (x << 9u) & 0xa000u;
+	offset ^= (x << 8u) & 0xc000u;
+	offset ^= (x << 9u) & 0x1000u;
 	return offset;
 }
 
 static constexpr uint32_t Depth64KB32YOffsetBytes(uint32_t y) {
 	uint32_t offset = 0;
+	offset ^= (y << 1u) & 0x0100u;
 	offset ^= (y << 3u) & 0x0008u;
-	offset ^= (y << 4u) & 0x0020u;
-	offset ^= (y << 5u) & 0x0f80u;
-	offset ^= (y << 9u) & 0x1000u;
-	offset ^= (y << 8u) & 0x4000u;
+	offset ^= (y << 4u) & 0x0120u;
+	offset ^= (y << 5u) & 0x0e80u;
+	offset ^= (y << 7u) & 0x4000u;
+	offset ^= (y << 9u) & 0x8000u;
+	offset ^= (y << 10u) & 0x2000u;
 	return offset;
 }
 
 static constexpr uint32_t Depth64KB64XOffsetBytes(uint32_t x) {
-	return ((x << 3u) & 0x0008u) ^ ((x << 4u) & 0x0420u) ^ ((x << 5u) & 0x0380u) ^
-	       ((x << 6u) & 0x0800u) ^ ((x << 10u) & 0x2000u) ^ ((x << 9u) & 0x8000u);
+	uint32_t offset = 0;
+	offset ^= (x << 1u) & 0x0100u;
+	offset ^= (x << 3u) & 0x0008u;
+	offset ^= (x << 4u) & 0x0420u;
+	offset ^= (x << 5u) & 0x0280u;
+	offset ^= (x << 6u) & 0x0800u;
+	offset ^= (x << 7u) & 0x4000u;
+	offset ^= (x << 9u) & 0x8000u;
+	offset ^= (x << 10u) & 0x2000u;
+	return offset;
 }
 
 static constexpr uint32_t Depth64KB64YOffsetBytes(uint32_t y) {
-	return ((y << 4u) & 0x0010u) ^ ((y << 5u) & 0x0f40u) ^ ((y << 10u) & 0x5000u);
+	uint32_t offset = 0;
+	offset ^= (y << 1u) & 0x0100u;
+	offset ^= (y << 4u) & 0x0110u;
+	offset ^= (y << 5u) & 0x0e40u;
+	offset ^= (y << 9u) & 0x8000u;
+	offset ^= (y << 10u) & 0x1000u;
+	offset ^= (y << 11u) & 0x4000u;
+	return offset;
 }
 
 static_assert(Depth64KB8XOffsetBytes(2) == 0x0004u);
@@ -1113,6 +1155,14 @@ static_assert((Depth64KB16XOffsetBytes(3) ^ Depth64KB16YOffsetBytes(5)) == 0x004
 static_assert(Depth64KB32XOffsetBytes(2) == 0x0010u);
 static_assert(Depth64KB32YOffsetBytes(1) == 0x0008u);
 static_assert((Depth64KB32XOffsetBytes(3) ^ Depth64KB32YOffsetBytes(5)) == 0x009cu);
+static_assert(Depth64KB8XOffsetBytes(256) == 0x8000u);
+static_assert(Depth64KB8YOffsetBytes(256) == 0x4000u);
+static_assert(Depth64KB16XOffsetBytes(256) == 0x8000u);
+static_assert(Depth64KB16YOffsetBytes(128) == 0x4100u);
+static_assert(Depth64KB32XOffsetBytes(128) == 0x8100u);
+static_assert(Depth64KB32YOffsetBytes(128) == 0x4100u);
+static_assert(Depth64KB64XOffsetBytes(128) == 0x4100u);
+static_assert(Depth64KB64YOffsetBytes(64) == 0x8800u);
 
 static bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& htile_size) {
 	htile_size = {};

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <set>
 #include <utility>
 
@@ -210,6 +211,12 @@ bool UsesGds(const Program& program) {
 	return false;
 }
 
+bool UsesBinkDiagnosticTrace(const Program& program) {
+	const char* const enabled = std::getenv("KYTY_BINK_TRACE_DIR");
+	const bool trace = enabled != nullptr && enabled[0] != '\0';
+	return trace && program.shader_hash == 0x0000000208a64d00ULL;
+}
+
 } // namespace
 
 bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std::string* error) {
@@ -270,9 +277,12 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 			return false;
 		}
 		auto& resources = image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())];
-		const auto descriptor_count = program.info.images[i].HasDynamicTable()
-		                                ? program.info.images[i].dynamic_descriptor_count + 1u
-		                                : 1u;
+		const auto descriptor_count =
+		    program.info.images[i].HasDynamicTable()
+		        ? program.info.images[i].dynamic_descriptor_count + 1u
+		        : (program.info.images[i].mip_mode == ImageMipMode::DynamicStorage
+		               ? MaxStorageImageMipLevels
+		               : 1u);
 		resources.insert(resources.end(), descriptor_count, i);
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
@@ -288,7 +298,7 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	if (UsesGds(program) || UsesBinkDiagnosticTrace(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (!program.info.addresses.empty()) {

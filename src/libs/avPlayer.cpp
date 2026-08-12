@@ -8,6 +8,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -1371,11 +1372,11 @@ private:
 	uint32_t VideoPitch(AVStream* s) const { return align_up(Width(s), 256u); }
 	uint32_t VideoBufferSize(AVStream* s) const { return VideoPitch(s) * Height(s) * 3 / 2; }
 	void     FillVideo(AVStream* s, AvPlayerVideo* v) const {
-		std::memset(v, 0, sizeof(*v));
-		v->width        = Width(s);
-		v->height       = Height(s);
-		v->aspect_ratio = Aspect(s);
-		lang(v->language_code, s->metadata);
+        std::memset(v, 0, sizeof(*v));
+        v->width        = Width(s);
+        v->height       = Height(s);
+        v->aspect_ratio = Aspect(s);
+        lang(v->language_code, s->metadata);
 	}
 	void FillVideoEx(AVStream* s, AvPlayerVideoEx* v) const {
 		std::memset(v, 0, sizeof(*v));
@@ -1497,6 +1498,24 @@ private:
 		for (int y = 0; y < src->height / 2; y++) {
 			std::memcpy(c + y * pitch, nv12->data[1] + y * nv12->linesize[1], src->width);
 		}
+		if (!video_frame_diagnostic_written) {
+			static std::atomic_uint32_t diagnostic_id {0};
+			const auto                  id = diagnostic_id.fetch_add(1) + 1;
+			std::array<char, 64>        filename {};
+			std::snprintf(filename.data(), filename.size(), "avplayer-nv12-%03u.raw", id);
+			bool wrote = false;
+			if (auto* output = std::fopen(filename.data(), "wb"); output != nullptr) {
+				wrote = std::fwrite(dst, 1, static_cast<size_t>(size), output) == size;
+				std::fclose(output);
+			}
+			LOGF("AvPlayer NV12 diagnostic: source=%s src_format=%d coded=%dx%d "
+			     "output=%ux%u pitch=%u size=%" PRIu64 " y_linesize=%d uv_linesize=%d "
+			     "y0=%02x,%02x,%02x,%02x uv0=%02x,%02x,%02x,%02x file=%s wrote=%d\n",
+			     path.c_str(), src->format, src->width, src->height, Width(s), h, pitch, size,
+			     nv12->linesize[0], nv12->linesize[1], dst[0], dst[1], dst[2], dst[3], c[0], c[1],
+			     c[2], c[3], filename.data(), wrote);
+			video_frame_diagnostic_written = true;
+		}
 		std::memset(info, 0, sizeof(*info));
 		info->data       = dst;
 		info->time_stamp = to_ms(
@@ -1615,9 +1634,10 @@ private:
 	std::atomic_bool                         audio_done {true};
 	std::mutex                               lifecycle_mutex;
 	mutable std::mutex                       mutex;
-	bool                                     stopped                  = true;
-	bool                                     paused                   = false;
-	bool                                     seek_video_frame_pending = false;
+	bool                                     stopped                        = true;
+	bool                                     paused                         = false;
+	bool                                     seek_video_frame_pending       = false;
+	bool                                     video_frame_diagnostic_written = false;
 	std::atomic_bool                         loop {false};
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;

@@ -95,10 +95,13 @@ vk::DescriptorBufferInfo BufferInfo(const BufferView& view) {
 
 } // namespace
 
-vk::DescriptorImageInfo DescriptorCache::MakeImageInfo(const TextureBinding& texture) {
-	EXIT_IF(!texture.image_id || texture.image_view == nullptr ||
+vk::DescriptorImageInfo DescriptorCache::MakeImageInfo(const TextureBinding& texture,
+                                                       uint32_t storage_mip) {
+	const auto view = storage_mip == 0 ? texture.image_view
+	                                   : texture.storage_mip_views.at(storage_mip);
+	EXIT_IF(!texture.image_id || view == nullptr ||
 	        texture.layout == vk::ImageLayout::eUndefined);
-	return {nullptr, texture.image_view, texture.layout};
+	return {nullptr, view, texture.layout};
 }
 
 DescriptorCache::~DescriptorCache() {
@@ -161,7 +164,8 @@ void DescriptorCache::CreatePool(const ShaderRecompiler::IR::Program& program) {
 		}
 	}
 	constexpr uint32_t Batch = 32;
-	const uint32_t MaxSets = per_set[1] > ShaderRecompiler::IR::ShaderInfo::MaxImages ? Batch : 512u;
+	const uint32_t MaxSets =
+	    per_set[1] > ShaderRecompiler::IR::ShaderInfo::MaxImages ? Batch : 512u;
 	const std::array types = {vk::DescriptorType::eStorageBuffer,
 	                          vk::DescriptorType::eSampledImage,
 	                          vk::DescriptorType::eStorageImage,
@@ -293,13 +297,19 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
 				}
 				break;
 			default: {
+				std::vector<uint32_t> mip_indices(data.images.size());
 				std::vector<uint32_t> table_indices(data.images.size());
 				for (const auto resource: binding.resources) {
-					const auto& texture = program.info.images.at(resource).HasDynamicTable()
-					                          ? data.image_tables.at(resource).at(
-					                                table_indices.at(resource)++)
-					                          : data.images.at(resource);
-					image_infos.push_back(MakeImageInfo(texture));
+					const auto table_dynamic =
+					    program.info.images.at(resource).HasDynamicTable();
+					const auto& texture =
+					    table_dynamic
+					        ? data.image_tables.at(resource).at(table_indices.at(resource)++)
+					        : data.images.at(resource);
+					const auto dynamic = program.info.images.at(resource).mip_mode ==
+					                     ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+					const auto mip = dynamic ? mip_indices.at(resource)++ : 0u;
+					image_infos.push_back(MakeImageInfo(texture, mip));
 				}
 				break;
 			}

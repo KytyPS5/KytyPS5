@@ -119,6 +119,37 @@ uint32_t ApplyMrtExportMapping(EmitterState& state, const IR::Instruction& inst,
 	return mapped;
 }
 
+uint32_t EmitSyntheticDepthClipDistance(EmitterState& state, uint32_t position) {
+	const auto z = state.builder.AllocateId();
+	const auto w = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, state.float_type, z, position, 2});
+	state.builder.AddFunction({OpCompositeExtract, state.float_type, w, position, 3});
+
+	const auto far_distance      = state.builder.AllocateId();
+	const auto near_gl_distance  = state.builder.AllocateId();
+	const auto clip_far          = state.builder.AllocateId();
+	const auto clip_near_dx      = state.builder.AllocateId();
+	const auto clip_near_gl      = state.builder.AllocateId();
+	const auto selected_near_gl  = state.builder.AllocateId();
+	const auto selected_near_dx  = state.builder.AllocateId();
+	const auto selected_far      = state.builder.AllocateId();
+	state.builder.AddFunction({OpFSub, state.float_type, far_distance, w, z});
+	state.builder.AddFunction({OpFAdd, state.float_type, near_gl_distance, z, w});
+	state.builder.AddFunction({OpIEqual, state.bool_type, clip_far,
+	                           state.synthetic_depth_clip, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpIEqual, state.bool_type, clip_near_dx,
+	                           state.synthetic_depth_clip, ConstantU32(state, 2)});
+	state.builder.AddFunction({OpIEqual, state.bool_type, clip_near_gl,
+	                           state.synthetic_depth_clip, ConstantU32(state, 3)});
+	state.builder.AddFunction({OpSelect, state.float_type, selected_near_gl, clip_near_gl,
+	                           near_gl_distance, ConstantF32Value(state, 1.0f)});
+	state.builder.AddFunction(
+	    {OpSelect, state.float_type, selected_near_dx, clip_near_dx, z, selected_near_gl});
+	state.builder.AddFunction({OpSelect, state.float_type, selected_far, clip_far, far_distance,
+	                           selected_near_dx});
+	return selected_far;
+}
+
 bool ExportWritesData(const IR::Instruction& inst) {
 	switch (inst.export_info.kind) {
 		case IR::ExportTargetKind::Null:
@@ -172,10 +203,15 @@ void EmitExport(EmitterState& state, const IR::Instruction& inst) {
 	    state, inst, uint_output ? EmitExportVec4U32(state, inst) : EmitExportVec4F32(state, inst),
 	    vector_type);
 	if (inst.export_info.kind == IR::ExportTargetKind::Position) {
-		const auto pointer = state.builder.AllocateId();
+		const auto pointer      = state.builder.AllocateId();
+		const auto clip_pointer = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpAccessChain, state.ptr_output_vec4_float, pointer, variable, ConstantU32(state, 0)});
 		state.builder.AddFunction({OpStore, pointer, value});
+		state.builder.AddFunction({OpAccessChain, state.ptr_output_float, clip_pointer, variable,
+		                           ConstantU32(state, 1), ConstantU32(state, 0)});
+		state.builder.AddFunction(
+		    {OpStore, clip_pointer, EmitSyntheticDepthClipDistance(state, value)});
 		return;
 	}
 

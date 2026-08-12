@@ -33,13 +33,14 @@ uint32_t ConstantImageGatherHorizontalOffsets(EmitterState& state, ImageViewKind
 }
 
 uint32_t LoadStorageImageDescriptorAtIndex(EmitterState& state, uint32_t resource,
-                                           uint32_t array_index, bool uint_image,
+                                           uint32_t array_index_id, bool uint_image,
                                            ImageViewKind view) {
 	const auto  kind        = StorageBindingKind(uint_image, view);
 	const auto& descriptors = state.storage_images[StorageImageIndex(uint_image, view)];
 	const auto  pointer =
-	    DescriptorElementPointer(state, descriptors.pointer_type, descriptors.variable, array_index,
-	                             kind, resource, "storage image descriptor array was not emitted");
+	    DescriptorElementPointerId(state, descriptors.pointer_type, descriptors.variable,
+	                               array_index_id, kind, resource,
+	                               "storage image descriptor array was not emitted");
 	const auto image = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, descriptors.image_type, image, pointer});
 	return image;
@@ -168,12 +169,64 @@ void EmitImageStore(EmitterState& state, const IR::Instruction& inst) {
 	const auto view       = StorageImageViewKind(state, inst.memory, uint_image, inst.pc);
 	const auto binding =
 	    ResourceForDescriptor(state, StorageBindingKind(uint_image, view), inst.memory.resource);
-	const auto image = LoadStorageImageDescriptorAtIndex(state, inst.memory.resource,
-	                                                     binding.array_index, uint_image, view);
+	auto descriptor_index = ConstantU32(state, binding.array_index);
+	if (inst.memory.image_has_mip) {
+		const auto lod = EmitImageMipLodU32(state, inst, inst.src[1], view);
+		const auto bounded_lod = EmitMinMaxU32Value(
+		    state, lod, ConstantU32(state, IR::MaxStorageImageMipLevels - 1u), false);
+		descriptor_index = EmitAddU32(state, descriptor_index, bounded_lod);
+	}
+	const auto image = LoadStorageImageDescriptorAtIndex(
+	    state, inst.memory.resource, descriptor_index, uint_image, view);
+	uint32_t texel =
+	    uint_image ? EmitImageStoreTexelU32(state, inst) : EmitImageStoreTexelF32(state, inst);
+	const char* const coverage = std::getenv("KYTY_SHADER_STORE_COVERAGE_DIAGNOSTIC");
+	if (uint_image && coverage != nullptr && coverage[0] != '\0' &&
+	    state.program.shader_hash == 0x0000000208a64d00ULL && inst.pc >= 0x2284u &&
+	    inst.pc <= 0x22bcu) {
+		uint32_t marker_value = 0;
+		switch (inst.pc) {
+			case 0x2284u: marker_value = 0x40u; break;
+			case 0x228cu: marker_value = 0x80u; break;
+			case 0x22b4u: marker_value = 0xc0u; break;
+			case 0x22bcu: marker_value = 0xffu; break;
+			default: break;
+		}
+		if (marker_value != 0) {
+			const auto marker = ConstantU32(state, marker_value);
+			texel             = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpCompositeConstruct, state.vec4_uint_type, texel, marker, marker, marker, marker});
+		}
+	}
 
-	state.builder.AddFunction(
-	    {OpImageWrite, image, EmitImageCoordU32(state, inst, view),
-	     uint_image ? EmitImageStoreTexelU32(state, inst) : EmitImageStoreTexelF32(state, inst)});
+	const auto coord = EmitImageCoordU32(state, inst, view);
+	state.builder.AddFunction({OpImageWrite, image, coord, texel});
+	if (BinkTraceEnabled(state) && inst.pc >= 0x2284u && inst.pc <= 0x22bcu) {
+		uint32_t site = 0;
+		switch (inst.pc) {
+			case 0x2284u: site = 2; break;
+			case 0x228cu: site = 3; break;
+			case 0x22b4u: site = 4; break;
+			case 0x22bcu: site = 5; break;
+			default: break;
+		}
+		if (site != 0) {
+			const auto coord_x = state.builder.AllocateId();
+			const auto coord_y = state.builder.AllocateId();
+			const auto texel_x = state.builder.AllocateId();
+			const auto texel_y = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpCompositeExtract, state.uint_type, coord_x, coord, 0});
+			state.builder.AddFunction(
+			    {OpCompositeExtract, state.uint_type, coord_y, coord, 1});
+			state.builder.AddFunction(
+			    {OpCompositeExtract, state.uint_type, texel_x, texel, 0});
+			state.builder.AddFunction(
+			    {OpCompositeExtract, state.uint_type, texel_y, texel, 1});
+			EmitBinkTraceRecord(state, site, inst.pc, coord_x, coord_y, texel_x, texel_y);
+		}
+	}
 }
 
 void EmitImageSampleResult(EmitterState& state, const IR::Instruction& inst, uint32_t sample,
@@ -327,6 +380,7 @@ void EmitImageGather4(EmitterState& state, const IR::Instruction& inst) {
 	AddImageGatherOperands(state, inst, layout, view, words);
 	state.builder.AddFunction(words);
 
+	std::array<uint32_t, 4> trace_values {};
 	for (uint32_t i = 0; i < inst.memory.data_dwords; i++) {
 		const auto component = state.builder.AllocateId();
 		state.builder.AddFunction({OpCompositeExtract, integer ? state.uint_type : state.float_type,
@@ -335,7 +389,12 @@ void EmitImageGather4(EmitterState& state, const IR::Instruction& inst) {
 		if (!integer) {
 			state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
 		}
+		trace_values[i] = bits;
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, i), bits);
+	}
+	if (BinkTraceEnabled(state) && inst.pc == 0x21a4u) {
+		EmitBinkTraceRecord(state, 0, inst.pc, trace_values[0], trace_values[1], trace_values[2],
+		                    trace_values[3]);
 	}
 }
 

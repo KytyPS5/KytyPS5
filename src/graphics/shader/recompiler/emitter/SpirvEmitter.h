@@ -11,6 +11,12 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 bool ProgramRequiresExactSubgroupSize(const IR::Program& program);
 
+bool ProgramSupportsHalfWaveSeparable(const IR::Program& program);
+
+bool ProgramSupportsLogicalSingleWaveWorkgroup(const IR::Program& program);
+
+bool ProgramSupportsLogicalMultiWaveWorkgroup(const IR::Program& program);
+
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
                  const ShaderVertexInputInfo*  vertex_input_info,
                  const ShaderPixelInputInfo*   pixel_input_info,

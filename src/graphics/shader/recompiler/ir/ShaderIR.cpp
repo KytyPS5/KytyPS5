@@ -863,25 +863,26 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock& block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
-	auto interp = InterpParameter::P0;
-	if (decoded.opcode == Decoder::Opcode::VInterpMovF32) {
-		if (decoded.src0.value > 2u) {
-			if (error != nullptr) {
-				*error = fmt::format("v_interp_mov_f32 mode {} is not a parameter selector "
-				                     "at pc 0x{:08x}",
-				                     decoded.src0.value, decoded.pc);
-			}
-			return false;
-		}
-		interp = static_cast<InterpParameter>(decoded.src0.value);
-	}
-
 	Instruction inst;
 	inst.pc              = decoded.pc;
-	inst.op                = Opcode::LoadInputF32;
-	inst.input_info.attr   = decoded.src1.value;
-	inst.input_info.chan   = decoded.src2.value;
-	inst.input_info.interp = interp;
+	inst.op              = Opcode::LoadInputF32;
+	inst.input_info.attr = decoded.src1.value;
+	inst.input_info.chan = decoded.src2.value;
+	if (decoded.opcode == Decoder::Opcode::VInterpMovF32) {
+		// RDNA2 V_INTERP_MOV_F32 selects P10, P20, or P0 with modes 0, 1, and 2.
+		// SPV_KHR_fragment_shader_barycentric exposes those values as vertices 1, 2, and 0.
+		switch (decoded.src0.value) {
+			case 0u: inst.input_info.vertex_index = 1u; break;
+			case 1u: inst.input_info.vertex_index = 2u; break;
+			case 2u: inst.input_info.vertex_index = 0u; break;
+			default:
+				if (error != nullptr) {
+					*error = fmt::format("invalid v_interp_mov_f32 mode {} at pc 0x{:08x}",
+					                     decoded.src0.value, decoded.pc);
+				}
+				return false;
+		}
+	}
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
 		return false;
 	}
@@ -970,6 +971,10 @@ bool LowerWaitcnt(const Decoder::Instruction& decoded, BasicBlock& block, std::s
 	inst.dst.kind     = OperandKind::Null;
 	inst.src_count    = 1u;
 	inst.waitcnt_kind = WaitcntKind::Packed;
+	if (!LowerSourceOperand(decoded.src0, inst.src[0], error)) {
+		return false;
+	}
+
 	if (decoded.opcode == Decoder::Opcode::SWaitcntDepctr) {
 		inst.waitcnt_kind = WaitcntKind::Depctr;
 	} else if (decoded.family == Decoder::Family::SOPK) {
@@ -978,12 +983,15 @@ bool LowerWaitcnt(const Decoder::Instruction& decoded, BasicBlock& block, std::s
 			case 0x18u: inst.waitcnt_kind = WaitcntKind::Vmcnt; break;
 			case 0x19u: inst.waitcnt_kind = WaitcntKind::Expcnt; break;
 			case 0x1au: inst.waitcnt_kind = WaitcntKind::Lgkmcnt; break;
-			default: return false;
+			default:
+				if (error != nullptr) {
+					*error = fmt::format("unknown SOPK wait-counter opcode 0x{:02x} at pc 0x{:08x}",
+					                     decoded.opcode_id, decoded.pc);
+				}
+				return false;
 		}
 	}
-	if (!LowerSourceOperand(decoded.src0, inst.src[0], error)) {
-		return false;
-	}
+
 	block.instructions.push_back(inst);
 	return true;
 }
@@ -1088,6 +1096,7 @@ bool IsControlOpcode(Decoder::Opcode opcode) {
 bool IsTerminatorOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::SEndpgm:
+		case Decoder::Opcode::SSceBreak:
 		case Decoder::Opcode::SBranch:
 		case Decoder::Opcode::SCbranchScc0:
 		case Decoder::Opcode::SCbranchScc1:

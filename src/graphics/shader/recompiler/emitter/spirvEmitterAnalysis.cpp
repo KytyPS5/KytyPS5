@@ -249,8 +249,9 @@ bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind ki
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program) {
 	for (const auto& input: program.info.inputs) {
-		state.inputs.push_back({input.kind, input.location, input.component_count, 0,
-		                        input.per_vertex, input.debug_name});
+		state.inputs.push_back(
+		    {input.kind, input.location, input.component_count, 0, input.debug_name,
+		     input.per_vertex});
 	}
 	for (const auto& output: program.info.outputs) {
 		if (HasOutput(state.outputs, output.kind, output.index)) {
@@ -459,9 +460,9 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
 }
 
 uint32_t DescriptorElementPointerId(EmitterState& state, uint32_t result_ptr_type,
-	                                uint32_t variable_id, uint32_t array_index_id,
-	                                IR::DescriptorBindingKind kind, uint32_t resource,
-	                                const char* variable_name) {
+                                    uint32_t variable_id, uint32_t array_index_id,
+                                    IR::DescriptorBindingKind kind, uint32_t resource,
+                                    const char* variable_name) {
 	if (variable_id == 0) {
 		ExitDescriptorBindingFailure(state, kind, resource, variable_name);
 	}
@@ -560,8 +561,8 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& m
 	const auto  binding     = ResourceForDescriptor(state, kind, mem.resource);
 	const auto& descriptors = state.sampled_images[SampledImageIndex(integer, view)];
 	auto descriptor_index = ConstantU32(state, binding.array_index);
-	const auto& resource   = state.program.info.images.at(mem.resource);
-	const bool dynamic     = resource.HasDynamicTable();
+	const auto& resource = state.program.info.images.at(mem.resource);
+	const bool dynamic = resource.HasDynamicTable();
 	if (dynamic) {
 		auto byte_offset = EmitValueLoad(state, mem.dynamic_resource_offset);
 		if (mem.dynamic_resource_base_offset != 0) {

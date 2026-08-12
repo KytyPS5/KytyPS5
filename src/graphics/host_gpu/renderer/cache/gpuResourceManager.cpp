@@ -77,6 +77,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::RunGarbageCollector() {
+	m_texture_cache.SampleIntervalContent();
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();

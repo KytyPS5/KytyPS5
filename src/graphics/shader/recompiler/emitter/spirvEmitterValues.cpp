@@ -140,6 +140,14 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	return {target, EmitTrueBool(state)};
 }
 
+DppTargetLane EmitDppRowXmaskTargetLane(EmitterState& state, uint32_t subid, uint32_t mask) {
+	const auto target = state.builder.AllocateId();
+	// RDNA DPP row_xmask operates independently inside each 16-lane row.
+	state.builder.AddFunction({OpBitwiseXor, state.uint_type, target, subid,
+	                           ConstantU32(state, mask & 0xfu)});
+	return {target, EmitTrueBool(state)};
+}
+
 DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);
 	if (control <= 0xffu) {
@@ -160,6 +168,9 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
+	if (control >= 0x160u && control <= 0x16fu) {
+		return EmitDppRowXmaskTargetLane(state, subid, control & 0xfu);
+	}
 	return {subid, EmitTrueBool(state)};
 }
 
@@ -169,14 +180,23 @@ uint32_t EmitDppValueU32(EmitterState& state, const IR::Operand& operand, uint32
 	}
 
 	const auto target   = EmitDppTargetLane(state, operand.dpp_ctrl);
+	uint32_t   host_lane = target.lane;
+	if (IsLogicalWaveWorkgroup(state)) {
+		// Supported DPP controls never leave a 16-lane row. Convert the guest
+		// LocalInvocationIndex (0..63) back to the lane index expected by the
+		// containing host subgroup32.
+		host_lane = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitwiseAnd, state.uint_type, host_lane, target.lane,
+		                           ConstantU32(state, 31u)});
+	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
-	                           ConstantU32(state, ScopeSubgroup), value, target.lane});
+	                           ConstantU32(state, ScopeSubgroup), value, host_lane});
 	if (operand.dpp_fetch_inactive) {
 		return shuffled;
 	}
 
-	const auto source_active = EmitLaneIndexActiveBool(state, target.lane);
+	const auto source_active = EmitLaneIndexActiveBool(state, host_lane);
 	const auto can_fetch     = state.builder.AllocateId();
 	const auto ret           = state.builder.AllocateId();
 	state.builder.AddFunction(
@@ -199,6 +219,17 @@ uint32_t EmitValueLoad(EmitterState& state, const IR::Operand& operand) {
 			}
 			value = state.builder.AllocateId();
 			state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
+			if (operand.reg.file == IR::RegisterFile::Scc &&
+			    IsLogicalWaveWorkgroup(state)) {
+				const auto local   = state.builder.AllocateId();
+				const auto summary = state.builder.AllocateId();
+				state.builder.AddFunction({OpINotEqual, state.bool_type, local, value,
+				                           ConstantU32(state, 0)});
+				state.builder.AddFunction({OpSelect, state.uint_type, summary,
+				                           EmitLogicalWaveAnyBool(state, local),
+				                           ConstantU32(state, 1), ConstantU32(state, 0)});
+				value = summary;
+			}
 			break;
 		}
 		case IR::OperandKind::Null: value = ConstantU32(state, 0); break;
@@ -329,7 +360,13 @@ uint32_t EmitMaskZeroBool(EmitterState& state, IR::RegisterFile file, bool zero)
 
 uint32_t EmitMaskSummaryZeroBool(EmitterState& state, IR::RegisterFile file, bool zero) {
 	if (state.per_invocation_masks) {
-		return EmitMaskZeroBool(state, file, zero);
+		const auto active = EmitLogicalWaveAnyBool(state, EmitMaskActiveBool(state, file));
+		if (!zero) {
+			return active;
+		}
+		const auto inactive = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalNot, state.bool_type, inactive, active});
+		return inactive;
 	}
 	if (state.exact_subgroup_operations) {
 		const auto low      = EmitRegisterLoad(state, {file, 0});
@@ -355,6 +392,103 @@ uint32_t EmitMaskSummaryZeroBool(EmitterState& state, IR::RegisterFile file, boo
 	return inactive;
 }
 
+uint32_t EmitLogicalWaveAnyBool(EmitterState& state, uint32_t value_bool) {
+	if (!IsLogicalWaveWorkgroup(state) ||
+	    state.logical_wave_lane_variable == 0) {
+		return value_bool;
+	}
+
+	// Do not depend on how Vulkan partitions local invocations into host subgroups.
+	// Snapshot every guest lane, let lane zero reduce its logical wave serially,
+	// then publish one summary value. This keeps the workgroup rendezvous count
+	// independent of the guest wave width and avoids a barrier at every tree stage.
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	const auto guest_lane = EmitLogicalWaveLaneIndex(state);
+	const auto own_index  = EmitLogicalWaveLaneArrayIndex(state, guest_lane);
+	const auto value      = state.builder.AllocateId();
+	const auto own_ptr    = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, state.uint_type, value, value_bool,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+	state.builder.AddFunction({OpAccessChain, state.ptr_workgroup_uint, own_ptr,
+	                           state.logical_wave_lane_variable, own_index});
+	state.builder.AddFunction({OpStore, own_ptr, value});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, semantics)});
+
+	const auto lane_zero = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpIEqual, state.bool_type, lane_zero, guest_lane, ConstantU32(state, 0)});
+	const auto summary_ptr = EmitLogicalWaveSummaryPointer(state);
+	EmitIfCondition(state, lane_zero, [&]() {
+		uint32_t aggregate = ConstantU32(state, 0);
+		for (uint32_t lane = 0; lane < 64u; lane++) {
+			const auto lane_ptr   = state.builder.AllocateId();
+			const auto lane_value = state.builder.AllocateId();
+			const auto combined   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpAccessChain, state.ptr_workgroup_uint, lane_ptr,
+			     state.logical_wave_lane_variable,
+			     EmitLogicalWaveLaneArrayIndex(state, ConstantU32(state, lane))});
+			state.builder.AddFunction({OpLoad, state.uint_type, lane_value, lane_ptr});
+			state.builder.AddFunction(
+			    {OpBitwiseOr, state.uint_type, combined, aggregate, lane_value});
+			aggregate = combined;
+		}
+		state.builder.AddFunction({OpStore, summary_ptr, aggregate});
+	});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, semantics)});
+
+	const auto summary = state.builder.AllocateId();
+	const auto active  = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, state.uint_type, summary, summary_ptr});
+	state.builder.AddFunction(
+	    {OpINotEqual, state.bool_type, active, summary, ConstantU32(state, 0)});
+	return active;
+}
+
+uint32_t EmitLogicalWaveIndex(EmitterState& state) {
+	if (!state.logical_multi_wave_workgroup) {
+		return ConstantU32(state, 0);
+	}
+	const auto wave = state.builder.AllocateId();
+	state.builder.AddFunction({OpUDiv, state.uint_type, wave,
+	                           EmitLocalInvocationIndex(state), ConstantU32(state, 64u)});
+	return wave;
+}
+
+uint32_t EmitLogicalWaveLaneIndex(EmitterState& state) {
+	if (!IsLogicalWaveWorkgroup(state)) {
+		return EmitSubgroupLocalInvocationId(state);
+	}
+	const auto lane = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane,
+	                           EmitLocalInvocationIndex(state), ConstantU32(state, 63u)});
+	return lane;
+}
+
+uint32_t EmitLogicalWaveSummaryPointer(EmitterState& state) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, state.ptr_workgroup_uint, pointer,
+	                           state.logical_wave_summary_variable,
+	                           EmitLogicalWaveIndex(state)});
+	return pointer;
+}
+
+uint32_t EmitLogicalWaveLaneArrayIndex(EmitterState& state, uint32_t guest_lane) {
+	if (!state.logical_multi_wave_workgroup) {
+		return guest_lane;
+	}
+	const auto base  = state.builder.AllocateId();
+	const auto index = state.builder.AllocateId();
+	state.builder.AddFunction({OpIMul, state.uint_type, base, EmitLogicalWaveIndex(state),
+	                           ConstantU32(state, 64u)});
+	state.builder.AddFunction({OpIAdd, state.uint_type, index, base, guest_lane});
+	return index;
+}
+
 uint32_t EmitExecActiveBool(EmitterState& state) {
 	return EmitMaskZeroBool(state, IR::RegisterFile::Exec, false);
 }
@@ -374,6 +508,9 @@ uint32_t EmitConditionBool(EmitterState& state, const IR::Operand& operand) {
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (IsLogicalWaveWorkgroup(state)) {
+		return EmitLogicalWaveLaneIndex(state);
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		return ConstantU32(state, 0);
 	}
@@ -482,36 +619,52 @@ void EmitLoadInputF32(EmitterState& state, const IR::Instruction& inst) {
 		             EmitVertexParameterComponentU32(state, *input, inst.input_info.chan & 3u));
 		return;
 	}
-
-	const auto chan = inst.input_info.chan & 3u;
-
 	if (input->per_vertex) {
-		// The input is one vec4 per vertex, indexed 0..2. P0 is vertex 0's value; P10 and P20 are
-		// the deltas the shader will scale by the barycentric weights, so they are differences
-		// against that same vertex - exactly the `P0 + P10*I + P20*J` the ISA describes.
-		const auto load_vertex = [&](uint32_t vertex) {
-			const auto ptr   = state.builder.AllocateId();
-			const auto value = state.builder.AllocateId();
-			state.builder.AddFunction({OpAccessChain, state.ptr_input_float, ptr,
-			                           input->variable_id, ConstantU32(state, vertex),
-			                           ConstantU32(state, chan)});
-			state.builder.AddFunction({OpLoad, state.float_type, value, ptr});
+		auto LoadVertexComponent = [&](uint32_t vertex) {
+			const auto pointer = state.builder.AllocateId();
+			const auto value   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpAccessChain, state.ptr_input_float, pointer, input->variable_id,
+			     ConstantU32(state, vertex), ConstantU32(state, inst.input_info.chan & 3u)});
+			state.builder.AddFunction({OpLoad, state.float_type, value, pointer});
 			return value;
 		};
 
-		const auto base = load_vertex(0);
-		uint32_t   result = base;
-		if (inst.input_info.interp != IR::InterpParameter::P0) {
-			const auto vertex =
-			    inst.input_info.interp == IR::InterpParameter::P10 ? 1u : 2u;
-			const auto delta = state.builder.AllocateId();
+		uint32_t component = 0;
+		if (inst.input_info.vertex_index != UINT32_MAX ||
+		    PixelParameterIsFlat(state, inst.input_info.attr)) {
+			const auto vertex = inst.input_info.vertex_index != UINT32_MAX
+			                        ? inst.input_info.vertex_index
+			                        : 0u;
+			component = LoadVertexComponent(vertex);
+		} else {
+			const auto bary_variable = state.pixel_input_info != nullptr &&
+			                                   state.pixel_input_info->ps_no_perspective
+			                               ? state.bary_coord_no_persp_variable
+			                               : state.bary_coord_variable;
+			const auto bary = state.builder.AllocateId();
 			state.builder.AddFunction(
-			    {OpFSub, state.float_type, delta, load_vertex(vertex), base});
-			result = delta;
+			    {OpLoad, state.vec3_float_type, bary, bary_variable});
+			for (uint32_t vertex = 0; vertex < 3; vertex++) {
+				const auto weight = state.builder.AllocateId();
+				const auto term   = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpCompositeExtract, state.float_type, weight, bary, vertex});
+				state.builder.AddFunction(
+				    {OpFMul, state.float_type, term, LoadVertexComponent(vertex), weight});
+				if (vertex == 0) {
+					component = term;
+				} else {
+					const auto sum = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpFAdd, state.float_type, sum, component, term});
+					component = sum;
+				}
+			}
 		}
-		const auto per_vertex_bits = state.builder.AllocateId();
-		state.builder.AddFunction({OpBitcast, state.uint_type, per_vertex_bits, result});
-		EmitStoreU32(state, inst.dst, per_vertex_bits);
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+		EmitStoreU32(state, inst.dst, bits);
 		return;
 	}
 
@@ -520,17 +673,23 @@ void EmitLoadInputF32(EmitterState& state, const IR::Instruction& inst) {
 	const auto bits        = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, state.vec4_float_type, input_value, input->variable_id});
 	state.builder.AddFunction(
-	    {OpCompositeExtract, state.float_type, component, input_value, chan});
+	    {OpCompositeExtract, state.float_type, component, input_value, inst.input_info.chan & 3u});
 	state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
 	EmitStoreU32(state, inst.dst, bits);
 }
 
 uint32_t EmitSccBool(EmitterState& state, bool non_zero) {
 	const auto value = EmitRegisterLoad(state, SccRegister());
-	const auto cond  = state.builder.AllocateId();
+	const auto local = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {non_zero ? OpINotEqual : OpIEqual, state.bool_type, cond, value, ConstantU32(state, 0)});
-	return cond;
+	    {OpINotEqual, state.bool_type, local, value, ConstantU32(state, 0)});
+	const auto summary = EmitLogicalWaveAnyBool(state, local);
+	if (non_zero) {
+		return summary;
+	}
+	const auto zero = state.builder.AllocateId();
+	state.builder.AddFunction({OpLogicalNot, state.bool_type, zero, summary});
+	return zero;
 }
 
 uint32_t EmitFloatLoad(EmitterState& state, const IR::Operand& operand) {

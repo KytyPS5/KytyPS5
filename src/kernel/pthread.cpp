@@ -881,6 +881,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
 	const auto guest_rsp = aligned_stack_top - 2u * sizeof(uintptr_t);
 	const auto guest_rbp = guest_rsp;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto guest_stack_base = reinterpret_cast<uintptr_t>(g_pthread_self->attr->stack_addr);
+#endif
 
 	auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
 	guest_root_frame[0]    = 0;
@@ -949,8 +952,11 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
+	             // Keep Windows' TEB stack metadata valid while host HLE code runs on the guest
+	             // stack. Ntdll uses these fields in paths such as heap allocation.
+	             "movq %[guest_stack_top], %%rcx\n\t"
 	             "movq %%rcx, %%gs:0x08\n\t"
+	             "movq %[guest_stack_base], %%rcx\n\t"
 	             "movq %%rcx, %%gs:0x10\n\t"
 #endif
 	             "movq %%rsp, %%r12\n\t"
@@ -969,12 +975,15 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
-	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             : [guest_rsp] "m"(guest_rsp), [guest_rbp] "m"(guest_rbp),
+	               [guest_stack_base] "m"(guest_stack_base),
+	               [guest_stack_top] "m"(aligned_stack_top)
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
 	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
+	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "xmm0",
 	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
 	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");

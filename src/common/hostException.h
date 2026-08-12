@@ -39,6 +39,13 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// External instrumentation can use access violations internally and resolve them in a later
+// vectored/structured exception handler. Keep Kyty's recognized guest faults active, but allow
+// otherwise unresolved faults to reach that instrumentation while this scope is enabled.
+void               BeginExternalExceptionPassthrough() noexcept;
+void               EndExternalExceptionPassthrough() noexcept;
+[[nodiscard]] bool ExternalExceptionPassthroughEnabled() noexcept;
+
 } // namespace Common::HostException
 
 #endif /* KYTY_COMMON_HOST_EXCEPTION_H_ */

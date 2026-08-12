@@ -71,20 +71,26 @@ public:
 		vec4_float_type = Type(spv::Op::OpTypeVector, float_type, 4u);
 		function_type   = Type(spv::Op::OpTypeFunction, void_type);
 
-		per_vertex_type = Type(spv::Op::OpTypeStruct, vec4_float_type);
+		clip_distance_array_type = Array(float_type, 1u);
+		per_vertex_type =
+		    Type(spv::Op::OpTypeStruct, vec4_float_type, clip_distance_array_type);
 		builder.AddAnnotation({Word(spv::Op::OpMemberDecorate), per_vertex_type, 0u,
 		                       Word(spv::Decoration::BuiltIn), Word(spv::BuiltIn::Position)});
+		builder.AddAnnotation({Word(spv::Op::OpMemberDecorate), per_vertex_type, 1u,
+		                       Word(spv::Decoration::BuiltIn), Word(spv::BuiltIn::ClipDistance)});
 		builder.AddAnnotation(
 		    {Word(spv::Op::OpDecorate), per_vertex_type, Word(spv::Decoration::Block)});
+		synthetic_depth_clip = SpecializationConstant(uint_type, 0u, 0u);
 
 		ptr_input_vec4_float  = Pointer(spv::StorageClass::Input, vec4_float_type);
 		ptr_output_vec4_float = Pointer(spv::StorageClass::Output, vec4_float_type);
+		ptr_output_float      = Pointer(spv::StorageClass::Output, float_type);
 		if (model == spv::ExecutionModel::TessellationControl) {
 			bool_type        = Type(spv::Op::OpTypeBool);
 			vec2_bool_type   = Type(spv::Op::OpTypeVector, bool_type, 2u);
 			vec2_float_type  = Type(spv::Op::OpTypeVector, float_type, 2u);
-			ptr_output_float = Pointer(spv::StorageClass::Output, float_type);
 		} else {
+			bool_type        = Type(spv::Op::OpTypeBool);
 			vec3_float_type = Type(spv::Op::OpTypeVector, float_type, 3u);
 			ptr_input_float = Pointer(spv::StorageClass::Input, float_type);
 		}
@@ -147,6 +153,7 @@ public:
 		    Result(spv::Op::OpSelect, vec4_float_type, is_fourth, position3,
 		           Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0))));
 		Store(Access(ptr_output_vec4_float, gl_out, invocation, Int(0)), position);
+		Store(Access(ptr_output_float, gl_out, invocation, Int(1), Int(0)), float_one);
 
 		for (uint32_t i = 0; i < parameters.size(); i++) {
 			const auto input0 =
@@ -184,6 +191,8 @@ public:
 		const auto position =
 		    Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0)));
 		Store(Access(ptr_output_vec4_float, gl_out, Int(0)), position);
+		Store(Access(ptr_output_float, gl_out, Int(1), Int(0)),
+		      SyntheticDepthClipDistance(position));
 		for (uint32_t i = 0; i < parameters.size(); i++) {
 			Store(outputs[i],
 			      Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
@@ -206,6 +215,13 @@ private:
 		const auto id = builder.AllocateId();
 		builder.AddType({Word(spv::Op::OpConstant), type, id, value});
 		return id;
+	}
+
+	uint32_t SpecializationConstant(uint32_t type, uint32_t value, uint32_t id) {
+		const auto result = builder.AllocateId();
+		builder.AddType({Word(spv::Op::OpSpecConstant), type, result, value});
+		Decorate(result, spv::Decoration::SpecId, id);
+		return result;
 	}
 
 	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
@@ -277,6 +293,7 @@ private:
 	void DefineEntry(spv::ExecutionModel model) {
 		builder.AddCapability({Word(spv::Capability::Shader)});
 		builder.AddCapability({Word(spv::Capability::Tessellation)});
+		builder.AddCapability({Word(spv::Capability::ClipDistance)});
 		main = Result(spv::Op::OpFunction, void_type, spv::FunctionControlMask::MaskNone,
 		              function_type);
 		if (model == spv::ExecutionModel::TessellationControl) {
@@ -353,6 +370,22 @@ private:
 		              Result(spv::Op::OpFAdd, vec4_float_type, p1, p2));
 	}
 
+	uint32_t SyntheticDepthClipDistance(uint32_t position) {
+		const auto z             = Result(spv::Op::OpCompositeExtract, float_type, position, 2u);
+		const auto w             = Result(spv::Op::OpCompositeExtract, float_type, position, 3u);
+		const auto far_distance  = Result(spv::Op::OpFSub, float_type, w, z);
+		const auto near_gl       = Result(spv::Op::OpFAdd, float_type, z, w);
+		const auto clip_far      = Result(spv::Op::OpIEqual, bool_type, synthetic_depth_clip, Uint(1));
+		const auto clip_near_dx  = Result(spv::Op::OpIEqual, bool_type, synthetic_depth_clip, Uint(2));
+		const auto clip_near_gl  = Result(spv::Op::OpIEqual, bool_type, synthetic_depth_clip, Uint(3));
+		const auto float_one     = Constant(float_type, std::bit_cast<uint32_t>(1.0f));
+		const auto selected_gl =
+		    Result(spv::Op::OpSelect, float_type, clip_near_gl, near_gl, float_one);
+		const auto selected_dx =
+		    Result(spv::Op::OpSelect, float_type, clip_near_dx, z, selected_gl);
+		return Result(spv::Op::OpSelect, float_type, clip_far, far_distance, selected_dx);
+	}
+
 	Builder                       builder {SpirvVersion15};
 	const std::vector<Parameter>& parameters;
 	std::vector<uint32_t>         interfaces;
@@ -372,6 +405,8 @@ private:
 	uint32_t                      vec4_float_type       = 0;
 	uint32_t                      function_type         = 0;
 	uint32_t                      per_vertex_type       = 0;
+	uint32_t                      clip_distance_array_type = 0;
+	uint32_t                      synthetic_depth_clip = 0;
 	uint32_t                      ptr_input_float       = 0;
 	uint32_t                      ptr_input_vec4_float  = 0;
 	uint32_t                      ptr_output_float      = 0;

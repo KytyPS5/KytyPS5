@@ -1441,6 +1441,32 @@ LIB_DEFINE(InitNet_1_NpManager) {
 
 } // namespace LibNpManager
 
+namespace LibNpCommerce {
+
+LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
+
+static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+	PRINT_NAME();
+
+	// The system commerce UI is not exposed by the emulator. This lifecycle endpoint has no
+	// parameters or output state; SDK clients use its successful normal path before opening UI.
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+	PRINT_NAME();
+
+	// Match the successful normal shutdown path without claiming to implement commerce UI.
+	return OK;
+}
+
+LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
+	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
+}
+
+} // namespace LibNpCommerce
+
 namespace LibNpSessionSignaling {
 
 LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
@@ -3936,6 +3962,7 @@ LIB_DEFINE(InitNet_1) {
 	LibHttp2::InitNet_1_Http2(s);
 	LibNetCtl::InitNet_1_NetCtl(s);
 	LibNpManager::InitNet_1_NpManager(s);
+	LibNpCommerce::InitNet_1_NpCommerce(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
 	LibNpAuth::InitNet_1_NpAuth(s);

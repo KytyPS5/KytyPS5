@@ -6,17 +6,15 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-bool HasInput(const ShaderInfo& info, StageInputKind kind, uint32_t location) {
-	return std::any_of(info.inputs.begin(), info.inputs.end(), [=](const auto& input) {
-		return input.kind == kind && input.location == location;
-	});
-}
-
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
-              std::string name) {
-	if (!HasInput(info, kind, location)) {
-		info.inputs.push_back({kind, location, components, false, std::move(name)});
+              std::string name, bool per_vertex = false) {
+	for (auto& input: info.inputs) {
+		if (input.kind == kind && input.location == location) {
+			input.per_vertex = input.per_vertex || per_vertex;
+			return;
+		}
 	}
+	info.inputs.push_back({kind, location, components, std::move(name), per_vertex});
 }
 
 bool HasOutput(const ShaderInfo& info, StageOutputKind kind, uint32_t index) {
@@ -114,7 +112,8 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 	}
 }
 
-void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
+void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixel,
+                        ShaderInfo& info) {
 	if (pixel == nullptr) {
 		return;
 	}
@@ -125,40 +124,35 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input));
-	}
-}
-
-// A parameter read as P10 or P20 cannot come from an interpolated input - those two are deltas
-// between vertices, and only the per-vertex values can produce them. Mark the ones that need it
-// so the module declares them as three-element arrays instead.
-void MarkPerVertexInputs(const Program& program, ShaderInfo& info) {
-	for (const auto& block: program.blocks) {
-		for (const auto& inst: block.instructions) {
-			if (inst.op != Opcode::LoadInputF32 ||
-			    inst.input_info.interp == InterpParameter::P0) {
-				continue;
-			}
-			for (auto& input: info.inputs) {
-				if (input.kind == StageInputKind::Parameter &&
-				    input.location == inst.input_info.attr) {
-					input.per_vertex = true;
-				}
+		bool per_vertex = false;
+		for (const auto& block: program.blocks) {
+			for (const auto& inst: block.instructions) {
+				per_vertex = per_vertex ||
+				             (inst.op == Opcode::LoadInputF32 && inst.input_info.attr == input &&
+				              inst.input_info.vertex_index != UINT32_MAX);
 			}
 		}
+		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
+		         per_vertex);
 	}
 }
 
 void CollectComputeInputs(const Program& program, const ShaderComputeInputInfo* compute,
                           ShaderInfo& info) {
 	if (compute != nullptr) {
+		const auto local_threads = std::max(compute->threads_num[0], 1u) *
+		                           std::max(compute->threads_num[1], 1u) *
+		                           std::max(compute->threads_num[2], 1u);
+		const bool logical_single_wave =
+		    program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation &&
+		    program.wave_size == 64u && local_threads == program.wave_size;
 		if (compute->group_id[0] || compute->group_id[1] || compute->group_id[2]) {
 			AddInput(info, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
 		}
 		if (compute->thread_ids_num > 0) {
 			AddInput(info, StageInputKind::LocalInvocationId, 0, 3, "gl_LocalInvocationID");
 		}
-		if (compute->thread_ids_num > 0 || compute->tg_size_en) {
+		if (compute->thread_ids_num > 0 || compute->tg_size_en || logical_single_wave) {
 			AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
 		}
 		if (compute->dispatch_thread_dimensions) {
@@ -242,10 +236,7 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
-		case ShaderType::Pixel:
-			CollectPixelInputs(options.pixel, next);
-			MarkPerVertexInputs(program, next);
-			break;
+		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(program, options.compute, next); break;
 		default: return false;
 	}

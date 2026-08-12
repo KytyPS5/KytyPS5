@@ -18,6 +18,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <span>
 
@@ -418,17 +419,64 @@ static void CreateLayout(DescriptorCache&                   descriptor_cache,
 static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStageFlagBits vk_stage,
                                   const ShaderRecompiler::IR::Program&                   program,
                                   vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo& required,
-                                  vk::PipelineShaderStageCreateInfo&                     stage) {
-	const auto config =
-	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program);
+                                  vk::PipelineShaderStageCreateInfo&                     stage,
+                                  uint32_t local_threads = 0) {
+	auto config =
+	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program,
+	                            local_threads);
+	if (config.mode == ShaderSubgroupMode::Unsupported &&
+	    vk_stage == vk::ShaderStageFlagBits::eCompute && program.wave_size == 64u &&
+	    program.lane_mask_mode == ShaderLaneMaskMode::NativeWave &&
+	    local_threads > program.wave_size) {
+		const char* fallback = std::getenv("KYTY_DEBUG_ALLOW_SPLIT_WAVE64");
+		if (fallback != nullptr && fallback[0] == '1' && fallback[1] == '\0') {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DEBUG ONLY: splitting %u-lane compute shader 0x%016" PRIx64
+				     " across subgroup32 for a %u-thread workgroup\n",
+				     program.wave_size, program.shader_hash, local_threads);
+			}
+			return;
+		}
+	}
 	switch (config.mode) {
 		case ShaderSubgroupMode::Natural: return;
+		case ShaderSubgroupMode::PartialWave: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running %u active lanes of a %u-lane guest compute wave "
+				     "inside one %u-lane host subgroup\n",
+				     local_threads, program.wave_size, graphics.subgroup_size);
+			}
+			return;
+		}
 		case ShaderSubgroupMode::PerInvocationGraphics: {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
 				LOGF("Vulkan running %u-lane graphics shader stage 0x%08x with per-invocation "
 				     "EXEC/VCC on the host-native subgroup\n",
 				     program.wave_size, static_cast<uint32_t>(vk_stage));
+			}
+			return;
+		}
+		case ShaderSubgroupMode::LogicalSingleWaveWorkgroup: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running one %u-lane guest compute wave as a full workgroup "
+				     "with per-invocation EXEC/VCC\n",
+				     program.wave_size);
+			}
+			return;
+		}
+		case ShaderSubgroupMode::LogicalMultiWaveWorkgroup: {
+			// The emitter represents each guest wave with per-invocation masks and
+			// workgroup-indexed summaries. It does not require a host subgroup size.
+			return;
+		}
+		case ShaderSubgroupMode::HalfWaveIndependent: {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("Vulkan running one separable wave64 as two independent subgroup32 halves\n");
 			}
 			return;
 		}
@@ -444,9 +492,12 @@ static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStag
 		case ShaderSubgroupMode::Controlled: break;
 		case ShaderSubgroupMode::Unsupported:
 		default:
-			EXIT("Vulkan cannot run %u-lane shader stage 0x%08x: default=%u min=%u max=%u "
+			EXIT("Vulkan cannot run shader 0x%016" PRIx64
+			     " (%u-lane, mask_mode=%u) stage 0x%08x: default=%u min=%u max=%u "
 			     "controlled_stages=0x%08x\n",
-			     program.wave_size, static_cast<uint32_t>(vk_stage), graphics.subgroup_size,
+			     program.shader_hash, program.wave_size,
+			     static_cast<uint32_t>(program.lane_mask_mode),
+			     static_cast<uint32_t>(vk_stage), graphics.subgroup_size,
 			     graphics.min_subgroup_size, graphics.max_subgroup_size,
 			     static_cast<vk::ShaderStageFlags::MaskType>(
 			         graphics.required_subgroup_size_stages));
@@ -482,7 +533,12 @@ void CreatePipelineInternal(
 
 	create_info.codeSize = vs_shader.size() * 4;
 	create_info.pCode    = vs_shader.data();
+	const uint64_t vs_shader_hash = (static_cast<uint64_t>(vs_hash0) << 32u) | vs_crc32;
+	const uint64_t ps_shader_hash = (static_cast<uint64_t>(ps_hash0) << 32u) | ps_crc32;
+	ShaderDiagnosticTrace("VS", vs_shader_hash, "vk_shader_module_begin", vs_shader.size());
 	auto result = graphics.device.createShaderModule(&create_info, nullptr, &vert_shader_module);
+	ShaderDiagnosticTrace("VS", vs_shader_hash, "vk_shader_module_end",
+	                      static_cast<uint64_t>(result));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateShaderModule VS done result=%s module=%p\n",
 		     VulkanToString(result).c_str(), static_cast<void*>(vert_shader_module));
@@ -492,7 +548,10 @@ void CreatePipelineInternal(
 	if (ps_active) {
 		create_info.codeSize = ps_shader.size() * 4;
 		create_info.pCode    = ps_shader.data();
+		ShaderDiagnosticTrace("PS", ps_shader_hash, "vk_shader_module_begin", ps_shader.size());
 		result = graphics.device.createShaderModule(&create_info, nullptr, &frag_shader_module);
+		ShaderDiagnosticTrace("PS", ps_shader_hash, "vk_shader_module_end",
+		                      static_cast<uint64_t>(result));
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule PS done result=%s module=%p\n",
 			     VulkanToString(result).c_str(), static_cast<void*>(frag_shader_module));
@@ -530,6 +589,12 @@ void CreatePipelineInternal(
 
 	vk::PipelineShaderStageCreateInfo                     vert_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo vert_subgroup_size {};
+	const uint32_t depth_clip_specialization_value = static_params.synthetic_depth_clip;
+	const vk::SpecializationMapEntry depth_clip_specialization_entry {
+	    0, 0, sizeof(depth_clip_specialization_value)};
+	const vk::SpecializationInfo depth_clip_specialization {
+	    1, &depth_clip_specialization_entry, sizeof(depth_clip_specialization_value),
+	    &depth_clip_specialization_value};
 
 	vert_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 	vert_shader_stage_info.pNext               = nullptr;
@@ -537,7 +602,7 @@ void CreatePipelineInternal(
 	vert_shader_stage_info.stage               = vk::ShaderStageFlagBits::eVertex;
 	vert_shader_stage_info.module              = vert_shader_module;
 	vert_shader_stage_info.pName               = "main";
-	vert_shader_stage_info.pSpecializationInfo = nullptr;
+	vert_shader_stage_info.pSpecializationInfo = rect_list ? nullptr : &depth_clip_specialization;
 	EXIT_IF(!vs_input_info.stage);
 	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eVertex, *vs_input_info.stage.program,
 	                      vert_subgroup_size, vert_shader_stage_info);
@@ -569,6 +634,7 @@ void CreatePipelineInternal(
 	tess_eval_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationEvaluation;
 	tess_eval_shader_stage_info.module = tess_eval_shader_module;
 	tess_eval_shader_stage_info.pName  = "main";
+	tess_eval_shader_stage_info.pSpecializationInfo = &depth_clip_specialization;
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4]   = {};
 	uint32_t                          shader_stage_count = 0;
@@ -783,7 +849,7 @@ void CreatePipelineInternal(
 	rasterizer.pNext = &clip_ext;
 #endif
 	rasterizer.flags                   = {};
-	rasterizer.depthClampEnable        = VK_FALSE;
+	rasterizer.depthClampEnable = static_params.depth_clamp_enable ? VK_TRUE : VK_FALSE;
 	rasterizer.rasterizerDiscardEnable = VK_FALSE;
 	rasterizer.polygonMode             = vk::PolygonMode::eFill;
 	rasterizer.cullMode                = cull_mode;
@@ -1018,8 +1084,12 @@ void CreatePipelineInternal(
 		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
 		     scissor.extent.width, scissor.extent.height);
 	}
+	ShaderDiagnosticTrace("GFX", ps_active ? ps_shader_hash : vs_shader_hash,
+	                      "vk_graphics_pipeline_begin", shader_stage_count);
 	result = graphics.device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	ShaderDiagnosticTrace("GFX", ps_active ? ps_shader_hash : vs_shader_hash,
+	                      "vk_graphics_pipeline_end", static_cast<uint64_t>(result));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -1046,6 +1116,8 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
                             const ShaderComputeInputInfo&   input_info,
                             std::span<const uint32_t>       cs_shader) {
 	vk::ShaderModule comp_shader_module = nullptr;
+	const uint64_t cs_trace_id = (static_cast<uint64_t>(pipeline.cs_shader_id.hash0) << 32u) |
+	                             pipeline.cs_shader_id.crc32;
 
 	vk::ShaderModuleCreateInfo create_info {};
 
@@ -1056,7 +1128,10 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	create_info.pCode    = cs_shader.data();
 	LOGF("PipelineTrace: vkCreateShaderModule CS begin words=%" PRIu64 "\n",
 	     static_cast<uint64_t>(cs_shader.size()));
+	ShaderDiagnosticTrace("CS-Pipeline", cs_trace_id, "vk_shader_module_begin", cs_shader.size());
 	auto result = graphics.device.createShaderModule(&create_info, nullptr, &comp_shader_module);
+	ShaderDiagnosticTrace("CS-Pipeline", cs_trace_id, "vk_shader_module_end",
+	                      static_cast<uint64_t>(result));
 	LOGF("PipelineTrace: vkCreateShaderModule CS done result=%s module=%p\n",
 	     VulkanToString(result).c_str(), static_cast<void*>(comp_shader_module));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -1073,8 +1148,11 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	comp_shader_stage_info.pName               = "main";
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
+	const auto local_threads = std::max(input_info.threads_num[0], 1u) *
+	                           std::max(input_info.threads_num[1], 1u) *
+	                           std::max(input_info.threads_num[2], 1u);
 	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute, *input_info.stage.program,
-	                      comp_subgroup_size, comp_shader_stage_info);
+	                      comp_subgroup_size, comp_shader_stage_info, local_threads);
 
 	vk::DescriptorSetLayout set_layouts[1]  = {};
 	uint32_t                set_layouts_num = 0;
@@ -1101,8 +1179,12 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=%u push_constants=%u\n",
 	     set_layouts_num, push_constant_info_num);
+	ShaderDiagnosticTrace("CS-Pipeline", cs_trace_id, "vk_pipeline_layout_begin",
+	                      set_layouts_num);
 	result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                              &pipeline.pipeline_layout);
+	ShaderDiagnosticTrace("CS-Pipeline", cs_trace_id, "vk_pipeline_layout_end",
+	                      static_cast<uint64_t>(result));
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -1122,7 +1204,11 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	ShaderDiagnosticTrace("CS-Pipeline", cs_trace_id, "vk_compute_pipeline_begin",
+	                      cs_shader.size());
 	result = graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline.pipeline);
+	ShaderDiagnosticTrace("CS-Pipeline", cs_trace_id, "vk_compute_pipeline_end",
+	                      static_cast<uint64_t>(result));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

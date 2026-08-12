@@ -78,6 +78,10 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Diagnostic surface sampler. Both methods are inert unless KYTY_PROBE_INTERVAL is set.
+	// Presentation only arms a sample; the GPU thread performs the read at a submission boundary.
+	void MarkPresentedFrame();
+	void SampleIntervalContent();
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -111,6 +115,7 @@ private:
 	void                                 UnregisterImage(ImageId id);
 	void                                 DeleteImage(ImageId id);
 	void DeleteImages(std::span<const ImageId> ids, std::optional<ImageId> native_source = {});
+	void DeleteImagePreservingGuest(ImageId id);
 	void RetainImage(CommandBuffer& command, ImageId id);
 	void TouchImage(Image& image);
 	void TrackImage(ImageId id);
@@ -159,7 +164,8 @@ private:
 	void                                        DownloadImage(ImageId id);
 	[[nodiscard]] bool                          TryDownloadImage(ImageId id);
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapDownload(uint64_t size, uint64_t alignment);
-	void QueueDownload(GuestRange range, StreamBuffer& download, uint8_t* mapped, uint64_t offset);
+	void QueueDownload(GuestRange range, Buffer& download, uint8_t* mapped, uint64_t offset,
+	                   std::shared_ptr<Buffer> lifetime = {});
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

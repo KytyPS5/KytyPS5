@@ -956,8 +956,9 @@ bool TryReadGpuBacking(uint64_t vaddr, void* data, uint64_t size) {
 	}
 
 	// Do not take g_memory_operation_mutex here. Guest map/unmap calls can hold it while waiting
-	// synchronously for the GPU command lane. The range and backing stores synchronize their own
-	// queries, while GPU unmapping is serialized behind the active command.
+	// synchronously for the GPU command lane, and this function runs on that lane. VirtualRanges
+	// and the backing store synchronize their own queries, while UnmapGpuRange serializes removal
+	// behind the active GPU command.
 	std::vector<VirtualRanges::Range> ranges;
 	if (!g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
 		return false;
@@ -969,9 +970,10 @@ bool TryReadGpuBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return false;
 	}
 
-	// PS5 PRT reads preserve resident spans and define unresident spans as zero for the GPU.
-	// Direct/flexible mappings use shared backing; private committed runtime mappings are read
-	// from their validated guest virtual addresses.
+	// Direct and flexible allocations have shared backing that remains readable while the host
+	// view is protected by the GPU dirty tracker. Runtime/code/stack allocations instead use
+	// private committed host pages, so validate those pages before copying from their guest VA.
+	// A sparse PRT aperture additionally defines unresident pages to read as zero.
 	auto* destination = static_cast<uint8_t*>(data);
 	if (sparse) {
 		std::memset(destination, 0, static_cast<size_t>(size));

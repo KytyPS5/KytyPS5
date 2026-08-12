@@ -52,6 +52,27 @@ void BufferCache::Upload(CommandBuffer& command, Buffer& destination, uint64_t d
 	}
 }
 
+void BufferCache::UploadGuestBacking(CommandBuffer& command, Buffer& destination,
+                                     uint64_t destination_offset, uint64_t source_address,
+                                     uint64_t size) {
+	while (size != 0) {
+		const auto chunk = std::min(size, m_staging_buffer.Size());
+		const auto [mapped, stage_offset] = m_staging_buffer.Map(chunk, 4);
+		if (mapped == nullptr ||
+		    !Libs::LibKernel::Memory::TryReadGpuBacking(source_address, mapped, chunk)) {
+			EXIT("BufferCache: guest backing upload failed, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     source_address, chunk);
+		}
+		m_staging_buffer.Commit();
+		destination.CopyFrom(command, m_staging_buffer, stage_offset, destination_offset, chunk,
+		                     vk::AccessFlagBits::eHostWrite);
+		source_address += chunk;
+		destination_offset += chunk;
+		size -= chunk;
+	}
+}
+
 bool BufferCache::ResolveOverlap(CacheRange& merged, CacheRange candidate) noexcept {
 	if (merged.address == 0 || merged.size == 0 || candidate.address == 0 || candidate.size == 0 ||
 	    merged.size > UINT64_MAX - merged.address ||
@@ -445,8 +466,8 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
 		    },
 		    [&]() noexcept {
 			    for (const auto& [address, bytes]: uploads) {
-				    Upload(command, *old.buffer, old.buffer->Offset(address),
-				           reinterpret_cast<const void*>(address), bytes);
+				    UploadGuestBacking(command, *old.buffer, old.buffer->Offset(address), address,
+				                       bytes);
 			    }
 		    });
 	}
@@ -486,14 +507,14 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		if (auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		    mapped != nullptr) {
-			if (Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
+			if (Libs::LibKernel::Memory::TryReadGpuBacking(vaddr, mapped, size)) {
 				m_stream_buffer.Commit();
 				return {{}, m_stream_buffer.Handle(), offset};
 			}
 		} else {
 			auto owner = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 			                                      AllFlags, size);
-			if (Libs::LibKernel::Memory::TryReadBacking(vaddr, owner->Mapped().data(), size)) {
+			if (Libs::LibKernel::Memory::TryReadGpuBacking(vaddr, owner->Mapped().data(), size)) {
 				owner->Flush(0, size);
 				return {owner, owner->Handle(), 0};
 			}
@@ -511,8 +532,8 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
 	    [&]() noexcept {
 		    for (const auto& [address, bytes]: uploads) {
-			    Upload(command, *cached.buffer, cached.buffer->Offset(address),
-			           reinterpret_cast<const void*>(address), bytes);
+			    UploadGuestBacking(command, *cached.buffer, cached.buffer->Offset(address), address,
+			                       bytes);
 		    }
 	    });
 	if (is_written) {
@@ -621,8 +642,15 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: failed to allocate image staging range: addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	if (!Libs::LibKernel::Memory::TryReadGpuBacking(vaddr, staging, size)) {
+		EXIT("BufferCache: failed to read mapped guest image backing: addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
 	}
 	m_staging_buffer.Commit();
 

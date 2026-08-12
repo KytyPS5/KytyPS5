@@ -1409,6 +1409,12 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	if (!image.info.data.Empty()) {
+		// Render and storage writes make the image the newest representation of these guest bytes.
+		// Keeping an older overlapping buffer dirty would later resurrect stale data when the
+		// allocation is read through another image interpretation.
+		m_buffer_cache.DiscardGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	}
 	image.MarkGpuModified();
 }
 

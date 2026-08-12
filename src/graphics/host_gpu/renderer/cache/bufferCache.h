@@ -68,6 +68,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend class TextureCache;
 
 	struct CacheRange {
 		uint64_t address = 0;
@@ -97,6 +98,7 @@ private:
 	void QueueGarbageDownload(std::span<const DownloadCopy> copies, RetiredBuffer retire);
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	void DiscardGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

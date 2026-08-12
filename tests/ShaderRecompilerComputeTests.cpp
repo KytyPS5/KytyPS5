@@ -141,6 +141,10 @@ struct BufferCacheTestAccess {
 	                                       uint64_t size) {
 		return cache.SynchronizeBufferFromImage(buffer, address, size);
 	}
+
+	static void DiscardGpuDirtyBytes(BufferCache& cache, uint64_t address, uint64_t size) {
+		cache.DiscardGpuDirtyBytes(address, size);
+	}
 };
 
 struct StreamBufferTestAccess {
@@ -865,9 +869,9 @@ void CheckRectListShaders() {
 
 	auto program = std::make_shared<ShaderRecompiler::IR::Program>();
 	program->info.inputs.push_back(
-	    {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, "in_param_0"});
+	        {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, false, "in_param_0"});
 	program->info.inputs.push_back(
-	    {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
+	        {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, false, "in_param_1"});
 
 	ShaderVertexInputInfo vertex {};
 	vertex.param_export_mask = 1u;
@@ -2490,6 +2494,59 @@ public:
 			Require(name, "registered-range removal",
 			        !cache.IsRegionRegistered(index_begin, index_span),
 			        "unmapped Buffer owner remained in the registered-range index");
+
+			constexpr uint64_t prepared_offset = 0x300000;
+			const uint64_t prepared_base = base + prepared_offset;
+			const std::array<BufferRange, 2> prepared_ranges {{
+			    {.address = prepared_base + 0x480, .size = 0x1000},
+			    {.address = prepared_base, .size = 0x5000},
+			}};
+			cache.PrepareBufferRanges(scheduler.Current(), prepared_ranges);
+			auto prepared_inner = cache.ObtainBuffer(
+			    scheduler.Current(), prepared_base + 0x480, 0x1000, true, true);
+			auto prepared_outer =
+			    cache.ObtainBuffer(scheduler.Current(), prepared_base, 0x5000, false, true);
+			Require(name, "prepared overlapping ranges",
+			        prepared_inner.owner != nullptr && prepared_outer.owner != nullptr &&
+			            prepared_inner.buffer == prepared_outer.buffer &&
+			            prepared_inner.offset == prepared_outer.offset + 0x480,
+			        "preflight published stale native views for overlapping guest ranges");
+			scheduler.Current().RetainResourceUntilFence(prepared_inner.owner);
+			scheduler.Current().RetainResourceUntilFence(prepared_outer.owner);
+
+			constexpr uint64_t reverse_offset = 0x380000;
+			const uint64_t reverse_base = base + reverse_offset;
+			const std::array<BufferRange, 2> reverse_ranges {{
+			    {.address = reverse_base, .size = 0x5000},
+			    {.address = reverse_base + 0x480, .size = 0x1000},
+			}};
+			cache.PrepareBufferRanges(scheduler.Current(), reverse_ranges);
+			auto reverse_outer =
+			    cache.ObtainBuffer(scheduler.Current(), reverse_base, 0x5000, false, true);
+			auto reverse_inner = cache.ObtainBuffer(
+			    scheduler.Current(), reverse_base + 0x480, 0x1000, true, true);
+			Require(name, "reverse prepared overlapping ranges",
+			        reverse_inner.buffer == reverse_outer.buffer &&
+			            reverse_inner.offset == reverse_outer.offset + 0x480,
+			        "reverse preflight order changed native buffer ownership");
+			scheduler.Current().RetainResourceUntilFence(reverse_inner.owner);
+			scheduler.Current().RetainResourceUntilFence(reverse_outer.owner);
+
+			constexpr uint64_t ownership_offset = 0x400000;
+			const uint64_t     image_bytes      = base + ownership_offset + 0x100;
+			const uint64_t     sibling_bytes    = base + ownership_offset + 0x200;
+			auto ownership = cache.ObtainBuffer(scheduler.Current(), image_bytes, 0x104, true, false);
+			Require(name, "image/buffer ownership setup", ownership.owner != nullptr,
+			        "failed to create overlapping dirty buffer ranges");
+			scheduler.Current().RetainResourceUntilFence(ownership.owner);
+			cache.FillBuffer(image_bytes, sizeof(uint32_t), 0x11223344u);
+			cache.FillBuffer(sibling_bytes, sizeof(uint32_t), 0x55667788u);
+			BufferCacheTestAccess::DiscardGpuDirtyBytes(cache, image_bytes, sizeof(uint32_t));
+			Require(name, "image supersedes exact buffer bytes",
+			        !cache.HasGpuDirtyBytes(image_bytes, sizeof(uint32_t)) &&
+			            cache.HasGpuDirtyBytes(sibling_bytes, sizeof(uint32_t)) &&
+			            cache.IsRegionGpuModified(sibling_bytes, sizeof(uint32_t)),
+			        "image ownership discarded a dirty sibling or retained stale exact bytes");
 
 			MarkGpuWrite(base + first_offset, sizeof(first_value));
 			MarkGpuWrite(base + second_offset, sizeof(second_value));
@@ -15216,7 +15273,58 @@ TestCase ImageStoreR32UintUsesUintStorageImage() {
 	test.storage_image_rgba           = MakeRgbaImage(4, 4);
 	test.storage_image_r32ui          = std::vector<u32>(16, 0);
 	test.expected_storage_image_r32ui = expected_image;
-	test.required_spirv               = {"R32ui", "storage_uint_2d"};
+	test.required_spirv = {"OpCapability StorageImageReadWithoutFormat",
+	                       "OpCapability StorageImageWriteWithoutFormat", "storage_uint_2d"};
+	test.forbidden_spirv = {"R32ui"};
+	return test;
+}
+
+TestCase ImageStoreR8UintUsesFormatlessStorageImage() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 20, 2);
+	AppendVMovU32(&code, 21, 1);
+	AppendVMovU32(&code, 22, 0);
+	AppendVMovU32(&code, 0, 0x7fu);
+	code.push_back(EncodeMimg0(0x08, 0x1));
+	code.push_back(EncodeMimg1(0, 20));
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name          = "ImageStoreR8UintUsesFormatlessStorageImage";
+	test.code          = code;
+	test.opcodes       = {O::VMovB32, O::ImageStore, O::SEndpgm};
+	test.user_data     = MakeStorageTextureData(Prospero::BufferFormat::k8UInt);
+	test.has_user_data = true;
+	test.compile_only  = true;
+	test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat", "storage_uint_2d"};
+	test.forbidden_spirv = {"R32ui"};
+	return test;
+}
+
+TestCase ImageStoreR8G8UintUsesFormatlessStorageImage() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 20, 2);
+	AppendVMovU32(&code, 21, 1);
+	AppendVMovU32(&code, 22, 0);
+	AppendVMovU32(&code, 0, 0x7fu);
+	AppendVMovU32(&code, 1, 0x80u);
+	code.push_back(EncodeMimg0(0x08, 0x3));
+	code.push_back(EncodeMimg1(0, 20));
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name          = "ImageStoreR8G8UintUsesFormatlessStorageImage";
+	test.code          = code;
+	test.opcodes       = {O::VMovB32, O::ImageStore, O::SEndpgm};
+	test.user_data     = MakeStorageTextureData(Prospero::BufferFormat::k8_8UInt);
+	test.has_user_data = true;
+	test.compile_only  = true;
+	test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat", "storage_uint_2d"};
+	test.forbidden_spirv = {"R32ui"};
 	return test;
 }
 
@@ -15782,6 +15890,8 @@ std::vector<TestCase> MakeCases() {
 	AddCase(ImageStoreR32FloatUsesFormatlessStorageImage);
 	AddCase(ImageStoreR32SintUsesRawUintView);
 	AddCase(ImageStoreR32UintUsesUintStorageImage);
+	AddCase(ImageStoreR8UintUsesFormatlessStorageImage);
+	AddCase(ImageStoreR8G8UintUsesFormatlessStorageImage);
 	AddCase(ComputeTgSizeSgprUsesWaveMetadata);
 	AddCase(ImageAtomicVariants);
 	AddCase(ImageAtomicGlc0DoesNotReturnOldValue);

@@ -3408,6 +3408,43 @@ uint64_t TestGuestBackingSize() {
 	return g_guest_address_space->GetBackingSize();
 }
 
+uint64_t TestGuestBackingCommittedSize() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const uint64_t begin = g_guest_address_space->GetBackingBase();
+	const uint64_t size  = g_guest_address_space->GetBackingSize();
+	if (begin == 0 || UINT64_MAX - begin < size) {
+		return UINT64_MAX;
+	}
+
+	const uint64_t end = begin + size;
+	uint64_t       pos = begin;
+	uint64_t       committed = 0;
+	while (pos < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(pos), &info, sizeof(info)) == 0 ||
+		    info.RegionSize == 0) {
+			return UINT64_MAX;
+		}
+
+		const uint64_t region_begin = reinterpret_cast<uint64_t>(info.BaseAddress);
+		if (UINT64_MAX - region_begin < info.RegionSize) {
+			return UINT64_MAX;
+		}
+		const uint64_t region_end = std::min(end, region_begin + info.RegionSize);
+		if (region_end <= pos) {
+			return UINT64_MAX;
+		}
+		if (info.State == MEM_COMMIT) {
+			committed += region_end - pos;
+		}
+		pos = region_end;
+	}
+	return committed;
+#else
+	return 0;
+#endif
+}
+
 bool TestGuestFreeRangeBounds() {
 	return GuestFreeRangeContains(0x10000, 0x20000, 0x18000, 0x4000) &&
 	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000) &&

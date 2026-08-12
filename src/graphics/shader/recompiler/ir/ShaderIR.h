@@ -127,6 +127,11 @@ struct MemoryInfo {
 	// exact scalar definitions reaching this instruction before that patching step.
 	uint32_t resource_source = 0;
 	uint32_t sampler_source  = 0;
+	// GPU-selected image descriptors are loaded from a guest table with a byte offset. Preserve
+	// the live offset operand after dense resource patching so SPIR-V can index the corresponding
+	// Vulkan descriptor array instead of trying to materialize one descriptor on the CPU.
+	Operand  dynamic_resource_offset;
+	uint32_t dynamic_resource_base_offset = 0;
 	bool     data_signed     = false;
 	bool     typed           = false;
 	bool     formatted       = false;
@@ -224,6 +229,7 @@ enum class ScalarValueOp {
 	AddShiftLeft,
 	XorAdd,
 	ShiftLeftOr,
+	FindLsbU32,
 	ReadConst,
 	ReadConstBuffer,
 	Phi,
@@ -297,17 +303,28 @@ enum class ImageMipMode { None, DynamicStorage };
 constexpr uint32_t StorageImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
+	static constexpr uint32_t NoDynamicTable = UINT32_MAX;
+
 	uint32_t                source          = 0;
 	uint32_t                first_use_pc    = 0;
 	ResourceKind            kind            = ResourceKind::None;
 	Decoder::ImageDimension dimension       = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode        = ImageMipMode::None;
 	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
+	uint32_t                dynamic_table_source         = ScalarProvenance::Undefined;
+	uint32_t                dynamic_table_buffer         = NoDynamicTable;
+	uint32_t                dynamic_table_address_offset = 0;
+	uint32_t                dynamic_table_address_count  = 0;
+	uint32_t                dynamic_descriptor_count     = 0;
 	bool                    read            = false;
 	bool                    written         = false;
 	bool                    atomic          = false;
 	bool                    depth_compare   = false;
 	bool                    cube            = false;
+
+	[[nodiscard]] bool HasDynamicTable() const {
+		return dynamic_table_buffer != NoDynamicTable || dynamic_table_address_count != 0;
+	}
 
 	bool operator==(const ImageResource& other) const = default;
 };

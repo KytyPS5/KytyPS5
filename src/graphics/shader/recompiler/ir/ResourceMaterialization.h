@@ -17,6 +17,9 @@ struct ResourceSnapshot {
 
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
+	// One entry per dense image resource. Static images keep an empty table. Dynamic images hold
+	// every guest table entry followed by a canonical null sentinel used for out-of-range access.
+	std::vector<std::vector<DescriptorValue>> image_tables;
 	std::vector<DescriptorValue> samplers;
 	std::vector<Address>         addresses;
 	std::vector<uint32_t>        flattened_srt;

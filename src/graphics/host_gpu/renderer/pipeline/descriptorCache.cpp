@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <algorithm>
 
 namespace Libs::Graphics {
 namespace {
@@ -146,21 +147,35 @@ DescriptorCache::GetDescriptorSetLayoutInternal(Stage                           
 	return layout;
 }
 
-void DescriptorCache::CreatePool() {
+void DescriptorCache::CreatePool(const ShaderRecompiler::IR::Program& program) {
 	KYTY_PROFILER_FUNCTION();
-	constexpr uint32_t           MaxSets = 512;
-	const vk::DescriptorPoolSize sizes[] = {
-	    {vk::DescriptorType::eStorageBuffer,
-	     MaxSets * (ShaderRecompiler::IR::ShaderInfo::MaxBuffers +
-	                ShaderRecompiler::IR::ShaderInfo::MaxAddresses + 3u)},
-	    {vk::DescriptorType::eSampledImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
-	    {vk::DescriptorType::eStorageImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
-	    {vk::DescriptorType::eSampler, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxSamplers},
-	};
+	std::array<uint32_t, 4> per_set {};
+	for (const auto& binding: program.bindings.descriptors) {
+		const auto count = DescriptorCount(binding);
+		switch (DescriptorType(binding.kind)) {
+			case vk::DescriptorType::eStorageBuffer: per_set[0] += count; break;
+			case vk::DescriptorType::eSampledImage: per_set[1] += count; break;
+			case vk::DescriptorType::eStorageImage: per_set[2] += count; break;
+			case vk::DescriptorType::eSampler: per_set[3] += count; break;
+			default: EXIT("unsupported descriptor pool type\n");
+		}
+	}
+	constexpr uint32_t Batch = 32;
+	const uint32_t MaxSets = per_set[1] > ShaderRecompiler::IR::ShaderInfo::MaxImages ? Batch : 512u;
+	const std::array types = {vk::DescriptorType::eStorageBuffer,
+	                          vk::DescriptorType::eSampledImage,
+	                          vk::DescriptorType::eStorageImage,
+	                          vk::DescriptorType::eSampler};
+	std::vector<vk::DescriptorPoolSize> sizes;
+	for (uint32_t i = 0; i < per_set.size(); i++) {
+		if (per_set[i] != 0) {
+			sizes.push_back({types[i], MaxSets * per_set[i]});
+		}
+	}
 	vk::DescriptorPoolCreateInfo info {};
 	info.sType         = vk::StructureType::eDescriptorPoolCreateInfo;
-	info.poolSizeCount = static_cast<uint32_t>(std::size(sizes));
-	info.pPoolSizes    = sizes;
+	info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	info.pPoolSizes    = sizes.data();
 	info.maxSets       = MaxSets;
 	const auto pool_id = static_cast<int>(m_pools.size());
 	auto&      pool    = m_pools.emplace_back();
@@ -207,7 +222,7 @@ VulkanDescriptorSet* DescriptorCache::Allocate(Stage                            
 			m_first_free_pool = pool.next_free_pool;
 			break;
 		}
-		CreatePool();
+		CreatePool(program);
 	}
 	return nullptr;
 }
@@ -222,15 +237,22 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
                                                     const ShaderRecompiler::IR::Program& program,
                                                     const NativeDescriptors&             data) {
 	KYTY_PROFILER_FUNCTION();
+	const auto has_dynamic_images =
+	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+		    return image.HasDynamicTable();
+	    });
 	EXIT_IF(data.buffers.size() != program.info.buffers.size() ||
 	        data.images.size() != program.info.images.size() ||
+	        (has_dynamic_images && data.image_tables.size() != program.info.images.size()) ||
 	        data.samplers.size() != program.info.samplers.size() ||
 	        data.addresses.size() != program.info.addresses.size());
 	auto* set = Allocate(stage, program);
 	EXIT_NOT_IMPLEMENTED(set == nullptr);
 
-	const auto descriptor_count = program.info.buffers.size() + program.info.images.size() +
-	                              program.info.samplers.size() + program.info.addresses.size() + 3u;
+	size_t descriptor_count = 0;
+	for (const auto& binding: program.bindings.descriptors) {
+		descriptor_count += DescriptorCount(binding);
+	}
 	std::vector<vk::DescriptorBufferInfo> buffer_infos;
 	std::vector<vk::DescriptorImageInfo>  image_infos;
 	std::vector<vk::WriteDescriptorSet>   writes;
@@ -271,8 +293,12 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
 				}
 				break;
 			default: {
+				std::vector<uint32_t> table_indices(data.images.size());
 				for (const auto resource: binding.resources) {
-					const auto& texture = data.images.at(resource);
+					const auto& texture = program.info.images.at(resource).HasDynamicTable()
+					                          ? data.image_tables.at(resource).at(
+					                                table_indices.at(resource)++)
+					                          : data.images.at(resource);
 					image_infos.push_back(MakeImageInfo(texture));
 				}
 				break;

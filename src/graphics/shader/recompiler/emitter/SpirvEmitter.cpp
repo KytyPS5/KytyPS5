@@ -249,7 +249,11 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 			return Fail(error, "native shader plan has an invalid image class");
 		}
 		present[static_cast<size_t>(kind)] = true;
-		expected[static_cast<size_t>(kind)].push_back(i);
+		auto& resources = expected[static_cast<size_t>(kind)];
+		const auto descriptor_count = program.info.images[i].HasDynamicTable()
+		                                ? program.info.images[i].dynamic_descriptor_count + 1u
+		                                : 1u;
+		resources.insert(resources.end(), descriptor_count, i);
 	}
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
@@ -488,6 +492,10 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.needs_subgroup_local_invocation_id = ProgramNeedsSubgroupLocalInvocationId(program);
 	state.needs_compute_derivatives          = ProgramNeedsComputeDerivatives(program);
 	state.needs_image_gather_extended        = ProgramNeedsImageGatherExtended(program);
+	state.needs_sampled_image_nonuniform =
+	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+		    return image.HasDynamicTable();
+	    });
 	state.needs_function_lds                 = ProgramNeedsFunctionLds(program);
 	state.needs_pixel_valid_mask             = ProgramNeedsPixelValidMask(program);
 	ComputeReachableBlocks(state, program);

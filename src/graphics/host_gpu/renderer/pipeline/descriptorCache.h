@@ -56,6 +56,7 @@ public:
 	struct NativeDescriptors {
 		std::vector<BufferView>     buffers;
 		std::vector<TextureBinding> images;
+		std::vector<std::vector<TextureBinding>> image_tables;
 		std::vector<vk::Sampler>    samplers;
 		std::vector<BufferView>     addresses;
 		BufferView                  gds;
@@ -95,7 +96,7 @@ private:
 	};
 
 	static vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture);
-	void                           CreatePool();
+	void                           CreatePool(const ShaderRecompiler::IR::Program& program);
 	VulkanDescriptorSet* Allocate(Stage stage, const ShaderRecompiler::IR::Program& program);
 	vk::DescriptorSetLayout
 	GetDescriptorSetLayoutInternal(Stage stage, const ShaderRecompiler::IR::Program& program);

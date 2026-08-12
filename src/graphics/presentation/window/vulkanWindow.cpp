@@ -291,6 +291,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("shaderStorageImageReadWithoutFormat is not supported\n");
 			skip_device = true;
 		}
+		if (features12.shaderSampledImageArrayNonUniformIndexing != VK_TRUE) {
+			LOGF("shaderSampledImageArrayNonUniformIndexing is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+			LOGF("shaderSampledImageArrayDynamicIndexing is not supported\n");
+			skip_device = true;
+		}
 
 		if (device_features2.features.shaderImageGatherExtended != VK_TRUE) {
 			LOGF("shaderImageGatherExtended is not supported\n");
@@ -553,7 +561,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features13.synchronization2 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.shaderSampledImageArrayNonUniformIndexing != VK_TRUE);
 	features12.timelineSemaphore = VK_TRUE;
+	features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
@@ -564,6 +576,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
+	device_features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;

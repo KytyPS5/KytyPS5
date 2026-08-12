@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <fmt/format.h>
 
@@ -68,6 +69,9 @@ bool ApplyOperation(ScalarValueOp op, const std::array<uint32_t, 3>& args, uint3
 		case ScalarValueOp::OrNot: result = args[0] | ~args[1]; break;
 		case ScalarValueOp::Xor: result = args[0] ^ args[1]; break;
 		case ScalarValueOp::Not: result = ~args[0]; break;
+		case ScalarValueOp::FindLsbU32:
+			result = args[0] == 0 ? UINT32_MAX : std::countr_zero(args[0]);
+			break;
 		case ScalarValueOp::ShiftLeft: result = args[0] << shift; break;
 		case ScalarValueOp::ShiftRight: result = args[0] >> shift; break;
 		case ScalarValueOp::ShiftRightArithmetic:

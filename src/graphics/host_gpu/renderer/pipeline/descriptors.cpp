@@ -97,8 +97,13 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 		return result;
 	}
 
-	uint64_t accessible = 0;
-	if (!HostMemoryQueryRange(address, footprint, HostMemoryAccess::Mapped, accessible)) {
+
+	uint64_t accessible = context.GetGpuResources().MappedExtent(address, footprint);
+	bool     mapped     = accessible != 0;
+	if (accessible < footprint) {
+		mapped = HostMemoryQueryRange(address, footprint, HostMemoryAccess::Mapped, accessible);
+	}
+	if (!mapped) {
 		static std::atomic_int unmapped_count = 0;
 		if (unmapped_count++ < 32) {
 			LOGF("storage buffer descriptor is not host-accessible: base=0x%016" PRIx64

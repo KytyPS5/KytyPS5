@@ -79,6 +79,7 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num       = 0;
 	int                     export_count      = 0;
 	uint32_t                param_export_mask = 0;
+	uint32_t                required_param_locations = 0;
 	bool                    fetch_external    = false;
 	bool                    fetch_embedded    = false;
 };
@@ -123,6 +124,7 @@ struct ShaderPixelInputInfo {
 };
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
+uint32_t ShaderPixelParameterLocationMask(const ShaderPixelInputInfo& info);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
@@ -234,7 +236,8 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 // Returned SPIR-V spans are read-only views backed by the shader program cache.
 bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                          ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
-                         std::span<const uint32_t>& spirv);
+                         std::span<const uint32_t>& spirv,
+                         uint32_t required_param_locations = 0);
 bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
                          ShaderLaneMaskMode lane_mask_mode, const ShaderVertexInputInfo& vs_info,
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,

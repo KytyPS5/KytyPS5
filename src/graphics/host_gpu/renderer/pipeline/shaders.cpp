@@ -18,6 +18,8 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <limits>
 #include <span>
 
@@ -466,6 +468,106 @@ void CreatePipelineInternal(
     const PipelineStaticParameters& static_params, uint32_t vs_hash0, uint32_t vs_crc32,
     uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active) {
 	EXIT_IF(ps_active && ps_input_info == nullptr);
+
+	if (ps_active && vs_input_info.stage && ps_input_info->stage) {
+		const auto& vs_info = vs_input_info.stage.program->info;
+		const auto& ps_info = ps_input_info->stage.program->info;
+		std::array<uint32_t, 32> active {};
+		uint32_t                 active_count = 0;
+		for (const auto& input: ps_info.inputs) {
+			if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
+				active[active_count++] = input.location;
+			}
+		}
+		std::string vs_out;
+		for (const auto& output: vs_info.outputs) {
+			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Parameter) {
+				vs_out += fmt::format("{}(idx{}) ", output.location, output.index);
+			}
+		}
+		std::string ps_in;
+		bool        missing = false;
+		for (uint32_t i = 0; i < active_count; i++) {
+			const auto location = ShaderPixelParameterLocation(
+			    *ps_input_info, {active.data(), active_count}, active[i]);
+			const bool found = std::any_of(
+			    vs_info.outputs.begin(), vs_info.outputs.end(), [&](const auto& output) {
+				    return output.kind == ShaderRecompiler::IR::StageOutputKind::Parameter &&
+				           output.location == location;
+			    });
+			bool used = false;
+			for (const auto& block: ps_input_info->stage.program->blocks) {
+				for (const auto& inst: block.instructions) {
+					used |= inst.op == ShaderRecompiler::IR::Opcode::LoadInputF32 &&
+					        inst.input_info.attr == active[i];
+				}
+			}
+			const bool synthesized =
+			    location < 32 &&
+			    (vs_input_info.required_param_locations & (1u << location)) != 0;
+			missing |= !found && !synthesized;
+			ps_in += fmt::format("{}->{}{}{} ", active[i], location,
+			                     found ? "" : (synthesized ? "!ZEROED" : "!MISSING"),
+			                     used ? "[READ]" : "[unread]");
+		}
+		if (missing) {
+			std::string interp;
+			for (uint32_t i = 0; i < ps_input_info->input_num && i < 32; i++) {
+				interp += fmt::format("{:#x} ", ps_input_info->interpolator_settings[i]);
+			}
+			const auto target_name = [](ShaderRecompiler::IR::ExportTargetKind kind) {
+				switch (kind) {
+					case ShaderRecompiler::IR::ExportTargetKind::Null: return "null";
+					case ShaderRecompiler::IR::ExportTargetKind::Position: return "pos";
+					case ShaderRecompiler::IR::ExportTargetKind::Primitive: return "prim";
+					case ShaderRecompiler::IR::ExportTargetKind::Parameter: return "param";
+					case ShaderRecompiler::IR::ExportTargetKind::Mrt: return "mrt";
+					case ShaderRecompiler::IR::ExportTargetKind::MrtZ: return "mrtz";
+					default: return "unknown";
+				}
+			};
+			std::string vs_exports;
+			size_t      vs_instructions = 0;
+			for (const auto& block: vs_input_info.stage.program->blocks) {
+				vs_instructions += block.instructions.size();
+				for (const auto& inst: block.instructions) {
+					if (inst.op != ShaderRecompiler::IR::Opcode::Export) {
+						continue;
+					}
+					const auto& e = inst.export_info;
+					vs_exports += fmt::format("{}[{}]tgt{} en=0x{:x}{}{} ", target_name(e.kind),
+					                          e.index, e.target, e.en, e.done ? " done" : "",
+					                          e.compr ? " compr" : "");
+				}
+			}
+			if (vs_exports.empty()) {
+				vs_exports = "(none decoded)";
+			}
+			const auto& vs_program = *vs_input_info.stage.program;
+			std::string vs_cfg;
+			for (const auto& block: vs_program.blocks) {
+				vs_cfg += fmt::format("b{}[{:#x}..{:#x}] term={} succ={}; ", block.id,
+				                      block.start_pc, block.end_pc,
+				                      static_cast<uint32_t>(block.terminator.kind),
+				                      block.successors.size());
+			}
+			LOGF("SPIR-V interface mismatch: vs_exports: %s\n", vs_exports.c_str());
+			std::printf("SPIR-V interface mismatch: vs_blocks=%zu vs_instructions=%zu "
+			            "cfg_failure=%u wave=%u stage=%u fallback='%s'\n"
+			            "  vs_exports: %s\n  vs_cfg: %s\n",
+			            vs_program.blocks.size(), vs_instructions,
+			            static_cast<uint32_t>(vs_program.cfg_failure_kind), vs_program.wave_size,
+			            static_cast<uint32_t>(vs_program.stage), vs_program.fallback_reason.c_str(),
+			            vs_exports.c_str(), vs_cfg.c_str());
+			EXIT("SPIR-V interface mismatch: vs_hash=0x%08x ps_hash=0x%08x ps_input_num=%u "
+			     "vs_export_count=%d vs_param_mask=0x%08x rect_list=%d\n  vs_outputs: %s\n  "
+			     "ps_inputs: %s\n  interp: %s\n",
+			     vs_hash0, ps_hash0, ps_input_info->input_num, vs_input_info.export_count,
+			     vs_input_info.param_export_mask,
+			     static_cast<int>(static_params.topology == vk::PrimitiveTopology::ePatchList),
+			     vs_out.c_str(), ps_in.c_str(), interp.c_str());
+		}
+	}
 
 	const bool rect_list = static_params.topology == vk::PrimitiveTopology::ePatchList;
 

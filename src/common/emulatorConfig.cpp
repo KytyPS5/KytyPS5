@@ -93,6 +93,10 @@ bool SpirvDebugPrintfEnabled() {
 	return g_config->spirv_debug_printf_enabled;
 }
 
+bool GpuAssistedValidationEnabled() {
+	return g_config->gpu_assisted_validation_enabled && g_config->vulkan_validation_enabled;
+}
+
 bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }

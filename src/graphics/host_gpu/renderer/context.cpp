@@ -17,9 +17,28 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 namespace Libs::Graphics {
+
+namespace {
+
+void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint64_t submit_seq,
+                       uint32_t debug_op, uint64_t debug_submit, uint32_t arg0, uint32_t arg1,
+                       uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	LOGF("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	     what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq, debug_op,
+	     debug_submit, arg0, arg1, arg2, arg3, arg4);
+	std::printf("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	            what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq,
+	            debug_op, debug_submit, arg0, arg1, arg2, arg3, arg4);
+	std::fflush(stdout);
+}
+
+} // namespace
 
 FenceResourceRetainer::~FenceResourceRetainer() {
 	if (!m_resources.empty()) {
@@ -169,8 +188,9 @@ void CommandBuffer::Execute(const SubmitInfo& submit) {
 
 	auto result = graphics.device.resetFences(1, &fence);
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkResetFences failed before submit: %s (%d)\n", VulkanToString(result).c_str(),
-		     static_cast<int>(result));
+		ReportVulkanFatal("vkResetFences (before submit)", result, m_slot->id, m_submit_seq,
+		                  m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
+		                  m_debug_arg3, m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -192,11 +212,9 @@ void CommandBuffer::Execute(const SubmitInfo& submit) {
 	m_fence_waited = false;
 
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkQueueSubmit failed: %s (%d), slot=%u submit_seq=%" PRIu64
-		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     VulkanToString(result).c_str(), static_cast<int>(result), m_slot->id, m_submit_seq,
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, m_slot->id, m_submit_seq, m_debug_op,
+		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
+		                  m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
@@ -213,11 +231,9 @@ void CommandBuffer::WaitForFenceOnly() {
 	auto device = m_graphics.device;
 	auto result = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkWaitForFences failed: %s (%d), slot=%u submit_seq=%" PRIu64
-		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     VulkanToString(result).c_str(), static_cast<int>(result), m_slot->id, m_submit_seq,
-		     m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
+		ReportVulkanFatal("vkWaitForFences", result, m_slot->id, m_submit_seq, m_debug_op,
+		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
+		                  m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	m_fence_waited = true;

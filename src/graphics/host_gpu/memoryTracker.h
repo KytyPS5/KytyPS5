@@ -23,6 +23,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	[[nodiscard]] static bool InUploadCallback() noexcept { return s_upload_owner != nullptr; }
+
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);

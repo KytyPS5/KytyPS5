@@ -615,7 +615,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.samples);
 		}
-		const auto layout = depth_attachment_layout(depth);
+		const auto layout =
+		    image.binding.is_bound ? vk::ImageLayout::eGeneral : depth_attachment_layout(depth);
 		const auto writes = depth.AttachmentWriteAspects();
 		auto       access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead};
 		if (writes) {

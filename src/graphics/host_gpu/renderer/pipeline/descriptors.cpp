@@ -723,7 +723,7 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	auto       id                  = texture_cache.FindImage(desc);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
+	if (stencil_association && !storage) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
@@ -798,6 +798,9 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 
 void RenderExecutor::ResetBindings() {
 	for (const auto& image: m_bound_images) {
+		if (image->binding.stencil_write) {
+			m_context.GetTextureCache().FlushStencilWrite(image);
+		}
 		image->binding = {};
 	}
 	m_bound_images.clear();
@@ -984,6 +987,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 		                                   view.layer_count};
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		if (storage && image.depth_id) {
+			image.binding.stencil_write = true;
+		}
 		if (image.info.data.Empty()) {
 			image.Transit(vk::ImageLayout::eGeneral,
 			              storage

@@ -62,6 +62,7 @@ public:
 	[[nodiscard]] Image&        GetImage(ImageId id);
 	[[nodiscard]] const Image&  GetImage(ImageId id) const;
 	void                        MarkGpuWritten(ImageId id);
+	void                        FlushStencilWrite(const std::shared_ptr<Image>& source);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

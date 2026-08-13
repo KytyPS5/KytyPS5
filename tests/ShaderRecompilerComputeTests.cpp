@@ -2491,6 +2491,43 @@ public:
 			        !cache.IsRegionRegistered(index_begin, index_span),
 			        "unmapped Buffer owner remained in the registered-range index");
 
+			constexpr uint64_t prepared_offset = 0x300000;
+			const uint64_t prepared_base = base + prepared_offset;
+			const std::array<BufferRange, 2> prepared_ranges {{
+			    {.address = prepared_base + 0x480, .size = 0x1000},
+			    {.address = prepared_base, .size = 0x5000},
+			}};
+			cache.PrepareBufferRanges(scheduler.Current(), prepared_ranges);
+			auto prepared_inner = cache.ObtainBuffer(
+			    scheduler.Current(), prepared_base + 0x480, 0x1000, true, true);
+			auto prepared_outer =
+			    cache.ObtainBuffer(scheduler.Current(), prepared_base, 0x5000, false, true);
+			Require(name, "prepared overlapping ranges",
+			        prepared_inner.owner != nullptr && prepared_outer.owner != nullptr &&
+			            prepared_inner.buffer == prepared_outer.buffer &&
+			            prepared_inner.offset == prepared_outer.offset + 0x480,
+			        "preflight published stale native views for overlapping guest ranges");
+			scheduler.Current().RetainResourceUntilFence(prepared_inner.owner);
+			scheduler.Current().RetainResourceUntilFence(prepared_outer.owner);
+
+			constexpr uint64_t reverse_offset = 0x380000;
+			const uint64_t reverse_base = base + reverse_offset;
+			const std::array<BufferRange, 2> reverse_ranges {{
+			    {.address = reverse_base, .size = 0x5000},
+			    {.address = reverse_base + 0x480, .size = 0x1000},
+			}};
+			cache.PrepareBufferRanges(scheduler.Current(), reverse_ranges);
+			auto reverse_outer =
+			    cache.ObtainBuffer(scheduler.Current(), reverse_base, 0x5000, false, true);
+			auto reverse_inner = cache.ObtainBuffer(
+			    scheduler.Current(), reverse_base + 0x480, 0x1000, true, true);
+			Require(name, "reverse prepared overlapping ranges",
+			        reverse_inner.buffer == reverse_outer.buffer &&
+			            reverse_inner.offset == reverse_outer.offset + 0x480,
+			        "reverse preflight order changed native buffer ownership");
+			scheduler.Current().RetainResourceUntilFence(reverse_inner.owner);
+			scheduler.Current().RetainResourceUntilFence(reverse_outer.owner);
+
 			MarkGpuWrite(base + first_offset, sizeof(first_value));
 			MarkGpuWrite(base + second_offset, sizeof(second_value));
 			cache.FillBuffer(base + first_offset, sizeof(first_value), first_value);

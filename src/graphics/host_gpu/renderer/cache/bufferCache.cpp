@@ -526,6 +526,23 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	return {owner, owner->Handle(), offset};
 }
 
+void BufferCache::PrepareBufferRanges(CommandBuffer& command,
+                                      std::span<const BufferRange> ranges) {
+	if (command.IsInvalid() || command.IsExecute()) {
+		EXIT("BufferCache: buffer range preparation requires a recording command buffer\n");
+	}
+	for (const auto& range: ranges) {
+		if (range.address == 0 || range.size == 0) {
+			continue;
+		}
+		if (range.address >= TRACKER_ADDRESS_SIZE ||
+		    range.size > TRACKER_ADDRESS_SIZE - range.address) {
+			EXIT("BufferCache: invalid prepared buffer range\n");
+		}
+		(void)GetOrCreateBuffer(command, range.address, range.size);
+	}
+}
+
 std::shared_ptr<Buffer> BufferCache::ObtainNullBuffer() {
 	if (m_null_buffer != nullptr) {
 		return m_null_buffer;

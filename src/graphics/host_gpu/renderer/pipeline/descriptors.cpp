@@ -27,6 +27,7 @@
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -78,6 +79,57 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+static BufferRange StorageBufferRange(RenderContext& context,
+                                      const ShaderBufferResource& descriptor) {
+	const auto address = descriptor.Base48();
+	const auto stride  = descriptor.Stride();
+	const auto records = descriptor.NumRecords();
+	if (stride != 0 && records > UINT64_MAX / stride) {
+		EXIT("storage buffer descriptor footprint overflow\n");
+	}
+	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	if (address == 0 || requested_size == 0) {
+		return {};
+	}
+	const auto size       = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+	const auto& graphics  = context.GetGraphics();
+	const auto  alignment = graphics.StorageMinAlignment();
+	if (alignment == 0 || size == 0 ||
+	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
+		EXIT("storage buffer range or device alignment is unsupported\n");
+	}
+	return {.address = address, .size = size};
+}
+
+static BufferRange AddressBufferRange(
+    RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
+    const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
+	if (address.binding_base == 0) {
+		return {};
+	}
+	if (resource.written) {
+		EXIT("writable address resources are unsupported\n");
+	}
+	const auto limit =
+	    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
+	        ? ShaderRecompiler::IR::FlatAddressWindowSize
+	        : static_cast<uint64_t>(
+	              context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	uint64_t size = 0;
+	if (!HostMemoryQueryRange(address.binding_base, limit, HostMemoryAccess::Mapped, size)) {
+		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
+		     address.binding_base);
+	}
+	const auto& graphics  = context.GetGraphics();
+	const auto  alignment = graphics.StorageMinAlignment();
+	if (alignment == 0 || size == 0 ||
+	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
+	    BufferCache::GetBufferOffset(address.binding_base) % alignment != 0) {
+		EXIT("address resource range or alignment is unsupported\n");
+	}
+	return {.address = address.binding_base, .size = size};
+}
+
 static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& command_buffer,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -85,23 +137,15 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	BufferView result;
 	buffer_offset = 0;
 
-	const auto address = descriptor.Base48();
-	const auto stride  = descriptor.Stride();
-	const auto records = descriptor.NumRecords();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("storage buffer descriptor footprint overflow\n");
-	}
-	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || size == 0) {
+	const auto range = StorageBufferRange(context, descriptor);
+	if (range.address == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
+	const auto address = range.address;
+	const auto size    = range.size;
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range or device alignment is unsupported\n");
-	}
 	auto binding = context.GetBufferCache().ObtainBuffer(
 	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
 	const auto aligned_offset = binding.offset - binding.offset % alignment;
@@ -123,38 +167,35 @@ NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
                     const ShaderRecompiler::IR::AddressResource&           resource,
                     const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
 	BufferView result;
-	if (address.binding_base == 0) {
+	const auto range = AddressBufferRange(context, resource, address);
+	if (range.address == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
-	if (resource.written) {
-		EXIT("writable address resources are unsupported\n");
-	}
-	const auto limit =
-	    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
-	        ? ShaderRecompiler::IR::FlatAddressWindowSize
-	        : static_cast<uint64_t>(
-	              context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
-	uint64_t   size   = 0;
-	const auto access = HostMemoryAccess::Mapped;
-	if (!HostMemoryQueryRange(address.binding_base, limit, access, size)) {
-		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
-		     address.binding_base);
-	}
-	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
-	    BufferCache::GetBufferOffset(address.binding_base) % alignment != 0) {
-		EXIT("address resource range or alignment is unsupported\n");
-	}
-	auto binding =
-	    context.GetBufferCache().ObtainBuffer(command_buffer, address.binding_base, size);
+	auto binding = context.GetBufferCache().ObtainBuffer(command_buffer, range.address, range.size);
 	result.owner  = std::move(binding.owner);
 	result.buffer = binding.buffer;
 	result.offset = binding.offset;
-	result.range  = static_cast<vk::DeviceSize>(size);
+	result.range  = static_cast<vk::DeviceSize>(range.size);
 	return result;
+}
+
+static void CollectNativeBufferRanges(RenderContext& context,
+                                      const DescriptorCache::PreparedBindings& prepared,
+                                      std::vector<BufferRange>& ranges) {
+	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
+	const auto& program  = *prepared.program;
+	const auto& snapshot = *prepared.snapshot;
+	ranges.reserve(ranges.size() + program.info.buffers.size() + program.info.addresses.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		ShaderBufferResource descriptor;
+		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
+		ranges.push_back(StorageBufferRange(context, descriptor));
+	}
+	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
+		ranges.push_back(
+		    AddressBufferRange(context, program.info.addresses[i], snapshot.addresses[i]));
+	}
 }
 
 static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageResource& resource) {
@@ -859,6 +900,9 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
+	std::vector<BufferRange> ranges;
+	CollectNativeBufferRanges(m_context, prepared, ranges);
+	m_context.GetBufferCache().PrepareBufferRanges(buffer, ranges);
 
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
@@ -918,11 +962,19 @@ RenderExecutor::PrepareGraphicsBindings(CommandBuffer& buffer, const ShaderStage
 	    .vertex = PrepareBindings(buffer, vertex, vk::ShaderStageFlagBits::eVertex,
 	                              DescriptorCache::Stage::Vertex),
 	};
-	RebindBuffers(buffer, bindings.vertex);
-	RebindImages(buffer, bindings.vertex);
 	if (pixel_active) {
 		bindings.pixel.emplace(PrepareBindings(buffer, pixel, vk::ShaderStageFlagBits::eFragment,
 		                                       DescriptorCache::Stage::Pixel));
+	}
+	std::vector<BufferRange> ranges;
+	CollectNativeBufferRanges(m_context, bindings.vertex, ranges);
+	if (bindings.pixel.has_value()) {
+		CollectNativeBufferRanges(m_context, *bindings.pixel, ranges);
+	}
+	m_context.GetBufferCache().PrepareBufferRanges(buffer, ranges);
+	RebindBuffers(buffer, bindings.vertex);
+	RebindImages(buffer, bindings.vertex);
+	if (bindings.pixel.has_value()) {
 		RebindBuffers(buffer, *bindings.pixel);
 		RebindImages(buffer, *bindings.pixel);
 	}

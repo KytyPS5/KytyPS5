@@ -15208,7 +15208,7 @@ TestCase ImageStoreR32UintUsesUintStorageImage() {
 	test.storage_image_rgba           = MakeRgbaImage(4, 4);
 	test.storage_image_r32ui          = std::vector<u32>(16, 0);
 	test.expected_storage_image_r32ui = expected_image;
-	test.required_spirv               = {"R32ui", "storage_uint_2d"};
+	test.required_spirv               = {"Unknown", "storage_uint_2d"};
 	return test;
 }
 

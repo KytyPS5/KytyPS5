@@ -700,6 +700,8 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
                                    bool uint_image, uint32_t use_pc);
 
+bool IsAtomic(IR::Opcode op);
+
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, bool uint_image,
                                        uint32_t      use_pc = UINT32_MAX,
                                        ImageViewKind view   = ImageViewKind::Dim2D);

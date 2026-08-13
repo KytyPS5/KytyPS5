@@ -541,6 +541,11 @@ struct DrawCallInfo {
 	uint32_t             first_instance = 0;
 };
 
+static vk::Extent2D AttachmentViewExtent(const Image& image, const ImageViewInfo& view) {
+	return {std::max(image.backing.extent.width >> view.base_level, 1u),
+	        std::max(image.backing.extent.height >> view.base_level, 1u)};
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -581,8 +586,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width             = std::min(state.width, target.extent.width);
-		state.height            = std::min(state.height, target.extent.height);
+		const auto view_extent  = AttachmentViewExtent(image, view);
+		state.width             = std::min({state.width, target.extent.width, view_extent.width});
+		state.height            = std::min({state.height, target.extent.height, view_extent.height});
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = target.image_view;
@@ -626,8 +632,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.width);
-		state.height              = std::min(state.height, depth.height);
+		const auto view_extent    = AttachmentViewExtent(image, view);
+		state.width               = std::min({state.width, depth.width, view_extent.width});
+		state.height              = std::min({state.height, depth.height, view_extent.height});
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.format);
 		auto&      attachment     = state.depth_stencil_attachment;

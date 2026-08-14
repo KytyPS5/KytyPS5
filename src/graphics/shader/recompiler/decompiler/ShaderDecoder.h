@@ -537,6 +537,7 @@ enum class Opcode {
 	STtraceData,
 	SInstPrefetch,
 	SEndpgm,
+	SCodeEnd,
 	Exp
 };
 

@@ -402,6 +402,10 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 		if (IsControlFlowBranch(inst.opcode)) {
 			branch_targets.insert(inst.branch_target);
 		}
+		if (inst.opcode == Opcode::SCodeEnd) {
+			program.instructions.pop_back();
+			return true;
+		}
 		if (inst.opcode == Opcode::SEndpgm &&
 		    (word_index >= code.size() || !branch_targets.contains(word_index * 4u))) {
 			return true;
@@ -936,6 +940,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SSleep: return "s_sleep";
 		case Opcode::STtraceData: return "s_ttracedata";
 		case Opcode::SInstPrefetch: return "s_inst_prefetch";
+		case Opcode::SCodeEnd: return "s_code_end";
 		case Opcode::SEndpgm: return "s_endpgm";
 		case Opcode::Exp: return "exp";
 		case Opcode::Unsupported: return "unsupported";

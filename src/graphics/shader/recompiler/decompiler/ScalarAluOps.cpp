@@ -74,7 +74,8 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x04u, Opcode::SCbranchScc0},  {0x05u, Opcode::SCbranchScc1},  {0x06u, Opcode::SCbranchVccz},
     {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
     {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
-    {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x20u, Opcode::SInstPrefetch},
+    {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x1fu, Opcode::SCodeEnd},
+    {0x20u, Opcode::SInstPrefetch},
 };
 static_assert(Detail::HasUniqueEncodings(SOP1_OPS));
 static_assert(Detail::HasUniqueEncodings(SOP2_OPS));

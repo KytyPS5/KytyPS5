@@ -241,6 +241,12 @@ bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::strin
 		return DecodeVectorGpr(code - 256u, operand, error);
 	}
 
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Ttmp;
+		operand.reg  = code - 108u;
+		return true;
+	}
+
 	switch (code) {
 		case 106u: operand.kind = OperandKind::VccLo; return true;
 		case 107u: operand.kind = OperandKind::VccHi; return true;
@@ -273,6 +279,12 @@ bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return true;
+	}
+
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Ttmp;
+		operand.reg  = code - 108u;
 		return true;
 	}
 
@@ -966,6 +978,7 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::ExecZ: text = "execz"; break;
 		case OperandKind::Scc: text = "scc"; break;
 		case OperandKind::M0: text = "m0"; break;
+		case OperandKind::Ttmp: text = fmt::format("ttmp{}", operand.reg); break;
 		case OperandKind::PopsExitingWaveId: text = "pops_exiting_wave_id"; break;
 		case OperandKind::Null: text = "null"; break;
 		default: text = "unknown"; break;

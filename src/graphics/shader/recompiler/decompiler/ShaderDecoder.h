@@ -558,6 +558,7 @@ enum class OperandKind {
 	PopsExitingWaveId,
 	Null,
 	Vgpr,
+	Ttmp,
 };
 
 enum ImageSampleFlag : uint32_t {

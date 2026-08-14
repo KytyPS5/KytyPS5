@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 
@@ -74,8 +75,6 @@ static Handler LoadInstalledHandler() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
-	FilterScope filter_scope;
-
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
@@ -87,6 +86,19 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 		// Set a thread name.
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
+
+	if (exception_record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
+	    exception_record->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
+		printf("Unhandled win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
+		       ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", rbp=0x%016" PRIx64 "\n",
+		       static_cast<uint32_t>(exception_record->ExceptionCode),
+		       reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
+		       exception->ContextRecord->Rip, exception->ContextRecord->Rsp,
+		       exception->ContextRecord->Rbp);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	FilterScope filter_scope;
 
 	ExceptionInfo info {};
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
@@ -102,16 +114,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 			default: info.access_violation_type = AccessViolationType::Unknown; break;
 		}
 		info.access_violation_vaddr = exception_record->ExceptionInformation[1];
-	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
-		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		printf("Unhandled win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
-		       ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", rbp=0x%016" PRIx64 "\n",
-		       static_cast<uint32_t>(exception_record->ExceptionCode),
-		       reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
-		       exception->ContextRecord->Rip, exception->ContextRecord->Rsp,
-		       exception->ContextRecord->Rbp);
-		return EXCEPTION_CONTINUE_SEARCH;
+		info.type = ExceptionType::IllegalInstruction;
 	}
 
 	info.rax = exception->ContextRecord->Rax;

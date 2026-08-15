@@ -2780,6 +2780,8 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
       0x0c860688u, // v_add_nc_u32 v5, 8, sign-extended v4.lo
       0x4a0c0cf9u,
       0x0d860688u, // v_add_nc_u32 v6, 8, sign-extended v6.hi
+      0x4a08c2f9u,
+      0x0686156au, // captured v_add_nc_u32 v4.word1, vcc_lo, v97; preserve word0
       0x4c1616f9u,
       0x0686128du, // v_sub_nc_u32 v11.byte2, 13, v11; preserve other
                    // destination bytes
@@ -2836,6 +2838,9 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
   Check(Common::ContainsStr(result.decoded_dump, "v_add_nc_u32 v6") &&
             Common::ContainsStr(result.decoded_dump, "v6.sdwa(sel=5,sext=1"),
         "new decoder did not decode V_ADD_NC_U32 SDWA sign-extended high word");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "v_add_nc_u32 v4.sdwa(sel=5,sext=0), vcc_lo, v97"),
+        "new decoder did not decode captured V_ADD_NC_U32 high-word destination");
   Check(Common::ContainsStr(result.decoded_dump, "v_sub_nc_u32 v11.sdwa(sel=2"),
         "new decoder did not decode V_SUB_NC_U32 SDWA byte-2 destination");
   Check(Common::ContainsStr(result.decoded_dump, "v_min_u32 v10.sdwa(sel=4"),
@@ -2877,6 +2882,9 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
   Check(Common::ContainsStr(result.ir_dump, "IAddU32 v6") &&
             Common::ContainsStr(result.ir_dump, "v6.sdwa(sel=5,sext=1"),
         "V_ADD_NC_U32 SDWA sign-extended high word did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "IAddU32 v4.sdwa(sel=5,sext=0), vcc_lo, v97"),
+        "captured V_ADD_NC_U32 high-word destination did not lower to IR");
   Check(Common::ContainsStr(result.ir_dump, "ISubU32 v11.sdwa(sel=2"),
         "V_SUB_NC_U32 SDWA byte-2 destination did not lower to IR");
   Check(Common::ContainsStr(result.ir_dump, "UMinU32 v10.sdwa(sel=4"),
@@ -3369,6 +3377,22 @@ void TestNewShaderDecoderArchitecture() {
             signed_bfe.dst.kind == OperandKind::VccLo &&
             signed_bfe.src0.reg == 20u && signed_bfe.src1.value == 0x0004001cu,
         "decoder rejected or misdecoded captured S_BFE_I32 instruction");
+
+  const uint32_t vop2_sdwa_partial_dst[] = {
+      0x4a08c2f9u,
+      0x0686156au, // v_add_nc_u32 v4.word1, vcc_lo, v97; preserve word0
+  };
+  Instruction sdwa_add;
+  Check(DecodeInstruction(vop2_sdwa_partial_dst, 0u, sdwa_add, &error),
+        error.c_str());
+  Check(sdwa_add.family == Family::VOP2 &&
+            sdwa_add.opcode == Opcode::VAddNcU32 && sdwa_add.word_count == 2u &&
+            sdwa_add.dst.reg == 4u && sdwa_add.dst.sdwa_sel == 5u &&
+            sdwa_add.dst.sdwa_dst_unused == 2u &&
+            sdwa_add.src0.kind == OperandKind::VccLo &&
+            sdwa_add.src1.kind == OperandKind::Vgpr && sdwa_add.src1.reg == 97u,
+        "decoder rejected or misdecoded captured partial-destination "
+        "V_ADD_NC_U32");
 
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,

@@ -59,7 +59,7 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x22u, Opcode::VBcntU32B32},
     {0x23u, Opcode::VMbcntLoU32B32},
     {0x24u, Opcode::VMbcntHiU32B32},
-    {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x28u, Opcode::VAddcU32},
     {0x2au, Opcode::VSubrevCoCiU32},
     {0x26u, Opcode::VSubNcU32, Vop2SdwaProfile::IntegerPartialDestination},

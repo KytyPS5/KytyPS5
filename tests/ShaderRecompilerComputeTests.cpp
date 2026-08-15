@@ -11436,6 +11436,30 @@ TestCase Vop2SdwaSubNcExactByte2Destination() {
   return test;
 }
 
+TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 106, Vgpr(0)));
+  AppendVMovLiteral(&code, 97, 0x00030004u);
+  AppendVMovLiteral(&code, 4, 0xa1b2c3d4u);
+  code.push_back(0x4a08c2f9u);
+  code.push_back(0x0686156au);
+  AppendStoreVgpr(&code, 4, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop2SdwaAddNcCapturedHighWordDestination";
+  test.code = std::move(code);
+  test.initial = {0x00010002u, 0};
+  test.expected = {0x00010002u, 0x0006c3d4u};
+  test.opcodes = {O::BufferLoadDword, O::VReadfirstlaneB32, O::VMovB32,
+                  O::VAddNcU32,       O::BufferStoreDword,  O::SEndpgm};
+  test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
   using O = ShaderOpcode;
 
@@ -17020,6 +17044,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
+  AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);

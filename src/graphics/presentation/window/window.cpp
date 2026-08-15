@@ -235,6 +235,8 @@ static void ToggleDesktopFullscreen() {
 }
 
 static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
+	static SDL_Keycode fullscreen_key = SDLK_UNKNOWN;
+
 #ifdef KYTY_DBG_INPUT
 	LOGF("Key: time = %.04f, %s%s, %s%s, %s, scan = %d, key = %d, mod = %04" PRIx16 "\n",
 	     key.timestamp_seconds, (key.down ? "down" : ""), (key.up ? "up" : ""),
@@ -261,6 +263,7 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 			case SDLK_KP_ENTER:
 				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
 					ToggleDesktopFullscreen();
+					fullscreen_key = key.key_code;
 				}
 				break;
 			default: break;
@@ -269,7 +272,12 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 
 #endif
 
-	if ((key.down || key.up) && !key.repeat) {
+	const bool fullscreen_key_event =
+	    fullscreen_key != SDLK_UNKNOWN && key.key_code == fullscreen_key;
+	if (fullscreen_key_event && key.up) {
+		fullscreen_key = SDLK_UNKNOWN;
+	}
+	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event) {
 		HostInputKey(key.key_code, key.down);
 	}
 }

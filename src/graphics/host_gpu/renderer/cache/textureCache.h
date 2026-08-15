@@ -71,6 +71,7 @@ public:
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	[[nodiscard]] ImageMetadataKind MetaKind(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
@@ -91,6 +92,8 @@ private:
 
 	struct MetaDataInfo {
 		uint32_t clear_mask = 0;
+		ImageMetadataKind kind       = ImageMetadataKind::None;
+		std::set<ImageId> owners;
 	};
 
 	struct OverlapResult {
@@ -134,8 +137,10 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id, const ImageDesc& desc);
-	void                        InitializeImage(ImageId id, const ImageDesc& desc);
+	void RegisterMetadataLocked(ImageId id, Image& image, const ImageDesc& desc);
+	void UnregisterMetadataLocked(ImageId id, const Image& image);
+	void RefreshImage(ImageId id, const ImageDesc& desc);
+	void InitializeImage(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
 	                                                   TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;

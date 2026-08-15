@@ -252,9 +252,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (owner->info.metadata.kind == ImageMetadataKind::Htile) {
-		m_surface_metas.erase(owner->info.metadata.range.address);
-	}
+	UnregisterMetadataLocked(id, *owner);
 	UnregisterImage(id);
 	const auto erase_slot = [this, id, retained = owner] {
 		auto& slot = m_slots[id.index];
@@ -717,7 +715,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	             ImageDesc {.info = cached.info, .view_info = {}, .type = UploadBinding(cached)});
 	auto info                 = requested;
 	info.resources            = std::max(requested.resources, cached.info.resources);
-	info.htile_clear_mask     = 0;
+	info.metadata_clear_mask  = 0;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = ResolveImage(replacement_id);
 	replacement.usage         = cached.usage;
@@ -1344,6 +1342,35 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	return view;
 }
 
+void TextureCache::RegisterMetadataLocked(ImageId id, Image& image, const ImageDesc& desc) {
+	if (!desc.info.HasMetadata()) {
+		return;
+	}
+	if (image.info.HasMetadata() &&
+	    image.info.metadata.range.address != desc.info.metadata.range.address) {
+		UnregisterMetadataLocked(id, image);
+	}
+	image.info.metadata    = desc.info.metadata;
+	auto [entry, inserted] = m_surface_metas.try_emplace(
+	    desc.info.metadata.range.address,
+	    MetaDataInfo {.clear_mask = image.info.metadata_clear_mask, .kind = desc.info.metadata.kind});
+	entry->second.owners.insert(id);
+}
+
+void TextureCache::UnregisterMetadataLocked(ImageId id, const Image& image) {
+	if (!image.info.HasMetadata()) {
+		return;
+	}
+	const auto found = m_surface_metas.find(image.info.metadata.range.address);
+	if (found == m_surface_metas.end()) {
+		return;
+	}
+	found->second.owners.erase(id);
+	if (found->second.owners.empty()) {
+		m_surface_metas.erase(found);
+	}
+}
+
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
@@ -1357,6 +1384,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id, desc);
+	RegisterMetadataLocked(id, image, desc);
 	CommitGpuWrite(image);
 	TrackImageDownloadLocked(id, image);
 	const auto view = image.FindView(desc.view_info);
@@ -1377,11 +1405,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
 	RefreshImage(id, desc);
-	if (desc.info.HasMetadata()) {
-		image.info.metadata = desc.info.metadata;
-		m_surface_metas.try_emplace(desc.info.metadata.range.address,
-		                            MetaDataInfo {.clear_mask = image.info.htile_clear_mask});
-	}
+	RegisterMetadataLocked(id, image, desc);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
 		AssociateStencilLocked(id, desc.info.stencil);
@@ -1862,6 +1886,12 @@ void TextureCache::ClearGpuModified(ImageId id) {
 bool TextureCache::IsMeta(uint64_t address) {
 	CacheLock lock(*this, m_lock);
 	return m_surface_metas.contains(address);
+}
+
+ImageMetadataKind TextureCache::MetaKind(uint64_t address) {
+	CacheLock  lock(*this, m_lock);
+	const auto found = m_surface_metas.find(address);
+	return found == m_surface_metas.end() ? ImageMetadataKind::None : found->second.kind;
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {

@@ -572,9 +572,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, target.samples);
 		}
-		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
-		                                            : vk::ImageLayout::eColorAttachmentOptimal;
+		const auto& view = target.desc.view_info;
+		if (target.dcc_meta_clear_capable &&
+		    target.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+			const auto dcc_addr = target.desc.info.metadata.range.address;
+			if (cache.IsMetaCleared(dcc_addr, view.base_layer)) {
+				target.color_clear_enable = true;
+				if (!cache.TouchMeta(dcc_addr, view.base_layer, false)) {
+					EXIT("failed to consume DCC clear state\n");
+				}
+			}
+		}
+		const auto layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
+		                                           : vk::ImageLayout::eColorAttachmentOptimal;
 		image.Transit(layout,
 		              vk::AccessFlagBits2::eColorAttachmentRead |
 		                  vk::AccessFlagBits2::eColorAttachmentWrite,

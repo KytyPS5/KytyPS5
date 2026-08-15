@@ -3506,7 +3506,7 @@ public:
 			            texture_cache.GetImage(ms_depth_image).backing.state.layout ==
 			                vk::ImageLayout::eDepthStencilAttachmentOptimal &&
 			            texture_cache.GetImage(ms_depth_image).IsGpuModified() &&
-			            texture_cache.GetImage(ms_depth_image).info.htile_clear_mask == 0 &&
+			            texture_cache.GetImage(ms_depth_image).info.metadata_clear_mask == 0 &&
 			            texture_cache.GetImage(ms_depth_image).info.metadata.range ==
 			                ms_depth_desc.info.metadata.range &&
 			            texture_cache.IsMeta(ms_htile_address) &&

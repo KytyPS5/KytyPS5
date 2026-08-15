@@ -33,6 +33,7 @@ struct RenderColorInfo {
 	Prospero::ColorComponentMapping export_mapping;
 	bool                            color_clear_enable = false;
 	vk::ClearColorValue             color_clear_value {};
+	bool dcc_meta_clear_capable = false;
 };
 
 } // namespace Libs::Graphics

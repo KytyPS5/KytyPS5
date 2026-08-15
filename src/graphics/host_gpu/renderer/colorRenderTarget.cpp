@@ -327,20 +327,43 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
-	r.desc                     = std::move(desc);
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
-	r.type                     = RenderColorType::RenderTexture;
-	r.base_addr                = rt.base.addr;
-	r.image_view               = nullptr;
-	r.format                   = r.desc.view_info.format;
-	r.extent                   = view_extent;
-	r.base_mip_level           = rt.view.current_mip_level;
-	r.buffer_size              = backing_size;
-	r.samples                  = samples;
-	r.export_mapping           = target_format.export_mapping;
-	r.color_clear_enable       = false;
-	r.color_clear_value        = {};
+	if (rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0) {
+		desc.info.metadata.range = {rt.dcc_addr.addr, 0};
+		desc.info.metadata.kind  = ImageMetadataKind::Dcc;
+		desc.info.metadata_clear_mask = 0;
+	}
+	auto& texture_cache  = m_context.GetTextureCache();
+	r.desc               = std::move(desc);
+	r.image_id           = texture_cache.FindImage(r.desc, exact_format);
+	r.type               = RenderColorType::RenderTexture;
+	r.base_addr          = rt.base.addr;
+	r.image_view         = nullptr;
+	r.format             = r.desc.view_info.format;
+	r.extent             = view_extent;
+	r.base_mip_level     = rt.view.current_mip_level;
+	r.buffer_size        = backing_size;
+	r.samples            = samples;
+	r.export_mapping     = target_format.export_mapping;
+	r.color_clear_enable = false;
+	r.color_clear_value  = {};
+	// A fast clear stores its colour in CB_COLOR*_CLEAR_WORD0/1, already encoded in the surface's
+	// native format. An all-zero pair is zero in every format we support, so it needs no decode;
+	// any other value would need a per-format decoder that does not exist yet, and guessing it
+	// would silently render the wrong colour. Those targets keep today's preserving load.
+	if (rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0) {
+		if (rt.clear_word0.word0 == 0 && rt.clear_word1.word1 == 0) {
+			// color_clear_value is already value-initialised to all zeros above, which is the
+			// bit pattern this clear key asks for.
+			r.dcc_meta_clear_capable = true;
+		} else {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("RenderColorTarget: non-zero DCC clear key (0x%08" PRIx32 " 0x%08" PRIx32
+				     ") has no decoder; skipping metadata clear\n",
+				     rt.clear_word0.word0, rt.clear_word1.word1);
+			}
+		}
+	}
 	BindRenderTarget(r.image_id);
 }
 

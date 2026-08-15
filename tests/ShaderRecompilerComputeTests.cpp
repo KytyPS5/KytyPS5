@@ -11080,6 +11080,19 @@ TestCase ScalarBitfieldPack() {
   code.push_back(EncodeSop2(0x0a, 17, InlineU32(1), InlineU32(0)));
   code.push_back(EncodeSopc(0x0c, InlineU32(4), InlineU32(1)));
   code.push_back(EncodeSop2(0x0a, 18, InlineU32(1), InlineU32(0)));
+  AppendSMovLiteral(&code, 25, 0u);
+  AppendSMovLiteral(&code, 26, 0x00000100u);
+  code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(1)));
+  code.push_back(EncodeSop1(0x14, 31, 25));
+  code.push_back(EncodeSop2(0x0a, 34, InlineU32(1), InlineU32(0)));
+  AppendSMovLiteral(&code, 27, 0x00000020u);
+  AppendSMovLiteral(&code, 28, 0x00000100u);
+  code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
+  code.push_back(EncodeSop1(0x14, 32, 27));
+  code.push_back(EncodeSop2(0x0a, 35, InlineU32(1), InlineU32(0)));
+  AppendSMovLiteral(&code, 29, 0u);
+  AppendSMovLiteral(&code, 30, 0u);
+  code.push_back(EncodeSop1(0x14, 33, 29));
 
   AppendStoreSgpr(&code, 1, 0);
   AppendStoreSgpr(&code, 3, 1);
@@ -11095,15 +11108,22 @@ TestCase ScalarBitfieldPack() {
   AppendStoreSgpr(&code, 15, 12);
   AppendStoreSgpr(&code, 17, 13);
   AppendStoreSgpr(&code, 18, 14);
+  AppendStoreSgpr(&code, 31, 15);
+  AppendStoreSgpr(&code, 32, 16);
+  AppendStoreSgpr(&code, 33, 17);
+  AppendStoreSgpr(&code, 34, 18);
+  AppendStoreSgpr(&code, 35, 19);
   AppendEnd(&code);
 
   return {"ScalarBitfieldPack",
           code,
           {},
           {0xf0000000u, 8, 9, 1, 0, 0, 0x0000000fu, 0, 0x00000f00u, 0x0000000fu,
-           0xddddbbbbu, 0xccccbbbbu, 0xccccaaaau, 1, 1},
+           0xddddbbbbu, 0xccccbbbbu, 0xccccaaaau, 1, 1, 40, 5, 0xffffffffu, 0,
+           1},
           {O::SMovB32, O::SBrevB32, O::SBcnt1I32B32, O::SBcnt1I32B64,
-           O::SBitreplicateB64B32, O::SBfmB32, O::SBfeU32, O::SPackLlB32B16,
+           O::SFf1I32B64, O::SBitreplicateB64B32, O::SBfmB32, O::SBfeU32,
+           O::SPackLlB32B16,
            O::SPackLhB32B16, O::SPackHhB32B16, O::SBitcmp0B32, O::SBitcmp1B32,
            O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
 }
@@ -20267,6 +20287,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sff1-b64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarBitfieldPack());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {

@@ -2931,6 +2931,7 @@ void TestNewShaderRecompilerScalarB64Alu() {
       EncodeSop2(0x21, 26, 24, 0),  // s_lshr_b64 s[26:27], s[24:25], s0
       EncodeSop2(0x25, 28, 132, 130), // s_bfm_b64 s[28:29], 4, 2
       EncodeSop1(0x10, 30, 26),       // s_bcnt1_i32_b64 s30, s[26:27]
+      EncodeSop1(0x14, 31, 26),       // s_ff1_i32_b64 s31, s[26:27]
       EncodeSop1(0x16, 106, 26),      // s_flbit_i32_b64 vcc_lo, s[26:27]
       EncodeSop1(0x3b, 32, 30),       // s_bitreplicate_b64_b32 s[32:33], s30
       EncodeSop2(0x29, 34, 32, 255), // s_bfe_u64 s[34:35], s[32:33], 0x00040002
@@ -2989,6 +2990,8 @@ void TestNewShaderRecompilerScalarB64Alu() {
         "new decoder did not decode old-backed S_BFM_B64");
   Check(Common::ContainsStr(result.decoded_dump, "s_bcnt1_i32_b64 s30, s26"),
         "new decoder did not decode old-backed S_BCNT1_I32_B64");
+  Check(Common::ContainsStr(result.decoded_dump, "s_ff1_i32_b64 s31, s26"),
+        "new decoder did not decode RDNA2 S_FF1_I32_B64");
   Check(Common::ContainsStr(result.decoded_dump, "s_flbit_i32_b64 vcc_lo, s26"),
         "new decoder did not decode RDNA2 S_FLBIT_I32_B64");
   Check(Common::ContainsStr(result.decoded_dump,
@@ -3042,6 +3045,8 @@ void TestNewShaderRecompilerScalarB64Alu() {
         "S_BFM_B64 did not lower to paired-dword IR");
   Check(Common::ContainsStr(result.ir_dump, "BitCountU64 s30, s26"),
         "S_BCNT1_I32_B64 did not lower to paired-source bit count IR");
+  Check(Common::ContainsStr(result.ir_dump, "FindLsbU64 s31, s26"),
+        "S_FF1_I32_B64 did not lower to paired-source bit search IR");
   Check(Common::ContainsStr(result.ir_dump, "FindMsbFromHighU64 vcc_lo, s26"),
         "S_FLBIT_I32_B64 did not lower to paired-source leading-zero IR");
   Check(Common::ContainsStr(result.ir_dump, "BitReplicateB64B32 s32, s30"),

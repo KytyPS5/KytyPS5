@@ -27,27 +27,17 @@ constexpr OpcodeMap SOP2_OPS[] = {
 };
 
 constexpr OpcodeMap SOP1_OPS[] = {
-    {0x03u, Opcode::SMovB32},
-    {0x04u, Opcode::SMovB64},
-    {0x07u, Opcode::SNotB32},
-    {0x08u, Opcode::SNotB64},
-    {0x0au, Opcode::SWqmB64},
-    {0x0bu, Opcode::SBrevB32},
-    {0x0fu, Opcode::SBcnt1I32B32},
-    {0x10u, Opcode::SBcnt1I32B64},
-    {0x13u, Opcode::SFf1I32B32},
-    {0x16u, Opcode::SFlbitI32B64},
-    {0x1bu, Opcode::SBitset0B32},
-    {0x1du, Opcode::SBitset1B32},
-    {0x1fu, Opcode::SGetpcB64},
-    {0x20u, Opcode::SSetpcB64},
-    {0x24u, Opcode::SAndSaveexecB64},
-    {0x28u, Opcode::SOrn2SaveexecB64},
-    {0x34u, Opcode::SAbsI32},
-    {0x37u, Opcode::SAndn1SaveexecB64},
-    {0x3bu, Opcode::SBitreplicateB64B32},
-    {0x3cu, Opcode::SAndSaveexecB32},
-    {0x44u, Opcode::SAndn1SaveexecB32},
+    {0x03u, Opcode::SMovB32},           {0x04u, Opcode::SMovB64},
+    {0x07u, Opcode::SNotB32},           {0x08u, Opcode::SNotB64},
+    {0x0au, Opcode::SWqmB64},           {0x0bu, Opcode::SBrevB32},
+    {0x0fu, Opcode::SBcnt1I32B32},      {0x10u, Opcode::SBcnt1I32B64},
+    {0x13u, Opcode::SFf1I32B32},        {0x14u, Opcode::SFf1I32B64},
+    {0x16u, Opcode::SFlbitI32B64},      {0x1bu, Opcode::SBitset0B32},
+    {0x1du, Opcode::SBitset1B32},       {0x1fu, Opcode::SGetpcB64},
+    {0x20u, Opcode::SSetpcB64},         {0x24u, Opcode::SAndSaveexecB64},
+    {0x28u, Opcode::SOrn2SaveexecB64},  {0x34u, Opcode::SAbsI32},
+    {0x37u, Opcode::SAndn1SaveexecB64}, {0x3bu, Opcode::SBitreplicateB64B32},
+    {0x3cu, Opcode::SAndSaveexecB32},   {0x44u, Opcode::SAndn1SaveexecB32},
 };
 
 constexpr OpcodeMap SOPC_OPS[] = {

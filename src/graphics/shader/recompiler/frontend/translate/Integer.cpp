@@ -320,6 +320,16 @@ bool Translator::TranslateComposedInteger(const IR::Instruction& inst) {
 			result = ir.BitwiseXor(ir.BitwiseXor(ReadU32(inst.src[0]), ReadU32(inst.src[1])),
 			                       ReadU32(inst.src[2]));
 			break;
+		case IR::Opcode::FindLsbU64: {
+			const auto source        = UnpackU64(ReadU64(inst.src[0]));
+			const auto low_lsb       = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[0]}));
+			const auto high_lsb      = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[1]}));
+			const auto high_position = ir.IAdd(high_lsb, IR::U32(IR::Value(32u)));
+			result = ir.Select(ir.INotEqual(source[0], IR::U32(IR::Value(0u))), low_lsb,
+			                   ir.Select(ir.INotEqual(source[1], IR::U32(IR::Value(0u))),
+			                             high_position, IR::U32(IR::Value(0xffffffffu))));
+			break;
+		}
 		case IR::Opcode::FindMsbFromHighU32: {
 			const auto source   = ReadU32(inst.src[0]);
 			const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {source}));

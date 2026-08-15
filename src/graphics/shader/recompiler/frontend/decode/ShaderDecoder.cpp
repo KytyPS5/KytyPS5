@@ -446,6 +446,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SBcnt1I32B32: return "s_bcnt1_i32_b32";
 		case Opcode::SBcnt1I32B64: return "s_bcnt1_i32_b64";
 		case Opcode::SFf1I32B32: return "s_ff1_i32_b32";
+		case Opcode::SFf1I32B64: return "s_ff1_i32_b64";
 		case Opcode::SFlbitI32B64: return "s_flbit_i32_b64";
 		case Opcode::SBitreplicateB64B32: return "s_bitreplicate_b64_b32";
 		case Opcode::SGetpcB64: return "s_getpc_b64";
@@ -1017,6 +1018,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::SBrevB32:
 		case Opcode::SBcnt1I32B32:
 		case Opcode::SFf1I32B32:
+		case Opcode::SFf1I32B64:
 		case Opcode::SNotB64:
 		case Opcode::SWqmB64:
 		case Opcode::SAndSaveexecB32:

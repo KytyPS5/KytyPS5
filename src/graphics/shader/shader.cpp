@@ -14,7 +14,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
@@ -1011,7 +1012,8 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	    program.bindings.descriptor_set, program.bindings.push_constant_size,
 	    program.bindings.descriptors.size(), program.bindings.user_data_registers.size(),
 	    program.info.buffers.size(), program.info.images.size(), program.info.samplers.size(),
-	    program.info.addresses.size(), program.srt.reads.size());
+	    program.info.addresses.size(),
+	    program.values != nullptr ? program.values->srt_reads.size() : 0u);
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& buffer = program.info.buffers[i];
 		ret += fmt::format(" b{}[stride={} format={}]", i, buffer.packed_stride,

@@ -1,6 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 
-#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 namespace Libs::Graphics {
 

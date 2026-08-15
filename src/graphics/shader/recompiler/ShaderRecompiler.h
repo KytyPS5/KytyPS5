@@ -3,7 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
-#include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <optional>

@@ -203,14 +203,21 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.h"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/cfg/*.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/cfg/*.h"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/*.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/*.h"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/emitter/*.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/emitter/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/*.inc"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.cpp"
@@ -367,9 +374,8 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ReadLaneElimination.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ScalarProvenance.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
@@ -413,9 +419,8 @@ add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStageRuntime.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ResourceMaterialization.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ScalarProvenance.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(shader_stage_runtime_tests fmt::fmt)
 target_include_directories(shader_stage_runtime_tests PRIVATE ${inc_headers})
@@ -424,13 +429,11 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ScalarProvenance.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/SrtWalker.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/SrtPatcher.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ResourceTracking.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ResourceMaterialization.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/ShaderInfoCollection.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BindingLayout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 )
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})

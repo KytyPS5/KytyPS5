@@ -2,18 +2,21 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "graphics/shader/recompiler/cfg/ShaderCFG.h"
-#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
-#include "graphics/shader/recompiler/emitter/SpirvEmitter.h"
-#include "graphics/shader/recompiler/ir/BindingLayout.h"
-#include "graphics/shader/recompiler/ir/ReadLaneElimination.h"
-#include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
-#include "graphics/shader/recompiler/ir/ResourceTracking.h"
-#include "graphics/shader/recompiler/ir/ScalarProvenance.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
-#include "graphics/shader/recompiler/ir/SrtPatcher.h"
-#include "graphics/shader/recompiler/ir/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
 #include <array>
@@ -43,7 +46,7 @@ std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
 	dump += CFG::GraphToString(cfg);
 	dump += "\nIR:\n";
-	dump += IR::ProgramToString(ir);
+	dump += ir.values != nullptr ? IR::ValueProgramToString(*ir.values) : IR::ProgramToString(ir);
 	return dump;
 }
 
@@ -56,10 +59,22 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-std::string FormatCfgFailure(const CFG::Graph& cfg, const CompileOptions& options,
-                             const std::string& reason) {
-	const auto block_id = cfg.failure_block != UINT32_MAX ? cfg.failure_block : cfg.entry_block;
-	return CFG::FormatBlockDiagnostic(cfg, block_id, StageName(options.stage), reason);
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase,
+                           const std::string& reason) {
+	const auto* block        = cfg.FindBlock(cfg.failure_block);
+	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
+	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
+	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
+	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
+	LOGF("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
+	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
+	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
+	     " reason=%s\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase,
+	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
+	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
+	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
+	     static_cast<uint64_t>(cfg.back_edges.size()), reason.c_str());
 }
 
 bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
@@ -94,21 +109,31 @@ bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
 		case IR::Opcode::FlatStoreByte:
 		case IR::Opcode::FlatStoreShort:
 		case IR::Opcode::FlatStoreDword:
+		case IR::Opcode::DsReadUbyte:
+		case IR::Opcode::DsReadSbyte:
+		case IR::Opcode::DsReadUshort:
+		case IR::Opcode::DsReadSshort:
+		case IR::Opcode::DsReadB32:
 		case IR::Opcode::DsMinF32:
 		case IR::Opcode::DsMaxF32:
 		case IR::Opcode::DsWriteByte:
 		case IR::Opcode::DsWriteShort:
 		case IR::Opcode::DsWriteB32:
 		case IR::Opcode::DsWriteAddtidB32:
+		case IR::Opcode::DsReadAddtidB32:
 		case IR::Opcode::DsAppend:
 		case IR::Opcode::DsConsume:
+		case IR::Opcode::ImageLoad:
 		case IR::Opcode::ImageStore:
+		case IR::Opcode::ImageSample:
+		case IR::Opcode::ImageGather4:
 		case IR::Opcode::Export: return true;
 		default: return false;
 	}
 }
 
-bool NeedsDispatcherForStructuredLoopHeader(const IR::Program& ir, std::string* reason) {
+bool NeedsDispatcherForStructuredLoopHeader(const IR::Program& ir, uint32_t* failure_block,
+                                            std::string* reason) {
 	for (const auto& block: ir.blocks) {
 		if (!block.terminator.loop_header) {
 			continue;
@@ -121,6 +146,9 @@ bool NeedsDispatcherForStructuredLoopHeader(const IR::Program& ir, std::string* 
 				*reason = fmt::format("loop header block {} contains an instruction whose SPIR-V "
 				                      "lowering emits internal control flow: {}",
 				                      block.id, IR::InstructionToString(inst).c_str());
+			}
+			if (failure_block != nullptr) {
+				*failure_block = block.id;
 			}
 			return true;
 		}
@@ -697,27 +725,25 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	bool        dispatcher_fallback = false;
 	std::string dispatcher_reason;
 	if (cfg.irreducible) {
-		dispatcher_fallback   = true;
-		dispatcher_reason     = cfg.unsupported_reason;
-		const auto diagnostic = FormatCfgFailure(cfg, options, cfg.unsupported_reason);
-		LOGF("%s irreducible CFG detected: %s\n", GetDumpLabel(options), diagnostic.c_str());
+		dispatcher_fallback = true;
+		dispatcher_reason   = cfg.unsupported_reason;
+		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
 	} else {
 		std::string structure_error;
 		const auto  unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		if (!CFG::Structurize(cfg, &structure_error)) {
-			const auto diagnostic = FormatCfgFailure(cfg, options, structure_error);
-			LOGF("%s structured CFG bug/failure: %s\n", GetDumpLabel(options), diagnostic.c_str());
 			dispatcher_fallback      = true;
 			dispatcher_reason        = structure_error;
 			const auto failure_kind  = cfg.failure_kind;
 			const auto failure_block = cfg.failure_block;
-			cfg                      = unstructured_cfg;
-			cfg.unsupported          = true;
-			cfg.failure_kind         = failure_kind;
-			cfg.failure_block        = failure_block;
-			cfg.unsupported_reason   = structure_error;
+			LogDispatcherFallback(options, cfg, "structurize", dispatcher_reason);
+			cfg                    = unstructured_cfg;
+			cfg.unsupported        = true;
+			cfg.failure_kind       = failure_kind;
+			cfg.failure_block      = failure_block;
+			cfg.unsupported_reason = structure_error;
 		} else {
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
@@ -732,13 +758,84 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	IR::Program ir;
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR LowerProgram\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, ir, error)) {
+	const auto lower_program = [&](IR::Program& output) {
+		output = {};
+		if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, output, error)) {
+			return false;
+		}
+		output.lane_mask_mode  = options.lane_mask_mode;
+		output.shader_hash     = options.shader_hash;
+		output.user_data_base  = options.user_data_base;
+		output.user_data_count = options.user_data_count;
+		return true;
+	};
+	if (!lower_program(ir)) {
 		return false;
 	}
-	ir.lane_mask_mode  = options.lane_mask_mode;
-	ir.shader_hash     = options.shader_hash;
-	ir.user_data_base  = options.user_data_base;
-	ir.user_data_count = options.user_data_count;
+
+	if (!dispatcher_fallback) {
+		const auto select_dispatcher = [&](uint32_t failure_block, const std::string& reason,
+		                                   const CFG::Graph& diagnostic_cfg) {
+			dispatcher_fallback    = true;
+			dispatcher_reason      = reason;
+			cfg.failure_kind       = CFG::FailureKind::StructuredControlFlow;
+			cfg.failure_block      = failure_block;
+			cfg.unsupported_reason = reason;
+			ir.cfg_failure_kind    = CFG::FailureKind::StructuredControlFlow;
+			ir.fallback_reason     = reason;
+			LogDispatcherFallback(options, diagnostic_cfg, "emit", reason);
+		};
+		const auto retry_budget = cfg.natural_loops.size();
+		for (size_t retry = 0;; retry++) {
+			std::string emitter_reason;
+			uint32_t    failure_block = UINT32_MAX;
+			if (!NeedsDispatcherForStructuredLoopHeader(ir, &failure_block, &emitter_reason)) {
+				break;
+			}
+			if (retry >= retry_budget) {
+				select_dispatcher(failure_block,
+				                  emitter_reason + "; no-clone loop-header isolation exhausted",
+				                  cfg);
+				break;
+			}
+
+			const auto* source_block = cfg.FindBlock(failure_block);
+			const auto  source_pc = source_block != nullptr ? source_block->start_pc : UINT32_MAX;
+			const auto  previous_cfg  = cfg;
+			const auto  blocks_before = cfg.blocks.size();
+			std::string isolation_error;
+			if (!CFG::IsolateLoopHeader(cfg, failure_block, &isolation_error)) {
+				const auto failed_cfg = cfg;
+				cfg                   = previous_cfg;
+				select_dispatcher(failure_block,
+				                  fmt::format("{}; no-clone loop-header isolation failed: {}",
+				                              emitter_reason, isolation_error),
+				                  failed_cfg);
+				break;
+			}
+
+			IR::Program isolated_ir;
+			if (!lower_program(isolated_ir)) {
+				const auto lower_error = error != nullptr ? *error : "IR lowering failed";
+				if (error != nullptr) {
+					error->clear();
+				}
+				cfg = previous_cfg;
+				select_dispatcher(failure_block,
+				                  fmt::format("{}; isolated loop-header lowering failed: {}",
+				                              emitter_reason, lower_error),
+				                  cfg);
+				break;
+			}
+			ir = std::move(isolated_ir);
+			LOGF("%s CFG isolated semantic loop header: stage=%s hash=0x%016" PRIx64
+			     " source_block=%" PRIu32 " pc=0x%08" PRIx32 " blocks=%" PRIu64 "->%" PRIu64
+			     " reason=%s\n",
+			     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+			     failure_block, source_pc, static_cast<uint64_t>(blocks_before),
+			     static_cast<uint64_t>(cfg.blocks.size()), emitter_reason.c_str());
+		}
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR LowerProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -757,8 +854,40 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			     rewritten);
 		}
 	}
-	if (!IR::BuildScalarProvenance(ir, error)) {
+	ir.dispatcher_fallback = dispatcher_fallback;
+	if (!dispatcher_reason.empty()) {
+		ir.fallback_reason = dispatcher_reason;
+	}
+
+	ShaderVertexInputInfo  default_vertex {};
+	ShaderPixelInputInfo   default_pixel {};
+	ShaderComputeInputInfo default_compute {};
+	const auto*            vertex =
+	    options.vertex_input_info != nullptr ? options.vertex_input_info : &default_vertex;
+	const auto* pixel =
+	    options.pixel_input_info != nullptr ? options.pixel_input_info : &default_pixel;
+	const auto* compute =
+	    options.compute_input_info != nullptr ? options.compute_input_info : &default_compute;
+	ir.values = std::make_shared<IR::ValueProgram>();
+	if (!Frontend::TranslateProgram(ir, *ir.values, vertex, pixel, compute, error)) {
 		return false;
+	}
+	ir.blocks.clear();
+	IR::RewriteToSsa(ir.values->blocks);
+	IR::ConstantPropagationPass(ir.values->blocks);
+	for (auto& info: ir.values->block_info) {
+		info.condition       = info.condition.Resolve();
+		info.indirect_target = info.indirect_target.Resolve();
+	}
+	IR::RemoveIdentities(ir.values->blocks);
+	IR::EliminateDeadCode(ir.values->blocks);
+	const auto read_lane_stats = IR::EliminateReadLane(*ir.values, ir.wave_size);
+	if (read_lane_stats.rewritten_reads != 0) {
+		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
+		     read_lane_stats.rewritten_reads);
+		IR::ConstantPropagationPass(ir.values->blocks);
+		IR::RemoveIdentities(ir.values->blocks);
+		IR::EliminateDeadCode(ir.values->blocks);
 	}
 	std::string srt_error;
 	if (!IR::BuildSrtPlan(ir, &srt_error)) {
@@ -768,28 +897,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
-	ir.dispatcher_fallback = dispatcher_fallback;
-	if (!dispatcher_reason.empty()) {
-		ir.fallback_reason = dispatcher_reason;
-	}
-
-	if (!IR::PatchSrtReads(ir, error) || !IR::TrackResources(ir, error)) {
+	IR::EliminateDeadCode(ir.values->blocks);
+	if (!IR::TrackResources(ir, error)) {
 		return false;
 	}
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
-	}
-	if (!dispatcher_fallback) {
-		std::string emitter_reason;
-		if (NeedsDispatcherForStructuredLoopHeader(ir, &emitter_reason)) {
-			dispatcher_fallback    = true;
-			dispatcher_reason      = emitter_reason;
-			ir.dispatcher_fallback = true;
-			ir.cfg_failure_kind    = CFG::FailureKind::StructuredControlFlow;
-			ir.fallback_reason     = emitter_reason;
-			LOGF("%s structured CFG emitter fallback: %s\n", GetDumpLabel(options),
-			     emitter_reason.c_str());
-		}
 	}
 
 	IR::ResourceSnapshot resources;
@@ -822,16 +935,10 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		return false;
 	}
 
-	ShaderVertexInputInfo  default_vertex {};
-	ShaderPixelInputInfo   default_pixel {};
-	ShaderComputeInputInfo default_compute {};
-	IR::ShaderInfoOptions  info_options;
-	info_options.vertex =
-	    options.vertex_input_info != nullptr ? options.vertex_input_info : &default_vertex;
-	info_options.pixel =
-	    options.pixel_input_info != nullptr ? options.pixel_input_info : &default_pixel;
-	info_options.compute =
-	    options.compute_input_info != nullptr ? options.compute_input_info : &default_compute;
+	IR::ShaderInfoOptions info_options;
+	info_options.vertex  = vertex;
+	info_options.pixel   = pixel;
+	info_options.compute = compute;
 	if (!IR::CollectShaderInfo(ir, info_options, error)) {
 		return false;
 	}
@@ -840,11 +947,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	layout_options.push_constant_offset = options.push_constant_offset;
 	if (!IR::AllocateBindings(ir, layout_options, error)) {
 		return false;
-	}
-	const auto read_lane_stats = IR::EliminateReadLane(ir);
-	if (read_lane_stats.rewritten_reads != 0) {
-		LOGF("%s read-lane elimination: reads=%" PRIu32 " shadow_writes=%" PRIu32 "\n",
-		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.shadow_writes);
 	}
 	std::string ir_dump;
 	if (options.dump_ir) {
@@ -859,7 +961,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	if (!Spirv::EmitProgram(ir, resources, options.vertex_input_info, options.pixel_input_info,
-	                        options.compute_input_info, spirv, &emit_error)) {
+	                        options.compute_input_info, spirv, &emit_error, options.dump_ir)) {
+		LOGF("%s typed SPIR-V emit failed: %s\n", GetDumpLabel(options), emit_error.c_str());
 		if (dispatcher_fallback && error != nullptr) {
 			*error = fmt::format("dispatcher fallback failed after {}: {}",
 			                     dispatcher_reason.c_str(), emit_error.c_str());
@@ -873,10 +976,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(spirv.size()), phase_ms());
-	if (dispatcher_fallback) {
-		LOGF("%s dispatcher fallback used: %s\n", GetDumpLabel(options), dispatcher_reason.c_str());
-	}
-
 	result.spirv     = std::move(spirv);
 	result.program   = std::move(ir);
 	result.resources = std::move(resources);

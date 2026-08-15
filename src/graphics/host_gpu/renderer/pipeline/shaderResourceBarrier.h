@@ -2,7 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SHADERRESOURCEBARRIER_H_
 
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <vector>
 

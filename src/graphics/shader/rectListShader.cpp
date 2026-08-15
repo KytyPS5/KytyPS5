@@ -1,7 +1,7 @@
 #include "graphics/shader/rectListShader.h"
 
 #include "common/assert.h"
-#include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 #include "spirv/unified1/spirv.hpp11"

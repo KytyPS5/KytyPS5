@@ -4,52 +4,19 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
-#include "graphics/shader/recompiler/cfg/ShaderCFG.h"
-#include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/opcodes/Opcodes.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <memory>
 #include <string_view>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-enum class Opcode {
-#define IR_OPCODE(name, category) name,
-#include "graphics/shader/recompiler/ir/ShaderIROpcodes.inc"
-#undef IR_OPCODE
-	Count,
-};
-
-enum class OpcodeClass { General, Compare, Compare64 };
-
-struct OpcodeInfo {
-	std::string_view name;
-	OpcodeClass      opcode_class = OpcodeClass::General;
-};
-
-inline constexpr OpcodeInfo OPCODE_INFO[] = {
-#define IR_OPCODE(name, category) {#name, OpcodeClass::category},
-#include "graphics/shader/recompiler/ir/ShaderIROpcodes.inc"
-#undef IR_OPCODE
-};
-static_assert(sizeof(OPCODE_INFO) / sizeof(OPCODE_INFO[0]) == static_cast<size_t>(Opcode::Count));
-
-constexpr const OpcodeInfo& GetOpcodeInfo(Opcode opcode) {
-	return OPCODE_INFO[static_cast<size_t>(opcode)];
-}
-
-constexpr std::string_view OpcodeName(Opcode opcode) {
-	return GetOpcodeInfo(opcode).name;
-}
-
-constexpr bool IsCompareOpcode(Opcode opcode) {
-	return GetOpcodeInfo(opcode).opcode_class != OpcodeClass::General;
-}
-
-constexpr bool IsCompare64Opcode(Opcode opcode) {
-	return GetOpcodeInfo(opcode).opcode_class == OpcodeClass::Compare64;
-}
+struct ValueProgram;
 
 enum class RegisterFile { Scalar, Vector, Vcc, Exec, Scc, M0 };
 
@@ -62,7 +29,7 @@ struct Register {
 	}
 };
 
-enum class OperandKind { Register, ImmediateU32, PcRelativeU32, Null };
+enum class OperandKind { Register, ImmediateU32, PcRelativeU32, PcRelativeHighU32, Null };
 
 struct Operand {
 	OperandKind kind = OperandKind::Null;
@@ -70,6 +37,7 @@ struct Operand {
 	uint32_t    imm                = 0;
 	bool        sext_64            = false;
 	uint32_t    sdwa_sel           = 6;
+	uint32_t    sdwa_dst_unused    = 2;
 	uint32_t    omod               = 0;
 	bool        sdwa_sext          = false;
 	bool        op_sel             = false;
@@ -123,19 +91,17 @@ struct MemoryInfo {
 	uint32_t                image_nsa_dwords         = 0;
 	uint32_t                image_nsa_addr[Decoder::MaxImageNsaAddressComponents] = {};
 	uint32_t                memory_segment                                        = 0;
-	// Dense resource indices are assigned by resource tracking. These source IDs refer to the
-	// exact scalar definitions reaching this instruction before that patching step.
-	uint32_t resource_source = 0;
-	uint32_t sampler_source  = 0;
-	bool     data_signed     = false;
-	bool     typed           = false;
-	bool     formatted       = false;
-	bool     image_has_mip   = false;
-	bool     image_cube      = false;
-	bool     glc             = false;
-	bool     slc             = false;
-	bool     idxen           = false;
-	bool     offen           = false;
+	bool                    address_is_full                                       = false;
+	bool                    data_signed                                           = false;
+	bool                    typed                                                 = false;
+	bool                    formatted                                             = false;
+	bool                    image_has_mip                                         = false;
+	bool                    image_cube                                            = false;
+	bool                    glc                                                   = false;
+	bool                    slc                                                   = false;
+	bool                    idxen                                                 = false;
+	bool                    offen                                                 = false;
+	bool                    planning_only                                         = false;
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -169,9 +135,7 @@ struct Instruction {
 	Operand      dst;
 	Operand      dst2;
 	Operand      src[4];
-	uint32_t     src_count         = 0;
-	uint32_t     scalar_sources[4] = {};
-	uint32_t     scalar_value      = 0;
+	uint32_t     src_count = 0;
 	MemoryInfo   memory;
 	ExportInfo   export_info;
 	InputInfo    input_info;
@@ -192,53 +156,6 @@ struct BasicBlock {
 	std::vector<Instruction> instructions;
 };
 
-enum class ScalarValueOp {
-	Undefined,
-	Unknown,
-	UserData,
-	Constant,
-	PcRelativeLow,
-	PcRelativeHigh,
-	Add,
-	AddCarry,
-	Carry,
-	Sub,
-	SubBorrow,
-	Borrow,
-	Mul,
-	And,
-	AndNot,
-	Or,
-	OrNot,
-	Xor,
-	Not,
-	ShiftLeft,
-	ShiftRight,
-	ShiftRightArithmetic,
-	BitFieldMaskU32,
-	BitFieldMaskU64Low,
-	BitFieldMaskU64High,
-	Add3,
-	ShiftLeftAdd,
-	ShiftLeftAddCarry,
-	AddShiftLeft,
-	XorAdd,
-	ShiftLeftOr,
-	ReadConst,
-	ReadConstBuffer,
-	Phi,
-};
-
-struct ScalarValue {
-	ScalarValueOp           op   = ScalarValueOp::Undefined;
-	uint32_t                pc   = 0;
-	uint32_t                imm  = 0;
-	std::array<uint32_t, 6> args = {};
-	std::vector<uint32_t>   phi_args;
-
-	bool operator==(const ScalarValue& other) const = default;
-};
-
 struct DescriptorValue {
 	std::array<uint32_t, 8> dwords      = {};
 	uint32_t                dword_count = 0;
@@ -246,32 +163,6 @@ struct DescriptorValue {
 	bool operator==(const DescriptorValue& other) const {
 		return dword_count == other.dword_count && dwords == other.dwords;
 	}
-};
-
-struct ScalarProvenance {
-	static constexpr uint32_t Undefined = 0;
-	static constexpr uint32_t Unknown   = 1;
-
-	std::vector<ScalarValue>     values;
-	std::vector<DescriptorValue> descriptors;
-
-	bool operator==(const ScalarProvenance& other) const = default;
-};
-
-struct SrtRead {
-	uint32_t value       = 0;
-	uint32_t flat_offset = 0;
-	uint32_t use_pc      = 0;
-
-	bool operator==(const SrtRead& other) const = default;
-};
-
-struct SrtPlan {
-	std::vector<SrtRead>  reads;
-	std::vector<uint32_t> dynamic_reads;
-	std::vector<uint32_t> dynamic_sources;
-
-	bool operator==(const SrtPlan& other) const = default;
 };
 
 struct BufferResource {
@@ -328,11 +219,12 @@ struct SampledResourcePair {
 };
 
 struct AddressResource {
-	uint32_t     source           = 0;
+	uint32_t     source           = UINT32_MAX;
 	uint32_t     first_use_pc     = 0;
 	ResourceKind kind             = ResourceKind::Flat;
 	int32_t      min_offset       = 0;
 	uint64_t     specialized_base = 0;
+	bool         unbased          = true;
 	bool         read             = false;
 	bool         written          = false;
 	bool         atomic           = false;
@@ -451,25 +343,23 @@ struct ShaderInfo {
 };
 
 struct Program {
-	ShaderType              stage               = ShaderType::Unknown;
-	ShaderLaneMaskMode      lane_mask_mode      = ShaderLaneMaskMode::NativeWave;
-	uint64_t                shader_hash         = 0;
-	uint32_t                wave_size           = 64;
-	uint32_t                user_data_base      = 0;
-	uint32_t                user_data_count     = 64;
-	bool                    dispatcher_fallback = false;
-	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
-	std::string             fallback_reason;
-	std::vector<BasicBlock> blocks;
-	ScalarProvenance        provenance;
-	SrtPlan                 srt;
-	bool                    srt_plan_complete     = false;
-	bool                    srt_patching_complete = false;
-	ShaderInfo              info;
-	bool                    resource_tracking_complete = false;
-	bool                    shader_info_complete       = false;
-	BindingLayout           bindings;
-	bool                    binding_layout_complete = false;
+	ShaderType                    stage               = ShaderType::Unknown;
+	ShaderLaneMaskMode            lane_mask_mode      = ShaderLaneMaskMode::NativeWave;
+	uint64_t                      shader_hash         = 0;
+	uint32_t                      wave_size           = 64;
+	uint32_t                      user_data_base      = 0;
+	uint32_t                      user_data_count     = 64;
+	bool                          dispatcher_fallback = false;
+	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
+	std::string                   fallback_reason;
+	std::vector<BasicBlock>       blocks;
+	std::shared_ptr<ValueProgram> values;
+	bool                          srt_plan_complete = false;
+	ShaderInfo                    info;
+	bool                          resource_tracking_complete = false;
+	bool                          shader_info_complete       = false;
+	BindingLayout                 bindings;
+	bool                          binding_layout_complete = false;
 };
 
 bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,

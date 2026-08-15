@@ -39,6 +39,9 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::Register: text = RegisterToString(operand.reg); break;
 		case OperandKind::ImmediateU32: text = fmt::format("0x{:08x}", operand.imm); break;
 		case OperandKind::PcRelativeU32: text = fmt::format("pc_rel(0x{:08x})", operand.imm); break;
+		case OperandKind::PcRelativeHighU32:
+			text = fmt::format("pc_rel_hi(0x{:08x})", operand.imm);
+			break;
 		case OperandKind::Null: text = "null"; break;
 		default: text = "unknown"; break;
 	}

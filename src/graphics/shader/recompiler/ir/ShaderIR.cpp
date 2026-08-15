@@ -32,6 +32,13 @@ Operand MakePcRelativeU32(uint32_t value) {
 	return operand;
 }
 
+Operand MakePcRelativeHighU32(uint32_t value) {
+	Operand operand;
+	operand.kind = OperandKind::PcRelativeHighU32;
+	operand.imm  = value;
+	return operand;
+}
+
 bool AppendScalarResultSccNonZero(const Decoder::Instruction& decoded, BasicBlock& block,
                                   std::string* error) {
 	if (!ScalarResultWritesSccNonZero(decoded.opcode)) {
@@ -74,6 +81,7 @@ uint32_t VectorByteConvertIndex(Decoder::Opcode opcode) {
 
 void CopyOperandModifiers(const Decoder::Operand& decoded, Operand& operand) {
 	operand.sdwa_sel           = decoded.sdwa_sel;
+	operand.sdwa_dst_unused    = decoded.sdwa_dst_unused;
 	operand.omod               = decoded.omod;
 	operand.sdwa_sext          = decoded.sdwa_sext;
 	operand.op_sel             = decoded.op_sel;
@@ -214,17 +222,20 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 		mem.image_nsa_addr[i] = decoded.image_nsa_addr[i];
 	}
 	mem.memory_segment = decoded.memory_segment;
-	mem.data_signed    = decoded.data_signed;
-	mem.typed          = decoded.typed;
-	mem.formatted      = decoded.formatted;
-	mem.image_has_mip  = decoded.opcode == Decoder::Opcode::ImageLoadMip ||
-	                     decoded.opcode == Decoder::Opcode::ImageStoreMip;
-	mem.glc            = decoded.glc;
-	mem.slc            = decoded.slc;
-	mem.idxen          = decoded.idxen;
-	mem.offen          = decoded.offen;
-	mem.resource       = ResourceIndexFromOperand(decoded.src1);
-	mem.sampler        = ResourceIndexFromOperand(decoded.src2);
+	mem.address_is_full =
+	    kind == ResourceKind::Flat || kind == ResourceKind::Scratch ||
+	    (kind == ResourceKind::Global && decoded.src1.kind == Decoder::OperandKind::Vgpr);
+	mem.data_signed   = decoded.data_signed;
+	mem.typed         = decoded.typed;
+	mem.formatted     = decoded.formatted;
+	mem.image_has_mip = decoded.opcode == Decoder::Opcode::ImageLoadMip ||
+	                    decoded.opcode == Decoder::Opcode::ImageStoreMip;
+	mem.glc           = decoded.glc;
+	mem.slc           = decoded.slc;
+	mem.idxen         = decoded.idxen;
+	mem.offen         = decoded.offen;
+	mem.resource      = ResourceIndexFromOperand(decoded.src1);
+	mem.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (kind == ResourceKind::Lds || kind == ResourceKind::Gds) {
 		mem.resource = 0;
 		mem.sampler  = 0;
@@ -246,6 +257,7 @@ uint32_t RawScalarLoadBase(const Decoder::Operand& operand) {
 
 void ClearRegisterOffsetModifiers(Decoder::Operand& operand) {
 	operand.sdwa_sel           = 6;
+	operand.sdwa_dst_unused    = 2;
 	operand.omod               = 0;
 	operand.sdwa_sext          = false;
 	operand.op_sel             = false;
@@ -988,9 +1000,10 @@ bool LowerScalarGetpcB64(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
 	for (uint32_t i = 0; i < 2u; i++) {
 		Instruction inst;
-		inst.pc        = decoded.pc;
-		inst.op        = Opcode::MoveU32;
-		inst.src[0]    = i == 0u ? MakePcRelativeU32(decoded.pc + 4u) : MakeImmediateU32(0u);
+		inst.pc = decoded.pc;
+		inst.op = Opcode::MoveU32;
+		inst.src[0] =
+		    i == 0u ? MakePcRelativeU32(decoded.pc + 4u) : MakePcRelativeHighU32(decoded.pc + 4u);
 		inst.src_count = 1;
 		if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, i), inst.dst, error)) {
 			return false;

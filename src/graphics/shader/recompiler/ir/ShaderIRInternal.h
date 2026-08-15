@@ -18,6 +18,7 @@ bool                  ScalarResultIs64Bit(Decoder::Opcode opcode);
 Operand  MakeSccOperand();
 Operand  MakeImmediateU32(uint32_t value);
 Operand  MakePcRelativeU32(uint32_t value);
+Operand  MakePcRelativeHighU32(uint32_t value);
 bool     AppendScalarResultSccNonZero(const Decoder::Instruction& decoded, BasicBlock& block,
                                       std::string* error);
 uint32_t VectorByteConvertIndex(Decoder::Opcode opcode);

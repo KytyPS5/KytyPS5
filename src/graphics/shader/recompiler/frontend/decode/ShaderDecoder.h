@@ -537,6 +537,7 @@ enum class Opcode {
 	SSendmsg,
 	SSetregB32,
 	SSleep,
+	STrap,
 	STtraceData,
 	SInstPrefetch,
 	SEndpgm,

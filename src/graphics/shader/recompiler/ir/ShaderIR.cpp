@@ -1000,6 +1000,9 @@ bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& bl
 		case Decoder::Opcode::SSetregB32:
 		case Decoder::Opcode::SSleep:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
+		case Decoder::Opcode::STrap:
+			// RDNA2 converts S_TRAP to a NOP when the unmodeled trap state is disabled.
+			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
 		case Decoder::Opcode::STtraceData:
 			return LowerControlMarker(decoded, block, Opcode::TtraceData, true, error);
 		case Decoder::Opcode::SInstPrefetch:
@@ -1076,6 +1079,7 @@ bool IsControlOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::SSendmsg:
 		case Decoder::Opcode::SSetregB32:
 		case Decoder::Opcode::SSleep:
+		case Decoder::Opcode::STrap:
 		case Decoder::Opcode::STtraceData:
 		case Decoder::Opcode::SInstPrefetch: return true;
 		default: return false;

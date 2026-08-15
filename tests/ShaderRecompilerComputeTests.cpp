@@ -35,11 +35,11 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
@@ -1080,15 +1080,13 @@ CompiledShader CompileCase(const TestCase &test) {
   }
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
-    Require(test.name, "decoded RDNA2",
-            actual == expected,
+    Require(test.name, "decoded RDNA2", actual == expected,
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
   }
   for (const auto &[text, expected] : test.ir_counts) {
     const auto actual = CountText(result.ir_dump, text);
-    Require(test.name, "typed IR",
-            actual == expected,
+    Require(test.name, "typed IR", actual == expected,
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
   }
@@ -10556,6 +10554,30 @@ TestCase Rdna2ScalarOpcodes() {
            O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase ScalarTrapDisabledFallsThroughExactRaw() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 0, 7);
+  code.push_back(0xbf920001u); // s_trap 1 from the game shader
+  AppendVMovU32(&code, 0, 42);
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarTrapDisabledFallsThroughExactRaw";
+  test.code = code;
+  test.expected = {42};
+  test.opcodes = {O::VMovB32, O::STrap, O::BufferStoreDword, O::SEndpgm};
+  test.decoded_counts = {{"s_trap 0x00000001", 1}};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarExtendedArithmetic() {
   using O = ShaderOpcode;
 
@@ -11721,9 +11743,9 @@ TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
   test.name = "VectorSubrevCoCiU32ExactRawOnGpu";
   test.code = code;
   test.expected = {0xdeadbeefu, 0, 2, 3, 0, 0, 0, 0};
-  test.opcodes = {O::VMovB32,          O::VLshlrevB32,    O::VAddNcU32,
-                  O::VCmpLtU32,        O::SMovB64,        O::VCmpNeU32,
-                  O::VSubrevCoCiU32,   O::VCndmaskB32,    O::BufferStoreDword,
+  test.opcodes = {O::VMovB32,        O::VLshlrevB32, O::VAddNcU32,
+                  O::VCmpLtU32,      O::SMovB64,     O::VCmpNeU32,
+                  O::VSubrevCoCiU32, O::VCndmaskB32, O::BufferStoreDword,
                   O::SEndpgm};
   test.required_spirv = {"OpISub", "OpUGreaterThan"};
   test.compute_info.threads_num[0] = 4;
@@ -16851,6 +16873,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ExactPushConstantExtent);
   AddCase(ScalarShiftCountsMaskLowBits);
   AddCase(Rdna2ScalarOpcodes);
+  AddCase(ScalarTrapDisabledFallsThroughExactRaw);
   AddCase(ScalarExtendedArithmetic);
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);

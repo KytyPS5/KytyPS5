@@ -85,6 +85,7 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
+		case ValueOpcode::UMin32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -636,6 +637,12 @@ private:
 			case ValueOpcode::IMul64:
 				if (binary()) {
 					result = a * b;
+					return true;
+				}
+				return false;
+			case ValueOpcode::UMin32:
+				if (binary()) {
+					result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
 					return true;
 				}
 				return false;

@@ -234,6 +234,35 @@ void TestScalarAndVectorBufferAlias() {
         "scalar/vector alias did not share a dense index");
 }
 
+void TestRuntimeUnsignedMinDescriptor() {
+  Fixture fixture;
+  const auto word3 = fixture.Emit(
+      ValueOpcode::UMin32, {fixture.UserData(0), Value(0x100u)});
+  const auto descriptor =
+      fixture.Buffer({Value(0u), Value(0u), Value(64u), word3}, 0x330);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {descriptor, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 0x330));
+  fixture.PlanAndTrack();
+
+  std::array<uint32_t, 1> user_data{0xffffffffu};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue value;
+  std::string error;
+  const auto source = fixture.program.info.buffers[0].source;
+  Check(EvaluateDescriptorSource(fixture.program, source, 0x330, runtime, value,
+                                 &error) &&
+            value.dwords[3] == 0x100u,
+        "runtime descriptor unsigned minimum did not clamp its first operand");
+  user_data[0] = 0x80u;
+  Check(EvaluateDescriptorSource(fixture.program, source, 0x330, runtime, value,
+                                 &error) &&
+            value.dwords[3] == 0x80u,
+        "runtime descriptor unsigned minimum did not preserve its first operand");
+}
+
 void TestImagesSamplersAndAliases() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -426,9 +455,11 @@ void TestPhiValidation() {
                                    static_cast<uint64_t>(Type::U32));
   phi.AddPhiOperand(left, Value(1u));
   phi.AddPhiOperand(right, Value(2u));
+  const auto word3 = fixture.Emit(
+      ValueOpcode::UMin32, {Value(&phi), Value(0x100u)}, 0, merge);
   const auto handle =
       fixture.Emit(ValueOpcode::GetBufferResource,
-                   {Value(&phi), Value(0u), Value(0u), Value(0u)},
+                   {Value(0u), Value(0u), Value(0u), word3},
                    MemoryFlags{0, 20}, merge);
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
@@ -628,6 +659,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

@@ -225,14 +225,14 @@ constexpr VopcOpcodeInfo VOPC_OPS[] = {
     {0xd1u, Opcode::VCmpxLtU32},       {0xd2u, Opcode::VCmpxEqU32},
     {0xd3u, Opcode::VCmpxLeU32},       {0xd4u, Opcode::VCmpxGtU32},
     {0xd5u, Opcode::VCmpxNeU32},       {0xd6u, Opcode::VCmpxGeU32},
-    {0xe5u, Opcode::VCmpNeU64, false}, {0xc9u, Opcode::VCmpLtF16},
-    {0xcau, Opcode::VCmpEqF16},        {0xcbu, Opcode::VCmpLeF16},
-    {0xccu, Opcode::VCmpGtF16},        {0xcdu, Opcode::VCmpLgF16},
-    {0xceu, Opcode::VCmpGeF16},        {0xedu, Opcode::VCmpNeqF16},
-    {0xd9u, Opcode::VCmpxLtF16},       {0xdau, Opcode::VCmpxEqF16},
-    {0xdbu, Opcode::VCmpxLeF16},       {0xdcu, Opcode::VCmpxGtF16},
-    {0xdeu, Opcode::VCmpxGeF16},       {0xfdu, Opcode::VCmpxNeqF16},
-    {0xfeu, Opcode::VCmpxNltF16},
+    {0xe4u, Opcode::VCmpGtU64, false}, {0xe5u, Opcode::VCmpNeU64, false},
+    {0xc9u, Opcode::VCmpLtF16},        {0xcau, Opcode::VCmpEqF16},
+    {0xcbu, Opcode::VCmpLeF16},        {0xccu, Opcode::VCmpGtF16},
+    {0xcdu, Opcode::VCmpLgF16},        {0xceu, Opcode::VCmpGeF16},
+    {0xedu, Opcode::VCmpNeqF16},       {0xd9u, Opcode::VCmpxLtF16},
+    {0xdau, Opcode::VCmpxEqF16},       {0xdbu, Opcode::VCmpxLeF16},
+    {0xdcu, Opcode::VCmpxGtF16},       {0xdeu, Opcode::VCmpxGeF16},
+    {0xfdu, Opcode::VCmpxNeqF16},      {0xfeu, Opcode::VCmpxNltF16},
 };
 static_assert(Detail::HasUniqueEncodings(VOPC_OPS));
 

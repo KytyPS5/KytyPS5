@@ -12959,6 +12959,48 @@ TestCase VectorVop3CompareNeU64OnGpu() {
            O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase VectorVop3CompareGtU64OnGpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+
+  AppendSMovLiteral(&code, 4, 0);
+  AppendSMovLiteral(&code, 5, 0x80000000u);
+  code.push_back(0xd4e4006au);
+  code.push_back(0x00010004u); // v_cmp_gt_u64 vcc, s[4:5], 0
+  code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 2, 0);
+
+  code.push_back(0xd4e4006au);
+  code.push_back(0x0001006au); // v_cmp_gt_u64 vcc, vcc, 0
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 3, 1);
+
+  AppendSMovLiteral(&code, 106, 0);
+  AppendSMovLiteral(&code, 107, 0);
+  code.push_back(0xd4e4006au);
+  code.push_back(0x0001006au); // v_cmp_gt_u64 vcc, vcc, 0
+  code.push_back(EncodeVop2(0x01, 4, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 4, 2);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVop3CompareGtU64OnGpu",
+                code,
+                {},
+                {1, 1, 0},
+                {O::VMovB32, O::SMovB32, O::VCmpGtU64, O::VCndmaskB32,
+                 O::BufferStoreDword, O::SEndpgm}};
+  test.required_spirv = {"OpUGreaterThan"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorVop3CompareEqI64OnGpu() {
   using O = ShaderOpcode;
 
@@ -16796,6 +16838,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSinCosMaxFiniteSpecialCases);
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
+  AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
   AddCase(VectorCompareClassF32);
   AddCase(VectorCompareF16Ops);

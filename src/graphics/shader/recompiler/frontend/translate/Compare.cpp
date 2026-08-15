@@ -40,6 +40,10 @@ bool Translator::TranslateIntegerCompare(const IR::Instruction& inst) {
 			opcode = IR::ValueOpcode::IEqual64;
 			type   = IR::Type::U64;
 			break;
+		case IR::Opcode::CompareGtU64:
+			opcode = IR::ValueOpcode::UGreaterThan64;
+			type   = IR::Type::U64;
+			break;
 		case IR::Opcode::CompareNeU64:
 			opcode = IR::ValueOpcode::INotEqual64;
 			type   = IR::Type::U64;

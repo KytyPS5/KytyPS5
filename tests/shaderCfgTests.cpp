@@ -3305,7 +3305,7 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
-  const uint32_t opcodes[] = {0xa2u, 0xe5u}; // v_cmp_eq_i64, v_cmp_ne_u64
+  const uint32_t opcodes[] = {0xa2u, 0xe4u, 0xe5u}; // eq_i64, gt_u64, ne_u64
   for (const auto opcode : opcodes) {
     const uint32_t shader[] = {
         EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0

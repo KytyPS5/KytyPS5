@@ -779,6 +779,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCmpGeU32: return "v_cmp_ge_u32";
 		case Opcode::VCmpTU32: return "v_cmp_t_u32";
 		case Opcode::VCmpEqI64: return "v_cmp_eq_i64";
+		case Opcode::VCmpGtU64: return "v_cmp_gt_u64";
 		case Opcode::VCmpNeU64: return "v_cmp_ne_u64";
 		case Opcode::VCmpxLtU32: return "v_cmpx_lt_u32";
 		case Opcode::VCmpxEqU32: return "v_cmpx_eq_u32";

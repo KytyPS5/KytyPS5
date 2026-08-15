@@ -671,9 +671,12 @@ void Translator::WriteCompareResult(const IR::Operand& operand, IR::U1 value) {
 }
 
 bool Translator::TranslateBlock(const IR::BasicBlock& source, std::string* error) {
-	BufferAddressValues buffer_address_snapshot {};
-	uint32_t            buffer_address_pc           = 0;
-	bool                has_buffer_address_snapshot = false;
+	BufferAddressValues      buffer_address_snapshot {};
+	ScalarMemorySourceValues scalar_source_snapshot {};
+	uint32_t                 buffer_address_pc           = 0;
+	uint32_t                 scalar_source_pc            = 0;
+	bool                     has_buffer_address_snapshot = false;
+	bool                     has_scalar_source_snapshot  = false;
 	for (const auto& source_inst: source.instructions) {
 		current_opcode = source_inst.op;
 		current_pc     = source_inst.pc;
@@ -688,11 +691,23 @@ bool Translator::TranslateBlock(const IR::BasicBlock& source, std::string* error
 		} else if (!grouped_buffer_load) {
 			has_buffer_address_snapshot = false;
 		}
+		const bool grouped_scalar_load =
+		    IsScalarMemoryLoadOperation(source_inst.op) && source_inst.memory.component_count > 1u;
+		if (grouped_scalar_load &&
+		    (!has_scalar_source_snapshot || scalar_source_pc != source_inst.pc ||
+		     source_inst.memory.component_index == 0u)) {
+			scalar_source_snapshot     = ReadScalarMemorySource(source_inst);
+			scalar_source_pc           = source_inst.pc;
+			has_scalar_source_snapshot = true;
+		} else if (!grouped_scalar_load) {
+			has_scalar_source_snapshot = false;
+		}
 		if (static_cast<size_t>(source_inst.op) >= static_cast<size_t>(IR::Opcode::Count)) {
 			return Fail(error, "value IR input opcode is out of range");
 		}
 		if (TranslateInstruction(source_inst,
-		                         grouped_buffer_load ? &buffer_address_snapshot : nullptr)) {
+		                         grouped_buffer_load ? &buffer_address_snapshot : nullptr,
+		                         grouped_scalar_load ? &scalar_source_snapshot : nullptr)) {
 			continue;
 		}
 		return Fail(error, fmt::format("opcode {} at 0x{:08x} has no typed Value IR lowering",

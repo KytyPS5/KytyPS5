@@ -8052,6 +8052,26 @@ bool ReadSrtHostDword(void *, uint64_t address, uint32_t *value) {
   return true;
 }
 
+struct SrtHostRange {
+  const uint32_t *data;
+  size_t count;
+};
+
+bool ReadSrtHostRangeDword(void *userdata, uint64_t address, uint32_t *value) {
+  const auto *range = static_cast<const SrtHostRange *>(userdata);
+  if (range == nullptr || range->data == nullptr || range->count == 0 ||
+      value == nullptr) {
+    return false;
+  }
+  const auto base = reinterpret_cast<uint64_t>(range->data);
+  const auto size = range->count * sizeof(uint32_t);
+  if (address < base || address - base > size - sizeof(uint32_t)) {
+    return false;
+  }
+  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  return true;
+}
+
 void TestTypedDescriptorRealWideMoveLowering() {
   const uint32_t shader[] = {
       EncodeSop1(0x04, 0, 20), // s_mov_b64 s[0:1], s[20:21]
@@ -8362,29 +8382,55 @@ void TestSrtWalkerRealSBufferLowering() {
 }
 
 void TestScalarMemoryLoadsSnapshotOverlappingOperands() {
-  const auto CheckOverlap = [](uint32_t opcode) {
-    const uint32_t shader[] = {
-        EncodeSmem0(opcode, 0, 0),
-        125u << 25u, // load s[0:3] through overlapping s[0:*], null SOFFSET
-        EncodeMubuf0(0x1c),
-        EncodeMubuf1(0, 0, 1),
-        EncodeSopp(0x01),
-    };
+  const auto CheckOverlap = [](uint32_t opcode, bool overlap_offset) {
+    const uint32_t base_field = overlap_offset ? 4u : 0u;
+    const uint32_t soffset = overlap_offset ? 0u : 125u;
+    std::vector<uint32_t> shader;
+    if (overlap_offset) {
+      shader.push_back(
+          EncodeSMovB32(0, 128)); // s0 = 0 before it is overwritten
+    }
+    shader.insert(shader.end(),
+                  {EncodeSmem0(opcode, 0, base_field),
+                   soffset << 25u, // load s[0:3] with overlapping source
+                   EncodeMubuf0(0x1c), EncodeMubuf1(0, 0, 1),
+                   EncodeSopp(0x01)});
     std::string error;
     ShaderRecompiler::IR::Program ir;
-    Check(LowerTypedPlanning(shader, static_cast<uint32_t>(std::size(shader)),
-                             ir, &error),
+    Check(LowerTypedPlanning(shader.data(),
+                             static_cast<uint32_t>(shader.size()), ir, &error),
           error.c_str());
     Check(ir.values->srt_reads.size() == 4 && ir.values->dynamic_reads.empty(),
           opcode == 0x02 ? "overlapping S_LOAD operands were evaluated after a "
                            "component write"
                          : "overlapping S_BUFFER_LOAD operands were evaluated "
                            "after a component write");
+    const std::array<uint32_t, 4> table = {0x11111111u, 0x22222222u,
+                                           0x33333333u, 0x44444444u};
+    std::array<uint32_t, 12> user_data = {};
+    const auto address = reinterpret_cast<uint64_t>(table.data());
+    const uint32_t base = overlap_offset ? 8u : 0u;
+    user_data[base] = static_cast<uint32_t>(address);
+    user_data[base + 1u] = static_cast<uint32_t>(address >> 32u);
+    if (opcode == 0x0a) {
+      user_data[base + 2u] = sizeof(table);
+    }
+    SrtHostRange range{table.data(), table.size()};
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        user_data, 0, ReadSrtHostRangeDword, &range};
+    std::vector<uint32_t> flat;
+    Check(ShaderRecompiler::IR::WalkSrt(ir, runtime, flat, &error),
+          error.c_str());
+    Check(flat.size() == table.size() &&
+              std::equal(flat.begin(), flat.end(), table.begin()),
+          "overlapping scalar-memory load did not snapshot its sources");
     CheckFlattenedReadSlots(
         ir, 4, "overlapping scalar-memory patch used the wrong flat offsets");
   };
-  CheckOverlap(0x02); // s_load_dwordx4
-  CheckOverlap(0x0a); // s_buffer_load_dwordx4
+  CheckOverlap(0x02, false); // s_load_dwordx4 overlapping SBASE
+  CheckOverlap(0x0a, false); // s_buffer_load_dwordx4 overlapping SBASE
+  CheckOverlap(0x02, true);  // s_load_dwordx4 overlapping SOFFSET
+  CheckOverlap(0x0a, true);  // s_buffer_load_dwordx4 overlapping SOFFSET
 }
 
 void TestScalarMemoryLoadCrossesIntoVcc() {

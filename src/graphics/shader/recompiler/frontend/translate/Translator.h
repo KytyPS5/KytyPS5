@@ -13,6 +13,11 @@ struct BufferAddressValues {
 	IR::U32 soffset;
 };
 
+struct ScalarMemorySourceValues {
+	IR::Value resource;
+	IR::U32   offset;
+};
+
 bool Fail(std::string* error, const std::string& message);
 
 class Translator {
@@ -80,21 +85,24 @@ private:
 	void            WriteImageComponents(const IR::Operand& dst, IR::Value value, uint32_t dmask,
 	                                     uint32_t component_limit);
 	IR::ValueOpcode ImageAtomicOpcode(IR::Opcode opcode);
-	BufferAddressValues ReadBufferAddress(const IR::Instruction& inst, uint32_t source_offset);
-	IR::U32             WidenSubdword(IR::Value value, uint32_t bits, bool sign);
-	IR::Value           NarrowSubdword(IR::U32 value, uint32_t bits);
-	IR::ValueOpcode     BufferAtomicOpcode(IR::Opcode opcode);
-	IR::ValueOpcode     SharedAtomicOpcode(IR::Opcode opcode, bool gds);
-	bool                IsBufferLoadOperation(IR::Opcode opcode);
-	bool                TranslateScalarMemory(const IR::Instruction& inst);
-	bool                TranslateBufferLoad(const IR::Instruction&     inst,
-	                                        const BufferAddressValues* address_snapshot);
-	bool                TranslateBufferStore(const IR::Instruction& inst);
-	bool                TranslateAtomicMemory(const IR::Instruction& inst);
-	bool                TranslateFlatLoad(const IR::Instruction& inst);
-	bool                TranslateFlatStore(const IR::Instruction& inst);
-	bool                TranslateImageMemory(const IR::Instruction& inst);
-	bool                TranslateSharedMemory(const IR::Instruction& inst);
+	BufferAddressValues      ReadBufferAddress(const IR::Instruction& inst, uint32_t source_offset);
+	IR::U32                  WidenSubdword(IR::Value value, uint32_t bits, bool sign);
+	IR::Value                NarrowSubdword(IR::U32 value, uint32_t bits);
+	IR::ValueOpcode          BufferAtomicOpcode(IR::Opcode opcode);
+	IR::ValueOpcode          SharedAtomicOpcode(IR::Opcode opcode, bool gds);
+	bool                     IsBufferLoadOperation(IR::Opcode opcode);
+	bool                     IsScalarMemoryLoadOperation(IR::Opcode opcode);
+	ScalarMemorySourceValues ReadScalarMemorySource(const IR::Instruction& inst);
+	bool                     TranslateScalarMemory(const IR::Instruction&          inst,
+	                                               const ScalarMemorySourceValues* source_snapshot);
+	bool                     TranslateBufferLoad(const IR::Instruction&     inst,
+	                                             const BufferAddressValues* address_snapshot);
+	bool                     TranslateBufferStore(const IR::Instruction& inst);
+	bool                     TranslateAtomicMemory(const IR::Instruction& inst);
+	bool                     TranslateFlatLoad(const IR::Instruction& inst);
+	bool                     TranslateFlatStore(const IR::Instruction& inst);
+	bool                     TranslateImageMemory(const IR::Instruction& inst);
+	bool                     TranslateSharedMemory(const IR::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
 	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
@@ -104,15 +112,17 @@ private:
 	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
 
-	bool TranslateInstruction(const IR::Instruction&     inst,
-	                          const BufferAddressValues* address_snapshot);
+	bool TranslateInstruction(const IR::Instruction&          inst,
+	                          const BufferAddressValues*      address_snapshot,
+	                          const ScalarMemorySourceValues* scalar_source_snapshot);
 	bool TranslateStateOperation(const IR::Instruction& inst);
 	bool TranslateControlOperation(const IR::Instruction& inst);
 	bool TranslateMove(const IR::Instruction& inst);
 	bool TranslateLaneOperation(const IR::Instruction& inst);
 	bool TranslateAttributeOperation(const IR::Instruction& inst);
-	bool TranslateMemoryOperation(const IR::Instruction&     inst,
-	                              const BufferAddressValues* address_snapshot = nullptr);
+	bool TranslateMemoryOperation(const IR::Instruction&          inst,
+	                              const BufferAddressValues*      address_snapshot,
+	                              const ScalarMemorySourceValues* scalar_source_snapshot);
 	bool TranslateIntegerCompare(const IR::Instruction& inst);
 	bool TranslateInteger16Compare(const IR::Instruction& inst);
 	bool TranslateFloatCompare(const IR::Instruction& inst);

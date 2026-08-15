@@ -11699,12 +11699,19 @@ TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
 
   std::vector<u32> code;
   code.push_back(EncodeVop1(0x01, 24, Vgpr(0)));
+  code.push_back(EncodeSop1(0x04, 20, 126)); // s_mov_b64 s[20:21], exec
   code.push_back(EncodeVop1(0x01, 1, InlineU32(2)));
   code.push_back(EncodeVop1(0x01, 2, InlineU32(1)));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
   code.push_back(EncodeVopc(0xc1, Vgpr(0), 1));
-  code.push_back(0x54003080u); // v_subrev_co_ci_u32 v0, 0, v24, vcc
+  code.push_back(EncodeSop1(0x04, 22, 106)); // s_mov_b64 s[22:23], vcc
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 0));
+  AppendVMovLiteral(&code, 0, 0xdeadbeefu);
+  code.push_back(EncodeSop1(0x04, 126, 106)); // s_mov_b64 exec, vcc
+  code.push_back(EncodeSop1(0x04, 106, 22));  // s_mov_b64 vcc, s[22:23]
+  code.push_back(0x54003080u); // v_subrev_co_ci_u32 v0, vcc, 0, v24, vcc
+  code.push_back(EncodeSop1(0x04, 126, 20)); // s_mov_b64 exec, s[20:21]
   code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 2));
   AppendBufferStoreDword(&code, 0, 4);
   AppendBufferStoreDword(&code, 3, 5);
@@ -11713,10 +11720,11 @@ TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
   TestCase test;
   test.name = "VectorSubrevCoCiU32ExactRawOnGpu";
   test.code = code;
-  test.expected = {0xffffffffu, 0, 2, 3, 1, 0, 0, 0};
+  test.expected = {0xdeadbeefu, 0, 2, 3, 0, 0, 0, 0};
   test.opcodes = {O::VMovB32,          O::VLshlrevB32,    O::VAddNcU32,
-                  O::VCmpLtU32,        O::VSubrevCoCiU32, O::VCndmaskB32,
-                  O::BufferStoreDword, O::SEndpgm};
+                  O::VCmpLtU32,        O::SMovB64,        O::VCmpNeU32,
+                  O::VSubrevCoCiU32,   O::VCndmaskB32,    O::BufferStoreDword,
+                  O::SEndpgm};
   test.required_spirv = {"OpISub", "OpUGreaterThan"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -11734,15 +11742,16 @@ TestCase VectorVop3BSubrevCoCiUsesEncodedMasks() {
 
   std::vector<u32> code;
   code.push_back(EncodeVop1(0x01, 24, Vgpr(0)));
+  code.push_back(EncodeVop2(0x25, 24, InlineU32(3), 24));
   code.push_back(EncodeVop1(0x01, 1, InlineU32(2)));
   code.push_back(EncodeVop1(0x01, 2, InlineU32(1)));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
-  code.push_back(EncodeVopc(0xc1, Vgpr(0), 1));
+  code.push_back(EncodeVopc(0xc2, InlineU32(1), 0));
   code.push_back(EncodeSop1(0x04, 20, 106)); // s_mov_b64 s[20:21], vcc
   AppendSMovLiteral(&code, 106, 0);
   AppendSMovLiteral(&code, 107, 0);
-  AppendVop3B(&code, 0x12au, 10, 22, InlineU32(0), Vgpr(24), 20);
+  AppendVop3B(&code, 0x12au, 10, 22, InlineU32(5), Vgpr(24), 20);
   AppendVop3(&code, 0x101u, 3, InlineU32(0), Vgpr(2), 22);
   AppendBufferStoreDword(&code, 10, 4);
   AppendBufferStoreDword(&code, 3, 5);
@@ -11751,9 +11760,9 @@ TestCase VectorVop3BSubrevCoCiUsesEncodedMasks() {
   TestCase test;
   test.name = "VectorVop3BSubrevCoCiUsesEncodedMasks";
   test.code = code;
-  test.expected = {0xffffffffu, 0, 2, 3, 1, 0, 0, 0};
+  test.expected = {0xfffffffeu, 0xfffffffeu, 0, 1, 1, 1, 0, 0};
   test.opcodes = {O::VMovB32,        O::VLshlrevB32, O::VAddNcU32,
-                  O::VCmpLtU32,      O::SMovB64,     O::SMovB32,
+                  O::VCmpEqU32,      O::SMovB64,     O::SMovB32,
                   O::VSubrevCoCiU32, O::VCndmaskB32, O::BufferStoreDword,
                   O::SEndpgm};
   test.compute_info.threads_num[0] = 4;

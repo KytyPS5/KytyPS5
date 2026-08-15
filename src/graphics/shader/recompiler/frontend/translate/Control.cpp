@@ -56,7 +56,7 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 			if (inst.op == IR::Opcode::ScalarAddCarryU32) {
 				ir.SetScc(carry);
 			} else {
-				WriteMask(inst.dst2, carry);
+				WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
 			}
 			return true;
 		}
@@ -70,7 +70,7 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 			if (inst.op == IR::Opcode::ScalarSubBorrowU32) {
 				ir.SetScc(borrow);
 			} else {
-				WriteMask(inst.dst2, borrow);
+				WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
 			}
 			return true;
 		}
@@ -88,7 +88,7 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 			if (inst.op == IR::Opcode::ScalarSubBorrowCarryU32) {
 				ir.SetScc(borrow);
 			} else {
-				WriteMask(inst.dst2, borrow);
+				WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
 			}
 			return true;
 		}

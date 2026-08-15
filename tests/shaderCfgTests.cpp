@@ -834,14 +834,13 @@ constexpr uint32_t EncodeVop3pWord0(uint32_t opcode, uint32_t dst,
                                     uint32_t neg_hi = 0, bool clamp = false) {
   return (0x33u << 26u) | ((opcode & 0x7fu) << 16u) | (dst & 0xffu) |
          ((neg_hi & 0x7u) << 8u) | ((op_sel & 0x7u) << 11u) |
-         ((op_sel_hi & 0x1u) << 14u) | (clamp ? (1u << 15u) : 0u);
+         (((op_sel_hi >> 2u) & 0x1u) << 14u) | (clamp ? (1u << 15u) : 0u);
 }
 
 constexpr uint32_t EncodeVop3pWord1(uint32_t src0, uint32_t src1, uint32_t src2,
                                     uint32_t op_sel_hi = 0, uint32_t neg = 0) {
   return (src0 & 0x1ffu) | ((src1 & 0x1ffu) << 9u) | ((src2 & 0x1ffu) << 18u) |
-         (((op_sel_hi >> 2u) & 0x1u) << 27u) |
-         (((op_sel_hi >> 1u) & 0x1u) << 28u) | ((neg & 0x7u) << 29u);
+         ((op_sel_hi & 0x3u) << 27u) | ((neg & 0x7u) << 29u);
 }
 
 constexpr uint32_t EncodeSmem0(uint32_t opcode, uint32_t dst, uint32_t sbase) {
@@ -3375,12 +3374,13 @@ void TestNewShaderDecoderArchitecture() {
   Check(boot.opcode == Opcode::DsSwizzleB32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
 
+  constexpr uint32_t packed_source_selectors[][2] = {
+      {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
+      {0xcc0e0000u, 0x140a0300u}, // Source 1: instruction bit 60.
+      {0xcc0e4000u, 0x040a0300u}, // Source 2: instruction bit 14.
+  };
   for (uint32_t source = 0; source < 3u; source++) {
-    const uint32_t op_sel_hi = 1u << source;
-    const uint32_t packed[] = {
-        EncodeVop3pWord0(0x0e, 0, 0, op_sel_hi),
-        EncodeVop3pWord1(256, 257, 258, op_sel_hi),
-    };
+    const auto &packed = packed_source_selectors[source];
     Instruction packed_inst;
     Check(DecodeInstruction(packed, 0u, packed_inst, &error), error.c_str());
     Check(packed_inst.src0.op_sel_hi == (source == 0u) &&

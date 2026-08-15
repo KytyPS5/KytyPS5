@@ -505,15 +505,14 @@ constexpr u32 EncodeVop3pWord0(u32 opcode, u32 dst, u32 op_sel_hi = 0,
                                u32 op_sel = 0, u32 neg_hi = 0,
                                bool clamp = false) {
   return (0x33u << 26u) | ((opcode & 0x7fu) << 16u) | ((neg_hi & 0x7u) << 8u) |
-         ((op_sel & 0x7u) << 11u) | ((op_sel_hi & 0x1u) << 14u) |
+         ((op_sel & 0x7u) << 11u) | (((op_sel_hi >> 2u) & 0x1u) << 14u) |
          (clamp ? (1u << 15u) : 0u) | (dst & 0xffu);
 }
 
 constexpr u32 EncodeVop3pWord1(u32 src0, u32 src1, u32 src2 = 0,
                                u32 op_sel_hi = 0, u32 neg = 0) {
   return (src0 & 0x1ffu) | ((src1 & 0x1ffu) << 9u) | ((src2 & 0x1ffu) << 18u) |
-         (((op_sel_hi >> 2u) & 0x1u) << 27u) |
-         (((op_sel_hi >> 1u) & 0x1u) << 28u) | ((neg & 0x7u) << 29u);
+         ((op_sel_hi & 0x3u) << 27u) | ((neg & 0x7u) << 29u);
 }
 
 constexpr u32 EncodeVopc(u32 opcode, u32 src0, u32 src1) {
@@ -12013,6 +12012,31 @@ TestCase VectorLaneAndPackedOps() {
            O::VCvtPkU16U32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x42003c00u); // low=1.0h, high=3.0h
+  AppendVMovLiteral(&code, 1, 0x48004400u); // low=4.0h, high=8.0h
+  AppendVMovLiteral(&code, 2, 0x50004c00u); // low=16.0h, high=32.0h
+
+  // Raw V_PK_FMA_F16 words keep this test independent of the encoders above.
+  code.insert(code.end(), {0xcc0e000au, 0x0c0a0300u}); // src0 high: 3*4+16=28
+  code.insert(code.end(), {0xcc0e000bu, 0x140a0300u}); // src1 high: 1*8+16=24
+  code.insert(code.end(), {0xcc0e400cu, 0x040a0300u}); // src2 high: 1*4+32=36
+
+  for (u32 i = 0; i < 3; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"Vop3pOpselHiUsesArchitecturalSourceBits",
+          code,
+          {},
+          {0x4f004d00u, 0x4e004d00u, 0x50804d00u},
+          {O::VMovB32, O::VPkFmaF16, O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase CvtPkU8F32PacksSelectedByte() {
   using O = ShaderOpcode;
 
@@ -16957,6 +16981,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
   AddCase(VectorLaneAndPackedOps);
+  AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);

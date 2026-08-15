@@ -1738,14 +1738,13 @@ bool DecodeVop3p(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t vdst        = word0 & 0xffu;
 	const uint32_t neg_hi      = (word0 >> 8u) & 0x7u;
 	const uint32_t op_sel      = (word0 >> 11u) & 0x7u;
-	const uint32_t op_sel_hi_0 = (word0 >> 14u) & 0x1u;
+	const uint32_t op_sel_hi_2 = (word0 >> 14u) & 0x1u;
 	const uint32_t clamp       = (word0 >> 15u) & 0x1u;
 	const uint32_t src0        = word1 & 0x1ffu;
 	const uint32_t src1        = (word1 >> 9u) & 0x1ffu;
 	const uint32_t src2        = (word1 >> 18u) & 0x1ffu;
-	const uint32_t op_sel_hi =
-	    op_sel_hi_0 | (((word1 >> 28u) & 0x1u) << 1u) | (((word1 >> 27u) & 0x1u) << 2u);
-	const uint32_t neg = (word1 >> 29u) & 0x7u;
+	const uint32_t op_sel_hi   = ((word1 >> 27u) & 0x3u) | (op_sel_hi_2 << 2u);
+	const uint32_t neg         = (word1 >> 29u) & 0x7u;
 
 	inst.pc        = pc;
 	inst.word      = word0;

@@ -198,12 +198,12 @@ uint32_t* KYTY_SYSV_ABI GraphicsAcbWaitRegMem(CommandBuffer* buf, uint8_t size,
                                               uint8_t compare_function, uint8_t cache_policy,
                                               const volatile void* address, uint64_t reference,
                                               uint64_t mask, uint32_t poll_cycles);
-uint32_t* KYTY_SYSV_ABI GraphicsAcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,
+uint32_t* KYTY_SYSV_ABI GraphicsAcbDmaData(CommandBuffer* buf, uint8_t dst,
                                            uint8_t dst_cache_policy, uint64_t dst_address_or_offset,
                                            uint8_t src, uint8_t src_cache_policy,
                                            uint64_t src_address_or_offset_or_immediate,
                                            uint32_t num_bytes, uint8_t wait_for_previous,
-                                           uint8_t write_confirm, uint8_t block_engine);
+                                           uint8_t write_confirm);
 uint32_t* KYTY_SYSV_ABI GraphicsAcbCopyData(CommandBuffer* buf, uint8_t dst,
                                             uint8_t dst_cache_policy, uint64_t dst_address,
                                             uint8_t src, uint8_t src_cache_policy,

@@ -1404,6 +1404,22 @@ LIB_DEFINE(InitNet_1_NetCtl) {
 
 } // namespace LibNetCtl
 
+namespace LibNpCommerce {
+
+LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
+
+static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
+	PRINT_NAME();
+
+	return 0; // SCE_COMMON_DIALOG_STATUS_NONE
+}
+
+LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
+}
+
+} // namespace LibNpCommerce
+
 namespace LibNpManager {
 
 LIB_VERSION("NpManager", 1, "NpManager", 1, 1);
@@ -3935,6 +3951,7 @@ LIB_DEFINE(InitNet_1) {
 	LibHttp::InitNet_1_Http(s);
 	LibHttp2::InitNet_1_Http2(s);
 	LibNetCtl::InitNet_1_NetCtl(s);
+	LibNpCommerce::InitNet_1_NpCommerce(s);
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);

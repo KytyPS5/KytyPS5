@@ -178,6 +178,7 @@ namespace AudioIn = Audio::AudioIn;
 LIB_DEFINE(InitAudio_1_AudioIn) {
 	LIB_FUNC("5NE8Sjc7VC8", AudioIn::AudioInOpen);
 	LIB_FUNC("LozEOU8+anM", AudioIn::AudioInInput);
+	LIB_FUNC("BohEAQ7DlUE", AudioIn::AudioInGetSilentState);
 }
 
 } // namespace LibAudioIn

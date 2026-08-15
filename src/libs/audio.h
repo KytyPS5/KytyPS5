@@ -99,6 +99,7 @@ namespace AudioIn {
 int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32_t len,
                               uint32_t freq, uint32_t param);
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest);
+int KYTY_SYSV_ABI AudioInGetSilentState(int handle);
 
 } // namespace AudioIn
 

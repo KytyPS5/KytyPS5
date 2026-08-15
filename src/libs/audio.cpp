@@ -796,6 +796,8 @@ namespace AudioIn {
 
 LIB_NAME("AudioIn", "AudioIn");
 
+constexpr int AUDIO_IN_SILENT_STATE_DEVICE_NONE = 0x1;
+
 int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32_t len,
                               uint32_t freq, uint32_t param) {
 	PRINT_NAME();
@@ -850,6 +852,19 @@ int KYTY_SYSV_ABI AudioInInput(int handle, void* dest) {
 	}
 
 	return static_cast<int>(g_audio->AudioInInput(Audio::Id(handle), dest));
+}
+
+int KYTY_SYSV_ABI AudioInGetSilentState(int handle) {
+	PRINT_NAME();
+
+	EXIT_IF(g_audio == nullptr);
+
+	if (!g_audio->AudioInValid(Audio::Id(handle))) {
+		return AUDIO_IN_ERROR_INVALID_HANDLE;
+	}
+
+	// Audio input has no device backend yet, so every valid port receives silence.
+	return AUDIO_IN_SILENT_STATE_DEVICE_NONE;
 }
 
 } // namespace AudioIn

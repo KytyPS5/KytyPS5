@@ -27,6 +27,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -91,11 +92,12 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	if (stride != 0 && records > UINT64_MAX / stride) {
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
-	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || size == 0) {
+	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	if (address == 0 || requested_size == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
+	const auto  size      = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||

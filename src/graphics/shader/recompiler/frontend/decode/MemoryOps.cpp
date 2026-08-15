@@ -1,13 +1,12 @@
 #include "graphics/shader/recompiler/frontend/decode/MemoryOps.h"
 
-#include <fmt/format.h>
-#include <iterator>
+#include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 struct MemoryOpcodeInfo {
-	uint32_t opcode      = 0;
+	uint32_t encoding    = 0;
 	Opcode   decoded     = Opcode::Unsupported;
 	uint32_t data_dwords = 1;
 	uint32_t data_bits   = 32;
@@ -16,7 +15,7 @@ struct MemoryOpcodeInfo {
 	bool     formatted   = false;
 };
 
-constexpr MemoryOpcodeInfo SMEM_OPS[] = {
+constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x00u, Opcode::SLoadDword, 1, 32},         {0x01u, Opcode::SLoadDwordx2, 2, 32},
     {0x02u, Opcode::SLoadDwordx4, 4, 32},       {0x03u, Opcode::SLoadDwordx8, 8, 32},
     {0x04u, Opcode::SLoadDwordx16, 16, 32},     {0x08u, Opcode::SBufferLoadDword, 1, 32},
@@ -24,7 +23,7 @@ constexpr MemoryOpcodeInfo SMEM_OPS[] = {
     {0x0bu, Opcode::SBufferLoadDwordx8, 8, 32}, {0x0cu, Opcode::SBufferLoadDwordx16, 16, 32},
 };
 
-constexpr MemoryOpcodeInfo MUBUF_OPS[] = {
+constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x00u, Opcode::BufferLoadFormatX, 1, 32, false, false, true},
     {0x01u, Opcode::BufferLoadFormatXy, 2, 32, false, false, true},
     {0x02u, Opcode::BufferLoadFormatXyz, 3, 32, false, false, true},
@@ -61,7 +60,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPS[] = {
     {0x40u, Opcode::BufferAtomicFMax, 1, 32},
 };
 
-constexpr MemoryOpcodeInfo MTBUF_OPS[] = {
+constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
     {0x00u, Opcode::TBufferLoadFormatX, 1, 32, false, true, true},
     {0x01u, Opcode::TBufferLoadFormatXy, 2, 32, false, true, true},
     {0x02u, Opcode::TBufferLoadFormatXyz, 3, 32, false, true, true},
@@ -72,7 +71,7 @@ constexpr MemoryOpcodeInfo MTBUF_OPS[] = {
     {0x07u, Opcode::TBufferStoreFormatXyzw, 4, 32, false, true, true},
 };
 
-constexpr MemoryOpcodeInfo FLAT_OPS[] = {
+constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
     {0x08u, Opcode::FlatLoadUbyte, 1, 8},     {0x09u, Opcode::FlatLoadSbyte, 1, 8, true},
     {0x0au, Opcode::FlatLoadUshort, 1, 16},   {0x0bu, Opcode::FlatLoadSshort, 1, 16, true},
     {0x0cu, Opcode::FlatLoadDword, 1, 32},    {0x0du, Opcode::FlatLoadDwordx2, 2, 32},
@@ -82,7 +81,7 @@ constexpr MemoryOpcodeInfo FLAT_OPS[] = {
     {0x1eu, Opcode::FlatStoreDwordx4, 4, 32}, {0x1fu, Opcode::FlatStoreDwordx3, 3, 32},
 };
 
-constexpr MemoryOpcodeInfo DS_OPS[] = {
+constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x00u, Opcode::DsAddU32, 1, 32},           {0x01u, Opcode::DsSubU32, 1, 32},
     {0x05u, Opcode::DsMinI32, 1, 32},           {0x06u, Opcode::DsMaxI32, 1, 32},
     {0x07u, Opcode::DsMinU32, 1, 32},           {0x08u, Opcode::DsMaxU32, 1, 32},
@@ -109,15 +108,11 @@ constexpr MemoryOpcodeInfo DS_OPS[] = {
     {0xfeu, Opcode::DsReadB96, 3, 32},          {0xffu, Opcode::DsReadB128, 4, 32},
 };
 
-const MemoryOpcodeInfo* LookupMemoryOpcode(const MemoryOpcodeInfo* ops, uint32_t count,
-                                           uint32_t opcode) {
-	for (uint32_t i = 0; i < count; i++) {
-		if (ops[i].opcode == opcode) {
-			return &ops[i];
-		}
-	}
-	return nullptr;
-}
+constexpr auto SMEM_OPS  = Detail::MakeOpcodeTable<0x100>(SMEM_OPCODE_LIST);
+constexpr auto MUBUF_OPS = Detail::MakeOpcodeTable<0x100>(MUBUF_OPCODE_LIST);
+constexpr auto MTBUF_OPS = Detail::MakeOpcodeTable<0x10>(MTBUF_OPCODE_LIST);
+constexpr auto FLAT_OPS  = Detail::MakeOpcodeTable<0x80>(FLAT_OPCODE_LIST);
+constexpr auto DS_OPS    = Detail::MakeOpcodeTable<0x100>(DS_OPCODE_LIST);
 
 uint32_t SignExtendU32(uint32_t value, uint32_t bits) {
 	if (bits == 0u || bits >= 32u) {
@@ -217,15 +212,8 @@ bool IsFlatStoreOpcode(Opcode opcode) {
 
 } // namespace
 
-bool DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated SMEM instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word0   = code[word_index];
 	const uint32_t word1   = code[word_index + 1u];
 	const uint32_t opcode  = (word0 >> 18u) & 0xffu;
@@ -233,15 +221,14 @@ bool DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t sbase   = word0 & 0x3fu;
 	const uint32_t soffset = (word1 >> 25u) & 0x7fu;
 
-	inst.pc         = pc;
-	inst.word       = word0;
-	inst.word_count = 2;
-	inst.offset     = SignExtendU32(word1 & 0x1fffffu, 21u);
-	inst.glc        = ((word0 >> 16u) & 1u) != 0;
-	inst.family     = Family::SMEM;
-	inst.opcode_id  = opcode;
-	const auto* info =
-	    LookupMemoryOpcode(SMEM_OPS, static_cast<uint32_t>(std::size(SMEM_OPS)), opcode);
+	inst.pc          = pc;
+	inst.word        = word0;
+	inst.word_count  = 2;
+	inst.offset      = SignExtendU32(word1 & 0x1fffffu, 21u);
+	inst.glc         = ((word0 >> 16u) & 1u) != 0;
+	inst.family      = Family::SMEM;
+	inst.opcode_id   = opcode;
+	const auto* info = Detail::FindOpcode(SMEM_OPS, opcode);
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::Unsupported) {
@@ -254,18 +241,10 @@ bool DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	DecodeScalarSource(sbase * 2u, pc, inst.src0, nullptr);
 	DecodeScalarSource(soffset, pc, inst.src1, nullptr);
 	inst.src_count = 2;
-	return true;
 }
 
-bool DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                 Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated MUBUF instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                 Instruction& inst) {
 	const uint32_t word0   = code[word_index];
 	const uint32_t word1   = code[word_index + 1u];
 	const uint32_t opcode  = ((word0 >> 18u) & 0x7fu) | (((word0 >> 25u) & 1u) << 7u);
@@ -274,41 +253,32 @@ bool DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t srsrc   = (word1 >> 16u) & 0x1fu;
 	const uint32_t soffset = (word1 >> 24u) & 0xffu;
 
-	inst.pc         = pc;
-	inst.word       = word0;
-	inst.word_count = 2;
-	inst.offset     = word0 & 0xfffu;
-	inst.idxen      = ((word0 >> 13u) & 1u) != 0;
-	inst.offen      = ((word0 >> 12u) & 1u) != 0;
-	inst.glc        = ((word0 >> 14u) & 1u) != 0;
-	inst.slc        = ((word1 >> 22u) & 1u) != 0;
-	inst.family     = Family::MUBUF;
-	inst.opcode_id  = opcode;
-	const auto* info =
-	    LookupMemoryOpcode(MUBUF_OPS, static_cast<uint32_t>(std::size(MUBUF_OPS)), opcode);
+	inst.pc          = pc;
+	inst.word        = word0;
+	inst.word_count  = 2;
+	inst.offset      = word0 & 0xfffu;
+	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
+	inst.offen       = ((word0 >> 12u) & 1u) != 0;
+	inst.glc         = ((word0 >> 14u) & 1u) != 0;
+	inst.slc         = ((word1 >> 22u) & 1u) != 0;
+	inst.family      = Family::MUBUF;
+	inst.opcode_id   = opcode;
+	const auto* info = Detail::FindOpcode(MUBUF_OPS, opcode);
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::Unsupported) {
 		MarkMemoryUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
 
-	DecodeVectorGpr(vdata, inst.dst, nullptr);
-	DecodeVectorGpr(vaddr, inst.src0, nullptr);
+	DecodeVectorGpr(vdata, inst.dst);
+	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1, nullptr);
 	DecodeScalarSource(soffset, pc, inst.src2, nullptr);
 	inst.src_count = 3;
-	return true;
 }
 
-bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                 Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated MTBUF instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                 Instruction& inst) {
 	const uint32_t word0   = code[word_index];
 	const uint32_t word1   = code[word_index + 1u];
 	const uint32_t opcode  = ((word0 >> 16u) & 0x7u) | (((word1 >> 21u) & 1u) << 3u);
@@ -331,31 +301,22 @@ bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.opcode_id     = opcode;
 	inst.data_format   = dfmt;
 	inst.number_format = nfmt;
-	const auto* info =
-	    LookupMemoryOpcode(MTBUF_OPS, static_cast<uint32_t>(std::size(MTBUF_OPS)), opcode);
+	const auto* info   = Detail::FindOpcode(MTBUF_OPS, opcode);
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::Unsupported) {
 		MarkMemoryUnsupported(inst, Family::MTBUF, opcode, "MTBUF opcode is not implemented");
 	}
 
-	DecodeVectorGpr(vdata, inst.dst, nullptr);
-	DecodeVectorGpr(vaddr, inst.src0, nullptr);
+	DecodeVectorGpr(vdata, inst.dst);
+	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1, nullptr);
 	DecodeScalarSource(soffset, pc, inst.src2, nullptr);
 	inst.src_count = 3;
-	return true;
 }
 
-bool DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated FLAT instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word0  = code[word_index];
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t offset = word0 & 0xfffu;
@@ -377,42 +338,32 @@ bool DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.family         = Family::FLAT;
 	inst.opcode_id      = opcode;
 	inst.memory_segment = seg;
-	const auto* info =
-	    LookupMemoryOpcode(FLAT_OPS, static_cast<uint32_t>(std::size(FLAT_OPS)), opcode);
+	const auto* info    = Detail::FindOpcode(FLAT_OPS, opcode);
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
 	if (dlc != 0 || lds != 0 || inst.glc || inst.slc || seg == 3u) {
 		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
-		return true;
+		return;
 	}
 	if (inst.opcode == Opcode::Unsupported) {
 		MarkMemoryUnsupported(inst, Family::FLAT, opcode, "FLAT opcode is not implemented");
-		return true;
+		return;
 	}
 
-	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst, nullptr);
-	DecodeVectorGpr(addr, inst.src0, nullptr);
+	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst);
+	DecodeVectorGpr(addr, inst.src0);
 	inst.src_count = 1;
 	if (seg == 0u || saddr == 0x7du || saddr == 0x7fu) {
-		DecodeVectorGpr(addr + 1u, inst.src1, nullptr);
+		DecodeVectorGpr(addr + 1u, inst.src1);
 		inst.src_count = 2;
 	} else {
 		DecodeScalarSource(saddr, pc, inst.src1, nullptr);
 		inst.src_count = 2;
 	}
-	return true;
 }
 
-bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-              std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated DS instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t word0   = code[word_index];
 	const uint32_t word1   = code[word_index + 1u];
 	const uint32_t opcode  = (word0 >> 18u) & 0xffu;
@@ -430,7 +381,7 @@ bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	inst.gds         = ((word0 >> 17u) & 1u) != 0u;
 	inst.family      = Family::DS;
 	inst.opcode_id   = opcode;
-	const auto* info = LookupMemoryOpcode(DS_OPS, static_cast<uint32_t>(std::size(DS_OPS)), opcode);
+	const auto* info = Detail::FindOpcode(DS_OPS, opcode);
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::Unsupported) {
@@ -466,12 +417,11 @@ bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		inst.secondary_offset = offset1 * 512u;
 	}
 
-	DecodeVectorGpr(vdst, inst.dst, nullptr);
-	DecodeVectorGpr(addr, inst.src0, nullptr);
-	DecodeVectorGpr(data0, inst.src1, nullptr);
-	DecodeVectorGpr(data1, inst.src2, nullptr);
+	DecodeVectorGpr(vdst, inst.dst);
+	DecodeVectorGpr(addr, inst.src0);
+	DecodeVectorGpr(data0, inst.src1);
+	DecodeVectorGpr(data1, inst.src2);
 	inst.src_count = DsSourceCount(inst.opcode);
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

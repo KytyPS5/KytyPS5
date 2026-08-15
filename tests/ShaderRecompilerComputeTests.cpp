@@ -505,14 +505,15 @@ constexpr u32 EncodeVop3pWord0(u32 opcode, u32 dst, u32 op_sel_hi = 0,
                                u32 op_sel = 0, u32 neg_hi = 0,
                                bool clamp = false) {
   return (0x33u << 26u) | ((opcode & 0x7fu) << 16u) | ((neg_hi & 0x7u) << 8u) |
-         ((op_sel & 0x7u) << 11u) | ((op_sel_hi & 0x4u) << 12u) |
+         ((op_sel & 0x7u) << 11u) | ((op_sel_hi & 0x1u) << 14u) |
          (clamp ? (1u << 15u) : 0u) | (dst & 0xffu);
 }
 
 constexpr u32 EncodeVop3pWord1(u32 src0, u32 src1, u32 src2 = 0,
                                u32 op_sel_hi = 0, u32 neg = 0) {
   return (src0 & 0x1ffu) | ((src1 & 0x1ffu) << 9u) | ((src2 & 0x1ffu) << 18u) |
-         ((op_sel_hi & 0x3u) << 27u) | ((neg & 0x7u) << 29u);
+         (((op_sel_hi >> 2u) & 0x1u) << 27u) |
+         (((op_sel_hi >> 1u) & 0x1u) << 28u) | ((neg & 0x7u) << 29u);
 }
 
 constexpr u32 EncodeVopc(u32 opcode, u32 src0, u32 src1) {
@@ -11118,14 +11119,15 @@ TestCase ScalarBitfieldPack() {
   return {"ScalarBitfieldPack",
           code,
           {},
-          {0xf0000000u, 8, 9, 1, 0, 0, 0x0000000fu, 0, 0x00000f00u, 0x0000000fu,
-           0xddddbbbbu, 0xccccbbbbu, 0xccccaaaau, 1, 1, 40, 5, 0xffffffffu, 0,
-           1},
+          {0xf0000000u, 8,           9,           1,           0,
+           0,           0x0000000fu, 0,           0x00000f00u, 0x0000000fu,
+           0xddddbbbbu, 0xccccbbbbu, 0xccccaaaau, 1,           1,
+           40,          5,           0xffffffffu, 0,           1},
           {O::SMovB32, O::SBrevB32, O::SBcnt1I32B32, O::SBcnt1I32B64,
            O::SFf1I32B64, O::SBitreplicateB64B32, O::SBfmB32, O::SBfeU32,
-           O::SPackLlB32B16,
-           O::SPackLhB32B16, O::SPackHhB32B16, O::SBitcmp0B32, O::SBitcmp1B32,
-           O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+           O::SPackLlB32B16, O::SPackLhB32B16, O::SPackHhB32B16, O::SBitcmp0B32,
+           O::SBitcmp1B32, O::SCselectB32, O::VMovB32, O::BufferStoreDword,
+           O::SEndpgm}};
 }
 
 TestCase ScalarBrevB32PreservesScc() {

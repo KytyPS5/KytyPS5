@@ -5,8 +5,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
-bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
+void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
 
 const char* MimgSampleOpcodeName(uint32_t opcode);
 

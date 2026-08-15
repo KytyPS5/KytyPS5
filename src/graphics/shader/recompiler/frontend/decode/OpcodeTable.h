@@ -3,7 +3,9 @@
 
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail {
 
@@ -12,32 +14,41 @@ struct OpcodeMap {
 	Opcode   decoded  = Opcode::Unknown;
 };
 
-template <typename Entry, size_t N>
-constexpr const Entry* FindOpcode(const Entry (&table)[N], uint32_t encoding) {
-	for (const auto& entry: table) {
-		if (entry.encoding == encoding) {
-			return &entry;
+template <typename Entry, size_t EncodingCount, size_t EntryCount>
+struct OpcodeTable {
+	std::array<Entry, EntryCount>       entries = {};
+	std::array<uint16_t, EncodingCount> indices = {};
+};
+
+template <size_t EncodingCount, typename Entry, size_t EntryCount>
+consteval auto MakeOpcodeTable(const Entry (&entries)[EntryCount]) {
+	static_assert(EntryCount < UINT16_MAX);
+	OpcodeTable<Entry, EncodingCount, EntryCount> table;
+	for (size_t i = 0; i < EntryCount; i++) {
+		const auto encoding = entries[i].encoding;
+		if (encoding >= EncodingCount || table.indices[encoding] != 0) {
+			throw "invalid opcode table";
 		}
+		table.entries[i]        = entries[i];
+		table.indices[encoding] = static_cast<uint16_t>(i + 1);
 	}
-	return nullptr;
+	return table;
 }
 
-template <typename Entry, size_t N>
-constexpr Opcode LookupOpcode(const Entry (&table)[N], uint32_t encoding) {
+template <typename Entry, size_t EncodingCount, size_t EntryCount>
+constexpr const Entry* FindOpcode(const OpcodeTable<Entry, EncodingCount, EntryCount>& table,
+                                  uint32_t                                             encoding) {
+	if (table.indices[encoding] == 0) {
+		return nullptr;
+	}
+	return &table.entries[table.indices[encoding] - 1];
+}
+
+template <typename Entry, size_t EncodingCount, size_t EntryCount>
+constexpr Opcode LookupOpcode(const OpcodeTable<Entry, EncodingCount, EntryCount>& table,
+                              uint32_t                                             encoding) {
 	const auto* entry = FindOpcode(table, encoding);
 	return entry != nullptr ? entry->decoded : Opcode::Unsupported;
-}
-
-template <typename Entry, size_t N>
-constexpr bool HasUniqueEncodings(const Entry (&table)[N]) {
-	for (size_t i = 0; i < N; i++) {
-		for (size_t j = i + 1; j < N; j++) {
-			if (table[i].encoding == table[j].encoding) {
-				return false;
-			}
-		}
-	}
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail

@@ -2,8 +2,6 @@
 
 #include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
 
-#include <fmt/format.h>
-
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
@@ -30,7 +28,7 @@ struct Vop2OpcodeInfo {
 	Vop2SdwaProfile sdwa_profile = Vop2SdwaProfile::None;
 };
 
-constexpr Vop2OpcodeInfo VOP2_OPS[] = {
+constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x01u, Opcode::VCndmaskB32, Vop2SdwaProfile::Cndmask},
     {0x02u, Opcode::VDot2cF32F16},
     {0x03u, Opcode::VAddF32, Vop2SdwaProfile::Float32},
@@ -81,13 +79,14 @@ constexpr Vop2OpcodeInfo VOP2_OPS[] = {
     {0x3au, Opcode::VMinF16, Vop2SdwaProfile::Float16},
     {0x3cu, Opcode::VPkFmacF16},
 };
-static_assert(Detail::HasUniqueEncodings(VOP2_OPS));
+
+constexpr auto VOP2_OPS = Detail::MakeOpcodeTable<0x40>(VOP2_OPCODE_LIST);
 
 constexpr Opcode LookupVop2Opcode(uint32_t encoding) {
 	return Detail::LookupOpcode(VOP2_OPS, encoding);
 }
 
-constexpr OpcodeMap VOP1_OPS[] = {
+constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::VNop},
     {0x01u, Opcode::VMovB32},
     {0x02u, Opcode::VReadfirstlaneB32},
@@ -138,7 +137,9 @@ constexpr OpcodeMap VOP1_OPS[] = {
     {0x5eu, Opcode::VRndneF16},
 };
 
-constexpr OpcodeMap VOP3_ENCODED_VOP1_OPS[] = {
+constexpr auto VOP1_OPS = Detail::MakeOpcodeTable<0x100>(VOP1_OPCODE_LIST);
+
+constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::VNop},
     {0x01u, Opcode::VMovB32},
     {0x02u, Opcode::VReadfirstlaneB32},
@@ -184,13 +185,15 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPS[] = {
     {0x5eu, Opcode::VRndneF16},
 };
 
+constexpr auto VOP3_ENCODED_VOP1_OPS = Detail::MakeOpcodeTable<0x80>(VOP3_ENCODED_VOP1_OPCODE_LIST);
+
 struct VopcOpcodeInfo {
 	uint32_t encoding     = 0;
 	Opcode   decoded      = Opcode::Unknown;
 	bool     supports_dpp = true;
 };
 
-constexpr VopcOpcodeInfo VOPC_OPS[] = {
+constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0x00u, Opcode::VCmpFF32},         {0x01u, Opcode::VCmpLtF32},
     {0x02u, Opcode::VCmpEqF32},        {0x03u, Opcode::VCmpLeF32},
     {0x04u, Opcode::VCmpGtF32},        {0x05u, Opcode::VCmpLgF32},
@@ -235,9 +238,10 @@ constexpr VopcOpcodeInfo VOPC_OPS[] = {
     {0xdcu, Opcode::VCmpxGtF16},       {0xdeu, Opcode::VCmpxGeF16},
     {0xfdu, Opcode::VCmpxNeqF16},      {0xfeu, Opcode::VCmpxNltF16},
 };
-static_assert(Detail::HasUniqueEncodings(VOPC_OPS));
 
-constexpr OpcodeMap VOP3_OPS[] = {
+constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
+
+constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x141u, Opcode::VMadF32},          {0x142u, Opcode::VMadI32I24},
     {0x143u, Opcode::VMadU32U24},       {0x176u, Opcode::VMadU64U32},
     {0x144u, Opcode::VCubeidF32},       {0x145u, Opcode::VCubescF32},
@@ -275,7 +279,9 @@ constexpr OpcodeMap VOP3_OPS[] = {
     {0x14fu, Opcode::VAlignbyteB32},
 };
 
-constexpr OpcodeMap VOP3P_OPS[] = {
+constexpr auto VOP3_OPS = Detail::MakeOpcodeTable<0x400>(VOP3_OPCODE_LIST);
+
+constexpr OpcodeMap VOP3P_OPCODE_LIST[] = {
     {0x00u, Opcode::VPkMadI16},     {0x01u, Opcode::VPkMulLoU16},   {0x02u, Opcode::VPkAddI16},
     {0x03u, Opcode::VPkSubI16},     {0x04u, Opcode::VPkLshlrevB16}, {0x05u, Opcode::VPkLshrrevB16},
     {0x06u, Opcode::VPkAshrrevI16}, {0x07u, Opcode::VPkMaxI16},     {0x08u, Opcode::VPkMinI16},
@@ -285,6 +291,8 @@ constexpr OpcodeMap VOP3P_OPS[] = {
     {0x12u, Opcode::VPkMaxF16},     {0x20u, Opcode::VFmaF32},       {0x21u, Opcode::VMadMixloF16},
     {0x22u, Opcode::VMadMixhiF16},
 };
+
+constexpr auto VOP3P_OPS = Detail::MakeOpcodeTable<0x80>(VOP3P_OPCODE_LIST);
 
 bool IsVop2LiteralMadOpcode(uint32_t opcode) {
 	return opcode == 0x20u || opcode == 0x21u || opcode == 0x2cu || opcode == 0x2du;
@@ -312,7 +320,7 @@ Opcode LookupVop3Opcode(uint32_t opcode) {
 	if (opcode >= 0x180u && opcode <= 0x1ffu) {
 		return Detail::LookupOpcode(VOP3_ENCODED_VOP1_OPS, opcode - 0x180u);
 	}
-	return Detail::LookupOpcode(VOP3_OPS, opcode);
+	return Opcode::Unsupported;
 }
 
 bool IsVop3EncodedVopc(uint32_t opcode) {
@@ -573,13 +581,6 @@ bool ValidateVop1Sdwa(Instruction& inst, uint32_t opcode, uint32_t modifier) {
 
 bool DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vdst, Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOP1 SDWA instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const auto modifier  = code[word_index + 1u];
 	const auto src0      = modifier & 0xffu;
 	const auto dst_sel   = (modifier >> 8u) & 0x7u;
@@ -598,9 +599,14 @@ bool DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	}
 
 	const bool scalar_dst = UsesScalarDestination(inst.opcode);
-	if (!(scalar_dst ? DecodeScalarDestination(vdst, pc, inst.dst, error)
-	                 : DecodeVectorGpr(vdst, inst.dst, error)) ||
-	    !DecodeScalarSource(src0 + (s0 == 0u ? 256u : 0u), pc, inst.src0, error)) {
+	if (scalar_dst) {
+		if (!DecodeScalarDestination(vdst, pc, inst.dst, error)) {
+			return false;
+		}
+	} else {
+		DecodeVectorGpr(vdst, inst.dst);
+	}
+	if (!DecodeScalarSource(src0 + (s0 == 0u ? 256u : 0u), pc, inst.src0, error)) {
 		return false;
 	}
 	inst.dst.sdwa_sel        = dst_sel;
@@ -612,7 +618,8 @@ bool DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	inst.src0.negate         = src0_neg != 0u;
 	inst.src0.absolute       = src0_abs != 0u;
 	inst.src_count           = 1;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 void ApplyDppModifier(Operand& operand, uint32_t modifier) {
@@ -628,21 +635,19 @@ void ApplyDppModifier(Operand& operand, uint32_t modifier) {
 
 bool DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOP1 DPP instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);
 
 	const bool scalar_dst = UsesScalarDestination(inst.opcode);
-	if (!(scalar_dst ? DecodeScalarDestination(vdst, pc, inst.dst, error)
-	                 : DecodeVectorGpr(vdst, inst.dst, error)) ||
-	    !DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
+	if (scalar_dst) {
+		if (!DecodeScalarDestination(vdst, pc, inst.dst, error)) {
+			return false;
+		}
+	} else {
+		DecodeVectorGpr(vdst, inst.dst);
+	}
+	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
 		return false;
 	}
 	ApplyDppModifier(inst.src0, modifier);
@@ -653,7 +658,8 @@ bool DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 		               "VOP1 DPP integer source modifiers are not supported");
 		return true;
 	}
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 using Vop1ModifierDecodeFn = bool (*)(uint32_t pc, std::span<const uint32_t> code,
@@ -976,19 +982,13 @@ bool FinalizeVop2Instruction(uint32_t pc, std::span<const uint32_t> code, uint32
 			break;
 		default: inst.src_count = 2; break;
 	}
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 bool DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst,
                     std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOP2 SDWA instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const auto modifier = code[word_index + 1u];
 	const auto fields   = DecodeVop2SdwaFields(modifier);
 	SetRawWords(inst, code, word_index, 2);
@@ -996,8 +996,8 @@ bool DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 		return true;
 	}
 
-	if (!DecodeVectorGpr(vdst, inst.dst, error) ||
-	    !DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0, error) ||
+	DecodeVectorGpr(vdst, inst.dst);
+	if (!DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0, error) ||
 	    !DecodeScalarSource(vsrc1 + (fields.s1 == 0u ? 256u : 0u), pc, inst.src1, error)) {
 		return false;
 	}
@@ -1019,20 +1019,13 @@ bool DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 bool DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst,
                    std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOP2 DPP instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);
 
-	if (!DecodeVectorGpr(vdst, inst.dst, error) ||
-	    !DecodeScalarSource(src0 + 256u, pc, inst.src0, error) ||
-	    !DecodeVectorGpr(vsrc1, inst.src1, error)) {
+	DecodeVectorGpr(vdst, inst.dst);
+	DecodeVectorGpr(vsrc1, inst.src1);
+	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
 		return false;
 	}
 	ApplyDefaultVop2F16Destination(inst);
@@ -1120,13 +1113,6 @@ bool SupportsVopcSdwa(Opcode opcode) {
 
 bool DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vsrc1, Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOPC SDWA instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const auto modifier = code[word_index + 1u];
 	const auto fields   = DecodeVopcSdwaFields(modifier);
 	SetRawWords(inst, code, word_index, 2);
@@ -1160,18 +1146,12 @@ bool DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	inst.src1.negate    = fields.src1_neg != 0u;
 	inst.src1.absolute  = fields.src1_abs != 0u;
 	inst.src_count      = 2;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 bool DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vsrc1, Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOPC DPP instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);
@@ -1184,8 +1164,8 @@ bool DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC DPP modifier is not supported for opcode");
 		return true;
 	}
-	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error) ||
-	    !DecodeVectorGpr(vsrc1, inst.src1, error)) {
+	DecodeVectorGpr(vsrc1, inst.src1);
+	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
 		return false;
 	}
 	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
@@ -1193,7 +1173,8 @@ bool DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
 	inst.src_count     = 2;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 uint32_t NativeVop3SourceCount(Opcode opcode) {
@@ -1480,11 +1461,6 @@ bool DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.opcode    = LookupVop2Opcode(opcode);
 	SetRawWords(inst, code, word_index, 1);
 
-	switch (opcode) {
-		case 0x3eu: return DecodeVopc(pc, code, word_index, inst, error);
-		case 0x3fu: return DecodeVop1(pc, code, word_index, inst, error);
-		default: break;
-	}
 	if (inst.opcode == Opcode::Unsupported) {
 		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 opcode is not implemented");
 		return true;
@@ -1498,9 +1474,9 @@ bool DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return true;
 	}
 
-	if (!DecodeVectorGpr(vdst, inst.dst, error) ||
-	    !DecodeScalarSource(src0, pc, inst.src0, error) ||
-	    !DecodeVectorGpr(vsrc1, inst.src1, error)) {
+	DecodeVectorGpr(vdst, inst.dst);
+	DecodeVectorGpr(vsrc1, inst.src1);
+	if (!DecodeScalarSource(src0, pc, inst.src0, error)) {
 		return false;
 	}
 	ApplyDefaultVop2F16Destination(inst);
@@ -1539,13 +1515,19 @@ bool DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return true;
 	}
 	const bool scalar_dst = UsesScalarDestination(inst.opcode);
-	if (!(scalar_dst ? DecodeScalarDestination(vdst, pc, inst.dst, error)
-	                 : DecodeVectorGpr(vdst, inst.dst, error)) ||
-	    !DecodeScalarSource(src0, pc, inst.src0, error)) {
+	if (scalar_dst) {
+		if (!DecodeScalarDestination(vdst, pc, inst.dst, error)) {
+			return false;
+		}
+	} else {
+		DecodeVectorGpr(vdst, inst.dst);
+	}
+	if (!DecodeScalarSource(src0, pc, inst.src0, error)) {
 		return false;
 	}
 	inst.src_count = 1;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 bool DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
@@ -1572,23 +1554,17 @@ bool DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
 		return true;
 	}
-	if (!DecodeScalarSource(src0, pc, inst.src0, error) ||
-	    !DecodeVectorGpr(vsrc1, inst.src1, error)) {
+	DecodeVectorGpr(vsrc1, inst.src1);
+	if (!DecodeScalarSource(src0, pc, inst.src0, error)) {
 		return false;
 	}
 	inst.src_count = 2;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
                 std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOP3 instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const uint32_t word0  = code[word_index];
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t opcode = (word0 >> 16u) & 0x3ffu;
@@ -1655,7 +1631,7 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		// VOP3A uses VDST for VOPC and the scalar-destination lane-read opcodes.
 		dst_ok = DecodeScalarDestination(vdst, pc, inst.dst, error);
 	} else {
-		dst_ok = DecodeVectorGpr(vdst, inst.dst, error);
+		DecodeVectorGpr(vdst, inst.dst);
 	}
 	if (!dst_ok || !DecodeScalarSource(src0, pc, inst.src0, error)) {
 		return false;
@@ -1674,14 +1650,16 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		if (native_source_modifiers) {
 			ApplyNativeVop3SourceModifiers(inst, abs, neg);
 		}
-		return ReadLiteralOperands(code, word_index, inst, error);
+		ReadLiteralOperands(code, word_index, inst);
+		return true;
 	}
 	if (IsVop3EncodedVop1(opcode)) {
 		inst.src_count = 1;
 		if (native_source_modifiers) {
 			ApplyNativeVop3SourceModifiers(inst, abs, neg);
 		}
-		return ReadLiteralOperands(code, word_index, inst, error);
+		ReadLiteralOperands(code, word_index, inst);
+		return true;
 	}
 	if (carry_in_out) {
 		if (!DecodeScalarDestination(sdst, pc, inst.dst2, error) ||
@@ -1690,7 +1668,8 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			return false;
 		}
 		inst.src_count = 3;
-		return ReadLiteralOperands(code, word_index, inst, error);
+		ReadLiteralOperands(code, word_index, inst);
+		return true;
 	}
 	if (vop3b_carry_out) {
 		if (!DecodeScalarDestination(sdst, pc, inst.dst2, error) ||
@@ -1698,7 +1677,8 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			return false;
 		}
 		inst.src_count = 2;
-		return ReadLiteralOperands(code, word_index, inst, error);
+		ReadLiteralOperands(code, word_index, inst);
+		return true;
 	}
 	if (vop3b_mad_u64) {
 		if (!DecodeScalarDestination(sdst, pc, inst.dst2, error) ||
@@ -1707,7 +1687,8 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			return false;
 		}
 		inst.src_count = 3;
-		return ReadLiteralOperands(code, word_index, inst, error);
+		ReadLiteralOperands(code, word_index, inst);
+		return true;
 	}
 	if (IsVop3EncodedVop2(opcode)) {
 		if (!DecodeScalarSource(src1, pc, inst.src1, error)) {
@@ -1724,7 +1705,8 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		if (native_source_modifiers) {
 			ApplyNativeVop3SourceModifiers(inst, abs, neg);
 		}
-		return ReadLiteralOperands(code, word_index, inst, error);
+		ReadLiteralOperands(code, word_index, inst);
+		return true;
 	}
 	if (!DecodeScalarSource(src1, pc, inst.src1, error)) {
 		return false;
@@ -1744,31 +1726,26 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	} else if (native_source_modifiers) {
 		ApplyNativeVop3SourceModifiers(inst, abs, neg);
 	}
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 bool DecodeVop3p(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                  Instruction& inst, std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VOP3P instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
 	const uint32_t word0       = code[word_index];
 	const uint32_t word1       = code[word_index + 1u];
 	const uint32_t opcode      = (word0 >> 16u) & 0x7fu;
 	const uint32_t vdst        = word0 & 0xffu;
 	const uint32_t neg_hi      = (word0 >> 8u) & 0x7u;
 	const uint32_t op_sel      = (word0 >> 11u) & 0x7u;
-	const uint32_t op_sel_hi_2 = (word0 >> 14u) & 0x1u;
+	const uint32_t op_sel_hi_0 = (word0 >> 14u) & 0x1u;
 	const uint32_t clamp       = (word0 >> 15u) & 0x1u;
 	const uint32_t src0        = word1 & 0x1ffu;
 	const uint32_t src1        = (word1 >> 9u) & 0x1ffu;
 	const uint32_t src2        = (word1 >> 18u) & 0x1ffu;
-	const uint32_t op_sel_hi   = ((word1 >> 27u) & 0x3u) | (op_sel_hi_2 << 2u);
-	const uint32_t neg         = (word1 >> 29u) & 0x7u;
+	const uint32_t op_sel_hi =
+	    op_sel_hi_0 | (((word1 >> 28u) & 0x1u) << 1u) | (((word1 >> 27u) & 0x1u) << 2u);
+	const uint32_t neg = (word1 >> 29u) & 0x7u;
 
 	inst.pc        = pc;
 	inst.word      = word0;
@@ -1782,8 +1759,8 @@ bool DecodeVop3p(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 		return true;
 	}
 	inst.src_count = Vop3pSourceCount(inst.opcode);
-	if (!DecodeVectorGpr(vdst, inst.dst, error) ||
-	    !DecodeScalarSource(src0, pc, inst.src0, error) ||
+	DecodeVectorGpr(vdst, inst.dst);
+	if (!DecodeScalarSource(src0, pc, inst.src0, error) ||
 	    !DecodeScalarSource(src1, pc, inst.src1, error)) {
 		return false;
 	}
@@ -1810,18 +1787,12 @@ bool DecodeVop3p(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	} else if (inst.opcode == Opcode::VFmaF32) {
 		ApplyVop3pMixAbsModifiers(inst);
 	}
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
-bool DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                  Instruction& inst, std::string* error) {
-	if (word_index >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated VINTRP instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                  Instruction& inst) {
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 16u) & 0x3u;
 	const uint32_t vdst   = (word >> 18u) & 0xffu;
@@ -1838,18 +1809,16 @@ bool DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_ind
 	SetRawWords(inst, code, word_index, 1);
 	if (inst.opcode == Opcode::Unsupported) {
 		SetUnsupported(inst, Family::VINTRP, opcode, "VINTRP opcode is not implemented");
-		return true;
+		return;
 	}
 
-	if (!DecodeVectorGpr(vdst, inst.dst, error)) {
-		return false;
-	}
+	DecodeVectorGpr(vdst, inst.dst);
 	if (inst.opcode == Opcode::VInterpMovF32) {
 		inst.src0.kind       = OperandKind::IntegerInlineConstant;
 		inst.src0.value      = vsrc & 0x3u;
 		inst.src0.signed_val = static_cast<int32_t>(inst.src0.value);
-	} else if (!DecodeVectorGpr(vsrc, inst.src0, error)) {
-		return false;
+	} else {
+		DecodeVectorGpr(vsrc, inst.src0);
 	}
 	inst.src1.kind       = OperandKind::IntegerInlineConstant;
 	inst.src1.value      = attr;
@@ -1858,7 +1827,6 @@ bool DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_ind
 	inst.src2.value      = chan;
 	inst.src2.signed_val = static_cast<int32_t>(chan);
 	inst.src_count       = 3;
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

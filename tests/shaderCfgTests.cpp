@@ -11,20 +11,20 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/shader/recompiler/ExecMask.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
-#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/shader.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
@@ -163,8 +163,7 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
 }
 
 bool SpirvSourceHasInstructionOperand(const std::string &source,
-                                      const char *opcode,
-                                      const char *operand) {
+                                      const char *opcode, const char *operand) {
   std::istringstream lines(source);
   std::string line;
   while (std::getline(lines, line)) {
@@ -835,13 +834,14 @@ constexpr uint32_t EncodeVop3pWord0(uint32_t opcode, uint32_t dst,
                                     uint32_t neg_hi = 0, bool clamp = false) {
   return (0x33u << 26u) | ((opcode & 0x7fu) << 16u) | (dst & 0xffu) |
          ((neg_hi & 0x7u) << 8u) | ((op_sel & 0x7u) << 11u) |
-         (((op_sel_hi >> 2u) & 0x1u) << 14u) | (clamp ? (1u << 15u) : 0u);
+         ((op_sel_hi & 0x1u) << 14u) | (clamp ? (1u << 15u) : 0u);
 }
 
 constexpr uint32_t EncodeVop3pWord1(uint32_t src0, uint32_t src1, uint32_t src2,
                                     uint32_t op_sel_hi = 0, uint32_t neg = 0) {
   return (src0 & 0x1ffu) | ((src1 & 0x1ffu) << 9u) | ((src2 & 0x1ffu) << 18u) |
-         ((op_sel_hi & 0x3u) << 27u) | ((neg & 0x7u) << 29u);
+         (((op_sel_hi >> 2u) & 0x1u) << 27u) |
+         (((op_sel_hi >> 1u) & 0x1u) << 28u) | ((neg & 0x7u) << 29u);
 }
 
 constexpr uint32_t EncodeSmem0(uint32_t opcode, uint32_t dst, uint32_t sbase) {
@@ -3313,6 +3313,81 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
   Check(Common::ContainsStr(error, "no IR lowering") ||
             Common::ContainsStr(error, "unsupported decoded"),
         "unsupported lowering error was not explicit");
+}
+
+void TestNewShaderDecoderArchitecture() {
+  using namespace ShaderRecompiler::Decoder;
+
+  Check(GetInstructionFamily(EncodeVop1(0x01, 2, 3)) == Family::VOP1,
+        "decoder did not classify compact VOP1 directly");
+  Check(GetInstructionFamily(EncodeVopc(0x02, 2, 3)) == Family::VOPC,
+        "decoder did not classify compact VOPC directly");
+  Check(GetInstructionFamily(EncodeDs0(0x36)) == Family::DS,
+        "decoder did not classify DS directly");
+
+  const uint32_t offset_code[] = {0u, EncodeVop1(0x01, 2, 3)};
+  Instruction direct;
+  std::string error;
+  Check(DecodeInstruction(offset_code, 1u, direct, &error), error.c_str());
+  Check(direct.pc == 4u && direct.family == Family::VOP1 &&
+            direct.opcode == Opcode::VMovB32 && direct.dst.reg == 2u &&
+            direct.src0.reg == 3u,
+        "single-instruction decoder failed at a nonzero offset");
+
+  const uint32_t program_code[] = {EncodeVop1(0x01, 2, 3), EncodeSopp(0x01, 0)};
+  Instruction program_direct;
+  Check(DecodeInstruction(program_code, 0u, program_direct, &error),
+        error.c_str());
+  Program program;
+  Check(DecodeProgram(program_code, program, &error), error.c_str());
+  Check(program.instructions.size() == 2u &&
+            program.instructions.front().family == program_direct.family &&
+            program.instructions.front().opcode == program_direct.opcode &&
+            program.instructions.front().word_count ==
+                program_direct.word_count,
+        "program decoder diverged from the single-instruction decoder");
+
+  const uint32_t literal_code[] = {EncodeVop1(0x01, 2, 255u), 0x12345678u};
+  Instruction literal;
+  Check(DecodeInstruction(literal_code, 0u, literal, &error), error.c_str());
+  Check(literal.word_count == 2u && literal.src0.value == 0x12345678u,
+        "single-instruction decoder lost a compact literal extension");
+
+  const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
+                               EncodeMimg1(4, 0, 1, 8), 0x03020100u,
+                               0x07060504u, 0x0b0a0908u};
+  Instruction image;
+  Check(DecodeInstruction(mimg_nsa, 0u, image, &error), error.c_str());
+  Check(image.family == Family::MIMG && image.word_count == 5u &&
+            image.image_nsa_dwords == 3u,
+        "single-instruction decoder lost the MIMG NSA length");
+
+  const uint32_t ds_code[] = {EncodeDs0(0x36) | (1u << 17u),
+                              EncodeDs1(2, 0, 1)};
+  Instruction ds;
+  Check(DecodeInstruction(ds_code, 0u, ds, &error), error.c_str());
+  Check(ds.opcode == Opcode::DsReadB32 && ds.gds,
+        "DS decoder lost the GFX10 opcode or GDS fields");
+
+  const uint32_t boot_ds[] = {0xd8d4c480u, 0x45000045u};
+  Instruction boot;
+  Check(DecodeInstruction(boot_ds, 0u, boot, &error), error.c_str());
+  Check(boot.opcode == Opcode::DsSwizzleB32 && boot.offset == 0xc480u,
+        "DS decoder rejected a captured boot-shader instruction");
+
+  for (uint32_t source = 0; source < 3u; source++) {
+    const uint32_t op_sel_hi = 1u << source;
+    const uint32_t packed[] = {
+        EncodeVop3pWord0(0x0e, 0, 0, op_sel_hi),
+        EncodeVop3pWord1(256, 257, 258, op_sel_hi),
+    };
+    Instruction packed_inst;
+    Check(DecodeInstruction(packed, 0u, packed_inst, &error), error.c_str());
+    Check(packed_inst.src0.op_sel_hi == (source == 0u) &&
+              packed_inst.src1.op_sel_hi == (source == 1u) &&
+              packed_inst.src2.op_sel_hi == (source == 2u),
+          "VOP3P OPSEL_HI source bit mapping is incorrect");
+  }
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
@@ -6053,14 +6128,17 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
 
 void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
   const uint32_t shader[] = {
-      EncodeSMovB32(0, 128),                               // preheader: s0 = 0
-      EncodeMubuf0(0x0c),           EncodeMubuf1(0, 0, 1), // loop:
-                                                           // buffer_load_dword
-                                                           // v0
+      EncodeSMovB32(0, 128), // preheader: s0 = 0
+      EncodeMubuf0(0x0c),
+      EncodeMubuf1(0, 0, 1),       // loop:
+                                   // buffer_load_dword
+                                   // v0
       EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
       EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
       EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
-      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 12, 0), 0xbf810000u,
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0),
+      0xbf810000u,
   };
 
   ShaderRecompiler::CompileOptions options;
@@ -6458,16 +6536,16 @@ void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
 
 void TestNewShaderRecompilerCfgLoopGatewaySelection() {
   const uint32_t shader[] = {
-      EncodeSopc(0x0a, 0, 130),    // loop: s_cmp_lt_u32 s0, 2
-      EncodeSopp(0x04, 8),         // loop exit -> end
-      EncodeSopc(0x06, 1, 1),      // skip-body condition
-      EncodeSopp(0x05, 3),         // skip body -> loop-control gateway
-      EncodeSopc(0x06, 2, 2),      // body early-break condition
-      EncodeSopp(0x05, 4),         // early break -> end
-      EncodeSMovB32(3, 129),       // body work
-      EncodeSopc(0x0a, 0, 130),    // loop-control gateway
-      EncodeSopp(0x04, 1),         // exit -> end, else latch
-      EncodeSopp(0x02, 0xfff6u),   // latch -> loop header
+      EncodeSopc(0x0a, 0, 130),  // loop: s_cmp_lt_u32 s0, 2
+      EncodeSopp(0x04, 8),       // loop exit -> end
+      EncodeSopc(0x06, 1, 1),    // skip-body condition
+      EncodeSopp(0x05, 3),       // skip body -> loop-control gateway
+      EncodeSopc(0x06, 2, 2),    // body early-break condition
+      EncodeSopp(0x05, 4),       // early break -> end
+      EncodeSMovB32(3, 129),     // body work
+      EncodeSopc(0x0a, 0, 130),  // loop-control gateway
+      EncodeSopp(0x04, 1),       // exit -> end, else latch
+      EncodeSopp(0x02, 0xfff6u), // latch -> loop header
       0xbf810000u,
   };
 
@@ -7017,9 +7095,12 @@ void TestNewShaderRecompilerCompareMaskIsFullWaveBallot() {
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
-      EncodeMubuf0(0x0c),           EncodeMubuf1(0, 0, 1), // buffer_load_dword
-                                                           // v0
-      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 12, 0), EncodeSopp(0x01),
+      EncodeMubuf0(0x0c),
+      EncodeMubuf1(0, 0, 1), // buffer_load_dword
+                             // v0
+      EncodeMubuf0(0x1c, 0, false),
+      EncodeMubuf1(0, 12, 0),
+      EncodeSopp(0x01),
   };
 
   ShaderRecompiler::CompileOptions options;
@@ -7430,9 +7511,7 @@ void TestNewShaderRecompilerPerInvocationU64Complement() {
       EncodeSop2(0x0f, 2, 126, 106), // s_and_b64 s[2:3], exec, vcc
       EncodeSop1(0x08, 4, 2),        // s_not_b64 s[4:5], s[2:3]
       EncodeSop2(0x0f, 126, 126, 4), // s_and_b64 exec, exec, s[4:5]
-      EncodeExp0(0x0c, 0xf),
-      EncodeExp1(0, 1, 2, 3),
-      EncodeSopp(0x01),
+      EncodeExp0(0x0c, 0xf),         EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01),
   };
 
   ShaderRecompiler::CompileOptions options;
@@ -7542,7 +7621,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   const auto compressed_ba_source =
       DisassembleSpirvBinary(compressed_ba_result.spirv);
   Check(CountSourceOccurrences(compressed_ba_source, "OpCompositeExtract") ==
-            1u &&
+                1u &&
             CountSourceOccurrences(compressed_ba_source,
                                    "OpBitFieldUExtract") == 2u,
         "compressed UINT16 BA-only export did not read and unpack VSRC1");
@@ -7796,7 +7875,7 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   Check(!Common::ContainsStr(ordinary_source, "pixel_valid_mask_active"),
         "ordinary pixel shader allocated pixel-valid state");
   Check(SpirvContainsExecutionMode(ordinary_result.spirv,
-                                  ExecutionModeEarlyFragmentTests),
+                                   ExecutionModeEarlyFragmentTests),
         "ordinary early-Z pixel shader lost EarlyFragmentTests");
   CheckSpirvBinaryValidates(ordinary_result.spirv);
 }
@@ -8294,9 +8373,9 @@ void TestSrtWalkerRealSmemLowering() {
 
 void TestSrtWalkerVccBaseLowering() {
   const uint32_t shader[] = {
-      EncodeSMovB32(106, 27), EncodeSMovB32(107, 28),
+      EncodeSMovB32(106, 27),   EncodeSMovB32(107, 28),
       EncodeSmem0(0x02, 0, 53), 125u << 25u,
-      EncodeMubuf0(0x1c),         EncodeMubuf1(0, 0, 1),
+      EncodeMubuf0(0x1c),       EncodeMubuf1(0, 0, 1),
       EncodeSopp(0x01),
   };
   std::string error;
@@ -8307,8 +8386,8 @@ void TestSrtWalkerVccBaseLowering() {
   Check(ir.values->srt_reads.size() == 4,
         "VCC-based SMEM lowering did not build four SRT reads");
 
-  const std::array<uint32_t, 4> table = {0x11111111u, 0x22222222u,
-                                         0x33333333u, 0x44444444u};
+  const std::array<uint32_t, 4> table = {0x11111111u, 0x22222222u, 0x33333333u,
+                                         0x44444444u};
   std::array<uint32_t, 32> user_data{};
   const auto address = reinterpret_cast<uint64_t>(table.data());
   user_data[27] = static_cast<uint32_t>(address);
@@ -8461,9 +8540,8 @@ void TestScalarMemoryLoadCrossesIntoVcc() {
         "wide SMEM destination crossing into VCC lost its descriptor source");
   for (uint32_t dword = 0; dword < 4; dword++) {
     const auto *value = source->dwords[dword].ResolveInstruction();
-    Check(value != nullptr &&
-              value->GetOpcode() ==
-                  ShaderRecompiler::IR::ValueOpcode::ReadConst,
+    Check(value != nullptr && value->GetOpcode() ==
+                                  ShaderRecompiler::IR::ValueOpcode::ReadConst,
           "wide SMEM descriptor lost a dword crossing into VCC");
   }
 }
@@ -8698,11 +8776,9 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CheckSpirvBinaryValidates(spirv);
 
   const uint32_t vcc_load_shader[] = {
-      EncodeSMovB32(106, 27),    EncodeSMovB32(107, 28),
-      EncodeSmem0(0x02, 44, 53), (0x7du << 25u) | 160u,
-      EncodeMubuf0(0x0c),        EncodeMubuf1(0, 11, 1),
-      EncodeExp0(0x00, 0x1),      EncodeExp1(0, 0, 0, 0),
-      EncodeSopp(0x01),
+      EncodeSMovB32(106, 27), EncodeSMovB32(107, 28), EncodeSmem0(0x02, 44, 53),
+      (0x7du << 25u) | 160u,  EncodeMubuf0(0x0c),     EncodeMubuf1(0, 11, 1),
+      EncodeExp0(0x00, 0x1),  EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
   };
   std::array<uint32_t, 44> table{};
   std::array<uint32_t, 1> buffer{};
@@ -8899,6 +8975,7 @@ int main() {
   // Opcode semantics and optimized direct SPIR-V are exercised by
   // ShaderRecompilerComputeTests. The pre-SSA register-IR shape checks above
   // remain as historical decoder fixtures only.
+  TestNewShaderDecoderArchitecture();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestPsInputCountRegisterDecode();

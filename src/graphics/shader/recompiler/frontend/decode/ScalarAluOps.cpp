@@ -7,7 +7,7 @@ namespace {
 
 using Detail::OpcodeMap;
 
-constexpr OpcodeMap SOP2_OPS[] = {
+constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x00u, Opcode::SAddU32},       {0x01u, Opcode::SSubU32},       {0x02u, Opcode::SAddI32},
     {0x03u, Opcode::SSubI32},       {0x04u, Opcode::SAddcU32},      {0x05u, Opcode::SSubbU32},
     {0x06u, Opcode::SMinI32},       {0x07u, Opcode::SMinU32},       {0x08u, Opcode::SMaxI32},
@@ -26,7 +26,7 @@ constexpr OpcodeMap SOP2_OPS[] = {
     {0x35u, Opcode::SMulHiU32},
 };
 
-constexpr OpcodeMap SOP1_OPS[] = {
+constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x03u, Opcode::SMovB32},           {0x04u, Opcode::SMovB64},
     {0x07u, Opcode::SNotB32},           {0x08u, Opcode::SNotB64},
     {0x0au, Opcode::SWqmB64},           {0x0bu, Opcode::SBrevB32},
@@ -40,7 +40,7 @@ constexpr OpcodeMap SOP1_OPS[] = {
     {0x3cu, Opcode::SAndSaveexecB32},   {0x44u, Opcode::SAndn1SaveexecB32},
 };
 
-constexpr OpcodeMap SOPC_OPS[] = {
+constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
     {0x00u, Opcode::SCmpEqI32},   {0x01u, Opcode::SCmpLgI32},   {0x02u, Opcode::SCmpGtI32},
     {0x03u, Opcode::SCmpGeI32},   {0x04u, Opcode::SCmpLtI32},   {0x05u, Opcode::SCmpLeI32},
     {0x06u, Opcode::SCmpEqU32},   {0x07u, Opcode::SCmpLgU32},   {0x08u, Opcode::SCmpGtU32},
@@ -49,7 +49,7 @@ constexpr OpcodeMap SOPC_OPS[] = {
     {0x13u, Opcode::SCmpLgU64},
 };
 
-constexpr OpcodeMap SOPK_OPS[] = {
+constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
     {0x00u, Opcode::SMovkI32},   {0x03u, Opcode::SCmpEqI32}, {0x04u, Opcode::SCmpLgI32},
     {0x05u, Opcode::SCmpGtI32},  {0x06u, Opcode::SCmpGeI32}, {0x07u, Opcode::SCmpLtI32},
     {0x08u, Opcode::SCmpLeI32},  {0x09u, Opcode::SCmpEqU32}, {0x0au, Opcode::SCmpLgU32},
@@ -59,7 +59,7 @@ constexpr OpcodeMap SOPK_OPS[] = {
     {0x19u, Opcode::SWaitcnt},   {0x1au, Opcode::SWaitcnt},
 };
 
-constexpr OpcodeMap SOPP_OPS[] = {
+constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x00u, Opcode::SNop},          {0x01u, Opcode::SEndpgm},       {0x02u, Opcode::SBranch},
     {0x04u, Opcode::SCbranchScc0},  {0x05u, Opcode::SCbranchScc1},  {0x06u, Opcode::SCbranchVccz},
     {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
@@ -67,11 +67,12 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x10u, Opcode::SSendmsg},      {0x12u, Opcode::STrap},         {0x16u, Opcode::STtraceData},
     {0x20u, Opcode::SInstPrefetch},
 };
-static_assert(Detail::HasUniqueEncodings(SOP1_OPS));
-static_assert(Detail::HasUniqueEncodings(SOP2_OPS));
-static_assert(Detail::HasUniqueEncodings(SOPK_OPS));
-static_assert(Detail::HasUniqueEncodings(SOPC_OPS));
-static_assert(Detail::HasUniqueEncodings(SOPP_OPS));
+
+constexpr auto SOP1_OPS = Detail::MakeOpcodeTable<0x100>(SOP1_OPCODE_LIST);
+constexpr auto SOP2_OPS = Detail::MakeOpcodeTable<0x80>(SOP2_OPCODE_LIST);
+constexpr auto SOPK_OPS = Detail::MakeOpcodeTable<0x20>(SOPK_OPCODE_LIST);
+constexpr auto SOPC_OPS = Detail::MakeOpcodeTable<0x80>(SOPC_OPCODE_LIST);
+constexpr auto SOPP_OPS = Detail::MakeOpcodeTable<0x80>(SOPP_OPCODE_LIST);
 
 bool DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                          Instruction& inst, uint32_t ssrc0, uint32_t ssrc1, std::string* error) {
@@ -80,7 +81,8 @@ bool DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t w
 		return false;
 	}
 	inst.src_count = 2;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 } // namespace
@@ -114,7 +116,8 @@ bool DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			if (!DecodeScalarSource(ssrc0, pc, inst.src0, error)) {
 				return false;
 			}
-			return ReadLiteralOperands(code, word_index, inst, error);
+			ReadLiteralOperands(code, word_index, inst);
+			return true;
 		default: break;
 	}
 
@@ -123,7 +126,8 @@ bool DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return false;
 	}
 	inst.src_count = 1;
-	return ReadLiteralOperands(code, word_index, inst, error);
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
 }
 
 bool DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
@@ -158,8 +162,6 @@ bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t opcode = (word >> 23u) & 0x1fu;
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
 	const auto     imm    = static_cast<int16_t>(word & 0xffffu);
-
-	(void)error;
 
 	inst.pc              = pc;
 	inst.word            = word;
@@ -234,13 +236,11 @@ bool DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	return DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1, error);
 }
 
-bool DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
+void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 16u) & 0x7fu;
 	const uint32_t simm   = word & 0xffffu;
-
-	(void)error;
 
 	inst.pc              = pc;
 	inst.word            = word;
@@ -265,7 +265,6 @@ bool DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::Unsupported) {
 		SetUnsupported(inst, Family::SOPP, opcode, "SOPP control-flow opcode is not implemented");
 	}
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

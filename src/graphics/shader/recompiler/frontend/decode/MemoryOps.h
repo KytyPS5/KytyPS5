@@ -5,16 +5,15 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
-bool DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
-bool DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                 Instruction& inst, std::string* error);
-bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                 Instruction& inst, std::string* error);
-bool DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
-bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-              std::string* error);
+void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
+void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                 Instruction& inst);
+void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                 Instruction& inst);
+void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
+void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
 

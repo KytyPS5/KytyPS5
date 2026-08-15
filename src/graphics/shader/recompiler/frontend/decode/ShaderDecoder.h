@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
@@ -664,7 +665,7 @@ struct Instruction {
 		bool     compr  = false;
 		bool     vm     = false;
 	} exp;
-	std::string unsupported_reason;
+	std::string_view unsupported_reason;
 };
 
 struct Program {
@@ -672,13 +673,17 @@ struct Program {
 	std::vector<Instruction>  instructions;
 };
 
+// Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
+Family GetInstructionFamily(uint32_t word);
+// The output object must be freshly initialized.
+bool DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
+                       std::string* error);
 bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error);
 
 bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
 bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
-bool DecodeVectorGpr(uint32_t reg, Operand& operand, std::string* error);
-bool ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                         std::string* error);
+void DecodeVectorGpr(uint32_t reg, Operand& operand);
+void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,
                  uint32_t word_count);
 void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const char* reason);

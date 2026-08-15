@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <bit>
 #include <fmt/format.h>
-#include <set>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
@@ -111,7 +110,7 @@ std::string WithUnsupportedReason(const Instruction& inst, const std::string& te
 	}
 	return text + fmt::format(" ; family={} opcode=0x{:02x} raw=[{}] reason={}",
 	                          FamilyToString(inst.family).c_str(), inst.opcode_id,
-	                          RawWordsToString(inst).c_str(), inst.unsupported_reason.c_str());
+	                          RawWordsToString(inst).c_str(), inst.unsupported_reason);
 }
 
 void AppendFlag(std::string* text, bool* first, uint32_t flags, uint32_t flag, const char* name) {
@@ -238,7 +237,8 @@ bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::strin
 		return true;
 	}
 	if (code >= 256u && code <= 511u) {
-		return DecodeVectorGpr(code - 256u, operand, error);
+		DecodeVectorGpr(code - 256u, operand);
+		return true;
 	}
 
 	switch (code) {
@@ -292,27 +292,15 @@ bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::
 	}
 }
 
-bool DecodeVectorGpr(uint32_t reg, Operand& operand, std::string* error) {
-	if (reg > 255u) {
-		SetError(error, "VGPR index is out of range");
-		return false;
-	}
+void DecodeVectorGpr(uint32_t reg, Operand& operand) {
 	operand      = {};
 	operand.kind = OperandKind::Vgpr;
 	operand.reg  = reg;
-	return true;
 }
 
-bool ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                         std::string* error) {
+void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	if (!HasLiteral(inst)) {
-		return true;
-	}
-	if (word_index + inst.word_count >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("missing literal constant at pc 0x{:08x}", inst.pc);
-		}
-		return false;
+		return;
 	}
 
 	const auto literal = code[word_index + inst.word_count];
@@ -322,13 +310,12 @@ bool ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, In
 	ApplyLiteral(inst.src3, literal);
 	inst.word_count++;
 	SetRawWords(inst, code, word_index, inst.word_count);
-	return true;
 }
 
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,
                  uint32_t word_count) {
 	inst.word_count = word_count;
-	inst.raw_count  = std::min<uint32_t>(word_count, MaxInstructionRawWords);
+	inst.raw_count  = word_count;
 	for (uint32_t i = 0; i < inst.raw_count; i++) {
 		inst.raw[i] = code[word_index + i];
 	}
@@ -341,69 +328,96 @@ void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const 
 	inst.unsupported_reason = reason;
 }
 
-bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error) {
-	if (code.empty() || code.size() > UINT32_MAX / sizeof(uint32_t)) {
-		SetError(error, "invalid shader decoder input");
-		return false;
+Family GetInstructionFamily(uint32_t word) {
+	if ((word & 0x80000000u) == 0u) {
+		switch ((word >> 25u) & 0x3fu) {
+			case 0x3eu: return Family::VOPC;
+			case 0x3fu: return Family::VOP1;
+			default: return Family::VOP2;
+		}
+	}
+	if ((word & 0xc0000000u) == 0x80000000u) {
+		const auto opcode = (word >> 23u) & 0x7fu;
+		switch (opcode) {
+			case 0x7du: return Family::SOP1;
+			case 0x7eu: return Family::SOPC;
+			case 0x7fu: return Family::SOPP;
+			default: return opcode >= 0x60u ? Family::SOPK : Family::SOP2;
+		}
 	}
 
+	switch (word >> 26u) {
+		case 0x32u: return Family::VINTRP;
+		case 0x33u: return Family::VOP3P;
+		case 0x35u: return Family::VOP3;
+		case 0x36u: return Family::DS;
+		case 0x37u: return Family::FLAT;
+		case 0x38u: return Family::MUBUF;
+		case 0x3au: return Family::MTBUF;
+		case 0x3cu: return Family::MIMG;
+		case 0x3du: return Family::SMEM;
+		case 0x3eu: return Family::EXP;
+		default: return Family::Unknown;
+	}
+}
+
+bool DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
+                       std::string* error) {
+	const uint32_t pc = word_index * sizeof(uint32_t);
+	switch (GetInstructionFamily(code[word_index])) {
+		case Family::SOP1: return DecodeSop1(pc, code, word_index, inst, error);
+		case Family::SOP2: return DecodeSop2(pc, code, word_index, inst, error);
+		case Family::SOPK: return DecodeSopk(pc, code, word_index, inst, error);
+		case Family::SOPC: return DecodeSopc(pc, code, word_index, inst, error);
+		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return true;
+		case Family::VOP1: return DecodeVop1(pc, code, word_index, inst, error);
+		case Family::VOP2: return DecodeVop2(pc, code, word_index, inst, error);
+		case Family::VOP3: return DecodeVop3(pc, code, word_index, inst, error);
+		case Family::VOP3P: return DecodeVop3p(pc, code, word_index, inst, error);
+		case Family::VOPC: return DecodeVopc(pc, code, word_index, inst, error);
+		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return true;
+		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return true;
+		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return true;
+		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return true;
+		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return true;
+		case Family::DS: DecodeDs(pc, code, word_index, inst); return true;
+		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return true;
+		case Family::EXP: DecodeExp(pc, code, word_index, inst); return true;
+		default:
+			if (error != nullptr) {
+				*error =
+				    fmt::format("unknown RDNA2 instruction family at pc 0x{:08x}, raw=0x{:08x}", pc,
+				                code[word_index]);
+			}
+			return false;
+	}
+}
+
+bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error) {
 	program.instructions.clear();
+	program.instructions.reserve(code.size());
 	program.code = code;
 
-	std::set<uint32_t> branch_targets;
+	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
-		const uint32_t pc   = word_index * 4u;
-		const uint32_t word = code[word_index];
-
-		Instruction inst;
-		bool        ok = false;
-		if ((word & 0x80000000u) == 0u) {
-			ok = DecodeVop2(pc, code, word_index, inst, error);
-		} else if ((word & 0xc0000000u) == 0x80000000u) {
-			const auto opcode = (word >> 23u) & 0x7fu;
-			switch (opcode) {
-				case 0x7du: ok = DecodeSop1(pc, code, word_index, inst, error); break;
-				case 0x7eu: ok = DecodeSopc(pc, code, word_index, inst, error); break;
-				case 0x7fu: ok = DecodeSopp(pc, code, word_index, inst, error); break;
-				default:
-					ok = opcode >= 0x60u ? DecodeSopk(pc, code, word_index, inst, error)
-					                     : DecodeSop2(pc, code, word_index, inst, error);
-					break;
-			}
-		} else {
-			switch (word >> 26u) {
-				case 0x32u: ok = DecodeVintrp(pc, code, word_index, inst, error); break;
-				case 0x33u: ok = DecodeVop3p(pc, code, word_index, inst, error); break;
-				case 0x35u: ok = DecodeVop3(pc, code, word_index, inst, error); break;
-				case 0x36u: ok = DecodeDs(pc, code, word_index, inst, error); break;
-				case 0x37u: ok = DecodeFlat(pc, code, word_index, inst, error); break;
-				case 0x38u: ok = DecodeMubuf(pc, code, word_index, inst, error); break;
-				case 0x3au: ok = DecodeMtbuf(pc, code, word_index, inst, error); break;
-				case 0x3cu: ok = DecodeMimg(pc, code, word_index, inst, error); break;
-				case 0x3du: ok = DecodeSmem(pc, code, word_index, inst, error); break;
-				case 0x3eu: ok = DecodeExp(pc, code, word_index, inst, error); break;
-				default:
-					if (error != nullptr) {
-						*error = fmt::format(
-						    "unknown RDNA2 instruction family at pc 0x{:08x}, raw=0x{:08x}", pc,
-						    word);
-					}
-					return false;
-			}
-		}
-
-		if (!ok) {
+		program.instructions.emplace_back();
+		if (!DecodeInstruction(code, word_index, program.instructions.back(), error)) {
+			program.instructions.pop_back();
 			return false;
 		}
 
-		program.instructions.push_back(inst);
+		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
 
 		if (IsControlFlowBranch(inst.opcode)) {
-			branch_targets.insert(inst.branch_target);
+			const auto target_index = inst.branch_target / sizeof(uint32_t);
+			if (branch_targets.empty()) {
+				branch_targets.resize(code.size());
+			}
+			branch_targets[target_index] = true;
 		}
 		if (inst.opcode == Opcode::SEndpgm &&
-		    (word_index >= code.size() || !branch_targets.contains(word_index * 4u))) {
+		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
 			return true;
 		}
 	}
@@ -1001,7 +1015,7 @@ std::string InstructionToString(const Instruction& inst) {
 	if (inst.opcode == Opcode::Unsupported) {
 		return fmt::format("0x{:08x}: unsupported family={} opcode=0x{:02x} raw=[{}] reason={}",
 		                   inst.pc, FamilyToString(inst.family).c_str(), inst.opcode_id,
-		                   RawWordsToString(inst).c_str(), inst.unsupported_reason.c_str());
+		                   RawWordsToString(inst).c_str(), inst.unsupported_reason);
 	}
 	if (inst.family == Family::SOPC) {
 		return WithUnsupportedReason(inst, FormatSources(inst));

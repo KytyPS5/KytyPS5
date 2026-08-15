@@ -1,21 +1,21 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
+#include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
+
 #include <algorithm>
-#include <fmt/format.h>
-#include <iterator>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 struct MimgSampleInfo {
-	uint32_t    opcode             = 0;
+	uint32_t    encoding           = 0;
 	const char* name               = nullptr;
 	uint32_t    flags              = 0;
 	uint32_t    address_components = 3;
 };
 
 struct MimgGatherInfo {
-	uint32_t    opcode             = 0;
+	uint32_t    encoding           = 0;
 	const char* name               = nullptr;
 	Opcode      decoded            = Opcode::Unsupported;
 	uint32_t    flags              = 0;
@@ -23,9 +23,9 @@ struct MimgGatherInfo {
 };
 
 struct MimgAtomicInfo {
-	uint32_t    opcode  = 0;
-	const char* name    = nullptr;
-	Opcode      decoded = Opcode::Unsupported;
+	uint32_t    encoding = 0;
+	const char* name     = nullptr;
+	Opcode      decoded  = Opcode::Unsupported;
 };
 
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
@@ -88,7 +88,7 @@ constexpr MimgSampleInfo SampleInfo(uint32_t opcode, const char* name, uint32_t 
 	return {opcode, name, flags, ImageSampleAddressComponents(flags, ImageDimension::Dim2D)};
 }
 
-constexpr MimgSampleInfo MIMG_SAMPLE_OPS[] = {
+constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     SampleInfo(0x20u, "image_sample", 0),
     SampleInfo(0x21u, "image_sample_cl", ImageSampleFlagLodClamp),
     SampleInfo(0x22u, "image_sample_d", ImageSampleFlagDerivative),
@@ -177,7 +177,7 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPS[] = {
                    ImageSampleFlagOffset),
 };
 
-constexpr MimgGatherInfo MIMG_GATHER_OPS[] = {
+constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x47u, "image_gather4_lz", Opcode::ImageGather4Lz, ImageSampleFlagLevelZero, 2u},
     {0x48u, "image_gather4_c", Opcode::ImageGather4C, ImageSampleFlagCompare, 3u},
     {0x4fu, "image_gather4_c_lz", Opcode::ImageGather4CLz,
@@ -191,7 +191,7 @@ constexpr MimgGatherInfo MIMG_GATHER_OPS[] = {
     {0x61u, "image_gather4h", Opcode::ImageGather4H, ImageSampleFlagGatherHorizontal, 2u},
 };
 
-constexpr MimgAtomicInfo MIMG_ATOMIC_OPS[] = {
+constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x11u, "image_atomic_add", Opcode::ImageAtomicAdd},
     {0x15u, "image_atomic_umin", Opcode::ImageAtomicUMin},
     {0x17u, "image_atomic_umax", Opcode::ImageAtomicUMax},
@@ -200,31 +200,20 @@ constexpr MimgAtomicInfo MIMG_ATOMIC_OPS[] = {
     {0x1au, "image_atomic_xor", Opcode::ImageAtomicXor},
 };
 
+constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
+constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCODE_LIST);
+constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
+
 const MimgSampleInfo* LookupSample(uint32_t opcode) {
-	for (const auto& info: MIMG_SAMPLE_OPS) {
-		if (info.opcode == opcode) {
-			return &info;
-		}
-	}
-	return nullptr;
+	return Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
 }
 
 const MimgGatherInfo* LookupGather(uint32_t opcode) {
-	for (const auto& info: MIMG_GATHER_OPS) {
-		if (info.opcode == opcode) {
-			return &info;
-		}
-	}
-	return nullptr;
+	return Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
 }
 
 const MimgAtomicInfo* LookupAtomic(uint32_t opcode) {
-	for (const auto& info: MIMG_ATOMIC_OPS) {
-		if (info.opcode == opcode) {
-			return &info;
-		}
-	}
-	return nullptr;
+	return Detail::FindOpcode(MIMG_ATOMIC_OPS, opcode);
 }
 
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
@@ -297,27 +286,14 @@ bool IsSingleDmaskBit(uint32_t dmask) {
 
 } // namespace
 
-bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated MIMG instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
-
+void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word0      = code[word_index];
 	const uint32_t word1      = code[word_index + 1u];
 	const uint32_t opcode     = ((word0 >> 18u) & 0x7fu) | ((word0 & 1u) << 7u);
 	const uint32_t nsa_dwords = (word0 >> 1u) & 0x3u;
 	const auto     dimension  = DecodeImageDimension((word0 >> 3u) & 0x7u);
 	const uint32_t word_count = 2u + nsa_dwords;
-	if (word_index + word_count > code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated MIMG NSA instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
 
 	const uint32_t vdata  = (word1 >> 8u) & 0xffu;
 	const uint32_t vaddr  = word1 & 0xffu;
@@ -344,7 +320,7 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	inst.image_dimension  = dimension;
 	inst.image_nsa_dwords = nsa_dwords;
-	for (uint32_t i = 0; i < nsa_dwords * 4u && i < MaxImageNsaAddressComponents; i++) {
+	for (uint32_t i = 0; i < nsa_dwords * 4u; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
@@ -359,12 +335,11 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		               "MIMG image gather requires exactly one dmask bit");
 	}
 
-	DecodeVectorGpr(vdata, inst.dst, nullptr);
-	DecodeVectorGpr(vaddr, inst.src0, nullptr);
+	DecodeVectorGpr(vdata, inst.dst);
+	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1, nullptr);
 	DecodeScalarSource(ssamp * 4u, pc, inst.src2, nullptr);
 	inst.src_count = 3;
-	return true;
 }
 
 const char* MimgSampleOpcodeName(uint32_t opcode) {

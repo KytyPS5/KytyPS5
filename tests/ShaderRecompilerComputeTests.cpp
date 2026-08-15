@@ -6216,6 +6216,138 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckRenderExecutorColorDepthTileDiscovery() {
+    constexpr const char *name = "RenderExecutorColorDepthTile";
+    constexpr uintptr_t base = 0x0000000203d00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "depth-tiled color allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "depth-tiled color mapping failed");
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    TileTextureBlockLayout tile_layout{};
+    Require(name, "tile layout",
+            TileGetTextureBlockLayout(Prospero::BufferFormat::k32Float,
+                                      Prospero::TileMode::kDepth, false,
+                                      tile_layout),
+            "depth-tiled color block layout is unavailable");
+    uint32_t block_xor = 0;
+    Require(name, "block xor",
+            TileGetBlockXor(tile_layout.block, 0, 0, 0, block_xor),
+            "depth-tiled color block XOR is unavailable");
+    std::vector<uint32_t> expected(allocation_size / sizeof(uint32_t));
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        uint32_t offset = 0;
+        Require(name, "texel offset",
+                TileGetBlockOffset(tile_layout.block, x, y, 0, offset),
+                "depth-tiled color texel offset is unavailable");
+        const auto index = (offset ^ block_xor) / sizeof(uint32_t);
+        Require(name, "texel address", index < expected.size(),
+                "depth-tiled color texel address exceeds its backing");
+        expected[index] = 0x3f000000u + y * width + x;
+      }
+    }
+    std::memcpy(mapped, expected.data(), allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k32,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 63, .width = 63});
+      registers.SetColorAttrib3(
+          0, {.tile_mode = Prospero::TileMode::kDepth,
+              .dimension = 1,
+              .cmask_pipe_aligned = true,
+              .dcc_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, 1, scheduler.Current(), color, 0);
+      const auto attachment =
+          texture_cache.FindRenderTarget(color.image_id, color.desc);
+      const auto &image = texture_cache.GetImage(color.image_id);
+      Require(name, "captured target",
+              color.image_id && attachment != nullptr &&
+                  color.desc.info.tile_mode == Prospero::TileMode::kDepth &&
+                  color.desc.info.pitch == 128 &&
+                  color.desc.info.data.size == allocation_size &&
+                  color.desc.info.mip_layout[0].size == allocation_size &&
+                  image.usage.render_target && image.IsGpuModified(),
+              "supported depth-tiled color target was not resolved");
+      scheduler.FinishCurrent();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint8_t> cleared(allocation_size);
+      Require(name, "clear guest backing",
+              Libs::LibKernel::Memory::TryWriteBacking(
+                  base, cleared.data(), allocation_size),
+              "depth-tiled color backing could not be cleared");
+      Require(name, "readback queue",
+              TextureCacheTestAccess::TryDownload(texture_cache, color.image_id),
+              "depth-tiled color target could not be queued for readback");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint32_t> observed(expected.size());
+      Require(name, "readback backing",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base, observed.data(), allocation_size),
+              "depth-tiled color readback is unavailable");
+      bool recovered = true;
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          uint32_t offset = 0;
+          const auto valid =
+              TileGetBlockOffset(tile_layout.block, x, y, 0, offset);
+          const auto index = (offset ^ block_xor) / sizeof(uint32_t);
+          recovered &= valid && index < observed.size() &&
+                       observed[index] == expected[index];
+        }
+      }
+      Require(name, "round trip", recovered,
+              "depth-tiled color upload/readback changed active texels");
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "depth-tiled color mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "depth-tiled color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -20414,6 +20546,7 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
@@ -20559,6 +20692,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
+  vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();

@@ -924,7 +924,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 					EXIT("TextureCache: invalid color-attachment upload\n");
 				}
 				format           = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
-				allow_depth_tile = false;
+				allow_depth_tile = true;
 				plan.swap_bgra16 = info.bgra16;
 				owner            = "RenderTarget";
 				break;
@@ -950,7 +950,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 		format           = binding == BindingType::RenderTarget
 		                       ? ImageOps::RenderTargetTransferFormat(info.bytes_per_block)
 		                       : info.guest_format;
-		allow_depth_tile = binding == BindingType::Storage;
+		allow_depth_tile = binding == BindingType::Storage || binding == BindingType::RenderTarget;
 		plan.swap_bgra16 = info.bgra16;
 	}
 

@@ -11694,6 +11694,79 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   return test;
 }
 
+TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 24, Vgpr(0)));
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(2)));
+  code.push_back(EncodeVop1(0x01, 2, InlineU32(1)));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  code.push_back(EncodeVopc(0xc1, Vgpr(0), 1));
+  code.push_back(0x54003080u); // v_subrev_co_ci_u32 v0, 0, v24, vcc
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 2));
+  AppendBufferStoreDword(&code, 0, 4);
+  AppendBufferStoreDword(&code, 3, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorSubrevCoCiU32ExactRawOnGpu";
+  test.code = code;
+  test.expected = {0xffffffffu, 0, 2, 3, 1, 0, 0, 0};
+  test.opcodes = {O::VMovB32,          O::VLshlrevB32,    O::VAddNcU32,
+                  O::VCmpLtU32,        O::VSubrevCoCiU32, O::VCndmaskB32,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.required_spirv = {"OpISub", "OpUGreaterThan"};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorVop3BSubrevCoCiUsesEncodedMasks() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 24, Vgpr(0)));
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(2)));
+  code.push_back(EncodeVop1(0x01, 2, InlineU32(1)));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  code.push_back(EncodeVopc(0xc1, Vgpr(0), 1));
+  code.push_back(EncodeSop1(0x04, 20, 106)); // s_mov_b64 s[20:21], vcc
+  AppendSMovLiteral(&code, 106, 0);
+  AppendSMovLiteral(&code, 107, 0);
+  AppendVop3B(&code, 0x12au, 10, 22, InlineU32(0), Vgpr(24), 20);
+  AppendVop3(&code, 0x101u, 3, InlineU32(0), Vgpr(2), 22);
+  AppendBufferStoreDword(&code, 10, 4);
+  AppendBufferStoreDword(&code, 3, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorVop3BSubrevCoCiUsesEncodedMasks";
+  test.code = code;
+  test.expected = {0xffffffffu, 0, 2, 3, 1, 0, 0, 0};
+  test.opcodes = {O::VMovB32,        O::VLshlrevB32, O::VAddNcU32,
+                  O::VCmpLtU32,      O::SMovB64,     O::SMovB32,
+                  O::VSubrevCoCiU32, O::VCndmaskB32, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorVop3BCarryOutWritesSgprMask() {
   using O = ShaderOpcode;
 
@@ -16800,6 +16873,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
+  AddCase(VectorSubrevCoCiU32ExactRawOnGpu);
+  AddCase(VectorVop3BSubrevCoCiUsesEncodedMasks);
   AddCase(VectorVop3BCarryOutWritesSgprMask);
   AddCase(VectorVop3BCarryOutUsesEncodedSdst);
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);

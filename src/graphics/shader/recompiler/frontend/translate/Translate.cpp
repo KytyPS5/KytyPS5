@@ -585,7 +585,7 @@ IR::U32 Translator::ConditionBit(const IR::Operand& operand) {
 	if (operand.kind == IR::OperandKind::ImmediateU32) {
 		return IR::U32(IR::Value(operand.imm & 1u));
 	}
-	return ir.Select(ReadCondition(operand), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
+	return ir.Select(ReadMask(operand), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
 }
 
 IR::U1 Translator::ReadMask(const IR::Operand& operand) {

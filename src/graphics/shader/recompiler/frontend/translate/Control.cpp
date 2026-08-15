@@ -74,7 +74,8 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 			}
 			return true;
 		}
-		case IR::Opcode::ScalarSubBorrowCarryU32: {
+		case IR::Opcode::ScalarSubBorrowCarryU32:
+		case IR::Opcode::ISubBorrowCarryU32: {
 			const auto lhs       = ReadU32(inst.src[0]);
 			const auto rhs       = ReadU32(inst.src[1]);
 			const auto borrow_in = ConditionBit(inst.src[2]);
@@ -83,7 +84,12 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 			const auto borrow0   = ir.UGreaterThan(rhs, lhs);
 			const auto borrow1   = ir.UGreaterThan(borrow_in, partial);
 			WriteOperand(inst.dst, result);
-			ir.SetScc(ir.LogicalOr(borrow0, borrow1));
+			const auto borrow = ir.LogicalOr(borrow0, borrow1);
+			if (inst.op == IR::Opcode::ScalarSubBorrowCarryU32) {
+				ir.SetScc(borrow);
+			} else {
+				WriteMask(inst.dst2, borrow);
+			}
 			return true;
 		}
 		case IR::Opcode::ScalarSignedAddOverflowI32:

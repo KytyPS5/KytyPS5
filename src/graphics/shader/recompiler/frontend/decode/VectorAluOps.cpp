@@ -63,6 +63,7 @@ constexpr Vop2OpcodeInfo VOP2_OPS[] = {
     {0x24u, Opcode::VMbcntHiU32B32},
     {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerFullDestination},
     {0x28u, Opcode::VAddcU32},
+    {0x2au, Opcode::VSubrevCoCiU32},
     {0x26u, Opcode::VSubNcU32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x27u, Opcode::VSubrevNcU32, Vop2SdwaProfile::IntegerFullDestination},
     {0x2bu, Opcode::VMacF32},
@@ -967,6 +968,7 @@ bool FinalizeVop2Instruction(uint32_t pc, std::span<const uint32_t> code, uint32
 			inst.src_count = 3;
 			break;
 		case Opcode::VAddcU32:
+		case Opcode::VSubrevCoCiU32:
 			inst.dst2.kind = OperandKind::VccLo;
 			inst.src2.kind = OperandKind::VccLo;
 			inst.src_count = 3;
@@ -1373,9 +1375,10 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 	}
 }
 
-bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix, bool addc,
-                                       bool scalar_dst, uint32_t abs, uint32_t op_sel,
-                                       uint32_t clamp, uint32_t omod, uint32_t neg) {
+bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,
+                                       bool carry_in_out, bool scalar_dst, uint32_t abs,
+                                       uint32_t op_sel, uint32_t clamp, uint32_t omod,
+                                       uint32_t neg) {
 	const bool source_modifiers = SupportsNativeVop3SourceModifiers(opcode);
 	const bool result_modifiers = SupportsNativeVop3ResultModifiers(opcode);
 
@@ -1391,7 +1394,7 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	if (IsNativeVop3B16BinaryOpcode(opcode)) {
 		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
 	}
-	if (addc || scalar_dst) {
+	if (carry_in_out || scalar_dst) {
 		return clamp != 0u || omod != 0u || neg != 0u;
 	}
 	switch (opcode) {
@@ -1606,19 +1609,20 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.opcode    = LookupVop3Opcode(opcode);
 	SetRawWords(inst, code, word_index, 2);
 
-	const bool addc                    = inst.opcode == Opcode::VAddcU32 && opcode == 0x128u;
-	const bool vop3b_carry_out         = IsVop3BCarryOutOpcode(inst.opcode);
-	const bool vop3b_mad_u64           = IsVop3BMadU64Opcode(inst.opcode);
-	const bool vop3b_uses_sdst         = addc || vop3b_carry_out || vop3b_mad_u64;
-	const bool mad_mix                 = false;
-	const bool f16_ternary             = IsNativeVop3F16TernaryOpcode(inst.opcode);
-	const bool b16_binary              = IsNativeVop3B16BinaryOpcode(inst.opcode);
-	const bool pack_b32_f16            = inst.opcode == Opcode::VPackB32F16;
-	const bool permlane                = IsPermlaneOpcode(inst.opcode);
-	const bool vop3_vopc               = IsVop3EncodedVopc(opcode);
-	const bool compare_exec            = vop3_vopc && IsVopcCompareExec(inst.opcode);
-	const bool scalar_dst              = vop3_vopc || UsesScalarDestination(inst.opcode);
-	const bool scalar_modifier_limits  = UsesScalarDestination(inst.opcode);
+	const bool carry_in_out           = (inst.opcode == Opcode::VAddcU32 && opcode == 0x128u) ||
+	                                    (inst.opcode == Opcode::VSubrevCoCiU32 && opcode == 0x12au);
+	const bool vop3b_carry_out        = IsVop3BCarryOutOpcode(inst.opcode);
+	const bool vop3b_mad_u64          = IsVop3BMadU64Opcode(inst.opcode);
+	const bool vop3b_uses_sdst        = carry_in_out || vop3b_carry_out || vop3b_mad_u64;
+	const bool mad_mix                = false;
+	const bool f16_ternary            = IsNativeVop3F16TernaryOpcode(inst.opcode);
+	const bool b16_binary             = IsNativeVop3B16BinaryOpcode(inst.opcode);
+	const bool pack_b32_f16           = inst.opcode == Opcode::VPackB32F16;
+	const bool permlane               = IsPermlaneOpcode(inst.opcode);
+	const bool vop3_vopc              = IsVop3EncodedVopc(opcode);
+	const bool compare_exec           = vop3_vopc && IsVopcCompareExec(inst.opcode);
+	const bool scalar_dst             = vop3_vopc || UsesScalarDestination(inst.opcode);
+	const bool scalar_modifier_limits = UsesScalarDestination(inst.opcode);
 	const bool native_source_modifiers = SupportsNativeVop3SourceModifiers(inst.opcode);
 	const bool native_result_modifiers = SupportsNativeVop3ResultModifiers(inst.opcode);
 	const bool modifiers =
@@ -1678,7 +1682,7 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		}
 		return ReadLiteralOperands(code, word_index, inst, error);
 	}
-	if (addc) {
+	if (carry_in_out) {
 		if (!DecodeScalarDestination(sdst, pc, inst.dst2, error) ||
 		    !DecodeScalarSource(src1, pc, inst.src1, error) ||
 		    !DecodeScalarSource(src2, pc, inst.src2, error)) {

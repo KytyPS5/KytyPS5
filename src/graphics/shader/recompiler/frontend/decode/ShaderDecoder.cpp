@@ -671,6 +671,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VMadMixhiF16: return "v_mad_mixhi_f16";
 		case Opcode::VAddNcU32: return "v_add_nc_u32";
 		case Opcode::VAddcU32: return "v_addc_u32";
+		case Opcode::VSubrevCoCiU32: return "v_subrev_co_ci_u32";
 		case Opcode::VSubNcU32: return "v_sub_nc_u32";
 		case Opcode::VSubrevNcU32: return "v_subrev_nc_u32";
 		case Opcode::VAddNcU16: return "v_add_nc_u16";

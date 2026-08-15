@@ -3356,6 +3356,20 @@ void TestNewShaderDecoderArchitecture() {
   Check(literal.word_count == 2u && literal.src0.value == 0x12345678u,
         "single-instruction decoder lost a compact literal extension");
 
+  const uint32_t scalar_signed_bfe[] = {
+      0x946aff14u, // s_bfe_i32 vcc_lo, s20, 0x0004001c
+      0x0004001cu,
+  };
+  Instruction signed_bfe;
+  Check(DecodeInstruction(scalar_signed_bfe, 0u, signed_bfe, &error),
+        error.c_str());
+  Check(signed_bfe.family == Family::SOP2 &&
+            signed_bfe.opcode == Opcode::SBfeI32 &&
+            signed_bfe.word_count == 2u &&
+            signed_bfe.dst.kind == OperandKind::VccLo &&
+            signed_bfe.src0.reg == 20u && signed_bfe.src1.value == 0x0004001cu,
+        "decoder rejected or misdecoded captured S_BFE_I32 instruction");
+
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,
                                0x07060504u, 0x0b0a0908u};

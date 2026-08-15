@@ -515,14 +515,18 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			result = ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {right_mask64(count), offset});
 			break;
 		}
-		case IR::Opcode::BitFieldExtractU32: {
+		case IR::Opcode::BitFieldExtractU32:
+		case IR::Opcode::BitFieldExtractI32: {
 			const auto source = ReadU32(inst.src[0]);
 			const auto field  = ReadU32(inst.src[1]);
 			const auto offset = extract(field, imm(0), imm(5), false);
 			const auto count =
 			    IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {extract(field, imm(16), imm(7), false),
 			                                              ir.ISub(imm(32), offset)}));
-			result = ir.Emit(IR::ValueOpcode::BitFieldUExtract, {source, offset, count});
+			const auto opcode = inst.op == IR::Opcode::BitFieldExtractI32
+			                        ? IR::ValueOpcode::BitFieldSExtract
+			                        : IR::ValueOpcode::BitFieldUExtract;
+			result            = ir.Emit(opcode, {source, offset, count});
 			break;
 		}
 		case IR::Opcode::BitFieldExtractU64: {

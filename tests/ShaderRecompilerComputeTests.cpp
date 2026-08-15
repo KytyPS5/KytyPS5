@@ -11164,6 +11164,36 @@ TestCase ScalarBrevB32PreservesScc() {
            O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase ScalarBfeI32CapturedRawSignExtends() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+  code.push_back(0x946aff14u); // s_bfe_i32 vcc_lo, s20, literal
+  code.push_back(0x0004001cu); // offset 28, width 4
+  code.push_back(EncodeSop2(0x0a, 21, InlineU32(1), InlineU32(0)));
+  code.push_back(EncodeSop2(0x28, 22, 20, 255u));
+  code.push_back(0u); // zero width produces zero and clears SCC
+  code.push_back(EncodeSop2(0x0a, 23, InlineU32(1), InlineU32(0)));
+  AppendStoreSgpr(&code, 106, 1);
+  AppendStoreSgpr(&code, 21, 2);
+  AppendStoreSgpr(&code, 22, 3);
+  AppendStoreSgpr(&code, 23, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarBfeI32CapturedRawSignExtends";
+  test.code = std::move(code);
+  test.initial = {0xf0000000u, 0, 0, 0, 0};
+  test.expected = {0xf0000000u, 0xffffffffu, 1, 0, 0};
+  test.opcodes = {O::BufferLoadDword, O::VReadfirstlaneB32, O::SBfeI32,
+                  O::SCselectB32,     O::VMovB32,           O::BufferStoreDword,
+                  O::SEndpgm};
+  test.required_spirv = {"OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase BitfieldExtractWidthPastEndEdges() {
   using O = ShaderOpcode;
 
@@ -16981,6 +17011,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
   AddCase(ScalarBrevB32PreservesScc);
+  AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
   AddCase(ScalarAndn2B64SccBranch);

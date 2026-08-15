@@ -20,10 +20,10 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x1du, Opcode::SXnorB64},      {0x1eu, Opcode::SLshlB32},      {0x1fu, Opcode::SLshlB64},
     {0x20u, Opcode::SLshrB32},      {0x21u, Opcode::SLshrB64},      {0x22u, Opcode::SAshrI32},
     {0x24u, Opcode::SBfmB32},       {0x25u, Opcode::SBfmB64},       {0x26u, Opcode::SMulI32},
-    {0x27u, Opcode::SBfeU32},       {0x29u, Opcode::SBfeU64},       {0x2eu, Opcode::SLshl1AddU32},
-    {0x2fu, Opcode::SLshl2AddU32},  {0x30u, Opcode::SLshl3AddU32},  {0x31u, Opcode::SLshl4AddU32},
-    {0x32u, Opcode::SPackLlB32B16}, {0x33u, Opcode::SPackLhB32B16}, {0x34u, Opcode::SPackHhB32B16},
-    {0x35u, Opcode::SMulHiU32},
+    {0x27u, Opcode::SBfeU32},       {0x28u, Opcode::SBfeI32},       {0x29u, Opcode::SBfeU64},
+    {0x2eu, Opcode::SLshl1AddU32},  {0x2fu, Opcode::SLshl2AddU32},  {0x30u, Opcode::SLshl3AddU32},
+    {0x31u, Opcode::SLshl4AddU32},  {0x32u, Opcode::SPackLlB32B16}, {0x33u, Opcode::SPackLhB32B16},
+    {0x34u, Opcode::SPackHhB32B16}, {0x35u, Opcode::SMulHiU32},
 };
 
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {

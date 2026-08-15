@@ -63,6 +63,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::SMulHiU32, Opcode::UMulHighU32},
     {Decoder::Opcode::SMulkI32, Opcode::IMulU32},
     {Decoder::Opcode::SBfeU32, Opcode::BitFieldExtractU32},
+    {Decoder::Opcode::SBfeI32, Opcode::BitFieldExtractI32},
     {Decoder::Opcode::SBfeU64, Opcode::BitFieldExtractU64},
     {Decoder::Opcode::SBfmB32, Opcode::BitFieldMaskU32},
     {Decoder::Opcode::SBfmB64, Opcode::BitFieldMaskU64},
@@ -492,6 +493,7 @@ bool ScalarResultWritesSccNonZero(Decoder::Opcode opcode) {
 		case Decoder::Opcode::SLshrB32:
 		case Decoder::Opcode::SAshrI32:
 		case Decoder::Opcode::SBfeU32:
+		case Decoder::Opcode::SBfeI32:
 		case Decoder::Opcode::SAndB64:
 		case Decoder::Opcode::SAndn2B64:
 		case Decoder::Opcode::SNotB64:

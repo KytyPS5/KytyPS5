@@ -219,7 +219,24 @@ static void GameEventTerminate(WindowLoopState& game) {
 	game.need_exit = true;
 }
 
+static void ToggleDesktopFullscreen() {
+	if (g_window == nullptr || g_window->window == nullptr) {
+		return;
+	}
+
+	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const bool fullscreen =
+	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode =
+	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
+		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
+	}
+}
+
 static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
+	static SDL_Keycode fullscreen_key = SDLK_UNKNOWN;
+
 #ifdef KYTY_DBG_INPUT
 	LOGF("Key: time = %.04f, %s%s, %s%s, %s, scan = %d, key = %d, mod = %04" PRIx16 "\n",
 	     key.timestamp_seconds, (key.down ? "down" : ""), (key.up ? "up" : ""),
@@ -237,13 +254,30 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 					RenderDocRequestCapture();
 				}
 				break;
+			case SDLK_F11:
+				if (!key.repeat) {
+					ToggleDesktopFullscreen();
+				}
+				break;
+			case SDLK_RETURN:
+			case SDLK_KP_ENTER:
+				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
+					ToggleDesktopFullscreen();
+					fullscreen_key = key.key_code;
+				}
+				break;
 			default: break;
 		}
 	}
 
 #endif
 
-	if ((key.down || key.up) && !key.repeat) {
+	const bool fullscreen_key_event =
+	    fullscreen_key != SDLK_UNKNOWN && key.key_code == fullscreen_key;
+	if (fullscreen_key_event && key.up) {
+		fullscreen_key = SDLK_UNKNOWN;
+	}
+	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event) {
 		HostInputKey(key.key_code, key.down);
 	}
 }

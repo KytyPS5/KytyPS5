@@ -308,8 +308,17 @@ private:
 		if (inst == nullptr) {
 			return Fail(use_pc, error, "invalid typed planning value");
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
-			return inst->GetOpcode() == ValueOpcode::Phi;
+		const auto cycle = std::ranges::find(m_visiting, inst);
+		if (cycle != m_visiting.end()) {
+			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
+				return value->GetOpcode() == ValueOpcode::Phi;
+			});
+			if (contains_phi) {
+				return true;
+			}
+			return Fail(use_pc, error,
+			            fmt::format("cyclic typed planning value {} without a phi",
+			                        ValueOpcodeName(inst->GetOpcode())));
 		}
 		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
 			return true;

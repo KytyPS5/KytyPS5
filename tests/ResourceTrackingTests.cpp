@@ -447,6 +447,28 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
+void TestLoopCycleEnteredThroughRuntimeValue() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  const auto initial = fixture.UserData(0);
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                  static_cast<uint64_t>(Type::U32));
+  const auto carried = fixture.Emit(
+      ValueOpcode::BitwiseAnd32, {Value(&phi), Value(0xffffffffu)}, 0, loop);
+  phi.AddPhiOperand(entry, initial);
+  phi.AddPhiOperand(loop, carried);
+  fixture.Emit(ValueOpcode::GetBufferResource,
+               {carried, Value(0u), Value(0u), Value(0u)},
+               MemoryFlags{0, 12}, loop);
+
+  std::string error;
+  Check(BuildSrtPlan(fixture.program, &error),
+        "SRT planning rejected a valid loop entered through a runtime value");
+}
+
 void TestInvariantLoopPhi() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -610,6 +632,7 @@ int main() {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
+    Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("address materialization", TestAddressMaterializationAndSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);

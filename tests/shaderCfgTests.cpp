@@ -1461,6 +1461,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
       EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
       EncodeVop3Word0(0x14e, 50),
       EncodeVop3Word1(5 + 256, 6 + 256, 129),
+      EncodeVop3Word0(0x14f, 115),
+      EncodeVop3Word1(5 + 256, 6 + 256, 129),
       EncodeVop3Word0(0x36d, 51),
       EncodeVop3Word1(5 + 256, 6 + 256, 7 + 256),
       EncodeVop3Word0(0x169, 52),
@@ -1811,6 +1813,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
         "new decoder did not decode VOP3 bitfield insert-select");
   Check(Common::ContainsStr(result.decoded_dump, "v_alignbit_b32 v50"),
         "new decoder did not decode VOP3 alignbit");
+  Check(Common::ContainsStr(result.decoded_dump, "v_alignbyte_b32 v115"),
+        "new decoder did not decode VOP3 alignbyte");
   Check(Common::ContainsStr(result.decoded_dump, "v_add3_u32 v51"),
         "new decoder did not decode VOP3 add3");
   Check(Common::ContainsStr(result.decoded_dump, "v_mul_lo_u32 v52, v5, v6"),
@@ -2186,6 +2190,8 @@ void TestNewShaderRecompilerMoreAluFamilies() {
         "VOP3 bitfield insert-select did not lower to IR");
   Check(Common::ContainsStr(result.ir_dump, "AlignBitU32 v50"),
         "VOP3 alignbit did not lower to IR");
+  Check(Common::ContainsStr(result.ir_dump, "AlignByteU32 v115"),
+        "VOP3 alignbyte did not lower to IR");
   Check(Common::ContainsStr(result.ir_dump, "IAdd3U32 v51"),
         "VOP3 add3 did not lower to IR");
   Check(Common::ContainsStr(result.ir_dump, "IMulU32 v52, v5, v6"),

@@ -216,6 +216,7 @@ enum class Opcode {
 	VBfeI32,
 	VBfiB32,
 	VAlignbitB32,
+	VAlignbyteB32,
 	VMin3F32,
 	VMin3I32,
 	VMin3U32,

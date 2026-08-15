@@ -151,6 +151,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VBfeI32, Opcode::BitFieldExtract3I32},
     {Decoder::Opcode::VBfiB32, Opcode::BitFieldInsertSelectU32},
     {Decoder::Opcode::VAlignbitB32, Opcode::AlignBitU32},
+    {Decoder::Opcode::VAlignbyteB32, Opcode::AlignByteU32},
     {Decoder::Opcode::VMin3F32, Opcode::FMin3F32},
     {Decoder::Opcode::VMin3I32, Opcode::IMin3I32},
     {Decoder::Opcode::VMin3U32, Opcode::UMin3U32},

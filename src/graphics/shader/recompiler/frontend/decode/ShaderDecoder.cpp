@@ -618,6 +618,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VBfeI32: return "v_bfe_i32";
 		case Opcode::VBfiB32: return "v_bfi_b32";
 		case Opcode::VAlignbitB32: return "v_alignbit_b32";
+		case Opcode::VAlignbyteB32: return "v_alignbyte_b32";
 		case Opcode::VMin3F32: return "v_min3_f32";
 		case Opcode::VMin3I32: return "v_min3_i32";
 		case Opcode::VMin3U32: return "v_min3_u32";

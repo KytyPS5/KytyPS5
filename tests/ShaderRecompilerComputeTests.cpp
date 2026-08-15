@@ -11584,6 +11584,28 @@ TestCase VectorBfeI32ArithmeticShiftMasksField() {
           {O::VMovB32, O::VBfeI32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase VectorAlignByteUsesFiveBitByteOffset() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0x55667788u);
+  constexpr u32 offsets[] = {0, 1, 3, 4, 5, 7, 8, 31};
+  for (u32 i = 0; i < static_cast<u32>(std::size(offsets)); i++) {
+    AppendVMovU32(&code, 2, offsets[i]);
+    AppendVop3(&code, 0x14f, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorAlignByteUsesFiveBitByteOffset",
+          code,
+          {},
+          {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
+           0x00000011u, 0u, 0u},
+          {O::VMovB32, O::VAlignbyteB32, O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase VectorCarryAndBitCountOps() {
   using O = ShaderOpcode;
 
@@ -16901,6 +16923,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32ArithmeticShiftMasksField);
+  AddCase(VectorAlignByteUsesFiveBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -20239,6 +20262,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {

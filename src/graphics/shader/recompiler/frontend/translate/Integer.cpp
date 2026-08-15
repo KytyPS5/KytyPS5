@@ -568,6 +568,19 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			result                 = ir.BitwiseOr(lo_part, hi_part);
 			break;
 		}
+		case IR::Opcode::AlignByteU32: {
+			const auto hi           = ReadU32(inst.src[0]);
+			const auto lo           = ReadU32(inst.src[1]);
+			const auto byte_offset  = mask(ReadU32(inst.src[2]), 31u);
+			const auto bit_offset   = ir.ShiftLeftLogical(byte_offset, imm(3));
+			const auto concatenated = ir.PackUint2x32(lo, hi);
+			const auto shifted      = IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64,
+			                                          {concatenated, mask(bit_offset, 63u)}));
+			const auto in_range =
+			    IR::U1(ir.Emit(IR::ValueOpcode::ULessThan32, {byte_offset, imm(8)}));
+			result = ir.Select(in_range, UnpackU64(shifted)[0], imm(0));
+			break;
+		}
 		case IR::Opcode::ShiftLeftAddU32:
 			result =
 			    ir.IAdd(ir.ShiftLeftLogical(ReadU32(inst.src[0]), mask(ReadU32(inst.src[1]), 31u)),

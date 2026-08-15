@@ -272,6 +272,7 @@ constexpr OpcodeMap VOP3_OPS[] = {
     {0x371u, Opcode::VAndOrB32},        {0x372u, Opcode::VOr3B32},
     {0x377u, Opcode::VPermlane16B32},   {0x378u, Opcode::VPermlanex16B32},
     {0x34bu, Opcode::VFmaF16},          {0x36du, Opcode::VAdd3U32},
+    {0x14fu, Opcode::VAlignbyteB32},
 };
 
 constexpr OpcodeMap VOP3P_OPS[] = {

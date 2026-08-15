@@ -486,6 +486,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.builder.AddCapability({CapabilitySampled1D});
 	state.builder.AddCapability({CapabilityImage1D});
 	state.builder.AddCapability({CapabilityImageQuery});
+	state.builder.AddCapability({CapabilitySignedZeroInfNanPreserve});
 	if (state.needs_image_gather_extended) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
@@ -509,10 +510,14 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
 		state.builder.AddExtension("SPV_KHR_compute_shader_derivatives");
 	}
+	state.builder.AddExtension("SPV_KHR_float_controls");
 	state.builder.AddExtInstImport(state.glsl_std450, "GLSL.std.450");
 	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
 	                            state.interface_variables);
+	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
+	// contract prevents host compilers from treating synthesized IEEE values as finite.
+	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
 	if (state.stage == ShaderType::Compute) {
 		uint32_t local_x = state.needs_compute_derivatives ? 2u : 1u;
 		uint32_t local_y = state.needs_compute_derivatives ? 2u : 1u;

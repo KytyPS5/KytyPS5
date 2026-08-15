@@ -12679,6 +12679,31 @@ TestCase VectorVop3FmaF16UsesRdna2Opcode34b() {
           {O::VMovB32, O::VFmaF16, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase VectorFloatControlContractPreservesInfNan() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSop2(0x24, 0, InlineU32(8), InlineU32(23)));
+  code.push_back(EncodeVop1(0x01, 0, InlineU32(0)));
+  AppendVMovU32(&code, 1, 1);
+  AppendVMovU32(&code, 2, 3);
+  AppendVop3(&code, 0x108, 10, 0, Vgpr(0));
+  code.push_back(EncodeVopc(0x88, Vgpr(10), 2));
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorFloatControlContractPreservesInfNan";
+  test.code = std::move(code);
+  test.expected = {1u};
+  test.opcodes = {O::SBfmB32, O::VMovB32, O::VMulF32, O::VCmpClassF32,
+                  O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm};
+  test.required_spirv = {"SPV_KHR_float_controls",
+                         "SignedZeroInfNanPreserve 32"};
+  return test;
+}
+
 TestCase VectorFloatArithmeticOps() {
   using O = ShaderOpcode;
 
@@ -17005,6 +17030,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
   AddCase(MadMixF16NegHiIsAbsAndNegIsIndependent);
   AddCase(VectorVop3FmaF16UsesRdna2Opcode34b);
+  AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);

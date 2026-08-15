@@ -978,6 +978,10 @@ void TestNewShaderRecompilerSMovB32() {
   Check(std::find(result.spirv.begin(), result.spirv.end(), 0x12345678u) !=
             result.spirv.end(),
         "new SPIR-V emitter did not encode the literal as a binary word");
+  Check(SpirvContainsCapability(result.spirv, 4466),
+        "SPIR-V binary does not request signed-zero/Inf/NaN preservation");
+  Check(SpirvContainsExecutionMode(result.spirv, 4461),
+        "SPIR-V binary does not enable signed-zero/Inf/NaN preservation");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

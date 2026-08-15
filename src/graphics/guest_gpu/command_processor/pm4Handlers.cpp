@@ -1627,16 +1627,10 @@ KYTY_HW_UC_PARSER(HwUcSetIaMultiVgtParam) {
 	return num_values;
 }
 
-static void HwIgnoreMultiPrimIbReset([[maybe_unused]] uint32_t value) {}
-
 KYTY_HW_UC_PARSER(HwUcSetMultiPrimIbReset) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		HwIgnoreMultiPrimIbReset(buffer[i]);
-	}
-
-	return num_values;
+	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::GE_MULTI_PRIM_IB_RESET_EN);
+	cp.GetUcfg().SetPrimitiveResetControl(buffer[0]);
+	return 1;
 }
 
 static void HwUcIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset,
@@ -3546,7 +3540,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetReuseOff(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_MULTI_PRIM_IB_RESET_INDX] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwIgnoreMultiPrimIbReset(value);
+		cp.GetCtx().SetPrimitiveResetIndex(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_TESS_DISTRIBUTION] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetTessDistribution(value);
@@ -4424,7 +4418,7 @@ void GraphicsInitJmpTablesUcIndirect() {
 		HwUcIgnoreIaMultiVgtParam(value);
 	};
 	g_hw_uc_indirect_func[Pm4::GE_MULTI_PRIM_IB_RESET_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		HwIgnoreMultiPrimIbReset(value);
+		cp.GetUcfg().SetPrimitiveResetControl(value);
 	};
 	g_hw_uc_indirect_func[Pm4::TA_CS_BC_BASE_ADDR] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HwUcIgnoreBorderColorTableAddr(cmd_offset, value);

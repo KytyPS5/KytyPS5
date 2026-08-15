@@ -71,14 +71,16 @@ void uc_print(const char* func, const HW::UserConfig& uc) {
 	LOGF("\t GetPrimType()         = 0x%08" PRIx32 "\n"
 	     "\t GetIndexOffset()      = 0x%08" PRIx32 "\n"
 	     "\t GetObjectId()         = 0x%08" PRIx32 "\n"
+	     "\t primitive_reset       = 0x%08" PRIx32 "\n"
 	     "\t primitive_group_size  = 0x%04" PRIx16 "\n"
 	     "\t vertex_group_size     = 0x%04" PRIx16 "\n"
 	     "\t en_user_vgpr1         = %s\n"
 	     "\t en_user_vgpr2         = %s\n"
 	     "\t en_user_vgpr3         = %s\n",
 	     static_cast<uint32_t>(uc.GetPrimType()), uc.GetIndexOffset(), uc.GetObjectId(),
-	     ge_cntl.primitive_group_size, ge_cntl.vertex_group_size, user_en.vgpr1 ? "true" : "false",
-	     user_en.vgpr2 ? "true" : "false", user_en.vgpr3 ? "true" : "false");
+	     uc.GetPrimitiveResetControl(), ge_cntl.primitive_group_size, ge_cntl.vertex_group_size,
+	     user_en.vgpr1 ? "true" : "false", user_en.vgpr2 ? "true" : "false",
+	     user_en.vgpr3 ? "true" : "false");
 }
 
 void uc_check(const HW::UserConfig& uc) {
@@ -1265,9 +1267,10 @@ void hw_print(const RenderCommandBuffer& buffer) {
 		     "\t GetRenderTargetMask()   = 0x%08" PRIx32 "\n"
 		     "\t GetDepthClearValue()    = %f\n"
 		     "\t GetStencilClearValue()  = %" PRIu8 "\n"
-		     "\t GetLineWidth()          = %f\n",
+		     "\t GetLineWidth()          = %f\n"
+		     "\t primitive_reset_index   = 0x%08" PRIx32 "\n",
 		     hw.GetRenderTargetMask(), hw.GetDepthClearValue(), hw.GetStencilClearValue(),
-		     hw.GetLineWidth());
+		     hw.GetLineWidth(), hw.GetPrimitiveResetIndex());
 
 		LOGF("%s", Common::Concat(rt_print("RenderTraget:", rt), "").c_str());
 

@@ -941,8 +941,10 @@ public:
 	[[nodiscard]] uint8_t GetStencilClearValue() const { return m_stencil_clear_value; }
 	void SetStencilClearValue(uint8_t clear_value) { m_stencil_clear_value = clear_value; }
 
-	[[nodiscard]] float GetLineWidth() const { return m_line_width; }
-	void                SetLineWidth(float width) { m_line_width = width; }
+	[[nodiscard]] float    GetLineWidth() const { return m_line_width; }
+	void                   SetLineWidth(float width) { m_line_width = width; }
+	[[nodiscard]] uint32_t GetPrimitiveResetIndex() const { return m_primitive_reset_index; }
+	void SetPrimitiveResetIndex(uint32_t index) { m_primitive_reset_index = index; }
 
 	[[nodiscard]] const ShaderRegisters& GetShaderRegisters() const { return m_sh_regs; }
 
@@ -987,7 +989,8 @@ public:
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
 
 private:
-	float m_line_width = 1.0f;
+	float    m_line_width            = 1.0f;
+	uint32_t m_primitive_reset_index = 0xffffffffu;
 
 	BlendControl    m_blend_control[8];
 	BlendColor      m_blend_color;
@@ -1035,6 +1038,8 @@ public:
 	[[nodiscard]] uint32_t GetIndexOffset() const { return m_index_offset; }
 	void                   SetObjectId(uint32_t object_id) { m_object_id = object_id; }
 	[[nodiscard]] uint32_t GetObjectId() const { return m_object_id; }
+	void SetPrimitiveResetControl(uint32_t control) { m_primitive_reset_control = control; }
+	[[nodiscard]] uint32_t GetPrimitiveResetControl() const { return m_primitive_reset_control; }
 
 	[[nodiscard]] const GeControl& GetGeControl() const { return m_ge_cntl; }
 	void                           SetGeControl(const GeControl& control) { m_ge_cntl = control; }
@@ -1049,9 +1054,10 @@ public:
 	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
 
 private:
-	Prospero::PrimitiveType m_prim_type    = Prospero::PrimitiveType::kNone;
-	uint32_t                m_index_offset = 0;
-	uint32_t                m_object_id    = 0;
+	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
+	uint32_t                m_index_offset            = 0;
+	uint32_t                m_object_id               = 0;
+	uint32_t                m_primitive_reset_control = 0;
 
 	GeControl    m_ge_cntl;
 	GeUserVgprEn m_ge_user_vgpr_en;

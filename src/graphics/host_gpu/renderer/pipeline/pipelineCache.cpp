@@ -55,8 +55,9 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
     RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
     ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
-    ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology, bool ps_active,
-    std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv) {
+    ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, bool ps_active, std::span<const uint32_t> vs_spirv,
+    std::span<const uint32_t> ps_spirv) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors == nullptr);
@@ -132,10 +133,11 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 
 	const auto& clip_control = ctx.GetClipControl();
 	EXIT_NOT_IMPLEMENTED(!clip_control.IsZClipModeRepresentable());
-	static_params.negative_one_to_one = !clip_control.dx_clip_space;
-	static_params.depth_clip_enable   = clip_control.IsZClipEnabled();
-	static_params.topology            = topology;
-	static_params.samples             = attachment_samples;
+	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
+	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
+	static_params.topology                 = topology;
+	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {

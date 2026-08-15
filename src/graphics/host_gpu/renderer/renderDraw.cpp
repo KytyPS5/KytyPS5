@@ -881,6 +881,41 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 	return true;
 }
 
+static bool ResolvePrimitiveRestart(const RenderCommandBuffer& buffer,
+                                    vk::PrimitiveTopology topology, uint32_t index_type_and_size) {
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
+	if ((control & 0x1u) == 0) {
+		return false;
+	}
+	switch (buffer.GetUserConfig().GetPrimType()) {
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip: break;
+		default: return false;
+	}
+	if (topology != vk::PrimitiveTopology::eLineStrip &&
+	    topology != vk::PrimitiveTopology::eTriangleStrip &&
+	    topology != vk::PrimitiveTopology::eTriangleFan) {
+		return false;
+	}
+
+	uint32_t index_mask = 0;
+	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
+		case Prospero::IndexType::kIndex8: index_mask = 0xffu; break;
+		case Prospero::IndexType::kIndex16: index_mask = 0xffffu; break;
+		case Prospero::IndexType::kIndex32: index_mask = 0xffffffffu; break;
+		default: EXIT("unknown index_type_and_size: %u\n", index_type_and_size);
+	}
+
+	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
+		return false;
+	}
+	EXIT_NOT_IMPLEMENTED((reset_index & index_mask) != index_mask);
+	return true;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuffer& buffer,
                                             const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
@@ -1096,8 +1131,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
-                                         bool log_pipeline_phase, bool set_bind_debug,
-                                         bool set_auto_debug) {
+                                         bool primitive_restart_enable, bool log_pipeline_phase,
+                                         bool set_bind_debug, bool set_auto_debug) {
 	EXIT_IF(draw.name == nullptr);
 	auto& ucfg = buffer.GetUserConfig();
 
@@ -1114,7 +1149,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	}
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    state.color_info, state.color_count, state.depth_info, state.vs_input_info, buffer,
-	    &state.ps_input_info, topology, state.ps_active, state.vs_shader, state.ps_shader);
+	    &state.ps_input_info, topology, primitive_restart_enable, state.ps_active, state.vs_shader,
+	    state.ps_shader);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1238,6 +1274,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	vk::IndexType index_type           = vk::IndexType::eUint16;
 	uint64_t      index_size           = 0;
 	bool          expand_index8_to_u16 = false;
+	const bool primitive_restart = ResolvePrimitiveRestart(buffer, topology, index_type_and_size);
 
 	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
 		case Prospero::IndexType::kIndex16:
@@ -1268,7 +1305,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 		const auto* src = static_cast<const uint8_t*>(index_addr);
 		expanded_indices.resize(index_count);
 		for (uint32_t i = 0; i < index_count; i++) {
-			expanded_indices[i] = src[i];
+			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
 	}
 
@@ -1298,8 +1335,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	emit.indexed       = true;
 	emit.vertex_offset = vertex_offset;
 
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, true, true,
-	                    false);
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+	                    primitive_restart, true, true, false);
 	ResetBindings();
 }
 
@@ -1398,7 +1435,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,
-	                    true);
+	                    false, true);
 	ResetBindings();
 }
 

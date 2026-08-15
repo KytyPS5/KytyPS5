@@ -212,11 +212,12 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          bool log_setup_phases, DrawRenderState& state);
-	void ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer& buffer,
-	                         const DrawCallInfo& draw, DrawRenderState& state,
-	                         vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
-	                         const DrawIndexBufferSource& index_source, bool log_pipeline_phase,
-	                         bool set_bind_debug, bool set_auto_debug);
+	void               ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer& buffer,
+	                                       const DrawCallInfo& draw, DrawRenderState& state,
+	                                       vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+	                                       const DrawIndexBufferSource& index_source,
+	                                       bool primitive_restart_enable, bool log_pipeline_phase,
+	                                       bool set_bind_debug, bool set_auto_debug);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth);
 	[[nodiscard]] bool        ResolveColorTargets(uint64_t submit_id, RenderCommandBuffer& buffer,

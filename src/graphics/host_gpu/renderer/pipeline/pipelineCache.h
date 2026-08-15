@@ -38,6 +38,7 @@ struct PipelineStaticParameters {
 	bool                       depth_clip_enable        = true;
 	int                        scissor_ltrb[4]          = {0};
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
+	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       with_depth               = false;
@@ -79,9 +80,9 @@ static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
 static_assert(sizeof(PipelineStaticParameters) ==
               sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 2 + sizeof(int[4]) +
-                  sizeof(vk::PrimitiveTopology) + sizeof(uint32_t) + sizeof(bool) * 4 +
-                  sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 + sizeof(bool) +
-                  sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
+                  sizeof(vk::PrimitiveTopology) + sizeof(bool) + sizeof(uint32_t) +
+                  sizeof(bool) * 4 + sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 +
+                  sizeof(bool) + sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
                   sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
                   sizeof(uint8_t[RENDER_COLOR_ATTACHMENTS_MAX]) * 6 +
                   sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) * 3 + sizeof(float) * 4);
@@ -122,8 +123,8 @@ public:
 	CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
 	                       ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
 	                       ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-	                       bool ps_active, std::span<const uint32_t> vs_spirv,
-	                       std::span<const uint32_t> ps_spirv);
+	                       bool primitive_restart_enable, bool ps_active,
+	                       std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	                                       const HW::ComputeShaderInfo& cs_regs,
 	                                       std::span<const uint32_t>    cs_spirv);

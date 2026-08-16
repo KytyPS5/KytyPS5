@@ -3003,9 +3003,41 @@ uint32_t* KYTY_SYSV_ABI GraphicsAcbDmaData(CommandBuffer* buf, uint8_t dst,
                                            uint64_t src_address_or_offset_or_immediate,
                                            uint32_t num_bytes, uint8_t wait_for_previous,
                                            uint8_t write_confirm) {
-	return GraphicsDcbDmaData(buf, 0, dst, dst_cache_policy, dst_address_or_offset, src,
-	                          src_cache_policy, src_address_or_offset_or_immediate, num_bytes,
-	                          wait_for_previous, write_confirm, 0);
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto src_address = src_address_or_offset_or_immediate;
+	switch (src) {
+		case 0x14: src_address = 0x30174u; break;
+		case 0x24: src_address = 0x3017cu; break;
+		case 0x25: src_address = 0x30184u; break;
+		default: break;
+	}
+
+	auto* cmd = buf->AllocateDW(7);
+
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	cmd[0] = KYTY_PM4(7, Pm4::IT_DMA_DATA, 0u);
+	cmd[1] = ((static_cast<uint32_t>(src_cache_policy) & 0x3u) << 13u) |
+	         ((static_cast<uint32_t>(dst) & 0x3u) << 20u) |
+	         ((static_cast<uint32_t>(dst_cache_policy) & 0x3u) << 25u) |
+	         ((static_cast<uint32_t>(src) & 0x3u) << 29u);
+	cmd[2] = static_cast<uint32_t>(src_address & 0xffffffffu);
+	cmd[3] = static_cast<uint32_t>((src_address >> 32u) & 0xffffffffu);
+	cmd[4] = static_cast<uint32_t>(dst_address_or_offset & 0xffffffffu);
+	cmd[5] = static_cast<uint32_t>((dst_address_or_offset >> 32u) & 0xffffffffu);
+	cmd[6] = (num_bytes & 0x03ffffffu) | ((static_cast<uint32_t>(src) & 0x4u) << 24u) |
+	         ((static_cast<uint32_t>(dst) & 0x4u) << 25u) |
+	         ((static_cast<uint32_t>(src) & 0x8u) << 25u) |
+	         ((static_cast<uint32_t>(dst) & 0x8u) << 26u) |
+	         ((static_cast<uint32_t>(wait_for_previous) & 0x1u) << 30u) |
+	         ((static_cast<uint32_t>(write_confirm) & 0x1u) << 31u);
+
+	return cmd;
 }
 
 uint32_t* KYTY_SYSV_ABI GraphicsAcbCopyData(CommandBuffer* buf, uint8_t dst,
@@ -3013,9 +3045,28 @@ uint32_t* KYTY_SYSV_ABI GraphicsAcbCopyData(CommandBuffer* buf, uint8_t dst,
                                             uint8_t src, uint8_t src_cache_policy,
                                             uint64_t src_address_or_immediate, uint8_t item_size,
                                             uint8_t write_confirm) {
-	const auto dcb_src = (src == 5 ? static_cast<uint8_t>(5u << 1u) : src);
-	return GraphicsDcbCopyData(buf, dst, dst_cache_policy, dst_address, dcb_src, src_cache_policy,
-	                           src_address_or_immediate, item_size, write_confirm);
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(6);
+
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	cmd[0] = KYTY_PM4(6, Pm4::IT_COPY_DATA, 0u);
+	cmd[1] = (static_cast<uint32_t>(src) & 0xfu) | ((static_cast<uint32_t>(dst) & 0xfu) << 8u) |
+	         ((static_cast<uint32_t>(src_cache_policy) & 0x3u) << 13u) |
+	         ((static_cast<uint32_t>(item_size) & 0x1u) << 16u) |
+	         ((static_cast<uint32_t>(write_confirm) & 0x1u) << 20u) |
+	         ((static_cast<uint32_t>(dst_cache_policy) & 0x3u) << 25u);
+	cmd[2] = static_cast<uint32_t>(src_address_or_immediate & 0xffffffffu);
+	cmd[3] = static_cast<uint32_t>((src_address_or_immediate >> 32u) & 0xffffffffu);
+	cmd[4] = static_cast<uint32_t>(dst_address & 0xffffffffu);
+	cmd[5] = static_cast<uint32_t>((dst_address >> 32u) & 0xffffffffu);
+
+	return cmd;
 }
 
 uint32_t* KYTY_SYSV_ABI GraphicsAcbDispatchIndirect(CommandBuffer*       buf,

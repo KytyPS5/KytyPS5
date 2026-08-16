@@ -335,6 +335,23 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 }
 #endif
 
+#if defined(_WIN32)
+// Quote one token for cmd.exe so paths with spaces survive /K parsing.
+static QString WinCmdQuote(QString value) {
+	value.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+	return QLatin1Char('"') + value + QLatin1Char('"');
+}
+
+static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList& args) {
+	QString command = WinCmdQuote(QDir::toNativeSeparators(interpreter));
+	for (const auto& arg: args) {
+		command += QLatin1Char(' ');
+		command += WinCmdQuote(arg);
+	}
+	return command;
+}
+#endif
+
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
 
@@ -359,22 +376,23 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	{
 		QString     terminal;
 		QStringList terminal_prefix;
+		// Pass the script as a file argument (not bash -c) so paths with spaces work.
 		if (FindTerminal(&terminal, &terminal_prefix)) {
 			process->setProgram(terminal);
-			process->setArguments(terminal_prefix + QStringList {"bash", "-c", bash_file_name});
+			process->setArguments(terminal_prefix + QStringList {"bash", bash_file_name});
 		} else {
 			// Run without a terminal as a fallback.
 			process->setProgram(QStringLiteral("bash"));
-			process->setArguments({QStringLiteral("-c"), bash_file_name});
+			process->setArguments({bash_file_name});
 		}
 	}
 #elif defined(_WIN32)
 	{
+		// Use nativeArguments so Qt does not re-quote the /K command string.
 		process->setProgram(CMD_EXE);
-		QStringList process_args;
-		process_args << QStringLiteral("/K") << interpreter;
-		process_args += args;
-		process->setArguments(process_args);
+		process->setArguments({});
+		process->setNativeArguments(QStringLiteral("/K \"") +
+		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
 	}
 #else
 	process->setProgram(interpreter);

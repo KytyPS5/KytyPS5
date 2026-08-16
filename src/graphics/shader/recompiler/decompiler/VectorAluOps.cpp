@@ -48,7 +48,7 @@ constexpr Vop2OpcodeInfo VOP2_OPS[] = {
     {0x15u, Opcode::VLshrB32},
     {0x16u, Opcode::VLshrrevB32, Vop2SdwaProfile::ReverseLogicalRight},
     {0x17u, Opcode::VAshrI32},
-    {0x18u, Opcode::VAshrrevI32},
+    {0x18u, Opcode::VAshrrevI32, Vop2SdwaProfile::ReverseLogicalRight},
     {0x19u, Opcode::VLshlB32},
     {0x1au, Opcode::VLshlrevB32, Vop2SdwaProfile::ReverseLogicalLeft},
     {0x1bu, Opcode::VAndB32, Vop2SdwaProfile::Bitwise},
@@ -61,7 +61,7 @@ constexpr Vop2OpcodeInfo VOP2_OPS[] = {
     {0x22u, Opcode::VBcntU32B32},
     {0x23u, Opcode::VMbcntLoU32B32},
     {0x24u, Opcode::VMbcntHiU32B32},
-    {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x25u, Opcode::VAddNcU32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x28u, Opcode::VAddcU32},
     {0x26u, Opcode::VSubNcU32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x27u, Opcode::VSubrevNcU32, Vop2SdwaProfile::IntegerFullDestination},
@@ -267,7 +267,8 @@ constexpr OpcodeMap VOP3_OPS[] = {
     {0x363u, Opcode::VBfmB32},          {0x364u, Opcode::VBcntU32B32},
     {0x365u, Opcode::VMbcntLoU32B32},   {0x366u, Opcode::VMbcntHiU32B32},
     {0x368u, Opcode::VCvtPknormI16F32}, {0x369u, Opcode::VCvtPknormU16F32},
-    {0x36au, Opcode::VCvtPkU16U32},     {0x36fu, Opcode::VLshlOrB32},
+    {0x36au, Opcode::VCvtPkU16U32},
+    {0x36fu, Opcode::VLshlOrB32},
     {0x371u, Opcode::VAndOrB32},        {0x372u, Opcode::VOr3B32},
     {0x377u, Opcode::VPermlane16B32},   {0x378u, Opcode::VPermlanex16B32},
     {0x34bu, Opcode::VFmaF16},          {0x36du, Opcode::VAdd3U32},
@@ -446,6 +447,10 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
      SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::VCvtF32U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::VCvtF32Ubyte0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::VCvtF32Ubyte1, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::VCvtF32Ubyte2, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::VCvtF32Ubyte3, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
     {Opcode::VCvtF16F32, SdwaSelFull(), SdwaSelWords(), SdwaSelFull(), false},
     {Opcode::VCvtF16U16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
@@ -478,6 +483,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::VCvtI32F32, SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(), SdwaSelFull(), false},
     {Opcode::VCvtRpiI32F32, SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(), SdwaSelFull(), false},
     {Opcode::VCvtFlrI32F32, SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(), SdwaSelFull(), false},
+    {Opcode::VNotB32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::VFfblB32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
 };
 
 const Vop1SdwaRule* FindVop1SdwaRule(Opcode opcode) {
@@ -870,8 +877,8 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
      true, true},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {SdwaSelFull(), SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), false, false},
-    {SdwaSelFull(), SdwaSelFull(), SdwaSelAll(), false, false},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelWords() | SdwaSelFull(), false, false},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
@@ -1221,7 +1228,7 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::VBcntU32B32:
 		case Opcode::VCvtPknormI16F32:
 		case Opcode::VCvtPknormU16F32:
-		case Opcode::VCvtPkU16U32: return 2;
+		case Opcode::VCvtPkU16U32:
 		default: return 3;
 	}
 }

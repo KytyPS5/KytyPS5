@@ -517,7 +517,15 @@ void TestNativeSubgroupPolicy() {
 	context.max_subgroup_size             = 32;
 	context.subgroup_size_control_enabled = true;
 	context.required_subgroup_size_stages = vk::ShaderStageFlagBits::eAll;
+	const ShaderSubgroupCapabilities subgroup_caps {context};
+	Check(SelectComputeLaneMaskMode(subgroup_caps, 64, 64) ==
+	          ShaderLaneMaskMode::PerInvocation,
+	      "host wave32 did not select logical masks for a single guest wave64");
+	Check(SelectComputeLaneMaskMode(subgroup_caps, 32, 32) ==
+	          ShaderLaneMaskMode::NativeWave,
+	      "native wave32 compute unexpectedly selected logical masks");
 	ShaderRecompiler::IR::Program safe;
+	safe.stage          = ShaderType::Compute;
 	safe.wave_size      = 32;
 	safe.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
 	Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities {context},
@@ -550,6 +558,14 @@ void TestNativeSubgroupPolicy() {
 	                              vk::ShaderStageFlagBits::eCompute, cross_lane_compute)
 	              .mode == ShaderSubgroupMode::Unsupported,
 	      "cross-lane compute mismatch bypassed the exact subgroup requirement");
+	cross_lane_compute.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
+	Check(ShaderRecompiler::Spirv::ProgramSupportsLogicalSingleWaveWorkgroup(
+	          cross_lane_compute) &&
+	          ConfigureShaderSubgroup(subgroup_caps, vk::ShaderStageFlagBits::eCompute,
+	                                  cross_lane_compute, 64)
+	                  .mode == ShaderSubgroupMode::LogicalSingleWaveWorkgroup,
+	      "supported logical wave64 compute program was rejected");
+	cross_lane_compute.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
 
 	ShaderRecompiler::IR::Program zero_exec = safe;
 	zero_exec.lane_mask_mode                = ShaderLaneMaskMode::NativeWave;
@@ -5995,22 +6011,10 @@ void TestNewShaderRecompilerExecMaskHelpers() {
 }
 
 void TestComputeShaderInputWaveSize() {
-	const auto decode_wave_size = [](uint32_t rsrc1) {
-		const bool wave32 = (((rsrc1 >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-		                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u);
-		return wave32 ? 32u : 64u;
-	};
-
-	constexpr uint32_t observed_wave32_rsrc1_a = 0x402c0146u;
-	constexpr uint32_t observed_wave32_rsrc1_b = 0x402c00c1u;
-	Check(decode_wave_size(observed_wave32_rsrc1_a) == 32u,
-	      "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value A");
-	Check(decode_wave_size(observed_wave32_rsrc1_b) == 32u,
-	      "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value B");
-
-	constexpr uint32_t w32_en_bit = 1u << Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT;
-	Check(decode_wave_size(observed_wave32_rsrc1_a & ~w32_en_bit) == 64u,
-	      "cleared COMPUTE_PGM_RSRC1 W32_EN bit did not decode as wave64");
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x00000041u) == 64u,
+	      "wave64 dispatch modifier was decoded incorrectly");
+	Check(Pm4::GetComputeWaveSizeFromDispatchModifier(0x00008041u) == 32u,
+	      "wave32 dispatch modifier was decoded incorrectly");
 }
 
 void TestNewShaderRecompilerWave32MasksExecHighStores() {

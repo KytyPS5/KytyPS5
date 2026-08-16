@@ -176,7 +176,10 @@ void EmitSaveexecPerInvocation(EmitterState& state, const IR::Instruction& inst)
 	const auto result =
 	    use_or ? EmitLogicalOrBool(state, lhs, rhs) : EmitLogicalAndBool(state, lhs, rhs);
 	EmitPerInvocationMask(state, MakeRegisterOperand(IR::RegisterFile::Exec, 0), result);
-	EmitStoreSccBool(state, result);
+	// SAVEEXEC reports whether the saved (old) EXEC was non-zero. In logical
+	// single-wave mode that is a workgroup-wide property; preserve the established
+	// graphics PerInvocation behavior until that path is migrated separately.
+	EmitStoreSccBool(state, IsLogicalWaveWorkgroup(state) ? old_exec : result);
 }
 
 void EmitSaveexecB32(EmitterState& state, const IR::Instruction& inst) {
@@ -205,7 +208,8 @@ void EmitSaveexecB32(EmitterState& state, const IR::Instruction& inst) {
 
 	const auto cond = state.builder.AllocateId();
 	const auto scc  = state.builder.AllocateId();
-	state.builder.AddFunction({OpINotEqual, state.bool_type, cond, new_low, ConstantU32(state, 0)});
+	// Prospero SAVEEXEC sets SCC from the saved old EXEC, not the updated mask.
+	state.builder.AddFunction({OpINotEqual, state.bool_type, cond, old_low, ConstantU32(state, 0)});
 	state.builder.AddFunction(
 	    {OpSelect, state.uint_type, scc, cond, ConstantU32(state, 1), ConstantU32(state, 0)});
 	EmitStoreU32(state, SccOperand(), scc);
@@ -250,11 +254,12 @@ void EmitSaveexecB64(EmitterState& state, const IR::Instruction& inst) {
 	EmitStoreU32(state, MakeRegisterOperand(IR::RegisterFile::Exec, 0), new_low);
 	EmitStoreU32(state, MakeRegisterOperand(IR::RegisterFile::Exec, 1), new_high);
 
-	const auto active_new_high = state.wave_size == 32u ? ConstantU32(state, 0) : new_high;
+	const auto active_old_high = state.wave_size == 32u ? ConstantU32(state, 0) : old_high;
 	const auto mask            = state.builder.AllocateId();
 	const auto cond            = state.builder.AllocateId();
 	const auto scc             = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, mask, new_low, active_new_high});
+	// Prospero SAVEEXEC sets SCC from SDST (the saved old EXEC).
+	state.builder.AddFunction({OpBitwiseOr, state.uint_type, mask, old_low, active_old_high});
 	state.builder.AddFunction({OpINotEqual, state.bool_type, cond, mask, ConstantU32(state, 0)});
 	state.builder.AddFunction(
 	    {OpSelect, state.uint_type, scc, cond, ConstantU32(state, 1), ConstantU32(state, 0)});
@@ -264,6 +269,61 @@ void EmitSaveexecB64(EmitterState& state, const IR::Instruction& inst) {
 void EmitReadFirstLaneU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto src         = EmitValueLoad(state, inst.src[0]);
 	const auto active      = EmitExecActiveBool(state);
+	if (IsLogicalWaveWorkgroup(state) && state.logical_wave_lane_variable != 0 &&
+	    state.logical_wave_summary_variable != 0) {
+		// V_READFIRSTLANE selects the lowest active guest lane. A logical wave64
+		// spans two host subgroup32 waves, so snapshot all values and reduce the
+		// active guest lane index through workgroup memory.
+		const auto local_id = EmitLocalInvocationIndex(state);
+		const auto guest_lane = EmitLogicalWaveLaneIndex(state);
+		const auto summary_pointer = EmitLogicalWaveSummaryPointer(state);
+		const auto own_ptr  = state.builder.AllocateId();
+		const auto semantics =
+		    MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+		state.builder.AddFunction({OpAccessChain, state.ptr_workgroup_uint, own_ptr,
+		                           state.logical_wave_lane_variable, local_id});
+		state.builder.AddFunction({OpStore, own_ptr, src});
+		const auto ignored_reset = state.builder.AllocateId();
+		state.builder.AddFunction({OpAtomicExchange, state.uint_type, ignored_reset,
+		                           summary_pointer,
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, MemorySemanticsNone),
+		                           ConstantU32(state, 64)});
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+		const auto candidate = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, state.uint_type, candidate, active, guest_lane,
+		                           ConstantU32(state, 64)});
+		const auto ignored_min = state.builder.AllocateId();
+		state.builder.AddFunction({OpAtomicUMin, state.uint_type, ignored_min,
+		                           summary_pointer,
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, MemorySemanticsNone), candidate});
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+		const auto first_lane  = state.builder.AllocateId();
+		const auto has_lane    = state.builder.AllocateId();
+		const auto safe_lane   = state.builder.AllocateId();
+		const auto lane_ptr    = state.builder.AllocateId();
+		const auto first_value = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpLoad, state.uint_type, first_lane, summary_pointer});
+		state.builder.AddFunction({OpULessThan, state.bool_type, has_lane, first_lane,
+		                           ConstantU32(state, 64)});
+		state.builder.AddFunction({OpSelect, state.uint_type, safe_lane, has_lane, first_lane,
+		                           ConstantU32(state, 0)});
+		state.builder.AddFunction({OpAccessChain, state.ptr_workgroup_uint, lane_ptr,
+		                           state.logical_wave_lane_variable,
+		                           EmitLogicalWaveLaneArrayIndex(state, safe_lane)});
+		state.builder.AddFunction({OpLoad, state.uint_type, first_value, lane_ptr});
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+		EmitStoreU32(state, inst.dst, first_value);
+		return;
+	}
 	const auto ballot      = state.builder.AllocateId();
 	const auto first_lane  = state.builder.AllocateId();
 	const auto first_value = state.builder.AllocateId();
@@ -287,6 +347,34 @@ uint32_t EmitLaneIndex(EmitterState& state, const IR::Operand& operand) {
 void EmitReadLaneU32(EmitterState& state, const IR::Instruction& inst) {
 	const auto src   = EmitValueLoad(state, inst.src[0]);
 	const auto lane  = EmitLaneIndex(state, inst.src[1]);
+	if (IsLogicalWaveWorkgroup(state) && state.logical_wave_lane_variable != 0) {
+		// A Prospero wave64 read may select lane 32..63, which cannot be reached
+		// by a host subgroup32 shuffle. Snapshot every guest lane in a dedicated
+		// workgroup array, rendezvous the two host subgroups, then broadcast the
+		// selected guest lane. Scalar lane reads are reached uniformly by the one
+		// logical-wave workgroup, so these barriers are dynamically uniform.
+		const auto local_id = EmitLocalInvocationIndex(state);
+		const auto own_ptr  = state.builder.AllocateId();
+		const auto lane_ptr = state.builder.AllocateId();
+		const auto value    = state.builder.AllocateId();
+		const auto semantics =
+		    MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+		state.builder.AddFunction({OpAccessChain, state.ptr_workgroup_uint, own_ptr,
+		                           state.logical_wave_lane_variable, local_id});
+		state.builder.AddFunction({OpStore, own_ptr, src});
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+		state.builder.AddFunction({OpAccessChain, state.ptr_workgroup_uint, lane_ptr,
+		                           state.logical_wave_lane_variable,
+		                           EmitLogicalWaveLaneArrayIndex(state, lane)});
+		state.builder.AddFunction({OpLoad, state.uint_type, value, lane_ptr});
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+		EmitStoreU32(state, inst.dst, value);
+		return;
+	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, value,
 	                           ConstantU32(state, ScopeSubgroup), src, lane});
@@ -347,11 +435,20 @@ void EmitPermlaneB32(EmitterState& state, const IR::Instruction& inst, bool x16)
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, state.uint_type, index1, index0, ConstantU32(state, 15)});
 	state.builder.AddFunction({OpBitwiseOr, state.uint_type, target, row_value, index1});
+	uint32_t host_target = target;
+	if (IsLogicalWaveWorkgroup(state)) {
+		// Both lane16 operations stay within one 32-lane row pair. LocalInvocationIndex
+		// is the guest lane, while OpGroupNonUniformShuffle expects the host-subgroup
+		// lane number for the second half of the guest wave.
+		host_target = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitwiseAnd, state.uint_type, host_target, target,
+		                           ConstantU32(state, 31u)});
+	}
 	state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
-	                           ConstantU32(state, ScopeSubgroup), value, target});
+	                           ConstantU32(state, ScopeSubgroup), value, host_target});
 	uint32_t ret = shuffled;
 	if (!inst.dst.op_sel) {
-		const auto source_active = EmitLaneIndexActiveBool(state, target);
+		const auto source_active = EmitLaneIndexActiveBool(state, host_target);
 		ret                      = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpSelect, state.uint_type, ret, source_active, shuffled, ConstantU32(state, 0)});

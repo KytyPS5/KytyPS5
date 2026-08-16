@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
@@ -115,7 +116,7 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
 	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
 	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 32 && !input.tg_size_en && mode == 0x61u &&
+	    input.thread_ids_num == 1 && input.wave_size == 64 && !input.tg_size_en && mode == 0x61u &&
 	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
 	const auto size = BufferDescriptorSize(descriptor);
 	if (!full_dispatch || size == 0) {
@@ -193,12 +194,44 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
+	const uint32_t sdk_guest_wave_size = Pm4::GetComputeWaveSizeFromDispatchModifier(mode);
+	const uint32_t local_threads = std::max(cs_regs.cs_regs.num_thread_x, 1u) *
+	                               std::max(cs_regs.cs_regs.num_thread_y, 1u) *
+	                               std::max(cs_regs.cs_regs.num_thread_z, 1u);
+	uint32_t guest_wave_size = sdk_guest_wave_size;
+	const ShaderSubgroupCapabilities subgroup_caps {m_context.GetGraphics()};
 
 	ShaderComputeInputInfo    input_info {};
 	std::span<const uint32_t> cs_shader;
-	if (!ShaderCompileInfoCS(cs_regs, sh_regs, input_info, cs_shader)) {
+	if (!ShaderCompileInfoCS(cs_regs, sh_regs, guest_wave_size,
+	                         ShaderLaneMaskMode::NativeWave, input_info, cs_shader)) {
 		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
 		     cs_regs.cs_regs.data_addr);
+	}
+	auto lane_mask_mode = SelectComputeProgramLaneMaskMode(
+	    subgroup_caps, guest_wave_size, local_threads, *input_info.stage.program);
+	const uint32_t execution_wave_size = SelectComputeExecutionWaveSize(
+	    subgroup_caps, local_threads, *input_info.stage.program);
+	if (execution_wave_size != guest_wave_size) {
+		guest_wave_size = execution_wave_size;
+		if (!ShaderCompileInfoCS(cs_regs, sh_regs, guest_wave_size,
+		                         ShaderLaneMaskMode::NativeWave, input_info, cs_shader)) {
+			EXIT("ShaderCompileInfoCS wave32 compatibility fallback failed for CS shader "
+			     "0x%016" PRIx64 "\n",
+			     cs_regs.cs_regs.data_addr);
+		}
+		lane_mask_mode = SelectComputeProgramLaneMaskMode(
+		    subgroup_caps, guest_wave_size, local_threads, *input_info.stage.program);
+	}
+	if (lane_mask_mode == ShaderLaneMaskMode::PerInvocation) {
+		ShaderComputeInputInfo logical_info {};
+		if (!ShaderCompileInfoCS(cs_regs, sh_regs, guest_wave_size, lane_mask_mode, logical_info,
+		                         cs_shader)) {
+			EXIT("ShaderCompileInfoCS logical wave64 recompile failed for CS shader 0x%016" PRIx64
+			     "\n",
+			     cs_regs.cs_regs.data_addr);
+		}
+		input_info = std::move(logical_info);
 	}
 
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;

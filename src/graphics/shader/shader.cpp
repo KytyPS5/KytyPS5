@@ -884,6 +884,7 @@ static void ShaderGetStaticInputInfoPS(
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
+                                       uint32_t guest_wave_size,
                                        ShaderComputeInputInfo& info) {
 	info = {};
 
@@ -893,8 +894,9 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.group_id[0]    = regs.cs_regs.tgid_x_en != 0;
 	info.group_id[1]    = regs.cs_regs.tgid_y_en != 0;
 	info.group_id[2]    = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size      = regs.cs_regs.wave_size;
+	info.wave_size      = guest_wave_size;
 	info.thread_ids_num = regs.cs_regs.tidig_comp_cnt + 1;
+	info.lds_size_dwords = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
 	info.tg_size_en     = regs.cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
@@ -1182,14 +1184,15 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& info, std::span<const uint32_t>& spirv) {
+	                     uint32_t guest_wave_size, ShaderLaneMaskMode lane_mask_mode,
+	                     ShaderComputeInputInfo& info, std::span<const uint32_t>& spirv) {
 	spirv = {};
 
-	ShaderGetStaticInputInfoCS(regs, sh, info);
+	ShaderGetStaticInputInfoCS(regs, sh, guest_wave_size, info);
 	const auto shader_hash = regs.cs_regs.data_addr;
 	const auto program_id  = ShaderGetIdCS(regs, info, false);
-	const auto key         = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id,
-	                                                   ShaderLaneMaskMode::NativeWave);
+	const auto key =
+	    MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id, lane_mask_mode);
 
 	{
 		std::scoped_lock lock(g_shader_program_cache_mutex);
@@ -1206,7 +1209,7 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 	}
 
 	std::vector<uint32_t> compiled_spirv;
-	if (!ShaderCompileSpirvCS(regs, sh, info, compiled_spirv)) {
+	if (!ShaderCompileSpirvCS(regs, sh, lane_mask_mode, info, compiled_spirv)) {
 		return false;
 	}
 
@@ -1311,10 +1314,12 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	LOGF("\t workgroup_register = %d\n"
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
+	     "\t lds_size_dwords    = %u\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
-	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.threads_num[0],
-	     info.threads_num[1], info.threads_num[2], info.tg_size_en ? "true" : "false");
+	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
+	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
+	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
 }
@@ -1520,7 +1525,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 }
 
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv) {
+	                      ShaderLaneMaskMode lane_mask_mode,
+	                      ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::CyanA700);
 
 	const uint64_t shader_addr = regs.cs_regs.data_addr;
@@ -1536,6 +1542,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.push_constant_offset = 0;
 	options.compute_input_info   = &input_info;
 	options.wave_size            = input_info.wave_size;
+	options.lane_mask_mode       = lane_mask_mode;
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";

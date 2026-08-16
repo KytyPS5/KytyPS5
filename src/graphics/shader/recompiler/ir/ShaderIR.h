@@ -457,6 +457,9 @@ struct Program {
 	uint32_t                wave_size           = 64;
 	uint32_t                user_data_base      = 0;
 	uint32_t                user_data_count     = 64;
+	bool                    compute_linear_local64 = false;
+	int32_t                 compute_workgroup_register = -1;
+	int32_t                 compute_thread_ids_num     = 0;
 	bool                    dispatcher_fallback = false;
 	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
 	std::string             fallback_reason;

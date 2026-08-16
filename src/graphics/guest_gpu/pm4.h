@@ -25,6 +25,13 @@ constexpr uint32_t IT_CLEAR_STATE               = 0x12;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE         = 0x13;
 constexpr uint32_t IT_DISPATCH_DIRECT           = 0x15;
 constexpr uint32_t IT_DISPATCH_INDIRECT         = 0x16;
+// Prospero AGC encodes the compute wave mode in DispatchModifier, not in
+// COMPUTE_PGM_RSRC1. Bit 15 set selects wave32; clear selects wave64.
+constexpr uint32_t DISPATCH_MODIFIER_WAVE32_EN = 1u << 15u;
+
+constexpr uint32_t GetComputeWaveSizeFromDispatchModifier(uint32_t dispatch_modifier) {
+	return (dispatch_modifier & DISPATCH_MODIFIER_WAVE32_EN) != 0u ? 32u : 64u;
+}
 constexpr uint32_t IT_SET_PREDICATION           = 0x20;
 constexpr uint32_t IT_COND_EXEC                 = 0x22;
 constexpr uint32_t IT_DRAW_INDIRECT             = 0x24;
@@ -984,8 +991,6 @@ constexpr uint32_t COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT  = 26;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FP16_OVFL_MASK   = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT   = 29;
 constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_MASK    = 0x1;
-constexpr uint32_t COMPUTE_PGM_RSRC1_W32_EN_SHIFT     = 30;
-constexpr uint32_t COMPUTE_PGM_RSRC1_W32_EN_MASK      = 0x1;
 
 constexpr uint32_t COMPUTE_PGM_RSRC2                      = 0x213;
 constexpr uint32_t COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT     = 0;

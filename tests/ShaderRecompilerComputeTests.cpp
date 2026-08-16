@@ -11759,6 +11759,32 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   return test;
 }
 
+TestCase Vop2SdwaAshrrevCapturedWord0SignExtends() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 1, 30);
+  code.push_back(0x303202f9u);
+  code.push_back(
+      0x0c860686u); // v_ashrrev_i32 v25, 6, sign_extend(v1.word0)
+  AppendStoreVgpr(&code, 25, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop2SdwaAshrrevCapturedWord0SignExtends";
+  test.code = std::move(code);
+  test.initial = {0xabcd8000u, 0};
+  test.expected = {0xabcd8000u, 0xfffffe00u};
+  test.opcodes = {O::BufferLoadDword, O::VAshrrevI32, O::VMovB32,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.decoded_counts = {
+      {"v_ashrrev_i32 v25, 6, v1.sdwa(sel=4,sext=1)", 1}};
+  test.ir_counts = {{" = BitFieldSExtract ", 1},
+                    {" = ShiftRightArithmetic32 ", 1}};
+  test.required_spirv = {"OpBitFieldSExtract", "OpShiftRightArithmetic"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
   using O = ShaderOpcode;
 
@@ -17539,6 +17565,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorIntegerOps);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
+  AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -20978,6 +21005,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaAshrrevCapturedWord0SignExtends());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sff1-b64-only") == 0) {

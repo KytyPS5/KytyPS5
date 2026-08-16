@@ -1491,6 +1491,22 @@ struct Ngs2ContextBufferInfo {
 	uintptr_t user_data        = 0;
 };
 
+struct Ngs2SystemInfo {
+	char                  name[64]      = {};
+	uintptr_t             system_handle = 0;
+	Ngs2ContextBufferInfo buffer_info;
+	uint32_t              uid               = 0;
+	uint32_t              min_grain_samples = 0;
+	uint32_t              max_grain_samples = 0;
+	uint32_t              state_flags       = 0;
+	uint32_t              rack_count        = 0;
+	float                 last_render_ratio = 0.0f;
+	uint64_t              last_render_tick  = 0;
+	uint64_t              render_count      = 0;
+	uint32_t              sample_rate       = 0;
+	uint32_t              num_grain_samples = 0;
+};
+
 struct Ngs2RenderBufferInfo {
 	void*    buffer        = nullptr;
 	size_t   buffer_size   = 0;
@@ -1624,10 +1640,13 @@ struct Ngs2BufferAllocator {
 };
 
 struct Ngs2Internal {
-	Ngs2SystemOption    option;
-	Ngs2BufferAllocator allocator;
-	Ngs2Internal*       next = nullptr;
-	Common::Mutex       mutex;
+	Ngs2SystemOption      option;
+	Ngs2ContextBufferInfo buffer_info;
+	Ngs2BufferAllocator   allocator;
+	Ngs2Internal*         next         = nullptr;
+	uint64_t              render_count = 0;
+	uint32_t              uid          = 0;
+	Common::Mutex         mutex;
 };
 
 enum class Ngs2RackType {
@@ -1742,11 +1761,13 @@ struct Ngs2SamplerVoiceState {
 	const void*    waveform_data;
 };
 
-static Ngs2Internal*     g_ngs_list   = nullptr;
-static Ngs2RackInternal* g_racks_list = nullptr;
-static Common::Mutex     g_racks_mutex;
+static Ngs2Internal*        g_ngs_list     = nullptr;
+static Ngs2RackInternal*    g_racks_list   = nullptr;
+static std::atomic_uint32_t g_next_ngs_uid = 1;
+static Common::Mutex        g_racks_mutex;
 
 static_assert(sizeof(Ngs2SystemOption) == 144);
+static_assert(sizeof(Ngs2SystemInfo) == 184);
 static_assert(sizeof(Ngs2RackOption) == 176);
 static_assert(sizeof(Ngs2VoiceState) == 8);
 static_assert(sizeof(Ngs2SubmixerVoiceState) == 20);
@@ -1782,12 +1803,15 @@ int KYTY_SYSV_ABI Ngs2SystemResetOption(Ngs2SystemOption* option) {
 	return OK;
 }
 
-static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption* option, void* host_buffer) {
-	auto* ngs = new (host_buffer) Ngs2Internal;
+static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption*      option,
+                                              const Ngs2ContextBufferInfo* buffer_info) {
+	auto* ngs = new (buffer_info->host_buffer) Ngs2Internal;
 
-	ngs->option = *option;
-	ngs->next   = g_ngs_list;
-	g_ngs_list  = ngs;
+	ngs->option      = *option;
+	ngs->buffer_info = *buffer_info;
+	ngs->uid         = g_next_ngs_uid.fetch_add(1, std::memory_order_relaxed);
+	ngs->next        = g_ngs_list;
+	g_ngs_list       = ngs;
 
 	return ngs;
 }
@@ -1838,7 +1862,7 @@ int KYTY_SYSV_ABI Ngs2SystemCreate(const Ngs2SystemOption*      option,
 
 	EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SystemOption));
 
-	auto* ngs = Ngs2CreateSystemInternal(option, buffer_info->host_buffer);
+	auto* ngs = Ngs2CreateSystemInternal(option, buffer_info);
 
 	*handle = reinterpret_cast<uintptr_t>(ngs);
 
@@ -2001,10 +2025,56 @@ int KYTY_SYSV_ABI Ngs2SystemCreateWithAllocator(const Ngs2SystemOption*    optio
 	EXIT_NOT_IMPLEMENTED(result != OK);
 	EXIT_NOT_IMPLEMENTED(buf.host_buffer == nullptr);
 
-	auto* ngs      = Ngs2CreateSystemInternal(option, buf.host_buffer);
+	auto* ngs      = Ngs2CreateSystemInternal(option, &buf);
 	ngs->allocator = *allocator;
 
 	*handle = reinterpret_cast<uintptr_t>(ngs);
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* info,
+                                    size_t info_size) {
+	constexpr int32_t ERROR_INVALID_OUT_ADDRESS   = static_cast<int32_t>(0x804a8010u);
+	constexpr int32_t ERROR_INVALID_OUT_SIZE      = static_cast<int32_t>(0x804a8011u);
+	constexpr int32_t ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
+
+	if (info == nullptr) {
+		return ERROR_INVALID_OUT_ADDRESS;
+	}
+	if (info_size != sizeof(Ngs2SystemInfo)) {
+		return ERROR_INVALID_OUT_SIZE;
+	}
+
+	auto* ngs     = reinterpret_cast<Ngs2Internal*>(system_handle);
+	auto* current = g_ngs_list;
+	while (current != nullptr && current != ngs) {
+		current = current->next;
+	}
+	if (current == nullptr) {
+		return ERROR_INVALID_SYSTEM_HANDLE;
+	}
+
+	Common::LockGuard lock(ngs->mutex);
+
+	*info = {};
+	std::memcpy(info->name, ngs->option.name, sizeof(info->name));
+	info->system_handle     = system_handle;
+	info->buffer_info       = ngs->buffer_info;
+	info->uid               = ngs->uid;
+	info->min_grain_samples = 64;
+	info->max_grain_samples = ngs->option.max_grain_samples;
+	info->state_flags       = 1;
+	info->render_count      = ngs->render_count;
+	info->sample_rate       = ngs->option.sample_rate;
+	info->num_grain_samples = ngs->option.num_grain_samples;
+
+	Common::LockGuard racks_lock(g_racks_mutex);
+	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+		if (rack->ngs == ngs) {
+			info->rack_count++;
+		}
+	}
 
 	return OK;
 }
@@ -2367,6 +2437,8 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 			}
 		}
 	}
+
+	ngs->render_count++;
 
 	return OK;
 }

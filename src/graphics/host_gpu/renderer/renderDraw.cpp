@@ -653,22 +653,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	return state;
 }
 
-static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer,
-                                     const DrawRenderState& state, const DrawCallInfo& draw) {
-	EXIT_IF(draw.name == nullptr);
-	const auto& ctx    = buffer.GetRegisters();
-	const auto& sh_ctx = buffer.GetShaders();
-
-	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
-	                         static_cast<bool>(state.depth_info.image_id));
-	if (state.color_count != 0 || !with_depth) {
-		return true;
-	}
-
-	const auto& sh_regs = ctx.GetShaderRegisters();
-	const auto& ps      = sh_ctx.GetPs();
-	return ShaderAddressValid(ps.ps_regs.data_addr) &&
-	       PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
+static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer) {
+	const auto& ctx              = buffer.GetRegisters();
+	const auto& sh_regs          = ctx.GetShaderRegisters();
+	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
+	return has_color_output || PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
 }
 
 enum class CbColorMode : uint8_t {
@@ -951,7 +940,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 		                   draw.index_count, draw.flags);
 		return false;
 	}
-	state.ps_active = DrawHasActivePixelShader(buffer, state, draw);
+	state.ps_active = DrawHasActivePixelShader(buffer);
 
 	return true;
 }

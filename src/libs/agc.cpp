@@ -2835,8 +2835,21 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbEventWrite(CommandBuffer* buf, uint8_t event_
 }
 
 uint32_t* KYTY_SYSV_ABI GraphicsAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
-                                              const volatile void* address) {
-	return GraphicsDcbEventWrite(buf, event_type, address);
+                                              const volatile void* /*address*/) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(2);
+
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	cmd[0] = KYTY_PM4(2, Pm4::IT_EVENT_WRITE, 0u);
+	cmd[1] = (static_cast<uint32_t>(event_type) & 0x3fu) | (event_type == 7u ? 0x400u : 0u);
+
+	return cmd;
 }
 
 uint32_t* KYTY_SYSV_ABI GraphicsDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
@@ -3104,8 +3117,27 @@ uint32_t* KYTY_SYSV_ABI GraphicsAcbWriteData(CommandBuffer* buf, uint8_t dst, ui
                                              uint64_t address_or_offset, const void* data,
                                              uint32_t num_dwords, uint8_t increment,
                                              uint8_t write_confirm) {
-	return GraphicsDcbWriteData(buf, dst, cache_policy, address_or_offset, data, num_dwords,
-	                            increment, write_confirm);
+	if (buf == nullptr || data == nullptr || num_dwords == 0u || num_dwords > 0x3ffdu) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(4u + num_dwords);
+
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	cmd[0] = KYTY_PM4(4u + num_dwords, Pm4::IT_WRITE_DATA, 0u);
+	cmd[1] = ((static_cast<uint32_t>(dst) & 0xfu) << 8u) |
+	         ((static_cast<uint32_t>(increment) & 0x1u) << 16u) |
+	         ((dst == 0u ? 0u : static_cast<uint32_t>(write_confirm) & 0x1u) << 20u) |
+	         ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
+	cmd[2] = static_cast<uint32_t>(address_or_offset);
+	cmd[3] = static_cast<uint32_t>(address_or_offset >> 32u);
+
+	memcpy(cmd + 4, data, static_cast<size_t>(num_dwords) * 4u);
+
+	return cmd;
 }
 
 uint32_t* KYTY_SYSV_ABI GraphicsDcbStallCommandBufferParser(CommandBuffer* buf) {

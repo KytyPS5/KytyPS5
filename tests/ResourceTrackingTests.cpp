@@ -575,6 +575,42 @@ void TestAddressMaterializationAndSpecialization() {
         "typed address specialization was not applied");
 }
 
+void TestBufferSwizzleSpecialization() {
+  Fixture fixture;
+  const auto handle = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
+       fixture.UserData(3)},
+      4);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  memory.formatted = true;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 4));
+  fixture.PlanAndTrack();
+
+  constexpr auto swizzle = Libs::Graphics::DstSel(4, 5, 0, 1);
+  std::array<uint32_t, 4> user_data{
+      0, 16u << 16u, 1,
+      swizzle |
+          (static_cast<uint32_t>(
+               Libs::Graphics::Prospero::BufferFormat::k32_32Float)
+           << 12u) |
+          (1u << 24u)};
+  SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  std::string error;
+  Check(MaterializeResources(fixture.program, runtime, snapshot, &error) &&
+            SpecializeResources(fixture.program, snapshot, &error) &&
+            fixture.program.info.buffers[0].descriptor_swizzle == swizzle &&
+            ValidateResourceSpecialization(fixture.program, snapshot, &error),
+        "buffer destination selectors were not specialized");
+
+  snapshot.buffers[0].dwords[3] ^= 1u << 9u;
+  Check(!ValidateResourceSpecialization(fixture.program, snapshot, &error),
+        "buffer swizzle change did not invalidate specialization");
+}
+
 void TestShaderInfoAndBindingLayout() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
@@ -667,6 +703,7 @@ int main() {
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("address materialization", TestAddressMaterializationAndSpecialization);
+    Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
   } catch (const std::exception &exception) {

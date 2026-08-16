@@ -1016,8 +1016,9 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	    program.values != nullptr ? program.values->srt_reads.size() : 0u);
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& buffer = program.info.buffers[i];
-		ret += fmt::format(" b{}[stride={} format={}]", i, buffer.packed_stride,
-		                   static_cast<uint32_t>(buffer.descriptor_format));
+		ret +=
+		    fmt::format(" b{}[stride={} format={} swizzle=0x{:03x}]", i, buffer.packed_stride,
+		                static_cast<uint32_t>(buffer.descriptor_format), buffer.descriptor_swizzle);
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& image = program.info.images[i];
@@ -1054,6 +1055,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 	for (const auto& buffer: program.info.buffers) {
 		ids.push_back(buffer.packed_stride);
 		ids.push_back(static_cast<uint32_t>(buffer.descriptor_format));
+		ids.push_back(buffer.descriptor_swizzle);
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.images.size()));
 	for (const auto& image: program.info.images) {

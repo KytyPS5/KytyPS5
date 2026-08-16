@@ -222,8 +222,8 @@ Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::Inst&
 
 IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, Prospero::BufferFormat format,
                                         uint32_t component) {
-	if (!mem.typed && component != 0u) {
-		const auto component_slot = component * 4u;
+	if (!mem.typed) {
+		const auto component_slot = mem.component_index * 4u;
 		mem.offset                = mem.offset >= component_slot ? mem.offset - component_slot : 0u;
 		mem.offset += Format::GetFormatComponentByteOffset(format, component);
 	}
@@ -234,12 +234,27 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto format = BufferFormat(ctx, inst, mem);
 	if (!Format::IsKnownFormat(format)) return LoadWord(ctx, inst, mem);
 	const auto info      = Format::GetFormatInfo(format);
-	const auto component = mem.component_index;
+	auto       component = mem.component_index;
+	if (!mem.typed) {
+		const auto selector =
+		    GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle, component);
+		if (selector == 0u) return ConstantU32(ctx.state, 0);
+		if (selector == 1u) {
+			const auto integer = info.type == Format::ComponentType::Uint ||
+			                     info.type == Format::ComponentType::Sint;
+			return ConstantU32(ctx.state, integer ? 1u : 0x3f800000u);
+		}
+		if (selector < 4u) {
+			ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers,
+			                             mem.resource, "buffer descriptor has reserved dst_sel");
+		}
+		component = selector - 4u;
+	}
 	if (component >= info.component_count) return ConstantU32(ctx.state, 0);
 	uint32_t   raw  = 0;
 	const auto bits = info.component_bits[component];
 	if (info.packed_bitfield) {
-		raw = LoadWord(ctx, inst, mem);
+		raw = LoadWord(ctx, inst, RebaseFormattedComponent(mem, format, component));
 		const auto type =
 		    IsSignedFormatComponent(info.type) ? ctx.state.int_type : ctx.state.uint_type;
 		const auto source =

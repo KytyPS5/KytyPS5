@@ -190,7 +190,8 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			return false;
 		}
 		if (buffer.packed_stride != descriptor.PackedStride() ||
-		    buffer.descriptor_format != descriptor.Format()) {
+		    buffer.descriptor_format != descriptor.Format() ||
+		    buffer.descriptor_swizzle != descriptor.DstSelXYZW()) {
 			if (error != nullptr) {
 				*error = fmt::format("buffer descriptor {} no longer matches specialization", i);
 			}
@@ -392,8 +393,9 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 			}
 			return false;
 		}
-		next.buffers[i].packed_stride     = descriptor.PackedStride();
-		next.buffers[i].descriptor_format = descriptor.Format();
+		next.buffers[i].packed_stride      = descriptor.PackedStride();
+		next.buffers[i].descriptor_format  = descriptor.Format();
+		next.buffers[i].descriptor_swizzle = descriptor.DstSelXYZW();
 	}
 	for (uint32_t i = 0; i < next.addresses.size(); i++) {
 		next.addresses[i].specialized_base =

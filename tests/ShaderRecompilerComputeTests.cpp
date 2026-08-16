@@ -1144,7 +1144,7 @@ std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
   std::array<u32, 64> data{};
   data[1] = (stride_bytes & 0x3fffu) << 16u;
   data[2] = num_records;
-  data[3] = 1u << 24u;
+  data[3] = DstSel(4, 5, 6, 7) | (1u << 24u);
   if (add_tid) {
     data[3] |= 1u << 23u;
   }
@@ -14278,6 +14278,56 @@ TestCase BufferLoadFormatXyzwSnapshotsOverlappingAddress() {
   return test;
 }
 
+TestCase BufferLoadFormatXyzwResource32_32FloatAppliesXy01() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferLoadOpcode(&code, 0x03, 0, 20);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXyzwResource32_32FloatAppliesXy01";
+  test.code = std::move(code);
+  test.initial = {0x3f800000u, 0x40000000u, 0, 0};
+  test.expected = {0x3f800000u, 0x40000000u, 0, 0x3f800000u};
+  test.opcodes = {O::VMovB32, O::BufferLoadFormatXyzw,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(
+      16, 1, false, BufferFormat(Prospero::BufferFormat::k32_32Float));
+  test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(4, 5, 0, 1);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferLoadOpcode(&code, 0x03, 0, 20);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1";
+  test.code = std::move(code);
+  test.initial = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
+  test.expected = {0x11u, 0x22u, 0x33u, 1u};
+  test.opcodes = {O::VMovB32, O::BufferLoadFormatXyzw,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.user_data = MakeStructuredStorageBufferData(
+      16, 1, false, BufferFormat(Prospero::BufferFormat::k8_8_8_8UInt));
+  test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(7, 6, 5, 1);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress() {
   using O = ShaderOpcode;
 
@@ -17264,6 +17314,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreVariants);
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
+  AddCase(BufferLoadFormatXyzwResource32_32FloatAppliesXy01);
+  AddCase(BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1);
   AddCase(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress);
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);

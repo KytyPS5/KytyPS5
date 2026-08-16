@@ -10,12 +10,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
 
 namespace {
+
+std::atomic<uint64_t> g_live_image_count {0};
+std::atomic<uint64_t> g_live_image_bytes {0};
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
@@ -706,10 +710,23 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	backing.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
-	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+	vk::Result create_result = vk::Result::eSuccess;
+	if (graphics.CreateImage(create, backing, &create_result)) {
+		g_live_image_count.fetch_add(1, std::memory_order_relaxed);
+		g_live_image_bytes.fetch_add(backing.memory.allocation_info.size,
+		                             std::memory_order_relaxed);
+	} else {
+		const auto budget = graphics.DescribeMemoryBudget();
+		EXIT("failed to create image: %s extent=%ux%ux%u format=%d layers=%u levels=%u "
+		     "usage=0x%x flags=0x%x samples=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     "\n\tlive images: %" PRIu64 " holding %" PRIu64 " bytes\n\tvma: %s\n",
+		     vk::to_string(create_result).c_str(), create.extent.width, create.extent.height,
+		     create.extent.depth, static_cast<int>(create.format), create.arrayLayers,
+		     create.mipLevels, static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), backing.samples,
+		     info.data.address, info.data.size,
+		     g_live_image_count.load(std::memory_order_relaxed),
+		     g_live_image_bytes.load(std::memory_order_relaxed), budget.c_str());
 	}
 }
 
@@ -747,6 +764,9 @@ Image::~Image() {
 		views.views.clear();
 	}
 	if (backing.image != nullptr) {
+		g_live_image_count.fetch_sub(1, std::memory_order_relaxed);
+		g_live_image_bytes.fetch_sub(backing.memory.allocation_info.size,
+		                             std::memory_order_relaxed);
 		m_graphics->DeleteImage(backing);
 	}
 }

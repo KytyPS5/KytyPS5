@@ -1688,14 +1688,14 @@ void Gpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 
 void Gpu::Submit(uint32_t* draw_commands, uint32_t draw_size_dw, uint32_t* constant_commands,
                  uint32_t constant_size_dw, bool trigger_agc_interrupt_on_done) {
-	EXIT_IF(draw_commands == nullptr || draw_size_dw == 0);
+	EXIT_IF(draw_commands == nullptr && draw_size_dw != 0);
 	m_state->Submit(draw_commands, draw_size_dw, constant_commands, constant_size_dw,
 	                trigger_agc_interrupt_on_done);
 }
 
 void Gpu::SubmitCompute(uint32_t queue, uint32_t* commands, uint32_t size_dw,
                         bool trigger_agc_interrupt_on_done) {
-	EXIT_IF(commands == nullptr || size_dw == 0);
+	EXIT_IF(commands == nullptr && size_dw != 0);
 	m_state->SubmitCompute(queue, commands, size_dw, trigger_agc_interrupt_on_done);
 }
 

@@ -515,7 +515,8 @@ static bool TryEmulateSse4a(PCONTEXT context) {
 		offset++;
 	}
 
-	if (rip[offset] != 0x0f || rip[offset + 1] != 0x78) {
+	const uint8_t opcode = rip[offset + 1];
+	if (rip[offset] != 0x0f || (opcode != 0x78 && opcode != 0x79)) {
 		return false;
 	}
 
@@ -524,13 +525,35 @@ static bool TryEmulateSse4a(PCONTEXT context) {
 		return false;
 	}
 
-	const uint8_t reg    = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm     = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+
+	// AMD SSE4a EXTRQ/INSERTQ. PS5 code can execute these natively on AMD hardware, while Intel
+	// hosts raise an illegal-instruction exception.
+	if (opcode == 0x79) {
+		auto* dst = GetContextXmm(context, reg);
+		auto* src = GetContextXmm(context, rm);
+		if (dst == nullptr || src == nullptr) {
+			return false;
+		}
+
+		if (prefix == 0x66) {
+			const auto control = static_cast<uint64_t>(src->Low);
+			dst->Low           = ExtractBitField(dst->Low, static_cast<uint32_t>(control),
+			                                     static_cast<uint32_t>(control >> 8u));
+			dst->High          = 0;
+		} else {
+			const auto control = static_cast<uint64_t>(src->High);
+			dst->Low = InsertBitField(dst->Low, src->Low, static_cast<uint32_t>(control),
+			                          static_cast<uint32_t>(control >> 8u));
+		}
+		context->Rip += offset + 3;
+		return true;
+	}
+
 	const uint8_t length = rip[offset + 3];
 	const uint8_t index  = rip[offset + 4];
 
-	// AMD SSE4a immediate-form EXTRQ/INSERTQ. PS5 code can execute these natively on AMD hardware,
-	// while Intel hosts raise an illegal-instruction exception.
 	if (prefix == 0x66) {
 		auto* dst = GetContextXmm(context, rm);
 		if (dst == nullptr) {
@@ -679,6 +702,10 @@ static uint64_t GetXmmLow(const uint32_t* xmm) {
 	return static_cast<uint64_t>(xmm[0]) | (static_cast<uint64_t>(xmm[1]) << 32u);
 }
 
+static uint64_t GetXmmHigh(const uint32_t* xmm) {
+	return static_cast<uint64_t>(xmm[2]) | (static_cast<uint64_t>(xmm[3]) << 32u);
+}
+
 static void SetXmmLow(uint32_t* xmm, uint64_t value) {
 	xmm[0] = static_cast<uint32_t>(value);
 	xmm[1] = static_cast<uint32_t>(value >> 32u);
@@ -710,7 +737,8 @@ static bool TryEmulateSse4a(ucontext_t* context) {
 		offset++;
 	}
 
-	if (rip[offset] != 0x0f || rip[offset + 1] != 0x78) {
+	const uint8_t opcode = rip[offset + 1];
+	if (rip[offset] != 0x0f || (opcode != 0x78 && opcode != 0x79)) {
 		return false;
 	}
 
@@ -719,12 +747,35 @@ static bool TryEmulateSse4a(ucontext_t* context) {
 		return false;
 	}
 
-	const uint8_t reg    = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm     = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+
+	// AMD SSE4a EXTRQ/INSERTQ.
+	if (opcode == 0x79) {
+		auto* dst = GetContextXmm(context, reg);
+		auto* src = GetContextXmm(context, rm);
+		if (dst == nullptr || src == nullptr) {
+			return false;
+		}
+
+		if (prefix == 0x66) {
+			const auto control = GetXmmLow(src);
+			SetXmmLow(dst, ExtractBitField(GetXmmLow(dst), static_cast<uint32_t>(control),
+			                               static_cast<uint32_t>(control >> 8u)));
+			SetXmmHigh(dst, 0);
+		} else {
+			const auto control = GetXmmHigh(src);
+			SetXmmLow(dst, InsertBitField(GetXmmLow(dst), GetXmmLow(src),
+			                              static_cast<uint32_t>(control),
+			                              static_cast<uint32_t>(control >> 8u)));
+		}
+		rip_reg += static_cast<greg_t>(offset + 3);
+		return true;
+	}
+
 	const uint8_t length = rip[offset + 3];
 	const uint8_t index  = rip[offset + 4];
 
-	// AMD SSE4a immediate-form EXTRQ/INSERTQ.
 	if (prefix == 0x66) {
 		auto* dst = GetContextXmm(context, rm);
 		if (dst == nullptr) {

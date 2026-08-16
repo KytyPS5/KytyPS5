@@ -1411,7 +1411,13 @@ static int NativeMutexUnlock(PthreadMutexPrivate* mutex, uint32_t* recurse = nul
 	std::unique_lock lock(mutex->m);
 
 	if (mutex->owner != self) {
-		return EPERM;
+		if (mutex->type != KERNEL_PTHREAD_MUTEX_NORMAL || mutex->owner != nullptr) {
+			return EPERM;
+		}
+		if (recurse != nullptr) {
+			*recurse = 0;
+		}
+		return OK;
 	}
 
 	if (recurse != nullptr) {

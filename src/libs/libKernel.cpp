@@ -1542,6 +1542,7 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 			// TODO(unwind): guest unwinding can reach a Kyty host return address below the guest VA
 			// range. Report a synthetic boundary with no unwind tables so libc stops cleanly
 			// instead of raising.
+			Loader::RecordUnwindHostBoundary(addr);
 			std::memset(info, 0, sizeof(ModuleInfoForUnwind));
 			info->st_size = sizeof(ModuleInfoForUnwind);
 			std::snprintf(info->name, sizeof(info->name), "%s", "KytyHostBoundary");

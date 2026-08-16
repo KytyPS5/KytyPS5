@@ -59,6 +59,24 @@ public:
 		return result;
 	}
 
+	// Bytes present contiguously from `address`, capped at `size`; 0 if `address` is absent.
+	// Ranges are kept merged, so one lookup already spans the whole extent.
+	[[nodiscard]] uint64_t ContiguousFrom(uint64_t address, uint64_t size) const {
+		if (address == 0 || size == 0 || size > UINT64_MAX - address) {
+			return 0;
+		}
+		const auto end = address + size;
+		auto       it  = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return 0;
+		}
+		--it;
+		if (it->first > address || it->second <= address) {
+			return 0;
+		}
+		return std::min(it->second, end) - address;
+	}
+
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);

@@ -1641,11 +1641,12 @@ enum class Ngs2RackType {
 };
 
 struct Ngs2RackInternal {
-	Ngs2Internal*       ngs  = nullptr;
-	Ngs2RackInternal*   next = nullptr;
-	Ngs2RackType        type = Ngs2RackType::Sampler;
-	Ngs2RackOptionUnion option;
-	Ngs2BufferAllocator allocator;
+	Ngs2Internal*         ngs  = nullptr;
+	Ngs2RackInternal*     next = nullptr;
+	Ngs2RackType          type = Ngs2RackType::Sampler;
+	Ngs2RackOptionUnion   option;
+	Ngs2ContextBufferInfo buffer_info;
+	Ngs2BufferAllocator   allocator;
 };
 
 enum class Ngs2VoicePlayState { Empty, Playing, Paused, Stopped };
@@ -1743,6 +1744,7 @@ struct Ngs2SamplerVoiceState {
 
 static Ngs2Internal*     g_ngs_list   = nullptr;
 static Ngs2RackInternal* g_racks_list = nullptr;
+static Common::Mutex     g_racks_mutex;
 
 static_assert(sizeof(Ngs2SystemOption) == 144);
 static_assert(sizeof(Ngs2RackOption) == 176);
@@ -2122,11 +2124,15 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 
 	LOGF("\t type                   = %s\n", Common::EnumName(rack->type).c_str());
 
-	rack->allocator = Ngs2BufferAllocator();
-	rack->ngs       = ngs;
+	rack->allocator   = Ngs2BufferAllocator();
+	rack->buffer_info = *buffer_info;
+	rack->ngs         = ngs;
 
-	rack->next   = g_racks_list;
-	g_racks_list = rack;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		rack->next   = g_racks_list;
+		g_racks_list = rack;
+	}
 
 	for (uint32_t i = 0; i < option->max_voices; i++) {
 		voices[i].rack  = rack;
@@ -2207,11 +2213,59 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 }
 
 int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* buffer_info) {
+	constexpr int32_t ERROR_INVALID_RACK_HANDLE = static_cast<int32_t>(0x804a8202u);
+
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
 
 	if (buffer_info != nullptr) {
-		std::memset(buffer_info, 0, sizeof(Ngs2ContextBufferInfo));
+		*buffer_info = {};
+	}
+	if (rack_handle == 0) {
+		return ERROR_INVALID_RACK_HANDLE;
+	}
+
+	auto*         rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
+	Ngs2Internal* ngs  = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		for (auto* current = g_racks_list; current != nullptr; current = current->next) {
+			if (current == rack) {
+				ngs = current->ngs;
+				break;
+			}
+		}
+	}
+	if (ngs == nullptr) {
+		return ERROR_INVALID_RACK_HANDLE;
+	}
+
+	Ngs2ContextBufferInfo context_buffer;
+	Ngs2BufferAllocator   allocator;
+	{
+		Common::LockGuard lock(ngs->mutex);
+		Common::LockGuard racks_lock(g_racks_mutex);
+
+		auto** link = &g_racks_list;
+		while (*link != nullptr && *link != rack) {
+			link = &(*link)->next;
+		}
+		if (*link == nullptr) {
+			return ERROR_INVALID_RACK_HANDLE;
+		}
+
+		*link          = rack->next;
+		context_buffer = rack->buffer_info;
+		allocator      = rack->allocator;
+		rack->ngs      = nullptr;
+		rack->next     = nullptr;
+	}
+
+	if (allocator.free_handler != nullptr) {
+		return allocator.free_handler(&context_buffer);
+	}
+	if (buffer_info != nullptr) {
+		*buffer_info = context_buffer;
 	}
 
 	return OK;
@@ -2272,6 +2326,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 	}
 
+	Common::LockGuard racks_lock(g_racks_mutex);
 	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
 		if (rack->ngs == ngs) {
 			auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);

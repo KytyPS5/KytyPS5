@@ -601,6 +601,7 @@ set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
 		"/DYNAMICBASE:NO"
+		"/CETCOMPAT:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"

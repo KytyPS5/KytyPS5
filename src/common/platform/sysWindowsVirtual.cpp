@@ -57,7 +57,21 @@ static VirtualMemory::Mode GetProtectionFlag(DWORD mode) {
 	}
 }
 
-void SysVirtualInit() {}
+void SysVirtualInit() {
+	// Windows 11 RtlRestoreContext validates CONTEXT.Rip after a VEH CONTINUE_EXECUTION.
+	// Guest code lives in MEM_PRIVATE mappings, so enable the documented JIT relaxed mode
+	// instead of redirecting RIP (that is itself FAST_FAIL_INVALID_SET_OF_CONTEXT).
+	PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY ssp {};
+	GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &ssp,
+	                           sizeof(ssp));
+	ssp.SetContextIpValidation            = 1;
+	ssp.SetContextIpValidationRelaxedMode = 1;
+	if (SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, &ssp, sizeof(ssp)) == 0) {
+		PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY relaxed {};
+		relaxed.SetContextIpValidationRelaxedMode = 1;
+		(void)SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, &relaxed, sizeof(relaxed));
+	}
+}
 
 uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	auto ptr = (address == 0 ? SysVirtualAllocAligned(address, size, mode, 1)

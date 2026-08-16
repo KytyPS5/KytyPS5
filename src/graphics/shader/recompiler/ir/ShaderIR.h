@@ -305,9 +305,10 @@ struct ImageResource {
 	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
 	bool                    read            = false;
 	bool                    written         = false;
-	bool                    atomic          = false;
-	bool                    depth_compare   = false;
-	bool                    cube            = false;
+	bool                    atomic             = false;
+	bool                    depth_compare      = false;
+	bool                    alu_depth_compare  = false;
+	bool                    cube               = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };

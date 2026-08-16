@@ -42,6 +42,14 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 	}
 }
 
+bool GuestFormatUsesAluDepthCompare(Prospero::BufferFormat format) {
+	switch (format) {
+		case Prospero::BufferFormat::k16UNorm:
+		case Prospero::BufferFormat::k32Float: return true;
+		default: return false;
+	}
+}
+
 bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
@@ -244,6 +252,14 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
+			if (image.alu_depth_compare !=
+			    (image.depth_compare && GuestFormatUsesAluDepthCompare(format))) {
+				if (error != nullptr) {
+					*error = fmt::format(
+					    "image descriptor {} no longer matches depth-compare specialization", i);
+				}
+				return false;
+			}
 		}
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
@@ -385,6 +401,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		if (NullImageDescriptor(descriptor)) {
 			image.dimension = Decoder::ImageDimension::Dim2D;
 			image.cube      = false;
+			image.alu_depth_compare = false;
 			switch (image.kind) {
 				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
 				case ResourceKind::StorageImageUint:
@@ -429,6 +446,8 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 				default: break;
 			}
 		}
+		image.alu_depth_compare =
+		    image.depth_compare && GuestFormatUsesAluDepthCompare(format);
 	}
 	struct ImagePatch {
 		std::reference_wrapper<Instruction> inst;

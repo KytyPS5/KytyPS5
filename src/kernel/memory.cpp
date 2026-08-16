@@ -905,7 +905,11 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+	try {
+		return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+	} catch (...) {
+		return false;
+	}
 }
 
 struct PrtAperture {
@@ -3419,11 +3423,69 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
 	VirtualRanges::Range range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &range) ||
-	    std::strncmp(range.name, "AMM", KERNEL_MAXIMUM_NAME_LENGTH) != 0) {
+	if (!g_virtual_ranges->Query(vaddr, 0, &range)) {
 		return false;
 	}
-	EXIT("AMM virtual-memory unmap is unsupported: addr=0x%016" PRIx64 "\n", vaddr);
+
+	if (std::strncmp(range.name, "AMM", KERNEL_MAXIMUM_NAME_LENGTH) == 0) {
+		EXIT("AMM virtual-memory unmap is unsupported: addr=0x%016" PRIx64 "\n", vaddr);
+		return false;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (range.type == VirtualRangeType::PoolReserved ||
+	    range.type == VirtualRangeType::Reserved) {
+		return false;
+	}
+
+	constexpr uint64_t page_size     = 0x4000;
+	constexpr uint64_t commit_window = 0x800000; // 8 MiB per fault during large asset loads
+	const uint64_t     page_addr     = vaddr & ~(page_size - 1);
+	const uint64_t     range_end     = range.start + range.size;
+	uint64_t           commit_end    = page_addr + commit_window;
+	if (commit_end > range_end) {
+		commit_end = range_end;
+	}
+	uint64_t commit_size = commit_end > page_addr ? commit_end - page_addr : page_size;
+	if (commit_size < page_size) {
+		commit_size = page_size;
+	}
+
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<void*>(page_addr), &info, sizeof(info)) != 0 &&
+	    info.State == MEM_COMMIT) {
+		// Already committed: this is a GPU write-watch / no-access fault, not demand-paging.
+		// VirtualProtect(PAGE_READWRITE) would permanently drop tracker protections and leave
+		// font atlases / streamed textures stale.
+		return false;
+	}
+
+	DWORD protect = PAGE_READWRITE;
+	if ((range.protection & PROT_CPU_EXEC) != 0) {
+		protect = PAGE_EXECUTE_READWRITE;
+	} else if ((range.protection & PROT_CPU_WRITE) == 0 && (range.protection & PROT_CPU_READ) != 0) {
+		protect = PAGE_READONLY;
+	}
+
+	void* committed_ptr = ::VirtualAlloc(reinterpret_cast<void*>(page_addr), commit_size,
+	                                     MEM_COMMIT, protect);
+	if (committed_ptr == nullptr) {
+		committed_ptr = ::VirtualAlloc(reinterpret_cast<void*>(page_addr), page_size, MEM_COMMIT,
+		                               protect);
+		commit_size   = page_size;
+	}
+	if (committed_ptr == nullptr) {
+		return false;
+	}
+	if (g_gpu_resources != nullptr) {
+		// MEM_COMMIT with an explicit protect resets nearby write-watchers in the 8 MiB window.
+		GetGpuResources().ReapplyPageProtection(page_addr, commit_size);
+	}
+	return true;
+#else
+	(void)vaddr;
+	return false;
+#endif
 }
 
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,

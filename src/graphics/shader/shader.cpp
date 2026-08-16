@@ -1073,7 +1073,9 @@ static std::span<const uint32_t> AddShaderProgramPermutation(const char* stage,
                                                              ShaderProgramPermutation permutation) {
 	static std::atomic<int> compiled {0};
 	const auto              compiled_count = compiled.fetch_add(1, std::memory_order_relaxed) + 1;
-	std::printf("Num compiled %d shaders\n", compiled_count);
+	if (compiled_count <= 8 || (compiled_count & 31) == 0) {
+		LOGF("Num compiled %d shaders\n", compiled_count);
+	}
 
 	std::scoped_lock lock(g_shader_program_cache_mutex);
 	auto&            permutations = g_shader_program_cache[key];

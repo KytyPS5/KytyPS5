@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -12,17 +13,26 @@ GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandSchedule
 GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	constexpr uint64_t fault_size = 8;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	try {
+		constexpr uint64_t fault_size = 8;
+		const bool mapped  = IsMapped(fault_vaddr, fault_size);
+		const bool watched = m_page_manager.HasWatchers(fault_vaddr);
+		if (!mapped && !watched) {
+			return false;
+		}
+		if (access == PageFaultAccess::Write) {
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		} else {
+			if (!mapped) {
+				return false;
+			}
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		}
+		return true;
+	} catch (...) {
 		return false;
 	}
-	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
-	}
-	return true;
 }
 
 bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -32,6 +42,14 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
+}
+
+void GpuResourceManager::ReapplyPageProtection(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		return;
+	}
+	m_page_manager.ReapplyProtection(vaddr, size);
 }
 
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {

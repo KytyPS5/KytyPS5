@@ -55,7 +55,7 @@ graphical glitches, low compatibility, and poor performance.
   <tr>
     <td align="center">
       <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Minecraft Legends running in KytyPS5">
+      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
     </td>
     <td align="center">
       <strong>SILENT HILL: The Short Message</strong><br>
@@ -65,11 +65,11 @@ graphical glitches, low compatibility, and poor performance.
   <tr>
     <td align="center">
       <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Disgaea 6 running in KytyPS5">
+      <img src="docs/screenshots/ps5-02.png" width="300" alt="Hellboy running in KytyPS5">
     </td>
     <td align="center">
       <strong>Paleo Pines</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Dreaming Sarah running in KytyPS5">
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="Paleo Pines running in KytyPS5">
     </td>
   </tr>
 </table>

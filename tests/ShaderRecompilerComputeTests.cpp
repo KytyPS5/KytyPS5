@@ -20823,8 +20823,8 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
       break;
     }
     const auto size_dw = static_cast<size_t>(
-        Gen5::GraphicsDcbContextStateOpGetSize(operation_value) / 4);
-    auto *emitted = Gen5::GraphicsDcbContextStateOp(
+        Gen5::AgcDcbContextStateOpGetSize(operation_value) / 4);
+    auto *emitted = Gen5::AgcDcbContextStateOp(
         reinterpret_cast<Gen5::CommandBuffer *>(&dcb), operation_value);
     bool packet_matches = true;
     size_t segment_offset = 0;
@@ -20919,11 +20919,11 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
           "processor reset retained an invalid saved Cx state");
 
   Require("Pm4ContextState", "HLE packet size",
-          Gen5::GraphicsDcbContextStateOpGetSize(0) == 20 &&
-              Gen5::GraphicsDcbContextStateOpGetSize(1) == 108 &&
-              Gen5::GraphicsDcbContextStateOpGetSize(2) == 108 &&
-              Gen5::GraphicsDcbContextStateOpGetSize(3) == 128 &&
-              Gen5::GraphicsDcbContextStateOpGetSize(4) == 0,
+          Gen5::AgcDcbContextStateOpGetSize(0) == 20 &&
+              Gen5::AgcDcbContextStateOpGetSize(1) == 108 &&
+              Gen5::AgcDcbContextStateOpGetSize(2) == 108 &&
+              Gen5::AgcDcbContextStateOpGetSize(3) == 128 &&
+              Gen5::AgcDcbContextStateOpGetSize(4) == 0,
           "context-state HLE sizes do not match libSceAgc");
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }

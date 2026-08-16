@@ -5115,7 +5115,7 @@ void TestPsInputCountRegisterDecode() {
 void TestGraphicsCreateInterpolantMapping() {
   ShaderRegister regs[32] = {};
 
-  Check(Gen5::GraphicsCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
+  Check(Gen5::AgcCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
         "null pixel shader interpolant mapping failed");
   for (uint32_t i = 0; i < 32u; i++) {
     Check(regs[i].offset == Pm4::CX_PS_SHADER_USAGE_BASE + i,
@@ -5154,7 +5154,7 @@ void TestGraphicsCreateInterpolantMapping() {
   ps.input_semantics = ps_semantics;
   ps.num_input_semantics = static_cast<uint32_t>(std::size(ps_semantics));
 
-  Check(Gen5::GraphicsCreateInterpolantMapping(regs, &gs, &ps) == 0,
+  Check(Gen5::AgcCreateInterpolantMapping(regs, &gs, &ps) == 0,
         "shader interpolant mapping failed");
   Check(regs[0].value == 0x00000005u,
         "matched interpolant mapping did not use GS hardware mapping");

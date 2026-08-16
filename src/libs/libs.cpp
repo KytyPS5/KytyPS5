@@ -57,7 +57,7 @@ LIB_DEFINE(InitDialog_1);
 LIB_DEFINE(InitFiber_1);
 LIB_DEFINE(InitFont_1);
 LIB_DEFINE(InitFontFt_1);
-LIB_DEFINE(InitGraphicsDriver_1);
+LIB_DEFINE(InitAgcDriver_1);
 LIB_DEFINE(InitLibKernel_1);
 LIB_DEFINE(InitNet_1);
 LIB_DEFINE(InitPad_1);
@@ -89,7 +89,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(InitFiber_1);
 	LIB_LOAD(InitFont_1);
 	LIB_LOAD(InitFontFt_1);
-	LIB_LOAD(InitGraphicsDriver_1);
+	LIB_LOAD(InitAgcDriver_1);
 	LIB_LOAD(InitLibKernel_1);
 	LIB_LOAD(LibMouse::InitMouse_1);
 	LIB_LOAD(LibKeyboard::InitKeyboard_1);

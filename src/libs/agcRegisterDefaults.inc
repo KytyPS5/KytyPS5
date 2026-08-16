@@ -1,4 +1,4 @@
-// No-feature, non-0x840f00 GraphicsGetRegisterDefaults2 dispatch, versions 0..12.
+// No-feature, non-0x840f00 AgcGetRegisterDefaults2 dispatch, versions 0..12.
 // Type entries keep the pointer index in bits 0..9; higher bits are AGC flags.
 
 // g_agc_internal_reg_defaults_v0: regs=(1, 12, 0, 4), ptrs=(1, 12, 0, 2), types=15.

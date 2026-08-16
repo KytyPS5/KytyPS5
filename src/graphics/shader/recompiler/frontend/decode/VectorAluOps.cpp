@@ -457,6 +457,7 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
      SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::VCvtF32U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::VCvtF32Ubyte0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::VCvtF32F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
     {Opcode::VCvtF16F32, SdwaSelFull(), SdwaSelWords(), SdwaSelFull(), false},
     {Opcode::VCvtF16U16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),

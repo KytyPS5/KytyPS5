@@ -2745,6 +2745,52 @@ void TestNewShaderRecompilerBootF16UnaryOpcodes() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
+  const uint32_t shader[] = {
+      0x7e0822f9u,
+      0x00040609u, // v_cvt_f32_ubyte0 v4, v9.word0 (PS 9ebba6b9)
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(4, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+
+  ShaderPixelInputInfo ps_info{};
+  ps_info.ps_system_input_base = 9;
+  ps_info.ps_pos_x = true;
+
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Pixel;
+  options.dump_ir = true;
+  options.pixel_input_info = &ps_info;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(
+            result.decoded_dump,
+            "v_cvt_f32_ubyte0 v4, v9.sdwa(sel=4,sext=0)"),
+        "captured V_CVT_F32_UBYTE0 SDWA instruction was not decoded");
+
+  size_t extracts = 0;
+  size_t converts = 0;
+  for (const auto *block : result.program.values->blocks) {
+    for (const auto &inst : *block) {
+      extracts += inst.GetOpcode() ==
+                  ShaderRecompiler::IR::ValueOpcode::BitFieldUExtract;
+      converts += inst.GetOpcode() ==
+                  ShaderRecompiler::IR::ValueOpcode::ConvertF32U32;
+    }
+  }
+  Check(extracts != 0u && converts != 0u,
+        "captured SDWA byte conversion did not remain live in typed IR");
+  Check(SpirvContainsOpcode(result.spirv, 203),
+        "captured SDWA byte conversion did not emit OpBitFieldUExtract");
+  Check(SpirvContainsOpcode(result.spirv, 112),
+        "captured SDWA byte conversion did not emit OpConvertUToF");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
   const uint32_t shader[] = {
       0xd7070001u,
@@ -9140,6 +9186,7 @@ int main() {
   TestNormalizedImageContracts();
   TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized direct SPIR-V are exercised by
   // ShaderRecompilerComputeTests. The pre-SSA register-IR shape checks above

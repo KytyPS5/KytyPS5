@@ -163,15 +163,14 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	}
 	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
 	if ((standard64 || depth_tile) &&
-	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || levels != 1 ||
-	     rt.view.current_mip_level != 0 || view.base_layer != 0 || view.image_layers != 1 ||
-	     samples != 1 || (standard64 && bytes_per_element != 4) ||
-	     rt.pitch.pitch_div8_minus1 != 0 || (rt.base.addr & 0xffffu) != 0 ||
-	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
-	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
-	     rt.info.dcc_compression_enable || rt.info.cmask_is_linear != 0 ||
-	     rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode || rt.cmask.addr != 0 ||
-	     rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
+	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || view.base_layer != 0 ||
+	     view.image_layers != 1 || samples != 1 || rt.pitch.pitch_div8_minus1 != 0 ||
+	     (rt.base.addr & 0xffffu) != 0 || rt.info.fmask_compression_enable ||
+	     rt.info.fmask_data_compression_disable || rt.info.fmask_one_frag_mode ||
+	     rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable ||
+	     rt.info.cmask_is_linear != 0 || rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode ||
+	     rt.cmask.addr != 0 || rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 ||
+	     rt.dcc.data_write_on_dcc_clear_to_reg)) {
 		EXIT("unsupported texture-tiled render target: addr=0x%016" PRIx64 " tile=%u"
 		     " dimension=%u depth=%u levels=%u layer=%u/%u samples=%u fragments=%u bpe=%u"
 		     " cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",

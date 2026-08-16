@@ -641,17 +641,6 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 static void RcCheck(const HW::RenderControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.depth_clear_enable != false);
 	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
-	if ((c.resummarize_enable || c.copy_centroid || c.copy_sample != 0)) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 render-control metadata state, continuing: "
-			     "resummarize=%s copy_centroid=%s copy_sample=%" PRIu8 "\n",
-			     c.resummarize_enable ? "true" : "false", c.copy_centroid ? "true" : "false",
-			     c.copy_sample);
-		}
-		return;
-	}
-	EXIT_NOT_IMPLEMENTED(c.resummarize_enable != false);
 	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
 	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
 	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);

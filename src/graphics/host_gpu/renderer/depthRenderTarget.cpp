@@ -166,19 +166,18 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
-	if (rc.resummarize_enable || rc.copy_centroid || rc.copy_sample != 0 ||
-	    z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
-	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
-	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
-	    z.depth_info.addr5_swizzle_mask != 0 || z.depth_info.array_mode != 0 ||
-	    z.depth_info.pipe_config != 0 || z.depth_info.bank_width != 0 ||
-	    z.depth_info.bank_height != 0 || z.depth_info.macro_tile_aspect != 0 ||
-	    z.depth_info.num_banks != 0 || z.htile_surface.linear != 0 ||
-	    z.htile_surface.full_cache != 0 || z.htile_surface.htile_uses_preload_win != 0 ||
-	    z.htile_surface.preload != 0 || z.htile_surface.prefetch_width != 0 ||
-	    z.htile_surface.prefetch_height != 0 || z.htile_surface.dst_outside_zero_to_one != 0 ||
-	    z.z_read_base_addr == 0 || z.z_write_base_addr != z.z_read_base_addr ||
-	    (z.z_read_base_addr & 0xffffu) != 0 ||
+	if (rc.copy_centroid || rc.copy_sample != 0 || z.z_info.expclear_enabled ||
+	    z.stencil_info.expclear_enabled || z.z_info.partially_resident ||
+	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
+	    z.depth_view.current_mip_level != 0 || z.depth_info.addr5_swizzle_mask != 0 ||
+	    z.depth_info.array_mode != 0 || z.depth_info.pipe_config != 0 ||
+	    z.depth_info.bank_width != 0 || z.depth_info.bank_height != 0 ||
+	    z.depth_info.macro_tile_aspect != 0 || z.depth_info.num_banks != 0 ||
+	    z.htile_surface.linear != 0 || z.htile_surface.full_cache != 0 ||
+	    z.htile_surface.htile_uses_preload_win != 0 || z.htile_surface.preload != 0 ||
+	    z.htile_surface.prefetch_width != 0 || z.htile_surface.prefetch_height != 0 ||
+	    z.htile_surface.dst_outside_zero_to_one != 0 || z.z_read_base_addr == 0 ||
+	    z.z_write_base_addr != z.z_read_base_addr || (z.z_read_base_addr & 0xffffu) != 0 ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
 		DepthFatal("unsupported depth register state");
 	}

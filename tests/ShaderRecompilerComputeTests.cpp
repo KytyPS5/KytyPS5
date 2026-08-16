@@ -6910,6 +6910,7 @@ public:
       phased_depth_control.z_write_enable = true;
       registers.SetDepthControl(phased_depth_control);
       HW::RenderControl phased_render_control{};
+      phased_render_control.resummarize_enable = true;
       registers.SetRenderControl(phased_render_control);
 
       RenderDepthInfo phased_depth{};

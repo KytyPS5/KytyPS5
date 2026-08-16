@@ -1142,6 +1142,29 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	InitializeImage(id, desc);
 }
 
+void TextureCache::FlushStencilWrite(const std::shared_ptr<Image>& source) {
+	CacheLock lock(*this, m_lock);
+	if (source == nullptr || !source->depth_id) {
+		EXIT("TextureCache: stencil write flush requires an associated image\n");
+	}
+	auto depth = ResolveOwner(source->depth_id);
+	if (depth == nullptr) {
+		EXIT("TextureCache: stencil write flush lost its depth image\n");
+	}
+	if (!depth->info.IsDepth() || !depth->info.HasStencil()) {
+		EXIT("TextureCache: stencil write flush target is not a depth/stencil image\n");
+	}
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid()) {
+		EXIT("TextureCache: stencil write flush requires a valid command buffer\n");
+	}
+	depth->CopyStencilFromColor(*source, m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal));
+	TouchImage(*depth);
+	CommitGpuWrite(*depth);
+	command.RetainResourceUntilFence(source);
+	command.RetainResourceUntilFence(depth);
+}
+
 void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	CacheLock lock(*this, m_lock);
 	AssociateStencilLocked(depth_id, stencil);
@@ -1315,8 +1338,10 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	CacheLock lock(*this, m_lock);
 	auto&     image = ResolveImage(id);
 	TouchImage(image);
+	const bool stencil_write =
+	    desc.type == BindingType::Storage && static_cast<bool>(image.depth_id);
 	if (!image.info.data.Empty()) {
-		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		if (!image.registered || (image.depth_id && !stencil_write) || image.binding.needs_rebind) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
 	}
@@ -1330,10 +1355,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			if (!image.info.data.Empty()) {
-				if (!image.registered || image.depth_id) {
+				if (!image.registered) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
 				}
-				CommitGpuWrite(image);
+				if (!stencil_write) {
+					CommitGpuWrite(image);
+				}
 			}
 			TrackImageDownloadLocked(id, image);
 			break;

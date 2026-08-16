@@ -6768,11 +6768,15 @@ public:
 			    scheduler.Current(), stencil_storage_runtime, vk::ShaderStageFlagBits::eCompute,
 			    DescriptorCache::Stage::Compute);
 			executor.RebindImages(scheduler.Current(), storage_redirected);
+			const auto storage_stencil_id = storage_redirected.resources.images[0].image_id;
 			Require(name, "storage stencil acquisition",
-			        storage_redirected.resources.images[0].image_id == depth_id &&
+			        storage_stencil_id != depth_id &&
+			            texture_cache.GetImage(storage_stencil_id).depth_id == depth_id &&
 			            storage_redirected.resources.images[0].image_view != nullptr &&
-			            texture_cache.GetImage(depth_id).usage.storage,
-			        "storage stencil binding did not acquire the associated depth owner");
+			            texture_cache.GetImage(storage_stencil_id).usage.storage &&
+			            !texture_cache.GetImage(depth_id).usage.storage,
+			        "a storage stencil binding must acquire the stencil plane itself, not the "
+			        "depth owner that cannot hold VK_IMAGE_USAGE_STORAGE_BIT");
 			RenderExecutorTestAccess::ResetBindings(executor);
 			resources.UnmapMemory(base, allocation_size);
 			scheduler.Finish();

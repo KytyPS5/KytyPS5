@@ -36,6 +36,9 @@ struct GraphicContext: public VulkanInstance {
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
+
+	// Persistent Vulkan pipeline cache (speeds up vkCreate*Pipelines on weak CPUs).
+	vk::PipelineCache pipeline_cache = nullptr;
 };
 
 struct VulkanMemory {

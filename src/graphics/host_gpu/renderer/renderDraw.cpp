@@ -1101,6 +1101,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	EXIT_IF(draw.name == nullptr);
 	auto& ucfg = buffer.GetUserConfig();
 
+	if (log_pipeline_phase) {
+		LogDrawPhase(draw.name, "RequestPipeline");
+	}
+	auto& pipeline = m_context.GetPipelineCache().RequestGraphicsPipeline(
+	    state.color_info, state.color_count, state.depth_info, state.vs_input_info, buffer,
+	    &state.ps_input_info, topology, state.ps_active, state.vs_shader, state.ps_shader);
+
 	LogDrawPhase(draw.name, "PrepareBindings");
 	auto bindings        = PrepareGraphicsBindings(buffer, state.vs_input_info.stage,
 	                                               state.ps_input_info.stage, state.ps_active);
@@ -1110,11 +1117,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
 
 	if (log_pipeline_phase) {
-		LogDrawPhase(draw.name, "CreatePipeline");
+		LogDrawPhase(draw.name, "WaitPipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    state.color_info, state.color_count, state.depth_info, state.vs_input_info, buffer,
-	    &state.ps_input_info, topology, state.ps_active, state.vs_shader, state.ps_shader);
+	m_context.GetPipelineCache().WaitGraphicsPipeline(pipeline);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

@@ -10,10 +10,14 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <deque>
 #include <memory>
+#include <optional>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -97,16 +101,16 @@ struct PipelineRenderingState {
 
 class PipelineCache {
 public:
-	PipelineCache(GraphicContext& graphics, DescriptorCache& descriptor_cache)
-	    : m_graphics(graphics), m_descriptor_cache(descriptor_cache) {
-		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	}
+	PipelineCache(GraphicContext& graphics, DescriptorCache& descriptor_cache);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+
+	enum class CompileState : uint8_t { Ready, Compiling };
 
 	struct Pipeline {
 		vk::PipelineLayout pipeline_layout = nullptr;
 		vk::Pipeline       pipeline        = nullptr;
+		CompileState       state           = CompileState::Ready;
 	};
 
 	struct GraphicsPipeline: Pipeline {
@@ -119,11 +123,25 @@ public:
 	};
 
 	GraphicsPipeline&
+	RequestGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
+	                        ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
+	                        ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                        bool ps_active, std::span<const uint32_t> vs_spirv,
+	                        std::span<const uint32_t> ps_spirv);
+	void WaitGraphicsPipeline(GraphicsPipeline& pipeline);
+
+	GraphicsPipeline&
 	CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
 	                       ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
 	                       ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                       bool ps_active, std::span<const uint32_t> vs_spirv,
 	                       std::span<const uint32_t> ps_spirv);
+
+	ComputePipeline& RequestComputePipeline(ShaderComputeInputInfo&      input_info,
+	                                        const HW::ComputeShaderInfo& cs_regs,
+	                                        std::span<const uint32_t>    cs_spirv);
+	void             WaitComputePipeline(ComputePipeline& pipeline);
+
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	                                       const HW::ComputeShaderInfo& cs_regs,
 	                                       std::span<const uint32_t>    cs_spirv);
@@ -200,14 +218,48 @@ private:
 		}
 	};
 
+	struct GraphicsCompileJob {
+		GraphicsPipeline*          target = nullptr;
+		PipelineRenderingState     rendering {};
+		PipelineStaticParameters   static_params {};
+		ShaderVertexInputInfo      vs_input_info {};
+		std::optional<ShaderPixelInputInfo> ps_input_info;
+		std::vector<uint32_t>      vs_spirv;
+		std::vector<uint32_t>      ps_spirv;
+		bool                       ps_active = false;
+		uint32_t                   vs_hash0  = 0;
+		uint32_t                   vs_crc32  = 0;
+		uint32_t                   ps_hash0  = 0;
+		uint32_t                   ps_crc32  = 0;
+	};
+
+	struct ComputeCompileJob {
+		ComputePipeline*         target = nullptr;
+		ShaderComputeInputInfo   input_info {};
+		std::vector<uint32_t>    cs_spirv;
+	};
+
+	struct CompileJob {
+		std::unique_ptr<GraphicsCompileJob> graphics;
+		std::unique_ptr<ComputeCompileJob>  compute;
+	};
+
+	void WorkerMain();
+
 	GraphicContext&  m_graphics;
 	DescriptorCache& m_descriptor_cache;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
 	                   GraphicsPipelineKeyHash>
 	    m_graphics_pipelines;
 	std::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>, ComputePipelineKeyHash>
-	              m_compute_pipelines;
-	Common::Mutex m_mutex;
+	                   m_compute_pipelines;
+	Common::Mutex      m_mutex;
+	Common::Mutex      m_create_mutex;
+	Common::CondVar    m_job_cv;
+	Common::CondVar    m_ready_cv;
+	std::deque<CompileJob> m_jobs;
+	bool               m_shutdown = false;
+	std::jthread       m_worker;
 };
 
 void LogPipelineTrace(const char* phase, uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0,

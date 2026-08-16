@@ -317,11 +317,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 
 	buffer.EndRendering();
 	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
+	    m_context.GetPipelineCache().RequestComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
 	auto bindings = PrepareBindings(buffer, input_info.stage, vk::ShaderStageFlagBits::eCompute,
 	                                DescriptorCache::Stage::Compute);
 	RebindBuffers(buffer, bindings);
 	RebindImages(buffer, bindings);
+	m_context.GetPipelineCache().WaitComputePipeline(pipeline);
 
 	auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, bindings);

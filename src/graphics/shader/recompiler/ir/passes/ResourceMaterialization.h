@@ -14,6 +14,13 @@ struct ResourceSnapshot {
 
 		bool operator==(const Address& other) const = default;
 	};
+	struct IndirectImage {
+		uint32_t                     resource = 0;
+		uint32_t                     capacity = 0;
+		std::vector<uint32_t>        keys;
+		std::vector<uint32_t>        candidates;
+		std::vector<DescriptorValue> descriptors;
+	};
 
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -21,6 +28,7 @@ struct ResourceSnapshot {
 	std::vector<Address>         addresses;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
+	std::vector<IndirectImage>   indirect_images;
 };
 
 bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& snapshot,
@@ -35,7 +43,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 
 // Applies runtime descriptor shape/format facts to a copied dense topology before layout and
 // emission. On failure the program is unchanged.
-bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std::string* error);
+bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::string* error);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

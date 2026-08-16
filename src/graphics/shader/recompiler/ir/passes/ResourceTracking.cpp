@@ -169,8 +169,12 @@ public:
 			}
 		}
 		for (const auto& plan: m_indirect_images) {
-			for (uint32_t dword = 0; dword < plan.roots.size(); dword++) {
-				plan.handle->SetArg(dword, plan.roots[dword]);
+			plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 0; dword < 4u; dword++) {
+				plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
+			}
+			for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
+				plan.handle->SetArg(dword, plan.key);
 			}
 			for (const auto index: plan.memory) {
 				m_values.memory_info[index].planning_only = true;
@@ -204,9 +208,10 @@ private:
 	struct IndirectImagePlan {
 		Inst*                      handle = nullptr;
 		uint32_t                   source = 0;
+		Value                      key;
 		std::array<Value, 8>       roots {};
-		std::array<uint32_t, 9>    memory {};
-		std::array<const Inst*, 9> reads {};
+		std::array<uint32_t, 8>    memory {};
+		std::array<const Inst*, 8> reads {};
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& reason) const {
@@ -474,8 +479,8 @@ private:
 			} else if (!EquivalentValue(m_values, heap_offset, heap_reads[dword]->Arg(1))) {
 				return false;
 			}
-			plan.memory[dword + 1u] = memory_index;
-			plan.reads[dword + 1u]  = heap_reads[dword];
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = heap_reads[dword];
 		}
 
 		const auto* shift        = heap_offset.TryInstruction();
@@ -538,13 +543,12 @@ private:
 		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
 		          image_source.dwords.begin() + 4u);
 		image_source.indirect_image = DescriptorSource::IndirectImage {
-		    material_source_index, heap_source_index, selector_stride, selector_offset};
+		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
 
-		plan.handle    = &handle;
-		plan.source    = InternSource(image_source);
-		plan.roots     = image_source.dwords;
-		plan.memory[0] = material_memory_index;
-		plan.reads[0]  = material_read;
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = Value(material_read);
+		plan.roots  = image_source.dwords;
 		return true;
 	}
 

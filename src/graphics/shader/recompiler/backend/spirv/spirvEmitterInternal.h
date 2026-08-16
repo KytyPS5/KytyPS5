@@ -720,6 +720,8 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t u
 
 uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
                           ImageViewKind view);
+uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
+                          ImageViewKind view, uint32_t image_resource);
 
 ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
                                    bool uint_image, uint32_t use_pc);

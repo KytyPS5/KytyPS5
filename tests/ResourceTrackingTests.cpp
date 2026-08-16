@@ -247,15 +247,24 @@ void TestInvariantIndirectImageMaterialization() {
       ValidateValueProgram(*fixture->program.values, true, &validation_error),
       "post-tracking dead-code elimination invalidated descriptor provenance");
 
-  Check(fixture->program.info.buffers.empty() &&
+  Check(fixture->program.info.buffers.size() == 1 &&
             fixture->program.info.images.size() == 1 &&
-            fixture->program.values->dynamic_reads.empty(),
-        "indirect image planning reads leaked into shader resources");
+            fixture->program.values->dynamic_reads.size() == 1,
+        "indirect image key was not retained as a scalar-buffer read");
   const auto source = fixture->program.info.images[0].source;
   Check(source < fixture->program.values->descriptor_sources.size() &&
             fixture->program.values->descriptor_sources[source]
                 .indirect_image.has_value(),
         "indirect image source was not retained for runtime proof");
+  const auto image_handle = std::ranges::find_if(
+      *fixture->block, [](const Inst &inst) {
+        return inst.GetOpcode() == ValueOpcode::GetImageResource;
+      });
+  Check(image_handle != fixture->block->end() &&
+            image_handle->Arg(0).ResolveInstruction() != nullptr &&
+            image_handle->Arg(0).ResolveInstruction()->GetOpcode() ==
+                ValueOpcode::ReadConstBuffer,
+        "indirect image handle discarded the live material key");
 
   std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
                                     16u << 16u, 4u,          0u, 7u};
@@ -284,24 +293,114 @@ void TestInvariantIndirectImageMaterialization() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   std::string error;
+  const auto same_snapshot = [](const ResourceSnapshot &lhs,
+                                const ResourceSnapshot &rhs) {
+    return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
+           lhs.samplers == rhs.samplers && lhs.addresses == rhs.addresses &&
+           lhs.flattened_srt == rhs.flattened_srt &&
+           lhs.user_data == rhs.user_data &&
+           lhs.indirect_images.empty() == rhs.indirect_images.empty();
+  };
   Check(MaterializeResources(fixture->program, runtime, snapshot, &error) &&
             snapshot.images.size() == 1 &&
             std::equal(image_descriptor.begin(), image_descriptor.end(),
                        snapshot.images[0].dwords.begin()),
         "invariant indirect image table did not materialize");
 
-  const auto prior_image = snapshot.images[0];
+  const auto prior_snapshot = snapshot;
   memory.fail_address = 0x1004u;
   Check(!MaterializeResources(fixture->program, runtime, snapshot, &error) &&
             error.find("scalar read") != std::string::npos &&
-            snapshot.images[0] == prior_image,
+            same_snapshot(snapshot, prior_snapshot),
         "rejected planning memory read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
+
   memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
-  Check(!MaterializeResources(fixture->program, runtime, snapshot, &error) &&
-            error.find("not invariant") != std::string::npos &&
-            snapshot.images[0] == prior_image,
-        "divergent indirect image table was accepted or mutated the snapshot");
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] = 0u;
+    memory.words[(0x2020u - memory.base) / 4u + dword] = 0u;
+  }
+  memory.words[(0x2000u - memory.base) / 4u + 1u] = image_descriptor[1];
+  memory.words[(0x2000u - memory.base) / 4u + 3u] = image_descriptor[3];
+  memory.words[(0x2020u - memory.base) / 4u + 1u] = image_descriptor[1];
+  memory.words[(0x2020u - memory.base) / 4u + 3u] =
+      image_descriptor[3] ^ (1u << 28u);
+  ResourceSnapshot null_snapshot;
+  Check(MaterializeResources(fixture->program, runtime, null_snapshot, &error) &&
+            null_snapshot.indirect_images.empty() &&
+            std::ranges::all_of(null_snapshot.images[0].dwords,
+                                [](uint32_t dword) { return dword == 0u; }),
+        "stale typed null image descriptors were not canonicalized");
+
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x2020u - memory.base) / 4u] ^= 1u;
+  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+  ResourceSnapshot dynamic_snapshot;
+  Check(MaterializeResources(fixture->program, runtime, dynamic_snapshot,
+                             &error) &&
+            dynamic_snapshot.images.size() == 1 &&
+            dynamic_snapshot.indirect_images.size() == 1 &&
+            dynamic_snapshot.indirect_images[0].descriptors.size() == 2 &&
+            SpecializeResources(fixture->program, dynamic_snapshot, &error) &&
+            fixture->program.info.images.size() == 2 &&
+            fixture->program.info.images[0].indirect_root == 0 &&
+            fixture->program.info.images[0].indirect_mapping_capacity != 0 &&
+            fixture->program.info.images[0].indirect_resources.size() == 2 &&
+            dynamic_snapshot.images.size() == 2 &&
+            dynamic_snapshot.indirect_images.empty(),
+        "dynamic indirect image table was not specialized transactionally");
+
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x2000u - memory.base) / 4u] += 0x100u;
+  memory.words[(0x2020u - memory.base) / 4u] += 0x101u;
+  ResourceSnapshot rebound_snapshot;
+  Check(MaterializeResources(fixture->program, runtime, rebound_snapshot,
+                             &error) &&
+            ValidateResourceSpecialization(fixture->program, rebound_snapshot,
+                                           &error),
+        "stable indirect key mapping did not accept changed image addresses");
+  memory.words[(0x2020u - memory.base) / 4u] =
+      memory.words[(0x2000u - memory.base) / 4u];
+  Check(MaterializeResources(fixture->program, runtime, rebound_snapshot,
+                             &error) &&
+            ValidateResourceSpecialization(fixture->program, rebound_snapshot,
+                                           &error),
+        "runtime indirect key mapping did not accept collapsed candidates");
+  const auto collapsed_snapshot = rebound_snapshot;
+  ResourceSnapshot capacity_snapshot;
+  for (const uint32_t records : {1u, 3u}) {
+    user_data[2] = records;
+    Check(MaterializeResources(fixture->program, runtime, capacity_snapshot,
+                               &error) &&
+              ValidateResourceSpecialization(fixture->program,
+                                             capacity_snapshot, &error),
+          "runtime indirect key mapping rejected a fitting material-table size");
+  }
+  user_data[2] = 2u;
+  memory.words[(0x2020u - memory.base) / 4u] =
+      memory.words[(0x2000u - memory.base) / 4u] + 1u;
+  memory.words[(0x2040u - memory.base) / 4u] =
+      memory.words[(0x2000u - memory.base) / 4u] + 2u;
+  for (uint32_t dword = 1; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2040u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x1000u - memory.base + 68u) / 4u] = 2u;
+  Check(!MaterializeResources(fixture->program, runtime, rebound_snapshot,
+                              &error) &&
+            error.find("candidate topology") != std::string::npos &&
+            same_snapshot(rebound_snapshot, collapsed_snapshot),
+        "larger indirect candidate topology reused or mutated a cached snapshot");
 
   auto memory_backed = MakeIndirectImageFixture(false, 0u, true);
   memory_backed->PlanAndTrack();
@@ -319,7 +418,7 @@ void TestInvariantIndirectImageMaterialization() {
   Check(!MaterializeResources(memory_backed->program, memory_backed_runtime,
                               snapshot, &error) &&
             error.find("constant read failed") != std::string::npos &&
-            snapshot.images[0] == prior_image,
+            same_snapshot(snapshot, prior_snapshot),
         "rejected indirect table descriptor read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
 

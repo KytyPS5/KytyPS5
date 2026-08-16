@@ -113,7 +113,13 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	if (!program.info.addresses.empty()) {
 		Expect(Kind::AddressMemory, Dense(program.info.addresses.size()));
 	}
-	if (program.values != nullptr && !program.values->srt_reads.empty()) {
+	const bool uses_flattened_runtime =
+	    program.values != nullptr &&
+	    (!program.values->srt_reads.empty() ||
+	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
+		     return image.indirect_mapping_capacity != 0u;
+	     }));
+	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && program.bindings.push_constant_size == 0) {

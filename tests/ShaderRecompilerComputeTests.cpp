@@ -16737,6 +16737,126 @@ TestCase ImageStoreVariants() {
   return test;
 }
 
+void CheckIndirectImageKeySwitch() {
+  constexpr const char *name = "IndirectImageKeySwitch";
+  constexpr uint32_t mapping_capacity = 1793u;
+  using namespace ShaderRecompiler::IR;
+
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.values = std::make_shared<ValueProgram>();
+  program.values->block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.values->block_storage.back().get();
+  program.values->blocks.push_back(block);
+  program.values->block_info.push_back({.id = 0});
+
+  auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &image = block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(&key), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)});
+  image.SetFlags<uint32_t>(0u);
+  auto &sampler = block->AppendNewInst(
+      ValueOpcode::GetSamplerResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  sampler.SetFlags<uint32_t>(0u);
+  auto &address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  MemoryInfo memory{};
+  memory.kind = ResourceKind::Image;
+  memory.resource = 0;
+  memory.sampler = 0;
+  memory.dmask = 0xf;
+  memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLod;
+  memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  memory.image_address_components = 3;
+  program.values->memory_info.push_back(memory);
+  const MemoryFlags memory_flags{0u, 0x10f0u};
+  uint64_t memory_flag_bits = 0;
+  std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
+  auto &sample = block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw,
+      {Value(&image), Value(&sampler), Value(&address)},
+      memory_flag_bits);
+  auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                        {Value(&sample), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
+
+  program.values->descriptor_sources.resize(2);
+  program.values->descriptor_sources[0].dword_count = 8;
+  program.values->descriptor_sources[0].indirect_image =
+      DescriptorSource::IndirectImage{0u, 0u, 224u, 12u, 0u};
+  program.values->descriptor_sources[1].dword_count = 4;
+
+  ImageResource root{};
+  root.source = 0;
+  root.first_use_pc = 0x10f0u;
+  root.kind = ResourceKind::Image;
+  root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  root.read = true;
+  root.indirect_root = 0;
+  root.indirect_mapping_offset = 0;
+  root.indirect_mapping_capacity = mapping_capacity;
+  root.indirect_resources = {0u, 1u};
+  auto candidate = root;
+  candidate.indirect_mapping_capacity = 0;
+  candidate.indirect_resources.clear();
+  program.info.images = {root, candidate};
+  program.info.samplers.push_back({1u, 0x10f0u});
+  program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+
+  std::string error;
+  Require(name, "binding layout",
+          AllocateBindings(program, {}, &error), error.c_str());
+  ResourceSnapshot snapshot{};
+  DescriptorValue descriptor{};
+  descriptor.dword_count = 8;
+  descriptor.dwords[0] = 0x20u;
+  descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  descriptor.dwords[2] = 3u | (3u << 14u);
+  descriptor.dwords[3] =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+  snapshot.images = {descriptor, descriptor};
+  snapshot.images[1].dwords[0] = 0x40u;
+  snapshot.flattened_srt.resize(1u + mapping_capacity * 2u);
+  snapshot.flattened_srt[0] = 2u;
+  snapshot.flattened_srt[1] = 0u;
+  snapshot.flattened_srt[2] = 0u;
+  snapshot.flattened_srt[3] = 1u;
+  snapshot.flattened_srt[4] = 1u;
+  DescriptorValue sampler_descriptor{};
+  sampler_descriptor.dword_count = 4;
+  snapshot.samplers.push_back(sampler_descriptor);
+
+  ShaderComputeInputInfo compute{};
+  std::vector<u32> spirv;
+  Require(name, "SPIR-V emit",
+          ShaderRecompiler::Spirv::EmitProgram(program, snapshot, nullptr,
+                                               nullptr, &compute, spirv, &error),
+          error.c_str());
+  ValidateSpirv(name, spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect image shader");
+  Require(name, "key switch",
+          text.find("OpSwitch") != std::string::npos &&
+              text.find("OpPhi") != std::string::npos &&
+              CountText(text, "OpImageSampleExplicitLod") == 2 &&
+              CountText(text, "OpIEqual") == 11,
+          "dynamic image key did not use a compact two-sample switch");
+}
+
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -19533,6 +19653,11 @@ void CheckStorageImageSwizzleSpecializationId() {
       ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
   auto mip3_program = mip1_program;
   mip3_program.info.images[0].mip_count = 3;
+  auto array_program = identity_program;
+  array_program.info.images[0].dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  auto cube_program = array_program;
+  cube_program.info.images[0].cube = true;
 
   const auto resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
@@ -19549,16 +19674,25 @@ void CheckStorageImageSwizzleSpecializationId() {
   auto mip3_info = identity_info;
   mip3_info.stage.program =
       std::make_shared<const ShaderRecompiler::IR::Program>(mip3_program);
+  auto array_info = identity_info;
+  array_info.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(array_program);
+  auto cube_info = identity_info;
+  cube_info.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(cube_program);
 
   const auto identity_id = ShaderGetIdCS(regs, identity_info, true);
   const auto rgb1_id = ShaderGetIdCS(regs, rgb1_info, true);
   const auto mip1_id = ShaderGetIdCS(regs, mip1_info, true);
   const auto mip3_id = ShaderGetIdCS(regs, mip3_info, true);
+  const auto array_id = ShaderGetIdCS(regs, array_info, true);
+  const auto cube_id = ShaderGetIdCS(regs, cube_info, true);
   Require("StorageImageSwizzleSpecializationId", "pipeline cache key",
           identity_id != rgb1_id &&
               identity_id.ids.size() == rgb1_id.ids.size() &&
-              mip1_id != mip3_id && mip1_id.ids.size() == mip3_id.ids.size(),
-          "storage swizzle or mip-count variants share a pipeline ID");
+              mip1_id != mip3_id && mip1_id.ids.size() == mip3_id.ids.size() &&
+              array_id != cube_id && array_id.ids.size() == cube_id.ids.size(),
+          "storage swizzle, mip-count, or cube variants share a pipeline ID");
   std::printf("[host]    %-32s ok\n", "StorageImageSwizzlePipelineId");
 }
 
@@ -20854,6 +20988,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
+    CheckStorageImageSwizzleSpecializationId();
+    CheckIndirectImageKeySwitch();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -20924,6 +21063,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckRectListShaders();
+  CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckGpuMappedRangeLifecycle();

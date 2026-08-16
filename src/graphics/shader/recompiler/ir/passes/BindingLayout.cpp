@@ -230,7 +230,12 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 		}
 		AddBinding(next, DescriptorBindingKind::AddressMemory, std::move(resources));
 	}
-	if (!program.values->srt_reads.empty()) {
+	const bool uses_flattened_runtime =
+	    !program.values->srt_reads.empty() ||
+	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		    return image.indirect_mapping_capacity != 0u;
+	    });
+	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -423,11 +424,11 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto layout  = Layout(mem, view);
 		const bool integer = mem.kind == IR::ResourceKind::ImageUint;
 		const bool dref    = HasFlag(mem, Decoder::ImageSampleFlagCompare);
-		const auto sampled = MakeSampledImage(state, mem, pc, view);
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
-		const auto sample = state.builder.AllocateId();
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			const auto            sampled = MakeSampledImage(state, mem, pc, view);
+			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words =
 			    dref ? std::vector<uint32_t> {OpImageDrefGather,
 			                                  state.vec4_float_type,
@@ -461,12 +462,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
 		const auto result_type =
 		    dref ? state.float_type : (integer ? state.vec4_uint_type : state.vec4_float_type);
-		std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
-		if (dref) {
-			words.push_back(layout.dref != NoImageComponent
-			                    ? AddressF32(ctx, mem, *address, layout.dref)
-			                    : ZeroF32(state));
-		}
+		const auto dref_value =
+		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
+		                                            : ZeroF32(state))
+		         : 0u;
 		uint32_t              operand_mask = 0;
 		std::vector<uint32_t> operands;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
@@ -485,12 +484,114 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operand_mask |= ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
-		if (operand_mask != 0u) {
-			words.push_back(operand_mask);
-			words.insert(words.end(), operands.begin(), operands.end());
+		const auto EmitSample = [&](uint32_t resource) {
+			const auto            sampled = MakeSampledImage(state, mem, pc, view, resource);
+			const auto            sample  = state.builder.AllocateId();
+			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
+			if (dref) {
+				words.push_back(dref_value);
+			}
+			if (operand_mask != 0u) {
+				words.push_back(operand_mask);
+				words.insert(words.end(), operands.begin(), operands.end());
+			}
+			state.builder.AddFunction(words);
+			return sample;
+		};
+		const auto& image = state.program.info.images[mem.resource];
+		if (image.indirect_root != mem.resource) {
+			ctx.Define(inst, ResultVector(ctx, EmitSample(mem.resource), integer, dref));
+			return true;
 		}
-		state.builder.AddFunction(words);
-		ctx.Define(inst, ResultVector(ctx, sample, integer, dref));
+		const auto* handle = image_arg.ResolveInstruction();
+		const auto* source = image.source < ctx.program.descriptor_sources.size()
+		                         ? &ctx.program.descriptor_sources[image.source]
+		                         : nullptr;
+		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
+		    source->indirect_image->key_arg >= handle->NumArgs()) {
+			ctx.Fail(inst, "has invalid indirect image key provenance");
+			return true;
+		}
+		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
+		if (state.flattened_srt_variable == 0 || image.indirect_mapping_capacity == 0u ||
+		    image.indirect_resources.size() < 2u) {
+			ctx.Fail(inst, "has no indirect image runtime mapping");
+			return true;
+		}
+		const auto LoadMapping = [&](uint32_t index) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer_uint, pointer,
+			                           state.flattened_srt_variable, ConstantU32(state, 0), index});
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
+			return value;
+		};
+		const auto mapping  = ConstantU32(state, image.indirect_mapping_offset);
+		auto       low      = ConstantU32(state, 0u);
+		auto       high     = LoadMapping(mapping);
+		auto       selected = ConstantU32(state, 0u);
+		for (uint32_t iteration = 0; iteration < std::bit_width(image.indirect_mapping_capacity);
+		     iteration++) {
+			const auto active = Binary(state, OpULessThan, state.bool_type, low, high);
+			const auto mid =
+			    Binary(state, OpShiftRightLogical, state.uint_type,
+			           Binary(state, OpIAdd, state.uint_type, low, high), ConstantU32(state, 1u));
+			const auto probe = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpSelect, state.uint_type, probe, active, mid, ConstantU32(state, 0u)});
+			const auto entry      = Binary(state, OpIAdd, state.uint_type, mapping,
+			                               Binary(state, OpIAdd, state.uint_type,
+			                                      Binary(state, OpShiftLeftLogical, state.uint_type,
+			                                             probe, ConstantU32(state, 1u)),
+			                                      ConstantU32(state, 1u)));
+			const auto mapped_key = LoadMapping(entry);
+			const auto candidate =
+			    LoadMapping(Binary(state, OpIAdd, state.uint_type, entry, ConstantU32(state, 1u)));
+			const auto equal         = Binary(state, OpIEqual, state.bool_type, mapped_key, key);
+			const auto match         = Binary(state, OpLogicalAnd, state.bool_type, active, equal);
+			const auto next_selected = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpSelect, state.uint_type, next_selected, match, candidate, selected});
+			selected              = next_selected;
+			const auto less       = Binary(state, OpULessThan, state.bool_type, mapped_key, key);
+			const auto take_upper = Binary(state, OpLogicalAnd, state.bool_type, active, less);
+			const auto take_lower = Binary(state, OpLogicalAnd, state.bool_type, active,
+			                               Unary(state, OpLogicalNot, state.bool_type, less));
+			const auto next_low   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpSelect, state.uint_type, next_low, take_upper,
+			     Binary(state, OpIAdd, state.uint_type, mid, ConstantU32(state, 1u)), low});
+			low                  = next_low;
+			const auto next_high = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpSelect, state.uint_type, next_high, take_lower, mid, high});
+			high = next_high;
+		}
+		const auto            default_label = state.builder.AllocateId();
+		const auto            merge_label   = state.builder.AllocateId();
+		std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
+		std::vector<uint32_t> switch_words {OpSwitch, selected, default_label};
+		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
+			labels[candidate - 1u] = state.builder.AllocateId();
+			switch_words.push_back(candidate);
+			switch_words.push_back(labels[candidate - 1u]);
+		}
+		state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+		state.builder.AddFunction(switch_words);
+		std::vector<uint32_t> phi_words {OpPhi, result_type, state.builder.AllocateId()};
+		state.builder.AddFunction({OpLabel, default_label});
+		phi_words.push_back(EmitSample(image.indirect_resources[0]));
+		phi_words.push_back(default_label);
+		state.builder.AddFunction({OpBranch, merge_label});
+		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
+			state.builder.AddFunction({OpLabel, labels[candidate - 1u]});
+			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
+			phi_words.push_back(labels[candidate - 1u]);
+			state.builder.AddFunction({OpBranch, merge_label});
+		}
+		state.builder.AddFunction({OpLabel, merge_label});
+		state.builder.AddFunction(phi_words);
+		ctx.Define(inst, ResultVector(ctx, phi_words[2], integer, dref));
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

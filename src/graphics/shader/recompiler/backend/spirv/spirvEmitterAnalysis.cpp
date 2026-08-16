@@ -445,6 +445,13 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 	return sampled_image;
 }
 
+uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
+                          ImageViewKind view, uint32_t image_resource) {
+	auto selected     = mem;
+	selected.resource = image_resource;
+	return MakeSampledImage(state, selected, use_pc, view);
+}
+
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, bool uint_image,
                                        uint32_t use_pc, ImageViewKind view) {
 	(void)use_pc;

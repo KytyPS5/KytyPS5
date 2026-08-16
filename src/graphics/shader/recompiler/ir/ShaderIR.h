@@ -190,18 +190,24 @@ enum class ImageMipMode { None, DynamicStorage };
 constexpr uint32_t StorageImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
-	uint32_t                source          = 0;
-	uint32_t                first_use_pc    = 0;
-	ResourceKind            kind            = ResourceKind::None;
-	Decoder::ImageDimension dimension       = Decoder::ImageDimension::Unknown;
-	ImageMipMode            mip_mode        = ImageMipMode::None;
-	uint32_t                mip_count       = 1;
-	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
-	bool                    read            = false;
-	bool                    written         = false;
-	bool                    atomic          = false;
-	bool                    depth_compare   = false;
-	bool                    cube            = false;
+	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+
+	uint32_t                source                    = 0;
+	uint32_t                first_use_pc              = 0;
+	ResourceKind            kind                      = ResourceKind::None;
+	Decoder::ImageDimension dimension                 = Decoder::ImageDimension::Unknown;
+	ImageMipMode            mip_mode                  = ImageMipMode::None;
+	uint32_t                mip_count                 = 1;
+	uint32_t                storage_swizzle           = StorageImageIdentitySwizzle;
+	bool                    read                      = false;
+	bool                    written                   = false;
+	bool                    atomic                    = false;
+	bool                    depth_compare             = false;
+	bool                    cube                      = false;
+	uint32_t                indirect_root             = NoIndirectImage;
+	uint32_t                indirect_mapping_offset   = 0;
+	uint32_t                indirect_mapping_capacity = 0;
+	std::vector<uint32_t>   indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
 };

@@ -1029,9 +1029,10 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& image = program.info.images[i];
 		ret += fmt::format(
-		    " i{}[kind={} dim={} mip={}/{} swizzle=0x{:03x}]", i, static_cast<uint32_t>(image.kind),
-		    static_cast<uint32_t>(image.dimension), static_cast<uint32_t>(image.mip_mode),
-		    image.mip_count, image.storage_swizzle);
+		    " i{}[kind={} dim={} mip={}/{} swizzle=0x{:03x} indirect={}/{}+{}]", i,
+		    static_cast<uint32_t>(image.kind), static_cast<uint32_t>(image.dimension),
+		    static_cast<uint32_t>(image.mip_mode), image.mip_count, image.storage_swizzle,
+		    image.indirect_root, image.indirect_mapping_offset, image.indirect_mapping_capacity);
 	}
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		ret += fmt::format(" a{}[base=0x{:x}]", i, program.info.addresses[i].specialized_base);
@@ -1068,9 +1069,15 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 	for (const auto& image: program.info.images) {
 		ids.push_back(static_cast<uint32_t>(image.kind));
 		ids.push_back(static_cast<uint32_t>(image.dimension));
+		ids.push_back(static_cast<uint32_t>(image.cube));
 		ids.push_back(static_cast<uint32_t>(image.mip_mode));
 		ids.push_back(image.mip_count);
 		ids.push_back(image.storage_swizzle);
+		ids.push_back(image.indirect_root);
+		ids.push_back(image.indirect_mapping_offset);
+		ids.push_back(image.indirect_mapping_capacity);
+		ids.push_back(static_cast<uint32_t>(image.indirect_resources.size()));
+		ids.insert(ids.end(), image.indirect_resources.begin(), image.indirect_resources.end());
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.addresses.size()));
 	for (const auto& address: program.info.addresses) {

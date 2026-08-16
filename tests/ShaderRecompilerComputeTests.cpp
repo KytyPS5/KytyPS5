@@ -6561,43 +6561,75 @@ public:
                 std::end(mipped_storage.fields),
                 mipped_storage_descriptor.dwords.begin());
       mipped_storage_descriptor.dword_count = 8;
+      auto overwide_mipped_storage = mipped_storage;
+      overwide_mipped_storage.fields[3] =
+          (overwide_mipped_storage.fields[3] & ~(0xfu << 16u)) | (4u << 16u);
+      ShaderRecompiler::IR::DescriptorValue
+          overwide_mipped_storage_descriptor{};
+      std::copy(std::begin(overwide_mipped_storage.fields),
+                std::end(overwide_mipped_storage.fields),
+                overwide_mipped_storage_descriptor.dwords.begin());
+      overwide_mipped_storage_descriptor.dword_count = 8;
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
       mipped_storage_resource.mip_count = 3;
+      auto sampled_overwide_resource = storage_resource;
+      sampled_overwide_resource.kind =
+          ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_overwide_resource.read = true;
+      sampled_overwide_resource.written = false;
       auto plain_mipped_storage_binding =
+          RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
+                                                   mipped_storage_descriptor);
+      auto mipped_storage_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, mipped_storage_resource, mipped_storage_descriptor);
+      auto overwide_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(
-              executor, storage_resource, mipped_storage_descriptor);
-      auto mipped_storage_binding =
-          RenderExecutorTestAccess::ResolveTexture(
-              executor, mipped_storage_resource, mipped_storage_descriptor);
+              executor, storage_resource, overwide_mipped_storage_descriptor);
+      auto sampled_overwide_resolved = RenderExecutorTestAccess::ResolveTexture(
+          executor, sampled_overwide_resource,
+          overwide_mipped_storage_descriptor);
       DescriptorCache::PreparedBindings mipped_prepared{};
-      auto mipped_program =
-          std::make_shared<ShaderRecompiler::IR::Program>();
+      auto mipped_program = std::make_shared<ShaderRecompiler::IR::Program>();
       mipped_program->info.images.push_back(storage_resource);
       mipped_program->info.images.push_back(mipped_storage_resource);
+      mipped_program->info.images.push_back(storage_resource);
+      mipped_program->info.images.push_back(sampled_overwide_resource);
       auto mipped_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
-      mipped_snapshot->images.assign(2, mipped_storage_descriptor);
+      mipped_snapshot->images = {mipped_storage_descriptor,
+                                 mipped_storage_descriptor,
+                                 overwide_mipped_storage_descriptor,
+                                 overwide_mipped_storage_descriptor};
       mipped_prepared.program = std::move(mipped_program);
       mipped_prepared.snapshot = std::move(mipped_snapshot);
       mipped_prepared.resources.images.push_back(
           std::move(plain_mipped_storage_binding));
       mipped_prepared.resources.images.push_back(
           std::move(mipped_storage_binding));
+      mipped_prepared.resources.images.push_back(
+          std::move(overwide_mipped_storage_binding));
+      mipped_prepared.resources.images.push_back(
+          std::move(sampled_overwide_resolved));
       executor.RebindImages(scheduler.Current(), mipped_prepared);
       auto &plain_mipped_binding = mipped_prepared.resources.images[0];
       auto &mipped_binding = mipped_prepared.resources.images[1];
+      auto &overwide_mipped_binding = mipped_prepared.resources.images[2];
+      auto &sampled_overwide_binding = mipped_prepared.resources.images[3];
       plain_mipped_binding.layout = vk::ImageLayout::eGeneral;
       mipped_binding.layout = vk::ImageLayout::eGeneral;
+      overwide_mipped_binding.layout = vk::ImageLayout::eGeneral;
+      sampled_overwide_binding.layout = vk::ImageLayout::eGeneral;
       auto plain_view_desc = plain_mipped_binding.desc;
       plain_view_desc.view_info.level_count = 1;
       Require(name, "dynamic storage mip views",
               plain_mipped_binding.desc.view_info.base_level == 1 &&
                   plain_mipped_binding.desc.view_info.level_count == 3 &&
                   plain_mipped_binding.mip_views.empty() &&
-                  plain_mipped_binding.image_view == texture_cache.FindTexture(
-                      plain_mipped_binding.image_id, plain_view_desc) &&
+                  plain_mipped_binding.image_view ==
+                      texture_cache.FindTexture(plain_mipped_binding.image_id,
+                                                plain_view_desc) &&
                   mipped_binding.desc.info.resources.levels == 4 &&
                   mipped_binding.desc.view_info.base_level == 1 &&
                   mipped_binding.desc.view_info.level_count == 3 &&
@@ -6615,6 +6647,28 @@ public:
                           .imageView == mipped_binding.mip_views[2],
               "base-1 through last-3 storage view did not create three "
               "ordered one-level descriptors");
+      Require(name, "over-wide fixed storage mip view",
+              overwide_mipped_storage.LastLevel() == 4 &&
+                  overwide_mipped_storage.MaxMip() == 3 &&
+                  overwide_mipped_binding.image_id ==
+                      plain_mipped_binding.image_id &&
+                  overwide_mipped_binding.desc.info.resources.levels == 4 &&
+                  overwide_mipped_binding.desc.view_info.base_level == 1 &&
+                  overwide_mipped_binding.desc.view_info.level_count == 3 &&
+                  overwide_mipped_binding.mip_views.empty() &&
+                  overwide_mipped_binding.image_view ==
+                      plain_mipped_binding.image_view,
+              "fixed storage view was not intersected with its physical mip "
+              "range before Vulkan acquisition");
+      Require(name, "over-wide sampled mip view",
+              sampled_overwide_binding.image_id ==
+                      plain_mipped_binding.image_id &&
+                  sampled_overwide_binding.desc.info.resources.levels == 4 &&
+                  sampled_overwide_binding.desc.view_info.base_level == 1 &&
+                  sampled_overwide_binding.desc.view_info.level_count == 3 &&
+                  sampled_overwide_binding.mip_views.empty() &&
+                  sampled_overwide_binding.image_view != nullptr,
+              "sampled view was not intersected with its physical mip range");
       auto srgb_storage = storage;
       constexpr auto srgb_format =
           static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb);
@@ -18967,6 +19021,11 @@ ShaderTextureResource Ppsa01340MipRangeStorageTextureDescriptor() {
            0x00700030u, 0xb07b0000u, 0x0002ac3cu}};
 }
 
+ShaderTextureResource Ppsa01340OverwideMipStorageTextureDescriptor() {
+  return {{0x0346c000u, 0xc4b00000u, 0x007fc07fu, 0x90990facu, 0x00000000u,
+           0x00700080u, 0x00000000u, 0x00000000u}};
+}
+
 ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
   auto resource = BasicBgraStorageTextureResource();
   resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
@@ -19102,7 +19161,11 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~(0x1fu << 20u)) |
         (static_cast<uint32_t>(Prospero::TileMode::kStandard256B) << 20u);
-  } else if (std::strcmp(kind, "mip") == 0) {
+  } else if (std::strcmp(kind, "base-mip-out-of-resource") == 0) {
+    descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
+  } else if (std::strcmp(kind, "dynamic-mip-out-of-resource") == 0) {
+    resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+    resource.mip_count = 2;
     descriptor.fields[3] |= 1u << 16u;
   } else if (std::strcmp(kind, "inverted-mip-range") == 0) {
     descriptor.fields[3] |= 1u << 12u;
@@ -19245,6 +19308,27 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA01340 mip-range storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), mip_range,
                          0xa30000);
+
+  const auto overwide_mip = Ppsa01340OverwideMipStorageTextureDescriptor();
+  Require(
+      "BasicStorageTexture", "PPSA01340 over-wide mip view",
+      overwide_mip.Base40() == 0x346c00000ull &&
+          overwide_mip.Width5() + 1u == 512 &&
+          overwide_mip.Height5() + 1u == 512 && overwide_mip.BaseLevel() == 0 &&
+          overwide_mip.LastLevel() == 9 && overwide_mip.MaxMip() == 8 &&
+          overwide_mip.Format() == Prospero::BufferFormat::k32_32_32_32UInt &&
+          overwide_mip.TileMode() == Prospero::TileMode::kStandard64KB,
+      "captured over-wide storage mip view is malformed");
+  TileSizeAlign overwide_size{};
+  TileGetTextureTotalSize(overwide_mip.Format(), overwide_mip.Width5() + 1u,
+                          overwide_mip.Height5() + 1u, 1,
+                          overwide_mip.MaxMip() + 1u, overwide_mip.TileMode(),
+                          false, overwide_size);
+  Require("BasicStorageTexture", "PPSA01340 over-wide mip footprint",
+          overwide_size.size == 0x560000 && overwide_size.align == 0x10000,
+          "captured nine-level Standard64KB footprint changed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), overwide_mip,
+                         overwide_size.size);
 
   const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA02527 R16F descriptor",
@@ -19542,12 +19626,13 @@ void CheckBasicStorageTextureDescriptor() {
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
           "GetModuleFileName failed");
   for (const char *kind :
-       {"resource", "type", "standard256b-volume", "mip",
-        "inverted-mip-range", "swizzle",
-        "linear-rgb1-read", "bgra-read", "r16-float-read", "r8-unorm-read",
-        "yzwx-read", "reserved-swizzle", "array-base-out-of-range", "reserved",
-        "uint-format", "uint-resource-float-format", "atomic-format",
-        "depth-tile-read", "depth-tile-extent", "depth-tile-fmask"}) {
+       {"resource", "type", "standard256b-volume",
+        "base-mip-out-of-resource", "dynamic-mip-out-of-resource",
+        "inverted-mip-range", "swizzle", "linear-rgb1-read", "bgra-read",
+        "r16-float-read", "r8-unorm-read", "yzwx-read", "reserved-swizzle",
+        "array-base-out-of-range", "reserved", "uint-format",
+        "uint-resource-float-format", "atomic-format", "depth-tile-read",
+        "depth-tile-extent", "depth-tile-fmask"}) {
     std::string command = std::string("\"") + path +
                           "\" --storage-texture-descriptor-death " + kind;
     std::vector<char> mutable_command(command.begin(), command.end());

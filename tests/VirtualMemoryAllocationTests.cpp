@@ -752,7 +752,15 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	Check(test, base != 0, "runtime allocation failed");
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 2),
 	      "runtime allocation is outside the owner");
-	*reinterpret_cast<uint64_t*>(base) = 0x52554e54494d454full; // "RUNTIMEO"
+	constexpr uint64_t runtime_value = 0x52554e54494d454full; // "RUNTIMEO"
+	*reinterpret_cast<uint64_t*>(base) = runtime_value;
+	uint64_t gpu_read = 0;
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, &gpu_read, sizeof(gpu_read)),
+	      "private runtime allocation unexpectedly used shared backing");
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadGpuBacking(base, &gpu_read, sizeof(gpu_read)) &&
+	          gpu_read == runtime_value,
+	      "GPU read did not resolve private committed runtime memory");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestMemory(base, SceKernelPageSize,
 	                                                  Common::VirtualMemory::Mode::Read),
@@ -2002,6 +2010,53 @@ void TestLargeHintedReserveHostsSmallDirectMap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGpuPrtBackingReadZeroFillsUnresidentPages() {
+	const char*        test          = "GpuPrtBackingReadZeroFillsUnresidentPages";
+	constexpr uint64_t aperture_hint = 0x2000000000ull;
+	constexpr uint64_t total_size    = SceKernelPageSize * 3;
+
+	void* reserve = reinterpret_cast<void*>(aperture_hint);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(0, reserve, total_size),
+	        "KernelSetPrtAperture");
+
+	void* mapped = reserve;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &mapped, SceKernelPageSize, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoCoalesce, "prt_resident"),
+	        "KernelMapNamedFlexibleMemory");
+	Check(test, mapped == reserve, "fixed PRT mapping moved");
+	std::memset(mapped, 0x5a, SceKernelPageSize);
+
+	std::vector<uint8_t> strict(total_size, 0xa5);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, strict.data(), strict.size()),
+	      "strict backing read accepted unresident PRT pages");
+	Check(test, strict.front() == 0xa5 && strict.back() == 0xa5,
+	      "failed strict read modified its destination");
+
+	std::vector<uint8_t> sparse(total_size, 0xa5);
+	Check(test, Libs::LibKernel::Memory::TryReadGpuBacking(base, sparse.data(), sparse.size()),
+	      "GPU PRT backing read failed");
+	Check(test,
+	      std::all_of(sparse.begin(), sparse.begin() + SceKernelPageSize,
+	                  [](uint8_t value) { return value == 0x5a; }),
+	      "GPU PRT backing read lost resident bytes");
+	Check(test,
+	      std::all_of(sparse.begin() + SceKernelPageSize, sparse.end(),
+	                  [](uint8_t value) { return value == 0; }),
+	      "GPU PRT backing read did not zero unresident pages");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, total_size), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(0, nullptr, 0),
+	        "KernelSetPrtAperture(clear)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMemoryPoolAlignmentContracts() {
 	const char* test = "MemoryPoolAlignmentContracts";
 	void*       addr = nullptr;
@@ -2477,6 +2532,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
 	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
+	RunTest(TestGpuPrtBackingReadZeroFillsUnresidentPages);
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);

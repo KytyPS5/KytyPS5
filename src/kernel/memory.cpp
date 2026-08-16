@@ -921,16 +921,37 @@ constexpr uint64_t PRT_APERTURE_END       = 0xfc00000000ull;
 static std::array<PrtAperture, PRT_APERTURE_MAX_INDEX + 1> g_prt_apertures {};
 static Common::Mutex                                       g_prt_aperture_mutex;
 
-static bool IsInPrtAperture(uint64_t address) {
+static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
+	if (size == 0 || UINT64_MAX - address < size) {
+		return false;
+	}
 	Common::LockGuard lock(g_prt_aperture_mutex);
 
 	for (const auto& aperture: g_prt_apertures) {
-		if (address >= aperture.address && address < aperture.address + aperture.size) {
-			return true;
+		if (address >= aperture.address) {
+			const auto offset = address - aperture.address;
+			if (offset < aperture.size && size <= aperture.size - offset) {
+				return true;
+			}
 		}
 	}
 
 	return false;
+}
+
+bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
+	    !IsInPrtAperture(vaddr, size) || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		return false;
+	}
+	if (std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		    return !IsReservedRangeType(range.type) &&
+		           !g_guest_address_space->BackingContains(range.start, range.size);
+	    })) {
+		return false;
+	}
+	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {

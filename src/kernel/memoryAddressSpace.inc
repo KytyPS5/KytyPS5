@@ -188,6 +188,43 @@ public:
 		    });
 	}
 
+	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end   = vaddr + size;
+		auto            first = m_maps.lower_bound(vaddr);
+		if (first != m_maps.begin()) {
+			auto previous = std::prev(first);
+			if (previous->second.vaddr + previous->second.size > vaddr) {
+				first = previous;
+			}
+		}
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
+		     ++mapping) {
+			const auto& entry = mapping->second;
+			const auto  start = std::max(vaddr, entry.vaddr);
+			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
+			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) {
+				return false;
+			}
+		}
+
+		auto* destination = static_cast<uint8_t*>(data);
+		std::memset(destination, 0, size);
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
+		     ++mapping) {
+			const auto& entry  = mapping->second;
+			const auto  start  = std::max(vaddr, entry.vaddr);
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
+			const auto  offset = entry.backing_offset + start - entry.vaddr;
+			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+		}
+		return true;
+	}
+
 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                                 VirtualMemory::Mode mode,
 	                                 FailureReason*      failure_reason = nullptr) {
@@ -692,6 +729,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }

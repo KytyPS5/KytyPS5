@@ -354,6 +354,84 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestPrtBackingReadPreservesSparseResidency() {
+	const char*        test         = "PrtBackingReadPreservesSparseResidency";
+	constexpr uint64_t commit_size  = SceKernelMemoryPoolCommitLen;
+	constexpr uint64_t aperture_len = commit_size * 3;
+	int64_t            pool_offset  = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolExpand(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), commit_size * 2,
+	            SceKernelMemoryPoolAlignment, &pool_offset),
+	        "KernelMemoryPoolExpand");
+
+	void* arena = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(
+	            reinterpret_cast<void*>(0x1000000000ull), SceKernelMemoryPoolReserveLen, 0, 0,
+	            &arena),
+	        "KernelMemoryPoolReserve");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	            arena, commit_size, SceKernelMtypeC, SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	            reinterpret_cast<void*>(base + commit_size * 2), commit_size, SceKernelMtypeC,
+	            SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit(third)");
+	std::memset(reinterpret_cast<void*>(base), 0x3c, commit_size);
+	std::memset(reinterpret_cast<void*>(base + commit_size * 2), 0xa7, commit_size);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, aperture_len),
+	        "KernelSetPrtAperture");
+	std::vector<uint8_t> bytes(aperture_len, 0x5a);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
+	      "dense backing read accepted a nonresident span");
+	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0x5a; }),
+	      "failed dense backing read modified its destination");
+	Check(test, Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), bytes.size()),
+	      "PRT backing read rejected a valid sparse aperture range");
+	Check(test,
+	      std::all_of(bytes.begin(), bytes.begin() + commit_size,
+	                  [](uint8_t value) { return value == 0x3c; }) &&
+	          std::all_of(bytes.begin() + commit_size, bytes.begin() + commit_size * 2,
+	                      [](uint8_t value) { return value == 0; }) &&
+	          std::all_of(bytes.begin() + commit_size * 2, bytes.end(),
+	                      [](uint8_t value) { return value == 0xa7; }),
+	      "PRT backing read did not copy resident pages and zero nonresident pages");
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadPrtBacking(base + commit_size * 2, bytes.data(),
+	                                                  commit_size * 2),
+	      "PRT backing read crossed the registered aperture");
+
+	constexpr uint64_t unowned_prt = 0x5000000000ull;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelSetPrtAperture(
+	            2, reinterpret_cast<void*>(unowned_prt), commit_size),
+	        "KernelSetPrtAperture(unowned)");
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadPrtBacking(unowned_prt, bytes.data(), commit_size),
+	      "PRT backing read accepted an unowned virtual range");
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
+	        "KernelSetPrtAperture(clear)");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, commit_size, 0),
+	        "KernelMemoryPoolDecommit(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolDecommit(
+	            reinterpret_cast<void*>(base + commit_size * 2), commit_size, 0),
+	        "KernelMemoryPoolDecommit(third)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelMemoryPoolReserveLen),
+	        "KernelMunmap(pool reserve)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(pool_offset, commit_size * 2),
+	        "KernelReleaseDirectMemory(pool expansion)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -2440,6 +2518,7 @@ int main(int argc, char** argv) {
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
+	RunTest(TestPrtBackingReadPreservesSparseResidency);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);

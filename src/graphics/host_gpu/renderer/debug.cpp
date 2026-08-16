@@ -617,8 +617,7 @@ static void ClipCheck(const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
 	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || !c.IsZClipModeRepresentable() ||
-	                     c.user_clip_plane_negate_y || c.clip_disable ||
+	                     c.vertex_kill_any || c.user_clip_plane_negate_y || c.clip_disable ||
 	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
 	                     c.force_viewport_index_from_vs_enable);
 }

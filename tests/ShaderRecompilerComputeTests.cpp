@@ -20143,23 +20143,23 @@ void CheckReferenceClockScale() {
 void CheckClipControlDepthClipState() {
   HW::ClipControl clip;
   Require("ClipControlDepthClipState", "default",
-          clip.IsZClipModeRepresentable() && clip.IsZClipEnabled(),
+          clip.IsZClipEnabled(),
           "default paired Z clipping was not enabled");
 
   clip.min_z_clip_disable = true;
   Require("ClipControlDepthClipState", "asymmetric near",
-          !clip.IsZClipModeRepresentable(),
-          "asymmetric near-plane state was accepted");
+          !clip.IsZClipEnabled(),
+          "near-plane disable did not disable paired host Z clipping");
 
   clip.min_z_clip_disable = false;
   clip.max_z_clip_disable = true;
   Require("ClipControlDepthClipState", "asymmetric far",
-          !clip.IsZClipModeRepresentable(),
-          "asymmetric far-plane state was accepted");
+          !clip.IsZClipEnabled(),
+          "far-plane disable did not disable paired host Z clipping");
 
   clip.min_z_clip_disable = true;
   Require("ClipControlDepthClipState", "both disabled",
-          clip.IsZClipModeRepresentable() && !clip.IsZClipEnabled(),
+          !clip.IsZClipEnabled(),
           "paired Z-clip disable was not represented");
   std::printf("[host]    %-32s ok\n", "ClipControlDepthClipState");
 }

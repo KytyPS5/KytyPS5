@@ -131,8 +131,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		}
 	}
 
-	const auto& clip_control = ctx.GetClipControl();
-	EXIT_NOT_IMPLEMENTED(!clip_control.IsZClipModeRepresentable());
+	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
 	static_params.topology                 = topology;

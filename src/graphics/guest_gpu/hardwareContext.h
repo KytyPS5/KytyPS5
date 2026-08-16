@@ -295,10 +295,7 @@ struct ClipControl {
 	bool    linear_attribute_clip_enable        = false;
 	bool    force_viewport_index_from_vs_enable = false;
 
-	[[nodiscard]] bool IsZClipModeRepresentable() const {
-		return min_z_clip_disable == max_z_clip_disable;
-	}
-	[[nodiscard]] bool IsZClipEnabled() const { return !min_z_clip_disable; }
+	[[nodiscard]] bool IsZClipEnabled() const { return !min_z_clip_disable && !max_z_clip_disable; }
 };
 
 struct DepthControl {

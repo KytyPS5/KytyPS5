@@ -8,7 +8,8 @@ namespace Libs::Dialog {
 
 namespace CommonDialog {
 
-int KYTY_SYSV_ABI CommonDialogInitialize();
+int KYTY_SYSV_ABI  CommonDialogInitialize();
+bool KYTY_SYSV_ABI CommonDialogIsUsed();
 
 } // namespace CommonDialog
 

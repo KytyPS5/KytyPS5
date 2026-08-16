@@ -21,6 +21,12 @@ int KYTY_SYSV_ABI CommonDialogInitialize() {
 	return OK;
 }
 
+bool KYTY_SYSV_ABI CommonDialogIsUsed() {
+	PRINT_NAME();
+
+	return false;
+}
+
 } // namespace CommonDialog
 
 namespace LoginDialog {

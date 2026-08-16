@@ -227,7 +227,8 @@ private:
 		bool  rooted = false;
 	};
 
-	AddressPart FindAddressPart(Value value, std::unordered_set<const Inst*>& visiting) const {
+	AddressPart FindAddressPart(Value value, Value active,
+	                            std::unordered_set<const Inst*>& visiting) const {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
 			return {value, false};
@@ -254,17 +255,20 @@ private:
 		};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::SelectU32:
-				return finish(merge(FindAddressPart(inst->Arg(1), visiting),
-				                    FindAddressPart(inst->Arg(2), visiting), true));
+				if (EquivalentValue(m_values, inst->Arg(0), active)) {
+					return finish(FindAddressPart(inst->Arg(1), active, visiting));
+				}
+				return finish(merge(FindAddressPart(inst->Arg(1), active, visiting),
+				                    FindAddressPart(inst->Arg(2), active, visiting), true));
 			case ValueOpcode::Phi: {
 				const auto invariant = ResolveInvariantPhi(m_values, value);
 				return finish(invariant.IsEmpty() ? AddressPart {}
-				                                  : FindAddressPart(invariant, visiting));
+				                                  : FindAddressPart(invariant, active, visiting));
 			}
 			case ValueOpcode::IAdd32:
 			case ValueOpcode::ISub32: {
-				const auto left  = FindAddressPart(inst->Arg(0), visiting);
-				const auto right = FindAddressPart(inst->Arg(1), visiting);
+				const auto left  = FindAddressPart(inst->Arg(0), active, visiting);
+				const auto right = FindAddressPart(inst->Arg(1), active, visiting);
 				if (left.rooted == right.rooted ||
 				    (inst->GetOpcode() == ValueOpcode::ISub32 && right.rooted)) {
 					return finish({});
@@ -276,8 +280,8 @@ private:
 				if (source == nullptr || source->GetOpcode() != ValueOpcode::IAddCarry32) {
 					return finish({});
 				}
-				const auto left  = FindAddressPart(source->Arg(0), visiting);
-				const auto right = FindAddressPart(source->Arg(1), visiting);
+				const auto left  = FindAddressPart(source->Arg(0), active, visiting);
+				const auto right = FindAddressPart(source->Arg(1), active, visiting);
 				if (left.rooted == right.rooted) {
 					return finish({});
 				}
@@ -287,11 +291,12 @@ private:
 		}
 	}
 
-	bool MakeFlatAddressSource(const Inst& handle, DescriptorSource& descriptor) const {
+	bool MakeFlatAddressSource(const Inst& handle, Value active,
+	                           DescriptorSource& descriptor) const {
 		std::unordered_set<const Inst*> visiting;
-		auto                            low = FindAddressPart(handle.Arg(0), visiting);
+		auto                            low = FindAddressPart(handle.Arg(0), active, visiting);
 		visiting.clear();
-		auto high = FindAddressPart(handle.Arg(1), visiting);
+		auto high = FindAddressPart(handle.Arg(1), active, visiting);
 		if ((!low.rooted && !high.rooted) || low.value.IsEmpty() || high.value.IsEmpty()) {
 			return false;
 		}
@@ -618,7 +623,9 @@ private:
 		DescriptorSource descriptor;
 		const auto&      memory = m_values.memory_info[memory_inst.Flags<MemoryFlags>().index];
 		if (memory.address_is_full) {
-			if (memory.kind != ResourceKind::Flat || !MakeFlatAddressSource(*handle, descriptor)) {
+			const auto active = memory_inst.Arg(memory_inst.NumArgs() - 1u);
+			if (memory.kind != ResourceKind::Flat ||
+			    !MakeFlatAddressSource(*handle, active, descriptor)) {
 				unbased = true;
 				source  = UINT32_MAX;
 				return true;

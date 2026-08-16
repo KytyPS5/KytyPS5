@@ -981,6 +981,62 @@ void TestAddressMaterializationAndSpecialization() {
         "typed address specialization was not applied");
 }
 
+void TestExecMaskedFlatAddressProvenance() {
+  Fixture fixture;
+  const auto low_root = fixture.UserData(0);
+  const auto high_root = fixture.UserData(1);
+  const auto active = fixture.Emit(
+      ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
+  const auto inactive_low = fixture.Emit(ValueOpcode::UndefU32);
+  const auto inactive_high = fixture.Emit(ValueOpcode::UndefU32);
+  const auto low = fixture.Emit(ValueOpcode::SelectU32,
+                                {active, low_root, inactive_low});
+  const auto high = fixture.Emit(ValueOpcode::SelectU32,
+                                 {active, high_root, inactive_high});
+  const auto address = fixture.Address(low, high, 0xa4);
+  MemoryInfo flat;
+  flat.kind = ResourceKind::Flat;
+  flat.address_is_full = true;
+  fixture.Emit(ValueOpcode::LoadAddressU8, {address, low, high, active},
+               fixture.AddMemory(flat, 0xa4));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.addresses.size() == 1 &&
+            !fixture.program.info.addresses[0].unbased,
+        "exec-masked FLAT address lost its active user-data root");
+  std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
+  SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  std::string error;
+  Check(MaterializeResources(fixture.program, runtime, snapshot, &error) &&
+            snapshot.addresses.size() == 1 &&
+            snapshot.addresses[0].guest_base == 0x0000000123456780ull &&
+            snapshot.addresses[0].binding_base == 0x0000000123450000ull,
+        "exec-masked FLAT address materialized the wrong user-data root");
+
+  Fixture mismatch;
+  const auto mismatch_active = mismatch.Emit(
+      ValueOpcode::INotEqual32, {mismatch.UserData(2), Value(0u)});
+  const auto other_active = mismatch.Emit(ValueOpcode::LogicalNot,
+                                          {mismatch_active});
+  const auto mismatch_low = mismatch.Emit(
+      ValueOpcode::SelectU32,
+      {mismatch_active, mismatch.UserData(0),
+       mismatch.Emit(ValueOpcode::UndefU32)});
+  const auto mismatch_high = mismatch.Emit(
+      ValueOpcode::SelectU32,
+      {mismatch_active, mismatch.UserData(1),
+       mismatch.Emit(ValueOpcode::UndefU32)});
+  const auto mismatch_address = mismatch.Address(mismatch_low, mismatch_high, 0xa4);
+  mismatch.Emit(ValueOpcode::LoadAddressU8,
+                {mismatch_address, mismatch_low, mismatch_high, other_active},
+                mismatch.AddMemory(flat, 0xa4));
+  mismatch.PlanAndTrack();
+  Check(mismatch.program.info.addresses.size() == 1 &&
+            mismatch.program.info.addresses[0].unbased,
+        "FLAT address used a select arm guarded by a different active mask");
+}
+
 void TestBufferSwizzleSpecialization() {
   Fixture fixture;
   const auto handle = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
@@ -1110,6 +1166,7 @@ int main() {
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("address materialization", TestAddressMaterializationAndSpecialization);
+    Run("exec-masked FLAT address", TestExecMaskedFlatAddressProvenance);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("resource limit", TestResourceLimitIsTransactional);

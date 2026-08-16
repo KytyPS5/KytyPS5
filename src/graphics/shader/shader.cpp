@@ -81,6 +81,31 @@ bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input
 	return input < info.input_num && (info.interpolator_settings[input] & PsInputFlatShade) != 0;
 }
 
+uint32_t ShaderPixelParameterLocationMask(const ShaderPixelInputInfo& info) {
+	if (!info.stage || info.stage.program == nullptr) {
+		return 0;
+	}
+
+	std::array<uint32_t, 32> active {};
+	uint32_t                 active_count = 0;
+	for (const auto& input: info.stage.program->info.inputs) {
+		if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
+		    active_count < active.size()) {
+			active[active_count++] = input.location;
+		}
+	}
+
+	uint32_t mask = 0;
+	for (uint32_t i = 0; i < active_count; i++) {
+		const auto location =
+		    ShaderPixelParameterLocation(info, {active.data(), active_count}, active[i]);
+		if (location < 32) {
+			mask |= 1u << location;
+		}
+	}
+	return mask;
+}
+
 struct ShaderBinaryInfo {
 	uint8_t  signature[7];
 	uint8_t  version;
@@ -1105,12 +1130,13 @@ static std::span<const uint32_t> AddShaderProgramPermutation(const char* stage,
 
 bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                          ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
-                         std::span<const uint32_t>& spirv) {
+                         std::span<const uint32_t>& spirv, uint32_t required_param_locations) {
 	spirv = {};
 
 	if (!ShaderGetStaticInputInfoVS(regs, sh, info)) {
 		return false;
 	}
+	info.required_param_locations = required_param_locations;
 	const auto shader_hash = regs.gs_regs.chksum;
 	const auto program_id  = ShaderGetIdVS(regs, info, false);
 	const auto key =
@@ -1586,6 +1612,7 @@ ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInput
 	ret.ids.push_back(static_cast<uint32_t>(input_info.fetch_embedded));
 	ret.ids.push_back(input_info.resources_num);
 	ret.ids.push_back(input_info.export_count);
+	ret.ids.push_back(input_info.required_param_locations);
 
 	for (int i = 0; i < input_info.resources_num; i++) {
 		const auto& r  = input_info.resources[i];

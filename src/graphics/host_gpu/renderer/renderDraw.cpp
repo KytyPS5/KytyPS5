@@ -955,9 +955,25 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
-	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
-	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
+	const bool ps_ok = [&] {
+		return ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode,
+		                           state.vs_input_info, target_export_mapping, state.ps_input_info,
+		                           state.ps_shader);
+	}();
+	if (!ps_ok) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
+	}
+
+	const uint32_t missing_param_locations =
+	    ShaderPixelParameterLocationMask(state.ps_input_info) & ~state.vs_input_info.param_export_mask;
+	if (missing_param_locations != 0) {
+		if (log_phases) {
+			LogDrawPhase(draw.name, "ShaderCompileInfoVS(unexported parameters)");
+		}
+		if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, lane_mask_mode,
+		                         state.vs_input_info, state.vs_shader, missing_param_locations)) {
+			EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
+		}
 	}
 }
 

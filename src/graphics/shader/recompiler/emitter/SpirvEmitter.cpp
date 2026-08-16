@@ -120,6 +120,10 @@ bool IsDsWrite(IR::Opcode op) {
 	}
 }
 
+} // namespace
+
+namespace Emitter {
+
 bool IsAtomic(IR::Opcode op) {
 	switch (op) {
 		case IR::Opcode::AtomicSwapU32:
@@ -137,6 +141,10 @@ bool IsAtomic(IR::Opcode op) {
 		default: return false;
 	}
 }
+
+} // namespace Emitter
+
+namespace {
 
 uint32_t BufferAddressOperandCount(const IR::Instruction& inst) {
 	return 1u + (inst.memory.idxen ? 1u : 0u) + (inst.memory.offen ? 1u : 0u);
@@ -211,7 +219,7 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	    (kind != IR::ResourceKind::Buffer || inst.src_count != buffer_address_count + 1u)) {
 		return Fail(error, "floating-point atomic instruction must target a buffer");
 	}
-	if (IsAtomic(inst.op) &&
+	if (Emitter::IsAtomic(inst.op) &&
 	    !((kind == IR::ResourceKind::Buffer && inst.src_count == buffer_address_count + 1u) ||
 	      ((kind == IR::ResourceKind::Lds || kind == IR::ResourceKind::Gds) &&
 	       inst.memory.resource == 0 && inst.src_count == 2 &&

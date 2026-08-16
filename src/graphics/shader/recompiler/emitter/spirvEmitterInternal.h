@@ -284,6 +284,7 @@ struct OutputBinding {
 	uint32_t            location    = 0;
 	uint32_t            variable_id = 0;
 	std::string         debug_name;
+	bool                synthetic = false;
 };
 
 struct DescriptorResourceBinding {
@@ -633,6 +634,8 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>& 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program);
+void AddSyntheticParameterOutputs(EmitterState& state);
+void EmitSyntheticParameterOutputStores(EmitterState& state);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
@@ -699,6 +702,8 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 
 ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
                                    bool uint_image, uint32_t use_pc);
+
+bool IsAtomic(IR::Opcode op);
 
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, bool uint_image,
                                        uint32_t      use_pc = UINT32_MAX,

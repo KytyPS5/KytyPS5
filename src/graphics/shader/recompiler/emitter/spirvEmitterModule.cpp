@@ -395,6 +395,25 @@ void AddVsharpAnnotationsAndNames(EmitterState& state) {
 	}
 }
 
+static bool StorageImageNeedsConcreteFormat(const EmitterState& state, ImageViewKind view,
+                                            bool integer) {
+	if (!integer) {
+		return false;
+	}
+	for (const auto& block: state.program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (!IsAtomic(inst.op) ||
+			    inst.memory.kind != IR::ResourceKind::StorageImageUint) {
+				continue;
+			}
+			if (StorageImageViewKind(state, inst.memory, true, inst.pc) == view) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void EmitHeaderAndTypes(EmitterState& state) {
 	state.void_type                    = state.builder.AllocateId();
 	state.bool_type                    = state.builder.AllocateId();
@@ -484,8 +503,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.needs_image_gather_extended) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
-	if (std::any_of(state.storage_images.begin(),
-	                state.storage_images.begin() + StorageImageViewKindCount,
+	if (std::any_of(state.storage_images.begin(), state.storage_images.end(),
 	                [](const auto& image) { return image.variable != 0; })) {
 		state.builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
 		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
@@ -765,7 +783,9 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		const auto view      = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
 		const bool integer   = i >= StorageImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
-		const auto format    = integer ? ImageFormatR32ui : ImageFormatUnknown;
+		const auto format =
+		    StorageImageNeedsConcreteFormat(state, view, integer) ? ImageFormatR32ui
+		                                                          : ImageFormatUnknown;
 		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
 		                       0, ImageSpirvArrayed(view), 0, 2, format});
 		state.builder.AddType(

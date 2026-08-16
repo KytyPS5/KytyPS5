@@ -241,6 +241,12 @@ bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::strin
 		return DecodeVectorGpr(code - 256u, operand, error);
 	}
 
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Ttmp;
+		operand.reg  = code - 108u;
+		return true;
+	}
+
 	switch (code) {
 		case 106u: operand.kind = OperandKind::VccLo; return true;
 		case 107u: operand.kind = OperandKind::VccHi; return true;
@@ -273,6 +279,12 @@ bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return true;
+	}
+
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Ttmp;
+		operand.reg  = code - 108u;
 		return true;
 	}
 
@@ -401,6 +413,10 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 
 		if (IsControlFlowBranch(inst.opcode)) {
 			branch_targets.insert(inst.branch_target);
+		}
+		if (inst.opcode == Opcode::SCodeEnd) {
+			program.instructions.pop_back();
+			return true;
 		}
 		if (inst.opcode == Opcode::SEndpgm &&
 		    (word_index >= code.size() || !branch_targets.contains(word_index * 4u))) {
@@ -936,6 +952,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::SSleep: return "s_sleep";
 		case Opcode::STtraceData: return "s_ttracedata";
 		case Opcode::SInstPrefetch: return "s_inst_prefetch";
+		case Opcode::SCodeEnd: return "s_code_end";
 		case Opcode::SEndpgm: return "s_endpgm";
 		case Opcode::Exp: return "exp";
 		case Opcode::Unsupported: return "unsupported";
@@ -961,6 +978,7 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::ExecZ: text = "execz"; break;
 		case OperandKind::Scc: text = "scc"; break;
 		case OperandKind::M0: text = "m0"; break;
+		case OperandKind::Ttmp: text = fmt::format("ttmp{}", operand.reg); break;
 		case OperandKind::PopsExitingWaveId: text = "pops_exiting_wave_id"; break;
 		case OperandKind::Null: text = "null"; break;
 		default: text = "unknown"; break;

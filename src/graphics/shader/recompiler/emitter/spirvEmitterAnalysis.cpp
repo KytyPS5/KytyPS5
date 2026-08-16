@@ -255,6 +255,32 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 		}
 		state.outputs.push_back({output.kind, output.index, output.location, 0, output.debug_name});
 	}
+	AddSyntheticParameterOutputs(state);
+}
+
+void AddSyntheticParameterOutputs(EmitterState& state) {
+	if (state.stage != ShaderType::Vertex || state.vertex_input_info == nullptr) {
+		return;
+	}
+	const auto required = state.vertex_input_info->required_param_locations;
+	if (required == 0) {
+		return;
+	}
+	for (uint32_t location = 0; location < 32; location++) {
+		if ((required & (1u << location)) == 0) {
+			continue;
+		}
+		const bool exported = std::any_of(
+		    state.outputs.begin(), state.outputs.end(), [location](const OutputBinding& binding) {
+			    return binding.kind == IR::StageOutputKind::Parameter &&
+			           binding.location == location;
+		    });
+		if (exported) {
+			continue;
+		}
+		state.outputs.push_back({IR::StageOutputKind::Parameter, location, location, 0,
+		                         "out_param_" + std::to_string(location) + "_unexported", true});
+	}
 }
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {

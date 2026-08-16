@@ -1100,6 +1100,22 @@ void EmitDispatcherFunction(EmitterState& state, const IR::Program& program) {
 	EmitDispatcherLoopTail(state);
 }
 
+void EmitSyntheticParameterOutputStores(EmitterState& state) {
+	uint32_t zero_vec4 = 0;
+	for (const auto& binding: state.outputs) {
+		if (!binding.synthetic || binding.variable_id == 0) {
+			continue;
+		}
+		if (zero_vec4 == 0) {
+			const auto zero = ConstantF32Value(state, 0.0F);
+			zero_vec4       = state.builder.AllocateId();
+			state.builder.AddType(
+			    {OpConstantComposite, state.vec4_float_type, zero_vec4, zero, zero, zero, zero});
+		}
+		state.builder.AddFunction({OpStore, binding.variable_id, zero_vec4});
+	}
+}
+
 void EmitFunction(EmitterState& state, const IR::Program& program) {
 	state.builder.AddFunction(
 	    {OpFunction, state.void_type, state.main_func, FunctionControlNone, state.func_type});
@@ -1110,6 +1126,7 @@ void EmitFunction(EmitterState& state, const IR::Program& program) {
 	EmitPixelInputRegisters(state);
 	EmitVertexInputRegisters(state);
 	EmitStorageBufferOffsets(state);
+	EmitSyntheticParameterOutputStores(state);
 	if (state.dispatcher_fallback) {
 		EmitDispatcherFunction(state, program);
 		state.builder.AddFunction({OpFunctionEnd});

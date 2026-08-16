@@ -1,5 +1,5 @@
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
 #include <cstdio>
@@ -13,6 +13,11 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ShaderStageRuntimeTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+bool RejectSpecializationRead(void *userdata, uint64_t, uint32_t *) {
+  ++*static_cast<uint32_t *>(userdata);
+  return false;
 }
 
 Libs::Graphics::ShaderRecompiler::IR::Block &
@@ -84,8 +89,13 @@ void TestMappedSrtUsesDirectReaderByDefault() {
   auto cached_program = SrtProgram(reinterpret_cast<uint64_t>(&dword));
   ShaderStageRuntime stage;
   std::string error;
-  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error),
+  uint32_t specialization_reads = 0;
+  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error,
+                                      RejectSpecializationRead,
+                                      &specialization_reads),
         error.c_str());
+  Check(specialization_reads == 0,
+        "ordinary SRT read used the specialization reader");
   Check(stage.program == cached_program && stage.resources != nullptr,
         "cache rematerialization did not publish the mapped stage");
   Check(stage.resources->flattened_srt.size() == 1 &&
@@ -131,5 +141,5 @@ int main() {
 #include "graphics/shader/recompiler/ir/Block.cpp"
 #include "graphics/shader/recompiler/ir/Type.cpp"
 #include "graphics/shader/recompiler/ir/Value.cpp"
-#include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"

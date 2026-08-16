@@ -18,6 +18,7 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory = nullptr;
 	void*                     userdata    = nullptr;
 	std::optional<uint64_t>   flat_memory_base;
+	SrtMemoryReader           read_specialization_memory = nullptr;
 };
 
 struct DescriptorSourceRequest {
@@ -46,7 +47,8 @@ bool EvaluateDescriptorSources(const Program&                           program,
 bool EvaluateRuntimeSources(const Program&                           program,
                             std::span<const DescriptorSourceRequest> requests,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                            std::vector<uint32_t>& flat, std::string* error);
+                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
+                            std::string* error);
 
 bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::string* error);

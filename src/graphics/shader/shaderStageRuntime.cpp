@@ -7,7 +7,9 @@ namespace Libs::Graphics {
 
 bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::Program> program,
                                    std::span<const uint32_t> user_data, uint64_t shader_base,
-                                   ShaderStageRuntime& stage, std::string* error) {
+                                   ShaderStageRuntime& stage, std::string* error,
+                                   ShaderSpecializationMemoryReader read_specialization_memory,
+                                   void*                            read_memory_data) {
 	if (program == nullptr) {
 		if (error != nullptr) {
 			*error = "missing native shader plan";
@@ -15,8 +17,10 @@ bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::P
 		return false;
 	}
 	ShaderRecompiler::IR::SrtRuntime runtime;
-	runtime.user_data   = user_data;
-	runtime.shader_base = shader_base;
+	runtime.user_data                  = user_data;
+	runtime.shader_base                = shader_base;
+	runtime.read_specialization_memory = read_specialization_memory;
+	runtime.userdata                   = read_memory_data;
 	ShaderRecompiler::IR::ResourceSnapshot snapshot;
 	if (!ShaderRecompiler::IR::MaterializeResources(*program, runtime, snapshot, error) ||
 	    !ShaderRecompiler::IR::ValidateResourceSpecialization(*program, snapshot, error)) {

@@ -901,6 +901,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::TrackResources(ir, error)) {
 		return false;
 	}
+	IR::EliminateDeadCode(ir.values->blocks);
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
@@ -922,6 +923,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		runtime.shader_base = options.shader_base != 0 ? options.shader_base
 		                                               : reinterpret_cast<uint64_t>(code.data());
 		runtime.read_memory = options.read_memory;
+		runtime.read_specialization_memory = options.read_specialization_memory;
 		if (runtime.read_memory == nullptr && options.user_data == nullptr) {
 			runtime.read_memory = ReadZeroMemory;
 		}

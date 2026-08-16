@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <span>
 #include <unordered_set>
 #include <utility>
 
@@ -148,6 +149,7 @@ public:
 		if (!m_program.srt_plan_complete) {
 			return Fail(0, error, "SRT plan is not ready");
 		}
+		PlanIndirectImages();
 		for (auto* block: m_values.blocks) {
 			for (auto& inst: *block) {
 				if (!Collect(inst, error)) {
@@ -166,6 +168,20 @@ public:
 				memory.sampler = patch.sampler;
 			}
 		}
+		for (const auto& plan: m_indirect_images) {
+			for (uint32_t dword = 0; dword < plan.roots.size(); dword++) {
+				plan.handle->SetArg(dword, plan.roots[dword]);
+			}
+			for (const auto index: plan.memory) {
+				m_values.memory_info[index].planning_only = true;
+			}
+		}
+		std::erase_if(m_values.dynamic_reads, [&](Value value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			return std::ranges::any_of(m_indirect_images, [&](const IndirectImagePlan& plan) {
+				return std::ranges::find(plan.reads, inst) != plan.reads.end();
+			});
+		});
 		m_values.descriptor_sources          = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
@@ -183,6 +199,14 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+	};
+
+	struct IndirectImagePlan {
+		Inst*                      handle = nullptr;
+		uint32_t                   source = 0;
+		std::array<Value, 8>       roots {};
+		std::array<uint32_t, 9>    memory {};
+		std::array<const Inst*, 9> reads {};
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& reason) const {
@@ -310,7 +334,8 @@ private:
 	uint32_t InternSource(const DescriptorSource& descriptor) {
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
-			if (current.dword_count != descriptor.dword_count) {
+			if (current.dword_count != descriptor.dword_count ||
+			    current.indirect_image != descriptor.indirect_image) {
 				continue;
 			}
 			bool same = true;
@@ -323,6 +348,236 @@ private:
 		}
 		m_sources.push_back(descriptor);
 		return static_cast<uint32_t>(m_sources.size() - 1);
+	}
+
+	static bool ImmediateU32(Value value, uint32_t& result) {
+		value = value.Resolve();
+		if (!value.IsImmediate() || value.GetType() != Type::U32) {
+			return false;
+		}
+		result = value.U32();
+		return true;
+	}
+
+	static bool UsesOnly(const Inst& value, std::span<const Inst* const> users) {
+		return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
+			return std::ranges::find(users, use.user) != users.end();
+		});
+	}
+
+	const MemoryInfo* ScalarReadMemory(const Inst& read, uint32_t& index) const {
+		if (read.GetOpcode() != ValueOpcode::ReadConstBuffer || read.NumArgs() != 2u) {
+			return nullptr;
+		}
+		index = read.Flags<MemoryFlags>().index;
+		if (index >= m_values.memory_info.size()) {
+			return nullptr;
+		}
+		const auto& memory = m_values.memory_info[index];
+		return memory.kind == ResourceKind::ScalarBuffer && memory.data_bits == 32u &&
+		               memory.data_dwords == 1u
+		           ? &memory
+		           : nullptr;
+	}
+
+	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		for (const auto* block: m_values.blocks) {
+			for (const auto& inst: *block) {
+				const auto op = inst.GetOpcode();
+				if ((!IsBuffer(op) && !IsAddress(op) && !IsImage(op)) || &inst == &owner) {
+					continue;
+				}
+				if (inst.Flags<MemoryFlags>().index == index) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	bool MakeRuntimeBufferSource(const Inst& handle, uint32_t pc, uint32_t& source,
+	                             DescriptorSource& descriptor) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource ||
+		    !MakeSource(handle, 4u, false, descriptor, pc, nullptr)) {
+			return false;
+		}
+		std::string reason;
+		uint32_t    bad_dword = 0;
+		if (!ValidateSource(descriptor, reason, bad_dword)) {
+			return false;
+		}
+		source = InternSource(descriptor);
+		return true;
+	}
+
+	bool MatchMaterialOffset(Value value, Value& selector, uint32_t& stride,
+	                         uint32_t& offset) const {
+		value           = value.Resolve();
+		offset          = 0;
+		auto* candidate = value.TryInstruction();
+		if (candidate != nullptr && candidate->GetOpcode() == ValueOpcode::IAdd32 &&
+		    candidate->NumArgs() == 2u) {
+			uint32_t immediate = 0;
+			if (ImmediateU32(candidate->Arg(0), immediate)) {
+				value = candidate->Arg(1).Resolve();
+			} else if (ImmediateU32(candidate->Arg(1), immediate)) {
+				value = candidate->Arg(0).Resolve();
+			} else {
+				return false;
+			}
+			offset = immediate;
+		}
+		const auto* multiply = value.TryInstruction();
+		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
+		    multiply->NumArgs() != 2u) {
+			return false;
+		}
+		if (ImmediateU32(multiply->Arg(0), stride)) {
+			selector = multiply->Arg(1).Resolve();
+		} else if (ImmediateU32(multiply->Arg(1), stride)) {
+			selector = multiply->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		const auto* selector_inst = selector.TryInstruction();
+		return stride != 0u && selector_inst != nullptr &&
+		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+	}
+
+	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+
+		std::array<Inst*, 8> heap_reads {};
+		Inst*                heap_handle = nullptr;
+		Value                heap_offset;
+		for (uint32_t dword = 0; dword < heap_reads.size(); dword++) {
+			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
+			if (heap_reads[dword] == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*heap_reads[dword], memory_index);
+			if (memory == nullptr || memory->offset != dword * sizeof(uint32_t) ||
+			    !MemoryIndexBelongsTo(memory_index, *heap_reads[dword])) {
+				return false;
+			}
+			auto* current_handle = heap_reads[dword]->Arg(0).Resolve().TryInstruction();
+			if (current_handle == nullptr ||
+			    (heap_handle != nullptr && current_handle != heap_handle)) {
+				return false;
+			}
+			heap_handle = current_handle;
+			if (dword == 0u) {
+				heap_offset = heap_reads[dword]->Arg(1).Resolve();
+			} else if (!EquivalentValue(m_values, heap_offset, heap_reads[dword]->Arg(1))) {
+				return false;
+			}
+			plan.memory[dword + 1u] = memory_index;
+			plan.reads[dword + 1u]  = heap_reads[dword];
+		}
+
+		const auto* shift        = heap_offset.TryInstruction();
+		uint32_t    shift_amount = 0;
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), shift_amount) ||
+		    shift_amount != 5u) {
+			return false;
+		}
+		auto* material_read = shift->Arg(0).Resolve().TryInstruction();
+		if (material_read == nullptr) {
+			return false;
+		}
+		uint32_t    material_memory_index = 0;
+		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
+		if (material_memory == nullptr || material_memory->offset != 0u ||
+		    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			return false;
+		}
+		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+		if (material_handle == nullptr) {
+			return false;
+		}
+
+		Value    selector;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+		if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_stride,
+		                         selector_offset)) {
+			return false;
+		}
+
+		const std::array<const Inst*, 1> material_users {shift};
+		std::array<const Inst*, 8>       heap_users {};
+		std::copy(heap_reads.begin(), heap_reads.end(), heap_users.begin());
+		const std::array<const Inst*, 1> image_users {&handle};
+		if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, heap_users)) {
+			return false;
+		}
+		for (const auto* read: heap_reads) {
+			if (!UsesOnly(*read, image_users)) {
+				return false;
+			}
+		}
+
+		DescriptorSource material_source;
+		DescriptorSource heap_source;
+		uint32_t         material_source_index = 0;
+		uint32_t         heap_source_index     = 0;
+		if (!MakeRuntimeBufferSource(*material_handle, pc, material_source_index,
+		                             material_source) ||
+		    !MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
+			return false;
+		}
+
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		std::copy(material_source.dwords.begin(), material_source.dwords.begin() + 4u,
+		          image_source.dwords.begin());
+		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+		          image_source.dwords.begin() + 4u);
+		image_source.indirect_image = DescriptorSource::IndirectImage {
+		    material_source_index, heap_source_index, selector_stride, selector_offset};
+
+		plan.handle    = &handle;
+		plan.source    = InternSource(image_source);
+		plan.roots     = image_source.dwords;
+		plan.memory[0] = material_memory_index;
+		plan.reads[0]  = material_read;
+		return true;
+	}
+
+	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
+		const auto found =
+		    std::ranges::find_if(m_indirect_images, [&](const IndirectImagePlan& plan) {
+			    return plan.handle == &handle;
+		    });
+		return found == m_indirect_images.end() ? nullptr : &*found;
+	}
+
+	bool IsIndirectPlanningMemory(uint32_t index) const {
+		return std::ranges::any_of(m_indirect_images, [&](const IndirectImagePlan& plan) {
+			return std::ranges::find(plan.memory, index) != plan.memory.end();
+		});
+	}
+
+	void PlanIndirectImages() {
+		for (auto* block: m_values.blocks) {
+			for (auto& inst: *block) {
+				if (!IsImage(inst.GetOpcode()) || inst.NumArgs() == 0u) {
+					continue;
+				}
+				auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || FindIndirectImage(*handle) != nullptr) {
+					continue;
+				}
+				IndirectImagePlan plan;
+				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+					m_indirect_images.push_back(std::move(plan));
+				}
+			}
+		}
 	}
 
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
@@ -560,7 +815,7 @@ private:
 			return Fail(flags.pc, error, "memory operation has no resource handle");
 		}
 		const auto& memory = m_values.memory_info[flags.index];
-		if (memory.planning_only) {
+		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
 			return true;
 		}
 		Inst*    handle   = nullptr;
@@ -592,8 +847,12 @@ private:
 			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc, error);
 		}
 
-		if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source,
-		               error)) {
+		handle               = inst.Arg(0).Resolve().TryInstruction();
+		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
+		if (indirect != nullptr) {
+			source = indirect->source;
+		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle,
+		                      source, error)) {
 			return false;
 		}
 		resource = AddImage(source, memory, op, flags.pc);
@@ -638,7 +897,8 @@ private:
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
-				if (image_source == nullptr || image_source->dword_count != 8) {
+				if (image_source == nullptr || image_source->dword_count != 8 ||
+				    image_source->indirect_image.has_value()) {
 					continue;
 				}
 				bool alias = true;
@@ -654,12 +914,13 @@ private:
 		}
 	}
 
-	Program&                      m_program;
-	ValueProgram&                 m_values;
-	ShaderInfo                    m_info;
-	std::vector<DescriptorSource> m_sources;
-	std::vector<HandlePatch>      m_handle_patches;
-	std::vector<MemoryPatch>      m_memory_patches;
+	Program&                       m_program;
+	ValueProgram&                  m_values;
+	ShaderInfo                     m_info;
+	std::vector<DescriptorSource>  m_sources;
+	std::vector<HandlePatch>       m_handle_patches;
+	std::vector<MemoryPatch>       m_memory_patches;
+	std::vector<IndirectImagePlan> m_indirect_images;
 };
 
 } // namespace

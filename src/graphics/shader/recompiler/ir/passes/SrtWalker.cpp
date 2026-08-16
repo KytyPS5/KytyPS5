@@ -396,8 +396,10 @@ private:
 
 class Evaluator {
 public:
-	Evaluator(const Program& program, const SrtRuntime& runtime)
-	    : m_program(program), m_values(*program.values), m_runtime(runtime) {}
+	Evaluator(const Program& program, const SrtRuntime& runtime,
+	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr)
+	    : m_program(program), m_values(*program.values), m_runtime(runtime),
+	      m_clean_flat_slots(clean_flat_slots), m_clean_evaluator(clean_evaluator) {}
 
 	void SetUsePc(uint32_t pc) { m_use_pc = pc; }
 
@@ -595,6 +597,12 @@ private:
 				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 				    slot.U32() >= m_values.srt_reads.size()) {
 					return Fail(error, "invalid flattened SRT index");
+				}
+				if (slot.U32() < m_clean_flat_slots.size() &&
+				    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
+					m_clean_evaluator->SetUsePc(m_use_pc);
+					return m_clean_evaluator->EvaluateWide(m_values.srt_reads[slot.U32()].value,
+					                                       result, error);
 				}
 				return EvaluateWide(m_values.srt_reads[slot.U32()].value, result, error);
 			}
@@ -842,7 +850,9 @@ private:
 	const Program&                            m_program;
 	const ValueProgram&                       m_values;
 	const SrtRuntime&                         m_runtime;
-	uint32_t                                  m_use_pc = 0;
+	std::span<const uint8_t>                  m_clean_flat_slots;
+	Evaluator*                                m_clean_evaluator = nullptr;
+	uint32_t                                  m_use_pc          = 0;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 };
@@ -858,14 +868,24 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
                                 std::span<const DescriptorSourceRequest> requests,
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
-                                std::string* error) {
+                                std::span<const uint8_t> clean_flat_slots, std::string* error) {
 	if (program.values == nullptr || !program.srt_plan_complete) {
 		if (error != nullptr) {
 			*error = Diagnostic(program, 0, "typed SRT plan is not ready");
 		}
 		return false;
 	}
-	Evaluator                    evaluator(program, runtime);
+	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
+	    runtime.read_specialization_memory == nullptr) {
+		if (error != nullptr) {
+			*error = Diagnostic(program, 0, "clean flattened SRT read has no memory reader");
+		}
+		return false;
+	}
+	SrtRuntime clean_runtime  = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	Evaluator                    clean_evaluator(program, clean_runtime);
+	Evaluator                    evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	std::vector<DescriptorValue> evaluated;
 	evaluated.reserve(requests.size());
 	for (const auto& request: requests) {
@@ -891,9 +911,12 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 	if (evaluate_flat) {
 		flattened.resize(program.values->srt_reads.size());
 		for (const auto& read: program.values->srt_reads) {
-			evaluator.SetUsePc(read.use_pc);
+			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
+			                      clean_flat_slots[read.flat_offset] != 0u;
+			auto&      selected = clean ? clean_evaluator : evaluator;
+			selected.SetUsePc(read.use_pc);
 			if (read.flat_offset >= flattened.size() ||
-			    !evaluator.Evaluate(read.value, flattened[read.flat_offset], error)) {
+			    !selected.Evaluate(read.value, flattened[read.flat_offset], error)) {
 				return false;
 			}
 		}
@@ -948,20 +971,23 @@ bool EvaluateDescriptorSources(const Program&                           program,
                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                std::string* error) {
 	std::vector<uint32_t> ignored;
-	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, ignored, false, error);
+	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, ignored, false, {},
+	                                  error);
 }
 
 bool EvaluateRuntimeSources(const Program&                           program,
                             std::span<const DescriptorSourceRequest> requests,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                            std::vector<uint32_t>& flat, std::string* error) {
-	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, flat, true, error);
+                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
+                            std::string* error) {
+	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, flat, true,
+	                                  clean_flat_slots, error);
 }
 
 bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::string* error) {
 	std::vector<DescriptorValue> ignored;
-	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, error);
+	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, {}, error);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

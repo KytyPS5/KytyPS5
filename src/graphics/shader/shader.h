@@ -39,11 +39,16 @@ struct ShaderStageRuntime {
 	}
 };
 
+using ShaderSpecializationMemoryReader = bool (*)(void* userdata, uint64_t address,
+                                                  uint32_t* value);
+
 // Resolves an immutable native shader plan against current user data. The prior stage is preserved
 // if any ReadConst, snapshot, or specialization check fails.
-bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::Program> program,
-                                   std::span<const uint32_t> user_data, uint64_t shader_base,
-                                   ShaderStageRuntime& stage, std::string* error);
+bool ShaderMaterializeStageRuntime(
+    std::shared_ptr<const ShaderRecompiler::IR::Program> program,
+    std::span<const uint32_t> user_data, uint64_t shader_base, ShaderStageRuntime& stage,
+    std::string* error, ShaderSpecializationMemoryReader read_specialization_memory = nullptr,
+    void* read_memory_data = nullptr);
 
 struct ShaderId {
 	uint32_t              hash0 = 0;

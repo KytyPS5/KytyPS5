@@ -17,6 +17,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
 #include "spirv-tools/libspirv.hpp"
@@ -50,6 +51,11 @@ namespace {
 
 constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
 constexpr uint32_t PsInputFlatShade  = 0x00000400u;
+
+bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
 
 } // namespace
 
@@ -958,7 +964,7 @@ static bool TryUseVertexPermutation(const ShaderProgramPermutation& permutation,
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr),
-	        regs.es_regs.data_addr, info.stage, &error)) {
+	        regs.es_regs.data_addr, info.stage, &error, ReadShaderGuestMemory)) {
 		return LogPermutationMismatch(permutation, "VS", shader_hash, error);
 	}
 	ApplyVertexOutputs(info, *permutation.program);
@@ -972,7 +978,7 @@ static bool TryUsePixelPermutation(const ShaderProgramPermutation& permutation,
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr),
-	        regs.ps_regs.data_addr, info.stage, &error)) {
+	        regs.ps_regs.data_addr, info.stage, &error, ReadShaderGuestMemory)) {
 		return LogPermutationMismatch(permutation, "PS", shader_hash, error);
 	}
 	ApplyPixelOutputs(info, *permutation.program);
@@ -986,7 +992,7 @@ static bool TryUseComputePermutation(const ShaderProgramPermutation& permutation
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
 	        std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr),
-	        regs.cs_regs.data_addr, info.stage, &error)) {
+	        regs.cs_regs.data_addr, info.stage, &error, ReadShaderGuestMemory)) {
 		return LogPermutationMismatch(permutation, "CS", shader_hash, error);
 	}
 	return true;
@@ -1429,19 +1435,20 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	const auto code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler VS", regs.gs_regs.chksum);
 
 	ShaderRecompiler::CompileOptions options;
-	options.stage                = ShaderType::Vertex;
-	options.lane_mask_mode       = lane_mask_mode;
-	options.shader_hash          = regs.gs_regs.chksum;
-	options.shader_base          = shader_addr;
-	options.user_data_base       = 8;
-	options.user_data_count      = regs.gs_regs.rsrc2.user_sgpr;
-	options.user_data            = regs.gs_user_sgpr.value;
-	options.descriptor_set       = 0;
-	options.push_constant_offset = 0;
-	options.vertex_input_info    = &input_info;
-	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
-	options.early_dump           = options.dump_ir;
-	options.dump_label           = "ShaderRecompiler VS";
+	options.stage                      = ShaderType::Vertex;
+	options.lane_mask_mode             = lane_mask_mode;
+	options.shader_hash                = regs.gs_regs.chksum;
+	options.shader_base                = shader_addr;
+	options.user_data_base             = 8;
+	options.user_data_count            = regs.gs_regs.rsrc2.user_sgpr;
+	options.user_data                  = regs.gs_user_sgpr.value;
+	options.read_specialization_memory = ReadShaderGuestMemory;
+	options.descriptor_set             = 0;
+	options.push_constant_offset       = 0;
+	options.vertex_input_info          = &input_info;
+	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
+	options.early_dump                 = options.dump_ir;
+	options.dump_label                 = "ShaderRecompiler VS";
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
@@ -1483,18 +1490,19 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	const auto     code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler PS", shader_hash);
 
 	ShaderRecompiler::CompileOptions options;
-	options.stage                = ShaderType::Pixel;
-	options.lane_mask_mode       = lane_mask_mode;
-	options.shader_hash          = shader_hash;
-	options.shader_base          = shader_addr;
-	options.user_data_count      = regs.ps_regs.rsrc2.user_sgpr;
-	options.user_data            = regs.ps_user_sgpr.value;
-	options.descriptor_set       = input_info.descriptor_set;
-	options.push_constant_offset = input_info.push_constant_offset;
-	options.pixel_input_info     = &input_info;
-	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
-	options.early_dump           = options.dump_ir;
-	options.dump_label           = "ShaderRecompiler PS";
+	options.stage                      = ShaderType::Pixel;
+	options.lane_mask_mode             = lane_mask_mode;
+	options.shader_hash                = shader_hash;
+	options.shader_base                = shader_addr;
+	options.user_data_count            = regs.ps_regs.rsrc2.user_sgpr;
+	options.user_data                  = regs.ps_user_sgpr.value;
+	options.read_specialization_memory = ReadShaderGuestMemory;
+	options.descriptor_set             = input_info.descriptor_set;
+	options.push_constant_offset       = input_info.push_constant_offset;
+	options.pixel_input_info           = &input_info;
+	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
+	options.early_dump                 = options.dump_ir;
+	options.dump_label                 = "ShaderRecompiler PS";
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
@@ -1533,18 +1541,19 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	const auto     code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler CS", shader_addr);
 
 	ShaderRecompiler::CompileOptions options;
-	options.stage                = ShaderType::Compute;
-	options.shader_hash          = shader_addr;
-	options.shader_base          = shader_addr;
-	options.user_data_count      = regs.cs_regs.user_sgpr;
-	options.user_data            = regs.cs_user_sgpr.value;
-	options.descriptor_set       = 0;
-	options.push_constant_offset = 0;
-	options.compute_input_info   = &input_info;
-	options.wave_size            = input_info.wave_size;
-	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
-	options.early_dump           = options.dump_ir;
-	options.dump_label           = "ShaderRecompiler CS";
+	options.stage                      = ShaderType::Compute;
+	options.shader_hash                = shader_addr;
+	options.shader_base                = shader_addr;
+	options.user_data_count            = regs.cs_regs.user_sgpr;
+	options.user_data                  = regs.cs_user_sgpr.value;
+	options.read_specialization_memory = ReadShaderGuestMemory;
+	options.descriptor_set             = 0;
+	options.push_constant_offset       = 0;
+	options.compute_input_info         = &input_info;
+	options.wave_size                  = input_info.wave_size;
+	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
+	options.early_dump                 = options.dump_ir;
+	options.dump_label                 = "ShaderRecompiler CS";
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;

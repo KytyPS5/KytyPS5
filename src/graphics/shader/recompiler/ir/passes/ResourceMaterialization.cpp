@@ -5,13 +5,18 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <numeric>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+constexpr uint64_t MaxIndirectImageProbes = 65536u;
 
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
@@ -86,6 +91,167 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 		return false;
 	}
 	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
+	return true;
+}
+
+const DescriptorSource* Source(const Program& program, uint32_t source) {
+	if (program.values == nullptr || source >= program.values->descriptor_sources.size()) {
+		return nullptr;
+	}
+	return &program.values->descriptor_sources[source];
+}
+
+void MarkCleanFlatSlots(const Program& program, const DescriptorSource* source,
+                        std::span<uint8_t> slots) {
+	if (source == nullptr) {
+		return;
+	}
+	std::vector<Value>       pending(source->dwords.begin(),
+	                                 source->dwords.begin() + source->dword_count);
+	std::vector<const Inst*> visited;
+	while (!pending.empty()) {
+		auto value = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+			continue;
+		}
+		visited.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
+				slots[slot.U32()] = 1u;
+				pending.push_back(program.values->srt_reads[slot.U32()].value);
+			}
+			continue;
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
+	}
+}
+
+uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
+	return descriptor.Stride() == 0u
+	           ? descriptor.NumRecords()
+	           : static_cast<uint64_t>(descriptor.Stride()) * descriptor.NumRecords();
+}
+
+bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
+	return runtime.read_specialization_memory != nullptr &&
+	       runtime.read_specialization_memory(runtime.userdata, address, &word);
+}
+
+bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynamic_offset,
+                          uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word,
+                          std::string* error, uint32_t use_pc) {
+	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
+	const auto aligned     = byte_offset & ~uint64_t {3};
+	const auto size        = ScalarBufferSize(descriptor);
+	if (aligned > size || size - aligned < sizeof(uint32_t)) {
+		word = 0;
+		return true;
+	}
+	const auto base = descriptor.Base48() & ~uint64_t {3};
+	if (aligned > AddressMask - base) {
+		if (error != nullptr) {
+			*error = fmt::format("indirect image scalar read at pc 0x{:08x} exceeds the "
+			                     "48-bit address space",
+			                     use_pc);
+		}
+		return false;
+	}
+	const auto address = base + aligned;
+	if (!ReadSpecializationWord(runtime, address, word)) {
+		if (error != nullptr) {
+			*error = fmt::format("indirect image scalar read at pc 0x{:08x} failed at "
+			                     "0x{:016x}",
+			                     use_pc, address);
+		}
+		return false;
+	}
+	return true;
+}
+
+bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
+                              const DescriptorValue&                 material_value,
+                              const DescriptorValue& heap_value, const SrtRuntime& runtime,
+                              DescriptorValue& result, std::string* error, uint32_t use_pc) {
+	ShaderBufferResource material;
+	ShaderBufferResource heap;
+	if (!DecodeBufferDescriptor(material_value, material) ||
+	    !DecodeBufferDescriptor(heap_value, heap)) {
+		if (error != nullptr) {
+			*error = fmt::format("indirect image tables at pc 0x{:08x} have invalid descriptors",
+			                     use_pc);
+		}
+		return false;
+	}
+	if (material.Stride() != indirect.selector_stride) {
+		if (error != nullptr) {
+			*error =
+			    fmt::format("indirect image material table at pc 0x{:08x} changed stride", use_pc);
+		}
+		return false;
+	}
+
+	// S_BUFFER_LOAD ignores vector-buffer swizzle/add-thread fields. The shader computes the
+	// record stride explicitly; enumerate every wrapped 32-bit offset that can pass bounds.
+	const auto period      = uint64_t {1} << 32u;
+	const auto step        = std::gcd<uint64_t>(indirect.selector_stride, period);
+	const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
+	const auto size        = ScalarBufferSize(material);
+	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
+	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+	if (probe_count > MaxIndirectImageProbes) {
+		if (error != nullptr) {
+			*error = fmt::format("indirect image material table at pc 0x{:08x} requires {} "
+			                     "bounded probes",
+			                     use_pc, probe_count);
+		}
+		return false;
+	}
+
+	std::vector<uint32_t>        keys {0u};
+	std::unordered_set<uint32_t> seen {0u};
+	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
+		uint32_t key = 0;
+		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key, error,
+		                          use_pc)) {
+			return false;
+		}
+		if (seen.insert(key).second) {
+			keys.push_back(key);
+		}
+		if (limit - offset < step) {
+			break;
+		}
+	}
+
+	DescriptorValue invariant;
+	bool            have_invariant = false;
+	for (const auto key: keys) {
+		DescriptorValue candidate;
+		candidate.dword_count  = 8u;
+		const auto heap_offset = key << 5u;
+		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
+			                          candidate.dwords[dword], error, use_pc)) {
+				return false;
+			}
+		}
+		if (!have_invariant) {
+			invariant      = candidate;
+			have_invariant = true;
+		} else if (candidate != invariant) {
+			if (error != nullptr) {
+				*error =
+				    fmt::format("indirect image table at pc 0x{:08x} is not invariant", use_pc);
+			}
+			return false;
+		}
+	}
+	result = invariant;
 	return true;
 }
 
@@ -305,13 +471,30 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	}
 
 	std::vector<DescriptorSourceRequest> requests;
-	requests.reserve(program.info.buffers.size() + program.info.images.size() +
+	std::vector<uint8_t>                 clean_flat_slots(program.values->srt_reads.size());
+	requests.reserve(program.info.buffers.size() + program.info.images.size() * 2u +
 	                 program.info.samplers.size() + program.info.addresses.size());
 	for (const auto& buffer: program.info.buffers) {
 		requests.push_back({buffer.source, buffer.first_use_pc});
 	}
 	for (const auto& image: program.info.images) {
-		requests.push_back({image.source, image.first_use_pc});
+		const auto* source = Source(program, image.source);
+		if (source != nullptr && source->indirect_image.has_value()) {
+			if (runtime.read_specialization_memory == nullptr) {
+				if (error != nullptr) {
+					*error = fmt::format("indirect image table at pc 0x{:08x} has no clean "
+					                     "memory reader",
+					                     image.first_use_pc);
+				}
+				return false;
+			}
+			MarkCleanFlatSlots(program, Source(program, source->indirect_image->material_source),
+			                   clean_flat_slots);
+			MarkCleanFlatSlots(program, Source(program, source->indirect_image->heap_source),
+			                   clean_flat_slots);
+		} else {
+			requests.push_back({image.source, image.first_use_pc});
+		}
 	}
 	for (const auto& sampler: program.info.samplers) {
 		requests.push_back({sampler.source, sampler.first_use_pc});
@@ -324,7 +507,8 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
-	if (!EvaluateRuntimeSources(program, requests, runtime, values, flattened_srt, error)) {
+	if (!EvaluateRuntimeSources(program, requests, runtime, values, flattened_srt, clean_flat_slots,
+	                            error)) {
 		return false;
 	}
 
@@ -338,12 +522,34 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			descriptor.dwords.fill(0);
 		}
 	}
-	next.images.assign(cursor, cursor + program.info.images.size());
-	cursor += program.info.images.size();
-	for (auto& descriptor: next.images) {
+	next.images.reserve(program.info.images.size());
+	for (const auto& image: program.info.images) {
+		const auto*     source = Source(program, image.source);
+		DescriptorValue descriptor;
+		if (source != nullptr && source->indirect_image.has_value()) {
+			const std::array requests {
+			    DescriptorSourceRequest {source->indirect_image->material_source,
+			                             image.first_use_pc},
+			    DescriptorSourceRequest {source->indirect_image->heap_source, image.first_use_pc}};
+			SrtRuntime clean_runtime  = runtime;
+			clean_runtime.read_memory = runtime.read_specialization_memory;
+			std::vector<DescriptorValue> tables;
+			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables, error)) {
+				return false;
+			}
+			const auto& material = tables[0];
+			const auto& heap     = tables[1];
+			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, runtime,
+			                              descriptor, error, image.first_use_pc)) {
+				return false;
+			}
+		} else {
+			descriptor = *cursor++;
+		}
 		if (!ValidImageDescriptor(descriptor)) {
 			descriptor.dwords.fill(0);
 		}
+		next.images.push_back(descriptor);
 	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();

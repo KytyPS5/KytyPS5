@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,8 +20,18 @@ struct ValueBlockInfo {
 };
 
 struct DescriptorSource {
-	std::array<Value, 8> dwords {};
-	uint32_t             dword_count = 0;
+	struct IndirectImage {
+		uint32_t material_source = 0;
+		uint32_t heap_source     = 0;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+
+		bool operator==(const IndirectImage& other) const = default;
+	};
+
+	std::array<Value, 8>         dwords {};
+	uint32_t                     dword_count = 0;
+	std::optional<IndirectImage> indirect_image;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };

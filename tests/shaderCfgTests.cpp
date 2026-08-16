@@ -162,6 +162,72 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
   return count;
 }
 
+uint32_t SpirvArrayLengthCount(const std::vector<uint32_t> &binary,
+                               uint32_t requested_length) {
+  std::vector<uint32_t> length_ids;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t opcode = binary[i] & 0xffffu;
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return 0;
+    }
+    if (opcode == 43u && word_count == 4u &&
+        binary[i + 3u] == requested_length) { // OpConstant
+      length_ids.push_back(binary[i + 2u]);
+    }
+    i += word_count;
+  }
+
+  uint32_t count = 0;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t opcode = binary[i] & 0xffffu;
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return count;
+    }
+    if (opcode == 28u && word_count == 4u && // OpTypeArray
+        std::find(length_ids.begin(), length_ids.end(), binary[i + 3u]) !=
+            length_ids.end()) {
+      count++;
+    }
+    i += word_count;
+  }
+  return count;
+}
+
+uint32_t SpirvUnsignedLessThanBoundCount(const std::vector<uint32_t> &binary,
+                                         uint32_t requested_bound) {
+  std::vector<uint32_t> bound_ids;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t opcode = binary[i] & 0xffffu;
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return 0;
+    }
+    if (opcode == 43u && word_count == 4u &&
+        binary[i + 3u] == requested_bound) { // OpConstant
+      bound_ids.push_back(binary[i + 2u]);
+    }
+    i += word_count;
+  }
+
+  uint32_t count = 0;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t opcode = binary[i] & 0xffffu;
+    const uint32_t word_count = binary[i] >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return count;
+    }
+    if (opcode == 176u && word_count == 5u && // OpULessThan
+        std::find(bound_ids.begin(), bound_ids.end(), binary[i + 4u]) !=
+            bound_ids.end()) {
+      count++;
+    }
+    i += word_count;
+  }
+  return count;
+}
+
 bool SpirvSourceHasInstructionOperand(const std::string &source,
                                       const char *opcode, const char *operand) {
   std::istringstream lines(source);
@@ -379,6 +445,7 @@ ShaderComputeInputInfo RegressionComputeInputInfo() {
   input_info.threads_num[0] = 1;
   input_info.threads_num[1] = 1;
   input_info.threads_num[2] = 1;
+  input_info.lds_size_dwords = 1024;
   input_info.workgroup_register = 40;
   return input_info;
 }
@@ -9020,6 +9087,72 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CheckSpirvBinaryValidates(vcc_spirv);
 }
 
+void TestComputeLdsAllocationIdentity() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x0d, 4288u), // ds_write_b32 v0, v1 offset:4288
+      EncodeDs1(0, 1, 0), EncodeSopp(0x01),
+  };
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.cs_regs.num_thread_x = 64;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+
+  const auto compile = [&](uint16_t encoded_lds_size,
+                           uint32_t expected_dwords) {
+    regs.cs_regs.lds_size = encoded_lds_size;
+    ShaderComputeInputInfo input_info{};
+    std::span<const uint32_t> spirv;
+    Check(ShaderCompileInfoCS(regs, sh, input_info, spirv),
+          "compute LDS allocation shader did not compile");
+    Check(input_info.lds_size_dwords == expected_dwords,
+          "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
+    const std::vector<uint32_t> binary(spirv.begin(), spirv.end());
+    Check(SpirvArrayLengthCount(binary, expected_dwords) == 1u,
+          "SPIR-V workgroup array did not use the declared LDS allocation");
+    Check(SpirvUnsignedLessThanBoundCount(binary, expected_dwords) == 1u,
+          "LDS bounds check did not use the declared allocation");
+    CheckSpirvBinaryValidates(binary);
+    return input_info;
+  };
+
+  constexpr uint32_t lds_1152_rsrc2 = 0x00048188u;
+  constexpr uint32_t lds_896_rsrc2 = 0x00038188u;
+  constexpr auto decode_lds_field = [](uint32_t rsrc2) {
+    return static_cast<uint16_t>(
+        (rsrc2 >> Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT) &
+        Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK);
+  };
+  const auto lds_1152 = compile(decode_lds_field(lds_1152_rsrc2), 1152u);
+  const auto lds_896 = compile(decode_lds_field(lds_896_rsrc2), 896u);
+  Check(ShaderGetIdCS(regs, lds_1152, true) !=
+            ShaderGetIdCS(regs, lds_896, true),
+        "compute pipeline identity omitted the LDS allocation");
+
+  const uint32_t append_shader[] = {
+      EncodeSMovB32(124, 132), // m0 = 4 bytes
+      EncodeDs0(0x3e), EncodeDs1(1, 0, 0), // ds_append v1
+      EncodeSopp(0x01),
+  };
+  ShaderComputeInputInfo append_info = RegressionComputeInputInfo();
+  append_info.lds_size_dwords = 1152u;
+  ShaderRecompiler::CompileOptions append_options;
+  append_options.stage = ShaderType::Compute;
+  append_options.compute_input_info = &append_info;
+  ShaderRecompiler::CompileResult append_result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(append_shader, append_options,
+                                       append_result, &error),
+        error.c_str());
+  Check(SpirvUnsignedLessThanBoundCount(append_result.spirv, 1152u) == 1u,
+        "typed LDS append omitted the declared allocation bound");
+  CheckSpirvBinaryValidates(append_result.spirv);
+}
+
 void TestPixelProgramCacheDescriptorSetIdentity() {
   const uint32_t shader_01[] = {0xbf810000u};
   const uint32_t shader_10[] = {0xbf810000u};
@@ -9250,6 +9383,7 @@ int main() {
   TestNewShaderRecompilerStageInputInfo();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
+  TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheDescriptorSetIdentity();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 

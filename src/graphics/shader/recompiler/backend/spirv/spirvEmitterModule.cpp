@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 const IR::DescriptorBinding* DescriptorBinding(const EmitterState&       state,
@@ -736,7 +738,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
 		const auto storage_class =
 		    state.needs_function_lds ? StorageClassFunction : StorageClassWorkgroup;
-		const auto lds_size = ConstantU32(state, state.needs_function_lds ? 8192u : 1024u);
+		const auto lds_dwords = std::max(LdsDwordCount(state), 1u);
+		const auto lds_size   = ConstantU32(state, lds_dwords);
 		state.builder.AddType({OpTypeArray, state.lds_array_type, state.uint_type, lds_size});
 		state.builder.AddType(
 		    {OpTypePointer, state.ptr_workgroup_array, storage_class, state.lds_array_type});

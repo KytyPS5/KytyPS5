@@ -91,6 +91,7 @@ struct ShaderVertexInputInfo {
 struct ShaderComputeInputInfo {
 	uint32_t           threads_num[3]             = {0, 0, 0};
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	uint32_t           lds_size_dwords            = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	uint32_t           wave_size                  = 64;

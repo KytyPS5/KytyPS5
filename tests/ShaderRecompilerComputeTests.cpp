@@ -846,7 +846,11 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
-  ShaderComputeInputInfo compute_info{};
+  ShaderComputeInputInfo compute_info = [] {
+    ShaderComputeInputInfo info{};
+    info.lds_size_dwords = 1024;
+    return info;
+  }();
   bool has_compute_info = false;
   u32 dispatch_x = 1;
   u32 dispatch_y = 1;
@@ -1061,8 +1065,7 @@ CompiledShader CompileCase(const TestCase &test) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
-  options.compute_input_info =
-      test.has_compute_info ? &test.compute_info : nullptr;
+  options.compute_input_info = &test.compute_info;
   options.user_data = user_data.data();
   options.read_memory = ReadTestMemory;
   options.read_memory_data = const_cast<std::vector<u32> *>(&test.initial);

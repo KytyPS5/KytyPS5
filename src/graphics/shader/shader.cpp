@@ -894,15 +894,16 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        ShaderComputeInputInfo& info) {
 	info = {};
 
-	info.threads_num[0] = regs.cs_regs.num_thread_x;
-	info.threads_num[1] = regs.cs_regs.num_thread_y;
-	info.threads_num[2] = regs.cs_regs.num_thread_z;
-	info.group_id[0]    = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]    = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]    = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size      = regs.cs_regs.wave_size;
-	info.thread_ids_num = regs.cs_regs.tidig_comp_cnt + 1;
-	info.tg_size_en     = regs.cs_regs.tg_size_en != 0;
+	info.threads_num[0]  = regs.cs_regs.num_thread_x;
+	info.threads_num[1]  = regs.cs_regs.num_thread_y;
+	info.threads_num[2]  = regs.cs_regs.num_thread_z;
+	info.lds_size_dwords = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
+	info.group_id[0]     = regs.cs_regs.tgid_x_en != 0;
+	info.group_id[1]     = regs.cs_regs.tgid_y_en != 0;
+	info.group_id[2]     = regs.cs_regs.tgid_z_en != 0;
+	info.wave_size       = regs.cs_regs.wave_size;
+	info.thread_ids_num  = regs.cs_regs.tidig_comp_cnt + 1;
+	info.tg_size_en      = regs.cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
@@ -1330,10 +1331,12 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	LOGF("\t workgroup_register = %d\n"
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
+	     "\t lds_size_dwords    = %u\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
-	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.threads_num[0],
-	     info.threads_num[1], info.threads_num[2], info.tg_size_en ? "true" : "false");
+	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
+	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
+	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
 }
@@ -1723,6 +1726,7 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 	ret.ids.push_back(input_info.workgroup_register);
 	ret.ids.push_back(input_info.wave_size);
 	ret.ids.push_back(input_info.thread_ids_num);
+	ret.ids.push_back(input_info.lds_size_dwords);
 
 	for (int i = 0; i < 3; i++) {
 		ret.ids.push_back(input_info.threads_num[i]);

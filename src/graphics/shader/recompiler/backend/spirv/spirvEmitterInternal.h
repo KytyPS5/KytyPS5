@@ -972,6 +972,10 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryIn
 
 uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index);
 
+uint32_t LdsDwordCount(const EmitterState& state);
+
+uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index);
+
 uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index);
 
 uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index);

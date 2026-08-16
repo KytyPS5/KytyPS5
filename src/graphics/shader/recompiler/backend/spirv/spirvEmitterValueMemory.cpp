@@ -158,7 +158,7 @@ uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 
 uint32_t InBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t index, uint32_t pc) {
 	if (mem.kind == IR::ResourceKind::Lds) {
-		return 0;
+		return EmitLdsElementInBounds(ctx.state, index);
 	}
 	if (mem.kind == IR::ResourceKind::Gds) {
 		return EmitGdsElementInBounds(ctx.state, index);
@@ -546,7 +546,8 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	                           ConstantU32(state, ScopeSubgroup), ballot});
 	const auto is_first =
 	    Binary(state, OpIEqual, state.bool_type, EmitSubgroupLocalInvocationId(state), first);
-	const auto storage_bounds = gds ? EmitGdsElementInBounds(state, index) : 0u;
+	const auto storage_bounds =
+	    gds ? EmitGdsElementInBounds(state, index) : EmitLdsElementInBounds(state, index);
 	const auto m0_bounds =
 	    gds ? Binary(state, OpINotEqual, state.bool_type, size, ConstantU32(state, 0))
 	        : Binary(state, OpULessThan, state.bool_type,

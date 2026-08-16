@@ -3171,6 +3171,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("onNY9Byn-W8", LibKernel::PthreadJoin);
 	LIB_FUNC("4qGrR6eoP9Y", LibKernel::PthreadDetach);
 	LIB_FUNC("3kg7rT0NQIs", LibKernel::PthreadExit);
+	LIB_FUNC("qBDmpCyGssE", LibKernel::PthreadCancel);
 	LIB_FUNC("OAmWq+OHSjw", LibKernel::PthreadSetcancelstate);
 	LIB_FUNC("sCJd99Phct0", LibKernel::PthreadSetcanceltype);
 	LIB_FUNC("How7B8Oet6k", LibKernel::PthreadGetname);

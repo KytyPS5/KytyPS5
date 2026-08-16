@@ -1351,6 +1351,7 @@ uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
 			}
 			break;
 		}
+		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kPrt:
 		case Prospero::TileMode::kDepth:

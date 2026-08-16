@@ -6266,6 +6266,109 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckRenderExecutorColorStandard4TileDiscovery() {
+    constexpr const char *name = "RenderExecutorColorStandard4Tile";
+    constexpr uintptr_t base = 0x0000000203b00000ull;
+    constexpr uint64_t target_address = base + 0x4000;
+    constexpr uint64_t target_size = 0x180000;
+    constexpr uint64_t allocation_size = 0x184000;
+    constexpr uint64_t allocation_alignment = 0x4000;
+    constexpr auto format = Prospero::BufferFormat::k32Float;
+    constexpr auto tile = Prospero::TileMode::kStandard4KB;
+    EnsureRuntimeContext();
+
+    const auto pitch = TileGetTexturePitch(format, 256, tile);
+    TileSizeAlign slice{};
+    TileGetTextureSize(format, 256, 256, 1, tile, &slice, nullptr, nullptr);
+    const auto odd_pitch = TileGetTexturePitch(format, 257, tile);
+    TileSizeAlign odd_slice{};
+    TileGetTextureSize(format, 257, 131, 1, tile, &odd_slice, nullptr, nullptr);
+    Require(name, "tile layout",
+            pitch == 256 && slice.size == 0x40000 && slice.align == 0x1000 &&
+                odd_pitch == 288 && odd_slice.size == 0x2d000 &&
+                odd_slice.align == 0x1000,
+            "Standard4KB pitch, footprint, or block alignment is incorrect");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "Standard4KB color allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "Standard4KB color mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = target_address});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k32,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorView(
+          0, {.base_array_slice_index = 5, .last_array_slice_index = 5});
+      registers.SetColorAttrib2(0, {.height = 255, .width = 255});
+      registers.SetColorAttrib3(0, {.tile_mode = tile,
+                                    .dimension = 1,
+                                    .cmask_pipe_aligned = true,
+                                    .dcc_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, 1, scheduler.Current(), color, 0);
+      const auto attachment =
+          texture_cache.FindRenderTarget(color.image_id, color.desc);
+      const auto &image = texture_cache.GetImage(color.image_id);
+      Require(name, "captured target",
+              color.image_id && attachment != nullptr &&
+                  color.base_array_layer == 5 &&
+                  color.desc.info.data.address == target_address &&
+                  color.desc.info.data.size == target_size &&
+                  color.desc.info.tile_mode == tile &&
+                  color.desc.info.extent == vk::Extent3D{256, 256, 1} &&
+                  color.desc.info.resources == ImageSubresources{1, 6} &&
+                  color.desc.info.pitch == pitch &&
+                  color.desc.info.mip_layout[0].offset == 0 &&
+                  color.desc.info.mip_layout[0].size == target_size &&
+                  color.desc.view_info.type == vk::ImageViewType::e2D &&
+                  color.desc.view_info.base_layer == 5 &&
+                  color.desc.view_info.layer_count == 1 &&
+                  (target_address & 0xffffu) == 0x4000 &&
+                  image.usage.render_target && image.IsGpuModified(),
+              "slice 5 Standard4KB render target was not resolved");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "Standard4KB color mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "Standard4KB color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorDepthTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorDepthTile";
     constexpr uintptr_t base = 0x0000000203d00000ull;
@@ -21177,6 +21280,11 @@ int main(int argc, char **argv) {
     CheckStandard64RenderTargetTileRoundTrip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--standard4-rt-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorColorStandard4TileDiscovery();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledColorViews();
@@ -21286,6 +21394,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
+  vulkan.CheckRenderExecutorColorStandard4TileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();

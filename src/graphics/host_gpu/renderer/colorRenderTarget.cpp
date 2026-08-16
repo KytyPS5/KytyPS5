@@ -130,12 +130,15 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	if (volume && samples != 1) {
 		EXIT("multisampled 3D render targets are unsupported\n");
 	}
-	const uint32_t depth      = volume ? rt.attrib3.depth + 1u : 1u;
-	const bool     standard64 = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
-	const bool     depth_tile = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const uint32_t depth        = volume ? rt.attrib3.depth + 1u : 1u;
+	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
+	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const bool     texture_tile = standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:
 		case Prospero::TileMode::kRenderTarget:
@@ -149,8 +152,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	if (samples > 1 && (!tile || levels != 1)) {
 		EXIT("multisampled render targets require a single-mip tiled surface\n");
 	}
-	if (depth_tile && samples != 1) {
-		EXIT("depth-tiled color render targets do not support multisampling\n");
+	if (texture_tile && samples != 1) {
+		EXIT("texture-tiled color render targets do not support multisampling\n");
 	}
 
 	width  = rt.attrib2.width + 1;
@@ -162,15 +165,17 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		EXIT("render-target format has no valid element size\n");
 	}
 	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
-	if ((standard64 || depth_tile) &&
-	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || view.base_layer != 0 ||
-	     view.image_layers != 1 || samples != 1 || rt.pitch.pitch_div8_minus1 != 0 ||
-	     (rt.base.addr & 0xffffu) != 0 || rt.info.fmask_compression_enable ||
-	     rt.info.fmask_data_compression_disable || rt.info.fmask_one_frag_mode ||
-	     rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable ||
-	     rt.info.cmask_is_linear != 0 || rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode ||
-	     rt.cmask.addr != 0 || rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 ||
-	     rt.dcc.data_write_on_dcc_clear_to_reg)) {
+	TileTextureBlockLayout texture_tile_layout {};
+	if (texture_tile &&
+	    (!TileGetTextureBlockLayout(transfer_format, rt.attrib3.tile_mode, volume,
+	                                texture_tile_layout) ||
+	     rt.pitch.pitch_div8_minus1 != 0 ||
+	     (rt.base.addr & (texture_tile_layout.block.block_size - 1u)) != 0 ||
+	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
+	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
+	     rt.info.dcc_compression_enable || rt.info.cmask_is_linear != 0 ||
+	     rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode || rt.cmask.addr != 0 ||
+	     rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
 		EXIT("unsupported texture-tiled render target: addr=0x%016" PRIx64 " tile=%u"
 		     " dimension=%u depth=%u levels=%u layer=%u/%u samples=%u fragments=%u bpe=%u"
 		     " cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
@@ -179,12 +184,18 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		     rt.attrib.num_fragments, bytes_per_element, rt.cmask.addr, rt.fmask.addr,
 		     rt.dcc_addr.addr);
 	}
+	if ((standard64 || depth_tile) && (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 ||
+	                                   view.base_layer != 0 || view.image_layers != 1)) {
+		EXIT("unsupported 64KB texture-tiled render-target view: dimension=%u depth=%u"
+		     " layer=%u/%u\n",
+		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
+	}
 	if (rt.pitch.pitch_div8_minus1 != 0) {
 		pitch = (rt.pitch.pitch_div8_minus1 + 1u) << 3u;
 	} else if (tile) {
 		if (volume) {
 			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
-		} else if (standard64 || depth_tile) {
+		} else if (texture_tile) {
 			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 		} else {
 			pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
@@ -218,10 +229,10 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	} else if (tile) {
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
-		if (standard64 || depth_tile) {
+		if (texture_tile) {
 			TileGetTextureSize(transfer_format, width, height, levels, rt.attrib3.tile_mode,
 			                   &layout, mip_sizes, mip_padded);
-			valid_layout = layout.size != 0 && layout.align == 65536;
+			valid_layout = layout.size != 0 && layout.align == texture_tile_layout.block.block_size;
 		} else {
 			valid_layout =
 			    levels == 1 ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element,

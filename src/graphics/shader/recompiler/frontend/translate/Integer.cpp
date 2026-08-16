@@ -548,12 +548,10 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			const auto count =
 			    IR::U32(ir.Emit(IR::ValueOpcode::UMin32,
 			                    {mask(ReadU32(inst.src[2]), 31u), ir.ISub(imm(32), offset)}));
-			if (inst.op == IR::Opcode::BitFieldExtract3I32) {
-				result =
-				    ir.BitwiseAnd(ir.ShiftRightArithmetic(source, offset), right_mask32(count));
-			} else {
-				result = ir.Emit(IR::ValueOpcode::BitFieldUExtract, {source, offset, count});
-			}
+			const auto opcode = inst.op == IR::Opcode::BitFieldExtract3I32
+			                        ? IR::ValueOpcode::BitFieldSExtract
+			                        : IR::ValueOpcode::BitFieldUExtract;
+			result            = ir.Emit(opcode, {source, offset, count});
 			break;
 		}
 		case IR::Opcode::BitFieldInsertSelectU32: {

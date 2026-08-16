@@ -12021,7 +12021,7 @@ TestCase VectorVop3IntegerOps() {
            0x3f3f3f3fu,
            0x3c3c3c38u,
            0x0fu,
-           0x0fu,
+           0xffffffffu,
            0x8b8b8b8bu,
            0x44556677u,
            0x00000f00u,
@@ -12044,27 +12044,29 @@ TestCase VectorVop3IntegerOps() {
            O::VSubI32,    O::VSubrevI32,  O::BufferStoreDword, O::SEndpgm}};
 }
 
-TestCase VectorBfeI32ArithmeticShiftMasksField() {
+TestCase VectorBfeI32SignExtendsField() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x80000000u);
-  AppendVMovLiteral(&code, 1, 0xfffffff8u);
-  AppendVMovU32(&code, 2, 31);
-  AppendVMovU32(&code, 3, 1);
-  AppendVMovU32(&code, 4, 3);
-  AppendVMovU32(&code, 5, 4);
+  for (u32 vgpr = 0; vgpr < 6; vgpr++) {
+    AppendVMovU32(&code, 30, vgpr * sizeof(u32));
+    AppendBufferLoadDword(&code, vgpr, 30);
+  }
   AppendVop3(&code, 0x149, 10, Vgpr(0), Vgpr(2), Vgpr(3));
   AppendVop3(&code, 0x149, 11, Vgpr(1), Vgpr(4), Vgpr(5));
   AppendStoreVgpr(&code, 10, 0);
   AppendStoreVgpr(&code, 11, 1);
   AppendEnd(&code);
 
-  return {"VectorBfeI32ArithmeticShiftMasksField",
-          code,
-          {},
-          {1, 0x0fu},
-          {O::VMovB32, O::VBfeI32, O::BufferStoreDword, O::SEndpgm}};
+  TestCase test;
+  test.name = "VectorBfeI32SignExtendsField";
+  test.code = std::move(code);
+  test.initial = {0x80000000u, 0xfffffff8u, 31, 1, 3, 4};
+  test.expected = {0xffffffffu, 0xffffffffu};
+  test.opcodes = {O::VMovB32, O::BufferLoadDword, O::VBfeI32,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.required_spirv = {"OpBitFieldSExtract"};
+  return test;
 }
 
 TestCase VectorAlignByteUsesFiveBitByteOffset() {
@@ -17655,7 +17657,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3IntegerOps);
-  AddCase(VectorBfeI32ArithmeticShiftMasksField);
+  AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorAlignByteUsesFiveBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);

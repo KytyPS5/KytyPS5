@@ -811,7 +811,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 		return false;
 	}
 
-	if (metadata.vertex_buffer_reg >= 0) {
+	if (metadata.vertex_attrib_reg >= 0) {
 		info.fetch_external   = false;
 		info.fetch_embedded   = true;
 		info.fetch_attrib_reg = metadata.vertex_attrib_reg;

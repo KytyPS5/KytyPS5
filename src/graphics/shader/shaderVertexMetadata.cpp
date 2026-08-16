@@ -56,16 +56,21 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 		}
 	}
 
-	const bool embedded = next.vertex_buffer_reg >= 0 || next.vertex_attrib_reg >= 0;
-	if (!embedded) {
+	if (next.vertex_attrib_reg >= 0 && next.vertex_buffer_reg < 0) {
+		return Fail(error, "vertex attribute table requires a vertex buffer table");
+	}
+	if (next.vertex_buffer_reg < 0) {
 		metadata = next;
 		return true;
 	}
-	if (next.vertex_buffer_reg < 0 || next.vertex_attrib_reg < 0) {
-		return Fail(error, "vertex buffer and attribute tables must be supplied together");
+	if (static_cast<uint32_t>(next.vertex_buffer_reg) + 1u >= max_user_sgprs) {
+		return Fail(error, "vertex table pointer exceeds the user-SGPR domain");
 	}
-	if (static_cast<uint32_t>(next.vertex_buffer_reg) + 1u >= max_user_sgprs ||
-	    static_cast<uint32_t>(next.vertex_attrib_reg) + 1u >= max_user_sgprs) {
+	if (next.vertex_attrib_reg < 0) {
+		metadata = next;
+		return true;
+	}
+	if (static_cast<uint32_t>(next.vertex_attrib_reg) + 1u >= max_user_sgprs) {
 		return Fail(error, "vertex table pointer exceeds the user-SGPR domain");
 	}
 	if (data.num_input_semantics == 0 ||

@@ -94,7 +94,7 @@ Value RawRead(Fixture &fixture, Value address, Value offset, uint32_t memory,
 
 void TestImmediateFlatteningAndGvn() {
   Fixture fixture;
-  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, 0x20);
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
   const auto first = RawRead(
       fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
   const auto second = RawRead(
@@ -119,9 +119,53 @@ void TestImmediateFlatteningAndGvn() {
         "flattened SRT did not evaluate its canonical read once");
 }
 
+void TestRawScalarComponentAlignment() {
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 2);
+  const auto read = RawRead(
+      fixture, Address(fixture, Value(0x1003u), Value(0u)), Value(2u), memory);
+  fixture.Emit(ValueOpcode::GetBufferResource,
+               {read, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+
+  TestMemory memory_image{{{0x1000u, 0x12345678u}}};
+  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
+  std::vector<uint32_t> flat;
+  std::string error;
+  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
+  Check(flat == std::vector<uint32_t>{0x12345678u} &&
+            memory_image.reads == 1,
+        "raw scalar base, immediate, and offset were not aligned independently");
+}
+
+void TestScalarMemoryDomainMismatchFails() {
+  Fixture raw;
+  const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
+  RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u),
+          raw_memory);
+  std::string error;
+  Check(!BuildSrtPlan(raw.program, &error) &&
+            error.find("incompatible scalar memory metadata") !=
+                std::string::npos,
+        "raw scalar load accepted descriptor-buffer metadata");
+
+  Fixture buffer;
+  const auto buffer_memory = buffer.AddMemory(ResourceKind::ScalarAddress);
+  const auto resource = buffer.Emit(ValueOpcode::GetBufferResource,
+                                    {Value(0x1000u), Value(0u), Value(16u),
+                                     Value(0u)});
+  buffer.EmitMemory(ValueOpcode::ReadConstBuffer,
+                    {resource, Value(0u)}, buffer_memory);
+  error.clear();
+  Check(!BuildSrtPlan(buffer.program, &error) &&
+            error.find("incompatible scalar memory metadata") !=
+                std::string::npos,
+        "descriptor scalar load accepted raw-address metadata");
+}
+
 void TestDynamicReadRemainsTyped() {
   Fixture fixture;
-  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
   const auto offset = fixture.Emit(ValueOpcode::GetUserData,
                                    {Value(static_cast<ScalarReg>(2))});
   const auto read = RawRead(
@@ -137,7 +181,7 @@ void TestDynamicReadRemainsTyped() {
 
 void TestNestedSrtWalk() {
   Fixture fixture;
-  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
   const auto pointer = RawRead(
       fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
   const auto value =
@@ -242,7 +286,7 @@ void TestInvariantAndDivergentPhi() {
 
 void TestControlDependentStandaloneLoadStaysTyped() {
   Fixture fixture(3);
-  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
   auto &base = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi);
   base.SetFlags(Type::U32);
   base.AddPhiOperand(&fixture.BlockAt(0), Value(0x1000u));
@@ -390,6 +434,8 @@ void DbgExit(int) { std::abort(); }
 int main() {
   try {
     TestImmediateFlatteningAndGvn();
+    TestRawScalarComponentAlignment();
+    TestScalarMemoryDomainMismatchFails();
     TestDynamicReadRemainsTyped();
     TestNestedSrtWalk();
     TestShaderBaseAndUserData();

@@ -102,8 +102,12 @@ uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t ad
 
 uint32_t AddressByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                             uint32_t low, uint32_t high) {
-	auto&      state          = ctx.state;
-	const auto immediate      = static_cast<int32_t>(mem.offset);
+	auto& state     = ctx.state;
+	auto  immediate = static_cast<int32_t>(mem.offset);
+	if (mem.kind == IR::ResourceKind::ScalarAddress) {
+		immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
+		low       = Binary(state, OpBitwiseAnd, state.uint_type, low, ConstantU32(state, ~3u));
+	}
 	const auto immediate_low  = ConstantU32(state, static_cast<uint32_t>(immediate));
 	const auto immediate_high = ConstantU32(state, immediate < 0 ? UINT32_MAX : 0u);
 	const auto base           = state.program.info.addresses[mem.resource].specialized_base;
@@ -137,11 +141,7 @@ uint32_t AddressByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const I
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	if (mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) {
-		if (mem.kind == IR::ResourceKind::ScalarBuffer) {
-			return Binary(ctx.state, OpIAdd, ctx.state.uint_type, ctx.Arg(inst, 1),
-			              ConstantU32(ctx.state, mem.offset));
-		}
+	if (mem.kind == IR::ResourceKind::Buffer) {
 		return BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
 		                         ctx.Arg(inst, 3));
 	}

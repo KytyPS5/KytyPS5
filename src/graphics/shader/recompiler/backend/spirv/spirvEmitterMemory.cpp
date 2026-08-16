@@ -302,9 +302,9 @@ uint32_t EmitBufferByteAddress(EmitterState& state, const IR::Instruction& inst,
 	return EmitBufferAddressFromParts(state, inst, index, offset, soffset);
 }
 
-bool IsFlatMemoryKind(IR::ResourceKind kind) {
-	return kind == IR::ResourceKind::Flat || kind == IR::ResourceKind::Global ||
-	       kind == IR::ResourceKind::Scratch;
+bool IsAddressMemoryKind(IR::ResourceKind kind) {
+	return kind == IR::ResourceKind::ScalarAddress || kind == IR::ResourceKind::Flat ||
+	       kind == IR::ResourceKind::Global || kind == IR::ResourceKind::Scratch;
 }
 
 uint32_t EmitRelativeAddress(EmitterState& state, const IR::Instruction& inst, uint32_t first_src,
@@ -423,7 +423,7 @@ StorageBufferBindingForMemory(EmitterState& state, const IR::MemoryInfo& mem, ui
 
 uint32_t EmitStorageBufferIndex(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
                                 uint32_t use_pc) {
-	if (IsFlatMemoryKind(mem.kind)) {
+	if (IsAddressMemoryKind(mem.kind)) {
 		return index;
 	}
 	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
@@ -432,7 +432,7 @@ uint32_t EmitStorageBufferIndex(EmitterState& state, const IR::MemoryInfo& mem, 
 
 uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInfo& mem,
                                         uint32_t use_pc) {
-	if (IsFlatMemoryKind(mem.kind)) {
+	if (IsAddressMemoryKind(mem.kind)) {
 		if (state.address_memory_variable == 0) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
 			                             mem.resource, "address memory binding was not emitted");
@@ -467,7 +467,7 @@ uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryI
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
                                          uint32_t index, uint32_t use_pc) {
 	index = EmitStorageBufferIndex(state, mem, index, use_pc);
-	if (IsFlatMemoryKind(mem.kind)) {
+	if (IsAddressMemoryKind(mem.kind)) {
 		if (state.address_memory_variable == 0) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
 			                             mem.resource, "address memory binding was not emitted");

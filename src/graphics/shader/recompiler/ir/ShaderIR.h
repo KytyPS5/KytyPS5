@@ -59,6 +59,7 @@ struct Operand {
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
+	ScalarAddress,
 	Buffer,
 	Flat,
 	Global,

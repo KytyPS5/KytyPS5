@@ -171,14 +171,14 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
     const auto pointer_address =
         fixture->Address(fixture->UserData(9), fixture->UserData(10), 0x10b0);
     MemoryInfo pointer_word;
-    pointer_word.kind = ResourceKind::ScalarBuffer;
+    pointer_word.kind = ResourceKind::ScalarAddress;
     const auto pointer =
         fixture->Emit(ValueOpcode::LoadAddressU32,
                       {pointer_address, Value(0u), Value(0u), Value(true)},
                       fixture->AddMemory(pointer_word, 0x10b0));
     const auto address = fixture->Address(pointer, Value(0u), 0x10c0);
     MemoryInfo descriptor_word;
-    descriptor_word.kind = ResourceKind::ScalarBuffer;
+    descriptor_word.kind = ResourceKind::ScalarAddress;
     material_words[0] =
         fixture->Emit(ValueOpcode::LoadAddressU32,
                       {address, Value(0u), Value(0u), Value(true)},
@@ -642,7 +642,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
   const auto base =
       fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
   MemoryInfo scalar;
-  scalar.kind = ResourceKind::ScalarBuffer;
+  scalar.kind = ResourceKind::ScalarAddress;
   scalar.offset = 4;
   const auto read0 = fixture.Emit(ValueOpcode::LoadAddressU32,
                                   {base, Value(0u), Value(0u), Value(true)},
@@ -710,7 +710,7 @@ void TestDynamicSrtReadRemainsExplicit() {
   const auto base =
       fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
   MemoryInfo scalar;
-  scalar.kind = ResourceKind::ScalarBuffer;
+  scalar.kind = ResourceKind::ScalarAddress;
   const auto read =
       fixture.Emit(ValueOpcode::LoadAddressU32,
                    {base, fixture.UserData(2), Value(0u), Value(true)},

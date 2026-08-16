@@ -724,7 +724,7 @@ private:
 	uint32_t AddAddress(uint32_t source, bool unbased, const MemoryInfo& memory, ValueOpcode op,
 	                    uint32_t pc) {
 		auto immediate = static_cast<int32_t>(memory.offset);
-		if (memory.kind == ResourceKind::ScalarBuffer) {
+		if (memory.kind == ResourceKind::ScalarAddress) {
 			immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
 		}
 		const auto min_offset = unbased ? 0 : std::min(immediate, 0);

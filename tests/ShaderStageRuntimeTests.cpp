@@ -42,7 +42,7 @@ SrtProgram(uint64_t address) {
   auto &value_block = AddValueBlock(program);
 
   MemoryInfo memory;
-  memory.kind = ResourceKind::ScalarBuffer;
+  memory.kind = ResourceKind::ScalarAddress;
   memory.planning_only = true;
   program.values->memory_info.push_back(memory);
   const auto low = Value(static_cast<uint32_t>(address));

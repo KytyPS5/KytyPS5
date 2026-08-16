@@ -74,6 +74,7 @@ std::string OperandToString(const Operand& operand) {
 std::string ResourceKindToString(ResourceKind kind) {
 	switch (kind) {
 		case ResourceKind::ScalarBuffer: return "scalar_buffer";
+		case ResourceKind::ScalarAddress: return "scalar_address";
 		case ResourceKind::Buffer: return "buffer";
 		case ResourceKind::Flat: return "flat";
 		case ResourceKind::Global: return "global";

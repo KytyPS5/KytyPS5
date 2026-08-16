@@ -50,13 +50,17 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 }
 
 bool IsRawRead(const ValueProgram& values, const Inst& inst) {
-	if (inst.GetOpcode() != ValueOpcode::LoadAddressU32 &&
-	    inst.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+	const auto op = inst.GetOpcode();
+	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
 		return false;
 	}
 	const auto index = inst.Flags<MemoryFlags>().index;
-	return index < values.memory_info.size() &&
-	       values.memory_info[index].kind == ResourceKind::ScalarBuffer;
+	if (index >= values.memory_info.size()) {
+		return false;
+	}
+	const auto kind = values.memory_info[index].kind;
+	return (op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
+	       (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
 }
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
@@ -262,6 +266,22 @@ public:
 		m_values.dynamic_reads.clear();
 		for (auto* block: m_values.blocks) {
 			for (auto& inst: *block) {
+				const auto op = inst.GetOpcode();
+				if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+					const auto flags = inst.Flags<MemoryFlags>();
+					if (flags.index < m_values.memory_info.size()) {
+						const auto kind       = m_values.memory_info[flags.index].kind;
+						const bool crosswired = (op == ValueOpcode::LoadAddressU32 &&
+						                         kind == ResourceKind::ScalarBuffer) ||
+						                        (op == ValueOpcode::ReadConstBuffer &&
+						                         kind == ResourceKind::ScalarAddress);
+						if (crosswired) {
+							return Fail(flags.pc, error,
+							            fmt::format("{} has incompatible scalar memory metadata",
+							                        ValueOpcodeName(op)));
+						}
+					}
+				}
 				if (IsDescriptorHandle(inst.GetOpcode())) {
 					for (size_t index = 0; index < inst.NumArgs(); index++) {
 						if (!Collect(inst.Arg(index), 0, error)) {

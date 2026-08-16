@@ -3582,6 +3582,132 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerScalarMemoryBindingDomains() {
+  const auto count_live_memory_ops =
+      [](const ShaderRecompiler::IR::Program &program,
+         ShaderRecompiler::IR::ValueOpcode opcode,
+         ShaderRecompiler::IR::ResourceKind kind) {
+        size_t count = 0;
+        for (const auto *block : program.values->blocks) {
+          for (const auto &inst : *block) {
+            if (inst.GetOpcode() != opcode) {
+              continue;
+            }
+            const auto index =
+                inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+            Check(index < program.values->memory_info.size(),
+                  "typed scalar memory operation has invalid metadata");
+            const auto &memory = program.values->memory_info[index];
+            Check(memory.kind == kind && memory.resource == 0u &&
+                      !memory.planning_only,
+                  "typed scalar memory operation has the wrong live domain");
+            count++;
+          }
+        }
+        return count;
+      };
+
+  const uint32_t raw_shader[] = {
+      EncodeSmem0(0x00, 12, 4),
+      2u, // s_load_dword s12, s[8:9], s0 offset:2
+      EncodeVop1(0x01, 0, 12),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> raw_user_data{};
+  raw_user_data[0] = 2u;
+  raw_user_data[8] = 0x1003u;
+
+  ShaderRecompiler::CompileOptions raw_options;
+  raw_options.stage = ShaderType::Pixel;
+  raw_options.user_data = raw_user_data.data();
+  raw_options.user_data_count = static_cast<uint32_t>(raw_user_data.size());
+
+  ShaderRecompiler::CompileResult raw;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(raw_shader, raw_options, raw, &error),
+        error.c_str());
+  const auto *address_binding = ShaderRecompiler::IR::FindBinding(
+      raw.program.bindings,
+      ShaderRecompiler::IR::DescriptorBindingKind::AddressMemory);
+  Check(raw.program.info.addresses.size() == 1u &&
+            raw.program.info.addresses[0].kind ==
+                ShaderRecompiler::IR::ResourceKind::ScalarAddress &&
+            raw.program.info.addresses[0].read &&
+            !raw.program.info.addresses[0].written &&
+            raw.program.info.buffers.empty() && address_binding != nullptr &&
+            address_binding->resources == std::vector<uint32_t>{0u} &&
+            ShaderRecompiler::IR::FindBinding(
+                raw.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::Buffers) == nullptr &&
+            ShaderRecompiler::IR::FindBinding(
+                raw.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
+                nullptr &&
+            raw.program.bindings.buffer_offset_count == 0u,
+        "raw scalar load did not use only the address-memory domain");
+  Check(count_live_memory_ops(
+            raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
+            ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 1u,
+        "raw scalar load did not remain a live typed address operation");
+  Check(raw.resources.addresses.size() == 1u &&
+            raw.resources.addresses[0].guest_base == 0x1000u &&
+            raw.resources.addresses[0].binding_base == 0x1000u &&
+            raw.program.info.addresses[0].specialized_base == 0u,
+        "raw scalar address specialization was incorrect");
+  Check(SpirvContainsOpcode(raw.spirv, 199),
+        "raw scalar SOFFSET alignment was not emitted");
+  CheckSpirvBinaryValidates(raw.spirv);
+
+  const uint32_t buffer_shader[] = {
+      EncodeSmem0(0x08, 12, 4),
+      0u, // s_buffer_load_dword s12, s[8:11], s0
+      EncodeVop1(0x01, 0, 12),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> buffer_user_data{};
+  buffer_user_data[8] = 0x2000u;
+  buffer_user_data[10] = 4u;
+
+  ShaderRecompiler::CompileOptions buffer_options;
+  buffer_options.stage = ShaderType::Pixel;
+  buffer_options.user_data = buffer_user_data.data();
+  buffer_options.user_data_count =
+      static_cast<uint32_t>(buffer_user_data.size());
+
+  ShaderRecompiler::CompileResult buffer;
+  error.clear();
+  Check(ShaderRecompiler::TryRecompile(buffer_shader, buffer_options, buffer,
+                                       &error),
+        error.c_str());
+  const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
+      buffer.program.bindings,
+      ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+  Check(buffer.program.info.buffers.size() == 1u &&
+            buffer.program.info.buffers[0].scalar &&
+            buffer.program.info.addresses.empty() && buffer_binding != nullptr &&
+            buffer_binding->resources == std::vector<uint32_t>{0u} &&
+            ShaderRecompiler::IR::FindBinding(
+                buffer.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::AddressMemory) ==
+                nullptr &&
+            ShaderRecompiler::IR::FindBinding(
+                buffer.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
+                nullptr &&
+            buffer.program.bindings.buffer_offset_count == 1u,
+        "descriptor scalar load did not use only the buffer domain");
+  Check(count_live_memory_ops(
+            buffer.program,
+            ShaderRecompiler::IR::ValueOpcode::ReadConstBuffer,
+            ShaderRecompiler::IR::ResourceKind::ScalarBuffer) == 1u,
+        "descriptor scalar load did not remain a live typed buffer operation");
+  CheckSpirvBinaryValidates(buffer.spirv);
+}
+
 void TestNewShaderRecompilerImageQueryLowering() {
   const uint32_t shader[] = {
       EncodeMimg0(0x60, 0x3),
@@ -9014,6 +9140,7 @@ int main() {
   TestNormalizedImageContracts();
   TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized direct SPIR-V are exercised by
   // ShaderRecompilerComputeTests. The pre-SSA register-IR shape checks above
   // remain as historical decoder fixtures only.

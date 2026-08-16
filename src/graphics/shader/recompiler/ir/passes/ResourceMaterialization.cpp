@@ -559,7 +559,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			auto       base  = (static_cast<uint64_t>(value.dwords[0]) |
 			                    static_cast<uint64_t>(value.dwords[1]) << 32u) &
 			                   AddressMask;
-			if (address.kind == ResourceKind::ScalarBuffer) {
+			if (address.kind == ResourceKind::ScalarAddress) {
 				base &= ~uint64_t {3};
 			}
 			const auto before = static_cast<uint64_t>(-static_cast<int64_t>(address.min_offset));

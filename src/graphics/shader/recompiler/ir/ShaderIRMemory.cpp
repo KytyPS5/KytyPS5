@@ -75,14 +75,16 @@ Opcode LoweredImageOpcode(Decoder::Opcode opcode) {
 	}
 }
 
-bool LowerScalarBufferLoadDword(const Decoder::Instruction& decoded, BasicBlock& block, Opcode op,
+bool LowerScalarMemoryLoadDword(const Decoder::Instruction& decoded, BasicBlock& block, Opcode op,
                                 std::string* error) {
 	for (uint32_t i = 0; i < decoded.data_dwords; i++) {
 		Instruction inst;
 		inst.pc        = decoded.pc;
 		inst.op        = op;
 		inst.src_count = 1;
-		inst.memory    = OffsetMemoryInfo(decoded, ResourceKind::ScalarBuffer, i);
+		const auto kind =
+		    op == Opcode::SLoadDword ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+		inst.memory = OffsetMemoryInfo(decoded, kind, i);
 		// Raw s_load uses a two-SGPR pointer base; s_buffer_load uses a four-SGPR
 		// descriptor resource index.
 		inst.memory.resource = op == Opcode::SLoadDword ? RawScalarLoadBase(decoded.src0)
@@ -511,13 +513,13 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 		case Decoder::Opcode::SLoadDwordx4:
 		case Decoder::Opcode::SLoadDwordx8:
 		case Decoder::Opcode::SLoadDwordx16:
-			return LowerScalarBufferLoadDword(decoded, block, Opcode::SLoadDword, error);
+			return LowerScalarMemoryLoadDword(decoded, block, Opcode::SLoadDword, error);
 		case Decoder::Opcode::SBufferLoadDword:
 		case Decoder::Opcode::SBufferLoadDwordx2:
 		case Decoder::Opcode::SBufferLoadDwordx4:
 		case Decoder::Opcode::SBufferLoadDwordx8:
 		case Decoder::Opcode::SBufferLoadDwordx16:
-			return LowerScalarBufferLoadDword(decoded, block, Opcode::SBufferLoadDword, error);
+			return LowerScalarMemoryLoadDword(decoded, block, Opcode::SBufferLoadDword, error);
 		case Decoder::Opcode::BufferLoadUbyte:
 		case Decoder::Opcode::BufferLoadSbyte:
 		case Decoder::Opcode::BufferLoadUshort:

@@ -18703,6 +18703,11 @@ ShaderTextureResource Ppsa01530MaxMipStorageTextureDescriptor() {
            0x00700050u, 0x00000000u, 0x00000000u}};
 }
 
+ShaderTextureResource Ppsa01340MipRangeStorageTextureDescriptor() {
+  return {{0x0294dc00u, 0xc4700000u, 0x00b3c13fu, 0x91b31facu, 0x00000000u,
+           0x00700030u, 0xb07b0000u, 0x0002ac3cu}};
+}
+
 ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
   auto resource = BasicBgraStorageTextureResource();
   resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
@@ -18840,6 +18845,9 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
         (static_cast<uint32_t>(Prospero::TileMode::kStandard256B) << 20u);
   } else if (std::strcmp(kind, "mip") == 0) {
     descriptor.fields[3] |= 1u << 16u;
+  } else if (std::strcmp(kind, "inverted-mip-range") == 0) {
+    descriptor.fields[3] |= 1u << 12u;
+    descriptor.fields[5] |= 1u << 4u;
   } else if (std::strcmp(kind, "swizzle") == 0) {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~0xfffu) | DstSel(4, 5, 6, 1);
@@ -18962,6 +18970,22 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA01530 mip-one storage descriptor fixture is malformed");
   ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one,
                          0x20000);
+
+  const auto mip_range = Ppsa01340MipRangeStorageTextureDescriptor();
+  Require("BasicStorageTexture", "PPSA01340 mip-range descriptor",
+          mip_range.Base40() == 0x294dc0000ull &&
+              mip_range.Width5() + 1u == 1280 &&
+              mip_range.Height5() + 1u == 720 &&
+              mip_range.Depth() + 1u == 1 &&
+              mip_range.BaseLevel() == 1 && mip_range.LastLevel() == 3 &&
+              mip_range.MaxMip() == 3 &&
+              mip_range.Format() ==
+                  Prospero::BufferFormat::k16_16_16_16Float &&
+              mip_range.TileMode() == Prospero::TileMode::kRenderTarget &&
+              mip_range.DstSelXYZW() == DstSel(4, 5, 6, 7),
+          "PPSA01340 mip-range storage descriptor fixture is malformed");
+  ValidateStorageTexture(BasicBgraStorageTextureResource(), mip_range,
+                         0xa30000);
 
   const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA02527 R16F descriptor",
@@ -19259,7 +19283,8 @@ void CheckBasicStorageTextureDescriptor() {
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
           "GetModuleFileName failed");
   for (const char *kind :
-       {"resource", "type", "standard256b-volume", "mip", "swizzle",
+       {"resource", "type", "standard256b-volume", "mip",
+        "inverted-mip-range", "swizzle",
         "linear-rgb1-read", "bgra-read", "r16-float-read", "r8-unorm-read",
         "yzwx-read", "reserved-swizzle", "array-base-out-of-range", "reserved",
         "uint-format", "uint-resource-float-format", "atomic-format",

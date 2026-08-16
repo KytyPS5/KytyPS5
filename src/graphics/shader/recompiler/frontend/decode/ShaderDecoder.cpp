@@ -944,6 +944,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VInterpMovF32: return "v_interp_mov_f32";
 		case Opcode::SNop: return "s_nop";
 		case Opcode::SWaitcnt: return "s_waitcnt";
+		case Opcode::SWaitcntDepctr: return "s_waitcnt_depctr";
 		case Opcode::SBarrier: return "s_barrier";
 		case Opcode::SBranch: return "s_branch";
 		case Opcode::SCbranchScc0: return "s_cbranch_scc0";
@@ -1058,6 +1059,7 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src1).c_str()));
 		case Opcode::SNop:
 		case Opcode::SWaitcnt:
+		case Opcode::SWaitcntDepctr:
 		case Opcode::SSleep:
 		case Opcode::STrap:
 		case Opcode::SSendmsg:

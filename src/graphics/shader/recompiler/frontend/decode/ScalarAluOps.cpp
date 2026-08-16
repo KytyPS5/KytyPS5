@@ -60,12 +60,15 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
 };
 
 constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
-    {0x00u, Opcode::SNop},          {0x01u, Opcode::SEndpgm},       {0x02u, Opcode::SBranch},
-    {0x04u, Opcode::SCbranchScc0},  {0x05u, Opcode::SCbranchScc1},  {0x06u, Opcode::SCbranchVccz},
-    {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
-    {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
-    {0x10u, Opcode::SSendmsg},      {0x12u, Opcode::STrap},         {0x16u, Opcode::STtraceData},
-    {0x20u, Opcode::SInstPrefetch},
+    {0x00u, Opcode::SNop},           {0x01u, Opcode::SEndpgm},
+    {0x02u, Opcode::SBranch},        {0x04u, Opcode::SCbranchScc0},
+    {0x05u, Opcode::SCbranchScc1},   {0x06u, Opcode::SCbranchVccz},
+    {0x07u, Opcode::SCbranchVccnz},  {0x08u, Opcode::SCbranchExecz},
+    {0x09u, Opcode::SCbranchExecnz}, {0x0au, Opcode::SBarrier},
+    {0x0cu, Opcode::SWaitcnt},       {0x0eu, Opcode::SSleep},
+    {0x10u, Opcode::SSendmsg},       {0x12u, Opcode::STrap},
+    {0x16u, Opcode::STtraceData},    {0x20u, Opcode::SInstPrefetch},
+    {0x23u, Opcode::SWaitcntDepctr},
 };
 
 constexpr auto SOP1_OPS = Detail::MakeOpcodeTable<0x100>(SOP1_OPCODE_LIST);
@@ -252,14 +255,14 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.src0.signed_val = inst.opcode == Opcode::STrap
 	                           ? static_cast<int32_t>(inst.src0.value)
 	                           : static_cast<int32_t>(static_cast<int16_t>(simm));
-	inst.src_count       = (inst.opcode == Opcode::SNop || inst.opcode == Opcode::SWaitcnt ||
-	                        inst.opcode == Opcode::SSleep || inst.opcode == Opcode::SSendmsg ||
-	                        inst.opcode == Opcode::STrap || inst.opcode == Opcode::STtraceData ||
-	                        inst.opcode == Opcode::SInstPrefetch)
-	                           ? 1
-	                           : 0;
-	inst.branch_offset   = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;
-	inst.branch_target   = pc + 4u + static_cast<uint32_t>(inst.branch_offset);
+	inst.src_count = (inst.opcode == Opcode::SNop || inst.opcode == Opcode::SWaitcnt ||
+	                  inst.opcode == Opcode::SWaitcntDepctr || inst.opcode == Opcode::SSleep ||
+	                  inst.opcode == Opcode::SSendmsg || inst.opcode == Opcode::STrap ||
+	                  inst.opcode == Opcode::STtraceData || inst.opcode == Opcode::SInstPrefetch)
+	                     ? 1
+	                     : 0;
+	inst.branch_offset = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;
+	inst.branch_target = pc + 4u + static_cast<uint32_t>(inst.branch_offset);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::Unsupported) {

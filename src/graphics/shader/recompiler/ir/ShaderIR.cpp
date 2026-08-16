@@ -992,6 +992,7 @@ bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& bl
 		case Decoder::Opcode::SNop:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
 		case Decoder::Opcode::SWaitcnt:
+		case Decoder::Opcode::SWaitcntDepctr:
 			return LowerControlMarker(decoded, block, Opcode::Waitcnt, true, error);
 		case Decoder::Opcode::SBarrier:
 			return LowerControlMarker(decoded, block, Opcode::Barrier, false, error);
@@ -1075,6 +1076,7 @@ bool IsControlOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::SNop:
 		case Decoder::Opcode::SWaitcnt:
+		case Decoder::Opcode::SWaitcntDepctr:
 		case Decoder::Opcode::SBarrier:
 		case Decoder::Opcode::SSendmsg:
 		case Decoder::Opcode::SSetregB32:

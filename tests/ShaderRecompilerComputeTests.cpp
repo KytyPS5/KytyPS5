@@ -863,6 +863,7 @@ struct TestCase {
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
+  std::vector<std::pair<std::string, size_t>> native_ir_counts;
   u32 expected_storage_mip_descriptors = 0;
 };
 
@@ -1086,6 +1087,32 @@ CompiledShader CompileCase(const TestCase &test) {
     Require(test.name, "typed IR", actual == expected,
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
+  }
+  if (!test.native_ir_counts.empty()) {
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::CFG::Graph cfg;
+    ShaderRecompiler::IR::Program native;
+    std::string native_error;
+    Require(test.name, "native decode",
+            ShaderRecompiler::Decoder::DecodeProgram(test.code, decoded,
+                                                     &native_error),
+            native_error);
+    Require(test.name, "native CFG",
+            ShaderRecompiler::CFG::BuildGraph(decoded, cfg, &native_error) &&
+                ShaderRecompiler::CFG::Structurize(cfg, &native_error),
+            native_error);
+    Require(test.name, "native lowering",
+            ShaderRecompiler::IR::LowerProgram(decoded, cfg, options.stage,
+                                               options.wave_size, native,
+                                               &native_error),
+            native_error);
+    const auto native_ir = ShaderRecompiler::IR::ProgramToString(native);
+    for (const auto &[text, expected] : test.native_ir_counts) {
+      const auto actual = CountText(native_ir, text);
+      Require(test.name, "native IR", actual == expected,
+              text + " count=" + std::to_string(actual) +
+                  ", expected=" + std::to_string(expected));
+    }
   }
   if (test.expected_storage_mip_descriptors != 0) {
     const auto image = std::ranges::find_if(
@@ -10877,6 +10904,31 @@ TestCase ScalarTrapDisabledFallsThroughExactRaw() {
   return test;
 }
 
+TestCase ScalarWaitcntDepctrCapturedVmVsrc() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 7, 7);
+  AppendVMovU32(&code, 31, 0);
+  AppendBufferStoreDword(&code, 7, 31);
+  code.push_back(0xbfa3ffe3u); // s_waitcnt_depctr vm_vsrc(0)
+  AppendVMovU32(&code, 7, 42);
+  AppendStoreVgpr(&code, 7, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarWaitcntDepctrCapturedVmVsrc";
+  test.code = std::move(code);
+  test.initial = {0, 0};
+  test.expected = {7, 42};
+  test.opcodes = {O::VMovB32, O::BufferStoreDword, O::SWaitcntDepctr,
+                  O::SEndpgm};
+  test.decoded_counts = {{"0x00000010: s_waitcnt_depctr 0x0000ffe3\n", 1}};
+  test.native_ir_counts = {{"0x00000010: Waitcnt null, 0x0000ffe3", 1}};
+  test.forbidden_spirv = {"OpControlBarrier", "OpMemoryBarrier"};
+  return test;
+}
+
 TestCase ScalarExtendedArithmetic() {
   using O = ShaderOpcode;
 
@@ -17569,6 +17621,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarShiftCountsMaskLowBits);
   AddCase(Rdna2ScalarOpcodes);
   AddCase(ScalarTrapDisabledFallsThroughExactRaw);
+  AddCase(ScalarWaitcntDepctrCapturedVmVsrc);
   AddCase(ScalarExtendedArithmetic);
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);
@@ -21044,6 +21097,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--waitcnt-depctr-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarWaitcntDepctrCapturedVmVsrc());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sff1-b64-only") == 0) {

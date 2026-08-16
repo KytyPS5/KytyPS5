@@ -531,6 +531,7 @@ enum class Opcode {
 
 	SNop,
 	SWaitcnt,
+	SWaitcntDepctr,
 	SBarrier,
 	SBranch,
 	SCbranchScc0,

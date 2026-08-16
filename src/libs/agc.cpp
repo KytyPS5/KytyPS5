@@ -1661,6 +1661,14 @@ int KYTY_SYSV_ABI GraphicsDriverRegisterResource() {
 	return static_cast<int>(0x8a6c9018u);
 }
 
+int KYTY_SYSV_ABI GraphicsDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
+	PRINT_NAME();
+
+	(void)owner_handle;
+
+	return static_cast<int>(0x8a6c9018u);
+}
+
 int KYTY_SYSV_ABI GraphicsDriverUnregisterResource() {
 	PRINT_NAME();
 

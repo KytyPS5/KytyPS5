@@ -190,6 +190,7 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("uJziRsODk1c", Gen5::GraphicsDriverGetResourceRegistrationMaxNameLength);
 	LIB_FUNC("X-Nm5KLREeg", Gen5::GraphicsDriverRegisterOwner);
 	LIB_FUNC("W5z4eZrjEas", Gen5::GraphicsDriverRegisterResource);
+	LIB_FUNC("ZLJk9r2+2Aw", Gen5::GraphicsDriverUnregisterOwnerAndResources);
 	LIB_FUNC("pWLG7WOpVcw", Gen5::GraphicsDriverUnregisterResource);
 	LIB_FUNC("3AyTaWcF-H8", Gen5::GraphicsDriverRegisterWorkloadStream);
 

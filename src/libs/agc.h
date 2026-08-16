@@ -86,6 +86,7 @@ uint32_t KYTY_SYSV_ABI
 GraphicsDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes);
 int KYTY_SYSV_ABI GraphicsDriverRegisterOwner();
 int KYTY_SYSV_ABI GraphicsDriverRegisterResource();
+int KYTY_SYSV_ABI GraphicsDriverUnregisterOwnerAndResources(uint32_t owner_handle);
 int KYTY_SYSV_ABI GraphicsDriverUnregisterResource();
 int KYTY_SYSV_ABI GraphicsDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream);
 

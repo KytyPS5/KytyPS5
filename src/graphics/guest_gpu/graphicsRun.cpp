@@ -495,6 +495,13 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 			default: return false;
 		}
 	};
+	if (dst_sel == 2) {
+		// kNowhere discards the GL2 prefetch destination without a guest-visible write.
+		if (src_sel != 3) {
+			EXIT("unsupported dmaData nowhere source selector 0x%02" PRIx8 "\n", src_sel);
+		}
+		return;
+	}
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);

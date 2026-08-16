@@ -2180,22 +2180,27 @@ public:
     constexpr uint64_t memory_copy_dst = fault_base + 0x6000;
     constexpr uint64_t memory_dst = fault_base + 0x8000;
     constexpr uint64_t l2_copy_dst = fault_base + 0xa000;
+    constexpr uint64_t nowhere_dst = fault_base + 0xc000;
     constexpr uint64_t clean_cached_fill = fault_base + 0x3000;
     constexpr uint64_t clean_cached_copy = fault_base + 0x3008;
     constexpr uint64_t clean_cached_source = fault_base + 0x3010;
     constexpr uint64_t clean_cached_readback = fault_base + 0xb000;
     constexpr std::array<uint32_t, 2> source_words{0x11223344u, 0x55667788u};
+    constexpr std::array<uint32_t, 2> nowhere_words{0x89abcdefu, 0x01234567u};
     constexpr std::array<uint32_t, 2> clean_copy_words{0x13579bdfu,
                                                        0x2468ace0u};
     std::memcpy(reinterpret_cast<void *>(memory_src), source_words.data(),
                 sizeof(source_words));
+    std::memcpy(reinterpret_cast<void *>(nowhere_dst), nowhere_words.data(),
+                sizeof(nowhere_words));
     std::memcpy(reinterpret_cast<void *>(clean_cached_source),
                 clean_copy_words.data(), sizeof(clean_copy_words));
 
-    std::array<uint32_t, 49> dma_commands{};
+    std::array<uint32_t, 56> dma_commands{};
     size_t dma_cursor = 0;
     const auto append_dma = [&](uint8_t dst_sel, uint64_t dst, uint8_t src_sel,
-                                uint64_t src, uint32_t bytes) {
+                                uint64_t src, uint32_t bytes,
+                                uint32_t command_flags = 0) {
       auto *packet = dma_commands.data() + dma_cursor;
       dma_cursor += 7;
       packet[0] = KYTY_PM4(7, Pm4::IT_DMA_DATA, 0);
@@ -2205,7 +2210,7 @@ public:
       packet[3] = static_cast<uint32_t>(src >> 32u);
       packet[4] = static_cast<uint32_t>(dst);
       packet[5] = static_cast<uint32_t>(dst >> 32u);
-      packet[6] = bytes;
+      packet[6] = bytes | command_flags;
     };
     constexpr uint64_t gds_immediate_offset = 0;
     constexpr uint64_t gds_memory_offset = 0x10;
@@ -2219,9 +2224,10 @@ public:
                sizeof(source_words));
     append_dma(0, memory_copy_dst, 0, memory_src, sizeof(source_words));
     append_dma(3, l2_copy_dst, 3, memory_src, sizeof(source_words));
+    append_dma(2, nowhere_dst, 3, nowhere_dst, sizeof(nowhere_words), 1u << 31u);
     Require("GpuCommandLane", "DMA_DATA packet assembly",
             dma_cursor == dma_commands.size(),
-            "DMA_DATA GDS packet stream has the wrong size");
+            "DMA_DATA packet stream has the wrong size");
     gpu.Submit(dma_commands.data(), static_cast<uint32_t>(dma_commands.size()),
                nullptr, 0);
     gpu.Done();
@@ -2231,9 +2237,12 @@ public:
       Require("GpuCommandLane", "clean cached setup",
               buffer_cache.IsRegionRegistered(clean_cached_fill,
                                               sizeof(source_words)) &&
+                  !buffer_cache.HasGpuDirtyBytes(nowhere_dst,
+                                                sizeof(nowhere_words)) &&
                   buffer_cache.HasGpuDirtyBytes(immediate_dst,
                                                 sizeof(source_words)),
-              "DMA did not establish a cached page with a dirty sibling");
+              "DMA prefetch modified ownership or did not establish a dirty "
+              "cached page");
 
       buffer_cache.FillBuffer(clean_cached_fill, sizeof(source_words),
                               clean_fill_value);
@@ -2312,6 +2321,10 @@ public:
             "memory-to-memory bytes do not match");
     Require("GpuCommandLane", "DMA_DATA L2 contents",
             l2_copy_words == source_words, "MemoryUsingL2 bytes do not match");
+    Require("GpuCommandLane", "DMA_DATA nowhere contents",
+            std::memcmp(reinterpret_cast<const void *>(nowhere_dst),
+                        nowhere_words.data(), sizeof(nowhere_words)) == 0,
+            "Nowhere destination modified guest memory");
     Require("GpuCommandLane", "clean cached DMA contents",
             clean_cached_words == std::array<uint32_t, 4>{clean_fill_value,
                                                           clean_fill_value,

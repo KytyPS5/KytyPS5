@@ -90,7 +90,13 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 			return Fail(error, "native shader plan has an invalid image class");
 		}
 		present[static_cast<size_t>(kind)] = true;
-		expected[static_cast<size_t>(kind)].push_back(i);
+		const auto dynamic = program.info.images[i].mip_mode == IR::ImageMipMode::DynamicStorage;
+		const auto count   = dynamic ? program.info.images[i].mip_count : 1u;
+		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
+			return Fail(error, "native shader plan has an invalid image mip descriptor count");
+		}
+		expected[static_cast<size_t>(kind)].insert(expected[static_cast<size_t>(kind)].end(), count,
+		                                           i);
 	}
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));

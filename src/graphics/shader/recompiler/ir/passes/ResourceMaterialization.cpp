@@ -72,6 +72,15 @@ bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	       Prospero::ImageType::kCube;
 }
 
+uint32_t StorageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
+	if (image.mip_mode != ImageMipMode::DynamicStorage || NullImageDescriptor(descriptor)) {
+		return 1;
+	}
+	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
+	const auto last = (descriptor.dwords[3] >> 16u) & 0xfu;
+	return base <= last ? last - base + 1u : 0u;
+}
+
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
 	if (descriptor.dword_count != std::size(result.fields)) {
 		return false;
@@ -201,6 +210,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto& image      = program.info.images[i];
 		const auto& descriptor = snapshot.images[i];
+		const auto  mip_count  = StorageMipCount(image, descriptor);
+		if (mip_count == 0u || mip_count != image.mip_count) {
+			if (error != nullptr) {
+				*error = fmt::format("storage image descriptor {} changed mip range", i);
+			}
+			return false;
+		}
 		if (NullImageDescriptor(descriptor)) {
 			bool canonical_kind =
 			    image.kind == ResourceKind::Image || image.kind == ResourceKind::StorageImage;
@@ -404,6 +420,13 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 	for (uint32_t i = 0; i < next.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = next.images[i];
+		image.mip_count        = StorageMipCount(image, descriptor);
+		if (image.mip_count == 0u) {
+			if (error != nullptr) {
+				*error = fmt::format("storage image descriptor {} has an invalid mip range", i);
+			}
+			return false;
+		}
 		if (NullImageDescriptor(descriptor)) {
 			image.dimension = Decoder::ImageDimension::Dim2D;
 			image.cube      = false;

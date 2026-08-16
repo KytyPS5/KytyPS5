@@ -329,6 +329,112 @@ void TestImagesSamplersAndAliases() {
         "buffer/image descriptor alias was not linked");
 }
 
+void TestDynamicStorageMipTracking() {
+  Fixture fixture;
+  std::array<Value, 8> image_words;
+  for (uint32_t index = 0; index < image_words.size(); index++) {
+    image_words[index] = fixture.UserData(index);
+  }
+  const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+                                 {Value(1u), Value(2u), Value(3u), Value(4u)});
+  const auto AddStore = [&](uint32_t pc, bool has_mip, Value lod) {
+    const auto handle = fixture.Image(image_words, pc);
+    const auto address = fixture.Emit(
+        ValueOpcode::MakeImageAddress,
+        {Value(0u), Value(0u), lod, Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    memory.image_address_components = has_mip ? 3u : 2u;
+    memory.image_has_mip = has_mip;
+    const auto flags = fixture.AddMemory(memory, pc);
+    fixture.Emit(ValueOpcode::ImageWrite, {handle, address, data, Value(true)},
+                 flags);
+    return std::pair{handle, flags.index};
+  };
+
+  const auto plain = AddStore(4, false, Value(0u));
+  const auto mip1 = AddStore(8, true, Value(1u));
+  const auto mip2 = AddStore(12, true, Value(2u));
+  const auto dynamic = AddStore(16, true, fixture.UserData(8));
+  fixture.PlanAndTrack();
+
+  const auto &images = fixture.program.info.images;
+  Check(images.size() == 2 && images[0].mip_mode == ImageMipMode::None &&
+            images[0].mip_count == 1 &&
+            images[1].mip_mode == ImageMipMode::DynamicStorage &&
+            images[1].mip_count == 1,
+        "storage mip writes did not share one dynamic logical resource");
+  Check(plain.first.Instruction()->Flags<uint32_t>() == 0 &&
+            mip1.first.Instruction()->Flags<uint32_t>() == 1 &&
+            mip2.first.Instruction()->Flags<uint32_t>() == 1 &&
+            dynamic.first.Instruction()->Flags<uint32_t>() == 1 &&
+            fixture.program.values->memory_info[plain.second].resource == 0 &&
+            fixture.program.values->memory_info[mip1.second].resource == 1 &&
+            fixture.program.values->memory_info[mip2.second].resource == 1 &&
+            fixture.program.values->memory_info[dynamic.second].resource == 1,
+        "dynamic storage mip handles and memory metadata were not patched");
+
+  DescriptorValue descriptor{};
+  descriptor.dwords[0] = 0x1000u;
+  descriptor.dwords[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  descriptor.dwords[2] = 3u | (3u << 14u);
+  descriptor.dwords[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) | (1u << 12u) | (3u << 16u) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  descriptor.dwords[5] = 3u << 4u;
+  descriptor.dword_count = 8;
+  ResourceSnapshot snapshot;
+  snapshot.images.assign(images.size(), descriptor);
+  std::string error;
+  Check(SpecializeResources(fixture.program, snapshot, &error) &&
+            fixture.program.info.images[1].mip_count == 3 &&
+            ValidateResourceSpecialization(fixture.program, snapshot, &error),
+        "base-1 through last-3 dynamic storage range was not specialized");
+  ShaderComputeInputInfo compute{};
+  Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
+            AllocateBindings(fixture.program, {}, &error),
+        "dynamic storage mip bindings were not allocated");
+  const auto *storage_binding = FindBinding(
+      fixture.program.bindings, DescriptorBindingKind::Storage2D);
+  Check(storage_binding != nullptr &&
+            storage_binding->resources == std::vector<uint32_t>({0, 1, 1, 1}),
+        "dynamic storage mip descriptors were not expanded consecutively");
+
+  Program null_program;
+  null_program.values = std::make_shared<ValueProgram>();
+  null_program.resource_tracking_complete = true;
+  ImageResource null_image;
+  null_image.kind = ResourceKind::StorageImage;
+  null_image.dimension = Decoder::ImageDimension::Dim2D;
+  null_image.mip_mode = ImageMipMode::DynamicStorage;
+  null_image.written = true;
+  null_program.info.images.push_back(null_image);
+  ResourceSnapshot null_snapshot;
+  DescriptorValue null_descriptor{};
+  null_descriptor.dword_count = 8;
+  null_snapshot.images.push_back(null_descriptor);
+  Check(SpecializeResources(null_program, null_snapshot, &error) &&
+            null_program.info.images[0].mip_count == 1 &&
+            ValidateResourceSpecialization(null_program, null_snapshot, &error),
+        "canonical null dynamic storage image did not retain one descriptor");
+
+  snapshot.images[1].dwords[3] =
+      (snapshot.images[1].dwords[3] & ~(0xfu << 16u)) | (2u << 16u);
+  Check(!ValidateResourceSpecialization(fixture.program, snapshot, &error),
+        "a changed dynamic storage mip count reused the specialization");
+  snapshot.images[1].dwords[3] =
+      (snapshot.images[1].dwords[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
+      (4u << 12u) | (3u << 16u);
+  Check(!ValidateResourceSpecialization(fixture.program, snapshot, &error),
+        "an inverted dynamic storage mip range was accepted");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -697,6 +803,7 @@ int main() {
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
+    Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);

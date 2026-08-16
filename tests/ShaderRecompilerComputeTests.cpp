@@ -392,8 +392,9 @@ struct RenderExecutorTestAccess {
 
 struct DescriptorCacheTestAccess {
   static vk::DescriptorImageInfo
-  MakeImageInfo(const DescriptorCache::TextureBinding &binding) {
-    return DescriptorCache::MakeImageInfo(binding);
+  MakeImageInfo(const DescriptorCache::TextureBinding &binding,
+                uint32_t element = 0) {
+    return DescriptorCache::MakeImageInfo(binding, element);
   }
 };
 
@@ -862,11 +863,7 @@ struct TestCase {
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
-};
-
-struct SkippedCase {
-  const char *name = "";
-  const char *reason = "";
+  u32 expected_storage_mip_descriptors = 0;
 };
 
 struct GraphicsCase {
@@ -1089,6 +1086,29 @@ CompiledShader CompileCase(const TestCase &test) {
     Require(test.name, "typed IR", actual == expected,
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
+  }
+  if (test.expected_storage_mip_descriptors != 0) {
+    const auto image = std::ranges::find_if(
+        result.program.info.images, [](const auto &resource) {
+          return resource.mip_mode ==
+                 ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+        });
+    Require(test.name, "dynamic storage mip specialization",
+            image != result.program.info.images.end() &&
+                image->mip_count == test.expected_storage_mip_descriptors,
+            "runtime descriptor range did not specialize the mip count");
+    const auto resource = static_cast<u32>(
+        image - result.program.info.images.begin());
+    const auto binding = std::ranges::find_if(
+        result.program.bindings.descriptors, [&](const auto &group) {
+          return std::ranges::find(group.resources, resource) !=
+                 group.resources.end();
+        });
+    Require(test.name, "dynamic storage mip binding",
+            binding != result.program.bindings.descriptors.end() &&
+                std::ranges::count(binding->resources, resource) ==
+                    test.expected_storage_mip_descriptors,
+            "dynamic storage image did not receive one descriptor per mip");
   }
   if (test.force_shader_data_storage) {
     result.program.bindings = {};
@@ -6522,6 +6542,79 @@ public:
       std::copy(std::begin(storage.fields), std::end(storage.fields),
                 storage_descriptor.dwords.begin());
       storage_descriptor.dword_count = 8;
+      auto mipped_storage = storage;
+      constexpr uint64_t mipped_storage_address = base + 0x100000;
+      const auto encoded_mipped_storage_address = mipped_storage_address >> 8u;
+      mipped_storage.fields[0] =
+          static_cast<uint32_t>(encoded_mipped_storage_address);
+      mipped_storage.fields[1] =
+          static_cast<uint32_t>(encoded_mipped_storage_address >> 32u) |
+          (static_cast<uint32_t>(stencil_format) << 20u) | (3u << 30u);
+      mipped_storage.fields[2] = 1u | (7u << 14u);
+      mipped_storage.fields[3] =
+          DstSel(4, 5, 6, 7) | (1u << 12u) | (3u << 16u) |
+          (static_cast<uint32_t>(linear) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      mipped_storage.fields[5] = 0x00700000u | (3u << 4u);
+      ShaderRecompiler::IR::DescriptorValue mipped_storage_descriptor{};
+      std::copy(std::begin(mipped_storage.fields),
+                std::end(mipped_storage.fields),
+                mipped_storage_descriptor.dwords.begin());
+      mipped_storage_descriptor.dword_count = 8;
+      auto mipped_storage_resource = storage_resource;
+      mipped_storage_resource.mip_mode =
+          ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+      mipped_storage_resource.mip_count = 3;
+      auto plain_mipped_storage_binding =
+          RenderExecutorTestAccess::ResolveTexture(
+              executor, storage_resource, mipped_storage_descriptor);
+      auto mipped_storage_binding =
+          RenderExecutorTestAccess::ResolveTexture(
+              executor, mipped_storage_resource, mipped_storage_descriptor);
+      DescriptorCache::PreparedBindings mipped_prepared{};
+      auto mipped_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      mipped_program->info.images.push_back(storage_resource);
+      mipped_program->info.images.push_back(mipped_storage_resource);
+      auto mipped_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      mipped_snapshot->images.assign(2, mipped_storage_descriptor);
+      mipped_prepared.program = std::move(mipped_program);
+      mipped_prepared.snapshot = std::move(mipped_snapshot);
+      mipped_prepared.resources.images.push_back(
+          std::move(plain_mipped_storage_binding));
+      mipped_prepared.resources.images.push_back(
+          std::move(mipped_storage_binding));
+      executor.RebindImages(scheduler.Current(), mipped_prepared);
+      auto &plain_mipped_binding = mipped_prepared.resources.images[0];
+      auto &mipped_binding = mipped_prepared.resources.images[1];
+      plain_mipped_binding.layout = vk::ImageLayout::eGeneral;
+      mipped_binding.layout = vk::ImageLayout::eGeneral;
+      auto plain_view_desc = plain_mipped_binding.desc;
+      plain_view_desc.view_info.level_count = 1;
+      Require(name, "dynamic storage mip views",
+              plain_mipped_binding.desc.view_info.base_level == 1 &&
+                  plain_mipped_binding.desc.view_info.level_count == 3 &&
+                  plain_mipped_binding.mip_views.empty() &&
+                  plain_mipped_binding.image_view == texture_cache.FindTexture(
+                      plain_mipped_binding.image_id, plain_view_desc) &&
+                  mipped_binding.desc.info.resources.levels == 4 &&
+                  mipped_binding.desc.view_info.base_level == 1 &&
+                  mipped_binding.desc.view_info.level_count == 3 &&
+                  mipped_binding.mip_views.size() == 3 &&
+                  mipped_binding.mip_views[0] != nullptr &&
+                  mipped_binding.mip_views[1] != nullptr &&
+                  mipped_binding.mip_views[2] != nullptr &&
+                  mipped_binding.mip_views[0] != mipped_binding.mip_views[1] &&
+                  mipped_binding.mip_views[1] != mipped_binding.mip_views[2] &&
+                  DescriptorCacheTestAccess::MakeImageInfo(mipped_binding, 0)
+                          .imageView == mipped_binding.mip_views[0] &&
+                  DescriptorCacheTestAccess::MakeImageInfo(mipped_binding, 1)
+                          .imageView == mipped_binding.mip_views[1] &&
+                  DescriptorCacheTestAccess::MakeImageInfo(mipped_binding, 2)
+                          .imageView == mipped_binding.mip_views[2],
+              "base-1 through last-3 storage view did not create three "
+              "ordered one-level descriptors");
       auto srgb_storage = storage;
       constexpr auto srgb_format =
           static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb);
@@ -6739,11 +6832,24 @@ public:
       Require(name, "VS-to-PS image acquisition order",
               storage_binding.image_id == storage_id &&
                   sampled_binding.image_id == storage_id &&
+                  texture_cache.GetImage(storage_id).binding.force_general &&
+                  texture_cache.GetImage(storage_id).binding.shader_write &&
                   texture_cache.GetImage(storage_id).IsGpuModified() &&
                   texture_cache.GetImage(storage_id).usage.storage &&
                   texture_cache.GetImage(storage_id).usage.texture,
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
+      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
+                                               graphics_bindings.vertex);
+      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
+                                               *graphics_bindings.pixel);
+      Require(name, "early writable alias retention",
+              texture_cache.GetImage(storage_id).backing.state.access_mask ==
+                  (vk::AccessFlagBits2::eShaderRead |
+                   vk::AccessFlagBits2::eShaderWrite |
+                   vk::AccessFlagBits2::eColorAttachmentRead |
+                   vk::AccessFlagBits2::eColorAttachmentWrite),
+              "a later sampled alias dropped an earlier storage write access");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto vertex_sampled_program =
@@ -6782,9 +6888,15 @@ public:
                       writable_alias_bindings.pixel->resources.images[0])
                           .imageLayout == vk::ImageLayout::eGeneral &&
                   texture_cache.GetImage(storage_id).backing.state.layout ==
-                      vk::ImageLayout::eGeneral,
+                      vk::ImageLayout::eGeneral &&
+                  texture_cache.GetImage(storage_id)
+                          .backing.state.access_mask ==
+                      (vk::AccessFlagBits2::eShaderRead |
+                       vk::AccessFlagBits2::eShaderWrite |
+                       vk::AccessFlagBits2::eColorAttachmentRead |
+                       vk::AccessFlagBits2::eColorAttachmentWrite),
               "sampled/storage aliases did not retain the promoted general "
-              "layout in both generated descriptors");
+              "layout and writable access in both generated descriptors");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       const std::array<uint32_t, 3> split_mip_data{0x01020304u, 0x05060708u,
@@ -16382,12 +16494,6 @@ TestCase ImageGetResinfoDmaskMipLevels() {
   return test;
 }
 
-SkippedCase ImageStoreMipWritesExplicitMip2D() {
-  return {"ImageStoreMipWritesExplicitMip2D",
-          "requires per-mip storage-image view descriptors; Vulkan "
-          "OpImageWrite cannot take Lod"};
-}
-
 TestCase ImageSampleAndGather() {
   using O = ShaderOpcode;
 
@@ -16628,6 +16734,37 @@ TestCase ImageStoreVariants() {
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_rgba = expected_image;
+  return test;
+}
+
+TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 2);
+  AppendVMovU32(&code, 23, 0);
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0x40000000u);
+  AppendVMovLiteral(&code, 2, 0x40400000u);
+  AppendVMovLiteral(&code, 3, 0x40800000u);
+  code.push_back(EncodeMimg0(0x09, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageStoreMipSelectsPpsa01340Descriptor";
+  test.code = std::move(code);
+  test.opcodes = {O::VMovB32, O::ImageStoreMip, O::SEndpgm};
+  const std::array<u32, 8> descriptor{
+      0x0294dc00u, 0xc4700000u, 0x00b3c13fu, 0x91b31facu,
+      0x00000000u, 0x00700030u, 0xb07b0000u, 0x0002ac3cu};
+  std::copy(descriptor.begin(), descriptor.end(), test.user_data.begin());
+  test.has_user_data = true;
+  test.compile_only = true;
+  test.expected_storage_mip_descriptors = 3;
+  test.required_spirv = {"OpSwitch", "OpImageWrite"};
   return test;
 }
 
@@ -17395,6 +17532,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
+  AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
   AddCase(ImageStoreRgbOneUsesInverseSwizzle);
   AddCase(ImageStoreDuplicateSelectorUsesInverseSwizzle);
   AddCase(ImageStoreBgraUsesInverseSwizzle);
@@ -17423,10 +17561,6 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsFinalVmExportSupersedesEarlierVmMask(),
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
   };
-}
-
-std::vector<SkippedCase> MakeSkippedCases() {
-  return {ImageStoreMipWritesExplicitMip2D()};
 }
 
 void CheckPs5GameExampleImageClearRuntimeShape() {
@@ -17805,8 +17939,6 @@ void CheckRenderTargetFormatContract() {
       resource.atomic = true;
     } else if (std::strcmp(kind, "storage-compare") == 0) {
       resource.depth_compare = true;
-    } else if (std::strcmp(kind, "storage-mip") == 0) {
-      resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
     } else if (std::strcmp(kind, "storage-dimension") == 0) {
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Unknown;
     } else {
@@ -18024,6 +18156,13 @@ void CheckSampledColorViews() {
   Require("SampledColorViews", "atomic uint 2D storage resource",
           IsSupportedStorageImageResource(storage_resource),
           "atomic uint storage resource was rejected");
+  storage_resource.atomic = false;
+  storage_resource.mip_mode =
+      ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+  storage_resource.mip_count = 3;
+  Require("SampledColorViews", "dynamic storage mip resource",
+          IsSupportedStorageImageResource(storage_resource),
+          "dynamic storage mip resource was rejected");
 
   char path[MAX_PATH]{};
   Require("SampledColorViews", "host",
@@ -18033,7 +18172,7 @@ void CheckSampledColorViews() {
        {"sampled-invalid-selector", "sampled-incompatible-format",
         "sampled-invalid-high", "sampled-depth-format", "sampled-depth-swizzle",
         "storage-incompatible-format", "storage-kind", "storage-no-write",
-        "storage-nonuint-atomic", "storage-compare", "storage-mip",
+        "storage-nonuint-atomic", "storage-compare",
         "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
     std::string command =
         std::string("\"") + path + "\" --image-view-death " + kind;
@@ -19389,6 +19528,11 @@ void CheckStorageImageSwizzleSpecializationId() {
   identity_program.info.images.push_back(image);
   auto rgb1_program = identity_program;
   rgb1_program.info.images[0].storage_swizzle = DstSel(4, 5, 6, 1);
+  auto mip1_program = identity_program;
+  mip1_program.info.images[0].mip_mode =
+      ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+  auto mip3_program = mip1_program;
+  mip3_program.info.images[0].mip_count = 3;
 
   const auto resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
@@ -19399,13 +19543,22 @@ void CheckStorageImageSwizzleSpecializationId() {
   auto rgb1_info = identity_info;
   rgb1_info.stage.program =
       std::make_shared<const ShaderRecompiler::IR::Program>(rgb1_program);
+  auto mip1_info = identity_info;
+  mip1_info.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(mip1_program);
+  auto mip3_info = identity_info;
+  mip3_info.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(mip3_program);
 
   const auto identity_id = ShaderGetIdCS(regs, identity_info, true);
   const auto rgb1_id = ShaderGetIdCS(regs, rgb1_info, true);
+  const auto mip1_id = ShaderGetIdCS(regs, mip1_info, true);
+  const auto mip3_id = ShaderGetIdCS(regs, mip3_info, true);
   Require("StorageImageSwizzleSpecializationId", "pipeline cache key",
           identity_id != rgb1_id &&
-              identity_id.ids.size() == rgb1_id.ids.size(),
-          "storage swizzle-specialized SPIR-V variants share a pipeline ID");
+              identity_id.ids.size() == rgb1_id.ids.size() &&
+              mip1_id != mip3_id && mip1_id.ids.size() == mip3_id.ids.size(),
+          "storage swizzle or mip-count variants share a pipeline ID");
   std::printf("[host]    %-32s ok\n", "StorageImageSwizzlePipelineId");
 }
 
@@ -20701,6 +20854,15 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-mip-only") == 0) {
+    RunCase(nullptr, ImageStoreMipSelectsPpsa01340Descriptor());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-yzwx-only") == 0) {
     CheckSampledColorViews();
     CheckBasicStorageTextureDescriptor();
@@ -20782,9 +20944,6 @@ int main(int argc, char **argv) {
   CheckOpcodeCoverage(tests, graphics_tests);
   for (const auto &test : tests) {
     RunCase(&vulkan, test);
-  }
-  for (const auto &test : MakeSkippedCases()) {
-    std::printf("[skip]    %-32s %s\n", test.name, test.reason);
   }
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);

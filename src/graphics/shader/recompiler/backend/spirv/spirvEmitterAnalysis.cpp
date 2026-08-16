@@ -469,6 +469,48 @@ uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool
 	return image;
 }
 
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_image,
+                           ImageViewKind view, uint32_t mip_lod, uint32_t coord, uint32_t texel) {
+	const auto  kind    = StorageBindingKind(uint_image, view);
+	const auto  binding = ResourceForDescriptor(state, kind, resource);
+	const auto& image   = state.program.info.images.at(resource);
+	const auto  LoadAt  = [&](uint32_t array_index) {
+		const auto pointer = DescriptorElementPointer(
+		    state, StorageImagePointerType(state, uint_image, view),
+		    StorageImageVariable(state, uint_image, view), array_index, kind, resource,
+		    "storage image descriptor array was not emitted");
+		const auto descriptor = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpLoad, StorageImageType(state, uint_image, view), descriptor, pointer});
+		return descriptor;
+	};
+	if (image.mip_mode != IR::ImageMipMode::DynamicStorage) {
+		state.builder.AddFunction({OpImageWrite, LoadAt(binding.array_index), coord, texel});
+		return;
+	}
+	if (image.mip_count == 0u) {
+		ExitDescriptorBindingFailure(state, kind, resource,
+		                             "dynamic storage image has no mip descriptors");
+	}
+
+	const auto            merge_label = state.builder.AllocateId();
+	std::vector<uint32_t> labels(image.mip_count);
+	std::vector<uint32_t> words {OpSwitch, mip_lod, merge_label};
+	for (uint32_t mip = 0; mip < image.mip_count; mip++) {
+		labels[mip] = state.builder.AllocateId();
+		words.push_back(mip);
+		words.push_back(labels[mip]);
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction(words);
+	for (uint32_t mip = 0; mip < image.mip_count; mip++) {
+		state.builder.AddFunction({OpLabel, labels[mip]});
+		state.builder.AddFunction({OpImageWrite, LoadAt(binding.array_index + mip), coord, texel});
+		state.builder.AddFunction({OpBranch, merge_label});
+	}
+	state.builder.AddFunction({OpLabel, merge_label});
+}
+
 uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return ExecutionModelVertex;

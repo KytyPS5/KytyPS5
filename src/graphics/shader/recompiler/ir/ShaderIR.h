@@ -194,6 +194,7 @@ struct ImageResource {
 	ResourceKind            kind            = ResourceKind::None;
 	Decoder::ImageDimension dimension       = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode        = ImageMipMode::None;
+	uint32_t                mip_count       = 1;
 	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
 	bool                    read            = false;
 	bool                    written         = false;

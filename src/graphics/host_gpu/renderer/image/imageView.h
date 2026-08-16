@@ -120,7 +120,11 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.written &&
+	       ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
+	         resource.mip_count == 1u) ||
+	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
+	         resource.mip_count != 0u)) &&
+	       resource.written &&
 	       (!resource.atomic ||
 	        (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
 	         resource.read)) &&

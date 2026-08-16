@@ -196,7 +196,16 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 			}
 			return false;
 		}
-		image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())].push_back(i);
+		auto&      resources = image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())];
+		const auto dynamic   = program.info.images[i].mip_mode == ImageMipMode::DynamicStorage;
+		const auto count     = dynamic ? program.info.images[i].mip_count : 1u;
+		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
+			if (error != nullptr) {
+				*error = "image has an invalid specialized mip descriptor count";
+			}
+			return false;
+		}
+		resources.insert(resources.end(), count, i);
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {

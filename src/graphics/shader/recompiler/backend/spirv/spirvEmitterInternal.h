@@ -731,6 +731,9 @@ uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, b
 uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool uint_image,
                                     uint32_t use_pc, ImageViewKind view = ImageViewKind::Dim2D);
 
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_image,
+                           ImageViewKind view, uint32_t mip_lod, uint32_t coord, uint32_t texel);
+
 uint32_t ExecutionModelForStage(ShaderType stage);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);

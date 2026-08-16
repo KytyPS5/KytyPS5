@@ -408,11 +408,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto uint_image = mem.kind == IR::ResourceKind::StorageImageUint;
 		const auto view       = StorageImageViewKind(state, mem, uint_image, pc);
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			state.builder.AddFunction(
-			    {OpImageWrite,
-			     LoadStorageImageDescriptor(state, mem.resource, uint_image, pc, view),
-			     CoordU32(ctx, mem, *address, view),
-			     StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image)});
+			const auto mip_lod =
+			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::DynamicStorage
+			        ? LodU32(ctx, mem, *address, view)
+			        : 0u;
+			const auto coord = CoordU32(ctx, mem, *address, view);
+			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
+			EmitStorageImageWrite(state, mem.resource, uint_image, view, mip_lod, coord, texel);
 		});
 		return true;
 	}

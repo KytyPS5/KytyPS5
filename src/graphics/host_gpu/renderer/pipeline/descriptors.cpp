@@ -786,9 +786,10 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 		return;
 	}
 	if (image.binding.is_bound) {
-		image.binding.force_general |= storage;
+		image.binding.force_general |= image.binding.shader_write != storage;
 	}
 	image.binding.is_bound = true;
+	image.binding.shader_write |= storage;
 	TrackImageBinding(id);
 }
 
@@ -904,8 +905,27 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
-		auto& binding      = images[i];
-		binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+		auto& binding = images[i];
+		binding.mip_views.clear();
+		const auto& resource = program.info.images[i];
+		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+			EXIT_IF(resource.mip_count == 0u ||
+			        resource.mip_count != binding.desc.view_info.level_count);
+			binding.mip_views.reserve(resource.mip_count);
+			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
+				auto desc = binding.desc;
+				desc.view_info.base_level += mip;
+				desc.view_info.level_count = 1;
+				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
+			}
+			binding.image_view = binding.mip_views.front();
+		} else {
+			auto desc = binding.desc;
+			if (desc.type == TextureCache::BindingType::Storage) {
+				desc.view_info.level_count = 1;
+			}
+			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
+		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
@@ -994,8 +1014,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			              range, vk_buffer);
 		} else if ((image.binding.force_general || image.binding.is_target) &&
 		           !image.info.IsDepth()) {
+			const vk::AccessFlags2 storage_access = image.binding.shader_write
+			                                            ? vk::AccessFlagBits2::eShaderWrite
+			                                            : vk::AccessFlags2 {};
 			image.Transit(vk::ImageLayout::eGeneral,
-			              vk::AccessFlagBits2::eShaderRead |
+			              vk::AccessFlagBits2::eShaderRead | storage_access |
 			                  vk::AccessFlagBits2::eColorAttachmentRead |
 			                  vk::AccessFlagBits2::eColorAttachmentWrite,
 			              {}, vk_buffer);

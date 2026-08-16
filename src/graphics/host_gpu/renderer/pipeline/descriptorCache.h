@@ -47,10 +47,11 @@ public:
 	enum class Stage { Unknown, Vertex, Pixel, Compute };
 
 	struct TextureBinding {
-		ImageId                 image_id;
-		vk::ImageView           image_view = nullptr;
-		TextureCache::ImageDesc desc;
-		vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
+		ImageId                    image_id;
+		vk::ImageView              image_view = nullptr;
+		TextureCache::ImageDesc    desc;
+		vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
+		std::vector<vk::ImageView> mip_views;
 	};
 
 	struct NativeDescriptors {
@@ -94,7 +95,8 @@ private:
 		int                next_free_pool = -1;
 	};
 
-	static vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture);
+	static vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
+	                                             uint32_t              element = 0);
 	void                           CreatePool();
 	VulkanDescriptorSet* Allocate(Stage stage, const ShaderRecompiler::IR::Program& program);
 	vk::DescriptorSetLayout

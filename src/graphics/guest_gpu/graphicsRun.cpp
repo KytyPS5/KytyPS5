@@ -374,6 +374,12 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	}
 }
 
+void CommandProcessor::WaitForRewind(bool valid) {
+	if (!valid) {
+		SuspendPm4();
+	}
+}
+
 void CommandProcessor::IncrementDe() {
 	m_de_count++;
 }

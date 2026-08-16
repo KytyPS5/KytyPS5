@@ -112,6 +112,7 @@ public:
 	void SetCeComplete(bool complete) { m_ce_complete = complete; }
 	void WaitCe();
 	void WaitDeDiff(uint32_t diff);
+	void WaitForRewind(bool valid);
 	void IncrementDe();
 	void IncrementCe();
 

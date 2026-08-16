@@ -224,6 +224,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOS]           = CpOpEventWriteEos;
 	g_cp_op_func[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
 	g_cp_op_func[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
+	g_cp_op_func[Pm4::IT_REWIND]                    = CpOpRewind;
 	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG]           = CpOpSetContextReg;
 	g_cp_op_func[Pm4::IT_SET_SH_REG]                = CpOpSetShaderReg;
 	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG]           = CpOpSetUconfigReg;

@@ -21096,6 +21096,39 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
 }
 
+void CheckPm4RewindResume(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+
+  uint32_t suffix = 0;
+  const auto address = reinterpret_cast<uint64_t>(&suffix);
+  std::array<uint32_t, 7> commands{};
+  commands[0] = KYTY_PM4(2, Pm4::IT_REWIND, 0);
+  commands[1] = 0;
+  commands[2] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[3] = 0;
+  commands[4] = static_cast<uint32_t>(address);
+  commands[5] = static_cast<uint32_t>(address >> 32u);
+  commands[6] = 33;
+
+  Pm4Execution execution;
+  Require("Pm4RewindResume", "pending",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Blocked &&
+              suffix == 0,
+          "pending rewind did not preserve its command position");
+  Require("Pm4RewindResume", "patch valid",
+          Gen5::AgcRewindPatchSetRewindState(commands.data(), 1) == 0 &&
+              commands[1] == 0x80000000u,
+          "rewind state patch did not set the valid bit");
+  Require("Pm4RewindResume", "resume",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Complete &&
+              suffix == 33,
+          "valid rewind did not resume at the following packet");
+  std::printf("[host]    %-32s ok\n", "Pm4RewindResume");
+}
+
 void CheckPm4CeCompletion(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer);
@@ -21221,6 +21254,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4RewindResume(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
@@ -21381,6 +21419,7 @@ int main(int argc, char **argv) {
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
+  CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();

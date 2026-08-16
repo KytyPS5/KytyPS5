@@ -133,6 +133,7 @@ uint32_t CpOpDrawIndirectMulti(CommandProcessor&, uint32_t, const uint32_t*, uin
 uint32_t CpOpDrawIndex(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDrawIndexOffset(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPfpSyncMe(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpRewind(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndexType(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpNumInstances(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDrawIndexAuto(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

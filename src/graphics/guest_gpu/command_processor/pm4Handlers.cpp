@@ -1830,6 +1830,17 @@ KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 	return 1;
 }
 
+KYTY_CP_OP_PARSER(CpOpRewind) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0005900);
+	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0x81000000u) != 0);
+
+	cp.WaitForRewind((buffer[0] & 0x80000000u) != 0);
+
+	return 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	KYTY_PROFILER_FUNCTION();
 

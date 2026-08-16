@@ -52,14 +52,7 @@ union PlayGoOptionalChunk {
 };
 
 static bool ensure_chunks_loaded() {
-	if (g_chunks_num != 0) {
-		return true;
-	}
-	if (!Loader::SystemContentGetChunksNum(&g_chunks_num)) {
-		LOGF("Warning: assume that chunks count is 1\n");
-		g_chunks_num = 1;
-	}
-	return g_chunks_num != 0;
+	return g_chunks_num != 0 || Loader::SystemContentGetChunksNum(&g_chunks_num);
 }
 
 static bool is_valid_chunk(uint16_t chunk_id) {
@@ -121,10 +114,11 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	if (param != nullptr) {
 		return PLAYGO_ERROR_INVALID_ARGUMENT;
 	}
+	if (!ensure_chunks_loaded()) {
+		return PLAYGO_ERROR_NOT_SUPPORT_PLAYGO;
+	}
 
 	*out_handle = PLAYGO_HANDLE;
-
-	ensure_chunks_loaded();
 
 	return OK;
 }

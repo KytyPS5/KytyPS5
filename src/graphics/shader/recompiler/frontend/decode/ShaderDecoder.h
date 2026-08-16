@@ -249,6 +249,7 @@ enum class Opcode {
 	VCvtPknormI16F32,
 	VCvtPknormU16F32,
 	VCvtPkU16U32,
+	VCvtPkI16I32,
 	VPkMadI16,
 	VPkMulLoU16,
 	VPkAddI16,

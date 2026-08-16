@@ -201,6 +201,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VCvtPknormI16F32, Opcode::PackSnorm2x16F32},
     {Decoder::Opcode::VCvtPknormU16F32, Opcode::PackUnorm2x16F32},
     {Decoder::Opcode::VCvtPkU16U32, Opcode::PackU16U32},
+    {Decoder::Opcode::VCvtPkI16I32, Opcode::PackU16U32},
     {Decoder::Opcode::VCvtPkU8F32, Opcode::PackU8F32},
     {Decoder::Opcode::VPackB32F16, Opcode::PackB32F16},
     {Decoder::Opcode::VPkMadI16, Opcode::PackedMadI16},

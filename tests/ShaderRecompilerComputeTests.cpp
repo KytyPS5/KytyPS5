@@ -11809,6 +11809,34 @@ TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
           {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm}};
 }
 
+TestCase Vop3CvtPkI16I32Captured() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 7, 30);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 16, 30);
+  code.push_back(0xd76b0005u);
+  code.push_back(0x00022107u); // v_cvt_pk_i16_i32 v5, v7, v16
+  AppendStoreVgpr(&code, 5, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3CvtPkI16I32Captured";
+  test.code = std::move(code);
+  test.initial = {0x00018001u, 0xfffe7ffeu, 0};
+  test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
+  test.opcodes = {O::BufferLoadDword, O::VMovB32, O::VCvtPkI16I32,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.decoded_counts = {
+      {"0x00000014: v_cvt_pk_i16_i32 v5, v7, v16\n", 1}};
+  test.ir_counts = {{" = BitwiseAnd32 ", 2},
+                    {" = ShiftLeftLogical32 ", 1},
+                    {" = BitwiseOr32 ", 1}};
+  test.required_spirv = {"OpBitwiseAnd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  return test;
+}
+
 TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
@@ -17567,6 +17595,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
+  AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3IntegerOps);
@@ -21010,6 +21039,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop2SdwaAshrrevCapturedWord0SignExtends());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3CvtPkI16I32Captured());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sff1-b64-only") == 0) {

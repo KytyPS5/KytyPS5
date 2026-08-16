@@ -272,11 +272,11 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x363u, Opcode::VBfmB32},          {0x364u, Opcode::VBcntU32B32},
     {0x365u, Opcode::VMbcntLoU32B32},   {0x366u, Opcode::VMbcntHiU32B32},
     {0x368u, Opcode::VCvtPknormI16F32}, {0x369u, Opcode::VCvtPknormU16F32},
-    {0x36au, Opcode::VCvtPkU16U32},     {0x36fu, Opcode::VLshlOrB32},
-    {0x371u, Opcode::VAndOrB32},        {0x372u, Opcode::VOr3B32},
-    {0x377u, Opcode::VPermlane16B32},   {0x378u, Opcode::VPermlanex16B32},
-    {0x34bu, Opcode::VFmaF16},          {0x36du, Opcode::VAdd3U32},
-    {0x14fu, Opcode::VAlignbyteB32},
+    {0x36au, Opcode::VCvtPkU16U32},     {0x36bu, Opcode::VCvtPkI16I32},
+    {0x36fu, Opcode::VLshlOrB32},       {0x371u, Opcode::VAndOrB32},
+    {0x372u, Opcode::VOr3B32},          {0x377u, Opcode::VPermlane16B32},
+    {0x378u, Opcode::VPermlanex16B32},  {0x34bu, Opcode::VFmaF16},
+    {0x36du, Opcode::VAdd3U32},         {0x14fu, Opcode::VAlignbyteB32},
 };
 
 constexpr auto VOP3_OPS = Detail::MakeOpcodeTable<0x400>(VOP3_OPCODE_LIST);
@@ -1208,7 +1208,8 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::VBcntU32B32:
 		case Opcode::VCvtPknormI16F32:
 		case Opcode::VCvtPknormU16F32:
-		case Opcode::VCvtPkU16U32: return 2;
+		case Opcode::VCvtPkU16U32:
+		case Opcode::VCvtPkI16I32: return 2;
 		default: return 3;
 	}
 }

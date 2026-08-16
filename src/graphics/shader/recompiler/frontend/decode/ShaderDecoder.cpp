@@ -664,6 +664,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCvtPknormI16F32: return "v_cvt_pknorm_i16_f32";
 		case Opcode::VCvtPknormU16F32: return "v_cvt_pknorm_u16_f32";
 		case Opcode::VCvtPkU16U32: return "v_cvt_pk_u16_u32";
+		case Opcode::VCvtPkI16I32: return "v_cvt_pk_i16_i32";
 		case Opcode::VPkMadI16: return "v_pk_mad_i16";
 		case Opcode::VPkMulLoU16: return "v_pk_mul_lo_u16";
 		case Opcode::VPkAddI16: return "v_pk_add_i16";

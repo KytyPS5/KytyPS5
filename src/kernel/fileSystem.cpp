@@ -43,7 +43,7 @@ public:
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~MountPoints() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~MountPoints() = default;
 
 	KYTY_CLASS_NO_COPY(MountPoints);
 
@@ -76,7 +76,7 @@ struct File {
 class FileDescriptors {
 public:
 	FileDescriptors() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~FileDescriptors() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~FileDescriptors() = default;
 
 	KYTY_CLASS_NO_COPY(FileDescriptors);
 
@@ -193,8 +193,10 @@ void FileDescriptors::CloseAll() {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto& f: m_files) {
-		if (f != nullptr && f->opened) {
-			f->f.Close();
+		if (f != nullptr) {
+			if (f->opened) {
+				f->f.Close();
+			}
 			delete f;
 			f = nullptr;
 		}
@@ -1053,9 +1055,6 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	auto to_path   = std::string(to);
 	auto real_from = g_mount_points->GetRealFilename(from_path);
 	auto real_to   = g_mount_points->GetRealFilename(to_path);
-
-	EXIT_NOT_IMPLEMENTED(g_files->GetFile(real_from) != nullptr);
-	EXIT_NOT_IMPLEMENTED(g_files->GetFile(real_to) != nullptr);
 
 	if (!Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;

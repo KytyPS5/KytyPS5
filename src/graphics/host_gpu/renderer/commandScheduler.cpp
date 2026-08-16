@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryTracker.h"
 
 #include <algorithm>
 
@@ -239,6 +240,9 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
+	if (MemoryTracker::InUploadCallback()) {
+		return;
+	}
 	if (refresh_gpu_tick) {
 		m_master.Refresh();
 	}

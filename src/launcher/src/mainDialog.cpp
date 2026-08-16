@@ -391,8 +391,8 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		// Use nativeArguments so Qt does not re-quote the /K command string.
 		process->setProgram(CMD_EXE);
 		process->setArguments({});
-		process->setNativeArguments(QStringLiteral("/K ") +
-		                            BuildWinCmdKCommand(interpreter, args));
+		process->setNativeArguments(QStringLiteral("/K \"") +
+		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
 	}
 #else
 	process->setProgram(interpreter);

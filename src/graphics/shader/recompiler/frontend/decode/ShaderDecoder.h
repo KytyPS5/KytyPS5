@@ -232,6 +232,7 @@ enum class Opcode {
 	VMed3I32,
 	VMed3U32,
 	VMed3F16,
+	VMed3I16,
 	VSadU32,
 	VAdd3U32,
 	VLshlAddU32,

@@ -11995,6 +11995,33 @@ TestCase Vop3CvtPkI16I32Captured() {
   return test;
 }
 
+TestCase Vop3Med3I16Captured() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 5, 0x8ad003e8u);  // high=-30000, low=1000
+  AppendSMovLiteral(&code, 25, 0xb1e04e20u); // high=-20000, low=20000
+  AppendSMovLiteral(&code, 27, 0x7530fc18u); // high=30000, low=-1000
+  AppendVMovLiteral(&code, 3, 0x1234cafeu);
+  code.push_back(0xd7584803u);
+  code.push_back(0x006c3305u); // v_med3_i16 v3.hi, v5.hi, s25.lo, s27.lo
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3Med3I16Captured";
+  test.code = std::move(code);
+  test.expected = {0xfc18cafeu};
+  test.opcodes = {O::VMovB32, O::SMovB32, O::VMed3I16, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.decoded_counts = {{"0x00000020: v_med3_i16 v3.sdwa(sel=5,sext=0), "
+                          "v5.opsel(lo=1,hi=0,neghi=0), s25, s27\n",
+                          1}};
+  test.native_ir_counts = {{"IMed3I16", 1}};
+  test.required_spirv = {"OpSLessThan"};
+  return test;
+}
+
 TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
@@ -17757,6 +17784,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
+  AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3IntegerOps);
@@ -21238,6 +21266,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3Med3I16Captured());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--waitcnt-depctr-only") == 0) {

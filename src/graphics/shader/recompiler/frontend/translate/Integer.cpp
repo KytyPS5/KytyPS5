@@ -32,6 +32,11 @@ bool Translator::TranslateInteger16Operation(const IR::Instruction& inst) {
 		case IR::Opcode::ISubI16:
 			result = ir.ISub(ReadU16AsU32(inst.src[0], false), ReadU16AsU32(inst.src[1], false));
 			break;
+		case IR::Opcode::IMed3I16:
+			result = ir.Emit(IR::ValueOpcode::SMedTri32,
+			                 {ReadU16AsU32(inst.src[0], true), ReadU16AsU32(inst.src[1], true),
+			                  ReadU16AsU32(inst.src[2], true)});
+			break;
 		case IR::Opcode::IMinI16:
 		case IR::Opcode::IMaxI16:
 		case IR::Opcode::UMinU16:

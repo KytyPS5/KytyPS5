@@ -166,6 +166,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::VMed3I32, Opcode::IMed3I32},
     {Decoder::Opcode::VMed3U32, Opcode::UMed3U32},
     {Decoder::Opcode::VMed3F16, Opcode::Med3F16},
+    {Decoder::Opcode::VMed3I16, Opcode::IMed3I16},
     {Decoder::Opcode::VSadU32, Opcode::SadU32},
     {Decoder::Opcode::VAdd3U32, Opcode::IAdd3U32},
     {Decoder::Opcode::VLshlAddU32, Opcode::ShiftLeftAddU32},

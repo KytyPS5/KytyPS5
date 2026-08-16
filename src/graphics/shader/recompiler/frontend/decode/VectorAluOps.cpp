@@ -254,29 +254,30 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x155u, Opcode::VMax3I32},         {0x156u, Opcode::VMax3U32},
     {0x354u, Opcode::VMax3F16},         {0x157u, Opcode::VMed3F32},
     {0x158u, Opcode::VMed3I32},         {0x159u, Opcode::VMed3U32},
-    {0x357u, Opcode::VMed3F16},         {0x15du, Opcode::VSadU32},
-    {0x15eu, Opcode::VCvtPkU8F32},      {0x178u, Opcode::VXor3B32},
-    {0x12fu, Opcode::VCvtPkrtzF16F32},  {0x169u, Opcode::VMulLoU32},
-    {0x16au, Opcode::VMulHiU32},        {0x16bu, Opcode::VMulLoI32},
-    {0x16cu, Opcode::VMulHiI32},        {0x303u, Opcode::VAddNcU16},
-    {0x304u, Opcode::VSubNcU16},        {0x307u, Opcode::VLshrrevB16},
-    {0x308u, Opcode::VAshrrevI16},      {0x309u, Opcode::VMaxU16},
-    {0x30au, Opcode::VMaxI16},          {0x30bu, Opcode::VMinU16},
-    {0x30cu, Opcode::VMinI16},          {0x30du, Opcode::VAddNcI16},
-    {0x30eu, Opcode::VSubNcI16},        {0x30fu, Opcode::VAddI32},
-    {0x310u, Opcode::VSubI32},          {0x311u, Opcode::VPackB32F16},
-    {0x314u, Opcode::VLshlrevB16},      {0x319u, Opcode::VSubrevI32},
-    {0x345u, Opcode::VXadU32},          {0x346u, Opcode::VLshlAddU32},
-    {0x347u, Opcode::VAddLshlU32},      {0x360u, Opcode::VReadlaneB32},
-    {0x361u, Opcode::VWritelaneB32},    {0x362u, Opcode::VLdexpF32},
-    {0x363u, Opcode::VBfmB32},          {0x364u, Opcode::VBcntU32B32},
-    {0x365u, Opcode::VMbcntLoU32B32},   {0x366u, Opcode::VMbcntHiU32B32},
-    {0x368u, Opcode::VCvtPknormI16F32}, {0x369u, Opcode::VCvtPknormU16F32},
-    {0x36au, Opcode::VCvtPkU16U32},     {0x36bu, Opcode::VCvtPkI16I32},
-    {0x36fu, Opcode::VLshlOrB32},       {0x371u, Opcode::VAndOrB32},
-    {0x372u, Opcode::VOr3B32},          {0x377u, Opcode::VPermlane16B32},
-    {0x378u, Opcode::VPermlanex16B32},  {0x34bu, Opcode::VFmaF16},
-    {0x36du, Opcode::VAdd3U32},         {0x14fu, Opcode::VAlignbyteB32},
+    {0x357u, Opcode::VMed3F16},         {0x358u, Opcode::VMed3I16},
+    {0x15du, Opcode::VSadU32},          {0x15eu, Opcode::VCvtPkU8F32},
+    {0x178u, Opcode::VXor3B32},         {0x12fu, Opcode::VCvtPkrtzF16F32},
+    {0x169u, Opcode::VMulLoU32},        {0x16au, Opcode::VMulHiU32},
+    {0x16bu, Opcode::VMulLoI32},        {0x16cu, Opcode::VMulHiI32},
+    {0x303u, Opcode::VAddNcU16},        {0x304u, Opcode::VSubNcU16},
+    {0x307u, Opcode::VLshrrevB16},      {0x308u, Opcode::VAshrrevI16},
+    {0x309u, Opcode::VMaxU16},          {0x30au, Opcode::VMaxI16},
+    {0x30bu, Opcode::VMinU16},          {0x30cu, Opcode::VMinI16},
+    {0x30du, Opcode::VAddNcI16},        {0x30eu, Opcode::VSubNcI16},
+    {0x30fu, Opcode::VAddI32},          {0x310u, Opcode::VSubI32},
+    {0x311u, Opcode::VPackB32F16},      {0x314u, Opcode::VLshlrevB16},
+    {0x319u, Opcode::VSubrevI32},       {0x345u, Opcode::VXadU32},
+    {0x346u, Opcode::VLshlAddU32},      {0x347u, Opcode::VAddLshlU32},
+    {0x360u, Opcode::VReadlaneB32},     {0x361u, Opcode::VWritelaneB32},
+    {0x362u, Opcode::VLdexpF32},        {0x363u, Opcode::VBfmB32},
+    {0x364u, Opcode::VBcntU32B32},      {0x365u, Opcode::VMbcntLoU32B32},
+    {0x366u, Opcode::VMbcntHiU32B32},   {0x368u, Opcode::VCvtPknormI16F32},
+    {0x369u, Opcode::VCvtPknormU16F32}, {0x36au, Opcode::VCvtPkU16U32},
+    {0x36bu, Opcode::VCvtPkI16I32},     {0x36fu, Opcode::VLshlOrB32},
+    {0x371u, Opcode::VAndOrB32},        {0x372u, Opcode::VOr3B32},
+    {0x377u, Opcode::VPermlane16B32},   {0x378u, Opcode::VPermlanex16B32},
+    {0x34bu, Opcode::VFmaF16},          {0x36du, Opcode::VAdd3U32},
+    {0x14fu, Opcode::VAlignbyteB32},
 };
 
 constexpr auto VOP3_OPS = Detail::MakeOpcodeTable<0x400>(VOP3_OPCODE_LIST);
@@ -369,6 +370,10 @@ bool IsVop2LowHalfF16Opcode(Opcode opcode) {
 bool IsNativeVop3F16TernaryOpcode(Opcode opcode) {
 	return opcode == Opcode::VMin3F16 || opcode == Opcode::VMax3F16 || opcode == Opcode::VMed3F16 ||
 	       opcode == Opcode::VFmaF16;
+}
+
+bool IsNativeVop3I16TernaryOpcode(Opcode opcode) {
+	return opcode == Opcode::VMed3I16;
 }
 
 bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
@@ -1283,6 +1288,14 @@ void ApplyNativeVop3TernaryModifiers(Instruction& inst, uint32_t op_sel, uint32_
 	inst.dst.sdwa_sel = ((op_sel & 0x8u) != 0) ? 5u : 4u;
 }
 
+void ApplyNativeVop3I16TernarySelectors(Instruction& inst, uint32_t op_sel) {
+	Operand* sources[] = {&inst.src0, &inst.src1, &inst.src2};
+	for (uint32_t i = 0; i < 3u; i++) {
+		sources[i]->op_sel = ((op_sel >> i) & 1u) != 0;
+	}
+	inst.dst.sdwa_sel = (op_sel & 0x8u) != 0 ? 5u : 4u;
+}
+
 void ApplyNativeVop3B16BinaryModifiers(Instruction& inst, uint32_t op_sel) {
 	inst.src0.op_sel  = (op_sel & 0x1u) != 0;
 	inst.src1.op_sel  = (op_sel & 0x2u) != 0;
@@ -1374,6 +1387,9 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	}
 	if (IsNativeVop3F16TernaryOpcode(opcode)) {
 		return opcode != Opcode::VFmaF16 && (clamp != 0u || omod != 0u);
+	}
+	if (IsNativeVop3I16TernaryOpcode(opcode)) {
+		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
 	}
 	if (IsNativeVop3B16BinaryOpcode(opcode)) {
 		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
@@ -1595,6 +1611,7 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const bool vop3b_uses_sdst        = carry_in_out || vop3b_carry_out || vop3b_mad_u64;
 	const bool mad_mix                = false;
 	const bool f16_ternary            = IsNativeVop3F16TernaryOpcode(inst.opcode);
+	const bool i16_ternary            = IsNativeVop3I16TernaryOpcode(inst.opcode);
 	const bool b16_binary             = IsNativeVop3B16BinaryOpcode(inst.opcode);
 	const bool pack_b32_f16           = inst.opcode == Opcode::VPackB32F16;
 	const bool permlane               = IsPermlaneOpcode(inst.opcode);
@@ -1721,6 +1738,8 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		ApplyNativeVop3TernaryModifiers(inst, op_sel, abs, neg);
 	} else if (f16_ternary) {
 		ApplyNativeVop3TernaryModifiers(inst, op_sel, abs, neg);
+	} else if (i16_ternary) {
+		ApplyNativeVop3I16TernarySelectors(inst, op_sel);
 	} else if (b16_binary) {
 		ApplyNativeVop3B16BinaryModifiers(inst, op_sel);
 	} else if (pack_b32_f16) {

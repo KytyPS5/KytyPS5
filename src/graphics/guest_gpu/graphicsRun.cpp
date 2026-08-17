@@ -149,7 +149,10 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::Submit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t* cmd_const_buffer,
                       uint32_t num_const_dw, bool trigger_agc_interrupt_on_done) {
-	EXIT_IF(cmd_draw_buffer == nullptr || num_draw_dw == 0);
+	if (num_draw_dw == 0) {
+		return;
+	}
+	EXIT_IF(cmd_draw_buffer == nullptr);
 	GpuMutexLock lock(m_submission_mutex);
 	Submission   submission;
 	submission.type                          = SubmissionType::Graphics;

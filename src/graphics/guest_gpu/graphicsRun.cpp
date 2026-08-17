@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -277,6 +278,12 @@ void GpuState::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
 		WaitForIdle();
+	}
+	if (RenderDocCaptureInProgress()) {
+		SendCommandSync([this] {
+			Common::LockGuard render_lock(m_renderer.GetMutex());
+			RenderDocEndCapture();
+		});
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -638,8 +645,12 @@ void GpuState::ThreadRun(void* data) {
 }
 
 bool GpuState::Process(Submission& submission) {
-	auto&      cp          = GetProcessor(submission.queue_id);
 	const bool first_slice = !submission.started;
+	if (first_slice && RenderDocCaptureRequested()) {
+		Common::LockGuard render_lock(m_renderer.GetMutex());
+		RenderDocStartCapture();
+	}
+	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();

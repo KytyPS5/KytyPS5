@@ -3447,17 +3447,6 @@ bool TestGuestFreeRangeBounds() {
 }
 #endif
 
-bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
-	VirtualRanges::Range range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &range) ||
-	    std::strncmp(range.name, "AMM", KERNEL_MAXIMUM_NAME_LENGTH) != 0) {
-		return false;
-	}
-	EXIT("AMM virtual-memory unmap is unsupported: addr=0x%016" PRIx64 "\n", vaddr);
-}
-
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {
 	PRINT_NAME();

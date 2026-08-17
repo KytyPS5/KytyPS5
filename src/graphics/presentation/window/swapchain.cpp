@@ -32,7 +32,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/presenter.h"
-#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/controller.h"
@@ -866,7 +865,6 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			continue;
 		}
 
-		RenderDocOnPresent();
 		m_impl->presented_ime_revision.store(ime_visual.revision, std::memory_order_release);
 		window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);

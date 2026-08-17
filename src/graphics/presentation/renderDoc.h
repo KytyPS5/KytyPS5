@@ -1,17 +1,15 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RENDERDOC_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RENDERDOC_H_
 
-#include "common/common.h"
-#include "graphics/host_gpu/vulkanCommon.h"
-
-struct SDL_Window;
-
 namespace Libs::Graphics {
 
 void RenderDocInit();
-void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window);
 void RenderDocRequestCapture();
-void RenderDocOnPresent();
+void RenderDocStartCapture();
+void RenderDocEndCapture();
+
+[[nodiscard]] bool RenderDocCaptureRequested();
+[[nodiscard]] bool RenderDocCaptureInProgress();
 
 } // namespace Libs::Graphics
 

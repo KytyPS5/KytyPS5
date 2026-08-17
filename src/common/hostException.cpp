@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cstdio>
-#include <cstdlib>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -28,54 +27,14 @@ namespace Common::HostException {
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
-static thread_local bool    g_in_exception_filter = false;
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
-
-[[noreturn]] static void FailFast(const char* reason) noexcept {
-	std::fputs("HostException fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
-	std::fputc('\n', stderr);
-	std::fflush(stderr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
-#endif
-	std::_Exit(321);
-}
-
-class FilterScope final {
-public:
-	FilterScope() noexcept {
-		if (g_in_exception_filter) {
-			FailFast("nested exception while resolving a host fault");
-		}
-		g_in_exception_filter = true;
-	}
-
-	~FilterScope() { g_in_exception_filter = false; }
-
-	KYTY_CLASS_NO_COPY(FilterScope);
-};
-
-static Handler LoadInstalledHandler() noexcept {
-	if (g_install_state.load(std::memory_order_acquire) == 0) {
-		FailFast("host exception handler is not installed");
-	}
-
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler == nullptr) {
-		FailFast("host exception callback is null");
-	}
-	return handler;
-}
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
-static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
-	FilterScope filter_scope;
-
+static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
@@ -105,12 +64,6 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		printf("Unhandled win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
-		       ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", rbp=0x%016" PRIx64 "\n",
-		       static_cast<uint32_t>(exception_record->ExceptionCode),
-		       reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
-		       exception->ContextRecord->Rip, exception->ContextRecord->Rsp,
-		       exception->ContextRecord->Rbp);
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
@@ -131,27 +84,20 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	info.r14 = exception->ContextRecord->R14;
 	info.r15 = exception->ContextRecord->R15;
 
-	const auto handler = LoadInstalledHandler();
-
-	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && handler(info)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 #elif defined(__APPLE__)
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
-static thread_local bool    g_in_exception_filter = false;
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
-
-[[noreturn]] static void FailFast(const char* reason) noexcept {
-	std::fputs("HostException fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
-	std::fputc('\n', stderr);
-	std::fflush(stderr);
-	std::_Exit(321);
-}
 
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
 // bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
@@ -170,11 +116,6 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 // re-executing the faulting instruction against the now-fixed protection. An unresolved
 // fault restores the default disposition so the retry terminates the process.
 static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
-	if (g_in_exception_filter) {
-		FailFast("nested exception while resolving a host fault");
-	}
-	g_in_exception_filter = true;
-
 	auto*       uc = static_cast<ucontext_t*>(uctx);
 	const auto* mc = uc->uc_mcontext;
 	const auto& ss = mc->__ss;
@@ -210,14 +151,7 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	info.r15 = ss.__r15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler == nullptr) {
-		FailFast("host exception callback is null");
-	}
-
-	const bool resolved   = handler(info);
-	g_in_exception_filter = false;
-
-	if (resolved) {
+	if (handler != nullptr && handler(info)) {
 		return; // retry the faulting instruction against the fixed mapping
 	}
 
@@ -244,8 +178,6 @@ static void ChainToDefault(int signal_number) noexcept {
 }
 
 static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
-	FilterScope filter_scope;
-
 	auto* context = static_cast<ucontext_t*>(native_context);
 	auto* gregs   = context->uc_mcontext.gregs;
 
@@ -289,9 +221,8 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	info.r14 = static_cast<uint64_t>(gregs[REG_R14]);
 	info.r15 = static_cast<uint64_t>(gregs[REG_R15]);
 
-	const auto handler = LoadInstalledHandler();
-
-	if (handler(info)) {
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && handler(info)) {
 		return;
 	}
 
@@ -313,7 +244,7 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (AddVectoredExceptionHandler(1, ExceptionFilter) == nullptr) {
+	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");

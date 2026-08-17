@@ -22,11 +22,6 @@ namespace Libs::Graphics {
 
 using VulkanMemoryBarrier = vk::MemoryBarrier;
 
-template <typename Handle>
-[[nodiscard]] void* VulkanHandleToPointer(Handle handle) {
-	return reinterpret_cast<void*>(static_cast<typename Handle::CType>(handle));
-}
-
 std::string VulkanToString(vk::Result value);
 std::string VulkanToString(vk::Format value);
 std::string VulkanToString(vk::ImageLayout value);

@@ -32,7 +32,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/presenter.h"
-#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -601,11 +600,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
-	create_info.sType                = vk::StructureType::eDeviceCreateInfo;
-	create_info.pNext                = &features13;
-	create_info.flags                = {};
-	create_info.pQueueCreateInfos    = &queue_create_info;
-	create_info.queueCreateInfoCount = 1;
+	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
+	create_info.pNext                   = &features13;
+	create_info.flags                   = {};
+	create_info.pQueueCreateInfos       = &queue_create_info;
+	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -986,7 +985,6 @@ void WindowContext::CreateVulkan() {
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
 	presenter = std::make_unique<Presenter>(*this);
-	RenderDocSetActiveWindow(graphic_ctx.instance, window);
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {

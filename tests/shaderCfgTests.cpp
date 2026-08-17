@@ -7109,6 +7109,74 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   }
 }
 
+void TestNewShaderRecompilerCfgLoopSharedRegion() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0),      // loop condition
+      EncodeSopp(0x04, 14),        // loop exit -> end
+      EncodeSopc(0x06, 1, 1),      // outer condition
+      EncodeSopp(0x04, 2),         // outer -> shared region or inner
+      EncodeSopc(0x06, 2, 2),      // inner condition
+      EncodeSopp(0x04, 6),         // inner -> common tail or shared region
+      EncodeSopc(0x06, 3, 3),      // shared region condition
+      EncodeSopp(0x04, 2),         // shared region -> right or left
+      EncodeSMovB32(4, 129),       // shared left work
+      EncodeSopp(0x02, 2),         // shared left -> common tail
+      EncodeSMovB32(5, 129),       // shared right work
+      EncodeSopp(0x02, 0),         // shared right -> common tail
+      EncodeSop2(0x00, 6, 6, 129), // common tail work
+      EncodeSopp(0x02, 0),         // common tail -> continue
+      EncodeSop2(0x00, 7, 7, 129), // continue work
+      EncodeSopp(0x02, 0xfff0u),   // backedge -> loop header
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  const auto original_block_count = graph.blocks.size();
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.natural_loops.size() == 1u,
+        "loop shared-region fixture has the wrong native CFG");
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph, &error);
+  Check(structured, error.c_str());
+  const auto *loop_header = graph.FindBlockByPc(0x00u);
+  Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u &&
+            loop_header != nullptr && loop_header->terminator.loop_header &&
+            loop_header->terminator.continue_block != UINT32_MAX,
+        "loop shared-region routing did not preserve the natural loop");
+
+  uint32_t route_selects = 0;
+  uint32_t route_sets = 0;
+  for (const auto &block : graph.blocks) {
+    route_selects += block.terminator.condition ==
+                     ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+    route_sets += block.terminator.goto_value >= 0;
+  }
+  Check(route_selects == 1u && route_sets == 3u &&
+            graph.blocks.size() >= original_block_count + 5u &&
+            CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+                original_coverage,
+        "loop shared region was not routed without semantic duplication");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "loop shared region unexpectedly selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // block 0
@@ -9409,6 +9477,7 @@ int main() {
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
+  TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();

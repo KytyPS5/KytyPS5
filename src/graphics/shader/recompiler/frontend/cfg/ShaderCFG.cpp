@@ -1520,10 +1520,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
                        uint32_t route_variable, GotoRouteBlocks& route) {
 	auto* outer = graph.FindBlock(outer_id);
 	if (outer == nullptr || outer->inst_begin == outer->inst_end ||
-	    outer->terminator.kind != TerminatorKind::ConditionalBranch ||
-	    std::ranges::any_of(graph.natural_loops, [outer_id](const auto& loop) {
-		    return Contains(loop.body_blocks, outer_id);
-	    })) {
+	    outer->terminator.kind != TerminatorKind::ConditionalBranch) {
 		return false;
 	}
 
@@ -1553,21 +1550,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 		if (first_arm >= original_block_count || outer_id >= inner_id || inner_id >= first_arm) {
 			continue;
 		}
-		const auto* shared_block = graph.FindBlock(shared);
-		const auto* other_block  = graph.FindBlock(other);
-		if (shared_block == nullptr || other_block == nullptr ||
-		    shared_block->terminator.kind != TerminatorKind::Branch ||
-		    other_block->terminator.kind != TerminatorKind::Branch ||
-		    shared_block->successors.size() != 1u ||
-		    shared_block->successors != other_block->successors) {
-			continue;
-		}
-		const auto in_loop = [&](uint32_t block_id) {
-			return std::ranges::any_of(graph.natural_loops, [&](const auto& loop) {
-				return Contains(loop.body_blocks, block_id);
-			});
-		};
-		if (in_loop(inner_id) || in_loop(shared) || in_loop(other)) {
+		if (graph.FindNearestCommonPostDominator(shared, other) == UINT32_MAX) {
 			continue;
 		}
 
@@ -1592,32 +1575,32 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 	return false;
 }
 
-bool RouteTerminalSharedSelectionArm(Graph& graph) {
+bool RouteSharedSelectionArms(Graph& graph) {
 	if (graph.irreducible) {
 		return false;
 	}
-	const auto      original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	GotoRouteBlocks route;
-	bool            found = false;
-	for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
-		GotoRouteBlocks next;
-		if (RouteOneSharedArm(graph, original_block_count, block_id, 0u, next)) {
-			if (found) {
-				// Multiple interacting overlaps remain on the dispatcher path.
-				return false;
+	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
+	bool       found        = false;
+	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
+		const auto block_count = static_cast<uint32_t>(graph.blocks.size());
+		bool       routed      = false;
+		for (uint32_t block_id = 0; block_id < block_count; block_id++) {
+			GotoRouteBlocks route;
+			if (!RouteOneSharedArm(graph, block_count, block_id, route_variable, route)) {
+				continue;
 			}
-			found = true;
-			route = next;
+			PlaceGotoRouteBlocks(graph, block_count, route);
 			RebuildPredecessors(graph);
+			RecomputeAnalyses(graph);
+			found  = true;
+			routed = true;
+			break;
+		}
+		if (!routed) {
+			return found;
 		}
 	}
-	if (!found) {
-		return false;
-	}
-	PlaceGotoRouteBlocks(graph, original_block_count, route);
-	RebuildPredecessors(graph);
-	RecomputeAnalyses(graph);
-	return true;
+	return false;
 }
 
 } // namespace
@@ -1939,7 +1922,7 @@ bool Structurize(Graph& graph, std::string* error) {
 	if (StructurizeImpl(graph, error)) {
 		return true;
 	}
-	if (!RouteTerminalSharedSelectionArm(original)) {
+	if (!RouteSharedSelectionArms(original)) {
 		return false;
 	}
 	Graph       failed_graph = std::move(graph);

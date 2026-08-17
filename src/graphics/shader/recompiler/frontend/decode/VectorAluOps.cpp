@@ -121,6 +121,7 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x39u, Opcode::VFfbhU32},
     {0x3au, Opcode::VFfblB32},
     {0x3fu, Opcode::VFrexpExpI32F32},
+    {0x40u, Opcode::VFrexpMantF32},
     {0x42u, Opcode::VMovreldB32},
     {0x43u, Opcode::VMovrelsB32},
     {0x50u, Opcode::VCvtF16U16},
@@ -170,6 +171,7 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x39u, Opcode::VFfbhU32},
     {0x3au, Opcode::VFfblB32},
     {0x3fu, Opcode::VFrexpExpI32F32},
+    {0x40u, Opcode::VFrexpMantF32},
     {0x42u, Opcode::VMovreldB32},
     {0x43u, Opcode::VMovrelsB32},
     {0x50u, Opcode::VCvtF16U16},
@@ -413,6 +415,7 @@ bool IsVop1FloatSourceOpcode(Opcode opcode) {
 		case Opcode::VCvtRpiI32F32:
 		case Opcode::VCvtFlrI32F32:
 		case Opcode::VFrexpExpI32F32:
+		case Opcode::VFrexpMantF32:
 		case Opcode::VCvtF16F32:
 		case Opcode::VRcpF32:
 		case Opcode::VRcpIflagF32:
@@ -767,6 +770,7 @@ bool IsVop1FloatResultOpcode(Opcode opcode) {
 		case Opcode::VCeilF32:
 		case Opcode::VRndneF32:
 		case Opcode::VFloorF32:
+		case Opcode::VFrexpMantF32:
 		case Opcode::VExpF32:
 		case Opcode::VLogF32:
 		case Opcode::VRsqF32:

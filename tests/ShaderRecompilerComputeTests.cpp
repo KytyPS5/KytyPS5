@@ -13527,13 +13527,13 @@ TestCase VectorFloatConversionOps() {
            O::SEndpgm}};
 }
 
-TestCase VectorFrexpExpI32F32Edges() {
+TestCase VectorFrexpF32Edges() {
   using O = ShaderOpcode;
 
   const std::vector<u32> inputs = {
-      0x00000000u, 0x80000000u, 0x3f000000u, 0xbf800000u,
-      0x40800000u, 0xc1000000u, 0x00800000u, 0x007fffffu,
-      0x00000001u, 0x7f800000u, 0x7fc00000u,
+      0x00000000u, 0x80000000u, 0x3f000000u, 0xbf800000u, 0x40800000u,
+      0xc1000000u, 0x00800000u, 0x007fffffu, 0x00000001u, 0x7f800000u,
+      0x7fc00000u, 0xff800000u, 0x7fa00001u,
   };
   std::vector<u32> code;
   for (u32 i = 0; i < static_cast<u32>(inputs.size()); i++) {
@@ -13541,27 +13541,44 @@ TestCase VectorFrexpExpI32F32Edges() {
     AppendBufferLoadDword(&code, i == 3u ? 23u : i, 31);
   }
   for (u32 i = 0; i < static_cast<u32>(inputs.size()); i++) {
-    const auto dst = 16u + i;
-    if (dst == 19u) {
+    const auto exponent_dst = i == 3u ? 19u : 32u + i;
+    const auto mantissa_dst = i == 3u ? 21u : 48u + i;
+    if (i == 3u) {
       code.push_back(0x7e267ef9u); // captured v_frexp_exp_i32_f32 v19, abs(v23)
       code.push_back(0x00260617u);
     } else {
-      code.push_back(EncodeVop1(0x3f, dst, Vgpr(i)));
+      code.push_back(EncodeVop1(0x3f, exponent_dst, Vgpr(i)));
     }
-    AppendStoreVgpr(&code, dst, i);
+    AppendStoreVgpr(&code, exponent_dst, i);
+    if (i == 3u) {
+      code.push_back(0x7e2a80f9u); // captured v_frexp_mant_f32 v21, abs(v23)
+      code.push_back(0x00260617u);
+    } else {
+      code.push_back(EncodeVop1(0x40, mantissa_dst, Vgpr(i)));
+    }
+    AppendStoreVgpr(&code, mantissa_dst, inputs.size() + i);
   }
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "VectorFrexpExpI32F32Edges";
+  test.name = "VectorFrexpF32Edges";
   test.code = std::move(code);
   test.initial = inputs;
-  test.expected = {0u,          0u,          0u,          1u, 3u, 4u,
-                   0xffffff83u, 0xffffff82u, 0xffffff6cu, 0u, 0u};
-  test.opcodes = {O::VMovB32, O::BufferLoadDword, O::VFrexpExpI32F32,
-                  O::BufferStoreDword, O::SEndpgm};
-  test.decoded_counts = {{"v_frexp_exp_i32_f32", inputs.size()}};
-  test.required_spirv = {"FindUMsb", "OpBitFieldUExtract"};
+  test.initial.resize(inputs.size() * 2u);
+  test.expected = {
+      0u,          0u,          0u,          1u,          3u,
+      4u,          0xffffff83u, 0xffffff82u, 0xffffff6cu, 0u,
+      0u,          0u,          0u,          0x00000000u, 0x80000000u,
+      0x3f000000u, 0x3f000000u, 0x3f000000u, 0xbf000000u, 0x3f000000u,
+      0x3f7ffffeu, 0x3f000000u, 0x7f800000u, 0x7fc00000u, 0xff800000u,
+      0x7fa00001u,
+  };
+  test.opcodes = {O::VMovB32,       O::BufferLoadDword,  O::VFrexpExpI32F32,
+                  O::VFrexpMantF32, O::BufferStoreDword, O::SEndpgm};
+  test.decoded_counts = {{"v_frexp_exp_i32_f32", inputs.size()},
+                         {"v_frexp_mant_f32", inputs.size()}};
+  test.required_spirv = {"FindUMsb", "OpBitFieldUExtract",
+                         "OpShiftLeftLogical"};
   return test;
 }
 
@@ -17880,7 +17897,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
   AddCase(VectorFloatConversionOps);
-  AddCase(VectorFrexpExpI32F32Edges);
+  AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
   AddCase(VectorSpecialF32FlushesDenormalInputs);
   AddCase(VectorRcpIflagF32IntegerReciprocal);

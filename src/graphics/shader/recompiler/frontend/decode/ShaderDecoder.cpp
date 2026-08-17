@@ -567,6 +567,7 @@ std::string OpcodeToString(Opcode opcode) {
 		case Opcode::VCvtRpiI32F32: return "v_cvt_rpi_i32_f32";
 		case Opcode::VCvtFlrI32F32: return "v_cvt_flr_i32_f32";
 		case Opcode::VFrexpExpI32F32: return "v_frexp_exp_i32_f32";
+		case Opcode::VFrexpMantF32: return "v_frexp_mant_f32";
 		case Opcode::VCvtOffF32I4: return "v_cvt_off_f32_i4";
 		case Opcode::VCvtF32Ubyte0: return "v_cvt_f32_ubyte0";
 		case Opcode::VCvtF32Ubyte1: return "v_cvt_f32_ubyte1";

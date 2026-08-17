@@ -93,6 +93,26 @@ bool Translator::TranslateFloat16Operation(const IR::Instruction& inst) {
 }
 
 bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
+	if (inst.op == IR::Opcode::FrexpMantF32) {
+		const auto bits     = ReadU32(inst.src[0]);
+		const auto exponent = IR::U32(
+		    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(23u), IR::Value(8u)}));
+		const auto mantissa = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x007fffffu)));
+		const auto sign     = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x80000000u)));
+		const auto base     = ir.BitwiseOr(sign, IR::U32(IR::Value(0x3f000000u)));
+		const auto normal   = ir.BitwiseOr(base, mantissa);
+		const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {mantissa}));
+		const auto shift    = ir.ISub(IR::U32(IR::Value(23u)), msb);
+		const auto fraction =
+		    ir.BitwiseAnd(ir.ShiftLeftLogical(mantissa, shift), IR::U32(IR::Value(0x007fffffu)));
+		const auto subnormal = ir.BitwiseOr(base, fraction);
+		const auto zero      = ir.IEqual(mantissa, IR::U32(IR::Value(0u)));
+		const auto finite    = ir.Select(ir.INotEqual(exponent, IR::U32(IR::Value(0u))), normal,
+		                                 ir.Select(zero, bits, subnormal));
+		const auto result = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0xffu))), bits, finite);
+		WriteOperand(inst.dst, ir.BitCastF32(result));
+		return true;
+	}
 	IR::ValueOpcode opcode {};
 	switch (inst.op) {
 		case IR::Opcode::RcpF32: opcode = IR::ValueOpcode::FPRecip32; break;

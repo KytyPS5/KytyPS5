@@ -9,6 +9,32 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
+	const auto kill_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	const auto inactive    = state.builder.AllocateId();
+	state.builder.AddFunction({OpLogicalNot, state.bool_type, inactive, active});
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction({OpBranchConditional, inactive, kill_label, merge_label});
+	state.builder.AddFunction({OpLabel, kill_label});
+	state.builder.AddFunction({OpKill});
+	state.builder.AddFunction({OpLabel, merge_label});
+}
+
+void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
+	if (state.pixel_valid_mask_variable == 0) {
+		return;
+	}
+
+	const auto mask_value = state.builder.AllocateId();
+	const auto active     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLoad, state.uint_type, mask_value, state.pixel_valid_mask_variable});
+	state.builder.AddFunction(
+	    {OpINotEqual, state.bool_type, active, mask_value, ConstantU32(state, 0)});
+	EmitKillIfBoolFalse(state, active);
+}
+
 uint32_t BoolConstant(EmitterState& state, bool value) {
 	const auto id = state.builder.AllocateId();
 	state.builder.AddType({value ? 41u : 42u, state.bool_type, id});

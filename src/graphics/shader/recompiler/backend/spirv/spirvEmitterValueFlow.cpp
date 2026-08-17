@@ -5,6 +5,26 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+uint32_t EmitWqmLaneU32(EmitterState& state, uint32_t src) {
+	uint32_t ret = ConstantU32(state, 0);
+	for (uint32_t i = 0; i < 8u; i++) {
+		const auto mask     = 0x0fu << (i * 4u);
+		const auto masked   = state.builder.AllocateId();
+		const auto non_zero = state.builder.AllocateId();
+		const auto expanded = state.builder.AllocateId();
+		const auto combined = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpBitwiseAnd, state.uint_type, masked, src, ConstantU32(state, mask)});
+		state.builder.AddFunction(
+		    {OpINotEqual, state.bool_type, non_zero, masked, ConstantU32(state, 0)});
+		state.builder.AddFunction({OpSelect, state.uint_type, expanded, non_zero,
+		                           ConstantU32(state, mask), ConstantU32(state, 0)});
+		state.builder.AddFunction({OpBitwiseOr, state.uint_type, combined, ret, expanded});
+		ret = combined;
+	}
+	return ret;
+}
+
 uint32_t BoolAsU32(ValueEmitContext& ctx, uint32_t value) {
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction({OpSelect, ctx.state.uint_type, result, value,
@@ -407,20 +427,13 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction({OpUndef, ctx.TypeId(inst.GetType()), ctx.Result(inst)});
 			return true;
 		case IR::ValueOpcode::DppMoveU32: {
-			const auto  flags = inst.Flags<IR::DppMoveFlags>();
-			IR::Operand operand;
-			operand.dpp                = true;
-			operand.dpp_ctrl           = flags.control;
-			operand.dpp_row_mask       = flags.row_mask;
-			operand.dpp_bank_mask      = flags.bank_mask;
-			operand.dpp_fetch_inactive = flags.fetch_inactive;
-			operand.dpp_bound_ctrl     = flags.bound_control;
-			const auto target          = EmitDppTargetLane(state, operand.dpp_ctrl);
-			const auto shuffled        = state.builder.AllocateId();
+			const auto flags    = inst.Flags<IR::DppMoveFlags>();
+			const auto target   = EmitDppTargetLane(state, flags.control);
+			const auto shuffled = state.builder.AllocateId();
 			state.builder.AddFunction({OpGroupNonUniformShuffle, state.uint_type, shuffled,
 			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
 			                           target.lane});
-			if (operand.dpp_fetch_inactive) {
+			if (flags.fetch_inactive) {
 				ctx.Define(inst, shuffled);
 				return true;
 			}

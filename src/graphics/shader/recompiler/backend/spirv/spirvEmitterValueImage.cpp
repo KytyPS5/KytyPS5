@@ -6,6 +6,23 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+uint32_t DmaskComponentIndex(uint32_t dmask, uint32_t component) {
+	uint32_t index = 0;
+	for (uint32_t i = 0; i < component; i++) {
+		index += (dmask >> i) & 1u;
+	}
+	return index;
+}
+
+uint32_t ImageGatherComponent(uint32_t dmask) {
+	switch (dmask) {
+		case 0x2u: return 1;
+		case 0x4u: return 2;
+		case 0x8u: return 3;
+		default: return 0;
+	}
+}
+
 uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({opcode, type, result, value});

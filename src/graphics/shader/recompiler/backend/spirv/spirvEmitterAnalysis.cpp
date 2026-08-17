@@ -46,32 +46,8 @@ void CollectRegister(std::vector<RegisterBinding>& registers, IR::Register reg) 
 	registers.push_back({reg, 0});
 }
 
-IR::Operand MakeRegisterOperand(IR::RegisterFile file, uint32_t index) {
-	IR::Operand operand;
-	operand.kind = IR::OperandKind::Register;
-	operand.reg  = {file, index};
-	return operand;
-}
-
-IR::Register SccRegister() {
-	return {IR::RegisterFile::Scc, static_cast<uint32_t>(Decoder::OperandKind::Scc)};
-}
-
-IR::Operand SccOperand() {
-	return MakeRegisterOperand(IR::RegisterFile::Scc,
-	                           static_cast<uint32_t>(Decoder::OperandKind::Scc));
-}
-
 bool IsInactiveWave32ExecHigh(const EmitterState& state, IR::Register reg) {
 	return state.wave_size == 32u && reg.file == IR::RegisterFile::Exec && reg.index == 1u;
-}
-
-bool IsMaskRegisterFile(IR::RegisterFile file) {
-	return file == IR::RegisterFile::Exec || file == IR::RegisterFile::Vcc;
-}
-
-bool IsSccOperand(const IR::Operand& operand) {
-	return operand.kind == IR::OperandKind::Register && operand.reg.file == IR::RegisterFile::Scc;
 }
 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind,
@@ -277,9 +253,6 @@ uint32_t PointerForRegister(const EmitterState& state, IR::Register reg) {
 }
 
 uint32_t          ConstantU32(EmitterState& state, uint32_t value);
-void              EmitStoreU32(EmitterState& state, const IR::Operand& dst, uint32_t value);
-uint32_t          EmitSubgroupLocalInvocationId(EmitterState& state);
-uint32_t          EmitLaneIndexActiveBool(EmitterState& state, uint32_t lane);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason) {

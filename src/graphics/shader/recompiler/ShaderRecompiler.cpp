@@ -953,8 +953,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	std::string           emit_error;
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	if (!Spirv::EmitProgram(ir, resources, options.input_info, spirv, &emit_error,
-	                        options.dump_ir)) {
+	if (!Spirv::EmitProgram(ir, resources, options.input_info, spirv, &emit_error)) {
 		LOGF("%s typed SPIR-V emit failed: %s\n", GetDumpLabel(options), emit_error.c_str());
 		if (dispatcher_fallback && error != nullptr) {
 			*error = fmt::format("dispatcher fallback failed after {}: {}",

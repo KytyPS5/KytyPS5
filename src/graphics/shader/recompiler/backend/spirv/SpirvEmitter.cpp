@@ -312,8 +312,8 @@ bool ProgramRequiresExactSubgroupSize(const IR::Program& program) {
 }
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
-                 ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv, std::string* error,
-                 bool preserve_debug_values) {
+                 ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv,
+                 std::string* error) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -339,7 +339,6 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 		SetError(error, "SPIR-V emitter requires planned typed SSA");
 		return false;
 	}
-	(void)preserve_debug_values;
 	const auto& value_program = *program.values;
 	if (!IR::ValidateValueProgram(value_program, true, error)) {
 		return false;

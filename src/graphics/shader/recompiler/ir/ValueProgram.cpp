@@ -1,18 +1,16 @@
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
 
+#include "graphics/shader/shader.h"
+
 #include <fmt/format.h>
 #include <map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-namespace {
 
-bool Fail(std::string* error, const std::string& message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-	return false;
-}
+using ShaderError::Fail;
+
+namespace {
 
 bool IsRegisterGet(ValueOpcode opcode) {
 	switch (opcode) {

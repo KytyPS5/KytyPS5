@@ -10,9 +10,21 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace ShaderError {
+
+[[nodiscard]] inline bool Fail(std::string* error, std::string_view message) {
+	if (error != nullptr) {
+		error->assign(message.data(), message.size());
+	}
+	return false;
+}
+
+} // namespace ShaderError
 
 namespace HW {
 struct VertexShaderInfo;

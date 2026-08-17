@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -6,14 +7,10 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
-namespace Detail {
 
-bool Fail(std::string* error, const std::string& message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-	return false;
-}
+using ShaderError::Fail;
+
+namespace Detail {
 
 IR::Operand Translator::OffsetOperand(const IR::Operand& operand, uint32_t offset) {
 	if (offset == 0 || operand.kind != IR::OperandKind::Register) {
@@ -808,7 +805,7 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 			    return block.id;
 		    })->id;
 		if (max_id == UINT32_MAX) {
-			return Detail::Fail(error, "cannot allocate a typed prologue block id");
+			return Fail(error, "cannot allocate a typed prologue block id");
 		}
 		CFG::Terminator terminator;
 		terminator.kind       = CFG::TerminatorKind::Branch;
@@ -827,7 +824,7 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 	for (size_t index = 0; index < source.blocks.size(); index++) {
 		for (const auto successor: source.blocks[index].successors) {
 			if (successor >= source.blocks.size()) {
-				return Detail::Fail(error, "value IR block successor is out of range");
+				return Fail(error, "value IR block successor is out of range");
 			}
 			result.blocks[index + 1u]->AddBranch(result.blocks[successor + 1u]);
 		}

@@ -5,21 +5,10 @@
 
 namespace Libs::Graphics {
 
-namespace {
-
-bool Fail(std::string* error, const char* message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-	return false;
-}
-
-} // namespace
-
 bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
                               ShaderVertexMetadata& metadata, std::string* error) {
 	if (data.user_data == nullptr) {
-		return Fail(error, "missing AGC user-data header");
+		return ShaderError::Fail(error, "missing AGC user-data header");
 	}
 
 	ShaderUserData user_data {};
@@ -28,7 +17,8 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	constexpr uint32_t DirectResourceCount =
 	    static_cast<uint32_t>(AgcDirectResourceType::Last) + 1u;
 	if (user_data.direct_resource_count > DirectResourceCount) {
-		return Fail(error, "AGC direct-resource count exceeds the known resource domain");
+		return ShaderError::Fail(error,
+		                         "AGC direct-resource count exceeds the known resource domain");
 	}
 
 	std::array<uint16_t, DirectResourceCount> direct_offsets {};
@@ -36,7 +26,7 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	    static_cast<uint64_t>(user_data.direct_resource_count) * sizeof(uint16_t);
 	if (direct_size != 0) {
 		if (user_data.direct_resource_offset == nullptr) {
-			return Fail(error, "missing AGC direct-resource offsets");
+			return ShaderError::Fail(error, "missing AGC direct-resource offsets");
 		}
 		std::memcpy(direct_offsets.data(), user_data.direct_resource_offset, direct_size);
 	}
@@ -57,31 +47,31 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	}
 
 	if (next.vertex_attrib_reg >= 0 && next.vertex_buffer_reg < 0) {
-		return Fail(error, "vertex attribute table requires a vertex buffer table");
+		return ShaderError::Fail(error, "vertex attribute table requires a vertex buffer table");
 	}
 	if (next.vertex_buffer_reg < 0) {
 		metadata = next;
 		return true;
 	}
 	if (static_cast<uint32_t>(next.vertex_buffer_reg) + 1u >= max_user_sgprs) {
-		return Fail(error, "vertex table pointer exceeds the user-SGPR domain");
+		return ShaderError::Fail(error, "vertex table pointer exceeds the user-SGPR domain");
 	}
 	if (next.vertex_attrib_reg < 0) {
 		metadata = next;
 		return true;
 	}
 	if (static_cast<uint32_t>(next.vertex_attrib_reg) + 1u >= max_user_sgprs) {
-		return Fail(error, "vertex table pointer exceeds the user-SGPR domain");
+		return ShaderError::Fail(error, "vertex table pointer exceeds the user-SGPR domain");
 	}
 	if (data.num_input_semantics == 0 ||
 	    data.num_input_semantics > ShaderVertexInputInfo::RES_MAX) {
-		return Fail(error, "vertex semantic count is outside the supported domain");
+		return ShaderError::Fail(error, "vertex semantic count is outside the supported domain");
 	}
 
 	const auto semantic_size =
 	    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);
 	if (data.input_semantics == nullptr) {
-		return Fail(error, "missing vertex input semantics");
+		return ShaderError::Fail(error, "missing vertex input semantics");
 	}
 	std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);
 	next.input_semantics_count = data.num_input_semantics;

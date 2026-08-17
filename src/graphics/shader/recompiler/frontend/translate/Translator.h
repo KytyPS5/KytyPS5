@@ -18,8 +18,6 @@ struct ScalarMemorySourceValues {
 	IR::U32   offset;
 };
 
-bool Fail(std::string* error, const std::string& message);
-
 class Translator {
 public:
 	Translator(IR::ValueProgram& program, IR::Block* block, uint32_t vector_limit,

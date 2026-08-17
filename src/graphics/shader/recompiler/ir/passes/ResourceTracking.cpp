@@ -2,6 +2,7 @@
 
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -215,11 +216,9 @@ private:
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& reason) const {
-		if (error != nullptr) {
-			*error = fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
-			                     m_program.shader_hash, StageName(m_program.stage), pc, reason);
-		}
-		return false;
+		return ShaderError::Fail(
+		    error, fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
+		                       m_program.shader_hash, StageName(m_program.stage), pc, reason));
 	}
 
 	struct AddressPart {

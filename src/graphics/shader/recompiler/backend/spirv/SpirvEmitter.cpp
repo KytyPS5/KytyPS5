@@ -2,6 +2,7 @@
 
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -10,14 +11,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-namespace {
+using ShaderError::Fail;
 
-bool Fail(std::string* error, const std::string& message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-	return false;
-}
+namespace {
 
 bool ImageBinding(const IR::ImageResource& image, IR::DescriptorBindingKind& kind) {
 	using Kind = IR::DescriptorBindingKind;

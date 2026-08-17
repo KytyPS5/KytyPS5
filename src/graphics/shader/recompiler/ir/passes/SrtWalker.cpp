@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <bit>
@@ -314,10 +315,7 @@ private:
 	};
 
 	bool Fail(uint32_t pc, std::string* error, const std::string& message) const {
-		if (error != nullptr) {
-			*error = Diagnostic(m_program, pc, message);
-		}
-		return false;
+		return ShaderError::Fail(error, Diagnostic(m_program, pc, message));
 	}
 
 	bool Collect(Value value, uint32_t use_pc, std::string* error) {
@@ -434,10 +432,7 @@ public:
 
 private:
 	bool Fail(std::string* error, const std::string& message) const {
-		if (error != nullptr) {
-			*error = Diagnostic(m_program, m_use_pc, message);
-		}
-		return false;
+		return ShaderError::Fail(error, Diagnostic(m_program, m_use_pc, message));
 	}
 
 	bool EvaluateWide(Value value, uint64_t& result, std::string* error) {

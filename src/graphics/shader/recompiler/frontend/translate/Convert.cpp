@@ -109,6 +109,23 @@ bool Translator::TranslateConversion(const IR::Instruction& inst) {
 			WriteOperand(inst.dst, convert_i32(rounded));
 			return true;
 		}
+		case IR::Opcode::FrexpExpI32F32: {
+			const auto bits     = ir.BitCastU32(f32(0));
+			const auto exponent = IR::U32(
+			    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(23u), IR::Value(8u)}));
+			const auto mantissa  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x007fffffu)));
+			const auto normal    = ir.ISub(exponent, IR::U32(IR::Value(126u)));
+			const auto msb       = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {mantissa}));
+			const auto subnormal = ir.ISub(msb, IR::U32(IR::Value(148u)));
+			const auto denormal  = ir.Select(ir.INotEqual(mantissa, IR::U32(IR::Value(0u))),
+			                                 subnormal, IR::U32(IR::Value(0u)));
+			const auto finite    = ir.Select(
+			    ir.INotEqual(exponent, IR::U32(IR::Value(0xffu))),
+			    ir.Select(ir.INotEqual(exponent, IR::U32(IR::Value(0u))), normal, denormal),
+			    IR::U32(IR::Value(0u)));
+			WriteOperand(inst.dst, finite);
+			return true;
+		}
 		case IR::Opcode::ConvertI4ToOffsetF32: {
 			const auto nibble = IR::U32(
 			    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {u32(0), IR::Value(0u), IR::Value(4u)}));

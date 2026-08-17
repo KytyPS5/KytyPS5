@@ -151,6 +151,7 @@ enum class Opcode {
 	VCvtI16F16,
 	VCvtRpiI32F32,
 	VCvtFlrI32F32,
+	VFrexpExpI32F32,
 	VCvtOffF32I4,
 	VCvtF32Ubyte0,
 	VCvtF32Ubyte1,

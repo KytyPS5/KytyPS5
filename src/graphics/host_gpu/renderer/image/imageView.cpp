@@ -327,13 +327,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
-	normalized.aspect      = FullAspectMask(image.format);
-	if (normalized.aspect & vk::ImageAspectFlagBits::eDepth &&
-	    IsDepthViewFormat(normalized.format)) {
+	const auto  image_aspect = FullAspectMask(image.format);
+	if (image_aspect & vk::ImageAspectFlagBits::eDepth && IsDepthViewFormat(normalized.format)) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eDepth;
 	}
-	if (normalized.aspect & vk::ImageAspectFlagBits::eStencil &&
+	if (image_aspect & vk::ImageAspectFlagBits::eStencil &&
 	    IsStencilViewFormat(normalized.format)) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;

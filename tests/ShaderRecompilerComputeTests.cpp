@@ -2614,6 +2614,31 @@ public:
                 depth_attachment != depth_array &&
                 depth.views.views.size() == 3,
             "unified depth view cache lost sampled/attachment identity");
+
+    auto depth_stencil_info = depth_info;
+    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
+    depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
+    depth_stencil_info.bytes_per_block = 2;
+    Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
+                                        depth_stencil_info);
+    auto depth_only_info = depth_sampled;
+    depth_only_info.format = depth_stencil_info.pixel_format;
+    const auto depth_only = depth_stencil.FindView(depth_only_info);
+    auto combined_info = depth_only_info;
+    combined_info.aspect = vk::ImageAspectFlagBits::eDepth |
+                           vk::ImageAspectFlagBits::eStencil;
+    combined_info.mapping = {};
+    combined_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto combined = depth_stencil.FindView(combined_info);
+    Require(name, "depth/stencil aspects",
+            depth_only != nullptr && combined != nullptr &&
+                depth_only != combined && depth_stencil.views.views.size() == 2 &&
+                depth_stencil.views.views[0].info.aspect ==
+                    vk::ImageAspectFlagBits::eDepth &&
+                depth_stencil.views.views[1].info.aspect ==
+                    (vk::ImageAspectFlagBits::eDepth |
+                     vk::ImageAspectFlagBits::eStencil),
+            "explicit depth-only and combined aspects shared one image view");
     Require(name, "role-free backing",
             color.backing.image_type == vk::ImageType::e2D &&
                 color.backing.layers == 2 &&

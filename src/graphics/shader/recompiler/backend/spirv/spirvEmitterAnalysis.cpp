@@ -7,11 +7,10 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr) {
-	const auto* ps = state.pixel_input_info;
-	if (state.stage != ShaderType::Pixel || ps == nullptr) {
+	if (state.stage != ShaderType::Pixel) {
 		return attr;
 	}
-	return ShaderPixelParameterMappedLocation(*ps, attr);
+	return ShaderPixelParameterMappedLocation(*state.input_info.pixel, attr);
 }
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
@@ -22,16 +21,15 @@ uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
 			active_inputs[active_count++] = input.location;
 		}
 	}
-	return state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr
-	           ? ShaderPixelParameterLocation(*state.pixel_input_info,
+	return state.stage == ShaderType::Pixel
+	           ? ShaderPixelParameterLocation(*state.input_info.pixel,
 	                                          {active_inputs.data(), active_count}, attr)
 	           : attr;
 }
 
 bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr) {
-	const auto* ps = state.pixel_input_info;
-	return state.stage == ShaderType::Pixel && ps != nullptr &&
-	       ShaderPixelParameterIsFlat(*ps, attr);
+	return state.stage == ShaderType::Pixel &&
+	       ShaderPixelParameterIsFlat(*state.input_info.pixel, attr);
 }
 
 void SetError(std::string* error, const char* message) {

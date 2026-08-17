@@ -317,17 +317,16 @@ struct StorageImageDescriptors {
 };
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_)
-	    : program(program_), resources(resources_) {}
+	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
+	             ShaderStageInputInfo input_info_)
+	    : program(program_), resources(resources_), input_info(input_info_) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
 	const IR::ResourceSnapshot&                      resources;
-	const ShaderVertexInputInfo*                     vertex_input_info  = nullptr;
-	const ShaderPixelInputInfo*                      pixel_input_info   = nullptr;
-	const ShaderComputeInputInfo*                    compute_input_info = nullptr;
-	ShaderType                                       stage              = ShaderType::Unknown;
-	uint32_t                                         wave_size          = 64;
+	ShaderStageInputInfo                             input_info;
+	ShaderType                                       stage     = ShaderType::Unknown;
+	uint32_t                                         wave_size = 64;
 	bool                                             exact_subgroup_operations    = false;
 	bool                                             per_invocation_masks         = false;
 	uint32_t                                         void_type                    = 0;

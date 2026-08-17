@@ -1455,7 +1455,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.descriptor_set             = 0;
 	options.push_constant_offset       = 0;
-	options.vertex_input_info          = &input_info;
+	options.input_info.vertex          = &input_info;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
 	options.dump_label                 = "ShaderRecompiler VS";
@@ -1509,7 +1509,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.descriptor_set             = input_info.descriptor_set;
 	options.push_constant_offset       = input_info.push_constant_offset;
-	options.pixel_input_info           = &input_info;
+	options.input_info.pixel           = &input_info;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
 	options.dump_label                 = "ShaderRecompiler PS";
@@ -1559,7 +1559,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.descriptor_set             = 0;
 	options.push_constant_offset       = 0;
-	options.compute_input_info         = &input_info;
+	options.input_info.compute         = &input_info;
 	options.wave_size                  = input_info.wave_size;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;

@@ -336,9 +336,6 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
                                             uint32_t user_data_base, uint32_t user_data_count,
                                             uint32_t wave_size) {
 	EmbeddedFetchData data;
-	if (input_info == nullptr || !input_info->fetch_embedded) {
-		return data;
-	}
 	data.loads.reserve(input_info->resources_num);
 	int32_t offset_candidate = -1;
 	bool    offset_conflict  = false;
@@ -587,9 +584,6 @@ bool IsIrFetchPrologLoad(const IR::Instruction& inst) {
 
 int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo* input_info,
                                  const EmbeddedFetchLoad&     load) {
-	if (input_info == nullptr) {
-		return -1;
-	}
 	if (load.attrib_id >= 0 && load.attrib_id < input_info->resources_num &&
 	    input_info->resources_dst[load.attrib_id].attr_id == load.attrib_id) {
 		return load.attrib_id;
@@ -611,7 +605,7 @@ int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo* input_info,
 
 uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputInfo* input_info,
                                       const std::vector<EmbeddedFetchLoad>& loads) {
-	if (input_info == nullptr || loads.empty()) {
+	if (loads.empty()) {
 		return 0;
 	}
 
@@ -840,14 +834,20 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	const ShaderVertexInputInfo*  vertex  = nullptr;
+	const ShaderPixelInputInfo*   pixel   = nullptr;
+	const ShaderComputeInputInfo* compute = nullptr;
+	switch (options.stage) {
+		case ShaderType::Vertex: vertex = options.input_info.vertex; break;
+		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
+		case ShaderType::Compute: compute = options.input_info.compute; break;
+		default: break;
+	}
 	EmbeddedFetchData embedded_fetch;
-	if (options.stage == ShaderType::Vertex && options.vertex_input_info != nullptr &&
-	    options.vertex_input_info->fetch_embedded) {
-		embedded_fetch =
-		    DetectEmbeddedVertexFetch(decoded, options.vertex_input_info, ir.user_data_base,
-		                              ir.user_data_count, options.wave_size);
-		auto rewritten =
-		    RewriteEmbeddedVertexFetches(ir, options.vertex_input_info, embedded_fetch.loads);
+	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
+		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, ir.user_data_base,
+		                                           ir.user_data_count, options.wave_size);
+		auto rewritten = RewriteEmbeddedVertexFetches(ir, vertex, embedded_fetch.loads);
 		if (rewritten > 0 || !embedded_fetch.loads.empty()) {
 			LOGF("%s embedded vertex fetch rewrite: detected=%" PRIu64 " rewritten=%" PRIu32 "\n",
 			     GetDumpLabel(options), static_cast<uint64_t>(embedded_fetch.loads.size()),
@@ -859,15 +859,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		ir.fallback_reason = dispatcher_reason;
 	}
 
-	ShaderVertexInputInfo  default_vertex {};
-	ShaderPixelInputInfo   default_pixel {};
-	ShaderComputeInputInfo default_compute {};
-	const auto*            vertex =
-	    options.vertex_input_info != nullptr ? options.vertex_input_info : &default_vertex;
-	const auto* pixel =
-	    options.pixel_input_info != nullptr ? options.pixel_input_info : &default_pixel;
-	const auto* compute =
-	    options.compute_input_info != nullptr ? options.compute_input_info : &default_compute;
 	ir.values = std::make_shared<IR::ValueProgram>();
 	if (!Frontend::TranslateProgram(ir, *ir.values, vertex, pixel, compute, error)) {
 		return false;
@@ -962,8 +953,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	std::string           emit_error;
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	if (!Spirv::EmitProgram(ir, resources, options.vertex_input_info, options.pixel_input_info,
-	                        options.compute_input_info, spirv, &emit_error, options.dump_ir)) {
+	if (!Spirv::EmitProgram(ir, resources, options.input_info, spirv, &emit_error,
+	                        options.dump_ir)) {
 		LOGF("%s typed SPIR-V emit failed: %s\n", GetDumpLabel(options), emit_error.c_str());
 		if (dispatcher_fallback && error != nullptr) {
 			*error = fmt::format("dispatcher fallback failed after {}: {}",

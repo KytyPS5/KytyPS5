@@ -316,10 +316,8 @@ bool ProgramRequiresExactSubgroupSize(const IR::Program& program) {
 }
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
-                 const ShaderVertexInputInfo*  vertex_input_info,
-                 const ShaderPixelInputInfo*   pixel_input_info,
-                 const ShaderComputeInputInfo* compute_input_info, std::vector<uint32_t>& spirv,
-                 std::string* error, bool preserve_debug_values) {
+                 ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv, std::string* error,
+                 bool preserve_debug_values) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -345,21 +343,12 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 		SetError(error, "SPIR-V emitter requires planned typed SSA");
 		return false;
 	}
-	ShaderVertexInputInfo  default_vertex {};
-	ShaderPixelInputInfo   default_pixel {};
-	ShaderComputeInputInfo default_compute {};
-	const auto* vertex  = vertex_input_info != nullptr ? vertex_input_info : &default_vertex;
-	const auto* pixel   = pixel_input_info != nullptr ? pixel_input_info : &default_pixel;
-	const auto* compute = compute_input_info != nullptr ? compute_input_info : &default_compute;
 	(void)preserve_debug_values;
 	const auto& value_program = *program.values;
 	if (!IR::ValidateValueProgram(value_program, true, error)) {
 		return false;
 	}
-	EmitterState state(program, resources);
-	state.vertex_input_info    = vertex;
-	state.pixel_input_info     = pixel;
-	state.compute_input_info   = compute;
+	EmitterState state(program, resources, input_info);
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;

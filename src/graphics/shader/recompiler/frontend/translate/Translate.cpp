@@ -863,7 +863,7 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 		prologue.SetVccLo(IR::U32(IR::Value(0u)));
 		prologue.SetVccHi(IR::U32(IR::Value(0u)));
 		prologue.SetM0(IR::U32(IR::Value(0u)));
-		if (source.stage == ShaderType::Compute && compute_input_info != nullptr) {
+		if (source.stage == ShaderType::Compute) {
 			const auto* cs = compute_input_info;
 			const auto  thread_ids =
 			    cs->thread_ids_num > 0 ? std::min<uint32_t>(cs->thread_ids_num, 3u) : 0u;
@@ -897,7 +897,7 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 				    prologue.BitwiseOr(prologue.BitwiseOr(wave_bits, IR::U32(IR::Value(waves))),
 				                       first_bit));
 			}
-		} else if (source.stage == ShaderType::Pixel && pixel_input_info != nullptr) {
+		} else if (source.stage == ShaderType::Pixel) {
 			const auto* ps  = pixel_input_info;
 			uint32_t    reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
@@ -920,7 +920,7 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 				prologue.SetVectorReg(static_cast<IR::VectorReg>(reg),
 				                      builtin(IR::StageInputKind::FrontFacing));
 			}
-		} else if (source.stage == ShaderType::Vertex && vertex_input_info != nullptr) {
+		} else if (source.stage == ShaderType::Vertex) {
 			prologue.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			prologue.SetVectorReg(static_cast<IR::VectorReg>(8),

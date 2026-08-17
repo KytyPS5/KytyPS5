@@ -42,24 +42,15 @@ bool ValidateOptions(const Program& program, const ShaderInfoOptions& options, s
 	};
 	switch (program.stage) {
 		case ShaderType::Vertex:
-			if (options.vertex == nullptr) {
-				return Fail("vertex shader info requires vertex metadata");
-			}
 			if (options.vertex->resources_num < 0 ||
 			    options.vertex->resources_num > ShaderVertexInputInfo::RES_MAX) {
 				return Fail("vertex resource count is out of range");
 			}
 			return true;
 		case ShaderType::Pixel:
-			if (options.pixel == nullptr) {
-				return Fail("pixel shader info requires pixel metadata");
-			}
 			return options.pixel->input_num <= std::size(options.pixel->interpolator_settings) ||
 			       Fail("pixel input count is out of range");
 		case ShaderType::Compute:
-			if (options.compute == nullptr) {
-				return Fail("compute shader info requires compute metadata");
-			}
 			return (options.compute->thread_ids_num >= 0 && options.compute->thread_ids_num <= 3) ||
 			       Fail("compute thread ID count is out of range");
 		default: return Fail("unsupported shader stage for info collection");
@@ -83,7 +74,7 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 						return Fail("typed attribute reference is not constant");
 					}
 					if (program.stage == ShaderType::Vertex &&
-					    (inst.Arg(1).U32() >= 4u || options.vertex == nullptr ||
+					    (inst.Arg(1).U32() >= 4u ||
 					     inst.Arg(0).U32() >=
 					         static_cast<uint32_t>(options.vertex->resources_num))) {
 						return Fail("vertex input reference is out of range");
@@ -139,9 +130,6 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
                          ShaderInfo& info) {
 	AddInput(info, StageInputKind::VertexIndex, 0, 1, "gl_VertexIndex");
 	AddInput(info, StageInputKind::InstanceIndex, 0, 1, "gl_InstanceIndex");
-	if (vertex == nullptr) {
-		return;
-	}
 	uint32_t used_components[ShaderVertexInputInfo::RES_MAX] = {};
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
@@ -163,9 +151,6 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 }
 
 void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
-	if (pixel == nullptr) {
-		return;
-	}
 	if (pixel->HasPositionInput()) {
 		AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
 	}
@@ -178,19 +163,17 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 }
 
 void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& info) {
-	if (compute != nullptr) {
-		if (compute->group_id[0] || compute->group_id[1] || compute->group_id[2]) {
-			AddInput(info, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
-		}
-		if (compute->thread_ids_num > 0) {
-			AddInput(info, StageInputKind::LocalInvocationId, 0, 3, "gl_LocalInvocationID");
-		}
-		if (compute->thread_ids_num > 0 || compute->tg_size_en) {
-			AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
-		}
-		if (compute->dispatch_thread_dimensions) {
-			AddInput(info, StageInputKind::GlobalInvocationId, 0, 3, "gl_GlobalInvocationID");
-		}
+	if (compute->group_id[0] || compute->group_id[1] || compute->group_id[2]) {
+		AddInput(info, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
+	}
+	if (compute->thread_ids_num > 0) {
+		AddInput(info, StageInputKind::LocalInvocationId, 0, 3, "gl_LocalInvocationID");
+	}
+	if (compute->thread_ids_num > 0 || compute->tg_size_en) {
+		AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
+	}
+	if (compute->dispatch_thread_dimensions) {
+		AddInput(info, StageInputKind::GlobalInvocationId, 0, 3, "gl_GlobalInvocationID");
 	}
 }
 
@@ -238,11 +221,11 @@ void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, S
 			}
 			const auto& export_info = program.values->export_info[inst.Flags<ExportFlags>().index];
 			if (export_info.kind == ExportTargetKind::MrtZ) {
-				if (pixel != nullptr && (export_info.en & 0x1u) != 0 &&
+				if (program.stage == ShaderType::Pixel && (export_info.en & 0x1u) != 0 &&
 				    pixel->ps_depth_export_enable) {
 					AddOutput(info, StageOutputKind::Depth, 0, 0, "gl_FragDepth");
 				}
-				if (pixel != nullptr && (export_info.en & 0x4u) != 0 &&
+				if (program.stage == ShaderType::Pixel && (export_info.en & 0x4u) != 0 &&
 				    pixel->ps_sample_mask_export_enable) {
 					AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
 				}

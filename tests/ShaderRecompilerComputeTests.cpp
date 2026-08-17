@@ -1065,7 +1065,7 @@ CompiledShader CompileCase(const TestCase &test) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
-  options.compute_input_info = &test.compute_info;
+  options.input_info.compute = &test.compute_info;
   options.user_data = user_data.data();
   options.read_memory = ReadTestMemory;
   options.read_memory_data = const_cast<std::vector<u32> *>(&test.initial);
@@ -1157,8 +1157,7 @@ CompiledShader CompileCase(const TestCase &test) {
             "offset-only shader data did not use its storage fallback");
     std::vector<u32> storage_spirv;
     if (!ShaderRecompiler::Spirv::EmitProgram(
-            result.program, result.resources, nullptr, nullptr,
-            options.compute_input_info, storage_spirv, &error)) {
+            result.program, result.resources, options.input_info, storage_spirv, &error)) {
       Fail(test.name, "SPIR-V emit", error.c_str());
     }
     result.spirv = std::move(storage_spirv);
@@ -1231,7 +1230,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
   options.dump_ir = false;
-  options.pixel_input_info = &pixel_info;
+  options.input_info.pixel = &pixel_info;
   options.user_data = user_data.data();
 
   ShaderRecompiler::CompileResult result;
@@ -17149,8 +17148,8 @@ void CheckIndirectImageKeySwitch() {
   ShaderComputeInputInfo compute{};
   std::vector<u32> spirv;
   Require(name, "SPIR-V emit",
-          ShaderRecompiler::Spirv::EmitProgram(program, snapshot, nullptr,
-                                               nullptr, &compute, spirv, &error),
+          ShaderRecompiler::Spirv::EmitProgram(
+              program, snapshot, {.compute = &compute}, spirv, &error),
           error.c_str());
   ValidateSpirv(name, spirv);
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
@@ -18035,7 +18034,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     options.user_data_base = 0;
     options.user_data_count = static_cast<u32>(user_data.size());
     options.user_data = user_data.data();
-    options.compute_input_info = &compute;
+    options.input_info.compute = &compute;
     options.dump_ir = false;
     ShaderRecompiler::CompileResult result;
     std::string error;
@@ -18136,7 +18135,7 @@ void CheckEmbeddedFetchVertexOffset() {
     options.user_data_base = 8;
     options.user_data_count = static_cast<u32>(user_data.size());
     options.user_data = user_data.data();
-    options.vertex_input_info = &vertex;
+    options.input_info.vertex = &vertex;
 
     ShaderRecompiler::CompileResult result;
     std::string error;
@@ -20760,7 +20759,7 @@ void CheckEmbeddedFetchLaneSpill() {
   options.user_data_base = 8;
   options.user_data_count = static_cast<u32>(user_data.size());
   options.user_data = user_data.data();
-  options.vertex_input_info = &vertex;
+  options.input_info.vertex = &vertex;
 
   ShaderRecompiler::CompileResult result;
   std::string error;

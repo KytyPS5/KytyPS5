@@ -95,20 +95,19 @@ uint32_t EmitExportVec4U32(EmitterState& state, const IR::Instruction& inst) {
 }
 
 static bool MrtUsesUintOutput(const EmitterState& state, const IR::Instruction& inst) {
-	return inst.export_info.kind == IR::ExportTargetKind::Mrt &&
-	       state.pixel_input_info != nullptr &&
-	       inst.export_info.index < std::size(state.pixel_input_info->target_output_mode) &&
-	       state.pixel_input_info->target_output_mode[inst.export_info.index] == 7u;
+	return state.stage == ShaderType::Pixel && inst.export_info.kind == IR::ExportTargetKind::Mrt &&
+	       inst.export_info.index < std::size(state.input_info.pixel->target_output_mode) &&
+	       state.input_info.pixel->target_output_mode[inst.export_info.index] == 7u;
 }
 
 uint32_t ApplyMrtExportMapping(EmitterState& state, const IR::Instruction& inst, uint32_t value,
                                uint32_t vector_type) {
-	if (inst.export_info.kind != IR::ExportTargetKind::Mrt || state.pixel_input_info == nullptr ||
-	    inst.export_info.index >= state.pixel_input_info->target_export_mapping.size()) {
+	if (state.stage != ShaderType::Pixel || inst.export_info.kind != IR::ExportTargetKind::Mrt ||
+	    inst.export_info.index >= state.input_info.pixel->target_export_mapping.size()) {
 		return value;
 	}
 
-	const auto mapping = state.pixel_input_info->target_export_mapping[inst.export_info.index];
+	const auto mapping = state.input_info.pixel->target_export_mapping[inst.export_info.index];
 	if (mapping.IsIdentity()) {
 		return value;
 	}

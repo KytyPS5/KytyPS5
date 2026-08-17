@@ -59,13 +59,12 @@ uint32_t ConstantF32Value(EmitterState& state, float value) {
 }
 
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
-	if (state.stage != ShaderType::Vertex || state.vertex_input_info == nullptr ||
-	    location >= ShaderVertexInputInfo::RES_MAX ||
-	    location >= static_cast<uint32_t>(state.vertex_input_info->resources_num)) {
+	if (state.stage != ShaderType::Vertex || location >= ShaderVertexInputInfo::RES_MAX ||
+	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
 		return VertexInputScalarKind::Float;
 	}
 
-	switch (state.vertex_input_info->resources[location].Format()) {
+	switch (state.input_info.vertex->resources[location].Format()) {
 		case Prospero::BufferFormat::k8UInt:
 		case Prospero::BufferFormat::k16UInt:
 		case Prospero::BufferFormat::k8_8UInt:
@@ -92,12 +91,11 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 
 uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input) {
 	uint32_t count = input.component_count;
-	if (state.stage == ShaderType::Vertex && state.vertex_input_info != nullptr &&
-	    input.location < ShaderVertexInputInfo::RES_MAX &&
-	    input.location < static_cast<uint32_t>(state.vertex_input_info->resources_num) &&
-	    state.vertex_input_info->resources_dst[input.location].registers_num > 0) {
+	if (state.stage == ShaderType::Vertex && input.location < ShaderVertexInputInfo::RES_MAX &&
+	    input.location < static_cast<uint32_t>(state.input_info.vertex->resources_num) &&
+	    state.input_info.vertex->resources_dst[input.location].registers_num > 0) {
 		count = static_cast<uint32_t>(
-		    state.vertex_input_info->resources_dst[input.location].registers_num);
+		    state.input_info.vertex->resources_dst[input.location].registers_num);
 	}
 	return std::clamp(count, 1u, 4u);
 }
@@ -177,9 +175,9 @@ uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputS
 }
 
 static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
-	return state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr &&
-	       index < std::size(state.pixel_input_info->target_output_mode) &&
-	       state.pixel_input_info->target_output_mode[index] == 7u;
+	return state.stage == ShaderType::Pixel &&
+	       index < std::size(state.input_info.pixel->target_output_mode) &&
+	       state.input_info.pixel->target_output_mode[index] == 7u;
 }
 
 void AllocateInputVariables(EmitterState& state) {
@@ -260,8 +258,8 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 			}
-			if (state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr &&
-			    state.pixel_input_info->ps_no_perspective && !flat) {
+			if (state.stage == ShaderType::Pixel && state.input_info.pixel->ps_no_perspective &&
+			    !flat) {
 				state.builder.AddAnnotation(
 				    {OpDecorate, input.variable_id, DecorationNoPerspective});
 			}
@@ -521,15 +519,13 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
 	if (state.stage == ShaderType::Compute) {
-		uint32_t local_x = state.needs_compute_derivatives ? 2u : 1u;
-		uint32_t local_y = state.needs_compute_derivatives ? 2u : 1u;
-		uint32_t local_z = 1u;
-		if (state.compute_input_info != nullptr) {
-			const auto* cs = state.compute_input_info;
-			local_x        = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-			local_y        = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-			local_z        = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
-		}
+		uint32_t    local_x = state.needs_compute_derivatives ? 2u : 1u;
+		uint32_t    local_y = state.needs_compute_derivatives ? 2u : 1u;
+		uint32_t    local_z = 1u;
+		const auto* cs      = state.input_info.compute;
+		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		state.builder.AddExecutionMode(
 		    {state.main_func, ExecutionModeLocalSize, local_x, local_y, local_z});
 	}
@@ -538,10 +534,9 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode({state.main_func, ExecutionModeDepthReplacing});
 		}
-		if (state.pixel_input_info != nullptr && state.pixel_input_info->ps_early_z &&
-		    !state.pixel_input_info->ps_pixel_kill_enable &&
-		    !state.pixel_input_info->ps_depth_export_enable &&
-		    !state.pixel_input_info->ps_sample_mask_export_enable) {
+		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
+		    !state.input_info.pixel->ps_depth_export_enable &&
+		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode({state.main_func, ExecutionModeEarlyFragmentTests});
 		}
 	}

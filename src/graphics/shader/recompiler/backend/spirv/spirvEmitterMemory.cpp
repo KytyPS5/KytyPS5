@@ -496,7 +496,7 @@ uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index) {
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
-	return state.needs_function_lds ? 8192u : state.compute_input_info->lds_size_dwords;
+	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
 }
 
 uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index) {

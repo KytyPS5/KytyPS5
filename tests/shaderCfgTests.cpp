@@ -51,6 +51,29 @@ void Check(bool value, const char *text) {
   }
 }
 
+ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
+  static const ShaderVertexInputInfo vertex{};
+  static const ShaderPixelInputInfo pixel{};
+  static const ShaderComputeInputInfo compute{};
+
+  ShaderRecompiler::CompileOptions options;
+  options.stage = stage;
+  switch (stage) {
+  case ShaderType::Vertex:
+    options.input_info.vertex = &vertex;
+    break;
+  case ShaderType::Pixel:
+    options.input_info.pixel = &pixel;
+    break;
+  case ShaderType::Compute:
+    options.input_info.compute = &compute;
+    break;
+  default:
+    std::abort();
+  }
+  return options;
+}
+
 std::vector<uint32_t>
 CfgInstructionCoverage(const ShaderRecompiler::CFG::Graph &graph,
                        size_t instruction_count) {
@@ -1018,8 +1041,7 @@ void TestNewShaderRecompilerSMovB32() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -1063,8 +1085,7 @@ void TestNewShaderRecompilerSoppMarkers() {
       EncodeSopp(0x01, 0),    // s_endpgm
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -1113,8 +1134,7 @@ void TestNewShaderRecompilerSopkWaitcntMarkers() {
       EncodeSopp(0x01, 0),           // s_endpgm
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -1146,8 +1166,7 @@ void TestNewShaderRecompilerRdna2ScalarOpcodes() {
       EncodeSopp(0x01, 0), // s_endpgm
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -1220,8 +1239,7 @@ void TestNewShaderRecompilerScalarVectorAlu() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -1326,8 +1344,7 @@ void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
       EncodeSopp(0x01, 0),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -1605,8 +1622,7 @@ void TestNewShaderRecompilerMoreAluFamilies() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -2454,8 +2470,7 @@ void TestNewShaderRecompilerExpandedAluBatch() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -2540,8 +2555,7 @@ void TestNewShaderRecompilerVop3pPackedF16() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -2668,8 +2682,7 @@ void TestNewShaderRecompilerStagedShaderOps() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -2751,8 +2764,7 @@ void TestNewShaderRecompilerBootF16UnaryOpcodes() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -2825,10 +2837,9 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
   ps_info.ps_system_input_base = 9;
   ps_info.ps_pos_x = true;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
-  options.pixel_input_info = &ps_info;
+  options.input_info.pixel = &ps_info;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -2904,8 +2915,7 @@ void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -3064,8 +3074,7 @@ void TestNewShaderRecompilerScalarB64Alu() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -3230,8 +3239,7 @@ void TestNewShaderRecompilerSignedCompareAlu() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -3290,8 +3298,7 @@ void TestNewShaderRecompilerSignedMinShiftAlu() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -3348,8 +3355,7 @@ void TestNewShaderRecompilerScalarBitfieldAlu() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -3428,8 +3434,7 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
   Check(Common::ContainsStr(text, opcode_name),
         "decoder unsupported text did not include opcode name");
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   ShaderRecompiler::CompileResult result;
   Check(!ShaderRecompiler::TryRecompile(code, options, result, &error),
@@ -3630,8 +3635,7 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
   options.read_memory = ReadZeroTestMemory;
@@ -3732,8 +3736,7 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   raw_user_data[0] = 2u;
   raw_user_data[8] = 0x1003u;
 
-  ShaderRecompiler::CompileOptions raw_options;
-  raw_options.stage = ShaderType::Pixel;
+  auto raw_options = MakeCompileOptions(ShaderType::Pixel);
   raw_options.user_data = raw_user_data.data();
   raw_options.user_data_count = static_cast<uint32_t>(raw_user_data.size());
 
@@ -3785,8 +3788,7 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   buffer_user_data[8] = 0x2000u;
   buffer_user_data[10] = 4u;
 
-  ShaderRecompiler::CompileOptions buffer_options;
-  buffer_options.stage = ShaderType::Pixel;
+  auto buffer_options = MakeCompileOptions(ShaderType::Pixel);
   buffer_options.user_data = buffer_user_data.data();
   buffer_options.user_data_count =
       static_cast<uint32_t>(buffer_user_data.size());
@@ -3829,8 +3831,7 @@ void TestNewShaderRecompilerImageQueryLowering() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -3878,8 +3879,7 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
   };
 
   auto user_data = ImageTestUserData(Prospero::ImageType::kCube);
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data.data();
 
   ShaderRecompiler::CompileResult result;
@@ -3927,8 +3927,7 @@ void TestNewShaderRecompilerImageSampleVariants() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4019,8 +4018,7 @@ void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
   };
 
   auto user_data = ImageTestUserData(Prospero::ImageType::kColor3D);
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4066,8 +4064,7 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4104,8 +4101,7 @@ void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
     };
 
     auto user_data = ImageTestUserData();
-    ShaderRecompiler::CompileOptions options;
-    options.stage = ShaderType::Compute;
+    auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
     options.user_data = user_data.data();
 
@@ -4227,8 +4223,7 @@ void TestNewShaderRecompilerImageLoadA16UintCoords() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4274,9 +4269,8 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
     auto ps_info = RegressionPixelInputInfo();
 
     auto user_data = ImageTestUserData();
-    ShaderRecompiler::CompileOptions options;
-    options.stage = ShaderType::Pixel;
-    options.pixel_input_info = &ps_info;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &ps_info;
     options.dump_ir = true;
     options.user_data = user_data.data();
 
@@ -4382,9 +4376,8 @@ void TestNewShaderRecompilerImageViewDimensions() {
   SetImageTestType(&user_data, 9, Prospero::ImageType::kColor1D);
   SetImageTestFormat(&user_data, 9, Prospero::BufferFormat::k32UInt);
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
-  options.pixel_input_info = &ps_info;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4465,8 +4458,7 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   SetImageTestType(&user_data, 4, Prospero::ImageType::kColor1D);
   SetImageTestType(&user_data, 5, Prospero::ImageType::kColor1DArray);
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4501,8 +4493,7 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
   };
   std::array<uint32_t, 64> user_data{};
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data.data();
 
   ShaderRecompiler::CompileResult result;
@@ -4529,8 +4520,7 @@ void TestNewShaderRecompilerRejectsOneDimensionalGather() {
         0xbf810000u,
     };
     auto user_data = ImageTestUserData(type);
-    ShaderRecompiler::CompileOptions options;
-    options.stage = ShaderType::Compute;
+    auto options = MakeCompileOptions(ShaderType::Compute);
     options.user_data = user_data.data();
 
     ShaderRecompiler::CompileResult result;
@@ -4560,8 +4550,7 @@ void TestNewShaderRecompilerImageGatherVariants() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4650,8 +4639,7 @@ void TestNewShaderRecompilerImageLoadVariants() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4700,8 +4688,7 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
   user_data[5] |= 2u << 4u;
   user_data[6] |= 1u << 10u;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4745,8 +4732,7 @@ void TestNewShaderRecompilerImageStoreLowering() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4799,10 +4785,9 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   user_data[22] = 255u | (255u << 14u);
   user_data[23] = ImageTypeColor3D << 28u;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.compute_input_info = &input_info;
+  options.input_info.compute = &input_info;
   options.user_data = user_data.data();
 
   ShaderRecompiler::CompileResult result;
@@ -4853,10 +4838,9 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   user_data[22] = 255u | (255u << 14u);
   user_data[23] = ImageTypeColor2D << 28u;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.compute_input_info = &input_info;
+  options.input_info.compute = &input_info;
   options.user_data = user_data.data();
 
   ShaderRecompiler::CompileResult result;
@@ -4900,8 +4884,7 @@ void TestNewShaderRecompilerImageAtomicLowering() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -4968,9 +4951,8 @@ void TestNewShaderRecompilerVintrpLowering() {
   ps_info.input_num = 2;
   SetIdentityInterpolatorSettings(&ps_info);
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
-  options.pixel_input_info = &ps_info;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5015,7 +4997,7 @@ void TestNewShaderRecompilerVintrpLowering() {
   SetIdentityInterpolatorSettings(&remapped_ps_info);
   remapped_ps_info.interpolator_settings[2] = 3;
 
-  options.pixel_input_info = &remapped_ps_info;
+  options.input_info.pixel = &remapped_ps_info;
 
   ShaderRecompiler::CompileResult remapped_result;
   Check(ShaderRecompiler::TryRecompile(remapped_shader, options,
@@ -5041,7 +5023,7 @@ void TestNewShaderRecompilerVintrpLowering() {
   ShaderPixelInputInfo duplicate_ps_info{};
   duplicate_ps_info.input_num = 2;
 
-  options.pixel_input_info = &duplicate_ps_info;
+  options.input_info.pixel = &duplicate_ps_info;
 
   ShaderRecompiler::CompileResult duplicate_result;
   Check(ShaderRecompiler::TryRecompile(duplicate_location_shader, options,
@@ -5066,7 +5048,7 @@ void TestNewShaderRecompilerVintrpLowering() {
   SetIdentityInterpolatorSettings(&flat_ps_info);
   flat_ps_info.interpolator_settings[0] = 0x00000400u;
 
-  options.pixel_input_info = &flat_ps_info;
+  options.input_info.pixel = &flat_ps_info;
 
   ShaderRecompiler::CompileResult flat_result;
   Check(
@@ -5085,7 +5067,7 @@ void TestNewShaderRecompilerVintrpLowering() {
   no_perspective_ps_info.ps_no_perspective = true;
   SetIdentityInterpolatorSettings(&no_perspective_ps_info);
 
-  options.pixel_input_info = &no_perspective_ps_info;
+  options.input_info.pixel = &no_perspective_ps_info;
 
   ShaderRecompiler::CompileResult no_perspective_result;
   Check(ShaderRecompiler::TryRecompile(flat_shader, options,
@@ -5202,8 +5184,7 @@ void TestNewShaderRecompilerWideMemoryLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.flat_memory_base = 0;
 
@@ -5290,8 +5271,7 @@ void TestNewShaderRecompilerBufferSignedLoadLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5331,8 +5311,7 @@ void TestNewShaderRecompilerBufferSubDwordStoreLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5387,8 +5366,7 @@ void TestNewShaderRecompilerMubufFormatLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5437,8 +5415,7 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   user_data[2] = 5u;
   user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -5482,8 +5459,7 @@ void TestNewShaderRecompilerTypedBufferLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5538,8 +5514,7 @@ void TestNewShaderRecompilerFlatOldBackedLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.flat_memory_base = 0;
 
@@ -5573,8 +5548,7 @@ void TestNewShaderRecompilerUnbasedFlatRequiresTranslator() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -5595,8 +5569,7 @@ void TestNewShaderRecompilerFlatSignedLoadLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.flat_memory_base = 0;
 
@@ -5651,8 +5624,7 @@ void TestNewShaderRecompilerFlatStoreLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.flat_memory_base = 0;
 
@@ -5775,8 +5747,7 @@ void TestNewShaderRecompilerAtomicLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5907,8 +5878,7 @@ void TestNewShaderRecompilerDsReadWrite2Lowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -5977,8 +5947,7 @@ void TestNewShaderRecompilerDsSubDwordLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6046,8 +6015,7 @@ void TestNewShaderRecompilerDsWideAndAtomicLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6112,8 +6080,7 @@ void TestNewShaderRecompilerDsSwizzleLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6165,10 +6132,9 @@ void TestNewShaderRecompilerDsAddtidLowering() {
   ShaderComputeInputInfo input_info = RegressionComputeInputInfo();
   input_info.thread_ids_num = 1;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.compute_input_info = &input_info;
+  options.input_info.compute = &input_info;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -6208,8 +6174,7 @@ void TestNewShaderRecompilerDsFloatMinMaxLowering() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6247,8 +6212,7 @@ void TestNewShaderRecompilerCfgStraightLine() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6274,8 +6238,7 @@ void TestNewShaderRecompilerCfgIfElse() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6298,8 +6261,7 @@ void TestNewShaderRecompilerCfgTerminalExitMergePS() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6325,8 +6287,7 @@ void TestNewShaderRecompilerCfgPostEndTargetMergePS() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6362,8 +6323,7 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6395,8 +6355,7 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6422,8 +6381,7 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6472,8 +6430,7 @@ void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
             loop_header->inst_begin == loop_header->inst_end,
         "DS loop header still contains semantic instructions");
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6498,8 +6455,7 @@ void TestNewShaderRecompilerCfgLoopHeaderDsReadStructured() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6526,8 +6482,7 @@ void TestNewShaderRecompilerCfgSharedOuterAndLoopMerge() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6559,8 +6514,7 @@ void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6594,8 +6548,7 @@ void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6622,8 +6575,7 @@ void TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6709,8 +6661,7 @@ void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6733,8 +6684,7 @@ void TestNewShaderRecompilerCfgConditionalLatchNoSelection() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6760,8 +6710,7 @@ void TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6796,8 +6745,7 @@ void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -6845,8 +6793,7 @@ void TestNewShaderRecompilerCfgLoopGatewaySelection() {
             original_coverage,
         "loop gateway structurization duplicated semantic instructions");
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
@@ -6907,8 +6854,7 @@ void TestNewShaderRecompilerCfgConditionalLoopHeaderSelection() {
   Check(loop_headers == 1u && selection_headers == 1u,
         "guest conditional was not separated from the loop header");
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
@@ -6956,8 +6902,7 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
             continue_block->predecessors.size() == 2u,
         "canonical continue does not join both native latches");
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
@@ -6979,8 +6924,7 @@ void TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7074,8 +7018,7 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
 
   for (const auto lane_mode :
        {ShaderLaneMaskMode::NativeWave, ShaderLaneMaskMode::PerInvocation}) {
-    ShaderRecompiler::CompileOptions options;
-    options.stage = ShaderType::Compute;
+    auto options = MakeCompileOptions(ShaderType::Compute);
     options.lane_mask_mode = lane_mode;
     options.dump_ir = true;
     ShaderRecompiler::CompileResult result;
@@ -7149,8 +7092,7 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
           "structurization added a semantic block clone");
   }
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
@@ -7192,8 +7134,7 @@ void TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher() {
             original_coverage,
         "externally-entered selection handling duplicated semantic code");
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
@@ -7216,8 +7157,7 @@ void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7290,8 +7230,7 @@ void TestNewShaderRecompilerWave32MasksExecHighStores() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.wave_size = 32;
 
@@ -7317,8 +7256,7 @@ void TestNewShaderRecompilerWave32VccHighScalarStores() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.wave_size = 32;
 
@@ -7346,8 +7284,7 @@ void TestNewShaderRecompilerCompareMaskIsFullWaveBallot() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.wave_size = 32;
 
@@ -7384,8 +7321,7 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7426,8 +7362,7 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7478,8 +7413,7 @@ void TestNewShaderRecompilerBranchConditionForms() {
         0xbf810000u,
     };
 
-    ShaderRecompiler::CompileOptions options;
-    options.stage = ShaderType::Compute;
+    auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
 
     ShaderRecompiler::CompileResult result;
@@ -7507,8 +7441,7 @@ void TestNewShaderRecompilerSetpcBranch() {
       EncodeSMovB32(0, 129),       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7547,8 +7480,7 @@ void TestNewShaderRecompilerSetpcJumpTable() {
       0x00000000u, // table: target case 1 relative to pc 0x28
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7583,8 +7515,7 @@ void TestNewShaderRecompilerExpVertexOutputs() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Vertex;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7616,8 +7547,7 @@ void TestNewShaderRecompilerZeroInitialRegisterState() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Vertex;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7645,8 +7575,7 @@ void TestNewShaderRecompilerVertexSystemVgprs() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Vertex;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7682,8 +7611,7 @@ void TestNewShaderRecompilerVertexExportUsesLaneExecMask() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Vertex;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7727,8 +7655,7 @@ void TestNewShaderRecompilerPerInvocationMasks() {
       EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Vertex;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
   options.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
   options.dump_ir = true;
 
@@ -7795,8 +7722,7 @@ void TestNewShaderRecompilerPerInvocationU64Complement() {
       EncodeExp0(0x0c, 0xf),         EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01),
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Vertex;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
   options.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
   options.dump_ir = true;
 
@@ -7825,8 +7751,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
       0xbf810000u,
   };
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -7843,7 +7768,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
   ShaderPixelInputInfo uint16_info;
   uint16_info.target_output_mode[0] = 7;
-  options.pixel_input_info = &uint16_info;
+  options.input_info.pixel = &uint16_info;
   ShaderRecompiler::CompileResult uint16_result;
   Check(ShaderRecompiler::TryRecompile(shader, options, uint16_result, &error),
         error.c_str());
@@ -7865,7 +7790,8 @@ void TestNewShaderRecompilerExpPixelOutputs() {
       EncodeExp1(0, 1, 2, 3),
       0xbf810000u,
   };
-  options.pixel_input_info = nullptr;
+  ShaderPixelInputInfo default_info;
+  options.input_info.pixel = &default_info;
   ShaderRecompiler::CompileResult partial_result;
   Check(ShaderRecompiler::TryRecompile(partial_shader, options, partial_result,
                                        &error),
@@ -7878,7 +7804,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
   ShaderPixelInputInfo uint_info;
   uint_info.target_output_mode[0] = 7;
-  options.pixel_input_info = &uint_info;
+  options.input_info.pixel = &uint_info;
   ShaderRecompiler::CompileResult partial_uint_result;
   Check(ShaderRecompiler::TryRecompile(partial_shader, options,
                                        partial_uint_result, &error),
@@ -8045,9 +7971,8 @@ void TestRenderTargetReverseExportMapping() {
   ShaderPixelInputInfo reversed_info;
   reversed_info.target_export_mapping[0] = format.export_mapping;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
-  options.pixel_input_info = &identity_info;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &identity_info;
   ShaderRecompiler::CompileResult identity_result;
   std::string error;
   Check(
@@ -8056,7 +7981,7 @@ void TestRenderTargetReverseExportMapping() {
   Check(SpirvInstructionOpcodeCount(identity_result.spirv, 79u) == 0u,
         "identity MRT export unexpectedly added a component shuffle");
 
-  options.pixel_input_info = &reversed_info;
+  options.input_info.pixel = &reversed_info;
   ShaderRecompiler::CompileResult reversed_result;
   Check(
       ShaderRecompiler::TryRecompile(shader, options, reversed_result, &error),
@@ -8124,9 +8049,8 @@ void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   ps_info.ps_early_z = true;
   ps_info.ps_pixel_kill_enable = true;
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
-  options.pixel_input_info = &ps_info;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -8182,8 +8106,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   };
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
 
@@ -8237,7 +8160,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   const auto rejected_before = rejected_spirv;
   std::string rejected_error;
   Check(!ShaderRecompiler::Spirv::EmitProgram(
-            malformed, result.resources, nullptr, nullptr, nullptr,
+            malformed, result.resources, options.input_info,
             rejected_spirv, &rejected_error) &&
             rejected_spirv == rejected_before &&
             rejected_error.find("topology") != std::string::npos,
@@ -8258,7 +8181,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   rejected_spirv = rejected_before;
   rejected_error.clear();
   Check(!ShaderRecompiler::Spirv::EmitProgram(
-            result.program, stale_resources, nullptr, nullptr, nullptr,
+            result.program, stale_resources, options.input_info,
             rejected_spirv, &rejected_error) &&
             rejected_spirv == rejected_before &&
             rejected_error.find("specialized format") != std::string::npos,
@@ -8269,7 +8192,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   rejected_spirv = rejected_before;
   rejected_error.clear();
   Check(!ShaderRecompiler::Spirv::EmitProgram(
-            result.program, stale_dimension, nullptr, nullptr, nullptr,
+            result.program, stale_dimension, options.input_info,
             rejected_spirv, &rejected_error) &&
             rejected_spirv == rejected_before &&
             rejected_error.find("specialized dimension") != std::string::npos,
@@ -8293,7 +8216,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   rejected_spirv = rejected_before;
   rejected_error.clear();
   const bool rejected = !ShaderRecompiler::Spirv::EmitProgram(
-      result.program, result.resources, nullptr, nullptr, nullptr,
+      result.program, result.resources, options.input_info,
       rejected_spirv, &rejected_error);
   buffer_handle->SetFlags(dense);
   Check(rejected && rejected_spirv == rejected_before &&
@@ -8607,8 +8530,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
         "incorrectly");
 
   auto user_data = ImageTestUserData();
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Pixel;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data.data();
   ShaderRecompiler::CompileResult result;
   error.clear();
@@ -8945,9 +8867,8 @@ void TestNewShaderRecompilerStageInputInfo() {
   cs_info.thread_ids_num = 3;
   cs_info.dispatch_thread_dimensions = true;
 
-  ShaderRecompiler::CompileOptions cs_options;
-  cs_options.stage = ShaderType::Compute;
-  cs_options.compute_input_info = &cs_info;
+  auto cs_options = MakeCompileOptions(ShaderType::Compute);
+  cs_options.input_info.compute = &cs_info;
 
   ShaderRecompiler::CompileResult cs_result;
   std::string error;
@@ -8972,8 +8893,7 @@ void TestNewShaderRecompilerStageInputInfo() {
         "SPIR-V lacks LocalInvocationIndex BuiltIn decoration");
   CheckSpirvBinaryValidates(cs_result.spirv);
 
-  ShaderRecompiler::CompileOptions vs_options;
-  vs_options.stage = ShaderType::Vertex;
+  auto vs_options = MakeCompileOptions(ShaderType::Vertex);
 
   ShaderRecompiler::CompileResult vs_result;
   Check(ShaderRecompiler::TryRecompile(shader, vs_options, vs_result, &error),
@@ -8995,9 +8915,8 @@ void TestNewShaderRecompilerStageInputInfo() {
   ps_info.ps_pos_z = true;
   SetIdentityInterpolatorSettings(&ps_info);
 
-  ShaderRecompiler::CompileOptions ps_options;
-  ps_options.stage = ShaderType::Pixel;
-  ps_options.pixel_input_info = &ps_info;
+  auto ps_options = MakeCompileOptions(ShaderType::Pixel);
+  ps_options.input_info.pixel = &ps_info;
 
   ShaderRecompiler::CompileResult ps_result;
   Check(ShaderRecompiler::TryRecompile(shader, ps_options, ps_result, &error),
@@ -9019,7 +8938,7 @@ void TestNewShaderRecompilerStageInputInfo() {
   ps_pos_y_info.ps_system_input_base = 2;
   ps_pos_y_info.ps_pos_y = true;
   SetIdentityInterpolatorSettings(&ps_pos_y_info);
-  ps_options.pixel_input_info = &ps_pos_y_info;
+  ps_options.input_info.pixel = &ps_pos_y_info;
 
   ShaderRecompiler::CompileResult ps_pos_y_result;
   Check(ShaderRecompiler::TryRecompile(shader, ps_options, ps_pos_y_result,
@@ -9140,9 +9059,8 @@ void TestComputeLdsAllocationIdentity() {
   };
   ShaderComputeInputInfo append_info = RegressionComputeInputInfo();
   append_info.lds_size_dwords = 1152u;
-  ShaderRecompiler::CompileOptions append_options;
-  append_options.stage = ShaderType::Compute;
-  append_options.compute_input_info = &append_info;
+  auto append_options = MakeCompileOptions(ShaderType::Compute);
+  append_options.input_info.compute = &append_info;
   ShaderRecompiler::CompileResult append_result;
   std::string error;
   Check(ShaderRecompiler::TryRecompile(append_shader, append_options,
@@ -9250,8 +9168,7 @@ void TestNewShaderRecompilerFlatUserPointerProvenance() {
   };
   const uint32_t user_data[] = {0x34567000u, 0x00000012u};
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
   options.flat_memory_base = 0;
@@ -9288,8 +9205,7 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
   };
   const uint32_t user_data[] = {0x34567000u, 0u, 0x1000u};
 
-  ShaderRecompiler::CompileOptions options;
-  options.stage = ShaderType::Compute;
+  auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
   options.flat_memory_base = 0;

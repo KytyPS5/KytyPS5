@@ -159,9 +159,9 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 }
 
 bool MrtUsesUint(const EmitterState& state, const IR::ExportInfo& exp) {
-	return exp.kind == IR::ExportTargetKind::Mrt && state.pixel_input_info != nullptr &&
-	       exp.index < std::size(state.pixel_input_info->target_output_mode) &&
-	       state.pixel_input_info->target_output_mode[exp.index] == 7u;
+	return state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+	       exp.index < std::size(state.input_info.pixel->target_output_mode) &&
+	       state.input_info.pixel->target_output_mode[exp.index] == 7u;
 }
 
 uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t component) {
@@ -289,9 +289,9 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool uint_output = MrtUsesUint(state, exp);
 		const auto vector_type = uint_output ? state.vec4_uint_type : state.vec4_float_type;
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
-		if (exp.kind == IR::ExportTargetKind::Mrt && state.pixel_input_info != nullptr &&
-		    exp.index < state.pixel_input_info->target_export_mapping.size()) {
-			const auto mapping = state.pixel_input_info->target_export_mapping[exp.index];
+		if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
+			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
 			if (!mapping.IsIdentity()) {
 				const auto mapped = state.builder.AllocateId();
 				state.builder.AddFunction({OpVectorShuffle, vector_type, mapped, value, value,

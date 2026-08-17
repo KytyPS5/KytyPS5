@@ -35,9 +35,11 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -503,6 +505,12 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
+		static std::once_flag warning_once;
+		std::call_once(warning_once, [] {
+			std::printf("Warning: game uses unsupported graphics pipelines; some draw calls were "
+			            "skipped.\n");
+		});
+
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
 		if (log_id < 32) {
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32

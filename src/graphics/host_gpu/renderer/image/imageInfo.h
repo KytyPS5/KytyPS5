@@ -212,7 +212,6 @@ struct DepthFormatPolicy {
 	Prospero::DepthFormat     depth_format;
 	Prospero::BufferFormat    guest_format;
 	uint32_t                  bytes_per_element;
-	vk::Format                sampled_view_format;
 	vk::Format                depth_attachment_format;
 	std::array<vk::Format, 3> stencil_attachment_formats;
 };
@@ -221,13 +220,11 @@ inline constexpr std::array<DepthFormatPolicy, 2> DEPTH_FORMAT_POLICIES {{
     {Prospero::DepthFormat::kZ16,
      Prospero::BufferFormat::k16UNorm,
      2,
-     vk::Format::eR16Unorm,
      vk::Format::eD16Unorm,
      {vk::Format::eD16UnormS8Uint, vk::Format::eD24UnormS8Uint, vk::Format::eD32SfloatS8Uint}},
     {Prospero::DepthFormat::kZ32F,
      Prospero::BufferFormat::k32Float,
      4,
-     vk::Format::eR32Sfloat,
      vk::Format::eD32Sfloat,
      {vk::Format::eD32SfloatS8Uint, vk::Format::eUndefined, vk::Format::eUndefined}},
 }};
@@ -315,25 +312,6 @@ inline bool ImageInfo::IsDepth() const noexcept {
 
 [[nodiscard]] inline uint32_t EncodeD16AsD32(uint16_t value) noexcept {
 	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
-}
-
-[[nodiscard]] inline constexpr bool
-IsSupportedSampledDepthFormat(vk::Format image_format, Prospero::BufferFormat guest_format,
-                              vk::Format view_format) noexcept {
-	const auto* policy = FindGuestDepthFormatPolicy(guest_format);
-	return policy != nullptr && view_format == policy->sampled_view_format &&
-	       (image_format == policy->depth_attachment_format ||
-	        IsStencilAttachmentFormat(*policy, image_format));
-}
-
-[[nodiscard]] inline constexpr bool IsSupportedSampledDepthFormat(vk::Format image_format,
-                                                                  vk::Format view_format) noexcept {
-	for (const auto& policy: DEPTH_FORMAT_POLICIES) {
-		if (IsSupportedSampledDepthFormat(image_format, policy.guest_format, view_format)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {

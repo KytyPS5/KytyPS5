@@ -36,17 +36,6 @@ namespace {
 	}
 }
 
-[[nodiscard]] bool IsDepthViewFormat(vk::Format format) {
-	switch (format) {
-		case vk::Format::eD16Unorm:
-		case vk::Format::eR16Unorm:
-		case vk::Format::eD32Sfloat:
-		case vk::Format::eR32Sfloat:
-		case vk::Format::eR32Uint: return true;
-		default: return false;
-	}
-}
-
 [[nodiscard]] bool IsValidViewType(const VulkanImage& image, const ImageViewInfo& info) {
 	switch (image.image_type) {
 		case vk::ImageType::e1D:
@@ -328,7 +317,8 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
 	const auto  image_aspect = FullAspectMask(image.format);
-	if (image_aspect & vk::ImageAspectFlagBits::eDepth && IsDepthViewFormat(normalized.format)) {
+	if (image_aspect & vk::ImageAspectFlagBits::eDepth &&
+	    ImageViewOps::IsFormatDepthCompatible(normalized.format)) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eDepth;
 	}

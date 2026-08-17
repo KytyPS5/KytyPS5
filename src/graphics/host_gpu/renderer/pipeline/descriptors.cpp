@@ -316,8 +316,7 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	const bool encoding_ok =
 	    image != nullptr && IsSupportedDepthTextureEncoding(descriptor, *image);
 	const bool format_ok =
-	    image != nullptr &&
-	    IsSupportedSampledDepthFormat(image->info.pixel_format, descriptor.Format(), view_format);
+	    image != nullptr && IsSupportedSampledDepthFormat(image->info.pixel_format, view_format);
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}

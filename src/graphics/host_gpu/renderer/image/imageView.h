@@ -12,7 +12,24 @@ namespace ImageViewOps {
 
 [[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
 [[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
+
+[[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32Uint:
+		case vk::Format::eD16Unorm:
+		case vk::Format::eR16Unorm: return true;
+		default: return false;
+	}
+}
 } // namespace ImageViewOps
+
+[[nodiscard]] inline bool IsSupportedSampledDepthFormat(vk::Format image_format,
+                                                        vk::Format view_format) noexcept {
+	return DepthAspectTransferFormat(image_format) != vk::Format::eUndefined &&
+	       ImageViewOps::IsFormatDepthCompatible(view_format);
+}
 
 [[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle) noexcept {
 	if ((swizzle & ~0xfffu) != 0) {
@@ -86,21 +103,19 @@ SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t
 
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	return resource.kind == ShaderRecompiler::IR::ResourceKind::Image &&
-	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+	if (resource.kind != ShaderRecompiler::IR::ResourceKind::Image &&
+	    resource.kind != ShaderRecompiler::IR::ResourceKind::ImageUint) {
+		return false;
+	}
+	if (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint && resource.depth_compare) {
+		return false;
+	}
+	return (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic;
-}
-
-[[nodiscard]] inline bool
-IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	return resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint &&
-	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
-	       !resource.written && !resource.atomic && !resource.depth_compare;
 }
 
 inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_format,

@@ -7344,6 +7344,71 @@ public:
           "attachment");
       RenderExecutorTestAccess::ResetBindings(executor);
 
+      const auto sampled_width = depth_only.desc.info.extent.width - 1u;
+      const auto sampled_height = depth_only.desc.info.extent.height - 1u;
+      const auto sampled_address = depth_only_address >> 8u;
+      ShaderTextureResource sampled_depth_descriptor{};
+      sampled_depth_descriptor.fields[0] =
+          static_cast<uint32_t>(sampled_address);
+      sampled_depth_descriptor.fields[1] =
+          static_cast<uint32_t>(sampled_address >> 32u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u) |
+          ((sampled_width & 3u) << 30u);
+      sampled_depth_descriptor.fields[2] =
+          (sampled_width >> 2u) | (sampled_height << 14u);
+      sampled_depth_descriptor.fields[3] =
+          DstSel(4, 4, 4, 4) |
+          (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      sampled_depth_descriptor.fields[5] = 0x00700000u;
+      ShaderRecompiler::IR::DescriptorValue sampled_depth_value{};
+      std::copy(std::begin(sampled_depth_descriptor.fields),
+                std::end(sampled_depth_descriptor.fields),
+                sampled_depth_value.dwords.begin());
+      sampled_depth_value.dword_count = 8;
+      ShaderRecompiler::IR::ImageResource sampled_depth_resource{};
+      sampled_depth_resource.kind =
+          ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_depth_resource.dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled_depth_resource.read = true;
+      const auto sampled_depth_backing =
+          texture_cache.GetImage(depth_only.image_id).backing.image;
+      auto sampled_depth_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, sampled_depth_resource, sampled_depth_value);
+      const auto sampled_depth_view = texture_cache.FindTexture(
+          sampled_depth_binding.image_id, sampled_depth_binding.desc);
+      const auto &sampled_depth_image =
+          texture_cache.GetImage(sampled_depth_binding.image_id);
+      const bool normalized_depth_view = std::ranges::any_of(
+          sampled_depth_image.views.views, [&](const auto &cached) {
+            return cached.view == sampled_depth_view &&
+                   cached.info.format == vk::Format::eD32Sfloat &&
+                   cached.info.aspect == vk::ImageAspectFlagBits::eDepth &&
+                   cached.info.usage == vk::ImageUsageFlags{};
+          });
+      Require(
+          name, "R32 uint depth-backed view",
+          sampled_depth_binding.image_id == depth_only.image_id &&
+              sampled_depth_binding.desc.info.guest_format ==
+                  Prospero::BufferFormat::k32UInt &&
+              sampled_depth_binding.desc.info.pixel_format ==
+                  vk::Format::eR32Uint &&
+              sampled_depth_binding.desc.view_info.format ==
+                  vk::Format::eR32Uint &&
+              sampled_depth_binding.desc.view_info.aspect ==
+                  vk::ImageAspectFlagBits::eColor &&
+              sampled_depth_binding.desc.view_info.usage ==
+                  vk::ImageUsageFlagBits::eSampled &&
+              sampled_depth_image.info.pixel_format ==
+                  vk::Format::eD32Sfloat &&
+              sampled_depth_image.backing.format == vk::Format::eD32Sfloat &&
+              sampled_depth_image.backing.image == sampled_depth_backing &&
+              sampled_depth_view != nullptr && normalized_depth_view,
+          "uint T# did not retain its requested format while the concrete "
+          "view followed the D32 backing");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
       auto video_subresource =
           make_target_desc(base + 0x20000, target_mip_size, {1, 1, 1});
       video_subresource.type = BindingType::VideoOut;
@@ -16650,7 +16715,8 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   test.sampled_image_dwords_per_pixel = 1;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_2d"};
+  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+                         "OpImageFetch %v4uint"};
   return test;
 }
 
@@ -18398,7 +18464,7 @@ void CheckRenderTargetFormatContract() {
                                  DstSel(7, 6, 5, 3));
   } else if (std::strcmp(kind, "sampled-depth-format") == 0) {
     (void)SelectSampledDepthView(vk::Format::eD24UnormS8Uint,
-                                 vk::Format::eR32Sfloat, DstSel(4, 4, 4, 4));
+                                 vk::Format::eR8Unorm, DstSel(4, 4, 4, 4));
   } else if (std::strcmp(kind, "sampled-depth-swizzle") == 0) {
     (void)SelectSampledDepthView(vk::Format::eD32SfloatS8Uint,
                                  vk::Format::eR32Sfloat, DstSel(4, 5, 6, 7));
@@ -18767,12 +18833,19 @@ void CheckSampledDepthResource() {
       "array shader resource accepted a non-array descriptor view");
   resource = basic;
   resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
-  Require("SampledDepthResource", "integer rejected",
+  Require("SampledDepthResource", "integer read",
+          IsSupportedSampledDepthResource(resource),
+          "read-only uint depth resource was rejected");
+  resource.depth_compare = true;
+  Require("SampledDepthResource", "integer comparison rejected",
           !IsSupportedSampledDepthResource(resource),
-          "integer depth resource was accepted");
-  Require("SampledDepthResource", "integer reinterpret resource",
-          IsSupportedSampledDepthUintResource(resource),
-          "read-only uint depth reinterpretation resource was rejected");
+          "uint depth resource accepted comparison sampling");
+  Require("SampledDepthResource", "R32 uint depth view",
+          IsSupportedSampledDepthFormat(vk::Format::eD32Sfloat,
+                                        vk::Format::eR32Uint) &&
+              !IsSupportedSampledDepthFormat(vk::Format::eR32Uint,
+                                             vk::Format::eR32Uint),
+          "R32 uint depth-view compatibility diverged from its backing role");
   std::printf("[host]    %-32s ok\n", "SampledDepthResource");
 }
 

@@ -458,98 +458,6 @@ static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
 	::printf("return from main = %d\n", status);
 }
 
-enum class ThrdResult : int {
-	Success  = 0,
-	NoMem    = 1,
-	TimedOut = 2,
-	Busy     = 3,
-	Error    = 4,
-	Perm     = 5,
-};
-
-static int mtx_result(int result) {
-	return (result == OK ? static_cast<int>(ThrdResult::Success)
-	                     : static_cast<int>(ThrdResult::Error));
-}
-
-static KYTY_SYSV_ABI int MtxInit(LibKernel::PthreadMutex* mtx, int type) {
-	PRINT_NAME();
-
-	if (mtx == nullptr) {
-		return static_cast<int>(ThrdResult::Error);
-	}
-
-	constexpr int mtx_recursive = 0x100;
-	if ((type & mtx_recursive) == 0) {
-		return mtx_result(LibKernel::PthreadMutexInit(mtx, nullptr, nullptr));
-	}
-
-	LibKernel::PthreadMutexattr attr   = nullptr;
-	int                         result = LibKernel::PthreadMutexattrInit(&attr);
-	result = (result == OK ? LibKernel::PthreadMutexattrSettype(&attr, 2) : result);
-	result = (result == OK ? LibKernel::PthreadMutexInit(mtx, &attr, nullptr) : result);
-	(void)LibKernel::PthreadMutexattrDestroy(&attr);
-
-	return mtx_result(result);
-}
-
-static KYTY_SYSV_ABI int MtxInitWithName(LibKernel::PthreadMutex* mtx, int type,
-                                         const char* /*name*/) {
-	PRINT_NAME();
-
-	return MtxInit(mtx, type);
-}
-
-static KYTY_SYSV_ABI int MtxInitWithDefaultNameOverride(LibKernel::PthreadMutex* mtx, int type,
-                                                        const char* /*name*/) {
-	PRINT_NAME();
-
-	return MtxInit(mtx, type);
-}
-
-static KYTY_SYSV_ABI void MtxDestroy(LibKernel::PthreadMutex* mtx) {
-	PRINT_NAME();
-
-	if (mtx != nullptr) {
-		(void)LibKernel::PthreadMutexDestroy(mtx);
-	}
-}
-
-static KYTY_SYSV_ABI int MtxLock(LibKernel::PthreadMutex* mtx) {
-	PRINT_NAME();
-
-	return mtx_result(LibKernel::PthreadMutexLock(mtx));
-}
-
-static KYTY_SYSV_ABI int MtxTrylock(LibKernel::PthreadMutex* mtx) {
-	PRINT_NAME();
-
-	const auto result = LibKernel::PthreadMutexTrylock(mtx);
-	if (result == OK) {
-		return static_cast<int>(ThrdResult::Success);
-	}
-	return static_cast<int>(ThrdResult::Busy);
-}
-
-static KYTY_SYSV_ABI int MtxTimedlock(LibKernel::PthreadMutex* mtx, const void* /*xtime*/) {
-	PRINT_NAME();
-
-	return mtx_result(LibKernel::PthreadMutexLock(mtx));
-}
-
-static KYTY_SYSV_ABI int MtxUnlock(LibKernel::PthreadMutex* mtx) {
-	PRINT_NAME();
-
-	(void)LibKernel::PthreadMutexUnlock(mtx);
-	return static_cast<int>(ThrdResult::Success);
-}
-
-static KYTY_SYSV_ABI int MtxCurrentOwns(LibKernel::PthreadMutex* /*mtx*/) {
-	PRINT_NAME();
-
-	return 0;
-}
-
 using execute_once_func_t = KYTY_SYSV_ABI int (*)(void*, void*, void**);
 
 static std::mutex              g_execute_once_mutex;
@@ -907,15 +815,6 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
-	LIB_FUNC("YaHc3GS7y7g", LibC::MtxInit);
-	LIB_FUNC("tgioGpKtmbE", LibC::MtxInitWithName);
-	LIB_FUNC("JHp7ogc1+HY", LibC::MtxInitWithDefaultNameOverride);
-	LIB_FUNC("5Lf51jvohTQ", LibC::MtxDestroy);
-	LIB_FUNC("iS4aWbUonl0", LibC::MtxLock);
-	LIB_FUNC("k6pGNMwJB08", LibC::MtxTrylock);
-	LIB_FUNC("hPzYSd5Nasc", LibC::MtxTimedlock);
-	LIB_FUNC("gTuXQwP9rrs", LibC::MtxUnlock);
-	LIB_FUNC("VYQwFs4CC4Y", LibC::MtxCurrentOwns);
 }
 
 } // namespace Libs

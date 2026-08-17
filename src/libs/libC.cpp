@@ -540,7 +540,8 @@ static KYTY_SYSV_ABI int MtxTimedlock(LibKernel::PthreadMutex* mtx, const void* 
 static KYTY_SYSV_ABI int MtxUnlock(LibKernel::PthreadMutex* mtx) {
 	PRINT_NAME();
 
-	return mtx_result(LibKernel::PthreadMutexUnlock(mtx));
+	(void)LibKernel::PthreadMutexUnlock(mtx);
+	return static_cast<int>(ThrdResult::Success);
 }
 
 static KYTY_SYSV_ABI int MtxCurrentOwns(LibKernel::PthreadMutex* /*mtx*/) {

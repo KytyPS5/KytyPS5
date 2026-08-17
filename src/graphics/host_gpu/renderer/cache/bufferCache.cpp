@@ -257,11 +257,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
-	if (Gpu::IsGpuThread()) {
-		ReadMemoryOnGpu(vaddr, size, is_write);
-		return;
-	}
-	if (CommandScheduler::InDeferredOperation()) {
+	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);

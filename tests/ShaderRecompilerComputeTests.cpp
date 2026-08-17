@@ -1794,7 +1794,7 @@ public:
       gpu_thread = std::this_thread::get_id();
       Require("GpuCommandLane", "FIFO", order == 1,
               "synchronous command overtook an older host command");
-      Require("GpuCommandLane", "GPU context", Gpu::IsGpuThread(),
+      Require("GpuCommandLane", "GPU context", GuestGpu::IsGpuThread(),
               "host command did not run on the GPU thread");
       gpu.SendCommandSync(
           [&nested_thread] { nested_thread = std::this_thread::get_id(); });

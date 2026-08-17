@@ -13,7 +13,7 @@
 namespace Libs::Graphics {
 
 class CommandScheduler;
-class Gpu;
+class GuestGpu;
 
 class GpuResourceManager {
 public:
@@ -23,7 +23,7 @@ public:
 
 	[[nodiscard]] BufferCache&  GetBufferCache() { return m_buffer_cache; }
 	[[nodiscard]] TextureCache& GetTextureCache() { return m_texture_cache; }
-	void                        SetGpu(Gpu* gpu) noexcept { m_gpu = gpu; }
+	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -39,7 +39,7 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
-	Gpu*                      m_gpu = nullptr;
+	GuestGpu*                 m_gpu = nullptr;
 };
 
 } // namespace Libs::Graphics

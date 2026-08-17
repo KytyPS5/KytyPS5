@@ -24,7 +24,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 constexpr int AGC_USER_INTERRUPT_EVENT = 0x1800;
-class Gpu;
+class GuestGpu;
 
 class RenderContext {
 public:
@@ -35,7 +35,7 @@ public:
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
-	[[nodiscard]] Gpu&                      GetGpu() const;
+	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
@@ -67,7 +67,7 @@ private:
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	GpuResourceManager        m_gpu_resources;
-	std::unique_ptr<Gpu>      m_gpu;
+	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 
 	Common::Mutex                  m_eop_mutex;

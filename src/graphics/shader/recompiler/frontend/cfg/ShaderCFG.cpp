@@ -153,6 +153,9 @@ bool InstructionWritesScalarCode(const Instruction& inst, uint32_t code) {
 	return code >= dst_code && code < dst_code + count;
 }
 
+bool ScalarCodeWrittenInRange(const Decoder::Program& program, uint32_t begin_index,
+                              uint32_t end_index, uint32_t code);
+
 bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, uint32_t dst_code,
                        uint32_t* index) {
 	for (uint32_t i = before_index; i > 0; i--) {
@@ -193,8 +196,43 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 		const Decoder::Operand* offset      = nullptr;
 		int32_t                 imm         = 0;
 		uint32_t                getpc_index = 0;
-		if (!OtherScalarSource(candidate, base_code, &offset) || !IsImmediateSigned(*offset, imm) ||
+		if (adds) {
+			if (!OtherScalarSource(candidate, base_code, &offset)) {
+				return false;
+			}
+		} else {
+			if (!IsScalarCode(candidate.src0, base_code)) {
+				return false;
+			}
+			offset = &candidate.src1;
+		}
+		if (!IsImmediateSigned(*offset, imm) ||
 		    !FindPreviousGetpc(program, candidate_index, base_code, &getpc_index)) {
+			return false;
+		}
+
+		if (candidate_index + 1u >= before_index) {
+			return false;
+		}
+		const auto&             high       = program.instructions[candidate_index + 1u];
+		const Decoder::Operand* high_other = nullptr;
+		uint32_t                zero       = 0;
+		if (high.opcode != (adds ? Opcode::SAddcU32 : Opcode::SSubbU32) ||
+		    !IsScalarCode(high.dst, base_code + 1u)) {
+			return false;
+		}
+		if (adds) {
+			if (!OtherScalarSource(high, base_code + 1u, &high_other)) {
+				return false;
+			}
+		} else {
+			if (!IsScalarCode(high.src0, base_code + 1u)) {
+				return false;
+			}
+			high_other = &high.src1;
+		}
+		if (!IsImmediate(*high_other, zero) || zero != 0u ||
+		    ScalarCodeWrittenInRange(program, candidate_index + 2u, before_index, base_code + 1u)) {
 			return false;
 		}
 
@@ -206,13 +244,22 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 	return false;
 }
 
-bool FindPreviousScalarLoadPair(const Decoder::Program& program, uint32_t before_index,
-                                uint32_t dst_code, uint32_t* index) {
+bool AddSignedByteOffset(uint32_t base, uint32_t encoded_offset, uint32_t* address) {
+	const auto value = static_cast<int64_t>(base) + static_cast<int32_t>(encoded_offset);
+	if (address == nullptr || value < 0 || value > UINT32_MAX) {
+		return false;
+	}
+	*address = static_cast<uint32_t>(value);
+	return true;
+}
+
+bool FindPreviousScalarLoad(const Decoder::Program& program, uint32_t before_index,
+                            uint32_t dst_code, Opcode opcode, uint32_t* index) {
 	for (uint32_t i = before_index; i > 0; i--) {
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
 		if (InstructionWritesScalarCode(candidate, dst_code)) {
-			if (candidate.opcode == Opcode::SLoadDwordx2 && IsScalarCode(candidate.dst, dst_code)) {
+			if (candidate.opcode == opcode && IsScalarCode(candidate.dst, dst_code)) {
 				if (index != nullptr) {
 					*index = candidate_index;
 				}
@@ -225,8 +272,8 @@ bool FindPreviousScalarLoadPair(const Decoder::Program& program, uint32_t before
 }
 
 bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before_index,
-                                const Decoder::Operand& byte_offset_operand,
-                                uint32_t*               entry_count) {
+                                const Decoder::Operand& byte_offset_operand, uint32_t stride_shift,
+                                uint32_t* entry_count) {
 	if (entry_count == nullptr) {
 		return false;
 	}
@@ -248,7 +295,7 @@ bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before
 		const Decoder::Operand* shift_amount_operand = nullptr;
 		uint32_t                shift_amount         = 0;
 		if (!OtherScalarSource(shift, byte_offset_code, &shift_amount_operand) ||
-		    !IsImmediate(*shift_amount_operand, shift_amount) || shift_amount != 3u) {
+		    !IsImmediate(*shift_amount_operand, shift_amount) || shift_amount != stride_shift) {
 			return false;
 		}
 
@@ -264,10 +311,8 @@ bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before
 				return false;
 			}
 
-			const Decoder::Operand* clamp_other = nullptr;
-			uint32_t                max_index   = 0;
-			if (!OtherScalarSource(clamp, index_code, &clamp_other) ||
-			    !IsImmediate(*clamp_other, max_index)) {
+			uint32_t max_index = 0;
+			if (!IsImmediate(clamp.src0, max_index) && !IsImmediate(clamp.src1, max_index)) {
 				return false;
 			}
 			*entry_count = max_index + 1u;
@@ -332,7 +377,8 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	}
 
 	uint32_t load_index = 0;
-	if (!FindPreviousScalarLoadPair(program, setpc_index - 3u, offset_low_code, &load_index)) {
+	if (!FindPreviousScalarLoad(program, setpc_index - 3u, offset_low_code, Opcode::SLoadDwordx2,
+	                            &load_index)) {
 		return false;
 	}
 	const auto& load            = program.instructions[load_index];
@@ -342,12 +388,13 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	}
 
 	uint32_t table_pc = 0;
-	if (!ResolvePcRelativeBase(program, load_index, table_base_code, &table_pc)) {
+	if (!ResolvePcRelativeBase(program, load_index, table_base_code, &table_pc) ||
+	    !AddSignedByteOffset(table_pc, load.offset, &table_pc)) {
 		return false;
 	}
 
 	uint32_t entry_count = 0;
-	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, &entry_count)) {
+	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 3u, &entry_count)) {
 		return false;
 	}
 	uint32_t selector_code = UINT32_MAX;
@@ -357,8 +404,10 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	}
 
 	const uint32_t target_base = InstructionEndPc(getpc);
-	const uint32_t table_word  = table_pc / 4u;
-	if ((table_pc & 3u) != 0 || table_word + entry_count * 2u > program.code.size()) {
+	const size_t   table_word  = table_pc / 4u;
+	const size_t   table_words = static_cast<size_t>(entry_count) * 2u;
+	if ((table_pc & 3u) != 0 || table_word > program.code.size() ||
+	    table_words > program.code.size() - table_word) {
 		return false;
 	}
 
@@ -374,6 +423,92 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 		const auto target_pc = (target_base + low) & ~3u;
 		AddUniqueTargetPc(targets, target_pc);
 		selector_values.push_back(i * 8u);
+		selector_target_pcs.push_back(target_pc);
+	}
+	if (targets.empty()) {
+		return false;
+	}
+
+	info.indirect            = true;
+	info.pc_sgpr             = pc_reg;
+	info.selector_code       = selector_code;
+	info.table_load_pc       = load.pc;
+	info.target_pcs          = std::move(targets);
+	info.selector_values     = std::move(selector_values);
+	info.selector_target_pcs = std::move(selector_target_pcs);
+	return true;
+}
+
+bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_index,
+                                SetpcTargetInfo& info) {
+	if (setpc_index < 3u || setpc_index >= program.instructions.size()) {
+		return false;
+	}
+
+	const auto& setpc  = program.instructions[setpc_index];
+	uint32_t    pc_reg = 0;
+	if (setpc.opcode != Opcode::SSetpcB64 || setpc.src0.kind != Decoder::OperandKind::Sgpr ||
+	    !ScalarOperandCode(setpc.src0, pc_reg)) {
+		return false;
+	}
+	const auto& low_sub     = program.instructions[setpc_index - 2u];
+	const auto& high_sub    = program.instructions[setpc_index - 1u];
+	uint32_t    offset_code = 0;
+	uint32_t    zero        = 0;
+	if (low_sub.opcode != Opcode::SSubU32 || !IsScalarCode(low_sub.dst, pc_reg) ||
+	    !IsScalarCode(low_sub.src0, pc_reg) || !ScalarOperandCode(low_sub.src1, offset_code) ||
+	    high_sub.opcode != Opcode::SSubbU32 || !IsScalarCode(high_sub.dst, pc_reg + 1u) ||
+	    !IsScalarCode(high_sub.src0, pc_reg + 1u) || !IsImmediate(high_sub.src1, zero) ||
+	    zero != 0u || offset_code == pc_reg || offset_code == pc_reg + 1u) {
+		return false;
+	}
+
+	uint32_t load_index = 0;
+	if (!FindPreviousScalarLoad(program, setpc_index - 2u, offset_code, Opcode::SLoadDword,
+	                            &load_index)) {
+		return false;
+	}
+	const auto& load = program.instructions[load_index];
+	if (!IsScalarCode(load.src0, pc_reg)) {
+		return false;
+	}
+
+	uint32_t target_base = 0;
+	if (!ResolvePcRelativeBase(program, load_index, pc_reg, &target_base)) {
+		return false;
+	}
+	uint32_t table_pc = 0;
+	if (!AddSignedByteOffset(target_base, load.offset, &table_pc)) {
+		return false;
+	}
+
+	uint32_t entry_count = 0;
+	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 2u, &entry_count)) {
+		return false;
+	}
+	uint32_t selector_code = UINT32_MAX;
+	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
+		return false;
+	}
+
+	const size_t table_word = table_pc / 4u;
+	if ((table_pc & 3u) != 0 || table_word > program.code.size() ||
+	    entry_count > program.code.size() - table_word) {
+		return false;
+	}
+
+	std::vector<uint32_t> targets;
+	std::vector<uint32_t> selector_values;
+	std::vector<uint32_t> selector_target_pcs;
+	for (uint32_t i = 0; i < entry_count; i++) {
+		const uint32_t offset = program.code[table_word + i];
+		if (offset > target_base) {
+			return false;
+		}
+		const auto target_pc = (target_base - offset) & ~3u;
+		AddUniqueTargetPc(targets, target_pc);
+		selector_values.push_back(i * 4u);
 		selector_target_pcs.push_back(target_pc);
 	}
 	if (targets.empty()) {
@@ -436,6 +571,9 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
                          SetpcTargetInfo& info) {
 	info = {};
+	if (ResolveSetpcDwordJumpTable(program, setpc_index, info)) {
+		return true;
+	}
 	if (ResolveSetpcJumpTable(program, setpc_index, info)) {
 		return true;
 	}

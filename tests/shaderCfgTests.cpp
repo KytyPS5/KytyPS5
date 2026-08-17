@@ -7507,6 +7507,70 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerSetpcDwordJumpTable() {
+  const uint32_t shader[] = {
+      EncodeSop2(0x07, 106, 0, 130),   // s_min_u32 vcc_lo, s0, 2
+      EncodeSop2(0x1e, 106, 106, 130), // s_lshl_b32 vcc_lo, vcc_lo, 2
+      EncodeSop1(0x1f, 4, 0),          // s_getpc_b64 s[4:5]
+      EncodeSop2(0x00, 4, 4, 255),     // s_add_u32 s4, s4, literal
+      0x00000034u,
+      EncodeSop2(0x04, 5, 5, 128), // s_addc_u32 s5, s5, 0
+      EncodeSmem0(0x00, 6, 2),
+      (106u << 25u) | 4u,          // s_load_dword s6, s[4:5], vcc_lo offset:4
+      EncodeSopp(0x0c, 0),         // s_waitcnt 0
+      EncodeSop2(0x01, 4, 4, 6),   // s_sub_u32 s4, s4, s6
+      EncodeSop2(0x05, 5, 5, 128), // s_subb_u32 s5, s5, 0
+      EncodeSop1(0x20, 0, 4),      // s_setpc_b64 s[4:5]
+      EncodeSMovB32(1, 129),       // case 0
+      EncodeSopp(0x02, 1),
+      EncodeSMovB32(2, 129), // case 1
+      EncodeSopp(0x01, 0),
+      0u,
+      0x00000010u,
+      0x00000008u,
+      0x00000010u, // table at pc 0x44, targets relative backward from pc 0x40
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
+        "subtractive S_SETPC_B64 table did not select dispatcher fallback");
+  const auto jump = std::find_if(
+      result.program.values->block_info.begin(),
+      result.program.values->block_info.end(), [](const auto &block) {
+        return !block.terminator.indirect_targets.empty();
+      });
+  const auto block_pc = [&](uint32_t id) {
+    const auto block =
+        std::find_if(result.program.values->block_info.begin(),
+                     result.program.values->block_info.end(),
+                     [=](const auto &info) { return info.id == id; });
+    return block != result.program.values->block_info.end() ? block->start_pc
+                                                            : UINT32_MAX;
+  };
+  Check(jump != result.program.values->block_info.end() &&
+            jump->terminator.indirect_targets.size() == 2 &&
+            jump->terminator.indirect_target_pcs ==
+                std::vector<uint32_t>({0x30u, 0x38u}) &&
+            jump->terminator.indirect_selector_values ==
+                std::vector<uint32_t>({0u, 4u, 8u}) &&
+            jump->terminator.indirect_selector_targets.size() == 3 &&
+            block_pc(jump->terminator.indirect_selector_targets[0]) == 0x30u &&
+            block_pc(jump->terminator.indirect_selector_targets[1]) == 0x38u &&
+            block_pc(jump->terminator.indirect_selector_targets[2]) == 0x30u,
+        "subtractive S_SETPC_B64 table targets or selector mapping changed");
+  Check(!Common::ContainsStr(result.ir_dump, "SLoadDword"),
+        "subtractive S_SETPC_B64 table load reached normal IR");
+  Check(SpirvContainsOpcode(result.spirv, 251),
+        "subtractive S_SETPC_B64 dispatcher lacks OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerExpVertexOutputs() {
   const uint32_t shader[] = {
       EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
@@ -9280,6 +9344,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestNewShaderRecompilerSetpcJumpTable();
+  TestNewShaderRecompilerSetpcDwordJumpTable();
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexExportUsesLaneExecMask();
   TestNewShaderRecompilerPerInvocationU64Complement();

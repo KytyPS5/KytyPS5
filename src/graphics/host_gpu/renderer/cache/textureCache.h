@@ -119,6 +119,7 @@ private:
 	void UntrackImage(ImageId id);
 	void UntrackImageHead(ImageId id);
 	void UntrackImageTail(ImageId id);
+	void MarkAsMaybeDirty(ImageId id, Image& image);
 	void TrackImageDownload(ImageId id);
 	void TrackImageDownloadLocked(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,

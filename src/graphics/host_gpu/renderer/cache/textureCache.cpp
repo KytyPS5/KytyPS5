@@ -316,6 +316,14 @@ void TextureCache::TouchImage(Image& image) {
 	}
 }
 
+void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	image.MarkMaybeCpuDirty();
+	if (image.NeedsMaybeCpuHash()) {
+		image.SetMaybeCpuHash(image.HashGuestEdges());
+	}
+	UntrackImage(id);
+}
+
 void TextureCache::TrackImage(ImageId id) {
 	auto& image = ResolveImage(id);
 	if (!image.registered) {
@@ -399,11 +407,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	const auto size    = address - begin;
 	image.track_addr   = address;
 	if (image.track_addr == image.track_addr_end) {
-		image.MarkMaybeCpuDirty();
-		if (image.NeedsMaybeCpuHash()) {
-			image.SetMaybeCpuHash(image.HashGuestEdges());
-		}
-		UntrackImage(id);
+		MarkAsMaybeDirty(id, image);
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(begin, size);
@@ -420,11 +424,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	const auto size      = end - address;
 	image.track_addr_end = address;
 	if (image.track_addr == image.track_addr_end) {
-		image.MarkMaybeCpuDirty();
-		if (image.NeedsMaybeCpuHash()) {
-			image.SetMaybeCpuHash(image.HashGuestEdges());
-		}
-		UntrackImage(id);
+		MarkAsMaybeDirty(id, image);
 	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
@@ -1842,11 +1842,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		} else if (image_begin < page_begin) {
 			UntrackImageTail(id);
 		} else {
-			owner->MarkMaybeCpuDirty();
-			if (owner->NeedsMaybeCpuHash()) {
-				owner->SetMaybeCpuHash(owner->HashGuestEdges());
-			}
-			UntrackImage(id);
+			MarkAsMaybeDirty(id, *owner);
 		}
 	}
 }

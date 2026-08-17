@@ -52,17 +52,17 @@ uint32_t ProgramEndPc(const Decoder::Program& program) {
 }
 
 bool IsUnconditionalBranch(Opcode opcode) {
-	return opcode == Opcode::SBranch;
+	return opcode == Opcode::S_BRANCH;
 }
 
 bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
-		case Opcode::SCbranchScc0:
-		case Opcode::SCbranchScc1:
-		case Opcode::SCbranchVccz:
-		case Opcode::SCbranchVccnz:
-		case Opcode::SCbranchExecz:
-		case Opcode::SCbranchExecnz: return true;
+		case Opcode::S_CBRANCH_SCC0:
+		case Opcode::S_CBRANCH_SCC1:
+		case Opcode::S_CBRANCH_VCCZ:
+		case Opcode::S_CBRANCH_VCCNZ:
+		case Opcode::S_CBRANCH_EXECZ:
+		case Opcode::S_CBRANCH_EXECNZ: return true;
 		default: return false;
 	}
 }
@@ -73,13 +73,13 @@ bool IsBranch(Opcode opcode) {
 
 BranchCondition ConditionForOpcode(Opcode opcode) {
 	switch (opcode) {
-		case Opcode::SBranch: return BranchCondition::Always;
-		case Opcode::SCbranchScc0: return BranchCondition::SccZero;
-		case Opcode::SCbranchScc1: return BranchCondition::SccNonZero;
-		case Opcode::SCbranchVccz: return BranchCondition::VccZero;
-		case Opcode::SCbranchVccnz: return BranchCondition::VccNonZero;
-		case Opcode::SCbranchExecz: return BranchCondition::ExecZero;
-		case Opcode::SCbranchExecnz: return BranchCondition::ExecNonZero;
+		case Opcode::S_BRANCH: return BranchCondition::Always;
+		case Opcode::S_CBRANCH_SCC0: return BranchCondition::SccZero;
+		case Opcode::S_CBRANCH_SCC1: return BranchCondition::SccNonZero;
+		case Opcode::S_CBRANCH_VCCZ: return BranchCondition::VccZero;
+		case Opcode::S_CBRANCH_VCCNZ: return BranchCondition::VccNonZero;
+		case Opcode::S_CBRANCH_EXECZ: return BranchCondition::ExecZero;
+		case Opcode::S_CBRANCH_EXECNZ: return BranchCondition::ExecNonZero;
 		default: return BranchCondition::Unknown;
 	}
 }
@@ -161,7 +161,7 @@ bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, u
 	for (uint32_t i = before_index; i > 0; i--) {
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
-		if (candidate.opcode == Opcode::SGetpcB64 && IsScalarCode(candidate.dst, dst_code)) {
+		if (candidate.opcode == Opcode::S_GETPC_B64 && IsScalarCode(candidate.dst, dst_code)) {
 			if (index != nullptr) {
 				*index = candidate_index;
 			}
@@ -186,9 +186,9 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 			continue;
 		}
 		const bool adds =
-		    candidate.opcode == Opcode::SAddU32 || candidate.opcode == Opcode::SAddI32;
+		    candidate.opcode == Opcode::S_ADD_U32 || candidate.opcode == Opcode::S_ADD_I32;
 		const bool subs =
-		    candidate.opcode == Opcode::SSubU32 || candidate.opcode == Opcode::SSubI32;
+		    candidate.opcode == Opcode::S_SUB_U32 || candidate.opcode == Opcode::S_SUB_I32;
 		if (!adds && !subs) {
 			return false;
 		}
@@ -217,7 +217,7 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 		const auto&             high       = program.instructions[candidate_index + 1u];
 		const Decoder::Operand* high_other = nullptr;
 		uint32_t                zero       = 0;
-		if (high.opcode != (adds ? Opcode::SAddcU32 : Opcode::SSubbU32) ||
+		if (high.opcode != (adds ? Opcode::S_ADDC_U32 : Opcode::S_SUBB_U32) ||
 		    !IsScalarCode(high.dst, base_code + 1u)) {
 			return false;
 		}
@@ -288,7 +288,7 @@ bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before
 		if (!InstructionWritesScalarCode(shift, byte_offset_code)) {
 			continue;
 		}
-		if (shift.opcode != Opcode::SLshlB32 || !IsScalarCode(shift.dst, byte_offset_code)) {
+		if (shift.opcode != Opcode::S_LSHL_B32 || !IsScalarCode(shift.dst, byte_offset_code)) {
 			return false;
 		}
 
@@ -307,7 +307,7 @@ bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before
 			if (!InstructionWritesScalarCode(clamp, index_code)) {
 				continue;
 			}
-			if (clamp.opcode != Opcode::SMinU32 || !IsScalarCode(clamp.dst, index_code)) {
+			if (clamp.opcode != Opcode::S_MIN_U32 || !IsScalarCode(clamp.dst, index_code)) {
 				return false;
 			}
 
@@ -350,7 +350,7 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 
 	const auto& setpc  = program.instructions[setpc_index];
 	uint32_t    pc_reg = 0;
-	if (setpc.opcode != Opcode::SSetpcB64 || !ScalarOperandCode(setpc.src0, pc_reg) ||
+	if (setpc.opcode != Opcode::S_SETPC_B64 || !ScalarOperandCode(setpc.src0, pc_reg) ||
 	    setpc.src0.kind != Decoder::OperandKind::Sgpr) {
 		return false;
 	}
@@ -358,9 +358,9 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	const auto& getpc = program.instructions[setpc_index - 3u];
 	const auto& add   = program.instructions[setpc_index - 2u];
 	const auto& addc  = program.instructions[setpc_index - 1u];
-	if (getpc.opcode != Opcode::SGetpcB64 || !IsScalarCode(getpc.dst, pc_reg) ||
-	    add.opcode != Opcode::SAddU32 || !IsScalarCode(add.dst, pc_reg) ||
-	    addc.opcode != Opcode::SAddcU32 || !IsScalarCode(addc.dst, pc_reg + 1u)) {
+	if (getpc.opcode != Opcode::S_GETPC_B64 || !IsScalarCode(getpc.dst, pc_reg) ||
+	    add.opcode != Opcode::S_ADD_U32 || !IsScalarCode(add.dst, pc_reg) ||
+	    addc.opcode != Opcode::S_ADDC_U32 || !IsScalarCode(addc.dst, pc_reg + 1u)) {
 		return false;
 	}
 
@@ -377,7 +377,7 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	}
 
 	uint32_t load_index = 0;
-	if (!FindPreviousScalarLoad(program, setpc_index - 3u, offset_low_code, Opcode::SLoadDwordx2,
+	if (!FindPreviousScalarLoad(program, setpc_index - 3u, offset_low_code, Opcode::S_LOAD_DWORDX2,
 	                            &load_index)) {
 		return false;
 	}
@@ -447,7 +447,7 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 
 	const auto& setpc  = program.instructions[setpc_index];
 	uint32_t    pc_reg = 0;
-	if (setpc.opcode != Opcode::SSetpcB64 || setpc.src0.kind != Decoder::OperandKind::Sgpr ||
+	if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src0.kind != Decoder::OperandKind::Sgpr ||
 	    !ScalarOperandCode(setpc.src0, pc_reg)) {
 		return false;
 	}
@@ -455,16 +455,16 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	const auto& high_sub    = program.instructions[setpc_index - 1u];
 	uint32_t    offset_code = 0;
 	uint32_t    zero        = 0;
-	if (low_sub.opcode != Opcode::SSubU32 || !IsScalarCode(low_sub.dst, pc_reg) ||
+	if (low_sub.opcode != Opcode::S_SUB_U32 || !IsScalarCode(low_sub.dst, pc_reg) ||
 	    !IsScalarCode(low_sub.src0, pc_reg) || !ScalarOperandCode(low_sub.src1, offset_code) ||
-	    high_sub.opcode != Opcode::SSubbU32 || !IsScalarCode(high_sub.dst, pc_reg + 1u) ||
+	    high_sub.opcode != Opcode::S_SUBB_U32 || !IsScalarCode(high_sub.dst, pc_reg + 1u) ||
 	    !IsScalarCode(high_sub.src0, pc_reg + 1u) || !IsImmediate(high_sub.src1, zero) ||
 	    zero != 0u || offset_code == pc_reg || offset_code == pc_reg + 1u) {
 		return false;
 	}
 
 	uint32_t load_index = 0;
-	if (!FindPreviousScalarLoad(program, setpc_index - 2u, offset_code, Opcode::SLoadDword,
+	if (!FindPreviousScalarLoad(program, setpc_index - 2u, offset_code, Opcode::S_LOAD_DWORD,
 	                            &load_index)) {
 		return false;
 	}
@@ -531,7 +531,7 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 	}
 
 	const auto& setpc = program.instructions[setpc_index];
-	if (setpc.opcode != Opcode::SSetpcB64 || setpc.src0.kind != Decoder::OperandKind::Sgpr) {
+	if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src0.kind != Decoder::OperandKind::Sgpr) {
 		return false;
 	}
 
@@ -539,12 +539,12 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 	if (setpc_index >= 2u) {
 		const auto& arith = program.instructions[setpc_index - 1u];
 		const auto& getpc = program.instructions[setpc_index - 2u];
-		if (getpc.opcode == Opcode::SGetpcB64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
+		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
 		    getpc.dst.reg == pc_reg && arith.dst.kind == Decoder::OperandKind::Sgpr &&
 		    arith.dst.reg == pc_reg) {
 			uint32_t imm  = 0;
-			bool     adds = arith.opcode == Opcode::SAddU32 || arith.opcode == Opcode::SAddI32;
-			bool     subs = arith.opcode == Opcode::SSubU32 || arith.opcode == Opcode::SSubI32;
+			bool     adds = arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_ADD_I32;
+			bool     subs = arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32;
 			if ((adds || subs) &&
 			    (IsRegister(arith.src0, Decoder::OperandKind::Sgpr, pc_reg) ||
 			     IsRegister(arith.src1, Decoder::OperandKind::Sgpr, pc_reg)) &&
@@ -558,7 +558,7 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	if (setpc_index >= 1u) {
 		const auto& getpc = program.instructions[setpc_index - 1u];
-		if (getpc.opcode == Opcode::SGetpcB64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
+		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
 		    getpc.dst.reg == pc_reg) {
 			target = InstructionEndPc(getpc);
 			return true;
@@ -1619,7 +1619,7 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 	std::set<uint32_t> instruction_pcs;
 	for (const auto& inst: program.instructions) {
 		instruction_pcs.insert(inst.pc);
-		if (inst.opcode == Opcode::Unsupported) {
+		if (inst.opcode == Opcode::UNSUPPORTED) {
 			SetFailure(graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
 			           fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}",
 			                       inst.pc, Decoder::InstructionToString(inst).c_str()),
@@ -1649,7 +1649,7 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			if (next_pc <= end_pc) {
 				labels.insert(next_pc);
 			}
-		} else if (inst.opcode == Opcode::SSetpcB64) {
+		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
 				SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
@@ -1675,7 +1675,7 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			if (next_pc <= end_pc) {
 				labels.insert(next_pc);
 			}
-		} else if (inst.opcode == Opcode::SEndpgm) {
+		} else if (inst.opcode == Opcode::S_ENDPGM) {
 			labels.insert(next_pc);
 		}
 	}
@@ -1725,11 +1725,11 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 
 		const auto& last    = program.instructions[block.inst_end - 1u];
 		const auto  next_pc = InstructionEndPc(last);
-		if (last.opcode == Opcode::SEndpgm) {
+		if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind       = TerminatorKind::Branch;
 			block.terminator.condition  = BranchCondition::Always;
 			block.terminator.true_block = pc_to_block.at(end_pc);
-		} else if (last.opcode == Opcode::SSetpcB64) {
+		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {
 				block.terminator.kind                   = TerminatorKind::IndirectBranch;

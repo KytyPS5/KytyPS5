@@ -17,7 +17,7 @@ struct MimgSampleInfo {
 struct MimgGatherInfo {
 	uint32_t    encoding           = 0;
 	const char* name               = nullptr;
-	Opcode      decoded            = Opcode::Unsupported;
+	Opcode      decoded            = Opcode::UNSUPPORTED;
 	uint32_t    flags              = 0;
 	uint32_t    address_components = 3;
 };
@@ -25,7 +25,7 @@ struct MimgGatherInfo {
 struct MimgAtomicInfo {
 	uint32_t    encoding = 0;
 	const char* name     = nullptr;
-	Opcode      decoded  = Opcode::Unsupported;
+	Opcode      decoded  = Opcode::UNSUPPORTED;
 };
 
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
@@ -178,26 +178,26 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
-    {0x47u, "image_gather4_lz", Opcode::ImageGather4Lz, ImageSampleFlagLevelZero, 2u},
-    {0x48u, "image_gather4_c", Opcode::ImageGather4C, ImageSampleFlagCompare, 3u},
-    {0x4fu, "image_gather4_c_lz", Opcode::ImageGather4CLz,
+    {0x47u, "image_gather4_lz", Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero, 2u},
+    {0x48u, "image_gather4_c", Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare, 3u},
+    {0x4fu, "image_gather4_c_lz", Opcode::IMAGE_GATHER4_C_LZ,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero, 3u},
-    {0x57u, "image_gather4_lz_o", Opcode::ImageGather4LzO,
+    {0x57u, "image_gather4_lz_o", Opcode::IMAGE_GATHER4_LZ_O,
      ImageSampleFlagLevelZero | ImageSampleFlagOffset, 3u},
-    {0x58u, "image_gather4_c_o", Opcode::ImageGather4CO,
+    {0x58u, "image_gather4_c_o", Opcode::IMAGE_GATHER4_C_O,
      ImageSampleFlagCompare | ImageSampleFlagOffset, 4u},
-    {0x5fu, "image_gather4_c_lz_o", Opcode::ImageGather4CLzO,
+    {0x5fu, "image_gather4_c_lz_o", Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset, 4u},
-    {0x61u, "image_gather4h", Opcode::ImageGather4H, ImageSampleFlagGatherHorizontal, 2u},
+    {0x61u, "image_gather4h", Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal, 2u},
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x11u, "image_atomic_add", Opcode::ImageAtomicAdd},
-    {0x15u, "image_atomic_umin", Opcode::ImageAtomicUMin},
-    {0x17u, "image_atomic_umax", Opcode::ImageAtomicUMax},
-    {0x18u, "image_atomic_and", Opcode::ImageAtomicAnd},
-    {0x19u, "image_atomic_or", Opcode::ImageAtomicOr},
-    {0x1au, "image_atomic_xor", Opcode::ImageAtomicXor},
+    {0x11u, "image_atomic_add", Opcode::IMAGE_ATOMIC_ADD},
+    {0x15u, "image_atomic_umin", Opcode::IMAGE_ATOMIC_UMIN},
+    {0x17u, "image_atomic_umax", Opcode::IMAGE_ATOMIC_UMAX},
+    {0x18u, "image_atomic_and", Opcode::IMAGE_ATOMIC_AND},
+    {0x19u, "image_atomic_or", Opcode::IMAGE_ATOMIC_OR},
+    {0x1au, "image_atomic_xor", Opcode::IMAGE_ATOMIC_XOR},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
@@ -219,7 +219,7 @@ const MimgAtomicInfo* LookupAtomic(uint32_t opcode) {
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
                         const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
-		return Opcode::ImageSample;
+		return Opcode::IMAGE_SAMPLE;
 	}
 	if (gather != nullptr) {
 		return gather->decoded;
@@ -229,13 +229,13 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 	}
 
 	switch (opcode) {
-		case 0x00u: return Opcode::ImageLoad;
-		case 0x01u: return Opcode::ImageLoadMip;
-		case 0x08u: return Opcode::ImageStore;
-		case 0x09u: return Opcode::ImageStoreMip;
-		case 0x0eu: return Opcode::ImageGetResinfo;
-		case 0x60u: return Opcode::ImageGetLod;
-		default: return Opcode::Unsupported;
+		case 0x00u: return Opcode::IMAGE_LOAD;
+		case 0x01u: return Opcode::IMAGE_LOAD_MIP;
+		case 0x08u: return Opcode::IMAGE_STORE;
+		case 0x09u: return Opcode::IMAGE_STORE_MIP;
+		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
+		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		default: return Opcode::UNSUPPORTED;
 	}
 }
 
@@ -327,7 +327,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
 
-	if (inst.opcode == Opcode::Unsupported) {
+	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
 	}
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {

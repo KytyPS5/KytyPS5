@@ -14,7 +14,7 @@ void DecodeExp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
 	inst.word_count = 2;
 	inst.family     = Family::EXP;
 	inst.opcode_id  = target;
-	inst.opcode     = Opcode::Exp;
+	inst.opcode     = Opcode::EXP;
 	inst.exp.target = target;
 	inst.exp.en     = en;
 	inst.exp.compr  = ((word0 >> 10u) & 1u) != 0;

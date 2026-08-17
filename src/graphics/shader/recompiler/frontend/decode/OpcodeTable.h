@@ -11,7 +11,7 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail {
 
 struct OpcodeMap {
 	uint32_t encoding = 0;
-	Opcode   decoded  = Opcode::Unknown;
+	Opcode   decoded  = Opcode::UNKNOWN;
 };
 
 template <typename Entry, size_t EncodingCount, size_t EntryCount>
@@ -48,7 +48,7 @@ template <typename Entry, size_t EncodingCount, size_t EntryCount>
 constexpr Opcode LookupOpcode(const OpcodeTable<Entry, EncodingCount, EntryCount>& table,
                               uint32_t                                             encoding) {
 	const auto* entry = FindOpcode(table, encoding);
-	return entry != nullptr ? entry->decoded : Opcode::Unsupported;
+	return entry != nullptr ? entry->decoded : Opcode::UNSUPPORTED;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail

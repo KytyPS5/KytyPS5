@@ -227,19 +227,19 @@ uint32_t DecodedDstSize(const Decoder::Instruction& inst) {
 }
 
 uint32_t EmbeddedFetchDstSize(const Decoder::Instruction& inst) {
-	return inst.opcode == Decoder::Opcode::VMadU64U32 ? 2u : DecodedDstSize(inst);
+	return inst.opcode == Decoder::Opcode::V_MAD_U64_U32 ? 2u : DecodedDstSize(inst);
 }
 
 bool EmbeddedFetchHasBranch(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SSetpcB64:
-		case Decoder::Opcode::SBranch:
-		case Decoder::Opcode::SCbranchScc0:
-		case Decoder::Opcode::SCbranchScc1:
-		case Decoder::Opcode::SCbranchVccz:
-		case Decoder::Opcode::SCbranchVccnz:
-		case Decoder::Opcode::SCbranchExecz:
-		case Decoder::Opcode::SCbranchExecnz: return true;
+		case Decoder::Opcode::S_SETPC_B64:
+		case Decoder::Opcode::S_BRANCH:
+		case Decoder::Opcode::S_CBRANCH_SCC0:
+		case Decoder::Opcode::S_CBRANCH_SCC1:
+		case Decoder::Opcode::S_CBRANCH_VCCZ:
+		case Decoder::Opcode::S_CBRANCH_VCCNZ:
+		case Decoder::Opcode::S_CBRANCH_EXECZ:
+		case Decoder::Opcode::S_CBRANCH_EXECNZ: return true;
 		default: return false;
 	}
 }
@@ -288,32 +288,32 @@ bool TryDecodedSmemOffset(const std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
 
 bool IsEmbeddedFetchSLoad(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::SLoadDword:
-		case Decoder::Opcode::SLoadDwordx2:
-		case Decoder::Opcode::SLoadDwordx4:
-		case Decoder::Opcode::SLoadDwordx8:
-		case Decoder::Opcode::SLoadDwordx16: return true;
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16: return true;
 		default: return false;
 	}
 }
 
 bool IsEmbeddedFetchBufferLoad(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::BufferLoadFormatX:
-		case Decoder::Opcode::BufferLoadFormatXy:
-		case Decoder::Opcode::BufferLoadFormatXyz:
-		case Decoder::Opcode::BufferLoadFormatXyzw: return true;
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW: return true;
 		default: return false;
 	}
 }
 
 bool IsEmbeddedFetchAttribPropagationAlu(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::SBfeU32:
-		case Decoder::Opcode::SAndB32:
-		case Decoder::Opcode::SAddI32:
-		case Decoder::Opcode::SAddU32:
-		case Decoder::Opcode::SLshlB32: return true;
+		case Decoder::Opcode::S_BFE_U32:
+		case Decoder::Opcode::S_AND_B32:
+		case Decoder::Opcode::S_ADD_I32:
+		case Decoder::Opcode::S_ADD_U32:
+		case Decoder::Opcode::S_LSHL_B32: return true;
 		default: return false;
 	}
 }
@@ -373,10 +373,11 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		uint32_t   sad_zero = 0;
 		const bool vertex_offset_add =
 		    vertex_index_accumulator && IsDecodedSgpr(inst.src0) &&
-		    ((inst.opcode == Decoder::Opcode::VAddI32 && IsDecodedVgpr(inst.src1) &&
+		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && inst.dst.reg == 5 && inst.opcode == Decoder::Opcode::VSadU32 &&
-		      IsDecodedVgpr(inst.src2) && inst.src2.reg == inst.dst.reg &&
+		     (user_data_base == 8 && inst.dst.reg == 5 &&
+		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
+		      inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
 		if (data.loads.empty() && vertex_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
@@ -389,7 +390,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 			}
 		}
 		switch (inst.opcode) {
-			case Decoder::Opcode::VWritelaneB32: {
+			case Decoder::Opcode::V_WRITELANE_B32: {
 				uint32_t lane = 0;
 				if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
 					vgprs[inst.dst.reg] = {};
@@ -405,7 +406,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 				}
 				break;
 			}
-			case Decoder::Opcode::VReadlaneB32: {
+			case Decoder::Opcode::V_READLANE_B32: {
 				uint32_t lane = 0;
 				if (track_vector_lanes && IsDecodedSgpr(inst.dst) &&
 				    DecodedSgprReg(inst.dst) < sgprs.size() && IsDecodedVgpr(inst.src0) &&
@@ -419,7 +420,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 				}
 				break;
 			}
-			case Decoder::Opcode::SMovB32:
+			case Decoder::Opcode::S_MOV_B32:
 				if (IsDecodedSgpr(inst.dst) && IsDecodedSgpr(inst.src0) &&
 				    DecodedSgprReg(inst.src0) < sgprs.size()) {
 					sgprs[DecodedSgprReg(inst.dst)] = sgprs[DecodedSgprReg(inst.src0)];
@@ -435,7 +436,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 					}
 				}
 				break;
-			case Decoder::Opcode::SMovkI32:
+			case Decoder::Opcode::S_MOVK_I32:
 				if (IsDecodedSgpr(inst.dst)) {
 					auto& dst = sgprs[DecodedSgprReg(inst.dst)];
 					dst.type  = EmbeddedFetchValueType::Constant;
@@ -496,7 +497,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 					} else {
 						ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
 					}
-				} else if (inst.opcode == Decoder::Opcode::VCndmaskB32) {
+				} else if (inst.opcode == Decoder::Opcode::V_CNDMASK_B32) {
 					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
 						ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg);
 					}
@@ -518,11 +519,11 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 							auto& dst = sgprs[DecodedSgprReg(inst.dst)];
 							dst.type  = EmbeddedFetchValueType::Constant;
 							switch (inst.opcode) {
-								case Decoder::Opcode::SAndB32: dst.value = src0 & src1; break;
-								case Decoder::Opcode::SLshlB32:
+								case Decoder::Opcode::S_AND_B32: dst.value = src0 & src1; break;
+								case Decoder::Opcode::S_LSHL_B32:
 									dst.value = src0 << (src1 & 31u);
 									break;
-								case Decoder::Opcode::SBfeU32:
+								case Decoder::Opcode::S_BFE_U32:
 									dst.value = src0 >> (src1 & 31u);
 									break;
 								default: dst.value = src0 + src1; break;
@@ -551,9 +552,9 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 				}
 				break;
 		}
-		if (inst.opcode == Decoder::Opcode::VMovreldB32) {
+		if (inst.opcode == Decoder::Opcode::V_MOVRELD_B32) {
 			vector_lanes.clear();
-		} else if (inst.opcode != Decoder::Opcode::VWritelaneB32 && IsDecodedVgpr(inst.dst)) {
+		} else if (inst.opcode != Decoder::Opcode::V_WRITELANE_B32 && IsDecodedVgpr(inst.dst)) {
 			for (uint32_t i = 0; i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgprs.size();
 			     i++) {
 				ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg + i);

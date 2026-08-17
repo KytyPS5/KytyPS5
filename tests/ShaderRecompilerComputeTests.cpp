@@ -1050,8 +1050,8 @@ CompiledShader CompileCase(const TestCase &test) {
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
       std::any_of(test.opcodes.begin(), test.opcodes.end(), [](auto op) {
-        return op >= ShaderOpcode::ImageGetResinfo &&
-               op <= ShaderOpcode::ImageGather4H;
+        return op >= ShaderOpcode::IMAGE_GET_RESINFO &&
+               op <= ShaderOpcode::IMAGE_GATHER4H;
       });
   if (uses_image && ((user_data[3] >> 28u) & 0xfu) == 0) {
     user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
@@ -10586,273 +10586,273 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   }
 
   switch (opcode) {
-  case Opcode::SGetpcB64:
-  case Opcode::SSetpcB64:
-  case Opcode::SNop:
-  case Opcode::SWaitcnt:
-  case Opcode::SBarrier:
-  case Opcode::SBranch:
-  case Opcode::SCbranchScc0:
-  case Opcode::SCbranchScc1:
-  case Opcode::SCbranchVccz:
-  case Opcode::SCbranchVccnz:
-  case Opcode::SCbranchExecz:
-  case Opcode::SCbranchExecnz:
-  case Opcode::SSendmsg:
-  case Opcode::SSetregB32:
-  case Opcode::SSleep:
-  case Opcode::STtraceData:
-  case Opcode::SInstPrefetch:
-  case Opcode::SEndpgm:
+  case Opcode::S_GETPC_B64:
+  case Opcode::S_SETPC_B64:
+  case Opcode::S_NOP:
+  case Opcode::S_WAITCNT:
+  case Opcode::S_BARRIER:
+  case Opcode::S_BRANCH:
+  case Opcode::S_CBRANCH_SCC0:
+  case Opcode::S_CBRANCH_SCC1:
+  case Opcode::S_CBRANCH_VCCZ:
+  case Opcode::S_CBRANCH_VCCNZ:
+  case Opcode::S_CBRANCH_EXECZ:
+  case Opcode::S_CBRANCH_EXECNZ:
+  case Opcode::S_SENDMSG:
+  case Opcode::S_SETREG_B32:
+  case Opcode::S_SLEEP:
+  case Opcode::S_TTRACEDATA:
+  case Opcode::S_INST_PREFETCH:
+  case Opcode::S_ENDPGM:
     return CoverageClass::ControlOrMarker;
 
-  case Opcode::VAddF32:
-  case Opcode::VSubF32:
-  case Opcode::VSubrevF32:
-  case Opcode::VMulF32:
-  case Opcode::VMacF32:
-  case Opcode::VMadmkF32:
-  case Opcode::VMadakF32:
-  case Opcode::VMinF32:
-  case Opcode::VMaxF32:
-  case Opcode::VMadF32:
-  case Opcode::VFmaF32:
-  case Opcode::VMin3F32:
-  case Opcode::VMax3F32:
-  case Opcode::VMed3F32:
-  case Opcode::VDot2cF32F16:
-  case Opcode::VCvtF32I32:
-  case Opcode::VCvtF32U32:
-  case Opcode::VCvtU32F32:
-  case Opcode::VCvtI32F32:
-  case Opcode::VCvtF16F32:
-  case Opcode::VCvtF32F16:
-  case Opcode::VCvtU16F16:
-  case Opcode::VCvtRpiI32F32:
-  case Opcode::VCvtFlrI32F32:
-  case Opcode::VCvtOffF32I4:
-  case Opcode::VCvtF32Ubyte0:
-  case Opcode::VCvtF32Ubyte1:
-  case Opcode::VCvtF32Ubyte2:
-  case Opcode::VCvtF32Ubyte3:
-  case Opcode::VRcpF32:
-  case Opcode::VFractF32:
-  case Opcode::VTruncF32:
-  case Opcode::VCeilF32:
-  case Opcode::VRndneF32:
-  case Opcode::VFloorF32:
-  case Opcode::VExpF32:
-  case Opcode::VLogF32:
-  case Opcode::VRsqF32:
-  case Opcode::VSqrtF32:
-  case Opcode::VSinF32:
-  case Opcode::VCosF32:
-  case Opcode::VCubeidF32:
-  case Opcode::VCubescF32:
-  case Opcode::VCubetcF32:
-  case Opcode::VCubemaF32:
-  case Opcode::VLdexpF32:
-  case Opcode::VCvtPkU8F32:
-  case Opcode::VCvtPknormI16F32:
-  case Opcode::VCvtPknormU16F32:
-  case Opcode::VCvtPkrtzF16F32:
-  case Opcode::VPkAddF16:
-  case Opcode::VPkMulF16:
-  case Opcode::VPkMinF16:
-  case Opcode::VPkMaxF16:
-  case Opcode::VPkFmaF16:
-  case Opcode::VAddF16:
-  case Opcode::VSubF16:
-  case Opcode::VSubrevF16:
-  case Opcode::VMulF16:
-  case Opcode::VMaxF16:
-  case Opcode::VMinF16:
-  case Opcode::VMin3F16:
-  case Opcode::VMax3F16:
-  case Opcode::VMed3F16:
-  case Opcode::VRcpF16:
-  case Opcode::VRsqF16:
-  case Opcode::VLogF16:
-  case Opcode::VExpF16:
-  case Opcode::VMadMixloF16:
-  case Opcode::VMadMixhiF16:
-  case Opcode::DsMinF32:
-  case Opcode::DsMaxF32:
-  case Opcode::VCmpFF32:
-  case Opcode::VCmpLtF32:
-  case Opcode::VCmpEqF32:
-  case Opcode::VCmpLeF32:
-  case Opcode::VCmpGtF32:
-  case Opcode::VCmpLgF32:
-  case Opcode::VCmpGeF32:
-  case Opcode::VCmpOF32:
-  case Opcode::VCmpUF32:
-  case Opcode::VCmpNgeF32:
-  case Opcode::VCmpNlgF32:
-  case Opcode::VCmpNgtF32:
-  case Opcode::VCmpNleF32:
-  case Opcode::VCmpNeqF32:
-  case Opcode::VCmpNltF32:
-  case Opcode::VCmpTruF32:
-  case Opcode::VCmpxLtF32:
-  case Opcode::VCmpxEqF32:
-  case Opcode::VCmpxLeF32:
-  case Opcode::VCmpxGtF32:
-  case Opcode::VCmpxLgF32:
-  case Opcode::VCmpxGeF32:
-  case Opcode::VCmpxNgeF32:
-  case Opcode::VCmpxNlgF32:
-  case Opcode::VCmpxNgtF32:
-  case Opcode::VCmpxNleF32:
-  case Opcode::VCmpxNeqF32:
-  case Opcode::VCmpxNltF32:
-  case Opcode::VCmpClassF32:
-  case Opcode::VCmpLtF16:
-  case Opcode::VCmpEqF16:
-  case Opcode::VCmpLeF16:
-  case Opcode::VCmpGtF16:
-  case Opcode::VCmpLgF16:
-  case Opcode::VCmpGeF16:
-  case Opcode::VCmpNeqF16:
-  case Opcode::VCmpxLtF16:
-  case Opcode::VCmpxEqF16:
-  case Opcode::VCmpxLeF16:
-  case Opcode::VCmpxGtF16:
-  case Opcode::VCmpxGeF16:
-  case Opcode::VCmpxNeqF16:
-  case Opcode::VCmpxNltF16:
+  case Opcode::V_ADD_F32:
+  case Opcode::V_SUB_F32:
+  case Opcode::V_SUBREV_F32:
+  case Opcode::V_MUL_F32:
+  case Opcode::V_MAC_F32:
+  case Opcode::V_MADMK_F32:
+  case Opcode::V_MADAK_F32:
+  case Opcode::V_MIN_F32:
+  case Opcode::V_MAX_F32:
+  case Opcode::V_MAD_F32:
+  case Opcode::V_FMA_F32:
+  case Opcode::V_MIN3_F32:
+  case Opcode::V_MAX3_F32:
+  case Opcode::V_MED3_F32:
+  case Opcode::V_DOT2C_F32_F16:
+  case Opcode::V_CVT_F32_I32:
+  case Opcode::V_CVT_F32_U32:
+  case Opcode::V_CVT_U32_F32:
+  case Opcode::V_CVT_I32_F32:
+  case Opcode::V_CVT_F16_F32:
+  case Opcode::V_CVT_F32_F16:
+  case Opcode::V_CVT_U16_F16:
+  case Opcode::V_CVT_RPI_I32_F32:
+  case Opcode::V_CVT_FLR_I32_F32:
+  case Opcode::V_CVT_OFF_F32_I4:
+  case Opcode::V_CVT_F32_UBYTE0:
+  case Opcode::V_CVT_F32_UBYTE1:
+  case Opcode::V_CVT_F32_UBYTE2:
+  case Opcode::V_CVT_F32_UBYTE3:
+  case Opcode::V_RCP_F32:
+  case Opcode::V_FRACT_F32:
+  case Opcode::V_TRUNC_F32:
+  case Opcode::V_CEIL_F32:
+  case Opcode::V_RNDNE_F32:
+  case Opcode::V_FLOOR_F32:
+  case Opcode::V_EXP_F32:
+  case Opcode::V_LOG_F32:
+  case Opcode::V_RSQ_F32:
+  case Opcode::V_SQRT_F32:
+  case Opcode::V_SIN_F32:
+  case Opcode::V_COS_F32:
+  case Opcode::V_CUBEID_F32:
+  case Opcode::V_CUBESC_F32:
+  case Opcode::V_CUBETC_F32:
+  case Opcode::V_CUBEMA_F32:
+  case Opcode::V_LDEXP_F32:
+  case Opcode::V_CVT_PK_U8_F32:
+  case Opcode::V_CVT_PKNORM_I16_F32:
+  case Opcode::V_CVT_PKNORM_U16_F32:
+  case Opcode::V_CVT_PKRTZ_F16_F32:
+  case Opcode::V_PK_ADD_F16:
+  case Opcode::V_PK_MUL_F16:
+  case Opcode::V_PK_MIN_F16:
+  case Opcode::V_PK_MAX_F16:
+  case Opcode::V_PK_FMA_F16:
+  case Opcode::V_ADD_F16:
+  case Opcode::V_SUB_F16:
+  case Opcode::V_SUBREV_F16:
+  case Opcode::V_MUL_F16:
+  case Opcode::V_MAX_F16:
+  case Opcode::V_MIN_F16:
+  case Opcode::V_MIN3_F16:
+  case Opcode::V_MAX3_F16:
+  case Opcode::V_MED3_F16:
+  case Opcode::V_RCP_F16:
+  case Opcode::V_RSQ_F16:
+  case Opcode::V_LOG_F16:
+  case Opcode::V_EXP_F16:
+  case Opcode::V_MAD_MIXLO_F16:
+  case Opcode::V_MAD_MIXHI_F16:
+  case Opcode::DS_MIN_F32:
+  case Opcode::DS_MAX_F32:
+  case Opcode::V_CMP_F_F32:
+  case Opcode::V_CMP_LT_F32:
+  case Opcode::V_CMP_EQ_F32:
+  case Opcode::V_CMP_LE_F32:
+  case Opcode::V_CMP_GT_F32:
+  case Opcode::V_CMP_LG_F32:
+  case Opcode::V_CMP_GE_F32:
+  case Opcode::V_CMP_O_F32:
+  case Opcode::V_CMP_U_F32:
+  case Opcode::V_CMP_NGE_F32:
+  case Opcode::V_CMP_NLG_F32:
+  case Opcode::V_CMP_NGT_F32:
+  case Opcode::V_CMP_NLE_F32:
+  case Opcode::V_CMP_NEQ_F32:
+  case Opcode::V_CMP_NLT_F32:
+  case Opcode::V_CMP_TRU_F32:
+  case Opcode::V_CMPX_LT_F32:
+  case Opcode::V_CMPX_EQ_F32:
+  case Opcode::V_CMPX_LE_F32:
+  case Opcode::V_CMPX_GT_F32:
+  case Opcode::V_CMPX_LG_F32:
+  case Opcode::V_CMPX_GE_F32:
+  case Opcode::V_CMPX_NGE_F32:
+  case Opcode::V_CMPX_NLG_F32:
+  case Opcode::V_CMPX_NGT_F32:
+  case Opcode::V_CMPX_NLE_F32:
+  case Opcode::V_CMPX_NEQ_F32:
+  case Opcode::V_CMPX_NLT_F32:
+  case Opcode::V_CMP_CLASS_F32:
+  case Opcode::V_CMP_LT_F16:
+  case Opcode::V_CMP_EQ_F16:
+  case Opcode::V_CMP_LE_F16:
+  case Opcode::V_CMP_GT_F16:
+  case Opcode::V_CMP_LG_F16:
+  case Opcode::V_CMP_GE_F16:
+  case Opcode::V_CMP_NEQ_F16:
+  case Opcode::V_CMPX_LT_F16:
+  case Opcode::V_CMPX_EQ_F16:
+  case Opcode::V_CMPX_LE_F16:
+  case Opcode::V_CMPX_GT_F16:
+  case Opcode::V_CMPX_GE_F16:
+  case Opcode::V_CMPX_NEQ_F16:
+  case Opcode::V_CMPX_NLT_F16:
     return CoverageClass::NeedsFloatCase;
 
-  case Opcode::SLoadDword:
-  case Opcode::SLoadDwordx2:
-  case Opcode::SLoadDwordx4:
-  case Opcode::SLoadDwordx8:
-  case Opcode::SLoadDwordx16:
-  case Opcode::SBufferLoadDword:
-  case Opcode::SBufferLoadDwordx2:
-  case Opcode::SBufferLoadDwordx4:
-  case Opcode::SBufferLoadDwordx8:
-  case Opcode::SBufferLoadDwordx16:
-  case Opcode::BufferLoadFormatX:
-  case Opcode::BufferLoadFormatXy:
-  case Opcode::BufferLoadFormatXyz:
-  case Opcode::BufferLoadFormatXyzw:
-  case Opcode::BufferStoreFormatX:
-  case Opcode::BufferStoreFormatXy:
-  case Opcode::BufferStoreFormatXyz:
-  case Opcode::BufferStoreFormatXyzw:
-  case Opcode::BufferLoadUbyte:
-  case Opcode::BufferLoadSbyte:
-  case Opcode::BufferLoadUshort:
-  case Opcode::BufferLoadSshort:
-  case Opcode::BufferLoadDwordx2:
-  case Opcode::BufferLoadDwordx3:
-  case Opcode::BufferLoadDwordx4:
-  case Opcode::BufferStoreByte:
-  case Opcode::BufferStoreShort:
-  case Opcode::BufferStoreDwordx2:
-  case Opcode::BufferStoreDwordx3:
-  case Opcode::BufferStoreDwordx4:
-  case Opcode::TBufferLoadFormatX:
-  case Opcode::TBufferLoadFormatXy:
-  case Opcode::TBufferLoadFormatXyz:
-  case Opcode::TBufferLoadFormatXyzw:
-  case Opcode::TBufferStoreFormatX:
-  case Opcode::TBufferStoreFormatXy:
-  case Opcode::TBufferStoreFormatXyz:
-  case Opcode::TBufferStoreFormatXyzw:
-  case Opcode::BufferAtomicSwap:
-  case Opcode::BufferAtomicAdd:
-  case Opcode::BufferAtomicSub:
-  case Opcode::BufferAtomicSMin:
-  case Opcode::BufferAtomicUMin:
-  case Opcode::BufferAtomicSMax:
-  case Opcode::BufferAtomicUMax:
-  case Opcode::BufferAtomicAnd:
-  case Opcode::BufferAtomicOr:
-  case Opcode::BufferAtomicXor:
-  case Opcode::BufferAtomicFMin:
-  case Opcode::BufferAtomicFMax:
-  case Opcode::FlatLoadUbyte:
-  case Opcode::FlatLoadSbyte:
-  case Opcode::FlatLoadUshort:
-  case Opcode::FlatLoadSshort:
-  case Opcode::FlatLoadDword:
-  case Opcode::FlatLoadDwordx2:
-  case Opcode::FlatLoadDwordx3:
-  case Opcode::FlatLoadDwordx4:
-  case Opcode::FlatStoreByte:
-  case Opcode::FlatStoreShort:
-  case Opcode::FlatStoreDword:
-  case Opcode::FlatStoreDwordx2:
-  case Opcode::FlatStoreDwordx3:
-  case Opcode::FlatStoreDwordx4:
-  case Opcode::DsAddU32:
-  case Opcode::DsAddRtnU32:
-  case Opcode::DsSubU32:
-  case Opcode::DsSubRtnU32:
-  case Opcode::DsMinI32:
-  case Opcode::DsMinRtnI32:
-  case Opcode::DsMaxI32:
-  case Opcode::DsMaxRtnI32:
-  case Opcode::DsMinU32:
-  case Opcode::DsMinRtnU32:
-  case Opcode::DsMaxU32:
-  case Opcode::DsMaxRtnU32:
-  case Opcode::DsAndB32:
-  case Opcode::DsAndRtnB32:
-  case Opcode::DsOrB32:
-  case Opcode::DsOrRtnB32:
-  case Opcode::DsXorB32:
-  case Opcode::DsXorRtnB32:
-  case Opcode::DsWrxchgRtnB32:
-  case Opcode::DsSwizzleB32:
-  case Opcode::DsReadSbyte:
-  case Opcode::DsReadUbyte:
-  case Opcode::DsReadSshort:
-  case Opcode::DsReadUshort:
-  case Opcode::DsRead2B32:
-  case Opcode::DsReadB32:
-  case Opcode::DsReadB64:
-  case Opcode::DsRead2B64:
-  case Opcode::DsReadB96:
-  case Opcode::DsReadB128:
-  case Opcode::DsWriteByte:
-  case Opcode::DsWriteShort:
-  case Opcode::DsWrite2B32:
-  case Opcode::DsWrite2St64B32:
-  case Opcode::DsWriteB32:
-  case Opcode::DsWriteB64:
-  case Opcode::DsWriteB96:
-  case Opcode::DsWriteB128:
-  case Opcode::DsWriteAddtidB32:
-  case Opcode::DsReadAddtidB32:
+  case Opcode::S_LOAD_DWORD:
+  case Opcode::S_LOAD_DWORDX2:
+  case Opcode::S_LOAD_DWORDX4:
+  case Opcode::S_LOAD_DWORDX8:
+  case Opcode::S_LOAD_DWORDX16:
+  case Opcode::S_BUFFER_LOAD_DWORD:
+  case Opcode::S_BUFFER_LOAD_DWORDX2:
+  case Opcode::S_BUFFER_LOAD_DWORDX4:
+  case Opcode::S_BUFFER_LOAD_DWORDX8:
+  case Opcode::S_BUFFER_LOAD_DWORDX16:
+  case Opcode::BUFFER_LOAD_FORMAT_X:
+  case Opcode::BUFFER_LOAD_FORMAT_XY:
+  case Opcode::BUFFER_LOAD_FORMAT_XYZ:
+  case Opcode::BUFFER_LOAD_FORMAT_XYZW:
+  case Opcode::BUFFER_STORE_FORMAT_X:
+  case Opcode::BUFFER_STORE_FORMAT_XY:
+  case Opcode::BUFFER_STORE_FORMAT_XYZ:
+  case Opcode::BUFFER_STORE_FORMAT_XYZW:
+  case Opcode::BUFFER_LOAD_UBYTE:
+  case Opcode::BUFFER_LOAD_SBYTE:
+  case Opcode::BUFFER_LOAD_USHORT:
+  case Opcode::BUFFER_LOAD_SSHORT:
+  case Opcode::BUFFER_LOAD_DWORDX2:
+  case Opcode::BUFFER_LOAD_DWORDX3:
+  case Opcode::BUFFER_LOAD_DWORDX4:
+  case Opcode::BUFFER_STORE_BYTE:
+  case Opcode::BUFFER_STORE_SHORT:
+  case Opcode::BUFFER_STORE_DWORDX2:
+  case Opcode::BUFFER_STORE_DWORDX3:
+  case Opcode::BUFFER_STORE_DWORDX4:
+  case Opcode::TBUFFER_LOAD_FORMAT_X:
+  case Opcode::TBUFFER_LOAD_FORMAT_XY:
+  case Opcode::TBUFFER_LOAD_FORMAT_XYZ:
+  case Opcode::TBUFFER_LOAD_FORMAT_XYZW:
+  case Opcode::TBUFFER_STORE_FORMAT_X:
+  case Opcode::TBUFFER_STORE_FORMAT_XY:
+  case Opcode::TBUFFER_STORE_FORMAT_XYZ:
+  case Opcode::TBUFFER_STORE_FORMAT_XYZW:
+  case Opcode::BUFFER_ATOMIC_SWAP:
+  case Opcode::BUFFER_ATOMIC_ADD:
+  case Opcode::BUFFER_ATOMIC_SUB:
+  case Opcode::BUFFER_ATOMIC_SMIN:
+  case Opcode::BUFFER_ATOMIC_UMIN:
+  case Opcode::BUFFER_ATOMIC_SMAX:
+  case Opcode::BUFFER_ATOMIC_UMAX:
+  case Opcode::BUFFER_ATOMIC_AND:
+  case Opcode::BUFFER_ATOMIC_OR:
+  case Opcode::BUFFER_ATOMIC_XOR:
+  case Opcode::BUFFER_ATOMIC_FMIN:
+  case Opcode::BUFFER_ATOMIC_FMAX:
+  case Opcode::FLAT_LOAD_UBYTE:
+  case Opcode::FLAT_LOAD_SBYTE:
+  case Opcode::FLAT_LOAD_USHORT:
+  case Opcode::FLAT_LOAD_SSHORT:
+  case Opcode::FLAT_LOAD_DWORD:
+  case Opcode::FLAT_LOAD_DWORDX2:
+  case Opcode::FLAT_LOAD_DWORDX3:
+  case Opcode::FLAT_LOAD_DWORDX4:
+  case Opcode::FLAT_STORE_BYTE:
+  case Opcode::FLAT_STORE_SHORT:
+  case Opcode::FLAT_STORE_DWORD:
+  case Opcode::FLAT_STORE_DWORDX2:
+  case Opcode::FLAT_STORE_DWORDX3:
+  case Opcode::FLAT_STORE_DWORDX4:
+  case Opcode::DS_ADD_U32:
+  case Opcode::DS_ADD_RTN_U32:
+  case Opcode::DS_SUB_U32:
+  case Opcode::DS_SUB_RTN_U32:
+  case Opcode::DS_MIN_I32:
+  case Opcode::DS_MIN_RTN_I32:
+  case Opcode::DS_MAX_I32:
+  case Opcode::DS_MAX_RTN_I32:
+  case Opcode::DS_MIN_U32:
+  case Opcode::DS_MIN_RTN_U32:
+  case Opcode::DS_MAX_U32:
+  case Opcode::DS_MAX_RTN_U32:
+  case Opcode::DS_AND_B32:
+  case Opcode::DS_AND_RTN_B32:
+  case Opcode::DS_OR_B32:
+  case Opcode::DS_OR_RTN_B32:
+  case Opcode::DS_XOR_B32:
+  case Opcode::DS_XOR_RTN_B32:
+  case Opcode::DS_WRXCHG_RTN_B32:
+  case Opcode::DS_SWIZZLE_B32:
+  case Opcode::DS_READ_I8:
+  case Opcode::DS_READ_U8:
+  case Opcode::DS_READ_I16:
+  case Opcode::DS_READ_U16:
+  case Opcode::DS_READ2_B32:
+  case Opcode::DS_READ_B32:
+  case Opcode::DS_READ_B64:
+  case Opcode::DS_READ2_B64:
+  case Opcode::DS_READ_B96:
+  case Opcode::DS_READ_B128:
+  case Opcode::DS_WRITE_B8:
+  case Opcode::DS_WRITE_B16:
+  case Opcode::DS_WRITE2_B32:
+  case Opcode::DS_WRITE2ST64_B32:
+  case Opcode::DS_WRITE_B32:
+  case Opcode::DS_WRITE_B64:
+  case Opcode::DS_WRITE_B96:
+  case Opcode::DS_WRITE_B128:
+  case Opcode::DS_WRITE_ADDTID_B32:
+  case Opcode::DS_READ_ADDTID_B32:
     return CoverageClass::NeedsMemoryCase;
 
-  case Opcode::ImageGetResinfo:
-  case Opcode::ImageGetLod:
-  case Opcode::ImageLoad:
-  case Opcode::ImageLoadMip:
-  case Opcode::ImageStore:
-  case Opcode::ImageStoreMip:
-  case Opcode::ImageAtomicAdd:
-  case Opcode::ImageAtomicUMin:
-  case Opcode::ImageAtomicAnd:
-  case Opcode::ImageAtomicOr:
-  case Opcode::ImageAtomicXor:
-  case Opcode::ImageSample:
-  case Opcode::ImageGather4Lz:
-  case Opcode::ImageGather4C:
-  case Opcode::ImageGather4CLz:
-  case Opcode::ImageGather4LzO:
-  case Opcode::ImageGather4CO:
-  case Opcode::ImageGather4CLzO:
+  case Opcode::IMAGE_GET_RESINFO:
+  case Opcode::IMAGE_GET_LOD:
+  case Opcode::IMAGE_LOAD:
+  case Opcode::IMAGE_LOAD_MIP:
+  case Opcode::IMAGE_STORE:
+  case Opcode::IMAGE_STORE_MIP:
+  case Opcode::IMAGE_ATOMIC_ADD:
+  case Opcode::IMAGE_ATOMIC_UMIN:
+  case Opcode::IMAGE_ATOMIC_AND:
+  case Opcode::IMAGE_ATOMIC_OR:
+  case Opcode::IMAGE_ATOMIC_XOR:
+  case Opcode::IMAGE_SAMPLE:
+  case Opcode::IMAGE_GATHER4_LZ:
+  case Opcode::IMAGE_GATHER4_C:
+  case Opcode::IMAGE_GATHER4_C_LZ:
+  case Opcode::IMAGE_GATHER4_LZ_O:
+  case Opcode::IMAGE_GATHER4_C_O:
+  case Opcode::IMAGE_GATHER4_C_LZ_O:
     return CoverageClass::NeedsImageCase;
 
-  case Opcode::VInterpP1F32:
-  case Opcode::VInterpP2F32:
-  case Opcode::VInterpMovF32:
-  case Opcode::Exp:
+  case Opcode::V_INTERP_P1_F32:
+  case Opcode::V_INTERP_P2_F32:
+  case Opcode::V_INTERP_MOV_F32:
+  case Opcode::EXP:
     return CoverageClass::NeedsGraphicsStageCase;
 
   default:
@@ -10889,8 +10889,8 @@ void PrintPendingOpcodes(CoverageClass status,
 
   std::printf("[coverage] pending_%s:", CoverageClassName(status));
   for (auto opcode : opcodes) {
-    const auto name = ShaderRecompiler::Decoder::OpcodeToString(opcode);
-    std::printf(" %s", name.c_str());
+    const auto name = magic_enum::enum_name(opcode);
+    std::printf(" %.*s", static_cast<int>(name.size()), name.data());
   }
   std::printf("\n");
 }
@@ -10913,8 +10913,8 @@ void CheckOpcodeCoverage(const std::vector<TestCase> &tests,
 
   uint32_t counts[7] = {};
   std::vector<ShaderOpcode> pending[7];
-  for (auto value = static_cast<int>(Opcode::SMovB32);
-       value <= static_cast<int>(Opcode::Exp); value++) {
+  for (auto value = static_cast<int>(Opcode::S_MOV_B32);
+       value < static_cast<int>(Opcode::COUNT); value++) {
     const auto opcode = static_cast<Opcode>(value);
     const auto status = ClassifyOpcode(opcode, covered);
     counts[static_cast<uint32_t>(status)]++;
@@ -10969,8 +10969,8 @@ TestCase IntegerAddSubMul() {
           code,
           {},
           {18},
-          {O::SMovB32, O::SAddU32, O::SSubU32, O::SMulI32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_ADD_U32, O::S_SUB_U32, O::S_MUL_I32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BitwiseOps() {
@@ -10987,8 +10987,8 @@ TestCase BitwiseOps() {
           code,
           {},
           {~0x33u},
-          {O::SMovB32, O::SAndB32, O::SOrB32, O::SXorB32, O::VNotB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_AND_B32, O::S_OR_B32, O::S_XOR_B32, O::V_NOT_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Shifts() {
@@ -11006,8 +11006,8 @@ TestCase Shifts() {
           code,
           {},
           {6},
-          {O::SMovB32, O::SLshlB32, O::SLshrB32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LSHL_B32, O::S_LSHR_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ExactPushConstantExtent() {
@@ -11027,7 +11027,7 @@ TestCase ExactPushConstantExtent() {
   test.code = std::move(code);
   test.initial.resize(values.size());
   test.expected.assign(values.begin(), values.end());
-  test.opcodes = {O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data =
       MakeStructuredStorageBufferData(0, values.size() * sizeof(u32));
   std::copy(values.begin(), values.end(), test.user_data.begin() + 4);
@@ -11059,8 +11059,8 @@ TestCase ScalarShiftCountsMaskLowBits() {
           code,
           {},
           {1, 2, 0x80000000u, 0x40000000u, 0x80000000u, 0xc0000000u},
-          {O::SMovB32, O::SLshlB32, O::SLshrB32, O::SAshrI32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LSHL_B32, O::S_LSHR_B32, O::S_ASHR_I32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Rdna2ScalarOpcodes() {
@@ -11084,8 +11084,8 @@ TestCase Rdna2ScalarOpcodes() {
           code,
           {},
           {0x11u, 0x11u, 7u, 7u},
-          {O::SMovB32, O::SBitset1B32, O::SSetregB32, O::SAddI32, O::SSleep,
-           O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_BITSET1_B32, O::S_SETREG_B32, O::S_ADD_I32, O::S_SLEEP,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarTrapDisabledFallsThroughExactRaw() {
@@ -11102,8 +11102,8 @@ TestCase ScalarTrapDisabledFallsThroughExactRaw() {
   test.name = "ScalarTrapDisabledFallsThroughExactRaw";
   test.code = code;
   test.expected = {42};
-  test.opcodes = {O::VMovB32, O::STrap, O::BufferStoreDword, O::SEndpgm};
-  test.decoded_counts = {{"s_trap 0x00000001", 1}};
+  test.opcodes = {O::V_MOV_B32, O::S_TRAP, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_TRAP 0x00000001", 1}};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -11129,9 +11129,9 @@ TestCase ScalarWaitcntDepctrCapturedVmVsrc() {
   test.code = std::move(code);
   test.initial = {0, 0};
   test.expected = {7, 42};
-  test.opcodes = {O::VMovB32, O::BufferStoreDword, O::SWaitcntDepctr,
-                  O::SEndpgm};
-  test.decoded_counts = {{"0x00000010: s_waitcnt_depctr 0x0000ffe3\n", 1}};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_WAITCNT_DEPCTR,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"0x00000010: S_WAITCNT_DEPCTR 0x0000ffe3\n", 1}};
   test.native_ir_counts = {{"0x00000010: Waitcnt null, 0x0000ffe3", 1}};
   test.forbidden_spirv = {"OpControlBarrier", "OpMemoryBarrier"};
   return test;
@@ -11172,10 +11172,10 @@ TestCase ScalarExtendedArithmetic() {
           code,
           {},
           {0, 12, 15, 0xfffffffeu, 0xfffffffbu, 3, 3, 0xfffffffeu, 5, 33},
-          {O::SMovB32, O::SAddU32, O::SAddcU32, O::SAddI32, O::SSubI32,
-           O::SMinI32, O::SMaxI32, O::SMinU32, O::SMaxU32, O::SAbsI32,
-           O::SMovkI32, O::SMulkI32, O::VMovB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::S_ADD_U32, O::S_ADDC_U32, O::S_ADD_I32, O::S_SUB_I32,
+           O::S_MIN_I32, O::S_MAX_I32, O::S_MIN_U32, O::S_MAX_U32, O::S_ABS_I32,
+           O::S_MOVK_I32, O::S_MULK_I32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarArithmeticSccCarryBorrowOverflow() {
@@ -11237,8 +11237,8 @@ TestCase ScalarArithmeticSccCarryBorrowOverflow() {
           code,
           {},
           {1, 0, 1, 0, 1, 0, 1, 0},
-          {O::SMovB32, O::SSubU32, O::SAddI32, O::SSubI32, O::SCmpEqU32,
-           O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_SUB_U32, O::S_ADD_I32, O::S_SUB_I32, O::S_CMP_EQ_U32,
+           O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarMinMaxSccComparisonEdges() {
@@ -11280,9 +11280,9 @@ TestCase ScalarMinMaxSccComparisonEdges() {
           code,
           {},
           {1, 0, 1, 0, 1, 0, 1, 0},
-          {O::SMovB32, O::SMinI32, O::SMaxI32, O::SMinU32, O::SMaxU32,
-           O::SCmpEqU32, O::SCselectB32, O::VMovB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::S_MIN_I32, O::S_MAX_I32, O::S_MIN_U32, O::S_MAX_U32,
+           O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarAbsI32UpdatesScc() {
@@ -11316,8 +11316,8 @@ TestCase ScalarAbsI32UpdatesScc() {
           code,
           {},
           {0, 0, 5, 1},
-          {O::SMovB32, O::SCmpEqU32, O::SAbsI32, O::SCselectB32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_ABS_I32, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarShiftLeftAddSccCarryEdges() {
@@ -11360,9 +11360,9 @@ TestCase ScalarShiftLeftAddSccCarryEdges() {
           code,
           {},
           {1, 0, 1, 0, 1, 0, 1, 0},
-          {O::SMovB32, O::SLshl1AddU32, O::SLshl2AddU32, O::SLshl3AddU32,
-           O::SLshl4AddU32, O::SCmpEqU32, O::SCselectB32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32, O::S_LSHL3_ADD_U32,
+           O::S_LSHL4_ADD_U32, O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarCompareOps() {
@@ -11412,10 +11412,10 @@ TestCase ScalarCompareOps() {
           code,
           {},
           {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1},
-          {O::SMovB32, O::SCmpEqI32, O::SCmpLgI32, O::SCmpGtI32, O::SCmpGeI32,
-           O::SCmpLtI32, O::SCmpLeI32, O::SCmpLgU32, O::SCmpGtU32, O::SCmpGeU32,
-           O::SCmpLeU32, O::SCmpEqU64, O::SCmpLgU64, O::SCselectB32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_CMP_EQ_I32, O::S_CMP_LG_I32, O::S_CMP_GT_I32, O::S_CMP_GE_I32,
+           O::S_CMP_LT_I32, O::S_CMP_LE_I32, O::S_CMP_LG_U32, O::S_CMP_GT_U32, O::S_CMP_GE_U32,
+           O::S_CMP_LE_U32, O::S_CMP_EQ_U64, O::S_CMP_LG_U64, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarShiftAddAndMaskOps() {
@@ -11453,9 +11453,9 @@ TestCase ScalarShiftAddAndMaskOps() {
           {},
           {7, 11, 19, 35, 0xfffffffeu, 1, 0xf0f0f0f0u, 0xff00ff00u, 0x0f0f0f0fu,
            0x00ff00ffu},
-          {O::SMovB32, O::SLshl1AddU32, O::SLshl2AddU32, O::SLshl3AddU32,
-           O::SLshl4AddU32, O::SAshrI32, O::SMulHiU32, O::SNotB64, O::SWqmB64,
-           O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32, O::S_LSHL3_ADD_U32,
+           O::S_LSHL4_ADD_U32, O::S_ASHR_I32, O::S_MUL_HI_U32, O::S_NOT_B64, O::S_WQM_B64,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarNotB64UpdatesScc() {
@@ -11491,8 +11491,8 @@ TestCase ScalarNotB64UpdatesScc() {
           code,
           {},
           {0, 1, 0, 0, 1, 0},
-          {O::SMovB32, O::SCmpEqU32, O::SNotB64, O::SCselectB32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_NOT_B64, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarFlbitI32B64Gpu() {
@@ -11525,8 +11525,8 @@ TestCase ScalarFlbitI32B64Gpu() {
           code,
           {},
           {0, 48, 0xffffffffu, 60},
-          {O::SMovB32, O::SFlbitI32B64, O::VMovB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::S_FLBIT_I32_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarSaveExecOps() {
@@ -11565,9 +11565,9 @@ TestCase ScalarSaveExecOps() {
           {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
            0xffffffffu, 0xffffffffu, 0x00000003u, 0xffffffffu, 0x00000003u,
            0x00000002u, 0xffffffffu, 1},
-          {O::SMovB32, O::SAndSaveexecB64, O::SOrn2SaveexecB64,
-           O::SAndn1SaveexecB64, O::SAndSaveexecB32, O::SAndn1SaveexecB32,
-           O::SMovB64, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
+           O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32, O::S_ANDN1_SAVEEXEC_B32,
+           O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
@@ -11591,8 +11591,8 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
           code,
           {},
           {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
-          {O::SMovB32, O::SOrn2SaveexecB64, O::SMovB64, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarGetpcWritesNextInstructionPc() {
@@ -11607,7 +11607,7 @@ TestCase ScalarGetpcWritesNextInstructionPc() {
           code,
           {},
           {4, 0},
-          {O::SGetpcB64, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_GETPC_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarBitfieldPack() {
@@ -11681,11 +11681,11 @@ TestCase ScalarBitfieldPack() {
            0,           0x0000000fu, 0,           0x00000f00u, 0x0000000fu,
            0xddddbbbbu, 0xccccbbbbu, 0xccccaaaau, 1,           1,
            40,          5,           0xffffffffu, 0,           1},
-          {O::SMovB32, O::SBrevB32, O::SBcnt1I32B32, O::SBcnt1I32B64,
-           O::SFf1I32B64, O::SBitreplicateB64B32, O::SBfmB32, O::SBfeU32,
-           O::SPackLlB32B16, O::SPackLhB32B16, O::SPackHhB32B16, O::SBitcmp0B32,
-           O::SBitcmp1B32, O::SCselectB32, O::VMovB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::S_BREV_B32, O::S_BCNT1_I32_B32, O::S_BCNT1_I32_B64,
+           O::S_FF1_I32_B64, O::S_BITREPLICATE_B64_B32, O::S_BFM_B32, O::S_BFE_U32,
+           O::S_PACK_LL_B32_B16, O::S_PACK_LH_B32_B16, O::S_PACK_HH_B32_B16, O::S_BITCMP0_B32,
+           O::S_BITCMP1_B32, O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarBrevB32PreservesScc() {
@@ -11719,8 +11719,8 @@ TestCase ScalarBrevB32PreservesScc() {
           code,
           {},
           {0x80000000u, 0, 0, 1},
-          {O::SMovB32, O::SCmpEqU32, O::SBrevB32, O::SCselectB32, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_BREV_B32, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarBfeI32CapturedRawSignExtends() {
@@ -11746,9 +11746,9 @@ TestCase ScalarBfeI32CapturedRawSignExtends() {
   test.code = std::move(code);
   test.initial = {0xf0000000u, 0, 0, 0, 0};
   test.expected = {0xf0000000u, 0xffffffffu, 1, 0, 0};
-  test.opcodes = {O::BufferLoadDword, O::VReadfirstlaneB32, O::SBfeI32,
-                  O::SCselectB32,     O::VMovB32,           O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_BFE_I32,
+                  O::S_CSELECT_B32,     O::V_MOV_B32,           O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpBitFieldSExtract"};
   return test;
 }
@@ -11776,8 +11776,8 @@ TestCase BitfieldExtractWidthPastEndEdges() {
           code,
           {},
           {0x00000f00u, 1, 0x0000000fu},
-          {O::SMovB32, O::SBfeU32, O::VMovB32, O::VBfeU32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::S_BFE_U32, O::V_MOV_B32, O::V_BFE_U32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase Scalar64BitOps() {
@@ -11824,10 +11824,10 @@ TestCase Scalar64BitOps() {
            0xf00ff00fu, 0x0f0f0f0fu, 0x00ff00ffu, 0xf0f0f0f0u, 0x0ff00ff0u,
            0xff0f0f0fu, 0x0000ff00u, 0xfffffff0u, 0x000000ffu, 0xffffffffu,
            0x7fffffffu, 0x000000f0u, 0,           0x0f0f0f0fu, 0x00ff00ffu},
-          {O::SMovB32, O::SMovB64, O::SAndB64, O::SAndn2B64, O::SOrB64,
-           O::SOrn2B64, O::SXorB64, O::SNandB64, O::SNorB64, O::SXnorB64,
-           O::SLshlB64, O::SLshrB64, O::SBfmB64, O::SBfeU64, O::SCmpEqU32,
-           O::SCselectB64, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_MOV_B64, O::S_AND_B64, O::S_ANDN2_B64, O::S_OR_B64,
+           O::S_ORN2_B64, O::S_XOR_B64, O::S_NAND_B64, O::S_NOR_B64, O::S_XNOR_B64,
+           O::S_LSHL_B64, O::S_LSHR_B64, O::S_BFM_B64, O::S_BFE_U64, O::S_CMP_EQ_U32,
+           O::S_CSELECT_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarAndn2B64SccBranch() {
@@ -11850,8 +11850,8 @@ TestCase ScalarAndn2B64SccBranch() {
           code,
           {},
           {7},
-          {O::SMovB32, O::SAndn2B64, O::VMovB32, O::SCbranchScc0,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_ANDN2_B64, O::V_MOV_B32, O::S_CBRANCH_SCC0,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarLiteral() {
@@ -11866,7 +11866,7 @@ TestCase ScalarLiteral() {
           code,
           {},
           {0x12345678u},
-          {O::SMovB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMoves() {
@@ -11883,7 +11883,7 @@ TestCase VectorMoves() {
           code,
           {},
           {5},
-          {O::VNop, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_NOP, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3MoveAppliesFloatSourceModifiers() {
@@ -11899,7 +11899,7 @@ TestCase VectorVop3MoveAppliesFloatSourceModifiers() {
   test.name = "VectorVop3MoveAppliesFloatSourceModifiers";
   test.code = code;
   test.expected = {0xc0000000u};
-  test.opcodes = {O::SMovB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpFNegate"};
   return test;
 }
@@ -11967,13 +11967,13 @@ TestCase VectorIntegerOps() {
            32,          32,          0x0fffffffu, 0x0fffffffu, 0xffffffffu,
            0xffffffffu, 0xf0f0f0f0u, 0xf0000000u, 1,           30,
            7,           0xfffffff8u},
-          {O::VMovB32,    O::VMinI32,     O::VMaxI32,          O::VMinU32,
-           O::VMaxU32,    O::VAddNcU32,   O::VSubNcU32,        O::VSubrevNcU32,
-           O::VMulU32U24, O::VMulI32I24,  O::VAndB32,          O::VOrB32,
-           O::VXorB32,    O::VXnorB32,    O::VLshlB32,         O::VLshlrevB32,
-           O::VLshrB32,   O::VLshrrevB32, O::VAshrI32,         O::VAshrrevI32,
-           O::VNotB32,    O::VBfrevB32,   O::VFfblB32,         O::VFfbhU32,
-           O::VCmpEqU32,  O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32,    O::V_MIN_I32,     O::V_MAX_I32,          O::V_MIN_U32,
+           O::V_MAX_U32,    O::V_ADD_NC_U32,   O::V_SUB_NC_U32,        O::V_SUBREV_NC_U32,
+           O::V_MUL_U32_U24, O::V_MUL_I32_I24,  O::V_AND_B32,          O::V_OR_B32,
+           O::V_XOR_B32,    O::V_XNOR_B32,    O::V_LSHL_B32,         O::V_LSHLREV_B32,
+           O::V_LSHR_B32,   O::V_LSHRREV_B32, O::V_ASHR_I32,         O::V_ASHRREV_I32,
+           O::V_NOT_B32,    O::V_BFREV_B32,   O::V_FFBL_B32,         O::V_FFBH_U32,
+           O::V_CMP_EQ_U32,  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaSubNcExactByte2Destination() {
@@ -11990,7 +11990,7 @@ TestCase Vop2SdwaSubNcExactByte2Destination() {
   test.name = "Vop2SdwaSubNcExactByte2Destination";
   test.code = code;
   test.expected = {0x000b0002u};
-  test.opcodes = {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpISub", "OpShiftLeftLogical"};
   return test;
 }
@@ -12013,8 +12013,8 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.code = std::move(code);
   test.initial = {0x00010002u, 0};
   test.expected = {0x00010002u, 0x0006c3d4u};
-  test.opcodes = {O::BufferLoadDword, O::VReadfirstlaneB32, O::VMovB32,
-                  O::VAddNcU32,       O::BufferStoreDword,  O::SEndpgm};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
+                  O::V_ADD_NC_U32,       O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
   test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
   return test;
 }
@@ -12035,10 +12035,9 @@ TestCase Vop2SdwaAshrrevCapturedWord0SignExtends() {
   test.code = std::move(code);
   test.initial = {0xabcd8000u, 0};
   test.expected = {0xabcd8000u, 0xfffffe00u};
-  test.opcodes = {O::BufferLoadDword, O::VAshrrevI32, O::VMovB32,
-                  O::BufferStoreDword, O::SEndpgm};
-  test.decoded_counts = {
-      {"v_ashrrev_i32 v25, 6, v1.sdwa(sel=4,sext=1)", 1}};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_ASHRREV_I32, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_ASHRREV_I32 v25, 6, v1.sdwa(sel=4,sext=1)", 1}};
   test.ir_counts = {{" = BitFieldSExtract ", 1},
                     {" = ShiftRightArithmetic32 ", 1}};
   test.required_spirv = {"OpBitFieldSExtract", "OpShiftRightArithmetic"};
@@ -12066,7 +12065,7 @@ TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
           {},
           {0xa1b2c311u, 0xa1b211d4u, 0xa111c3d4u, 0x11b2c3d4u, 0xa1b20011u,
            0x0011c3d4u},
-          {O::VMovB32, O::VSubNcU32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop3CvtPkI16I32Captured() {
@@ -12086,10 +12085,9 @@ TestCase Vop3CvtPkI16I32Captured() {
   test.code = std::move(code);
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
   test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
-  test.opcodes = {O::BufferLoadDword, O::VMovB32, O::VCvtPkI16I32,
-                  O::BufferStoreDword, O::SEndpgm};
-  test.decoded_counts = {
-      {"0x00000014: v_cvt_pk_i16_i32 v5, v7, v16\n", 1}};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
   test.ir_counts = {{" = BitwiseAnd32 ", 2},
                     {" = ShiftLeftLogical32 ", 1},
                     {" = BitwiseOr32 ", 1}};
@@ -12114,9 +12112,9 @@ TestCase Vop3Med3I16Captured() {
   test.name = "Vop3Med3I16Captured";
   test.code = std::move(code);
   test.expected = {0xfc18cafeu};
-  test.opcodes = {O::VMovB32, O::SMovB32, O::VMed3I16, O::BufferStoreDword,
-                  O::SEndpgm};
-  test.decoded_counts = {{"0x00000020: v_med3_i16 v3.sdwa(sel=5,sext=0), "
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_MED3_I16, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"0x00000020: V_MED3_I16 v3.sdwa(sel=5,sext=0), "
                           "v5.opsel(lo=1,hi=0,neghi=0), s25, s27\n",
                           1}};
   test.native_ir_counts = {{"IMed3I16", 1}};
@@ -12144,7 +12142,7 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
   test.expected = {0xa1b20007u, 0xa1b2001fu};
-  test.opcodes = {O::VMovB32, O::VMinU32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpULessThan", "OpSelect"};
   return test;
 }
@@ -12173,8 +12171,8 @@ TestCase VectorShiftCountsMaskLowBits() {
           code,
           {},
           {1, 2, 0x80000000u, 0x40000000u, 0x80000000u, 0xc0000000u},
-          {O::VMovB32, O::VLshlB32, O::VLshlrevB32, O::VLshrB32, O::VLshrrevB32,
-           O::VAshrI32, O::VAshrrevI32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_LSHL_B32, O::V_LSHLREV_B32, O::V_LSHR_B32, O::V_LSHRREV_B32,
+           O::V_ASHR_I32, O::V_ASHRREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3IntegerOps() {
@@ -12266,14 +12264,14 @@ TestCase VectorVop3IntegerOps() {
            5,
            0xffffffffu,
            1},
-          {O::VMovB32,    O::VAdd3U32,    O::VMin3I32,         O::VMax3I32,
-           O::VMed3I32,   O::VMin3U32,    O::VMax3U32,         O::VMed3U32,
-           O::VSadU32,    O::VLshlAddU32, O::VAddLshlU32,      O::VXadU32,
-           O::VLshlOrB32, O::VAndOrB32,   O::VOr3B32,          O::VXor3B32,
-           O::VBfeU32,    O::VBfeI32,     O::VBfiB32,          O::VAlignbitB32,
-           O::VBfmB32,    O::VMulLoU32,   O::VMulHiU32,        O::VMulLoI32,
-           O::VMulHiI32,  O::VMadI32I24,  O::VMadU32U24,       O::VAddI32,
-           O::VSubI32,    O::VSubrevI32,  O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32,    O::V_ADD3_U32,    O::V_MIN3_I32,         O::V_MAX3_I32,
+           O::V_MED3_I32,   O::V_MIN3_U32,    O::V_MAX3_U32,         O::V_MED3_U32,
+           O::V_SAD_U32,    O::V_LSHL_ADD_U32, O::V_ADD_LSHL_U32,      O::V_XAD_U32,
+           O::V_LSHL_OR_B32, O::V_AND_OR_B32,   O::V_OR3_B32,          O::V_XOR3_B32,
+           O::V_BFE_U32,    O::V_BFE_I32,     O::V_BFI_B32,          O::V_ALIGNBIT_B32,
+           O::V_BFM_B32,    O::V_MUL_LO_U32,   O::V_MUL_HI_U32,        O::V_MUL_LO_I32,
+           O::V_MUL_HI_I32,  O::V_MAD_I32_I24,  O::V_MAD_U32_U24,       O::V_ADD_I32,
+           O::V_SUB_I32,    O::V_SUBREV_I32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorBfeI32SignExtendsField() {
@@ -12295,8 +12293,8 @@ TestCase VectorBfeI32SignExtendsField() {
   test.code = std::move(code);
   test.initial = {0x80000000u, 0xfffffff8u, 31, 1, 3, 4};
   test.expected = {0xffffffffu, 0xffffffffu};
-  test.opcodes = {O::VMovB32, O::BufferLoadDword, O::VBfeI32,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_BFE_I32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpBitFieldSExtract"};
   return test;
 }
@@ -12320,7 +12318,7 @@ TestCase VectorAlignByteUsesFiveBitByteOffset() {
           {},
           {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
            0x00000011u, 0u, 0u},
-          {O::VMovB32, O::VAlignbyteB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCarryAndBitCountOps() {
@@ -12350,9 +12348,9 @@ TestCase VectorCarryAndBitCountOps() {
           code,
           {},
           {0, 1, 13, 5, 5},
-          {O::VMovB32, O::VCmpTU32, O::VAddcU32, O::VBcntU32B32,
-           O::VMbcntLoU32B32, O::VMbcntHiU32B32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMP_T_U32, O::V_ADDC_U32, O::V_BCNT_U32_B32,
+           O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorMbcntUsesThreadMask() {
@@ -12375,9 +12373,9 @@ TestCase VectorMbcntUsesThreadMask() {
   test.name = "VectorMbcntUsesThreadMask";
   test.code = code;
   test.expected = {0, 1, 2, 3, 0, 1, 2, 3};
-  test.opcodes = {O::VMovB32,        O::VLshlrevB32,    O::VAddNcU32,
-                  O::VMbcntLoU32B32, O::VMbcntHiU32B32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::V_LSHLREV_B32,    O::V_ADD_NC_U32,
+                  O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12408,8 +12406,8 @@ TestCase VectorAddcUsesPerLaneCarryIn() {
   test.name = "VectorAddcUsesPerLaneCarryIn";
   test.code = code;
   test.expected = std::vector<u32>(8, 1);
-  test.opcodes = {O::VMovB32,  O::VLshlrevB32,      O::VAddNcU32, O::VCmpTU32,
-                  O::VAddcU32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,  O::V_LSHLREV_B32,      O::V_ADD_NC_U32, O::V_CMP_T_U32,
+                  O::V_ADDC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12442,8 +12440,8 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   test.name = "VectorAddcWritesPerLaneCarryOut";
   test.code = code;
   test.expected = std::vector<u32>(8, 0x0fu);
-  test.opcodes = {O::VMovB32,  O::VLshlrevB32,      O::VAddNcU32, O::VCmpFU32,
-                  O::VAddcU32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,  O::V_LSHLREV_B32,      O::V_ADD_NC_U32, O::V_CMP_F_U32,
+                  O::V_ADDC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12482,10 +12480,10 @@ TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
   test.name = "VectorSubrevCoCiU32ExactRawOnGpu";
   test.code = code;
   test.expected = {0xdeadbeefu, 0, 2, 3, 0, 0, 0, 0};
-  test.opcodes = {O::VMovB32,        O::VLshlrevB32, O::VAddNcU32,
-                  O::VCmpLtU32,      O::SMovB64,     O::VCmpNeU32,
-                  O::VSubrevCoCiU32, O::VCndmaskB32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_LT_U32,      O::S_MOV_B64,     O::V_CMP_NE_U32,
+                  O::V_SUBREV_CO_CI_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpISub", "OpUGreaterThan"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -12522,10 +12520,10 @@ TestCase VectorVop3BSubrevCoCiUsesEncodedMasks() {
   test.name = "VectorVop3BSubrevCoCiUsesEncodedMasks";
   test.code = code;
   test.expected = {0xfffffffeu, 0xfffffffeu, 0, 1, 1, 1, 0, 0};
-  test.opcodes = {O::VMovB32,        O::VLshlrevB32, O::VAddNcU32,
-                  O::VCmpEqU32,      O::SMovB64,     O::SMovB32,
-                  O::VSubrevCoCiU32, O::VCndmaskB32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_EQ_U32,      O::S_MOV_B64,     O::S_MOV_B32,
+                  O::V_SUBREV_CO_CI_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12557,8 +12555,8 @@ TestCase VectorVop3BCarryOutWritesSgprMask() {
   test.name = "VectorVop3BCarryOutWritesSgprMask";
   test.code = code;
   test.expected = std::vector<u32>(12, 0x0fu);
-  test.opcodes = {O::VMovB32,    O::VAddI32,          O::VSubI32,
-                  O::VSubrevI32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
+                  O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12589,8 +12587,8 @@ TestCase VectorVop3BCarryOutUsesEncodedSdst() {
   test.name = "VectorVop3BCarryOutUsesEncodedSdst";
   test.code = code;
   test.expected = std::vector<u32>(12, 0x0fu);
-  test.opcodes = {O::VMovB32,    O::VAddI32,          O::VSubI32,
-                  O::VSubrevI32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
+                  O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12628,8 +12626,8 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
   test.name = "VectorVop3BSubCoU32UsesRdna2Opcode310";
   test.code = code;
   test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 9, 9, 9, 9};
-  test.opcodes = {O::VMovB32, O::VCmpEqU32,        O::VCndmaskB32,
-                  O::VSubI32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32,        O::V_CNDMASK_B32,
+                  O::V_SUB_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12658,7 +12656,7 @@ TestCase VectorMadU64U32UnsignedCarryOut() {
           code,
           {},
           {0x00000000u, 0x00000001u, 0x00000001u, 0x00000000u},
-          {O::VMovB32, O::VMadU64U32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_MAD_U64_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorLaneAndPackedOps() {
@@ -12702,10 +12700,10 @@ TestCase VectorLaneAndPackedOps() {
           {0x12345678u, 0x12345678u, 0x12345678u, 0x12345678u, 0x40003c00u,
            0x46004400u, 0x48004200u, 0x40003c00u, 0x44004200u, 0x48804400u,
            0x40000000u, 0xef015678u},
-          {O::VMovB32, O::VReadfirstlaneB32, O::VReadlaneB32, O::VWritelaneB32,
-           O::VPermlane16B32, O::VCvtPkrtzF16F32, O::VPkAddF16, O::VPkMulF16,
-           O::VPkMinF16, O::VPkMaxF16, O::VPkFmaF16, O::VLdexpF32,
-           O::VCvtPkU16U32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32, O::V_WRITELANE_B32,
+           O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32, O::V_PK_ADD_F16, O::V_PK_MUL_F16,
+           O::V_PK_MIN_F16, O::V_PK_MAX_F16, O::V_PK_FMA_F16, O::V_LDEXP_F32,
+           O::V_CVT_PK_U16_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
@@ -12730,7 +12728,7 @@ TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
           code,
           {},
           {0x4f004d00u, 0x4e004d00u, 0x50804d00u},
-          {O::VMovB32, O::VPkFmaF16, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_PK_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase CvtPkU8F32PacksSelectedByte() {
@@ -12757,7 +12755,7 @@ TestCase CvtPkU8F32PacksSelectedByte() {
           code,
           {},
           {0x1122330cu, 0x1122ff44u, 0x11003344u, 0x00223344u},
-          {O::VMovB32, O::VCvtPkU8F32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CVT_PK_U8_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
@@ -12774,7 +12772,7 @@ TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
           code,
           {},
           {0x80010001u},
-          {O::VMovB32, O::VCvtPkrtzF16F32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
@@ -12802,8 +12800,8 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
           code,
           {},
           {0x80004000u, 0x00004000u, 0x7f017f01u, 0x7f017f01u},
-          {O::VMovB32, O::VPkMinF16, O::VPkMaxF16, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorMinMaxF16Ops() {
@@ -12845,8 +12843,8 @@ TestCase VectorMinMaxF16Ops() {
           {},
           {0x66664200u, 0x77773c00u, 0x8888bc00u, 0xaaaa0000u, 0x55554000u,
            0x12344000u, 0x87653c00u, 0x99994000u},
-          {O::VMovB32, O::VAddF16, O::VSubF16, O::VSubrevF16, O::VMulF16,
-           O::VMaxF16, O::VMinF16, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_ADD_F16, O::V_SUB_F16, O::V_SUBREV_F16, O::V_MUL_F16,
+           O::V_MAX_F16, O::V_MIN_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCvtU16F16Sdwa() {
@@ -12880,7 +12878,7 @@ TestCase VectorCvtU16F16Sdwa() {
           code,
           {},
           {0x12340003u, 0x00054321u, 0xabcdffffu, 0x77770000u, 0x55550000u},
-          {O::VMovB32, O::VCvtU16F16, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CVT_U16_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMinMaxMed3F16Ops() {
@@ -12910,8 +12908,8 @@ TestCase VectorMinMaxMed3F16Ops() {
           code,
           {},
           {0xaaaa3c00u, 0x48005678u, 0x77773c00u},
-          {O::VMovB32, O::VMin3F16, O::VMax3F16, O::VMed3F16,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_MIN3_F16, O::V_MAX3_F16, O::V_MED3_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorSpecialF16Ops() {
@@ -12942,8 +12940,8 @@ TestCase VectorSpecialF16Ops() {
           {},
           {0x00008000u, 0xb8005678u, 0x00003800u, 0x00000000u, 0x0000fe00u,
            0x00000000u},
-          {O::VMovB32, O::VRcpF16, O::VRsqF16, O::VLogF16, O::VExpF16,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_RCP_F16, O::V_RSQ_F16, O::V_LOG_F16, O::V_EXP_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorWritelaneIgnoresExecMask() {
@@ -12965,8 +12963,8 @@ TestCase VectorWritelaneIgnoresExecMask() {
   test.name = "VectorWritelaneIgnoresExecMask";
   test.code = code;
   test.expected = {0xaaaaaaaau, 0x12345678u, 0xaaaaaaaau, 0xaaaaaaaau};
-  test.opcodes = {O::VMovB32,     O::SMovB32,          O::VWritelaneB32,
-                  O::VLshlrevB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,          O::V_WRITELANE_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12990,8 +12988,8 @@ TestCase VectorReadlaneFromInactiveWrittenLane() {
   test.name = "VectorReadlaneInactiveWrittenLane";
   test.code = code;
   test.expected = {0x12345678u};
-  test.opcodes = {O::SMovB32, O::VWritelaneB32,    O::VReadlaneB32,
-                  O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::S_MOV_B32, O::V_WRITELANE_B32,    O::V_READLANE_B32,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -13017,9 +13015,9 @@ TestCase VectorLaneWave32RuntimeSelectorWraps() {
   test.name = "VectorLaneWave32RuntimeSelectorWraps";
   test.code = code;
   test.expected = {0x12345678u};
-  test.opcodes = {O::SAddU32,      O::SMovB32, O::VWritelaneB32,
-                  O::VReadlaneB32, O::VMovB32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::S_ADD_U32,      O::S_MOV_B32, O::V_WRITELANE_B32,
+                  O::V_READLANE_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpGroupNonUniformShuffle"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -13048,8 +13046,8 @@ TestCase VectorPermlanex16() {
   test.name = "VectorPermlanex16";
   test.code = code;
   test.expected = std::vector<u32>(32, 0xfeedbabeu);
-  test.opcodes = {O::VMovB32, O::VPermlanex16B32, O::VLshlrevB32,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_PERMLANEX16_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 32;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13074,8 +13072,8 @@ TestCase VectorPermlane16FetchInactiveZero() {
   test.name = "VectorPermlane16FetchInactiveZero";
   test.code = code;
   test.expected = {0};
-  test.opcodes = {O::VMovB32,        O::VAddNcU32,        O::SMovB32,
-                  O::VPermlane16B32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,        O::S_MOV_B32,
+                  O::V_PERMLANE16_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13100,8 +13098,8 @@ TestCase VectorPermlane16FetchInactiveFi() {
   test.name = "VectorPermlane16FetchInactiveFi";
   test.code = code;
   test.expected = {11};
-  test.opcodes = {O::VMovB32,        O::VAddNcU32,        O::SMovB32,
-                  O::VPermlane16B32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,        O::S_MOV_B32,
+                  O::V_PERMLANE16_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13125,8 +13123,8 @@ TestCase VectorDppQuadPermuteReverse() {
   test.name = "VectorDppQuadPermuteReverse";
   test.code = code;
   test.expected = {103, 102, 101, 100, 107, 106, 105, 104};
-  test.opcodes = {O::VMovB32, O::VAddNcU32, O::VLshlrevB32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13152,8 +13150,8 @@ TestCase VectorDppBankMaskPreservesDestination() {
   test.code = code;
   test.expected = {0xaaaaaaaau, 0xaaaaaaaau, 0xaaaaaaaau, 0xaaaaaaaau,
                    104,         105,         106,         107};
-  test.opcodes = {O::VMovB32, O::VAddNcU32, O::VLshlrevB32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13178,8 +13176,8 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   test.name = "VectorDppBoundsControlZeroPreservesDestination";
   test.code = code;
   test.expected = {0xaaaaaaaau, 100, 101, 102, 103, 104, 105, 106};
-  test.opcodes = {O::VMovB32, O::VAddNcU32, O::VLshlrevB32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13202,7 +13200,7 @@ TestCase Vop3LdexpSourceModifier() {
           code,
           {},
           {0x3ec00000u},
-          {O::VMovB32, O::VLdexpF32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_LDEXP_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop1MoveRelSource() {
@@ -13221,8 +13219,8 @@ TestCase Vop1MoveRelSource() {
           code,
           {},
           {0x33333333u},
-          {O::VMovB32, O::SMovB32, O::VMovrelsB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase Vop1MoveRelDestination() {
@@ -13247,8 +13245,8 @@ TestCase Vop1MoveRelDestination() {
   test.name = "Vop1MoveRelDestination";
   test.code = code;
   test.expected = {0x12345678u, 0xccccccccu, 0xccccccccu, 0xccccccccu};
-  test.opcodes = {O::VMovB32,     O::SMovB32,          O::VMovreldB32,
-                  O::VLshlrevB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,          O::V_MOVRELD_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13295,10 +13293,10 @@ TestCase VectorFloatSpecialOps() {
           {},
           {0x41400000u, 0x80017fffu, 0x8000ffffu, 0xaaaa4700u, 0x4700bbbbu,
            0x40800000u, 0x3f800000u, 0xc0000000u, 0x40c00000u},
-          {O::VMovB32, O::VDot2cF32F16, O::VCvtPknormI16F32,
-           O::VCvtPknormU16F32, O::VMadMixloF16, O::VMadMixhiF16, O::VCubeidF32,
-           O::VCubescF32, O::VCubetcF32, O::VCubemaF32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_DOT2C_F32_F16, O::V_CVT_PKNORM_I16_F32,
+           O::V_CVT_PKNORM_U16_F32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16, O::V_CUBEID_F32,
+           O::V_CUBESC_F32, O::V_CUBETC_F32, O::V_CUBEMA_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase MadMixF16LiteralHalfSourceUsesOpsel() {
@@ -13322,8 +13320,8 @@ TestCase MadMixF16LiteralHalfSourceUsesOpsel() {
           code,
           {},
           {0xaaaa4200u, 0x40002222u},
-          {O::VMovB32, O::VMadMixloF16, O::VMadMixhiF16, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase MadMixF16NegHiIsAbsAndNegIsIndependent() {
@@ -13347,8 +13345,8 @@ TestCase MadMixF16NegHiIsAbsAndNegIsIndependent() {
           code,
           {},
           {0xaaaa4200u, 0xbc002222u},
-          {O::VMovB32, O::VMadMixloF16, O::VMadMixhiF16, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorVop3FmaF16UsesRdna2Opcode34b() {
@@ -13372,7 +13370,7 @@ TestCase VectorVop3FmaF16UsesRdna2Opcode34b() {
           code,
           {},
           {0xaaaa4400u, 0x48805555u},
-          {O::VMovB32, O::VFmaF16, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorFloatControlContractPreservesInfNan() {
@@ -13393,8 +13391,8 @@ TestCase VectorFloatControlContractPreservesInfNan() {
   test.name = "VectorFloatControlContractPreservesInfNan";
   test.code = std::move(code);
   test.expected = {1u};
-  test.opcodes = {O::SBfmB32, O::VMovB32, O::VMulF32, O::VCmpClassF32,
-                  O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::S_BFM_B32, O::V_MOV_B32, O::V_MUL_F32, O::V_CMP_CLASS_F32,
+                  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"SPV_KHR_float_controls",
                          "SignedZeroInfNanPreserve 32"};
   return test;
@@ -13471,10 +13469,10 @@ TestCase VectorFloatArithmeticOps() {
            0x40a00000u, 0x40800000u, 0x40c00000u, 0x41000000u, 0x40400000u,
            0x40400000u, 0xbf800000u, 0x3f800000u, 0x3f800000u, 0x40800000u,
            0xbf800000u, 0x40c00000u, 0x40000000u, 0x40400000u},
-          {O::SMovB32, O::VMovB32, O::VAddF32, O::VSubF32, O::VSubrevF32,
-           O::VMulF32, O::VMinF32, O::VMaxF32, O::VMacF32, O::VMadF32,
-           O::VFmaF32, O::VMin3F32, O::VMax3F32, O::VMed3F32, O::VMadmkF32,
-           O::VMadakF32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::V_ADD_F32, O::V_SUB_F32, O::V_SUBREV_F32,
+           O::V_MUL_F32, O::V_MIN_F32, O::V_MAX_F32, O::V_MAC_F32, O::V_MAD_F32,
+           O::V_FMA_F32, O::V_MIN3_F32, O::V_MAX3_F32, O::V_MED3_F32, O::V_MADMK_F32,
+           O::V_MADAK_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
@@ -13508,8 +13506,8 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
           {},
           {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u, 0x7fe00001u,
            0x7fe00001u, 0x40000000u, 0x40000000u},
-          {O::VMovB32, O::VMinF32, O::VMaxF32, O::VMin3F32, O::VMax3F32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32, O::V_MAX3_F32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMed3F32NanUsesMin3Path() {
@@ -13534,7 +13532,7 @@ TestCase VectorMed3F32NanUsesMin3Path() {
           code,
           {},
           {0x7fe00001u, 0x40000000u, 0x40400000u},
-          {O::VMovB32, O::VMed3F32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorFloatConversionOps() {
@@ -13605,16 +13603,16 @@ TestCase VectorFloatConversionOps() {
            0x40400000u, 0x40000000u, 0x40000000u, 0x40000000u, 0x40000000u,
            0x3f000000u, 0x40000000u, 0,           0x3f800000u, 0xbd800000u,
            0x3f800000u, 0x3f800000u, 0x40000000u},
-          {O::VMovB32,       O::VCvtF32I32,    O::VCvtF32U32,
-           O::VCvtU32F32,    O::VCvtI32F32,    O::VCvtF16F32,
-           O::VCvtF32F16,    O::VCvtRpiI32F32, O::VCvtFlrI32F32,
-           O::VCvtOffF32I4,  O::VCvtF32Ubyte0, O::VCvtF32Ubyte1,
-           O::VCvtF32Ubyte2, O::VCvtF32Ubyte3, O::VRcpF32,
-           O::VFractF32,     O::VTruncF32,     O::VCeilF32,
-           O::VRndneF32,     O::VFloorF32,     O::VExpF32,
-           O::VLogF32,       O::VRsqF32,       O::VSqrtF32,
-           O::VSinF32,       O::VCosF32,       O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32,       O::V_CVT_F32_I32,    O::V_CVT_F32_U32,
+           O::V_CVT_U32_F32,    O::V_CVT_I32_F32,    O::V_CVT_F16_F32,
+           O::V_CVT_F32_F16,    O::V_CVT_RPI_I32_F32, O::V_CVT_FLR_I32_F32,
+           O::V_CVT_OFF_F32_I4,  O::V_CVT_F32_UBYTE0, O::V_CVT_F32_UBYTE1,
+           O::V_CVT_F32_UBYTE2, O::V_CVT_F32_UBYTE3, O::V_RCP_F32,
+           O::V_FRACT_F32,     O::V_TRUNC_F32,     O::V_CEIL_F32,
+           O::V_RNDNE_F32,     O::V_FLOOR_F32,     O::V_EXP_F32,
+           O::V_LOG_F32,       O::V_RSQ_F32,       O::V_SQRT_F32,
+           O::V_SIN_F32,       O::V_COS_F32,       O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorFrexpF32Edges() {
@@ -13663,10 +13661,10 @@ TestCase VectorFrexpF32Edges() {
       0x3f7ffffeu, 0x3f000000u, 0x7f800000u, 0x7fc00000u, 0xff800000u,
       0x7fa00001u,
   };
-  test.opcodes = {O::VMovB32,       O::BufferLoadDword,  O::VFrexpExpI32F32,
-                  O::VFrexpMantF32, O::BufferStoreDword, O::SEndpgm};
-  test.decoded_counts = {{"v_frexp_exp_i32_f32", inputs.size()},
-                         {"v_frexp_mant_f32", inputs.size()}};
+  test.opcodes = {O::V_MOV_B32,       O::BUFFER_LOAD_DWORD,  O::V_FREXP_EXP_I32_F32,
+                  O::V_FREXP_MANT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FREXP_EXP_I32_F32", inputs.size()},
+                         {"V_FREXP_MANT_F32", inputs.size()}};
   test.required_spirv = {"FindUMsb", "OpBitFieldUExtract",
                          "OpShiftLeftLogical"};
   return test;
@@ -13702,8 +13700,8 @@ TestCase CvtF32ToIntSaturatesNaNAndOutOfRange() {
           {},
           {0, 0, 0xffffffffu, 0xffffffffu, 0, 0x7fffffffu, 0x80000000u,
            0x7fffffffu},
-          {O::VMovB32, O::VCvtU32F32, O::VCvtI32F32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CVT_U32_F32, O::V_CVT_I32_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorSpecialF32FlushesDenormalInputs() {
@@ -13725,8 +13723,8 @@ TestCase VectorSpecialF32FlushesDenormalInputs() {
           code,
           {},
           {0xff800000u, 0x7f800000u, 0x7f800000u, 0x00000000u},
-          {O::VMovB32, O::VLogF32, O::VRcpF32, O::VRsqF32, O::VSqrtF32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_LOG_F32, O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorRcpIflagF32IntegerReciprocal() {
@@ -13754,9 +13752,9 @@ TestCase VectorRcpIflagF32IntegerReciprocal() {
   test.code = std::move(code);
   test.expected = {0x7f800000u, 0x3f800000u, 0x3f000000u, 0x2f800000u,
                    0x3f800000u};
-  test.opcodes = {O::VMovB32, O::VCvtF32U32, O::VRcpIflagF32,
-                  O::BufferStoreDword, O::SEndpgm};
-  test.decoded_counts = {{"v_rcp_iflag_f32", 5}};
+  test.opcodes = {O::V_MOV_B32, O::V_CVT_F32_U32, O::V_RCP_IFLAG_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_RCP_IFLAG_F32", 5}};
   test.ir_counts = {{"FPRecipIFlag32", 5}};
   test.required_spirv = {"OpConvertUToF", "OpFDiv"};
   test.forbidden_spirv = {"8388608"};
@@ -13779,7 +13777,7 @@ TestCase VectorSinCosMaxFiniteSpecialCases() {
       code,
       {},
       {0x00000000u, 0x3f800000u},
-      {O::VMovB32, O::VSinF32, O::VCosF32, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCompareOps() {
@@ -13868,15 +13866,15 @@ TestCase VectorCompareOps() {
           code,
           {},
           expected,
-          {O::VMovB32,    O::VCndmaskB32, O::VCmpFF32,         O::VCmpLtF32,
-           O::VCmpEqF32,  O::VCmpLeF32,   O::VCmpGtF32,        O::VCmpLgF32,
-           O::VCmpGeF32,  O::VCmpOF32,    O::VCmpUF32,         O::VCmpNgeF32,
-           O::VCmpNlgF32, O::VCmpNgtF32,  O::VCmpNleF32,       O::VCmpNeqF32,
-           O::VCmpNltF32, O::VCmpTruF32,  O::VCmpFI32,         O::VCmpLtI32,
-           O::VCmpEqI32,  O::VCmpLeI32,   O::VCmpGtI32,        O::VCmpNeI32,
-           O::VCmpGeI32,  O::VCmpTI32,    O::VCmpFU32,         O::VCmpLtU32,
-           O::VCmpEqU32,  O::VCmpLeU32,   O::VCmpGtU32,        O::VCmpNeU32,
-           O::VCmpGeU32,  O::VCmpTU32,    O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32,    O::V_CNDMASK_B32, O::V_CMP_F_F32,         O::V_CMP_LT_F32,
+           O::V_CMP_EQ_F32,  O::V_CMP_LE_F32,   O::V_CMP_GT_F32,        O::V_CMP_LG_F32,
+           O::V_CMP_GE_F32,  O::V_CMP_O_F32,    O::V_CMP_U_F32,         O::V_CMP_NGE_F32,
+           O::V_CMP_NLG_F32, O::V_CMP_NGT_F32,  O::V_CMP_NLE_F32,       O::V_CMP_NEQ_F32,
+           O::V_CMP_NLT_F32, O::V_CMP_TRU_F32,  O::V_CMP_F_I32,         O::V_CMP_LT_I32,
+           O::V_CMP_EQ_I32,  O::V_CMP_LE_I32,   O::V_CMP_GT_I32,        O::V_CMP_NE_I32,
+           O::V_CMP_GE_I32,  O::V_CMP_T_I32,    O::V_CMP_F_U32,         O::V_CMP_LT_U32,
+           O::V_CMP_EQ_U32,  O::V_CMP_LE_U32,   O::V_CMP_GT_U32,        O::V_CMP_NE_U32,
+           O::V_CMP_GE_U32,  O::V_CMP_T_U32,    O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CompareNeU64OnGpu() {
@@ -13903,8 +13901,8 @@ TestCase VectorVop3CompareNeU64OnGpu() {
           code,
           {},
           {0, 1},
-          {O::VMovB32, O::SMovB64, O::VCmpNeU64, O::VCndmaskB32, O::SMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_NE_U64, O::V_CNDMASK_B32, O::S_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CompareGtU64OnGpu() {
@@ -13937,8 +13935,8 @@ TestCase VectorVop3CompareGtU64OnGpu() {
                 code,
                 {},
                 {1, 1, 0},
-                {O::VMovB32, O::SMovB32, O::VCmpGtU64, O::VCndmaskB32,
-                 O::BufferStoreDword, O::SEndpgm}};
+                {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_GT_U64, O::V_CNDMASK_B32,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.required_spirv = {"OpUGreaterThan"};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
@@ -13972,8 +13970,8 @@ TestCase VectorVop3CompareEqI64OnGpu() {
           code,
           {},
           {1, 0},
-          {O::VMovB32, O::SMovB64, O::VCmpEqI64, O::VCndmaskB32, O::SMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_EQ_I64, O::V_CNDMASK_B32, O::S_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCompareClassF32() {
@@ -14014,8 +14012,8 @@ TestCase VectorCompareClassF32() {
           code,
           {},
           expected,
-          {O::VMovB32, O::VCmpClassF32, O::VCndmaskB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMP_CLASS_F32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorCompareF16Ops() {
@@ -14066,11 +14064,11 @@ TestCase VectorCompareF16Ops() {
           code,
           {},
           expected,
-          {O::VMovB32, O::SMovB32, O::VCmpLtF16, O::VCmpEqF16, O::VCmpLeF16,
-           O::VCmpGtF16, O::VCmpLgF16, O::VCmpGeF16, O::VCmpNeqF16,
-           O::VCmpxLtF16, O::VCmpxEqF16, O::VCmpxLeF16, O::VCmpxGtF16,
-           O::VCmpxGeF16, O::VCmpxNeqF16, O::VCmpxNltF16, O::VCndmaskB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_LT_F16, O::V_CMP_EQ_F16, O::V_CMP_LE_F16,
+           O::V_CMP_GT_F16, O::V_CMP_LG_F16, O::V_CMP_GE_F16, O::V_CMP_NEQ_F16,
+           O::V_CMPX_LT_F16, O::V_CMPX_EQ_F16, O::V_CMPX_LE_F16, O::V_CMPX_GT_F16,
+           O::V_CMPX_GE_F16, O::V_CMPX_NEQ_F16, O::V_CMPX_NLT_F16, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaCndmaskSourceModifier() {
@@ -14090,8 +14088,8 @@ TestCase Vop2SdwaCndmaskSourceModifier() {
           code,
           {},
           {0xbf800000u},
-          {O::VMovB32, O::VCmpTU32, O::VCndmaskB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMP_T_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
@@ -14114,8 +14112,8 @@ TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
   test.name = "Vop2SdwaCndmaskFullDestinationWithSubDwordSource";
   test.code = code;
   test.expected = {0x00001234u, 0x55667788u};
-  test.opcodes = {O::VMovB32,     O::VCmpFU32,         O::VCmpTU32,
-                  O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,     O::V_CMP_F_U32,         O::V_CMP_T_U32,
+                  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSelect"};
   return test;
 }
@@ -14140,8 +14138,8 @@ TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
   test.name = "Vop3CndmaskUsesSgprMaskLaneBits";
   test.code = code;
   test.expected = {20, 10, 10, 10, 20, 10, 10, 10};
-  test.opcodes = {O::VMovB32, O::VLshlrevB32, O::VAddNcU32,        O::VCmpFU32,
-                  O::SMovB32, O::VCndmaskB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,        O::V_CMP_F_U32,
+                  O::S_MOV_B32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -14169,8 +14167,8 @@ TestCase Vop3CndmaskAllowsDataSourceModifier() {
           code,
           {},
           {0xbf800000u},
-          {O::VMovB32, O::SMovB32, O::VCndmaskB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorCompareExecOps() {
@@ -14220,13 +14218,13 @@ TestCase VectorCompareExecOps() {
           code,
           {},
           std::vector<u32>(out, 1),
-          {O::SMovB32,     O::VMovB32,     O::VCmpxLtF32,       O::VCmpxEqF32,
-           O::VCmpxLeF32,  O::VCmpxGtF32,  O::VCmpxLgF32,       O::VCmpxGeF32,
-           O::VCmpxNgeF32, O::VCmpxNlgF32, O::VCmpxNgtF32,      O::VCmpxNleF32,
-           O::VCmpxNeqF32, O::VCmpxNltF32, O::VCmpxLtI32,       O::VCmpxEqI32,
-           O::VCmpxLeI32,  O::VCmpxGtI32,  O::VCmpxNeI32,       O::VCmpxGeI32,
-           O::VCmpxLtU32,  O::VCmpxEqU32,  O::VCmpxLeU32,       O::VCmpxGtU32,
-           O::VCmpxNeU32,  O::VCmpxGeU32,  O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32,     O::V_MOV_B32,     O::V_CMPX_LT_F32,       O::V_CMPX_EQ_F32,
+           O::V_CMPX_LE_F32,  O::V_CMPX_GT_F32,  O::V_CMPX_LG_F32,       O::V_CMPX_GE_F32,
+           O::V_CMPX_NGE_F32, O::V_CMPX_NLG_F32, O::V_CMPX_NGT_F32,      O::V_CMPX_NLE_F32,
+           O::V_CMPX_NEQ_F32, O::V_CMPX_NLT_F32, O::V_CMPX_LT_I32,       O::V_CMPX_EQ_I32,
+           O::V_CMPX_LE_I32,  O::V_CMPX_GT_I32,  O::V_CMPX_NE_I32,       O::V_CMPX_GE_I32,
+           O::V_CMPX_LT_U32,  O::V_CMPX_EQ_U32,  O::V_CMPX_LE_U32,       O::V_CMPX_GT_U32,
+           O::V_CMPX_NE_U32,  O::V_CMPX_GE_U32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3FloatCompareNegSourceModifier() {
@@ -14244,7 +14242,7 @@ TestCase VectorVop3FloatCompareNegSourceModifier() {
           code,
           {},
           {1, 0},
-          {O::VMovB32, O::VCmpLtF32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMP_LT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CmpxWritesExecMask() {
@@ -14264,7 +14262,7 @@ TestCase VectorVop3CmpxWritesExecMask() {
           code,
           {0},
           {0},
-          {O::VMovB32, O::VCmpxLtU32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMPX_LT_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVopcSdwaCmpxWritesExecMask() {
@@ -14285,7 +14283,7 @@ TestCase VectorVopcSdwaCmpxWritesExecMask() {
           code,
           {0},
           {0},
-          {O::VMovB32, O::VCmpxLtU32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMPX_LT_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCompareInvertedMaskSelect() {
@@ -14303,8 +14301,8 @@ TestCase VectorCompareInvertedMaskSelect() {
           code,
           {},
           {0x12345678u},
-          {O::VMovB32, O::VCmpTU32, O::SNotB64, O::VCndmaskB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::V_CMP_T_U32, O::S_NOT_B64, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BranchSelect() {
@@ -14326,8 +14324,8 @@ TestCase BranchSelect() {
           code,
           {},
           {7},
-          {O::SMovB32, O::SCmpEqU32, O::SCbranchScc1, O::SBranch,
-           O::SCselectB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC1, O::S_BRANCH,
+           O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase SimpleLoop() {
@@ -14347,8 +14345,8 @@ TestCase SimpleLoop() {
           code,
           {},
           {4},
-          {O::SMovB32, O::SCmpLtU32, O::SCbranchScc0, O::SAddU32, O::SBranch,
-           O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0, O::S_ADD_U32, O::S_BRANCH,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BranchVccnzUsesWholeMask() {
@@ -14372,9 +14370,9 @@ TestCase BranchVccnzUsesWholeMask() {
   test.name = "BranchVccnzUsesWholeMask";
   test.code = code;
   test.expected = std::vector<u32>(8, 42);
-  test.opcodes = {O::VMovB32,          O::VLshlrevB32,   O::VAddNcU32,
-                  O::VCmpEqU32,        O::SCbranchVccnz, O::SBranch,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,   O::V_ADD_NC_U32,
+                  O::V_CMP_EQ_U32,        O::S_CBRANCH_VCCNZ, O::S_BRANCH,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -14438,11 +14436,11 @@ TestCase ScalarMemoryLoadVariants() {
           code,
           initial,
           expected,
-          {O::SMovB32, O::SLoadDword, O::SLoadDwordx2, O::SLoadDwordx4,
-           O::SLoadDwordx8, O::SLoadDwordx16, O::SBufferLoadDword,
-           O::SBufferLoadDwordx2, O::SBufferLoadDwordx4, O::SBufferLoadDwordx8,
-           O::SBufferLoadDwordx16, O::VMovB32, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
+           O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
+           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORDX8,
+           O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
@@ -14461,7 +14459,7 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
           code,
           {0x11111111u, 0x22222222u},
           {0x22222222u, 0x22222222u},
-          {O::SMovB32, O::SLoadDword, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadStore() {
@@ -14476,7 +14474,7 @@ TestCase BufferLoadStore() {
           code,
           {0x11223344u, 0},
           {0x11223344u, 0x11223344u},
-          {O::BufferLoadDword, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset() {
@@ -14494,7 +14492,7 @@ TestCase BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset() {
           code,
           {0x11111111u, 0x22222222u, 0x33333333u},
           {0x33333333u, 0x22222222u, 0x33333333u},
-          {O::VMovB32, O::BufferLoadDword, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset() {
@@ -14512,7 +14510,7 @@ TestCase BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset() {
           code,
           {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
           {0x11111111u, 0x22222222u, 0x33333333u, 0xabcdef01u},
-          {O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordNoAddressFlagsIgnoresVaddr() {
@@ -14529,7 +14527,7 @@ TestCase BufferLoadDwordNoAddressFlagsIgnoresVaddr() {
           code,
           {0x11111111u, 0x22222222u, 0x33333333u, 0},
           {0x11111111u, 0x22222222u, 0x33333333u, 0x11111111u},
-          {O::VMovB32, O::BufferLoadDword, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordIdxenUsesDescriptorStride() {
@@ -14551,8 +14549,8 @@ TestCase BufferLoadDwordIdxenUsesDescriptorStride() {
   test.expected = {0x99aabbccu, 0x22222222u, 0x33333333u,
                    0x44444444u, 0x55555555u, 0x66666666u,
                    0x77777777u, 0x88888888u, 0x99aabbccu};
-  test.opcodes = {O::VMovB32, O::BufferLoadDword, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(16, 3);
   test.has_user_data = true;
   return test;
@@ -14577,7 +14575,7 @@ TestCase BufferStoreDwordIdxenUsesDescriptorStride() {
   test.expected = {0x11111111u, 0x22222222u, 0x33333333u,
                    0x44444444u, 0x55555555u, 0x66666666u,
                    0x77777777u, 0x88888888u, 0xabcdef01u};
-  test.opcodes = {O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(16, 3);
   test.has_user_data = true;
   return test;
@@ -14599,7 +14597,7 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0xabcdef01u};
   test.storage_buffer_range_dwords = 1;
   test.storage_buffer_offsets = {12};
-  test.opcodes = {O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(4, 1);
   test.has_user_data = true;
   return test;
@@ -14631,7 +14629,7 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   test.storage_buffer_range_dwords = 1;
   test.storage_buffer_offsets = {0, 12};
   test.force_shader_data_storage = true;
-  test.opcodes = {O::SMovB32, O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -14664,9 +14662,9 @@ TestCase BufferLoadVariants() {
           {0x01u, 0xffffffffu, 0x7f01u, 0xffff80ffu, 0x11223344u, 0x55667788u,
            0x11223344u, 0x55667788u, 0x99aabbccu, 0x11223344u, 0x55667788u,
            0x99aabbccu, 0xddeeff00u},
-          {O::BufferLoadUbyte, O::BufferLoadSbyte, O::BufferLoadUshort,
-           O::BufferLoadSshort, O::BufferLoadDwordx2, O::BufferLoadDwordx3,
-           O::BufferLoadDwordx4, O::VMovB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_SBYTE, O::BUFFER_LOAD_USHORT,
+           O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3,
+           O::BUFFER_LOAD_DWORDX4, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordx4SnapshotsOverlappingAddress() {
@@ -14689,8 +14687,8 @@ TestCase BufferLoadDwordx4SnapshotsOverlappingAddress() {
                   0,           0,           0,           0};
   test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
                    0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.opcodes = {O::VMovB32, O::BufferLoadDwordx4, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(16, 2);
   test.has_user_data = true;
   return test;
@@ -14714,8 +14712,8 @@ TestCase BufferLoadDwordx2SnapshotsOverlappingAddress() {
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0, 0};
   test.expected = {0x11111111u, 0x22222222u, 0x11111111u, 0x22222222u};
-  test.opcodes = {O::VMovB32, O::BufferLoadDwordx2, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX2, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(8, 2);
   test.has_user_data = true;
   return test;
@@ -14740,8 +14738,8 @@ TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0, 0, 0};
   test.expected = {0x11111111u, 0x22222222u, 0x33333333u,
                    0x11111111u, 0x22222222u, 0x33333333u};
-  test.opcodes = {O::VMovB32, O::BufferLoadDwordx3, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX3, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(12, 2);
   test.has_user_data = true;
   return test;
@@ -14779,9 +14777,9 @@ TestCase BufferStoreVariants() {
           std::vector<u32>(10, 0),
           {0xbbccaa00u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
            0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u},
-          {O::VMovB32, O::BufferStoreByte, O::BufferStoreShort,
-           O::BufferStoreDwordx2, O::BufferStoreDwordx3, O::BufferStoreDwordx4,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT,
+           O::BUFFER_STORE_DWORDX2, O::BUFFER_STORE_DWORDX3, O::BUFFER_STORE_DWORDX4,
+           O::S_ENDPGM}};
 }
 
 TestCase BufferFormatVariants() {
@@ -14805,13 +14803,13 @@ TestCase BufferFormatVariants() {
   load.expected = {0x01020304u, 0x01020304u, 0x11121314u, 0x01020304u,
                    0x11121314u, 0x21222324u, 0x01020304u, 0x11121314u,
                    0x21222324u, 0x31323334u};
-  load.opcodes = {O::BufferLoadFormatX,
-                  O::BufferLoadFormatXy,
-                  O::BufferLoadFormatXyz,
-                  O::BufferLoadFormatXyzw,
-                  O::VMovB32,
-                  O::BufferStoreDword,
-                  O::SEndpgm};
+  load.opcodes = {O::BUFFER_LOAD_FORMAT_X,
+                  O::BUFFER_LOAD_FORMAT_XY,
+                  O::BUFFER_LOAD_FORMAT_XYZ,
+                  O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return load;
 }
 
@@ -14835,8 +14833,8 @@ TestCase BufferLoadFormatXyzwSnapshotsOverlappingAddress() {
                   0,           0,           0,           0};
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
                    0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::VMovB32, O::BufferLoadFormatXyzw, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(
       16, 2, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -14859,8 +14857,8 @@ TestCase BufferLoadFormatXyzwResource32_32FloatAppliesXy01() {
   test.code = std::move(code);
   test.initial = {0x3f800000u, 0x40000000u, 0, 0};
   test.expected = {0x3f800000u, 0x40000000u, 0, 0x3f800000u};
-  test.opcodes = {O::VMovB32, O::BufferLoadFormatXyzw,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(
       16, 1, false, BufferFormat(Prospero::BufferFormat::k32_32Float));
   test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(4, 5, 0, 1);
@@ -14884,8 +14882,8 @@ TestCase BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1() {
   test.code = std::move(code);
   test.initial = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u};
   test.expected = {0x11u, 0x22u, 0x33u, 1u};
-  test.opcodes = {O::VMovB32, O::BufferLoadFormatXyzw,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(
       16, 1, false, BufferFormat(Prospero::BufferFormat::k8_8_8_8UInt));
   test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(7, 6, 5, 1);
@@ -14917,8 +14915,8 @@ TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress() {
   test.initial = {0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd, 0, 0, 0, 0};
   test.expected = {0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu, 0xddddddddu,
                    0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.opcodes = {O::VMovB32, O::SMovB64,          O::BufferLoadFormatXyzw,
-                  O::SMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64,          O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(
       16, 2, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -14954,8 +14952,8 @@ TestCase BufferFormatStoreVariants() {
           std::vector<u32>(10, 0),
           {0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u, 0x41424344u,
            0x51525354u, 0x61626364u, 0x71727374u, 0x81828384u, 0x91929394u},
-          {O::VMovB32, O::BufferStoreFormatX, O::BufferStoreFormatXy,
-           O::BufferStoreFormatXyz, O::BufferStoreFormatXyzw, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
+           O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadFormatXResource8UintZeroExtendsByte() {
@@ -14973,8 +14971,8 @@ TestCase BufferLoadFormatXResource8UintZeroExtendsByte() {
   test.code = code;
   test.initial = {0x11223344u, 0};
   test.expected = {0x11223344u, 0x00000044u};
-  test.opcodes = {O::VMovB32, O::BufferLoadFormatX, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 5);
   test.has_user_data = true;
   return test;
@@ -14995,7 +14993,7 @@ TestCase BufferStoreFormatXResource16UintWritesHalfword() {
   test.code = code;
   test.initial = {0x11223344u};
   test.expected = {0x1122aaaau};
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatX, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 4, false, 11);
   test.has_user_data = true;
   return test;
@@ -15017,8 +15015,8 @@ TestCase BufferLoadFormatXyResource88UintExtractsBytes() {
   test.code = code;
   test.initial = {0x0000807fu, 0x55667788u, 0, 0};
   test.expected = {0x0000807fu, 0x55667788u, 0x0000007fu, 0x00000080u};
-  test.opcodes = {O::VMovB32, O::BufferLoadFormatXy, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 18);
   test.has_user_data = true;
   return test;
@@ -15041,8 +15039,8 @@ TestCase BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents() {
   test.code = code;
   test.initial = {0x44332211u, 0xdeadbeefu};
   test.expected = {0x3d888889u, 0x3e088889u};
-  test.opcodes = {O::VMovB32, O::BufferLoadFormatXy, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 56);
   test.has_user_data = true;
   return test;
@@ -15064,7 +15062,7 @@ TestCase BufferStoreFormatXyResource88UintWritesBytes() {
   test.code = code;
   test.initial = {0x11223344u, 0x55667788u};
   test.expected = {0x1122bbaau, 0x55667788u};
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatXy, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 18);
   test.has_user_data = true;
   return test;
@@ -15086,7 +15084,7 @@ TestCase BufferStoreFormatXyResource32UintWritesOneDword() {
   test.code = code;
   test.initial = {0x11111111u, 0x22222222u};
   test.expected = {0xabcdef01u, 0x22222222u};
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatXy, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 20);
   test.has_user_data = true;
   return test;
@@ -15109,7 +15107,7 @@ TestCase BufferStoreFormatXyzResource3232UintWritesTwoDwords() {
   test.code = code;
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u};
   test.expected = {0xabcdef01u, 0x12345678u, 0x33333333u};
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatXyz, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZ, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 62);
   test.has_user_data = true;
   return test;
@@ -15133,7 +15131,7 @@ TestCase BufferStoreFormatXyzwResource323232UintWritesThreeDwords() {
   test.code = code;
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = {0xabcdef01u, 0x12345678u, 0x0badc0deu, 0x44444444u};
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatXyzw, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 72);
   test.has_user_data = true;
   return test;
@@ -15156,7 +15154,7 @@ TestCase BufferStoreFormatXyzResource8UintWritesOneByte() {
   test.code = code;
   test.initial = {0x11223344u, 0x55667788u, 0x99aabbccu};
   test.expected = {0x112233aau, 0x55667788u, 0x99aabbccu};
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatXyz, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZ, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(0, 8, false, 5);
   test.has_user_data = true;
   return test;
@@ -15176,7 +15174,7 @@ TestCase BufferStoreFormatXAddTidUsesLaneIndex() {
   test.code = code;
   test.initial = std::vector<u32>(4, 0);
   test.expected = std::vector<u32>(4, 0x12345678u);
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatX, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -15203,7 +15201,7 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
   test.initial = {0x11111111u, 0x22222222u};
   test.expected = {0x11111111u, 0x22222222u};
   test.storage_buffer_range_dwords = 1;
-  test.opcodes = {O::VMovB32, O::BufferStoreFormatX, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(4, 1, false, 20);
   test.has_user_data = true;
   return test;
@@ -15228,9 +15226,9 @@ TestCase TBufferLoadVariants() {
           {0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u},
           {0x01020304u, 0x01020304u, 0x11121314u, 0x01020304u, 0x11121314u,
            0x21222324u, 0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u},
-          {O::TBufferLoadFormatX, O::TBufferLoadFormatXy,
-           O::TBufferLoadFormatXyz, O::TBufferLoadFormatXyzw, O::VMovB32,
-           O::BufferStoreDword, O::SEndpgm}};
+          {O::TBUFFER_LOAD_FORMAT_X, O::TBUFFER_LOAD_FORMAT_XY,
+           O::TBUFFER_LOAD_FORMAT_XYZ, O::TBUFFER_LOAD_FORMAT_XYZW, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzwSnapshotsOverlappingAddress() {
@@ -15256,8 +15254,8 @@ TestCase TBufferLoadFormatXyzwSnapshotsOverlappingAddress() {
                   0,           0,           0,           0};
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
                    0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::VMovB32, O::TBufferLoadFormatXyzw, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(16, 2);
   test.has_user_data = true;
   return test;
@@ -15283,8 +15281,8 @@ TestCase TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress() {
   test.code = std::move(code);
   test.initial = {0x44332211u, 0, 0, 0, 0, 0, 0, 0};
   test.expected = {0x44332211u, 0, 0, 0, 0x11u, 0x22u, 0x33u, 0x44u};
-  test.opcodes = {O::VMovB32, O::TBufferLoadFormatXyzw, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(4, 8);
   test.has_user_data = true;
   return test;
@@ -15304,7 +15302,7 @@ TestCase TBufferStoreFormatX8UintWritesOneByte() {
           code,
           {0x11223344u},
           {0x112233aau},
-          {O::VMovB32, O::TBufferStoreFormatX, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatX8UintZeroExtendsByte() {
@@ -15321,7 +15319,7 @@ TestCase TBufferLoadFormatX8UintZeroExtendsByte() {
           code,
           {0x11223344u, 0},
           {0x00000044u, 0},
-          {O::VMovB32, O::TBufferLoadFormatX, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatX8888UintExtractsFirstByte() {
@@ -15338,7 +15336,7 @@ TestCase TBufferLoadFormatX8888UintExtractsFirstByte() {
           code,
           {0x44332211u, 0},
           {0x00000011u, 0},
-          {O::VMovB32, O::TBufferLoadFormatX, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXIdxenUsesDescriptorStride() {
@@ -15356,8 +15354,8 @@ TestCase TBufferLoadFormatXIdxenUsesDescriptorStride() {
   test.code = code;
   test.initial = {0x01020304u, 0, 0, 0, 0, 0, 0, 0, 0x0000007eu};
   test.expected = {0x0000007eu, 0, 0, 0, 0, 0, 0, 0, 0x0000007eu};
-  test.opcodes = {O::VMovB32, O::TBufferLoadFormatX, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(16, 3);
   test.has_user_data = true;
   return test;
@@ -15377,7 +15375,7 @@ TestCase TBufferLoadFormatX16FloatConvertsToFloat() {
           code,
           {0x00003c00u, 0},
           {0x3f800000u, 0},
-          {O::VMovB32, O::TBufferLoadFormatX, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXSintSignExtendsSubDword() {
@@ -15398,7 +15396,7 @@ TestCase TBufferLoadFormatXSintSignExtendsSubDword() {
           code,
           {0x00000080u, 0x00008001u},
           {0xffffff80u, 0xffff8001u},
-          {O::VMovB32, O::TBufferLoadFormatX, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXSintWritesSubDword() {
@@ -15419,7 +15417,7 @@ TestCase TBufferStoreFormatXSintWritesSubDword() {
           code,
           {0x11223344u, 0x55667788u},
           {0x11223380u, 0x55668001u},
-          {O::VMovB32, O::TBufferStoreFormatX, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy88IntegerComponents() {
@@ -15442,7 +15440,7 @@ TestCase TBufferLoadFormatXy88IntegerComponents() {
       code,
       {0x0000807fu, 0x00007f80u, 0, 0},
       {0x0000007fu, 0x00000080u, 0xffffff80u, 0x0000007fu},
-      {O::VMovB32, O::TBufferLoadFormatXy, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXy88IntegerComponents() {
@@ -15465,7 +15463,7 @@ TestCase TBufferStoreFormatXy88IntegerComponents() {
           code,
           {0x11223344u, 0x55667788u},
           {0x1122bbaau, 0x55667f80u},
-          {O::VMovB32, O::TBufferStoreFormatXy, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_XY, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy1616IntegerComponents() {
@@ -15488,7 +15486,7 @@ TestCase TBufferLoadFormatXy1616IntegerComponents() {
       code,
       {0x80017fffu, 0x7fff8000u, 0, 0},
       {0x00007fffu, 0x00008001u, 0xffff8000u, 0x00007fffu},
-      {O::VMovB32, O::TBufferLoadFormatXy, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXy1616IntegerComponents() {
@@ -15511,7 +15509,7 @@ TestCase TBufferStoreFormatXy1616IntegerComponents() {
           code,
           {0x11223344u, 0x55667788u},
           {0xbbbbaaaau, 0x7fff8000u},
-          {O::VMovB32, O::TBufferStoreFormatXy, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_XY, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyz16161616UintLoadsHalfwords() {
@@ -15531,7 +15529,7 @@ TestCase TBufferLoadFormatXyz16161616UintLoadsHalfwords() {
       code,
       {0x22221111u, 0x44443333u, 0},
       {0x00001111u, 0x00002222u, 0x00003333u},
-      {O::VMovB32, O::TBufferLoadFormatXyz, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy88UnormConvertsToFloat() {
@@ -15550,7 +15548,7 @@ TestCase TBufferLoadFormatXy88UnormConvertsToFloat() {
       code,
       {0x0000ff80u, 0},
       {0x3f008081u, 0x3f800000u},
-      {O::VMovB32, O::TBufferLoadFormatXy, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy88SnormConvertsToFloat() {
@@ -15569,7 +15567,7 @@ TestCase TBufferLoadFormatXy88SnormConvertsToFloat() {
       code,
       {0x00007f80u, 0},
       {0xbf800000u, 0x3f800000u},
-      {O::VMovB32, O::TBufferLoadFormatXy, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy1616UnormConvertsToFloat() {
@@ -15588,7 +15586,7 @@ TestCase TBufferLoadFormatXy1616UnormConvertsToFloat() {
       code,
       {0xffff8000u, 0},
       {0x3f000080u, 0x3f800000u},
-      {O::VMovB32, O::TBufferLoadFormatXy, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy8888UnormConvertsFirstTwoComponents() {
@@ -15607,7 +15605,7 @@ TestCase TBufferLoadFormatXy8888UnormConvertsFirstTwoComponents() {
       code,
       {0x44332211u, 0xdeadbeefu},
       {0x3d888889u, 0x3e088889u},
-      {O::VMovB32, O::TBufferLoadFormatXy, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzw8888UintExtractsBytes() {
@@ -15627,7 +15625,7 @@ TestCase TBufferLoadFormatXyzw8888UintExtractsBytes() {
       code,
       {0x44332211u, 0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu},
       {0x00000011u, 0x00000022u, 0x00000033u, 0x00000044u},
-      {O::VMovB32, O::TBufferLoadFormatXyzw, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzw1010102SnormConvertsToFloat() {
@@ -15647,7 +15645,7 @@ TestCase TBufferLoadFormatXyzw1010102SnormConvertsToFloat() {
       code,
       {0x800801ffu, 0, 0, 0},
       {0x3f800000u, 0xbf800000u, 0, 0xbf800000u},
-      {O::VMovB32, O::TBufferLoadFormatXyzw, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyz111110FloatUnpacks() {
@@ -15667,7 +15665,7 @@ TestCase TBufferLoadFormatXyz111110FloatUnpacks() {
       code,
       {0x781e03c0u, 0, 0},
       {0x3f800000u, 0x3f800000u, 0x3f800000u},
-      {O::VMovB32, O::TBufferLoadFormatXyz, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzw3232FloatZerosMissingComponents() {
@@ -15687,7 +15685,7 @@ TestCase TBufferLoadFormatXyzw3232FloatZerosMissingComponents() {
       code,
       {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
       {0x11111111u, 0x22222222u, 0, 0},
-      {O::VMovB32, O::TBufferLoadFormatXyzw, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXyzw3232FloatWritesOnlyPresentComponents() {
@@ -15707,7 +15705,7 @@ TestCase TBufferStoreFormatXyzw3232FloatWritesOnlyPresentComponents() {
           code,
           {0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu, 0xddddddddu},
           {0x3f800000u, 0x40000000u, 0xccccccccu, 0xddddddddu},
-          {O::VMovB32, O::TBufferStoreFormatXyzw, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreVariants() {
@@ -15739,8 +15737,8 @@ TestCase TBufferStoreVariants() {
           std::vector<u32>(10, 0),
           {0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u, 0x41424344u,
            0x51525354u, 0x61626364u, 0x71727374u, 0x81828384u, 0x91929394u},
-          {O::VMovB32, O::TBufferStoreFormatX, O::TBufferStoreFormatXy,
-           O::TBufferStoreFormatXyz, O::TBufferStoreFormatXyzw, O::SEndpgm}};
+          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::TBUFFER_STORE_FORMAT_XY,
+           O::TBUFFER_STORE_FORMAT_XYZ, O::TBUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM}};
 }
 
 TestCase FlatLoadVariants() {
@@ -15779,10 +15777,10 @@ TestCase FlatLoadVariants() {
                  0x55667788u, 0x11223344u, 0x55667788u, 0x99aabbccu,
                  0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u,
                  0x11223344u},
-                {O::VMovB32, O::FlatLoadUbyte, O::FlatLoadSbyte,
-                 O::FlatLoadUshort, O::FlatLoadSshort, O::FlatLoadDword,
-                 O::FlatLoadDwordx2, O::FlatLoadDwordx3, O::FlatLoadDwordx4,
-                 O::BufferStoreDword, O::SEndpgm}};
+                {O::V_MOV_B32, O::FLAT_LOAD_UBYTE, O::FLAT_LOAD_SBYTE,
+                 O::FLAT_LOAD_USHORT, O::FLAT_LOAD_SSHORT, O::FLAT_LOAD_DWORD,
+                 O::FLAT_LOAD_DWORDX2, O::FLAT_LOAD_DWORDX3, O::FLAT_LOAD_DWORDX4,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.flat_memory_base = 0;
   return test;
 }
@@ -15808,9 +15806,9 @@ TestCase BranchVccnzUsesCarryProducedWholeMask() {
   test.name = "BranchVccnzUsesCarryProducedWholeMask";
   test.code = code;
   test.expected = std::vector<u32>(8, 42);
-  test.opcodes = {O::VMovB32,  O::VLshlrevB32,      O::VAddNcU32,
-                  O::VCmpFU32, O::VAddcU32,         O::SCbranchVccnz,
-                  O::SBranch,  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,  O::V_LSHLREV_B32,      O::V_ADD_NC_U32,
+                  O::V_CMP_F_U32, O::V_ADDC_U32,         O::S_CBRANCH_VCCNZ,
+                  O::S_BRANCH,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -15838,7 +15836,7 @@ TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
           code,
           {0x11111111u, 0x22222222u},
           {0x11111111u, 0x22222222u},
-          {O::SMovB32, O::SLoadDword, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase FlatVirtualAddressRebasesGuestAllocation() {
@@ -15866,8 +15864,8 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   test.initial = {0, 0x12345678u};
   test.expected = {0x12345678u, 0x12345678u, 0};
   test.flat_memory_base = GuestBase;
-  test.opcodes = {O::VMovB32, O::FlatLoadDword, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return test;
 }
 
@@ -15888,8 +15886,8 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
           code,
           {0x11111111u, 0x22222222u, 0x12345678u},
           {0x12345678u},
-          {O::SMovB32, O::VMovB32, O::FlatLoadDword, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
@@ -15918,8 +15916,8 @@ TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   test.code = code;
   test.initial = initial;
   test.expected = {0x11111111u, 0x11111111u};
-  test.opcodes = {O::SMovB32, O::VMovB32, O::FlatLoadDword, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.flat_memory_base = 0;
   return test;
 }
@@ -15966,9 +15964,9 @@ TestCase FlatStoreVariants() {
                 {0xbbccaa00u, 0x11111111u, 0x22222222u, 0x33333333u,
                  0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u,
                  0x88888888u, 0x99999999u, 0x11111111u, 0},
-                {O::VMovB32, O::FlatStoreByte, O::FlatStoreShort,
-                 O::FlatStoreDword, O::FlatStoreDwordx2, O::FlatStoreDwordx3,
-                 O::FlatStoreDwordx4, O::SEndpgm}};
+                {O::V_MOV_B32, O::FLAT_STORE_BYTE, O::FLAT_STORE_SHORT,
+                 O::FLAT_STORE_DWORD, O::FLAT_STORE_DWORDX2, O::FLAT_STORE_DWORDX3,
+                 O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
   test.flat_memory_base = 0;
   return test;
 }
@@ -16031,11 +16029,11 @@ TestCase DsReadWriteVariants() {
           {0x11223344u, 0xaau, 0xffffffaau, 0x80ffu, 0xffff80ffu, 0x10101010u,
            0x11111111u, 0x20202020u, 0x21212121u, 0x22222222u, 0x30303030u,
            0x31313131u, 0x32323232u, 0x33333333u},
-          {O::VMovB32, O::DsWriteB32, O::DsReadB32, O::DsWriteByte,
-           O::DsReadUbyte, O::DsReadSbyte, O::DsWriteShort, O::DsReadUshort,
-           O::DsReadSshort, O::DsWriteB64, O::DsReadB64, O::DsWriteB96,
-           O::DsReadB96, O::DsWriteB128, O::DsReadB128, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32, O::DS_WRITE_B8,
+           O::DS_READ_U8, O::DS_READ_I8, O::DS_WRITE_B16, O::DS_READ_U16,
+           O::DS_READ_I16, O::DS_WRITE_B64, O::DS_READ_B64, O::DS_WRITE_B96,
+           O::DS_READ_B96, O::DS_WRITE_B128, O::DS_READ_B128, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase DsReadWrite2Variants() {
@@ -16096,10 +16094,10 @@ TestCase DsReadWrite2Variants() {
            0x66666666u, 0x99999999u, 0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu,
            0x77777777u, 0x88888888u, 0xddddddddu, 0xeeeeeeeeu, 0xf0f0f0f0u,
            0x12345678u},
-          {O::VMovB32, O::DsWrite2B32, O::DsRead2B32, O::DsWriteB64,
-           O::DsRead2B64, O::DsWrite2B64, O::DsWrite2St64B32,
-           O::DsWrite2St64B64, O::DsRead2St64B64, O::BufferStoreDword,
-           O::SEndpgm}};
+          {O::V_MOV_B32, O::DS_WRITE2_B32, O::DS_READ2_B32, O::DS_WRITE_B64,
+           O::DS_READ2_B64, O::DS_WRITE2_B64, O::DS_WRITE2ST64_B32,
+           O::DS_WRITE2ST64_B64, O::DS_READ2ST64_B64, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase DsAtomicNoReturnVariants() {
@@ -16130,9 +16128,9 @@ TestCase DsAtomicNoReturnVariants() {
           code,
           std::vector<u32>(9, 0),
           {15, 7, 0xfffffff0u, 5, 5, 20, 0x00f0u, 0xff00u, 0xf0f0u},
-          {O::VMovB32, O::DsWriteB32, O::DsAddU32, O::DsSubU32, O::DsMinI32,
-           O::DsMaxI32, O::DsMinU32, O::DsMaxU32, O::DsAndB32, O::DsOrB32,
-           O::DsXorB32, O::DsReadB32, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_U32, O::DS_SUB_U32, O::DS_MIN_I32,
+           O::DS_MAX_I32, O::DS_MIN_U32, O::DS_MAX_U32, O::DS_AND_B32, O::DS_OR_B32,
+           O::DS_XOR_B32, O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsAtomicReturnVariants() {
@@ -16169,10 +16167,10 @@ TestCase DsAtomicReturnVariants() {
       std::vector<u32>(20, 0),
       {10, 10, 0xfffffff0u, 0xfffffff0u, 10, 10, 0xf0f0u, 0xf000u, 0xf00fu, 10,
        15, 7,  0xfffffff0u, 5,           5,  20, 0x00f0u, 0xff00u, 0xf0f0u, 99},
-      {O::VMovB32, O::DsWriteB32, O::DsAddRtnU32, O::DsSubRtnU32,
-       O::DsMinRtnI32, O::DsMaxRtnI32, O::DsMinRtnU32, O::DsMaxRtnU32,
-       O::DsAndRtnB32, O::DsOrRtnB32, O::DsXorRtnB32, O::DsWrxchgRtnB32,
-       O::DsReadB32, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_RTN_U32, O::DS_SUB_RTN_U32,
+       O::DS_MIN_RTN_I32, O::DS_MAX_RTN_I32, O::DS_MIN_RTN_U32, O::DS_MAX_RTN_U32,
+       O::DS_AND_RTN_B32, O::DS_OR_RTN_B32, O::DS_XOR_RTN_B32, O::DS_WRXCHG_RTN_B32,
+       O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsMiscVariants() {
@@ -16218,10 +16216,10 @@ TestCase DsMiscVariants() {
   test.code = code;
   test.initial = std::vector<u32>(4, 0);
   test.expected = {0x40000000u, 0x40400000u, 0x12345678u, 0xabcdef01u};
-  test.opcodes = {O::VMovB32,          O::SMovB32,          O::DsWriteB32,
-                  O::DsMinF32,         O::DsMaxF32,         O::DsReadB32,
-                  O::DsSwizzleB32,     O::DsWriteAddtidB32, O::DsReadAddtidB32,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,          O::S_MOV_B32,          O::DS_WRITE_B32,
+                  O::DS_MIN_F32,         O::DS_MAX_F32,         O::DS_READ_B32,
+                  O::DS_SWIZZLE_B32,     O::DS_WRITE_ADDTID_B32, O::DS_READ_ADDTID_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16261,8 +16259,8 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
   test.expected = {0x41100000u, 0x3f800000u};
-  test.opcodes = {O::VMovB32,   O::DsWriteB32,       O::DsMinF32, O::DsMaxF32,
-                  O::DsReadB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,   O::DS_WRITE_B32,       O::DS_MIN_F32, O::DS_MAX_F32,
+                  O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16285,8 +16283,8 @@ TestCase DsSwizzleInvalidSourceLaneZero() {
   test.name = "DsSwizzleInvalidSourceLaneZero";
   test.code = code;
   test.expected = {0, 0, 0, 0};
-  test.opcodes = {O::VMovB32, O::DsSwizzleB32, O::VLshlrevB32,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::DS_SWIZZLE_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16320,10 +16318,10 @@ TestCase BufferAtomicVariants() {
       {100,     15,          7,       0xfffffff0u, 5,       5,      20,
        0x00f0u, 0xff00u,     0xf0f0u, 10,          10,      10,     0xfffffff0u,
        10,      0xfffffff0u, 10,      0xf0f0u,     0xf000u, 0xf00fu},
-      {O::VMovB32, O::BufferAtomicSwap, O::BufferAtomicAdd, O::BufferAtomicSub,
-       O::BufferAtomicSMin, O::BufferAtomicUMin, O::BufferAtomicSMax,
-       O::BufferAtomicUMax, O::BufferAtomicAnd, O::BufferAtomicOr,
-       O::BufferAtomicXor, O::BufferStoreDword, O::SEndpgm}};
+      {O::V_MOV_B32, O::BUFFER_ATOMIC_SWAP, O::BUFFER_ATOMIC_ADD, O::BUFFER_ATOMIC_SUB,
+       O::BUFFER_ATOMIC_SMIN, O::BUFFER_ATOMIC_UMIN, O::BUFFER_ATOMIC_SMAX,
+       O::BUFFER_ATOMIC_UMAX, O::BUFFER_ATOMIC_AND, O::BUFFER_ATOMIC_OR,
+       O::BUFFER_ATOMIC_XOR, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
@@ -16340,7 +16338,7 @@ TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
           code,
           {10, 0},
           {15, 5},
-          {O::VMovB32, O::BufferAtomicAdd, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicFMinExactRawGlcModes() {
@@ -16362,8 +16360,8 @@ TestCase BufferAtomicFMinExactRawGlcModes() {
   test.code = code;
   test.initial = {0x40800000u, 0, 0}; // 4.0
   test.expected = {0x3f800000u, 0x40000000u, 0x40000000u};
-  test.opcodes = {O::VMovB32, O::BufferAtomicFMin, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   const auto descriptor = MakeStructuredStorageBufferData(
       0, static_cast<u32>(test.initial.size() * sizeof(u32)));
   std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
@@ -16406,7 +16404,7 @@ TestCase BufferAtomicFMinSpecialValues() {
            0x80000000u, 0x00000000u, 0x00000000u, 0x80000001u, 0x40800000u,
            0xbf800000u, 0x7f800000u, 0x7fc00000u, 0x3f800000u, 0x80000000u,
            0x00000000u, 0x00000001u, 0x00000000u},
-          {O::VMovB32, O::BufferAtomicFMin, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicFMinContendedWorkgroup() {
@@ -16423,7 +16421,7 @@ TestCase BufferAtomicFMinContendedWorkgroup() {
   test.code = code;
   test.initial = {0x42c80000u};  // 100.0
   test.expected = {0x00000000u}; // min(100.0, 0.0 .. 63.0)
-  test.opcodes = {O::VCvtF32U32, O::VMovB32, O::BufferAtomicFMin, O::SEndpgm};
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16452,8 +16450,8 @@ TestCase BufferAtomicFMaxExactRawGlcModes() {
   test.code = code;
   test.initial = {0, 0, 0, 0x3f800000u, 0, 0}; // memory[3] = 1.0
   test.expected = {0, 0, 0, 0x40800000u, 0x40000000u, 0x40000000u};
-  test.opcodes = {O::VMovB32, O::BufferAtomicFMax, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   const auto descriptor = MakeStructuredStorageBufferData(
       0, static_cast<u32>(test.initial.size() * sizeof(u32)));
   std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
@@ -16511,7 +16509,7 @@ TestCase BufferAtomicFMaxSpecialValues() {
            0x7f800000u, 0xff800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u,
            0x3f800000u, 0x80000000u, 0x00000000u, 0x80000001u, 0x80000000u,
            0x00000000u, 0x00000001u},
-          {O::VMovB32, O::BufferAtomicFMax, O::BufferStoreDword, O::SEndpgm}};
+          {O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicFMaxContendedWorkgroup() {
@@ -16528,7 +16526,7 @@ TestCase BufferAtomicFMaxContendedWorkgroup() {
   test.code = code;
   test.initial = {0xc2c80000u};  // -100.0
   test.expected = {0x427c0000u}; // max(-100.0, 0.0 .. 63.0)
-  test.opcodes = {O::VCvtF32U32, O::VMovB32, O::BufferAtomicFMax, O::SEndpgm};
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16580,8 +16578,8 @@ TestCase ImageLoadVariants() {
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u,
                    0x40800000u, 0x3f800000u, 0x40000000u,
                    0x40400000u, 0x40800000u, 4};
-  test.opcodes = {O::VMovB32,         O::ImageLoad,        O::ImageLoadMip,
-                  O::ImageGetResinfo, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,         O::IMAGE_LOAD,        O::IMAGE_LOAD_MIP,
+                  O::IMAGE_GET_RESINFO, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   return test;
 }
@@ -16614,8 +16612,8 @@ TestCase DsAppendConsumeUsesEncodedLdsSelector() {
           code,
           {},
           {10, 74, 0, 10},
-          {O::SMovB32, O::VMovB32, O::DsWriteB32, O::DsReadB32, O::DsAppend,
-           O::DsConsume, O::BufferStoreDword, O::SEndpgm}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32, O::DS_APPEND,
+           O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsAppendUsesEncodedGdsSelector() {
@@ -16649,7 +16647,7 @@ TestCase DsAppendUsesEncodedGdsSelector() {
       code,
       {},
       {10, 74, 20, 84, 40, 104},
-      {O::SMovB32, O::DsAppend, O::DsConsume, O::BufferStoreDword, O::SEndpgm}};
+      {O::S_MOV_B32, O::DS_APPEND, O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.gds_initial = {10, 20, 30, 40};
   test.expected_gds = {10, 20, 30, 40};
   return test;
@@ -16681,8 +16679,8 @@ TestCase DsGdsSubdwordAndAtomicWrites() {
   TestCase test;
   test.name = "DsGdsSubdwordAndAtomics";
   test.code = code;
-  test.opcodes = {O::VMovB32,      O::VAddNcU32, O::VLshlrevB32, O::DsWriteByte,
-                  O::DsWriteShort, O::DsAddU32,  O::DsMinF32,    O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,      O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::DS_WRITE_B8,
+                  O::DS_WRITE_B16, O::DS_ADD_U32,  O::DS_MIN_F32,    O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16708,7 +16706,7 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   test.name = "ImageLoadR32UintUsesIntegerSampledImage";
   test.code = code;
   test.expected = {0xdeadbeefu};
-  test.opcodes = {O::VMovB32, O::ImageLoad, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba.resize(16);
   test.sampled_image_rgba[6] = 0xdeadbeefu;
   test.sampled_image_format = vk::Format::eR32Uint;
@@ -16734,7 +16732,7 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   test.name = "ImageLoad1DUsesScalarCoordinate";
   test.code = code;
   test.expected = {0xdeadbeefu};
-  test.opcodes = {O::VMovB32, O::ImageLoad, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = {0, 0, 0xdeadbeefu, 0};
@@ -16765,7 +16763,7 @@ TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   test.name = "ImageLoad1DArrayUsesLayerCoordinate";
   test.code = code;
   test.expected = {0xcafebabeu};
-  test.opcodes = {O::VMovB32, O::ImageLoad, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = {0, 0, 0, 0, 0, 0, 0xcafebabeu, 0};
@@ -16796,7 +16794,7 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
   test.name = "ImageLoad1DArrayDescriptorUsesSelectedLayer";
   test.code = code;
   test.expected = {0xcafebabeu};
-  test.opcodes = {O::VMovB32, O::ImageLoad, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = {
@@ -16840,7 +16838,7 @@ TestCase ImageLoadMipUsesVaddr2Lod2D() {
   test.name = "ImageLoadMipUsesVaddr2Lod2D";
   test.code = code;
   test.expected = {0x40000000u};
-  test.opcodes = {O::VMovB32, O::ImageLoadMip, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD_MIP, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba_mips = {base, mip1};
   return test;
 }
@@ -16869,7 +16867,7 @@ TestCase ImageLoadMipNsaUsesSelectedAddressVgprs() {
   test.name = "ImageLoadMipNsaUsesSelectedAddressVgprs";
   test.code = code;
   test.expected = {0x40a00000u};
-  test.opcodes = {O::VMovB32, O::ImageLoadMip, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD_MIP, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba_mips = {base, mip1};
   return test;
 }
@@ -16895,7 +16893,7 @@ TestCase ImageLoadA16UintCoordsOnGpu() {
   test.name = "ImageLoadA16UintCoordsOnGpu";
   test.code = code;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::VMovB32, O::ImageLoad, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.required_spirv = {"OpShiftRightLogical", "OpBitwiseAnd"};
   test.forbidden_spirv = {"UnpackHalf2x16"};
@@ -16917,8 +16915,8 @@ TestCase ImageGetResinfoDmaskWidthHeight() {
   test.name = "ImageGetResinfoDmaskWidthHeight";
   test.code = code;
   test.expected = {4, 2};
-  test.opcodes = {O::VMovB32, O::ImageGetResinfo, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GET_RESINFO, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 2;
   test.sampled_image_rgba = MakeRgbaImage(test.image_width, test.image_height);
@@ -16939,8 +16937,8 @@ TestCase ImageGetResinfoDmaskMipLevels() {
   test.name = "ImageGetResinfoDmaskMipLevels";
   test.code = code;
   test.expected = {2};
-  test.opcodes = {O::VMovB32, O::ImageGetResinfo, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GET_RESINFO, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   auto base = MakeRgbaImage(4, 4);
   auto mip1 = MakeRgbaImage(2, 2);
   test.sampled_image_rgba_mips = {base, mip1};
@@ -16996,9 +16994,9 @@ TestCase ImageSampleAndGather() {
                    0x3f800000u,
                    0x3f800000u,
                    0};
-  test.opcodes = {O::VMovB32,        O::ImageSample,     O::ImageGetLod,
-                  O::ImageGather4Lz, O::ImageGather4LzO, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::IMAGE_SAMPLE,     O::IMAGE_GET_LOD,
+                  O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba = image;
   return test;
 }
@@ -17024,7 +17022,7 @@ TestCase ImageSampleA16SamplerCoordsOnGpu() {
   test.name = "ImageSampleA16SamplerCoordsOnGpu";
   test.code = code;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::VMovB32, O::ImageSample, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.required_spirv = {"UnpackHalf2x16"};
   return test;
@@ -17044,7 +17042,7 @@ TestCase ImageSampleOpcodeAliasUsesNormalCoords() {
   TestCase test;
   test.name = "ImageSampleOpcodeAliasUsesNormalCoords";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageSample, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpImageSampleExplicitLod"};
   test.forbidden_spirv = {"UnpackHalf2x16"};
   test.compile_only = true;
@@ -17074,7 +17072,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.name = "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu";
   test.code = code;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::VMovB32, O::ImageSample, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.required_spirv = {"UnpackHalf2x16"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
@@ -17096,7 +17094,7 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   TestCase test;
   test.name = "ImageSampleA16CompareBiasRdna2AddressOrder";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageSample, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
@@ -17137,9 +17135,9 @@ TestCase ImageGatherCompareOpcodes() {
   TestCase test;
   test.name = "ImageGatherCompareOpcodes";
   test.code = code;
-  test.opcodes = {O::VMovB32,        O::ImageGather4C,    O::ImageGather4CLz,
-                  O::ImageGather4CO, O::ImageGather4CLzO, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,        O::IMAGE_GATHER4_C,    O::IMAGE_GATHER4_C_LZ,
+                  O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
@@ -17182,8 +17180,8 @@ TestCase ImageStoreVariants() {
   test.name = "ImageStoreVariants";
   test.code = code;
   test.expected = {0x12345678u};
-  test.opcodes = {O::VMovB32, O::ImageStore, O::ImageStoreMip,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::IMAGE_STORE_MIP,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_rgba = expected_image;
@@ -17329,7 +17327,7 @@ TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   TestCase test;
   test.name = "ImageStoreMipSelectsPpsa01340Descriptor";
   test.code = std::move(code);
-  test.opcodes = {O::VMovB32, O::ImageStoreMip, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE_MIP, O::S_ENDPGM};
   const std::array<u32, 8> descriptor{
       0x0294dc00u, 0xc4700000u, 0x00b3c13fu, 0x91b31facu,
       0x00000000u, 0x00700030u, 0xb07b0000u, 0x0002ac3cu};
@@ -17359,7 +17357,7 @@ TestCase ImageStoreRgbOneUsesInverseSwizzle() {
   TestCase test;
   test.name = "ImageStoreRgbOneUsesInverseSwizzle";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageStore, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.has_user_data = true;
   test.user_data[0] = 0x1000u;
   test.user_data[1] =
@@ -17399,7 +17397,7 @@ TestCase ImageStoreBgraUsesInverseSwizzle() {
   TestCase test;
   test.name = "ImageStoreBgraUsesInverseSwizzle";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageStore, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.has_user_data = true;
   test.user_data[0] = 0x1000u;
   test.user_data[1] =
@@ -17431,7 +17429,7 @@ TestCase ImageStoreYzwxUsesInverseSwizzle() {
   TestCase test;
   test.name = "ImageStoreYzwxUsesInverseSwizzle";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageStore, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.user_data =
       MakeStorageTextureData(Prospero::BufferFormat::k32_32_32_32Float);
   test.has_user_data = true;
@@ -17461,7 +17459,7 @@ TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
   TestCase test;
   test.name = "ImageStoreR32FloatUsesFormatlessStorageImage";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageStore, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.storage_image_format = vk::Format::eR32Sfloat;
   test.storage_image_dwords_per_pixel = 1;
   test.storage_image_rgba = std::vector<u32>(16, 0);
@@ -17490,7 +17488,7 @@ TestCase ImageStoreR32SintUsesRawUintView() {
   TestCase test;
   test.name = "ImageStoreR32SintUsesRawUintView";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageStore, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32SInt);
   test.has_user_data = true;
   test.storage_image_r32ui = std::vector<u32>(16, 0);
@@ -17517,7 +17515,7 @@ TestCase ImageStoreR32UintUsesUintStorageImage() {
   TestCase test;
   test.name = "ImageStoreR32UintUsesUintStorageImage";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::ImageStore, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
   test.storage_image_rgba = MakeRgbaImage(4, 4);
@@ -17537,7 +17535,7 @@ TestCase ComputeTgSizeSgprUsesWaveMetadata() {
   TestCase test;
   test.name = "ComputeTgSizeSgprUsesWaveMetadata";
   test.code = code;
-  test.opcodes = {O::VMovB32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 4;
   test.compute_info.threads_num[2] = 16;
@@ -17576,9 +17574,9 @@ TestCase ImageAtomicVariants() {
   test.name = "ImageAtomicVariants";
   test.code = code;
   test.expected = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
-  test.opcodes = {O::VMovB32,          O::ImageAtomicAdd, O::ImageAtomicUMin,
-                  O::ImageAtomicAnd,   O::ImageAtomicOr,  O::ImageAtomicXor,
-                  O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD, O::IMAGE_ATOMIC_UMIN,
+                  O::IMAGE_ATOMIC_AND,   O::IMAGE_ATOMIC_OR,  O::IMAGE_ATOMIC_XOR,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {
@@ -17610,8 +17608,8 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   test.name = "ImageAtomicGlc0DoesNotReturnOldValue";
   test.code = code;
   test.expected = {5};
-  test.opcodes = {O::VMovB32, O::ImageAtomicAdd, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_ATOMIC_ADD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.storage_image_r32ui[0] = 10;
@@ -17636,8 +17634,8 @@ GraphicsCase GraphicsInterpolationExport() {
   return {"GraphicsInterpolationExport",
           code,
           {0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u},
-          {O::VInterpP1F32, O::VInterpP2F32, O::VInterpMovF32, O::VMovB32,
-           O::Exp, O::SEndpgm}};
+          {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_INTERP_MOV_F32, O::V_MOV_B32,
+           O::EXP, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsFlatInterpolatorExport() {
@@ -17656,7 +17654,7 @@ GraphicsCase GraphicsFlatInterpolatorExport() {
   test.name = "GraphicsFlatInterpolatorExport";
   test.fragment_code = code;
   test.expected_pixel = {0x3e800000u, 0x00000000u, 0x00000000u, 0x3f800000u};
-  test.opcodes = {O::VInterpMovF32, O::VMovB32, O::Exp, O::SEndpgm};
+  test.opcodes = {O::V_INTERP_MOV_F32, O::V_MOV_B32, O::EXP, O::S_ENDPGM};
   test.pixel_interpolator_settings = {0x00000400u};
   test.vertices = {
       0xbf800000u, 0xbf800000u, 0x3e800000u, 0x00000000u, 0x00000000u,
@@ -17684,8 +17682,8 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
   return {"GraphicsDsAddtidScratchExport",
           code,
           {0x3f000000u, 0x3f000000u, 0x3f000000u, 0x3f000000u},
-          {O::SMovB32, O::VMovB32, O::DsWriteAddtidB32, O::DsReadAddtidB32,
-           O::Exp, O::SEndpgm}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_ADDTID_B32, O::DS_READ_ADDTID_B32,
+           O::EXP, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
@@ -17707,7 +17705,7 @@ GraphicsCase GraphicsDirectSgprPushConstantExport() {
   test.name = "GraphicsDirectSgprPushConstantExport";
   test.fragment_code = code;
   test.expected_pixel = values;
-  test.opcodes = {O::VMovB32, O::Exp, O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::EXP, O::S_ENDPGM};
 
   for (size_t i = 0; i < values.size(); i++) {
     test.user_data[i] = values[i];
@@ -17734,7 +17732,7 @@ GraphicsCase GraphicsInlineSrtScalarPromotionExport() {
   test.name = "GraphicsInlineSrtScalarPromotionExport";
   test.fragment_code = code;
   test.expected_pixel = values;
-  test.opcodes = {O::VCvtPkrtzF16F32, O::Exp, O::SEndpgm};
+  test.opcodes = {O::V_CVT_PKRTZ_F16_F32, O::EXP, O::S_ENDPGM};
 
   for (size_t i = 0; i < values.size(); i++) {
     test.user_data[i] = values[i];
@@ -17762,7 +17760,7 @@ GraphicsCase GraphicsNullVmExportDiscardsInactiveExec() {
   return {"GraphicsNullVmExportDiscardsInactiveExec",
           code,
           {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
-          {O::VMovB32, O::Exp, O::SMovB64, O::SEndpgm}};
+          {O::V_MOV_B32, O::EXP, O::S_MOV_B64, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsMrt0OffVmExportDiscardsInactiveExec() {
@@ -17783,7 +17781,7 @@ GraphicsCase GraphicsMrt0OffVmExportDiscardsInactiveExec() {
   return {"GraphicsMrt0OffVmExportDiscardsInactiveExec",
           code,
           {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
-          {O::VMovB32, O::Exp, O::SMovB64, O::SEndpgm}};
+          {O::V_MOV_B32, O::EXP, O::S_MOV_B64, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsFinalVmExportSupersedesEarlierVmMask() {
@@ -17810,7 +17808,7 @@ GraphicsCase GraphicsFinalVmExportSupersedesEarlierVmMask() {
   return {"GraphicsFinalVmExportSupersedesEarlierVmMask",
           code,
           {0x40400000u, 0x40800000u, 0x40a00000u, 0x40c00000u},
-          {O::VMovB32, O::SMovB64, O::Exp, O::SMovB32, O::SEndpgm}};
+          {O::V_MOV_B32, O::S_MOV_B64, O::EXP, O::S_MOV_B32, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsBranchPathFinalVmExportDiscardsInactiveExec() {
@@ -17846,8 +17844,8 @@ GraphicsCase GraphicsBranchPathFinalVmExportDiscardsInactiveExec() {
   return {"GraphicsBranchPathFinalVmExportDiscardsInactiveExec",
           code,
           {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
-          {O::VMovB32, O::Exp, O::SMovB64, O::SCmpEqU32, O::SCbranchScc1,
-           O::SMovB32, O::SEndpgm}};
+          {O::V_MOV_B32, O::EXP, O::S_MOV_B64, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC1,
+           O::S_MOV_B32, O::S_ENDPGM}};
 }
 
 TestCase MultipleWorkitemsGlobalId() {
@@ -17867,8 +17865,8 @@ TestCase MultipleWorkitemsGlobalId() {
   test.name = "MultipleWorkitemsGlobalId";
   test.code = code;
   test.expected = {64, 65, 66, 67, 68, 69, 70, 71};
-  test.opcodes = {O::VMovB32, O::VLshlrevB32, O::VAddNcU32, O::BufferStoreDword,
-                  O::SEndpgm};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -17895,8 +17893,8 @@ TestCase DispatcherIrreducibleControlFlow() {
   test.name = "DispatcherIrreducibleControlFlow";
   test.code = code;
   test.expected = {7};
-  test.opcodes = {O::SCbranchScc1, O::VMovB32, O::BufferStoreDword,
-                  O::SCbranchScc0, O::SBranch, O::SEndpgm};
+  test.opcodes = {O::S_CBRANCH_SCC1, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_CBRANCH_SCC0, O::S_BRANCH, O::S_ENDPGM};
   return test;
 }
 

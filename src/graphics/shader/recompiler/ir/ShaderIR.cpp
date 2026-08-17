@@ -71,10 +71,10 @@ bool AppendScalarResultSccNonZero(const Decoder::Instruction& decoded, BasicBloc
 
 uint32_t VectorByteConvertIndex(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::VCvtF32Ubyte0: return 0;
-		case Decoder::Opcode::VCvtF32Ubyte1: return 1;
-		case Decoder::Opcode::VCvtF32Ubyte2: return 2;
-		case Decoder::Opcode::VCvtF32Ubyte3: return 3;
+		case Decoder::Opcode::V_CVT_F32_UBYTE0: return 0;
+		case Decoder::Opcode::V_CVT_F32_UBYTE1: return 1;
+		case Decoder::Opcode::V_CVT_F32_UBYTE2: return 2;
+		case Decoder::Opcode::V_CVT_F32_UBYTE3: return 3;
 		default: return 0xffffffffu;
 	}
 }
@@ -228,8 +228,8 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 	mem.data_signed   = decoded.data_signed;
 	mem.typed         = decoded.typed;
 	mem.formatted     = decoded.formatted;
-	mem.image_has_mip = decoded.opcode == Decoder::Opcode::ImageLoadMip ||
-	                    decoded.opcode == Decoder::Opcode::ImageStoreMip;
+	mem.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
+	                    decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	mem.glc           = decoded.glc;
 	mem.slc           = decoded.slc;
 	mem.idxen         = decoded.idxen;
@@ -451,10 +451,10 @@ bool LowerScalarSelect64(const Decoder::Instruction& decoded, BasicBlock& block,
 
 uint32_t ScalarShiftLeftAddAmount(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SLshl1AddU32: return 1;
-		case Decoder::Opcode::SLshl2AddU32: return 2;
-		case Decoder::Opcode::SLshl3AddU32: return 3;
-		case Decoder::Opcode::SLshl4AddU32: return 4;
+		case Decoder::Opcode::S_LSHL1_ADD_U32: return 1;
+		case Decoder::Opcode::S_LSHL2_ADD_U32: return 2;
+		case Decoder::Opcode::S_LSHL3_ADD_U32: return 3;
+		case Decoder::Opcode::S_LSHL4_ADD_U32: return 4;
 		default: return 0;
 	}
 }
@@ -484,20 +484,20 @@ bool LowerScalarShiftLeftAdd(const Decoder::Instruction& decoded, BasicBlock& bl
 
 Opcode ScalarMinMaxSccCompareOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SMinI32: return Opcode::CompareLtI32;
-		case Decoder::Opcode::SMaxI32: return Opcode::CompareGtI32;
-		case Decoder::Opcode::SMinU32: return Opcode::CompareLtU32;
-		case Decoder::Opcode::SMaxU32: return Opcode::CompareGtU32;
+		case Decoder::Opcode::S_MIN_I32: return Opcode::CompareLtI32;
+		case Decoder::Opcode::S_MAX_I32: return Opcode::CompareGtI32;
+		case Decoder::Opcode::S_MIN_U32: return Opcode::CompareLtU32;
+		case Decoder::Opcode::S_MAX_U32: return Opcode::CompareGtU32;
 		default: return Opcode::CompareFalse;
 	}
 }
 
 bool IsScalarMinMaxOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SMinI32:
-		case Decoder::Opcode::SMaxI32:
-		case Decoder::Opcode::SMinU32:
-		case Decoder::Opcode::SMaxU32: return true;
+		case Decoder::Opcode::S_MIN_I32:
+		case Decoder::Opcode::S_MAX_I32:
+		case Decoder::Opcode::S_MIN_U32:
+		case Decoder::Opcode::S_MAX_U32: return true;
 		default: return false;
 	}
 }
@@ -507,7 +507,7 @@ bool ResolveIrOpcode(Decoder::Opcode decoded, Opcode& lowered, std::string* erro
 	if (!opcode.has_value()) {
 		if (error != nullptr) {
 			*error = fmt::format("decoded opcode has no IR lowering: {}",
-			                     Decoder::OpcodeToString(decoded));
+			                     magic_enum::enum_name(decoded));
 		}
 		return false;
 	}
@@ -763,17 +763,19 @@ bool LowerVectorCarryOut(const Decoder::Instruction& decoded, BasicBlock& block,
 	Instruction inst;
 	inst.pc = decoded.pc;
 	inst.op =
-	    decoded.opcode == Decoder::Opcode::VAddI32 ? Opcode::IAddCarryU32 : Opcode::ISubBorrowU32;
-	inst.src_count   = decoded.opcode == Decoder::Opcode::VAddI32 ? 3u : 2u;
-	const auto& src0 = decoded.opcode == Decoder::Opcode::VSubrevI32 ? decoded.src1 : decoded.src0;
-	const auto& src1 = decoded.opcode == Decoder::Opcode::VSubrevI32 ? decoded.src0 : decoded.src1;
+	    decoded.opcode == Decoder::Opcode::V_ADD_I32 ? Opcode::IAddCarryU32 : Opcode::ISubBorrowU32;
+	inst.src_count = decoded.opcode == Decoder::Opcode::V_ADD_I32 ? 3u : 2u;
+	const auto& src0 =
+	    decoded.opcode == Decoder::Opcode::V_SUBREV_I32 ? decoded.src1 : decoded.src0;
+	const auto& src1 =
+	    decoded.opcode == Decoder::Opcode::V_SUBREV_I32 ? decoded.src0 : decoded.src1;
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
 	    !LowerRegisterOperand(decoded.dst2, inst.dst2, error) ||
 	    !LowerSourceOperand(src0, inst.src[0], error) ||
 	    !LowerSourceOperand(src1, inst.src[1], error)) {
 		return false;
 	}
-	if (decoded.opcode == Decoder::Opcode::VAddI32) {
+	if (decoded.opcode == Decoder::Opcode::V_ADD_I32) {
 		inst.src[2] = MakeImmediateU32(0);
 	}
 	block.instructions.push_back(inst);
@@ -892,7 +894,7 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock& block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
-	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value != 2u) {
+	if (decoded.opcode == Decoder::Opcode::V_INTERP_MOV_F32 && decoded.src0.value != 2u) {
 		if (error != nullptr) {
 			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
 			                     decoded.src0.value, decoded.pc);
@@ -989,29 +991,29 @@ bool LowerControlMarker(const Decoder::Instruction& decoded, BasicBlock& block, 
 bool LowerControlInstruction(const Decoder::Instruction& decoded, BasicBlock& block,
                              std::string* error) {
 	switch (decoded.opcode) {
-		case Decoder::Opcode::SNop:
+		case Decoder::Opcode::S_NOP:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
-		case Decoder::Opcode::SWaitcnt:
-		case Decoder::Opcode::SWaitcntDepctr:
+		case Decoder::Opcode::S_WAITCNT:
+		case Decoder::Opcode::S_WAITCNT_DEPCTR:
 			return LowerControlMarker(decoded, block, Opcode::Waitcnt, true, error);
-		case Decoder::Opcode::SBarrier:
+		case Decoder::Opcode::S_BARRIER:
 			return LowerControlMarker(decoded, block, Opcode::Barrier, false, error);
-		case Decoder::Opcode::SSendmsg:
+		case Decoder::Opcode::S_SENDMSG:
 			return LowerControlMarker(decoded, block, Opcode::Sendmsg, true, error);
-		case Decoder::Opcode::SSetregB32:
-		case Decoder::Opcode::SSleep:
+		case Decoder::Opcode::S_SETREG_B32:
+		case Decoder::Opcode::S_SLEEP:
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
-		case Decoder::Opcode::STrap:
+		case Decoder::Opcode::S_TRAP:
 			// RDNA2 converts S_TRAP to a NOP when the unmodeled trap state is disabled.
 			return LowerControlMarker(decoded, block, Opcode::ControlNop, true, error);
-		case Decoder::Opcode::STtraceData:
+		case Decoder::Opcode::S_TTRACEDATA:
 			return LowerControlMarker(decoded, block, Opcode::TtraceData, true, error);
-		case Decoder::Opcode::SInstPrefetch:
+		case Decoder::Opcode::S_INST_PREFETCH:
 			return LowerControlMarker(decoded, block, Opcode::InstPrefetch, true, error);
 		default:
 			if (error != nullptr) {
 				*error = fmt::format("control opcode has no specialized IR lowering: {}",
-				                     Decoder::OpcodeToString(decoded.opcode));
+				                     magic_enum::enum_name(decoded.opcode));
 			}
 			return false;
 	}
@@ -1036,20 +1038,20 @@ bool LowerScalarGetpcB64(const Decoder::Instruction& decoded, BasicBlock& block,
 
 bool IsScalarSaveexecOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SAndSaveexecB32:
-		case Decoder::Opcode::SAndn1SaveexecB32:
-		case Decoder::Opcode::SAndSaveexecB64:
-		case Decoder::Opcode::SOrn2SaveexecB64:
-		case Decoder::Opcode::SAndn1SaveexecB64: return true;
+		case Decoder::Opcode::S_AND_SAVEEXEC_B32:
+		case Decoder::Opcode::S_ANDN1_SAVEEXEC_B32:
+		case Decoder::Opcode::S_AND_SAVEEXEC_B64:
+		case Decoder::Opcode::S_ORN2_SAVEEXEC_B64:
+		case Decoder::Opcode::S_ANDN1_SAVEEXEC_B64: return true;
 		default: return false;
 	}
 }
 
 SaveexecMode ScalarSaveexecMode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SOrn2SaveexecB64: return SaveexecMode::Orn2;
-		case Decoder::Opcode::SAndn1SaveexecB32:
-		case Decoder::Opcode::SAndn1SaveexecB64: return SaveexecMode::Andn1;
+		case Decoder::Opcode::S_ORN2_SAVEEXEC_B64: return SaveexecMode::Orn2;
+		case Decoder::Opcode::S_ANDN1_SAVEEXEC_B32:
+		case Decoder::Opcode::S_ANDN1_SAVEEXEC_B64: return SaveexecMode::Andn1;
 		default: return SaveexecMode::And;
 	}
 }
@@ -1058,8 +1060,8 @@ bool LowerScalarSaveexec(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
 	Instruction inst;
 	inst.pc            = decoded.pc;
-	inst.op            = (decoded.opcode == Decoder::Opcode::SAndSaveexecB32 ||
-	                      decoded.opcode == Decoder::Opcode::SAndn1SaveexecB32)
+	inst.op            = (decoded.opcode == Decoder::Opcode::S_AND_SAVEEXEC_B32 ||
+	                      decoded.opcode == Decoder::Opcode::S_ANDN1_SAVEEXEC_B32)
 	                         ? Opcode::SaveexecB32
 	                         : Opcode::SaveexecB64;
 	inst.saveexec_mode = ScalarSaveexecMode(decoded.opcode);
@@ -1074,31 +1076,31 @@ bool LowerScalarSaveexec(const Decoder::Instruction& decoded, BasicBlock& block,
 
 bool IsControlOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SNop:
-		case Decoder::Opcode::SWaitcnt:
-		case Decoder::Opcode::SWaitcntDepctr:
-		case Decoder::Opcode::SBarrier:
-		case Decoder::Opcode::SSendmsg:
-		case Decoder::Opcode::SSetregB32:
-		case Decoder::Opcode::SSleep:
-		case Decoder::Opcode::STrap:
-		case Decoder::Opcode::STtraceData:
-		case Decoder::Opcode::SInstPrefetch: return true;
+		case Decoder::Opcode::S_NOP:
+		case Decoder::Opcode::S_WAITCNT:
+		case Decoder::Opcode::S_WAITCNT_DEPCTR:
+		case Decoder::Opcode::S_BARRIER:
+		case Decoder::Opcode::S_SENDMSG:
+		case Decoder::Opcode::S_SETREG_B32:
+		case Decoder::Opcode::S_SLEEP:
+		case Decoder::Opcode::S_TRAP:
+		case Decoder::Opcode::S_TTRACEDATA:
+		case Decoder::Opcode::S_INST_PREFETCH: return true;
 		default: return false;
 	}
 }
 
 bool IsTerminatorOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SEndpgm:
-		case Decoder::Opcode::SBranch:
-		case Decoder::Opcode::SCbranchScc0:
-		case Decoder::Opcode::SCbranchScc1:
-		case Decoder::Opcode::SCbranchVccz:
-		case Decoder::Opcode::SCbranchVccnz:
-		case Decoder::Opcode::SCbranchExecz:
-		case Decoder::Opcode::SCbranchExecnz:
-		case Decoder::Opcode::SSetpcB64: return true;
+		case Decoder::Opcode::S_ENDPGM:
+		case Decoder::Opcode::S_BRANCH:
+		case Decoder::Opcode::S_CBRANCH_SCC0:
+		case Decoder::Opcode::S_CBRANCH_SCC1:
+		case Decoder::Opcode::S_CBRANCH_VCCZ:
+		case Decoder::Opcode::S_CBRANCH_VCCNZ:
+		case Decoder::Opcode::S_CBRANCH_EXECZ:
+		case Decoder::Opcode::S_CBRANCH_EXECNZ:
+		case Decoder::Opcode::S_SETPC_B64: return true;
 		default: return false;
 	}
 }
@@ -1120,43 +1122,44 @@ bool IsMemoryFamily(Decoder::Family family) {
 bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block,
                              std::string* error) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::Unsupported:
+		case Decoder::Opcode::UNSUPPORTED:
 			if (error != nullptr) {
 				*error = fmt::format("unsupported decoded instruction: {}",
 				                     Decoder::InstructionToString(inst).c_str());
 			}
 			return false;
-		case Decoder::Opcode::SGetpcB64: return LowerScalarGetpcB64(inst, block, error);
-		case Decoder::Opcode::VNop: return true;
-		case Decoder::Opcode::Exp: return LowerExportInstruction(inst, block, error);
-		case Decoder::Opcode::SCselectB32: return LowerScalarSelect(inst, block, error);
-		case Decoder::Opcode::SCselectB64: return LowerScalarSelect64(inst, block, error);
-		case Decoder::Opcode::SAddU32: return LowerScalarAddCarry(inst, block, false, error);
-		case Decoder::Opcode::SAddcU32: return LowerScalarAddCarry(inst, block, true, error);
-		case Decoder::Opcode::SSubbU32: return LowerScalarSubBorrowCarry(inst, block, error);
-		case Decoder::Opcode::SSubU32:
+		case Decoder::Opcode::S_GETPC_B64: return LowerScalarGetpcB64(inst, block, error);
+		case Decoder::Opcode::V_NOP: return true;
+		case Decoder::Opcode::EXP: return LowerExportInstruction(inst, block, error);
+		case Decoder::Opcode::S_CSELECT_B32: return LowerScalarSelect(inst, block, error);
+		case Decoder::Opcode::S_CSELECT_B64: return LowerScalarSelect64(inst, block, error);
+		case Decoder::Opcode::S_ADD_U32: return LowerScalarAddCarry(inst, block, false, error);
+		case Decoder::Opcode::S_ADDC_U32: return LowerScalarAddCarry(inst, block, true, error);
+		case Decoder::Opcode::S_SUBB_U32: return LowerScalarSubBorrowCarry(inst, block, error);
+		case Decoder::Opcode::S_SUB_U32:
 			return LowerScalarBinaryScc(inst, block, Opcode::ScalarSubBorrowU32, error);
-		case Decoder::Opcode::SBitset0B32: return LowerScalarBitset0B32(inst, block, error);
-		case Decoder::Opcode::SBitset1B32: return LowerScalarBitset1B32(inst, block, error);
-		case Decoder::Opcode::SAddI32:
+		case Decoder::Opcode::S_BITSET0_B32: return LowerScalarBitset0B32(inst, block, error);
+		case Decoder::Opcode::S_BITSET1_B32: return LowerScalarBitset1B32(inst, block, error);
+		case Decoder::Opcode::S_ADD_I32:
 			return LowerScalarBinaryScc(inst, block, Opcode::ScalarSignedAddOverflowI32, error);
-		case Decoder::Opcode::SSubI32:
+		case Decoder::Opcode::S_SUB_I32:
 			return LowerScalarBinaryScc(inst, block, Opcode::ScalarSignedSubOverflowI32, error);
-		case Decoder::Opcode::VCndmaskB32: return LowerVectorCndmask(inst, block, error);
-		case Decoder::Opcode::VMovB32: return LowerVectorMoveB32(inst, block, error);
-		case Decoder::Opcode::VMovreldB32: return LowerVectorMoveRelDestination(inst, block, error);
-		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
-		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);
-		case Decoder::Opcode::VSubrevCoCiU32:
+		case Decoder::Opcode::V_CNDMASK_B32: return LowerVectorCndmask(inst, block, error);
+		case Decoder::Opcode::V_MOV_B32: return LowerVectorMoveB32(inst, block, error);
+		case Decoder::Opcode::V_MOVRELD_B32:
+			return LowerVectorMoveRelDestination(inst, block, error);
+		case Decoder::Opcode::V_MOVRELS_B32: return LowerVectorMoveRelSource(inst, block, error);
+		case Decoder::Opcode::V_ADDC_U32: return LowerVectorAddCarry(inst, block, error);
+		case Decoder::Opcode::V_SUBREV_CO_CI_U32:
 			return LowerVectorSubrevBorrowCarry(inst, block, error);
-		case Decoder::Opcode::VMadU64U32: return LowerVectorMadU64U32(inst, block, error);
-		case Decoder::Opcode::VMacF32: return LowerVectorMacF32(inst, block, error);
-		case Decoder::Opcode::VPkFmacF16: return LowerVectorPkFmacF16(inst, block, error);
-		case Decoder::Opcode::VFmacF16: return LowerVectorFmacF16(inst, block, error);
-		case Decoder::Opcode::VDot2cF32F16: return LowerVectorDot2cF32F16(inst, block, error);
-		case Decoder::Opcode::VInterpP1F32: return LowerVInterpP1F32(inst, block);
-		case Decoder::Opcode::VInterpP2F32:
-		case Decoder::Opcode::VInterpMovF32: return LowerVInterpLoadF32(inst, block, error);
+		case Decoder::Opcode::V_MAD_U64_U32: return LowerVectorMadU64U32(inst, block, error);
+		case Decoder::Opcode::V_MAC_F32: return LowerVectorMacF32(inst, block, error);
+		case Decoder::Opcode::V_PK_FMAC_F16: return LowerVectorPkFmacF16(inst, block, error);
+		case Decoder::Opcode::V_FMAC_F16: return LowerVectorFmacF16(inst, block, error);
+		case Decoder::Opcode::V_DOT2C_F32_F16: return LowerVectorDot2cF32F16(inst, block, error);
+		case Decoder::Opcode::V_INTERP_P1_F32: return LowerVInterpP1F32(inst, block);
+		case Decoder::Opcode::V_INTERP_P2_F32:
+		case Decoder::Opcode::V_INTERP_MOV_F32: return LowerVInterpLoadF32(inst, block, error);
 		default: break;
 	}
 
@@ -1177,7 +1180,7 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock& block
 	if (IsMemoryFamily(inst.family)) {
 		if (error != nullptr) {
 			*error = fmt::format("decoded memory-family opcode has no specialized IR lowering: {}",
-			                     Decoder::OpcodeToString(inst.opcode));
+			                     magic_enum::enum_name(inst.opcode));
 		}
 		return false;
 	}

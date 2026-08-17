@@ -60,17 +60,17 @@ Opcode DsWriteOpcode(uint32_t data_bits) {
 
 Opcode LoweredImageOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::ImageGetResinfo: return Opcode::ImageGetResinfo;
-		case Decoder::Opcode::ImageGetLod: return Opcode::ImageGetLod;
-		case Decoder::Opcode::ImageLoad:
-		case Decoder::Opcode::ImageLoadMip: return Opcode::ImageLoad;
-		case Decoder::Opcode::ImageGather4Lz:
-		case Decoder::Opcode::ImageGather4C:
-		case Decoder::Opcode::ImageGather4CLz:
-		case Decoder::Opcode::ImageGather4LzO:
-		case Decoder::Opcode::ImageGather4CO:
-		case Decoder::Opcode::ImageGather4CLzO:
-		case Decoder::Opcode::ImageGather4H: return Opcode::ImageGather4;
+		case Decoder::Opcode::IMAGE_GET_RESINFO: return Opcode::ImageGetResinfo;
+		case Decoder::Opcode::IMAGE_GET_LOD: return Opcode::ImageGetLod;
+		case Decoder::Opcode::IMAGE_LOAD:
+		case Decoder::Opcode::IMAGE_LOAD_MIP: return Opcode::ImageLoad;
+		case Decoder::Opcode::IMAGE_GATHER4_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4H: return Opcode::ImageGather4;
 		default: return Opcode::ImageSample;
 	}
 }
@@ -334,12 +334,12 @@ bool LowerDsAppendConsume(const Decoder::Instruction& decoded, BasicBlock& block
 
 Opcode ImageAtomicIrOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::ImageAtomicAdd: return Opcode::AtomicAddU32;
-		case Decoder::Opcode::ImageAtomicUMin: return Opcode::AtomicUMinU32;
-		case Decoder::Opcode::ImageAtomicUMax: return Opcode::AtomicUMaxU32;
-		case Decoder::Opcode::ImageAtomicAnd: return Opcode::AtomicAndU32;
-		case Decoder::Opcode::ImageAtomicOr: return Opcode::AtomicOrU32;
-		case Decoder::Opcode::ImageAtomicXor: return Opcode::AtomicXorU32;
+		case Decoder::Opcode::IMAGE_ATOMIC_ADD: return Opcode::AtomicAddU32;
+		case Decoder::Opcode::IMAGE_ATOMIC_UMIN: return Opcode::AtomicUMinU32;
+		case Decoder::Opcode::IMAGE_ATOMIC_UMAX: return Opcode::AtomicUMaxU32;
+		case Decoder::Opcode::IMAGE_ATOMIC_AND: return Opcode::AtomicAndU32;
+		case Decoder::Opcode::IMAGE_ATOMIC_OR: return Opcode::AtomicOrU32;
+		case Decoder::Opcode::IMAGE_ATOMIC_XOR: return Opcode::AtomicXorU32;
 		default: return Opcode::AtomicAddU32;
 	}
 }
@@ -477,8 +477,8 @@ bool LowerImageOperation(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
 	Instruction inst;
 	inst.pc = decoded.pc;
-	if (decoded.opcode == Decoder::Opcode::ImageStore ||
-	    decoded.opcode == Decoder::Opcode::ImageStoreMip) {
+	if (decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
+	    decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP) {
 		inst.op             = Opcode::ImageStore;
 		inst.src_count      = 2;
 		inst.memory         = MemoryInfoFromDecoded(decoded, ResourceKind::StorageImage);
@@ -508,181 +508,184 @@ bool LowerImageOperation(const Decoder::Instruction& decoded, BasicBlock& block,
 bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& block,
                             std::string* error) {
 	switch (decoded.opcode) {
-		case Decoder::Opcode::SLoadDword:
-		case Decoder::Opcode::SLoadDwordx2:
-		case Decoder::Opcode::SLoadDwordx4:
-		case Decoder::Opcode::SLoadDwordx8:
-		case Decoder::Opcode::SLoadDwordx16:
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16:
 			return LowerScalarMemoryLoadDword(decoded, block, Opcode::SLoadDword, error);
-		case Decoder::Opcode::SBufferLoadDword:
-		case Decoder::Opcode::SBufferLoadDwordx2:
-		case Decoder::Opcode::SBufferLoadDwordx4:
-		case Decoder::Opcode::SBufferLoadDwordx8:
-		case Decoder::Opcode::SBufferLoadDwordx16:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16:
 			return LowerScalarMemoryLoadDword(decoded, block, Opcode::SBufferLoadDword, error);
-		case Decoder::Opcode::BufferLoadUbyte:
-		case Decoder::Opcode::BufferLoadSbyte:
-		case Decoder::Opcode::BufferLoadUshort:
-		case Decoder::Opcode::BufferLoadSshort:
-		case Decoder::Opcode::BufferLoadDword:
-		case Decoder::Opcode::BufferLoadDwordx2:
-		case Decoder::Opcode::BufferLoadDwordx3:
-		case Decoder::Opcode::BufferLoadDwordx4:
-		case Decoder::Opcode::BufferLoadFormatX:
-		case Decoder::Opcode::BufferLoadFormatXy:
-		case Decoder::Opcode::BufferLoadFormatXyz:
-		case Decoder::Opcode::BufferLoadFormatXyzw:
-		case Decoder::Opcode::TBufferLoadFormatX:
-		case Decoder::Opcode::TBufferLoadFormatXy:
-		case Decoder::Opcode::TBufferLoadFormatXyz:
-		case Decoder::Opcode::TBufferLoadFormatXyzw: return LowerBufferLoad(decoded, block, error);
-		case Decoder::Opcode::BufferStoreDword:
-		case Decoder::Opcode::BufferStoreDwordx2:
-		case Decoder::Opcode::BufferStoreDwordx3:
-		case Decoder::Opcode::BufferStoreDwordx4:
-		case Decoder::Opcode::BufferStoreByte:
-		case Decoder::Opcode::BufferStoreShort:
-		case Decoder::Opcode::BufferStoreFormatX:
-		case Decoder::Opcode::BufferStoreFormatXy:
-		case Decoder::Opcode::BufferStoreFormatXyz:
-		case Decoder::Opcode::BufferStoreFormatXyzw:
-		case Decoder::Opcode::TBufferStoreFormatX:
-		case Decoder::Opcode::TBufferStoreFormatXy:
-		case Decoder::Opcode::TBufferStoreFormatXyz:
-		case Decoder::Opcode::TBufferStoreFormatXyzw:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_USHORT:
+		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
+		case Decoder::Opcode::BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::BUFFER_LOAD_DWORDX3:
+		case Decoder::Opcode::BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZW:
+			return LowerBufferLoad(decoded, block, error);
+		case Decoder::Opcode::BUFFER_STORE_DWORD:
+		case Decoder::Opcode::BUFFER_STORE_DWORDX2:
+		case Decoder::Opcode::BUFFER_STORE_DWORDX3:
+		case Decoder::Opcode::BUFFER_STORE_DWORDX4:
+		case Decoder::Opcode::BUFFER_STORE_BYTE:
+		case Decoder::Opcode::BUFFER_STORE_SHORT:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW:
 			return LowerBufferStore(decoded, block, error);
-		case Decoder::Opcode::BufferAtomicSwap:
+		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSwapU32, error);
-		case Decoder::Opcode::BufferAtomicAdd:
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAddU32, error);
-		case Decoder::Opcode::BufferAtomicSub:
+		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSubU32, error);
-		case Decoder::Opcode::BufferAtomicSMin:
+		case Decoder::Opcode::BUFFER_ATOMIC_SMIN:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSMinI32, error);
-		case Decoder::Opcode::BufferAtomicUMin:
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicUMinU32, error);
-		case Decoder::Opcode::BufferAtomicSMax:
+		case Decoder::Opcode::BUFFER_ATOMIC_SMAX:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSMaxI32, error);
-		case Decoder::Opcode::BufferAtomicUMax:
+		case Decoder::Opcode::BUFFER_ATOMIC_UMAX:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicUMaxU32, error);
-		case Decoder::Opcode::BufferAtomicAnd:
+		case Decoder::Opcode::BUFFER_ATOMIC_AND:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAndU32, error);
-		case Decoder::Opcode::BufferAtomicOr:
+		case Decoder::Opcode::BUFFER_ATOMIC_OR:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicOrU32, error);
-		case Decoder::Opcode::BufferAtomicXor:
+		case Decoder::Opcode::BUFFER_ATOMIC_XOR:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicXorU32, error);
-		case Decoder::Opcode::BufferAtomicFMin:
+		case Decoder::Opcode::BUFFER_ATOMIC_FMIN:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMinF32, error);
-		case Decoder::Opcode::BufferAtomicFMax:
+		case Decoder::Opcode::BUFFER_ATOMIC_FMAX:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicFMaxF32, error);
-		case Decoder::Opcode::FlatLoadUbyte:
-		case Decoder::Opcode::FlatLoadSbyte:
-		case Decoder::Opcode::FlatLoadUshort:
-		case Decoder::Opcode::FlatLoadSshort:
-		case Decoder::Opcode::FlatLoadDword:
-		case Decoder::Opcode::FlatLoadDwordx2:
-		case Decoder::Opcode::FlatLoadDwordx3:
-		case Decoder::Opcode::FlatLoadDwordx4: return LowerFlatLoad(decoded, block, error);
-		case Decoder::Opcode::FlatStoreByte:
-		case Decoder::Opcode::FlatStoreShort:
-		case Decoder::Opcode::FlatStoreDword:
-		case Decoder::Opcode::FlatStoreDwordx2:
-		case Decoder::Opcode::FlatStoreDwordx3:
-		case Decoder::Opcode::FlatStoreDwordx4: return LowerFlatStore(decoded, block, error);
-		case Decoder::Opcode::DsAddU32:
+		case Decoder::Opcode::FLAT_LOAD_UBYTE:
+		case Decoder::Opcode::FLAT_LOAD_SBYTE:
+		case Decoder::Opcode::FLAT_LOAD_USHORT:
+		case Decoder::Opcode::FLAT_LOAD_SSHORT:
+		case Decoder::Opcode::FLAT_LOAD_DWORD:
+		case Decoder::Opcode::FLAT_LOAD_DWORDX2:
+		case Decoder::Opcode::FLAT_LOAD_DWORDX3:
+		case Decoder::Opcode::FLAT_LOAD_DWORDX4: return LowerFlatLoad(decoded, block, error);
+		case Decoder::Opcode::FLAT_STORE_BYTE:
+		case Decoder::Opcode::FLAT_STORE_SHORT:
+		case Decoder::Opcode::FLAT_STORE_DWORD:
+		case Decoder::Opcode::FLAT_STORE_DWORDX2:
+		case Decoder::Opcode::FLAT_STORE_DWORDX3:
+		case Decoder::Opcode::FLAT_STORE_DWORDX4: return LowerFlatStore(decoded, block, error);
+		case Decoder::Opcode::DS_ADD_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicAddU32, false, error);
-		case Decoder::Opcode::DsAddRtnU32:
+		case Decoder::Opcode::DS_ADD_RTN_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicAddU32, true, error);
-		case Decoder::Opcode::DsSubU32:
+		case Decoder::Opcode::DS_SUB_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSubU32, false, error);
-		case Decoder::Opcode::DsSubRtnU32:
+		case Decoder::Opcode::DS_SUB_RTN_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSubU32, true, error);
-		case Decoder::Opcode::DsMinI32:
+		case Decoder::Opcode::DS_MIN_I32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSMinI32, false, error);
-		case Decoder::Opcode::DsMinRtnI32:
+		case Decoder::Opcode::DS_MIN_RTN_I32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSMinI32, true, error);
-		case Decoder::Opcode::DsMaxI32:
+		case Decoder::Opcode::DS_MAX_I32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSMaxI32, false, error);
-		case Decoder::Opcode::DsMaxRtnI32:
+		case Decoder::Opcode::DS_MAX_RTN_I32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSMaxI32, true, error);
-		case Decoder::Opcode::DsMinU32:
+		case Decoder::Opcode::DS_MIN_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicUMinU32, false, error);
-		case Decoder::Opcode::DsMinRtnU32:
+		case Decoder::Opcode::DS_MIN_RTN_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicUMinU32, true, error);
-		case Decoder::Opcode::DsMaxU32:
+		case Decoder::Opcode::DS_MAX_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicUMaxU32, false, error);
-		case Decoder::Opcode::DsMaxRtnU32:
+		case Decoder::Opcode::DS_MAX_RTN_U32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicUMaxU32, true, error);
-		case Decoder::Opcode::DsAndB32:
+		case Decoder::Opcode::DS_AND_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicAndU32, false, error);
-		case Decoder::Opcode::DsAndRtnB32:
+		case Decoder::Opcode::DS_AND_RTN_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicAndU32, true, error);
-		case Decoder::Opcode::DsOrB32:
+		case Decoder::Opcode::DS_OR_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicOrU32, false, error);
-		case Decoder::Opcode::DsOrRtnB32:
+		case Decoder::Opcode::DS_OR_RTN_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicOrU32, true, error);
-		case Decoder::Opcode::DsXorB32:
+		case Decoder::Opcode::DS_XOR_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicXorU32, false, error);
-		case Decoder::Opcode::DsXorRtnB32:
+		case Decoder::Opcode::DS_XOR_RTN_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicXorU32, true, error);
-		case Decoder::Opcode::DsWrxchgRtnB32:
+		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicSwapU32, true, error);
-		case Decoder::Opcode::DsMinF32:
+		case Decoder::Opcode::DS_MIN_F32:
 			return LowerDsFloatMinMaxF32(decoded, block, Opcode::DsMinF32, error);
-		case Decoder::Opcode::DsMaxF32:
+		case Decoder::Opcode::DS_MAX_F32:
 			return LowerDsFloatMinMaxF32(decoded, block, Opcode::DsMaxF32, error);
-		case Decoder::Opcode::DsSwizzleB32: return LowerDsSwizzleB32(decoded, block, error);
-		case Decoder::Opcode::DsConsume:
+		case Decoder::Opcode::DS_SWIZZLE_B32: return LowerDsSwizzleB32(decoded, block, error);
+		case Decoder::Opcode::DS_CONSUME:
 			return LowerDsAppendConsume(decoded, block, Opcode::DsConsume, error);
-		case Decoder::Opcode::DsAppend:
+		case Decoder::Opcode::DS_APPEND:
 			return LowerDsAppendConsume(decoded, block, Opcode::DsAppend, error);
-		case Decoder::Opcode::DsWriteAddtidB32: return LowerDsWriteAddtidB32(decoded, block, error);
-		case Decoder::Opcode::DsReadAddtidB32: return LowerDsReadAddtidB32(decoded, block, error);
-		case Decoder::Opcode::DsRead2B32: return LowerDsRead2(decoded, block, 1, error);
-		case Decoder::Opcode::DsRead2B64:
-		case Decoder::Opcode::DsRead2St64B64: return LowerDsRead2(decoded, block, 2, error);
-		case Decoder::Opcode::DsReadSbyte:
-		case Decoder::Opcode::DsReadUbyte:
-		case Decoder::Opcode::DsReadSshort:
-		case Decoder::Opcode::DsReadUshort:
-		case Decoder::Opcode::DsReadB32:
-		case Decoder::Opcode::DsReadB64:
-		case Decoder::Opcode::DsReadB96:
-		case Decoder::Opcode::DsReadB128: return LowerDsRead(decoded, block, error);
-		case Decoder::Opcode::DsWrite2B32:
-		case Decoder::Opcode::DsWrite2St64B32: return LowerDsWrite2(decoded, block, 1, error);
-		case Decoder::Opcode::DsWrite2B64:
-		case Decoder::Opcode::DsWrite2St64B64: return LowerDsWrite2(decoded, block, 2, error);
-		case Decoder::Opcode::DsWriteByte:
-		case Decoder::Opcode::DsWriteShort:
-		case Decoder::Opcode::DsWriteB32:
-		case Decoder::Opcode::DsWriteB64:
-		case Decoder::Opcode::DsWriteB96:
-		case Decoder::Opcode::DsWriteB128: return LowerDsWrite(decoded, block, error);
-		case Decoder::Opcode::ImageGetResinfo:
-		case Decoder::Opcode::ImageGetLod:
-		case Decoder::Opcode::ImageLoad:
-		case Decoder::Opcode::ImageLoadMip:
-		case Decoder::Opcode::ImageStore:
-		case Decoder::Opcode::ImageStoreMip:
-		case Decoder::Opcode::ImageGather4Lz:
-		case Decoder::Opcode::ImageGather4C:
-		case Decoder::Opcode::ImageGather4CLz:
-		case Decoder::Opcode::ImageGather4LzO:
-		case Decoder::Opcode::ImageGather4CO:
-		case Decoder::Opcode::ImageGather4CLzO:
-		case Decoder::Opcode::ImageGather4H:
-		case Decoder::Opcode::ImageSample: return LowerImageOperation(decoded, block, error);
-		case Decoder::Opcode::ImageAtomicAdd:
-		case Decoder::Opcode::ImageAtomicUMin:
-		case Decoder::Opcode::ImageAtomicUMax:
-		case Decoder::Opcode::ImageAtomicAnd:
-		case Decoder::Opcode::ImageAtomicOr:
-		case Decoder::Opcode::ImageAtomicXor: return LowerImageAtomicU32(decoded, block, error);
+		case Decoder::Opcode::DS_WRITE_ADDTID_B32:
+			return LowerDsWriteAddtidB32(decoded, block, error);
+		case Decoder::Opcode::DS_READ_ADDTID_B32:
+			return LowerDsReadAddtidB32(decoded, block, error);
+		case Decoder::Opcode::DS_READ2_B32: return LowerDsRead2(decoded, block, 1, error);
+		case Decoder::Opcode::DS_READ2_B64:
+		case Decoder::Opcode::DS_READ2ST64_B64: return LowerDsRead2(decoded, block, 2, error);
+		case Decoder::Opcode::DS_READ_I8:
+		case Decoder::Opcode::DS_READ_U8:
+		case Decoder::Opcode::DS_READ_I16:
+		case Decoder::Opcode::DS_READ_U16:
+		case Decoder::Opcode::DS_READ_B32:
+		case Decoder::Opcode::DS_READ_B64:
+		case Decoder::Opcode::DS_READ_B96:
+		case Decoder::Opcode::DS_READ_B128: return LowerDsRead(decoded, block, error);
+		case Decoder::Opcode::DS_WRITE2_B32:
+		case Decoder::Opcode::DS_WRITE2ST64_B32: return LowerDsWrite2(decoded, block, 1, error);
+		case Decoder::Opcode::DS_WRITE2_B64:
+		case Decoder::Opcode::DS_WRITE2ST64_B64: return LowerDsWrite2(decoded, block, 2, error);
+		case Decoder::Opcode::DS_WRITE_B8:
+		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B32:
+		case Decoder::Opcode::DS_WRITE_B64:
+		case Decoder::Opcode::DS_WRITE_B96:
+		case Decoder::Opcode::DS_WRITE_B128: return LowerDsWrite(decoded, block, error);
+		case Decoder::Opcode::IMAGE_GET_RESINFO:
+		case Decoder::Opcode::IMAGE_GET_LOD:
+		case Decoder::Opcode::IMAGE_LOAD:
+		case Decoder::Opcode::IMAGE_LOAD_MIP:
+		case Decoder::Opcode::IMAGE_STORE:
+		case Decoder::Opcode::IMAGE_STORE_MIP:
+		case Decoder::Opcode::IMAGE_GATHER4_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4H:
+		case Decoder::Opcode::IMAGE_SAMPLE: return LowerImageOperation(decoded, block, error);
+		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
+		case Decoder::Opcode::IMAGE_ATOMIC_UMIN:
+		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
+		case Decoder::Opcode::IMAGE_ATOMIC_AND:
+		case Decoder::Opcode::IMAGE_ATOMIC_OR:
+		case Decoder::Opcode::IMAGE_ATOMIC_XOR: return LowerImageAtomicU32(decoded, block, error);
 		default:
 			if (error != nullptr) {
 				*error = fmt::format("memory opcode has no specialized IR lowering: {}",
-				                     Decoder::OpcodeToString(decoded.opcode));
+				                     magic_enum::enum_name(decoded.opcode));
 			}
 			return false;
 	}
@@ -690,139 +693,139 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 
 bool IsMemoryOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
-		case Decoder::Opcode::SLoadDword:
-		case Decoder::Opcode::SLoadDwordx2:
-		case Decoder::Opcode::SLoadDwordx4:
-		case Decoder::Opcode::SLoadDwordx8:
-		case Decoder::Opcode::SLoadDwordx16:
-		case Decoder::Opcode::SBufferLoadDword:
-		case Decoder::Opcode::SBufferLoadDwordx2:
-		case Decoder::Opcode::SBufferLoadDwordx4:
-		case Decoder::Opcode::SBufferLoadDwordx8:
-		case Decoder::Opcode::SBufferLoadDwordx16:
-		case Decoder::Opcode::BufferLoadUbyte:
-		case Decoder::Opcode::BufferLoadSbyte:
-		case Decoder::Opcode::BufferLoadUshort:
-		case Decoder::Opcode::BufferLoadSshort:
-		case Decoder::Opcode::BufferLoadDword:
-		case Decoder::Opcode::BufferLoadDwordx2:
-		case Decoder::Opcode::BufferLoadDwordx3:
-		case Decoder::Opcode::BufferLoadDwordx4:
-		case Decoder::Opcode::BufferLoadFormatX:
-		case Decoder::Opcode::BufferLoadFormatXy:
-		case Decoder::Opcode::BufferLoadFormatXyz:
-		case Decoder::Opcode::BufferLoadFormatXyzw:
-		case Decoder::Opcode::TBufferLoadFormatX:
-		case Decoder::Opcode::TBufferLoadFormatXy:
-		case Decoder::Opcode::TBufferLoadFormatXyz:
-		case Decoder::Opcode::TBufferLoadFormatXyzw:
-		case Decoder::Opcode::BufferStoreDword:
-		case Decoder::Opcode::BufferStoreDwordx2:
-		case Decoder::Opcode::BufferStoreDwordx3:
-		case Decoder::Opcode::BufferStoreDwordx4:
-		case Decoder::Opcode::BufferStoreByte:
-		case Decoder::Opcode::BufferStoreShort:
-		case Decoder::Opcode::BufferStoreFormatX:
-		case Decoder::Opcode::BufferStoreFormatXy:
-		case Decoder::Opcode::BufferStoreFormatXyz:
-		case Decoder::Opcode::BufferStoreFormatXyzw:
-		case Decoder::Opcode::TBufferStoreFormatX:
-		case Decoder::Opcode::TBufferStoreFormatXy:
-		case Decoder::Opcode::TBufferStoreFormatXyz:
-		case Decoder::Opcode::TBufferStoreFormatXyzw:
-		case Decoder::Opcode::BufferAtomicSwap:
-		case Decoder::Opcode::BufferAtomicAdd:
-		case Decoder::Opcode::BufferAtomicSub:
-		case Decoder::Opcode::BufferAtomicSMin:
-		case Decoder::Opcode::BufferAtomicUMin:
-		case Decoder::Opcode::BufferAtomicSMax:
-		case Decoder::Opcode::BufferAtomicUMax:
-		case Decoder::Opcode::BufferAtomicAnd:
-		case Decoder::Opcode::BufferAtomicOr:
-		case Decoder::Opcode::BufferAtomicXor:
-		case Decoder::Opcode::BufferAtomicFMin:
-		case Decoder::Opcode::BufferAtomicFMax:
-		case Decoder::Opcode::FlatLoadUbyte:
-		case Decoder::Opcode::FlatLoadSbyte:
-		case Decoder::Opcode::FlatLoadUshort:
-		case Decoder::Opcode::FlatLoadSshort:
-		case Decoder::Opcode::FlatLoadDword:
-		case Decoder::Opcode::FlatLoadDwordx2:
-		case Decoder::Opcode::FlatLoadDwordx3:
-		case Decoder::Opcode::FlatLoadDwordx4:
-		case Decoder::Opcode::FlatStoreByte:
-		case Decoder::Opcode::FlatStoreShort:
-		case Decoder::Opcode::FlatStoreDword:
-		case Decoder::Opcode::FlatStoreDwordx2:
-		case Decoder::Opcode::FlatStoreDwordx3:
-		case Decoder::Opcode::FlatStoreDwordx4:
-		case Decoder::Opcode::DsAddU32:
-		case Decoder::Opcode::DsAddRtnU32:
-		case Decoder::Opcode::DsSubU32:
-		case Decoder::Opcode::DsSubRtnU32:
-		case Decoder::Opcode::DsMinI32:
-		case Decoder::Opcode::DsMinRtnI32:
-		case Decoder::Opcode::DsMaxI32:
-		case Decoder::Opcode::DsMaxRtnI32:
-		case Decoder::Opcode::DsMinU32:
-		case Decoder::Opcode::DsMinRtnU32:
-		case Decoder::Opcode::DsMaxU32:
-		case Decoder::Opcode::DsMaxRtnU32:
-		case Decoder::Opcode::DsAndB32:
-		case Decoder::Opcode::DsAndRtnB32:
-		case Decoder::Opcode::DsOrB32:
-		case Decoder::Opcode::DsOrRtnB32:
-		case Decoder::Opcode::DsXorB32:
-		case Decoder::Opcode::DsXorRtnB32:
-		case Decoder::Opcode::DsWrxchgRtnB32:
-		case Decoder::Opcode::DsMinF32:
-		case Decoder::Opcode::DsMaxF32:
-		case Decoder::Opcode::DsSwizzleB32:
-		case Decoder::Opcode::DsConsume:
-		case Decoder::Opcode::DsAppend:
-		case Decoder::Opcode::DsReadSbyte:
-		case Decoder::Opcode::DsReadUbyte:
-		case Decoder::Opcode::DsReadSshort:
-		case Decoder::Opcode::DsReadUshort:
-		case Decoder::Opcode::DsRead2B32:
-		case Decoder::Opcode::DsReadB32:
-		case Decoder::Opcode::DsReadB64:
-		case Decoder::Opcode::DsRead2B64:
-		case Decoder::Opcode::DsRead2St64B64:
-		case Decoder::Opcode::DsReadB96:
-		case Decoder::Opcode::DsReadB128:
-		case Decoder::Opcode::DsWriteByte:
-		case Decoder::Opcode::DsWriteShort:
-		case Decoder::Opcode::DsWrite2B32:
-		case Decoder::Opcode::DsWrite2St64B32:
-		case Decoder::Opcode::DsWrite2B64:
-		case Decoder::Opcode::DsWrite2St64B64:
-		case Decoder::Opcode::DsWriteB32:
-		case Decoder::Opcode::DsWriteB64:
-		case Decoder::Opcode::DsWriteB96:
-		case Decoder::Opcode::DsWriteB128:
-		case Decoder::Opcode::DsWriteAddtidB32:
-		case Decoder::Opcode::DsReadAddtidB32:
-		case Decoder::Opcode::ImageGetResinfo:
-		case Decoder::Opcode::ImageGetLod:
-		case Decoder::Opcode::ImageLoad:
-		case Decoder::Opcode::ImageLoadMip:
-		case Decoder::Opcode::ImageStore:
-		case Decoder::Opcode::ImageStoreMip:
-		case Decoder::Opcode::ImageAtomicAdd:
-		case Decoder::Opcode::ImageAtomicUMin:
-		case Decoder::Opcode::ImageAtomicUMax:
-		case Decoder::Opcode::ImageAtomicAnd:
-		case Decoder::Opcode::ImageAtomicOr:
-		case Decoder::Opcode::ImageAtomicXor:
-		case Decoder::Opcode::ImageGather4Lz:
-		case Decoder::Opcode::ImageGather4C:
-		case Decoder::Opcode::ImageGather4CLz:
-		case Decoder::Opcode::ImageGather4LzO:
-		case Decoder::Opcode::ImageGather4CO:
-		case Decoder::Opcode::ImageGather4CLzO:
-		case Decoder::Opcode::ImageGather4H:
-		case Decoder::Opcode::ImageSample: return true;
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
+		case Decoder::Opcode::BUFFER_LOAD_USHORT:
+		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
+		case Decoder::Opcode::BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::BUFFER_LOAD_DWORDX3:
+		case Decoder::Opcode::BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_DWORD:
+		case Decoder::Opcode::BUFFER_STORE_DWORDX2:
+		case Decoder::Opcode::BUFFER_STORE_DWORDX3:
+		case Decoder::Opcode::BUFFER_STORE_DWORDX4:
+		case Decoder::Opcode::BUFFER_STORE_BYTE:
+		case Decoder::Opcode::BUFFER_STORE_SHORT:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
+		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
+		case Decoder::Opcode::BUFFER_ATOMIC_SMIN:
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN:
+		case Decoder::Opcode::BUFFER_ATOMIC_SMAX:
+		case Decoder::Opcode::BUFFER_ATOMIC_UMAX:
+		case Decoder::Opcode::BUFFER_ATOMIC_AND:
+		case Decoder::Opcode::BUFFER_ATOMIC_OR:
+		case Decoder::Opcode::BUFFER_ATOMIC_XOR:
+		case Decoder::Opcode::BUFFER_ATOMIC_FMIN:
+		case Decoder::Opcode::BUFFER_ATOMIC_FMAX:
+		case Decoder::Opcode::FLAT_LOAD_UBYTE:
+		case Decoder::Opcode::FLAT_LOAD_SBYTE:
+		case Decoder::Opcode::FLAT_LOAD_USHORT:
+		case Decoder::Opcode::FLAT_LOAD_SSHORT:
+		case Decoder::Opcode::FLAT_LOAD_DWORD:
+		case Decoder::Opcode::FLAT_LOAD_DWORDX2:
+		case Decoder::Opcode::FLAT_LOAD_DWORDX3:
+		case Decoder::Opcode::FLAT_LOAD_DWORDX4:
+		case Decoder::Opcode::FLAT_STORE_BYTE:
+		case Decoder::Opcode::FLAT_STORE_SHORT:
+		case Decoder::Opcode::FLAT_STORE_DWORD:
+		case Decoder::Opcode::FLAT_STORE_DWORDX2:
+		case Decoder::Opcode::FLAT_STORE_DWORDX3:
+		case Decoder::Opcode::FLAT_STORE_DWORDX4:
+		case Decoder::Opcode::DS_ADD_U32:
+		case Decoder::Opcode::DS_ADD_RTN_U32:
+		case Decoder::Opcode::DS_SUB_U32:
+		case Decoder::Opcode::DS_SUB_RTN_U32:
+		case Decoder::Opcode::DS_MIN_I32:
+		case Decoder::Opcode::DS_MIN_RTN_I32:
+		case Decoder::Opcode::DS_MAX_I32:
+		case Decoder::Opcode::DS_MAX_RTN_I32:
+		case Decoder::Opcode::DS_MIN_U32:
+		case Decoder::Opcode::DS_MIN_RTN_U32:
+		case Decoder::Opcode::DS_MAX_U32:
+		case Decoder::Opcode::DS_MAX_RTN_U32:
+		case Decoder::Opcode::DS_AND_B32:
+		case Decoder::Opcode::DS_AND_RTN_B32:
+		case Decoder::Opcode::DS_OR_B32:
+		case Decoder::Opcode::DS_OR_RTN_B32:
+		case Decoder::Opcode::DS_XOR_B32:
+		case Decoder::Opcode::DS_XOR_RTN_B32:
+		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
+		case Decoder::Opcode::DS_MIN_F32:
+		case Decoder::Opcode::DS_MAX_F32:
+		case Decoder::Opcode::DS_SWIZZLE_B32:
+		case Decoder::Opcode::DS_CONSUME:
+		case Decoder::Opcode::DS_APPEND:
+		case Decoder::Opcode::DS_READ_I8:
+		case Decoder::Opcode::DS_READ_U8:
+		case Decoder::Opcode::DS_READ_I16:
+		case Decoder::Opcode::DS_READ_U16:
+		case Decoder::Opcode::DS_READ2_B32:
+		case Decoder::Opcode::DS_READ_B32:
+		case Decoder::Opcode::DS_READ_B64:
+		case Decoder::Opcode::DS_READ2_B64:
+		case Decoder::Opcode::DS_READ2ST64_B64:
+		case Decoder::Opcode::DS_READ_B96:
+		case Decoder::Opcode::DS_READ_B128:
+		case Decoder::Opcode::DS_WRITE_B8:
+		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE2_B32:
+		case Decoder::Opcode::DS_WRITE2ST64_B32:
+		case Decoder::Opcode::DS_WRITE2_B64:
+		case Decoder::Opcode::DS_WRITE2ST64_B64:
+		case Decoder::Opcode::DS_WRITE_B32:
+		case Decoder::Opcode::DS_WRITE_B64:
+		case Decoder::Opcode::DS_WRITE_B96:
+		case Decoder::Opcode::DS_WRITE_B128:
+		case Decoder::Opcode::DS_WRITE_ADDTID_B32:
+		case Decoder::Opcode::DS_READ_ADDTID_B32:
+		case Decoder::Opcode::IMAGE_GET_RESINFO:
+		case Decoder::Opcode::IMAGE_GET_LOD:
+		case Decoder::Opcode::IMAGE_LOAD:
+		case Decoder::Opcode::IMAGE_LOAD_MIP:
+		case Decoder::Opcode::IMAGE_STORE:
+		case Decoder::Opcode::IMAGE_STORE_MIP:
+		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
+		case Decoder::Opcode::IMAGE_ATOMIC_UMIN:
+		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
+		case Decoder::Opcode::IMAGE_ATOMIC_AND:
+		case Decoder::Opcode::IMAGE_ATOMIC_OR:
+		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
+		case Decoder::Opcode::IMAGE_GATHER4_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4H:
+		case Decoder::Opcode::IMAGE_SAMPLE: return true;
 		default: return false;
 	}
 }

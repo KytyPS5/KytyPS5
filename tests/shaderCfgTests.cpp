@@ -1050,11 +1050,11 @@ void TestNewShaderRecompilerSMovB32() {
   Check(!result.spirv.empty(), "new shader recompiler produced no SPIR-V");
   Check(result.spirv.front() == 0x07230203u,
         "new shader recompiler did not emit SPIR-V binary");
-  Check(Common::ContainsStr(result.decoded_dump, "s_mov_b32 s0, 1"),
+  Check(Common::ContainsStr(result.decoded_dump, "S_MOV_B32 s0, 1"),
         "new decoder did not decode inline S_MOV_B32 operand");
-  Check(Common::ContainsStr(result.decoded_dump, "s_mov_b32 s1, 0x12345678"),
+  Check(Common::ContainsStr(result.decoded_dump, "S_MOV_B32 s1, 0x12345678"),
         "new decoder did not decode literal S_MOV_B32 operand");
-  Check(Common::ContainsStr(result.decoded_dump, "s_mov_b32 s2, s1"),
+  Check(Common::ContainsStr(result.decoded_dump, "S_MOV_B32 s2, s1"),
         "new decoder did not decode register S_MOV_B32 operand");
   Check(Common::ContainsStr(result.ir_dump, "StoreBufferU32") &&
             Common::ContainsStr(result.ir_dump, "0x00000001") &&
@@ -2844,9 +2844,8 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
   std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(
-            result.decoded_dump,
-            "v_cvt_f32_ubyte0 v4, v9.sdwa(sel=4,sext=0)"),
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CVT_F32_UBYTE0 v4, v9.sdwa(sel=4,sext=0)"),
         "captured V_CVT_F32_UBYTE0 SDWA instruction was not decoded");
 
   size_t extracts = 0;
@@ -3458,7 +3457,7 @@ void TestNewShaderDecoderArchitecture() {
   std::string error;
   Check(DecodeInstruction(offset_code, 1u, direct, &error), error.c_str());
   Check(direct.pc == 4u && direct.family == Family::VOP1 &&
-            direct.opcode == Opcode::VMovB32 && direct.dst.reg == 2u &&
+            direct.opcode == Opcode::V_MOV_B32 && direct.dst.reg == 2u &&
             direct.src0.reg == 3u,
         "single-instruction decoder failed at a nonzero offset");
 
@@ -3489,7 +3488,7 @@ void TestNewShaderDecoderArchitecture() {
   Check(DecodeInstruction(scalar_signed_bfe, 0u, signed_bfe, &error),
         error.c_str());
   Check(signed_bfe.family == Family::SOP2 &&
-            signed_bfe.opcode == Opcode::SBfeI32 &&
+            signed_bfe.opcode == Opcode::S_BFE_I32 &&
             signed_bfe.word_count == 2u &&
             signed_bfe.dst.kind == OperandKind::VccLo &&
             signed_bfe.src0.reg == 20u && signed_bfe.src1.value == 0x0004001cu,
@@ -3503,7 +3502,7 @@ void TestNewShaderDecoderArchitecture() {
   Check(DecodeInstruction(vop2_sdwa_partial_dst, 0u, sdwa_add, &error),
         error.c_str());
   Check(sdwa_add.family == Family::VOP2 &&
-            sdwa_add.opcode == Opcode::VAddNcU32 && sdwa_add.word_count == 2u &&
+            sdwa_add.opcode == Opcode::V_ADD_NC_U32 && sdwa_add.word_count == 2u &&
             sdwa_add.dst.reg == 4u && sdwa_add.dst.sdwa_sel == 5u &&
             sdwa_add.dst.sdwa_dst_unused == 2u &&
             sdwa_add.src0.kind == OperandKind::VccLo &&
@@ -3524,13 +3523,13 @@ void TestNewShaderDecoderArchitecture() {
                               EncodeDs1(2, 0, 1)};
   Instruction ds;
   Check(DecodeInstruction(ds_code, 0u, ds, &error), error.c_str());
-  Check(ds.opcode == Opcode::DsReadB32 && ds.gds,
+  Check(ds.opcode == Opcode::DS_READ_B32 && ds.gds,
         "DS decoder lost the GFX10 opcode or GDS fields");
 
   const uint32_t boot_ds[] = {0xd8d4c480u, 0x45000045u};
   Instruction boot;
   Check(DecodeInstruction(boot_ds, 0u, boot, &error), error.c_str());
-  Check(boot.opcode == Opcode::DsSwizzleB32 && boot.offset == 0xc480u,
+  Check(boot.opcode == Opcode::DS_SWIZZLE_B32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
 
   constexpr uint32_t packed_source_selectors[][2] = {
@@ -3565,7 +3564,7 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
     Check(program.instructions.size() == 2u,
           "64-bit VOPC DPP decode did not consume its modifier word");
     const auto &compare = program.instructions.front();
-    Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::Unsupported,
+    Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
           "64-bit VOPC illegally accepted a DPP modifier");
     Check(Common::ContainsStr(compare.unsupported_reason,
                               "VOPC DPP modifier is not supported for opcode"),
@@ -3578,7 +3577,7 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   ShaderRecompiler::Decoder::Instruction missing;
   missing.pc = 0u;
   missing.family = ShaderRecompiler::Decoder::Family::VOP1;
-  missing.opcode = ShaderRecompiler::Decoder::Opcode::Unknown;
+  missing.opcode = ShaderRecompiler::Decoder::Opcode::UNKNOWN;
   decoded.instructions.push_back(missing);
 
   ShaderRecompiler::CFG::Graph cfg;
@@ -3600,7 +3599,7 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   decoded.instructions.front().family =
       ShaderRecompiler::Decoder::Family::MUBUF;
   decoded.instructions.front().opcode =
-      ShaderRecompiler::Decoder::Opcode::VAddNcU32;
+      ShaderRecompiler::Decoder::Opcode::V_ADD_NC_U32;
   error.clear();
   Check(!ShaderRecompiler::IR::LowerProgram(decoded, cfg, ShaderType::Compute,
                                             64u, ir, &error),
@@ -3650,8 +3649,8 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
         "new decoder did not decode SMEM scalar-buffer dword load");
   Check(Common::ContainsStr(result.decoded_dump, "s_buffer_load_dword s1, s8"),
         "SMEM scalar-buffer SBASE was not decoded as an SGPR-pair index");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_dword"),
-        "new decoder did not decode MUBUF dword load");
+	Check(Common::ContainsStr(result.decoded_dump, "buffer_load_dword"),
+	      "new decoder did not decode MUBUF dword load");
   Check(Common::ContainsStr(result.decoded_dump, "buffer_store_dword"),
         "new decoder did not decode MUBUF dword store");
   Check(Common::ContainsStr(result.decoded_dump, "ds_read_b32"),
@@ -6225,7 +6224,7 @@ void TestNewShaderRecompilerCfgPostEndTargetMergePS() {
                  error.c_str());
   }
   Check(ok, "post-end target PS shader failed to compile");
-  Check(Common::ContainsStr(result.decoded_dump, "0x0000000c: s_mov_b32"),
+  Check(Common::ContainsStr(result.decoded_dump, "0x0000000c: S_MOV_B32"),
         "post-end branch target was not decoded");
   Check(Common::ContainsStr(result.ir_dump, "mode=structured"),
         "post-end terminal branch should stay on structured path");
@@ -7366,7 +7365,7 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_dword"),
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_LOAD_DWORD"),
         "buffer load guard regression did not decode MUBUF load");
   CheckSpirvBinaryValidates(result.spirv);
 
@@ -7407,7 +7406,7 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
   std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_atomic_add"),
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_ATOMIC_ADD"),
         "buffer atomic bounds regression did not decode MUBUF atomic");
   CheckSpirvBinaryValidates(result.spirv);
 

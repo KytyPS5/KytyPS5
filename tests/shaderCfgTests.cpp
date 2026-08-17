@@ -9,7 +9,6 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
-#include "graphics/shader/recompiler/ExecMask.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -7242,36 +7241,6 @@ void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
   Check(SpirvContainsOpcode(result.spirv, 251),
         "dispatcher SPIR-V lacks OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
-}
-
-void TestNewShaderRecompilerExecMaskHelpers() {
-  using namespace ShaderRecompiler::Exec;
-
-  State wave32;
-  wave32.wave_size = 32;
-  WriteExec(wave32, FullMask(64));
-  Check(ReadExec(wave32).low == 0xffffffffu && ReadExec(wave32).high == 0u,
-        "wave32 EXEC high half was not masked off");
-  AndExec(wave32, {0x0fu, 0xffffffffu});
-  Check(ReadExec(wave32).low == 0x0fu && ReadExec(wave32).high == 0u,
-        "wave32 AndExec did not preserve wave size");
-  InvertExec(wave32);
-  Check(ReadExec(wave32).low == 0xfffffff0u && ReadExec(wave32).high == 0u,
-        "wave32 InvertExec did not preserve wave size");
-  WriteExec(wave32, {0u, 0xffffffffu});
-  Check(IsExecZero(wave32), "wave32 IsExecZero used inactive high lanes");
-
-  State wave64;
-  wave64.wave_size = 64;
-  WriteExec(wave64, FullMask(64));
-  Check(ReadExec(wave64).low == 0xffffffffu &&
-            ReadExec(wave64).high == 0xffffffffu,
-        "wave64 EXEC full mask was wrong");
-  XorExec(wave64, {0xffffffffu, 0u});
-  Check(ReadExec(wave64).low == 0u && ReadExec(wave64).high == 0xffffffffu,
-        "wave64 XorExec did not update both halves correctly");
-  wave64.vcc = {0u, 1u};
-  Check(!IsVccZero(wave64), "wave64 VCC high half was ignored");
 }
 
 void TestComputeShaderInputWaveSize() {

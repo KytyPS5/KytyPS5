@@ -6943,6 +6943,80 @@ void TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0),      // preheader condition
+      EncodeSopp(0x05, 10),        // preheader early exit -> end
+      EncodeSopc(0x06, 1, 1),      // outer condition
+      EncodeSopp(0x05, 8),         // outer early exit -> end
+      EncodeSopc(0x06, 2, 2),      // inner condition
+      EncodeSopp(0x05, 2),         // inner -> loop, else linear arm
+      EncodeSMovB32(3, 129),       // linear arm work
+      EncodeSopp(0x02, 4),         // linear arm -> end
+      EncodeSopc(0x06, 4, 4),      // loop header condition
+      EncodeSopp(0x04, 2),         // loop exit -> end
+      EncodeSop2(0x00, 5, 5, 129), // loop work
+      EncodeSopp(0x02, 0xfffcu),   // backedge -> loop header
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  const auto original_block_count = graph.blocks.size();
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  const auto original_empty_blocks =
+      std::ranges::count_if(graph.blocks, [](const auto &block) {
+        return block.inst_begin == block.inst_end;
+      });
+  Check(original_block_count == 8u && graph.natural_loops.size() == 1u,
+        "nested early-exit fixture has the wrong native CFG");
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph, &error);
+  Check(structured, error.c_str());
+  Check(graph.blocks.size() == original_block_count + 3u &&
+            CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+                original_coverage &&
+            std::ranges::count_if(graph.blocks,
+                                  [](const auto &block) {
+                                    return block.inst_begin == block.inst_end;
+                                  }) == original_empty_blocks + 3,
+        "nested early-exit structurization changed semantic coverage");
+  const auto *preheader = graph.FindBlockByPc(0x00u);
+  const auto *outer = graph.FindBlockByPc(0x08u);
+  const auto *inner = graph.FindBlockByPc(0x10u);
+  const auto *loop = graph.FindBlockByPc(0x20u);
+  Check(
+      preheader != nullptr && outer != nullptr && inner != nullptr &&
+          loop != nullptr && loop->terminator.loop_header &&
+          preheader->terminator.merge_block != UINT32_MAX &&
+          outer->terminator.merge_block != UINT32_MAX &&
+          inner->terminator.merge_block != UINT32_MAX &&
+          preheader->terminator.merge_block != outer->terminator.merge_block &&
+          preheader->terminator.merge_block != inner->terminator.merge_block &&
+          outer->terminator.merge_block != inner->terminator.merge_block,
+      "nested early-exit constructs do not have distinct structured merges");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured"),
+        "nested early-exit loop unexpectedly selected dispatcher fallback");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 3u &&
+            SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "nested early-exit SPIR-V has the wrong structured control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgExecSccSharedArm() {
   const uint32_t shader[] = {
       EncodeSop2(0x15, 126, 4, 126), // s_andn2_b64 exec, s4, exec
@@ -9333,6 +9407,7 @@ int main() {
   TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
   TestNewShaderRecompilerCfgMultipleLoopLatches();
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+  TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher();

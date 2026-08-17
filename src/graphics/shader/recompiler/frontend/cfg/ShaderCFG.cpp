@@ -1051,15 +1051,6 @@ bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
 	return true;
 }
 
-bool IsSyntheticMergeForwarder(const Graph& graph, uint32_t block_id, uint32_t merge) {
-	const auto* block = graph.FindBlock(block_id);
-	return block != nullptr && block->inst_begin == block->inst_end &&
-	       block->successors.size() == 1u && block->successors.front() == merge &&
-	       block->terminator.kind == TerminatorKind::Branch &&
-	       block->terminator.condition == BranchCondition::Always &&
-	       block->terminator.true_block == merge;
-}
-
 const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
 	const NaturalLoop* innermost = nullptr;
 	for (const auto& loop: graph.natural_loops) {
@@ -1232,24 +1223,14 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	if (construct_predecessors.empty() || (!force_split && external_predecessors.empty())) {
 		return false;
 	}
-	std::vector<uint32_t> predecessors_to_split;
-	for (auto pred: construct_predecessors) {
-		if (!IsSyntheticMergeForwarder(graph, pred, merge)) {
-			AddUnique(predecessors_to_split, pred);
-		}
-	}
-	if (predecessors_to_split.empty()) {
-		return false;
-	}
-
 	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
 	auto*      synthetic_block = graph.FindBlock(synthetic_merge);
 	if (synthetic_block != nullptr) {
-		synthetic_block->predecessors = predecessors_to_split;
+		synthetic_block->predecessors = construct_predecessors;
 		SortUnique(synthetic_block->predecessors);
 	}
 
-	for (auto pred: predecessors_to_split) {
+	for (auto pred: construct_predecessors) {
 		auto* block = graph.FindBlock(pred);
 		if (block == nullptr) {
 			continue;
@@ -1260,7 +1241,7 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 
 	auto* old_merge = graph.FindBlock(merge);
 	if (old_merge != nullptr) {
-		for (auto pred: predecessors_to_split) {
+		for (auto pred: construct_predecessors) {
 			RemoveValue(old_merge->predecessors, pred);
 		}
 		AddUnique(old_merge->predecessors, synthetic_merge);
@@ -1313,11 +1294,24 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 		AddUnique(loop_headers, loop.header);
 	}
 
-	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
+	std::vector<uint32_t> selection_headers;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind == TerminatorKind::ConditionalBranch &&
+		    !Contains(loop_headers, block.id)) {
+			selection_headers.push_back(block.id);
+		}
+	}
+	std::sort(selection_headers.begin(), selection_headers.end(), [&](uint32_t lhs, uint32_t rhs) {
+		const auto* lhs_block = graph.FindBlock(lhs);
+		const auto* rhs_block = graph.FindBlock(rhs);
+		const auto  lhs_depth = lhs_block != nullptr ? lhs_block->dominators.size() : 0u;
+		const auto  rhs_depth = rhs_block != nullptr ? rhs_block->dominators.size() : 0u;
+		return lhs_depth != rhs_depth ? lhs_depth > rhs_depth : lhs < rhs;
+	});
+
+	for (const auto block_id: selection_headers) {
 		const auto* block = graph.FindBlock(block_id);
-		if (block == nullptr || block->terminator.kind != TerminatorKind::ConditionalBranch ||
-		    Contains(loop_headers, block_id)) {
+		if (block == nullptr) {
 			continue;
 		}
 		if (IsInnermostLoopControlConditional(graph, *block)) {
@@ -1352,8 +1346,7 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 
 bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	const auto split_budget =
-	    std::max<uint32_t>(16u, std::min<uint32_t>(128u, original_block_count * 4u));
+	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
 		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph, error)) {
 			return !graph.unsupported;

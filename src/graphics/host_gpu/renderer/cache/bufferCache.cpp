@@ -527,21 +527,13 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid image source\n");
 	}
-	auto find_owner = [&]() {
+	auto find_owner = [&]() -> CachedBuffer* {
 		auto owner = m_buffers.upper_bound(vaddr);
 		if (owner == m_buffers.begin()) {
-			return m_buffers.end();
+			return nullptr;
 		}
 		--owner;
-		return owner->second->buffer->IsInBounds(vaddr, size) ? owner : m_buffers.end();
-	};
-	auto has_overlapping_owner = [&]() {
-		auto owner = m_buffers.lower_bound(vaddr + size);
-		if (owner == m_buffers.begin()) {
-			return false;
-		}
-		--owner;
-		return owner->second->vaddr + owner->second->size > vaddr;
+		return owner->second->buffer->IsInBounds(vaddr, size) ? owner->second.get() : nullptr;
 	};
 
 	{
@@ -552,24 +544,24 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
 		                                           "image source");
 
-		auto owner = find_owner();
-		if (has_dirty_buffer_source && owner == m_buffers.end()) {
-			if (!has_overlapping_owner()) {
+		auto* owner = find_owner();
+		if (has_dirty_buffer_source && owner == nullptr) {
+			if (!IsRegionRegistered(vaddr, size)) {
 				EXIT("BufferCache: GPU-dirty image source has no native buffer\n");
 			}
-			auto& cached = GetOrCreateBuffer(m_scheduler.Current(), vaddr, size);
-			owner        = m_buffers.find(cached.vaddr);
-			if (owner == m_buffers.end() || owner->second.get() != &cached ||
+			auto& cached        = GetOrCreateBuffer(m_scheduler.Current(), vaddr, size);
+			owner               = &cached;
+			const auto resolved = m_buffers.find(cached.vaddr);
+			if (resolved == m_buffers.end() || resolved->second.get() != &cached ||
 			    !cached.buffer->IsInBounds(vaddr, size)) {
 				EXIT("BufferCache: merged image source does not contain the requested range\n");
 			}
 		}
-		if (owner != m_buffers.end() && !cpu_modified &&
-		    (!gpu_modified || has_dirty_buffer_source)) {
-			owner->second->tick_accessed_last = m_gc_tick;
-			return {owner->second->buffer.get(), owner->second->buffer->Offset(vaddr)};
+		if (owner != nullptr && !cpu_modified && (!gpu_modified || has_dirty_buffer_source)) {
+			owner->tick_accessed_last = m_gc_tick;
+			return {owner->buffer.get(), owner->buffer->Offset(vaddr)};
 		}
-		if (has_dirty_buffer_source && owner == m_buffers.end()) {
+		if (has_dirty_buffer_source && owner == nullptr) {
 			EXIT("BufferCache: GPU-dirty image source could not resolve its native owner\n");
 		}
 	}
@@ -583,16 +575,16 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 
 	const auto dirty                   = m_gpu_modified_ranges.Intersections(vaddr, size);
 	const bool has_dirty_buffer_source = !dirty.empty();
-	auto       owner                   = find_owner();
-	if (has_dirty_buffer_source && owner == m_buffers.end()) {
+	auto*      owner                   = find_owner();
+	if (has_dirty_buffer_source && owner == nullptr) {
 		EXIT("BufferCache: GPU-dirty image source lost its native owner\n");
 	}
-	if (owner == m_buffers.end() ||
+	if (owner == nullptr ||
 	    (m_memory_tracker.IsRegionGpuModified(vaddr, size) && !has_dirty_buffer_source)) {
 		return {&m_staging_buffer, stage_offset};
 	}
 
-	auto& cached              = *owner->second;
+	auto& cached              = *owner;
 	cached.tick_accessed_last = m_gc_tick;
 	std::vector<std::pair<uint64_t, uint64_t>> uploads;
 	m_memory_tracker.ForEachUploadRange(

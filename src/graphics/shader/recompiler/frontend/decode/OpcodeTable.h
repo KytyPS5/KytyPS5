@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_DECOMPILER_OPCODETABLE_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_DECOMPILER_OPCODETABLE_H_
 
+#include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <array>
@@ -27,7 +28,7 @@ consteval auto MakeOpcodeTable(const Entry (&entries)[EntryCount]) {
 	for (size_t i = 0; i < EntryCount; i++) {
 		const auto encoding = entries[i].encoding;
 		if (encoding >= EncodingCount || table.indices[encoding] != 0) {
-			throw "invalid opcode table";
+			EXIT("invalid opcode table\n");
 		}
 		table.entries[i]        = entries[i];
 		table.indices[encoding] = static_cast<uint16_t>(i + 1);

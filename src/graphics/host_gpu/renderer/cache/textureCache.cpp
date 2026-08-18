@@ -1168,11 +1168,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
-			const auto owner = ResolveOwner(id);
-			if (owner == nullptr) {
-				continue;
-			}
-			if (SameBacking(owner->info, desc.info, exact_format)) {
+			const auto& image = ResolveImage(id);
+			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
 		}
@@ -1181,12 +1178,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
-				view_mip         = -1;
-				view_layer       = -1;
-				const auto owner = ResolveOwner(candidate);
-				if (owner == nullptr) {
-					continue;
-				}
+				view_mip                = -1;
+				view_layer              = -1;
 				const auto& merged_info = result ? ResolveImage(result).info : desc.info;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {

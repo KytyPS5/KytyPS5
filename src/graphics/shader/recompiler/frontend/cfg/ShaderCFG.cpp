@@ -1,7 +1,6 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include <algorithm>
-#include <array>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
@@ -1079,11 +1078,96 @@ bool IsLoopControlGateway(const Graph& graph, const NaturalLoop& loop, uint32_t 
 	       is_control_target(block->terminator.false_block);
 }
 
+bool HasLinearPathTo(const Graph& graph, uint32_t start, uint32_t target) {
+	std::vector<bool> visited(graph.blocks.size(), false);
+	for (auto block_id = start; block_id != target;) {
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr || block_id >= visited.size() || visited[block_id] ||
+		    block->successors.size() != 1) {
+			return false;
+		}
+		visited[block_id] = true;
+		block_id          = block->successors.front();
+	}
+	return true;
+}
+
+bool HasLinearPathToTerminal(const Graph& graph, uint32_t start) {
+	std::vector<bool> visited(graph.blocks.size(), false);
+	for (auto block_id = start;;) {
+		const auto* block = graph.FindBlock(block_id);
+		if (block == nullptr || block_id >= visited.size() || visited[block_id]) {
+			return false;
+		}
+		if (block->successors.empty()) {
+			return true;
+		}
+		if (block->successors.size() != 1) {
+			return false;
+		}
+		visited[block_id] = true;
+		block_id          = block->successors.front();
+	}
+}
+
+bool IsEnclosingLinearExit(const Graph& graph, uint32_t header, uint32_t block_id) {
+	// AGC commonly lowers nested early returns through a terminal epilogue shared with an
+	// enclosing conditional. Such a path is an exit boundary, not part of the inner selection.
+	const auto* block = graph.FindBlock(block_id);
+	if (block == nullptr || graph.Dominates(header, block_id) ||
+	    !HasLinearPathToTerminal(graph, block_id) || block->predecessors.empty()) {
+		return false;
+	}
+	return std::ranges::all_of(block->predecessors, [&](uint32_t predecessor) {
+		return graph.Dominates(header, predecessor) || graph.Dominates(predecessor, header);
+	});
+}
+
+bool CanReachBefore(const Graph& graph, uint32_t start, uint32_t target, uint32_t stop) {
+	std::vector<uint32_t> pending = {start};
+	std::vector<bool>     visited(graph.blocks.size(), false);
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (block_id == target) {
+			return true;
+		}
+		if (block_id == stop || block_id >= visited.size() || visited[block_id]) {
+			continue;
+		}
+		visited[block_id] = true;
+		const auto* block = graph.FindBlock(block_id);
+		if (block != nullptr) {
+			pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+		}
+	}
+	return false;
+}
+
 uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 	const auto  global_merge = graph.FindNearestCommonPostDominator(block.terminator.true_block,
 	                                                                block.terminator.false_block);
 	const auto* loop         = FindInnermostContainingLoop(graph, block.id);
 	if (loop == nullptr) {
+		const auto* global_block = graph.FindBlock(global_merge);
+		const auto  true_target  = block.terminator.true_block;
+		const auto  false_target = block.terminator.false_block;
+		if (global_block != nullptr && global_block->successors.empty()) {
+			// A terminal common post-dominator can hide the local continuation of a nested
+			// early-exit selection. Prefer that continuation as the structured merge.
+			const bool true_exits  = HasLinearPathTo(graph, true_target, global_merge);
+			const bool false_exits = HasLinearPathTo(graph, false_target, global_merge);
+			if (true_exits != false_exits) {
+				return true_exits ? false_target : true_target;
+			}
+			const bool false_reaches_true =
+			    CanReachBefore(graph, false_target, true_target, global_merge);
+			const bool true_reaches_false =
+			    CanReachBefore(graph, true_target, false_target, global_merge);
+			if (false_reaches_true != true_reaches_false) {
+				return false_reaches_true ? true_target : false_target;
+			}
+		}
 		return global_merge;
 	}
 
@@ -1269,15 +1353,22 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	std::vector<uint32_t> region;
 	std::vector<uint32_t> pending = {header.terminator.true_block, header.terminator.false_block};
 	const auto*           loop    = FindInnermostContainingLoop(graph, header.id);
+	const auto global_merge = graph.FindNearestCommonPostDominator(header.terminator.true_block,
+	                                                               header.terminator.false_block);
 	while (!pending.empty()) {
 		const auto block_id = pending.back();
 		pending.pop_back();
 		if (block_id == merge || Contains(region, block_id) ||
-		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block))) {
+		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block)) ||
+		    IsEnclosingLinearExit(graph, header.id, block_id) ||
+		    (block_id == global_merge && HasLinearPathToTerminal(graph, block_id))) {
 			continue;
 		}
 		const auto* block = graph.FindBlock(block_id);
 		if (block == nullptr) {
+			continue;
+		}
+		if (block->successors.empty()) {
 			continue;
 		}
 		AddUnique(region, block_id);
@@ -1449,8 +1540,8 @@ uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_
 namespace {
 
 struct GotoRouteBlocks {
-	uint32_t                before = UINT32_MAX;
-	std::array<uint32_t, 5> blocks {};
+	uint32_t              before = UINT32_MAX;
+	std::vector<uint32_t> blocks;
 };
 
 void PlaceGotoRouteBlocks(Graph& graph, uint32_t original_block_count,
@@ -1514,6 +1605,48 @@ uint32_t AppendGotoSetBlock(Graph& graph, uint32_t route_variable, bool value, u
 	return block_id;
 }
 
+void AppendEnclosingRouteBlocks(Graph& graph, uint32_t original_block_count,
+                                uint32_t route_variable, uint32_t shared, uint32_t other,
+                                uint32_t route_select, uint32_t route_root,
+                                std::vector<uint32_t>& route_blocks) {
+	for (uint32_t depth = 0; depth < original_block_count; depth++) {
+		uint32_t predecessor = UINT32_MAX;
+		uint32_t leaf        = UINT32_MAX;
+		for (uint32_t candidate = 0; candidate < original_block_count; candidate++) {
+			const auto* candidate_block = graph.FindBlock(candidate);
+			if (candidate_block == nullptr ||
+			    candidate_block->terminator.kind != TerminatorKind::ConditionalBranch) {
+				continue;
+			}
+			const auto candidate_true  = candidate_block->terminator.true_block;
+			const auto candidate_false = candidate_block->terminator.false_block;
+			if (candidate_true == route_root &&
+			    (candidate_false == shared || candidate_false == other)) {
+				predecessor = candidate;
+				leaf        = candidate_false;
+				break;
+			}
+			if (candidate_false == route_root &&
+			    (candidate_true == shared || candidate_true == other)) {
+				predecessor = candidate;
+				leaf        = candidate_true;
+				break;
+			}
+		}
+		if (predecessor == UINT32_MAX) {
+			break;
+		}
+
+		const auto routed_leaf =
+		    AppendGotoSetBlock(graph, route_variable, leaf == other, route_select);
+		auto* predecessor_block = graph.FindBlock(predecessor);
+		ReplaceValue(predecessor_block->successors, leaf, routed_leaf);
+		ReplaceTerminatorTarget(predecessor_block->terminator, leaf, routed_leaf);
+		route_blocks.push_back(routed_leaf);
+		route_root = predecessor;
+	}
+}
+
 // Turn H0 -> shared/H1, H1 -> shared/other into nested selections whose empty
 // forwarding blocks set one typed SSA route value. Guest semantic blocks remain unique.
 bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t outer_id,
@@ -1538,66 +1671,120 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 
 		const bool true_is_shared  = inner->terminator.true_block == shared;
 		const bool false_is_shared = inner->terminator.false_block == shared;
-		if (true_is_shared == false_is_shared) {
-			continue;
-		}
-		const auto other =
-		    true_is_shared ? inner->terminator.false_block : inner->terminator.true_block;
-		if (other == outer_id || other == inner_id || other == shared) {
-			continue;
-		}
-		const auto first_arm = std::min(shared, other);
-		if (first_arm >= original_block_count || outer_id >= inner_id || inner_id >= first_arm) {
-			continue;
-		}
-		if (graph.FindNearestCommonPostDominator(shared, other) == UINT32_MAX) {
-			continue;
+		if (true_is_shared != false_is_shared) {
+			const auto other =
+			    true_is_shared ? inner->terminator.false_block : inner->terminator.true_block;
+			if (other == outer_id || other == inner_id || other == shared) {
+				continue;
+			}
+			const auto first_arm = std::min(shared, other);
+			if (first_arm >= original_block_count || outer_id >= inner_id ||
+			    inner_id >= first_arm ||
+			    graph.FindNearestCommonPostDominator(shared, other) == UINT32_MAX) {
+				continue;
+			}
+
+			const auto route_select = AppendGotoSelectBlock(graph, route_variable, other, shared);
+			const auto inner_merge  = AppendSyntheticBranchBlock(graph, route_select);
+			const auto outer_shared =
+			    AppendGotoSetBlock(graph, route_variable, false, route_select);
+			const auto inner_shared = AppendGotoSetBlock(graph, route_variable, false, inner_merge);
+			const auto inner_other  = AppendGotoSetBlock(graph, route_variable, true, inner_merge);
+
+			outer                         = graph.FindBlock(outer_id);
+			auto* mutable_inner           = graph.FindBlock(inner_id);
+			outer->terminator.true_block  = inner_is_true ? inner_id : outer_shared;
+			outer->terminator.false_block = inner_is_true ? outer_shared : inner_id;
+			outer->successors = {outer->terminator.true_block, outer->terminator.false_block};
+			mutable_inner->terminator.true_block  = true_is_shared ? inner_shared : inner_other;
+			mutable_inner->terminator.false_block = true_is_shared ? inner_other : inner_shared;
+			mutable_inner->successors             = {mutable_inner->terminator.true_block,
+			                                         mutable_inner->terminator.false_block};
+
+			std::vector<uint32_t> route_blocks = {inner_shared, inner_other, inner_merge,
+			                                      outer_shared};
+			AppendEnclosingRouteBlocks(graph, original_block_count, route_variable, shared, other,
+			                           route_select, outer_id, route_blocks);
+			route_blocks.push_back(route_select);
+			route = {first_arm, std::move(route_blocks)};
+			return true;
 		}
 
-		const auto route_select = AppendGotoSelectBlock(graph, route_variable, other, shared);
-		const auto inner_merge  = AppendSyntheticBranchBlock(graph, route_select);
-		const auto outer_shared = AppendGotoSetBlock(graph, route_variable, false, route_select);
-		const auto inner_shared = AppendGotoSetBlock(graph, route_variable, false, inner_merge);
-		const auto inner_other  = AppendGotoSetBlock(graph, route_variable, true, inner_merge);
+		// H0 -> continuation/H1, H1 -> exit/body, body -> continuation. Route both
+		// destinations after joining H0 and H1 so neither selection has a nonlocal edge.
+		for (const bool exit_is_true: {true, false}) {
+			const auto other =
+			    exit_is_true ? inner->terminator.true_block : inner->terminator.false_block;
+			const auto body =
+			    exit_is_true ? inner->terminator.false_block : inner->terminator.true_block;
+			if (other == outer_id || other == inner_id || other == shared || body == outer_id ||
+			    body == inner_id || body == shared || !graph.Dominates(inner_id, body) ||
+			    !graph.PostDominates(shared, body)) {
+				continue;
+			}
 
-		outer                         = graph.FindBlock(outer_id);
-		auto* mutable_inner           = graph.FindBlock(inner_id);
-		outer->terminator.true_block  = inner_is_true ? inner_id : outer_shared;
-		outer->terminator.false_block = inner_is_true ? outer_shared : inner_id;
-		outer->successors = {outer->terminator.true_block, outer->terminator.false_block};
-		mutable_inner->terminator.true_block  = true_is_shared ? inner_shared : inner_other;
-		mutable_inner->terminator.false_block = true_is_shared ? inner_other : inner_shared;
-		mutable_inner->successors             = {mutable_inner->terminator.true_block,
-		                                         mutable_inner->terminator.false_block};
-		route = {first_arm, {inner_shared, inner_other, inner_merge, outer_shared, route_select}};
-		return true;
+			std::vector<uint32_t> inner_shared_predecessors;
+			const auto*           shared_block = graph.FindBlock(shared);
+			for (const auto predecessor: shared_block->predecessors) {
+				if (predecessor != inner_id && graph.Dominates(inner_id, predecessor)) {
+					inner_shared_predecessors.push_back(predecessor);
+				}
+			}
+			const auto first_arm = std::min(shared, other);
+			if (inner_shared_predecessors.empty() || first_arm >= original_block_count ||
+			    outer_id >= inner_id || inner_id >= first_arm ||
+			    graph.FindNearestCommonPostDominator(shared, other) == UINT32_MAX) {
+				continue;
+			}
+
+			const auto route_select = AppendGotoSelectBlock(graph, route_variable, other, shared);
+			const auto inner_merge  = AppendSyntheticBranchBlock(graph, route_select);
+			const auto outer_shared =
+			    AppendGotoSetBlock(graph, route_variable, false, route_select);
+			const auto inner_shared = AppendGotoSetBlock(graph, route_variable, false, inner_merge);
+			const auto inner_other  = AppendGotoSetBlock(graph, route_variable, true, inner_merge);
+
+			outer                         = graph.FindBlock(outer_id);
+			auto* mutable_inner           = graph.FindBlock(inner_id);
+			outer->terminator.true_block  = inner_is_true ? inner_id : outer_shared;
+			outer->terminator.false_block = inner_is_true ? outer_shared : inner_id;
+			outer->successors = {outer->terminator.true_block, outer->terminator.false_block};
+			if (exit_is_true) {
+				mutable_inner->terminator.true_block = inner_other;
+			} else {
+				mutable_inner->terminator.false_block = inner_other;
+			}
+			ReplaceValue(mutable_inner->successors, other, inner_other);
+			for (const auto predecessor: inner_shared_predecessors) {
+				auto* predecessor_block = graph.FindBlock(predecessor);
+				ReplaceValue(predecessor_block->successors, shared, inner_shared);
+				ReplaceTerminatorTarget(predecessor_block->terminator, shared, inner_shared);
+			}
+
+			std::vector<uint32_t> route_blocks = {inner_shared, inner_other, inner_merge,
+			                                      outer_shared};
+			AppendEnclosingRouteBlocks(graph, original_block_count, route_variable, shared, other,
+			                           route_select, outer_id, route_blocks);
+			route_blocks.push_back(route_select);
+			route = {first_arm, std::move(route_blocks)};
+			return true;
+		}
 	}
 	return false;
 }
 
-bool RouteSharedSelectionArms(Graph& graph) {
+bool RouteSharedSelectionArm(Graph& graph, uint32_t route_variable) {
 	if (graph.irreducible) {
 		return false;
 	}
-	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
-	bool       found        = false;
-	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
-		const auto block_count = static_cast<uint32_t>(graph.blocks.size());
-		bool       routed      = false;
-		for (uint32_t block_id = 0; block_id < block_count; block_id++) {
-			GotoRouteBlocks route;
-			if (!RouteOneSharedArm(graph, block_count, block_id, route_variable, route)) {
-				continue;
-			}
+	const auto block_count = static_cast<uint32_t>(graph.blocks.size());
+	for (uint32_t block_id = 0; block_id < block_count; block_id++) {
+		GotoRouteBlocks route;
+		if (RouteOneSharedArm(graph, block_count, block_id, route_variable, route)) {
 			PlaceGotoRouteBlocks(graph, block_count, route);
 			RebuildPredecessors(graph);
 			RecomputeAnalyses(graph);
-			found  = true;
-			routed = true;
-			break;
-		}
-		if (!routed) {
-			return found;
+			return true;
 		}
 	}
 	return false;
@@ -1922,17 +2109,25 @@ bool Structurize(Graph& graph, std::string* error) {
 	if (StructurizeImpl(graph, error)) {
 		return true;
 	}
-	if (!RouteSharedSelectionArms(original)) {
-		return false;
-	}
+
 	Graph       failed_graph = std::move(graph);
 	std::string failed_error = error != nullptr ? *error : std::string {};
 	graph                    = std::move(original);
-	if (error != nullptr) {
-		error->clear();
-	}
-	if (StructurizeImpl(graph, error)) {
-		return true;
+	const auto route_budget  = static_cast<uint32_t>(graph.blocks.size());
+	// Apply one route at a time and retry. Eagerly routing every matching diamond can
+	// rewrite unrelated selections that were already structurally valid.
+	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
+		if (!RouteSharedSelectionArm(graph, route_variable)) {
+			break;
+		}
+		Graph routed = graph;
+		if (error != nullptr) {
+			error->clear();
+		}
+		if (StructurizeImpl(routed, error)) {
+			graph = std::move(routed);
+			return true;
+		}
 	}
 	graph = std::move(failed_graph);
 	if (error != nullptr) {

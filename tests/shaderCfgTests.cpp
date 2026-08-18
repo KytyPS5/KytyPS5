@@ -7147,30 +7147,83 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
   const bool structured = ShaderRecompiler::CFG::Structurize(graph, &error);
-  Check(!structured && Common::ContainsStr(error, "externally entered region"),
-        "overlapping early-exit ladder should require dispatcher without "
-        "cloning");
+  Check(structured, error.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
-        "failed structurization duplicated semantic instructions");
-  for (size_t index = original_block_count; index < graph.blocks.size();
-       index++) {
-    Check(graph.blocks[index].inst_begin == graph.blocks[index].inst_end,
-          "structurization added a semantic block clone");
-  }
+        "early-exit ladder routing changed semantic instruction coverage");
+  Check(graph.blocks.size() > original_block_count,
+        "early-exit ladder routing did not add forwarding blocks");
+  const auto route_selects = std::ranges::count_if(graph.blocks, [](const auto &block) {
+    return block.terminator.condition ==
+           ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+  });
+  const auto route_sets = std::ranges::count_if(graph.blocks, [](const auto &block) {
+    return block.terminator.goto_value >= 0;
+  });
+  Check(route_selects != 0u && route_sets >= 3u,
+        "early-exit ladder lacks explicit typed route state");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(result.program.dispatcher_fallback &&
-            Common::ContainsStr(result.ir_dump, "mode=dispatcher"),
-        "overlapping early-exit ladder did not select dispatcher");
-  Check(Common::ContainsStr(result.ir_dump, "externally entered region"),
-        "overlapping early-exit ladder lost its fallback reason");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0u,
-        "overlapping early-exit dispatcher lacks OpSwitch");
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured"),
+        "overlapping early-exit ladder did not stay structured");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "overlapping early-exit ladder unexpectedly used dispatcher OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // enclosing condition
+      EncodeSopp(0x04, 4),    // enclosing -> continuation or inner header
+      EncodeSopc(0x06, 1, 1), // inner early-exit condition
+      EncodeSopp(0x04, 4),    // inner -> shared terminal or body
+      EncodeSMovB32(2, 129),  // inner body
+      EncodeSopp(0x02, 0),    // body -> enclosing continuation
+      EncodeSMovB32(3, 129),  // enclosing continuation
+      EncodeSopp(0x02, 0),    // continuation -> shared terminal
+      EncodeSMovB32(4, 129),  // shared terminal epilogue
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph, &error);
+  Check(structured, error.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "nested early-exit structurization changed semantic coverage");
+  const auto route_selects = std::ranges::count_if(graph.blocks, [](const auto &block) {
+    return block.terminator.condition ==
+           ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+  });
+  const auto route_sets = std::ranges::count_if(graph.blocks, [](const auto &block) {
+    return block.terminator.goto_value >= 0;
+  });
+  Check(route_selects == 1u && route_sets == 3u,
+        "nested early exit lacks complete typed route state");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "nested early exit to a shared terminal did not stay structured");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -9374,6 +9427,7 @@ int main() {
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
+  TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestComputeShaderInputWaveSize();

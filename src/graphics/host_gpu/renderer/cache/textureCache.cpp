@@ -1758,17 +1758,17 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 	CacheLock lock(*this, m_lock);
 	bool      found = false;
 	for (const auto id: FindImagesInRegion(address, size, true)) {
-		auto owner = ResolveOwner(id);
-		if (owner == nullptr || owner->depth_id || !owner->Overlaps(address, size)) {
+		auto& image = ResolveImage(id);
+		if (image.depth_id || !image.Overlaps(address, size)) {
 			continue;
 		}
-		if (owner->IsGpuModified()) {
+		if (image.IsGpuModified()) {
 			if (!formatted_buffer_write) {
 				EXIT("TextureCache: buffer write aliases GPU-modified image\n");
 			}
-			ClearGpuModified(id);
+			image.ClearGpuModified();
 		}
-		owner->MarkBufferModified();
+		image.MarkBufferModified();
 		found = true;
 	}
 	return found;
@@ -1781,13 +1781,13 @@ TextureCache::RegionInfo TextureCache::QueryRegion(uint64_t address, uint64_t si
 	}
 	CacheLock lock(*this, m_lock);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
-		auto owner = ResolveOwner(id);
-		if (owner == nullptr || owner->depth_id || !owner->Overlaps(address, size, true)) {
+		const auto& image = ResolveImage(id);
+		if (image.depth_id) {
 			continue;
 		}
 		result.image_pages = true;
-		result.image_bytes |= owner->Overlaps(address, size);
-		result.gpu_image_bytes |= owner->GpuOverlaps(address, size);
+		result.image_bytes |= image.Overlaps(address, size);
+		result.gpu_image_bytes |= image.GpuOverlaps(address, size);
 	}
 	return result;
 }

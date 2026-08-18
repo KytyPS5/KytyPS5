@@ -274,6 +274,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
+void TextureCache::FreeImage(ImageId id) {
+	ClearGpuModified(id);
+	DeleteImage(id);
+}
+
 void TextureCache::DeleteImages(std::span<const ImageId> ids,
                                 std::optional<ImageId>   native_source) {
 	std::set<std::pair<uint32_t, uint32_t>> unique;
@@ -1226,7 +1231,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				result = ExpandImage(desc.info, result);
+				FreeImage(result);
+				result = {};
 			}
 		}
 		if (!result) {

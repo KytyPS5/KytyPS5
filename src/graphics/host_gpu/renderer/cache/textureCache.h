@@ -110,6 +110,7 @@ private:
 	void                                 RegisterImage(ImageId id);
 	void                                 UnregisterImage(ImageId id);
 	void                                 DeleteImage(ImageId id);
+	void                                 FreeImage(ImageId id);
 	void DeleteImages(std::span<const ImageId> ids, std::optional<ImageId> native_source = {});
 	void RetainImage(CommandBuffer& command, ImageId id);
 	void TouchImage(Image& image);

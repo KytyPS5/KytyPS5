@@ -3455,6 +3455,45 @@ public:
           "TextureCache::FindTexture did not preserve sampled view "
           "identity, final refresh, and cache-only ownership");
 
+      constexpr uint64_t resource_replacement_offset = 0x700000;
+      const std::array<uint32_t, 3> resource_replacement_data{
+          0x01020304u, 0x11121314u, 0x21222324u};
+      std::memcpy(memory + resource_replacement_offset,
+                  resource_replacement_data.data(),
+                  sizeof(resource_replacement_data));
+      auto underspecified = sampled;
+      underspecified.info.data = {base + resource_replacement_offset,
+                                  sizeof(resource_replacement_data)};
+      underspecified.info.pixel_format = vk::Format::eR32Uint;
+      underspecified.info.guest_format = Prospero::BufferFormat::k32UInt;
+      underspecified.info.extent = {2, 1, 1};
+      underspecified.info.resources = {1, 1};
+      underspecified.info.pitch = 2;
+      underspecified.info.mip_layout[0] = {0, 8, 2, 1};
+      underspecified.info.mip_layout[1] = {8, 4, 1, 1};
+      underspecified.view_info.format = underspecified.info.pixel_format;
+      underspecified.view_info.level_count = 1;
+      const auto underspecified_id = texture_cache.FindImage(underspecified);
+      (void)texture_cache.FindTexture(underspecified_id, underspecified);
+      texture_cache.MarkGpuWritten(underspecified_id);
+
+      auto complete = underspecified;
+      complete.info.resources = {2, 1};
+      complete.view_info.level_count = 2;
+      const auto complete_id = texture_cache.FindImage(complete);
+      const auto complete_owner =
+          TextureCacheTestAccess::Owner(texture_cache, complete_id);
+      Require(name, "insufficient-resource replacement",
+              complete_id && complete_id != underspecified_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    underspecified_id) &&
+                  complete_owner != nullptr && complete_owner->registered &&
+                  complete_owner->info.resources == complete.info.resources &&
+                  !complete_owner->IsGpuModified() &&
+                  complete_owner->IsDefinitelyCpuDirty(),
+              "an exact backing with insufficient resources was expanded "
+              "instead of being discarded and recreated");
+
       ImageInfo chain = sampled.info;
       chain.data = {0x10000, 0x8000};
       chain.extent = {8, 8, 1};
@@ -4804,6 +4843,96 @@ public:
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
 
+      constexpr uint64_t bridged_gpu_offset = 0x101000;
+      constexpr uint64_t bridged_cpu_offset = 0x105000;
+      constexpr uint64_t bridged_texel_size = 16;
+      constexpr uint64_t bridged_source_size =
+          bridged_cpu_offset - bridged_gpu_offset + bridged_texel_size;
+      constexpr uint32_t bridged_source_width =
+          bridged_source_size / bridged_texel_size;
+      constexpr uint32_t bridged_gpu_value = 0x10293847u;
+      constexpr uint32_t bridged_cpu_value = 0x56473829u;
+      constexpr uint32_t bridged_gpu_guest_value = 0xa5a5a5a5u;
+      std::array<uint32_t, bridged_texel_size / sizeof(uint32_t)>
+          bridged_cpu_values{};
+      bridged_cpu_values.fill(bridged_cpu_value);
+      std::memcpy(memory + bridged_cpu_offset, bridged_cpu_values.data(),
+                  sizeof(bridged_cpu_values));
+      auto bridged_cpu_owner = resources.GetBufferCache().ObtainBuffer(
+          command, base + bridged_cpu_offset, bridged_texel_size, true, false);
+      Require(name, "bridged CPU owner allocation",
+              bridged_cpu_owner.owner != nullptr,
+              "bridged image source did not create its CPU-side cache owner");
+      command.RetainResourceUntilFence(bridged_cpu_owner.owner);
+      resources.GetBufferCache().FillBuffer(base + bridged_cpu_offset,
+                                            bridged_texel_size, 0);
+      Require(
+          name, "bridged CPU write fault",
+          resources.HandleFault(PageFaultAccess::Write,
+                                base + bridged_cpu_offset),
+          "bridged image source could not transfer its second owner to CPU");
+      std::memcpy(memory + bridged_cpu_offset, bridged_cpu_values.data(),
+                  sizeof(bridged_cpu_values));
+
+      std::array<uint32_t, bridged_texel_size / sizeof(uint32_t)>
+          bridged_gpu_guest_values{};
+      bridged_gpu_guest_values.fill(bridged_gpu_guest_value);
+      std::memcpy(memory + bridged_gpu_offset, bridged_gpu_guest_values.data(),
+                  sizeof(bridged_gpu_guest_values));
+
+      auto bridged_gpu_owner = resources.GetBufferCache().ObtainBuffer(
+          scheduler.Current(), base + bridged_gpu_offset, bridged_texel_size,
+          true, false);
+      Require(name, "bridged GPU owner allocation",
+              bridged_gpu_owner.owner != nullptr &&
+                  bridged_gpu_owner.owner != bridged_cpu_owner.owner,
+              "bridged image source did not retain two disjoint cache owners");
+      scheduler.Current().RetainResourceUntilFence(bridged_gpu_owner.owner);
+      resources.GetBufferCache().FillBuffer(
+          base + bridged_gpu_offset, bridged_texel_size, bridged_gpu_value);
+      Require(name, "bridged ownership split",
+              resources.GetBufferCache().HasGpuDirtyBytes(
+                  base + bridged_gpu_offset, bridged_texel_size) &&
+                  !resources.GetBufferCache().HasGpuDirtyBytes(
+                      base + bridged_cpu_offset, bridged_texel_size) &&
+                  resources.GetBufferCache().IsRegionCpuModified(
+                      base + bridged_cpu_offset, bridged_texel_size),
+              "bridged image source did not retain distinct GPU and CPU "
+              "ownership domains");
+
+      auto bridged_source_desc = MakeLinearDesc(
+          base + bridged_gpu_offset, bridged_source_size,
+          vk::Format::eR32G32B32A32Uint,
+          Prospero::BufferFormat::k32_32_32_32UInt,
+          Prospero::ImageType::kColor2D, {bridged_source_width, 1, 1}, 1,
+          bridged_texel_size, 1);
+      const auto bridged_source_image =
+          texture_cache.FindImage(bridged_source_desc);
+      (void)texture_cache.FindTexture(bridged_source_image,
+                                      bridged_source_desc);
+      auto bridged_source_readback = CreateHostBuffer(
+          name, bridged_source_size, vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(bridged_source_size / sizeof(u32), 0));
+      auto &bridged_source_native =
+          texture_cache.GetImage(bridged_source_image);
+      bridged_source_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::AccessFlagBits2::eTransferRead, {},
+                                    scheduler.Current().Handle());
+      vk::BufferImageCopy bridged_source_copy{};
+      bridged_source_copy.bufferRowLength = bridged_source_width;
+      bridged_source_copy.imageSubresource.aspectMask =
+          vk::ImageAspectFlagBits::eColor;
+      bridged_source_copy.imageSubresource.layerCount = 1;
+      bridged_source_copy.imageExtent = {bridged_source_width, 1, 1};
+      scheduler.Current().Handle().copyImageToBuffer(
+          bridged_source_native.backing.image,
+          vk::ImageLayout::eTransferSrcOptimal, bridged_source_readback.buffer,
+          1, &bridged_source_copy);
+      HostReadBarrier(bridged_source_readback.buffer,
+                      bridged_source_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+
       constexpr uint64_t byte_mirror_page_offset = 0x24000;
       constexpr uint64_t byte_mirror_offset = byte_mirror_page_offset + 1;
       const std::array<uint8_t, 4> byte_mirror_guest{0xacu, 0x5au, 0xbdu,
@@ -5074,6 +5203,13 @@ public:
               mixed_source_words.front() == mixed_cpu_value &&
                   mixed_source_words[0x1000 / sizeof(u32)] == mixed_gpu_value,
               "mixed CPU/GPU source upload lost one "
+              "ownership domain");
+      const auto bridged_source_words = ReadBuffer(
+          name, bridged_source_readback, bridged_source_size / sizeof(u32));
+      Require(name, "bridged-owner image content",
+              bridged_source_words.front() == bridged_gpu_value &&
+                  bridged_source_words.back() == bridged_cpu_value,
+              "image upload bridging separate cache owners lost a GPU or CPU "
               "ownership domain");
       Require(name, "BGRA16 content",
               ReadBuffer(name, bgra16_readback, 2) ==
@@ -5980,6 +6116,7 @@ public:
       DestroyBuffer(&layered_readback);
       DestroyBuffer(&bgra16_readback);
       DestroyBuffer(&mixed_source_readback);
+      DestroyBuffer(&bridged_source_readback);
       DestroyBuffer(&mip_formatted_readback);
       DestroyBuffer(&mip_prefix_readback);
       DestroyBuffer(&partial_cpu_refresh_readback);

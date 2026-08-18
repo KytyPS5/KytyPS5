@@ -180,10 +180,10 @@ void MainDialogPrivate::FindInterpreter() {
 		return;
 	}
 
-	if (!m_ui->widget->EnsureGameDirectory()) {
-		QApplication::quit();
-		return;
-	}
+	// Prompt for a game folder when none are configured, but keep the launcher
+	// open if the user dismisses the dialog (quitting here can segfault during
+	// nested modal shutdown / background compatibility load).
+	m_ui->widget->EnsureGameDirectory();
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 

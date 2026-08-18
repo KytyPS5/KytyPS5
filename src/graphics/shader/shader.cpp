@@ -117,12 +117,11 @@ struct ShaderStageProgramKey {
 	uint64_t                       shader_hash    = 0;
 	ShaderId                       program_id;
 	Config::ShaderOptimizationType optimization_type = Config::ShaderOptimizationType::None;
-	bool                           validation        = false;
 
 	bool operator==(const ShaderStageProgramKey& other) const {
 		return stage == other.stage && lane_mask_mode == other.lane_mask_mode &&
 		       shader_hash == other.shader_hash && program_id == other.program_id &&
-		       optimization_type == other.optimization_type && validation == other.validation;
+		       optimization_type == other.optimization_type;
 	}
 };
 
@@ -143,7 +142,6 @@ struct ShaderStageProgramKeyHash {
 			mix(value);
 		}
 		mix(static_cast<uint32_t>(key.optimization_type));
-		mix(key.validation ? 1u : 0u);
 		return hash;
 	}
 };
@@ -917,7 +915,6 @@ static ShaderStageProgramKey MakeShaderStageProgramKey(ShaderType stage, uint64_
 	key.shader_hash       = shader_hash;
 	key.program_id        = program_id;
 	key.optimization_type = Config::GetShaderOptimizationType();
-	key.validation        = Config::ShaderValidationEnabled();
 	return key;
 }
 

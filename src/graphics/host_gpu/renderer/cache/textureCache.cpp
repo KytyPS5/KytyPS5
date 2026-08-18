@@ -22,7 +22,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <set>
+#include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -277,27 +277,6 @@ void TextureCache::DeleteImage(ImageId id) {
 void TextureCache::FreeImage(ImageId id) {
 	ClearGpuModified(id);
 	DeleteImage(id);
-}
-
-void TextureCache::DeleteImages(std::span<const ImageId> ids,
-                                std::optional<ImageId>   native_source) {
-	std::set<std::pair<uint32_t, uint32_t>> unique;
-	for (const auto id: ids) {
-		if (!id || !unique.emplace(id.index, id.generation).second) {
-			continue;
-		}
-		auto owner = ResolveOwner(id);
-		if (owner == nullptr) {
-			continue;
-		}
-		if (native_source == id) {
-			ClearGpuModified(id);
-		} else if (owner->IsGpuModified()) {
-			DownloadImage(id);
-			ClearGpuModified(id);
-		}
-		DeleteImage(id);
-	}
 }
 
 void TextureCache::RetainImage(CommandBuffer& command, ImageId id) {
@@ -729,7 +708,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
-	bool copied = false;
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
@@ -737,7 +715,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
 			CopyImage(replacement_id, cached_id);
-			copied = true;
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
 			           "TextureCache: unsupported cross-format multisample depth copy\n");
@@ -754,18 +731,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		RetainImage(command, cached_id);
 		RetainImage(command, replacement_id);
 		CommitGpuWrite(replacement);
-		copied = true;
 	} else {
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	if (copied) {
-		DeleteImages(std::array {cached_id}, cached_id);
-	} else {
-		ClearGpuModified(cached_id);
-		DeleteImage(cached_id);
-	}
+	FreeImage(cached_id);
 	return replacement_id;
 }
 
@@ -787,7 +758,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.BlockExtent() != cached.info.BlockExtent() ||
 		    requested_block != cached_block) {
 			if (safe_to_delete) {
-				DeleteImages(std::array {cached_id}, cached_id);
+				FreeImage(cached_id);
 			}
 			return {merged_id};
 		}
@@ -804,7 +775,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		if (requested.tile_mode != cached.info.tile_mode) {
 			if (safe_to_delete) {
-				DeleteImages(std::array {cached_id}, cached_id);
+				FreeImage(cached_id);
 			}
 			return {merged_id};
 		}
@@ -840,7 +811,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			}
 		}
 		if (safe_to_delete) {
-			DeleteImages(std::array {cached_id}, cached_id);
+			FreeImage(cached_id);
 		}
 		return {};
 	}
@@ -854,13 +825,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				if (merged_id) {
 					ResolveImage(merged_id).binding.is_target = true;
 				}
-				DeleteImages(std::array {cached_id}, cached_id);
+				FreeImage(cached_id);
 				return {merged_id};
 			}
 			if (merged_id) {
 				CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 				             static_cast<uint32_t>(layer));
-				DeleteImages(std::array {cached_id}, cached_id);
+				FreeImage(cached_id);
 			}
 		}
 	}
@@ -879,7 +850,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	InitializeImage(expanded_id,
 	                ImageDesc {.info = info, .view_info = {}, .type = UploadBinding(source)});
 	CopyImage(expanded_id, source_id);
-	DeleteImages(std::array {source_id}, source_id);
+	FreeImage(source_id);
 	return expanded_id;
 }
 

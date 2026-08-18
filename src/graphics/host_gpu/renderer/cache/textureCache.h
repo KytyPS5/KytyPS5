@@ -13,9 +13,7 @@
 #include <compare>
 #include <map>
 #include <memory>
-#include <optional>
 #include <set>
-#include <span>
 #include <utility>
 #include <vector>
 
@@ -111,18 +109,17 @@ private:
 	void                                 UnregisterImage(ImageId id);
 	void                                 DeleteImage(ImageId id);
 	void                                 FreeImage(ImageId id);
-	void DeleteImages(std::span<const ImageId> ids, std::optional<ImageId> native_source = {});
-	void RetainImage(CommandBuffer& command, ImageId id);
-	void TouchImage(Image& image);
-	void TrackImage(ImageId id);
-	void TrackImageHead(ImageId id);
-	void TrackImageTail(ImageId id);
-	void UntrackImage(ImageId id);
-	void UntrackImageHead(ImageId id);
-	void UntrackImageTail(ImageId id);
-	void MarkAsMaybeDirty(ImageId id, Image& image);
-	void TrackImageDownload(ImageId id);
-	void TrackImageDownloadLocked(ImageId id, Image& image);
+	void                                 RetainImage(CommandBuffer& command, ImageId id);
+	void                                 TouchImage(Image& image);
+	void                                 TrackImage(ImageId id);
+	void                                 TrackImageHead(ImageId id);
+	void                                 TrackImageTail(ImageId id);
+	void                                 UntrackImage(ImageId id);
+	void                                 UntrackImageHead(ImageId id);
+	void                                 UntrackImageTail(ImageId id);
+	void                                 MarkAsMaybeDirty(ImageId id, Image& image);
+	void                                 TrackImageDownload(ImageId id);
+	void                                 TrackImageDownloadLocked(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);

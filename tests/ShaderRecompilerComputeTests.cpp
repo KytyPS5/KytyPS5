@@ -7646,6 +7646,8 @@ public:
           array_target_view != nullptr && array_target_owner != nullptr &&
               array_target_owner->binding.needs_rebind &&
               expanded_array_id != array_target_id &&
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                array_target_id) &&
               array_binding.resources.images[0].image_view != nullptr &&
               array_binding.resources.images[0].desc.info.type ==
                   Prospero::ImageType::kColor2D &&

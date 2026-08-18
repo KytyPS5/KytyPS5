@@ -21,6 +21,28 @@ namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
+static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool has_dcc,
+                                uint32_t packed_clear) {
+	// Register-backed DCC clears use the target's packed clear value. Decode one-word guest
+	// formats here; unsupported encodings remain tracked without unsafe materialization.
+	info.metadata_clear_supported =
+	    has_dcc && DecodePackedColorClear(format, packed_clear, info.color_clear_value);
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+			info.metadata_fixed_clear_supported = has_dcc;
+			break;
+		default: info.metadata_fixed_clear_supported = false; break;
+	}
+	if (!info.metadata_clear_supported) {
+		info.color_clear_value = {};
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
                                               RenderColorInfo& r,
@@ -55,20 +77,22 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		}
 
 		// No color output
-		r.type               = RenderColorType::NoColorOutput;
-		r.desc               = {};
-		r.base_addr          = 0;
-		r.image_id           = {};
-		r.image_view         = nullptr;
-		r.format             = vk::Format::eUndefined;
-		r.extent             = {};
-		r.base_mip_level     = 0;
-		r.base_array_layer   = 0;
-		r.buffer_size        = 0;
-		r.samples            = 1;
-		r.export_mapping     = {};
-		r.color_clear_enable = false;
-		r.color_clear_value  = {};
+		r.type                           = RenderColorType::NoColorOutput;
+		r.desc                           = {};
+		r.base_addr                      = 0;
+		r.image_id                       = {};
+		r.image_view                     = nullptr;
+		r.format                         = vk::Format::eUndefined;
+		r.extent                         = {};
+		r.base_mip_level                 = 0;
+		r.base_array_layer               = 0;
+		r.buffer_size                    = 0;
+		r.samples                        = 1;
+		r.export_mapping                 = {};
+		r.color_clear_enable             = false;
+		r.metadata_clear_supported       = false;
+		r.metadata_fixed_clear_supported = false;
+		r.color_clear_value              = {};
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
@@ -107,9 +131,9 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		}
 	}
 
-	// CB_COLOR_CONTROL describes the color-buffer operation / ROP3 logic op.
-	// ROP3 Copy is the normal color write path, not a render-target clear.
-	// SRGB clear words are still encoded as normalized component values.
+	// Color-control state selects the color-buffer operation and logical blend operation.
+	// The normal copy operation is a regular color write, not an attachment clear.
+	// Nonlinear clear values are still stored as normalized components.
 	// Fast color clears are metadata driven and must be handled explicitly when
 	// that metadata path is implemented; render-pass load must preserve contents.
 	r.color_clear_enable = false;
@@ -309,6 +333,13 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
+	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+	if (has_dcc) {
+		// DCC uses a separate metadata allocation. Carry its address through ImageInfo so
+		// TextureCache can associate metadata fills observed before target registration.
+		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
+		desc.info.metadata.range.address = rt.dcc_addr.addr;
+	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
 			const auto& mip             = volume_layout.mips[level];
@@ -355,7 +386,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	r.samples                  = samples;
 	r.export_mapping           = target_format.export_mapping;
 	r.color_clear_enable       = false;
-	r.color_clear_value        = {};
+	ResolveDccClearInfo(r, target_format.format, has_dcc, rt.clear_word0.word0);
 	BindRenderTarget(r.image_id);
 }
 

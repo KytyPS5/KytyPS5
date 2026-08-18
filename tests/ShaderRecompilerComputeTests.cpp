@@ -4542,10 +4542,15 @@ public:
       };
       auto metadata_depth_a = MakeMetadataDepth(metadata_data_a, metadata_a);
       auto metadata_depth_b = MakeMetadataDepth(metadata_data_b, metadata_b);
+      metadata_depth_a.info.htile_clear_mask = 0;
       const auto metadata_depth_a_id =
           texture_cache.FindImage(metadata_depth_a);
       const auto metadata_depth_b_id =
           texture_cache.FindImage(metadata_depth_b);
+      Require(name, "pending DCC/HTile separation",
+              !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
+                  !texture_cache.IsMeta(base + metadata_a),
+              "an unclassified PS5 DCC fill was exposed as registered metadata");
       const auto metadata_depth_a_view =
           texture_cache.FindDepthTarget(metadata_depth_a_id, metadata_depth_a);
       const auto metadata_depth_b_view =
@@ -4553,6 +4558,7 @@ public:
       Require(name, "shared-page metadata state",
               metadata_depth_a_view != nullptr &&
                   metadata_depth_b_view != nullptr &&
+                  !texture_cache.IsMetaCleared(base + metadata_a, 0) &&
                   texture_cache.ClearMeta(base + metadata_a) &&
                   texture_cache.ClearMeta(base + metadata_b),
               "shared-page metadata did not retain logical clear state");
@@ -4576,6 +4582,11 @@ public:
               texture_cache.IsMeta(base + metadata_b) &&
               texture_cache.IsMetaCleared(base + metadata_b, 0),
           "image discovery retired aliased metadata or its live depth image");
+      Require(name, "registered DCC/HTile separation",
+              texture_cache.TouchMeta(base + metadata_a, 0, false) &&
+                  !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
+                  !texture_cache.IsMetaCleared(base + metadata_a, 0),
+              "a PS5 DCC fill changed registered HTile state");
       Require(
           name, "metadata first-touch state",
           texture_cache.TouchMeta(base + metadata_b, 0, true) &&
@@ -6313,7 +6324,8 @@ public:
       HW::Shader shaders{};
       registers.SetColorBase(0, {.addr = base});
       registers.SetColorInfo(
-          0, {.format = Prospero::ChannelLayout::k10_10_10_2,
+          0, {.dcc_compression_enable = true,
+              .format = Prospero::ChannelLayout::k10_10_10_2,
               .channel_type = Prospero::ChannelType::kUNorm,
               .channel_order = Prospero::ChannelOrder::kStandard});
       registers.SetColorAttrib2(0, {.height = 31, .width = 31});
@@ -6323,6 +6335,10 @@ public:
                                  .dimension = 2,
                                  .cmask_pipe_aligned = true,
                                  .dcc_pipe_aligned = true});
+      constexpr uint64_t dcc_address = base + allocation_size - 0x1000;
+      registers.SetColorDccAddr(0, {.addr = dcc_address});
+      registers.SetColorClearWord0(0, {.word0 = 0});
+      registers.SetColorClearWord1(0, {.word1 = 0});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
@@ -6330,6 +6346,10 @@ public:
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
+      Require(name, "deferred DCC clear",
+              !texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0) &&
+                  !texture_cache.IsMeta(dcc_address),
+              "a pre-registration DCC clear was not deferred");
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -6337,6 +6357,7 @@ public:
       const auto attachment =
           texture_cache.FindRenderTarget(color.image_id, color.desc);
       const auto &image = texture_cache.GetImage(color.image_id);
+      uint32_t dcc_clear_value = 0xffffffffu;
       Require(
           name, "captured 3D target",
           color.image_id && attachment != nullptr &&
@@ -6346,6 +6367,13 @@ public:
               color.desc.info.pitch == 128 &&
               color.desc.info.data.size == allocation_size &&
               color.desc.info.mip_layout[0].size == 0x10000 &&
+              color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+              color.desc.info.metadata.range.address == dcc_address &&
+              color.metadata_clear_supported &&
+              texture_cache.IsMetaCleared(dcc_address, 7,
+                                          &dcc_clear_value) &&
+              dcc_clear_value == 0 &&
+              !texture_cache.ClearMeta(dcc_address) &&
               color.desc.view_info.type == vk::ImageViewType::e2D &&
               color.desc.view_info.layer_count == 1 &&
               image.backing.image_type == vk::ImageType::e3D &&
@@ -6372,8 +6400,21 @@ public:
               sliced_color.image_view != nullptr &&
               sliced_color.desc.view_info.base_layer == 7 &&
               sliced_rendering.num_color_attachments == 1 &&
-              sliced_rendering.num_layers == 1,
+              sliced_rendering.num_layers == 1 &&
+              sliced_rendering.color_attachments[0].is_clear &&
+              sliced_rendering.color_attachments[0].clear_value ==
+                  vk::ClearColorValue {}.uint32 &&
+              !texture_cache.IsMetaCleared(dcc_address, 7),
           "a nonzero 3D attachment slice was treated as a Vulkan array layer");
+      dcc_clear_value = 0;
+      Require(name, "registered DCC code state",
+              texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0xffffffffu) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 7,
+                                               &dcc_clear_value) &&
+                  dcc_clear_value == 0xffffffffu &&
+                  texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0) &&
+                  texture_cache.IsMetaCleared(dcc_address, 7),
+              "DCC fill codes were not classified as clear or uncompressed");
 
       auto storage_desc = color.desc;
       storage_desc.type = BindingType::Storage;

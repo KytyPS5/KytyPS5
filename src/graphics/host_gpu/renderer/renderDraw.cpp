@@ -377,8 +377,8 @@ static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandB
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 	}
 
-	// CB_COLOR_CONTROL.operation controls special CB operations, not the normal color component
-	// write mask. Use CB_TARGET_MASK here so scanout passes with mode=Disable do not go black.
+	// Color-control operation selects special color-buffer paths, not the normal component write
+	// mask. Attachment availability therefore follows the target write mask.
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
 		ret.color_write_enable[i] =
 		    (i < color_count &&
@@ -552,6 +552,71 @@ struct DrawCallInfo {
 	uint32_t             first_instance = 0;
 };
 
+static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
+                                      const ImageViewInfo& view,
+                                      vk::ClearColorValue& clear_value) {
+	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
+		return false;
+	}
+
+	// A DCC fast clear may update metadata only and leave the color allocation stale. Vulkan has
+	// no guest DCC state, so materialize the deferred value when the surface is next bound.
+	const auto metadata_address = target.desc.info.metadata.range.address;
+	uint32_t   metadata_value   = 0xffffffffu;
+	if (!cache.IsMetaCleared(metadata_address, view.base_layer, &metadata_value)) {
+		return false;
+	}
+
+	// Translate recognized constant and register-backed DCC states into a host clear value.
+	clear_value = {};
+	switch (static_cast<uint8_t>(metadata_value)) {
+		case 0x00: break;
+		case 0x20:
+			if (!target.metadata_clear_supported) {
+				return false;
+			}
+			clear_value = target.color_clear_value;
+			break;
+		case 0x40:
+			if (!target.metadata_fixed_clear_supported) {
+				return false;
+			}
+			clear_value.float32[3] = 1.0f;
+			break;
+		case 0x80:
+			if (!target.metadata_fixed_clear_supported) {
+				return false;
+			}
+			clear_value.float32[0] = 1.0f;
+			clear_value.float32[1] = 1.0f;
+			clear_value.float32[2] = 1.0f;
+			break;
+		case 0xc0:
+			if (!target.metadata_fixed_clear_supported) {
+				return false;
+			}
+			clear_value.float32[0] = 1.0f;
+			clear_value.float32[1] = 1.0f;
+			clear_value.float32[2] = 1.0f;
+			clear_value.float32[3] = 1.0f;
+			break;
+		default: return false;
+	}
+
+	for (uint32_t layer = 1; layer < view.layer_count; layer++) {
+		if (!cache.IsMetaCleared(metadata_address, view.base_layer + layer)) {
+			return false;
+		}
+	}
+	// Consume only after every layer in this Vulkan view can be materialized together.
+	for (uint32_t layer = 0; layer < view.layer_count; layer++) {
+		if (!cache.TouchMeta(metadata_address, view.base_layer + layer, false)) {
+			EXIT("failed to consume DCC clear state\n");
+		}
+	}
+	return true;
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -592,14 +657,20 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width             = std::min(state.width, target.extent.width);
-		state.height            = std::min(state.height, target.extent.height);
-		state.num_layers        = std::min(state.num_layers, view.layer_count);
-		auto& attachment        = state.color_attachments[i];
-		attachment.image_view   = target.image_view;
-		attachment.image_layout = layout;
-		attachment.clear_value  = target.color_clear_value.uint32;
-		attachment.is_clear     = target.color_clear_enable;
+		state.width                 = std::min(state.width, target.extent.width);
+		state.height                = std::min(state.height, target.extent.height);
+		state.num_layers            = std::min(state.num_layers, view.layer_count);
+		auto& attachment            = state.color_attachments[i];
+		attachment.image_view       = target.image_view;
+		attachment.image_layout     = layout;
+		attachment.clear_value      = target.color_clear_value.uint32;
+		vk::ClearColorValue metadata_clear_value {};
+		const bool metadata_clear =
+		    ResolveDccAttachmentClear(cache, target, view, metadata_clear_value);
+		if (metadata_clear) {
+			attachment.clear_value = metadata_clear_value.uint32;
+		}
+		attachment.is_clear = target.color_clear_enable || metadata_clear;
 	}
 	if (depth.image_id) {
 		const auto owner = cache.ResolveOwner(depth.image_id);
@@ -687,10 +758,11 @@ enum class CbColorMode : uint8_t {
 static bool ConsumeMetadataColorOperation(const RenderCommandBuffer& buffer) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
-	// These AGC CB modes run color-buffer metadata/decompression operations. The shader is a
-	// dummy vehicle for the CB, and its exported color must not be applied as a normal draw.
-	// Kyty currently stores host images as expanded Vulkan images and does not track CMASK/DCC
-	// metadata state, so the matching host operation is a no-op.
+	// These special modes run color-buffer metadata or decompression operations. The shader is a
+	// vehicle for that operation, and its exported color must not be applied as a normal draw.
+	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
+	// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind;
+	// future CMask/FMask support can consume its state through the same TextureCache path.
 	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
 	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
@@ -948,7 +1020,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	}
 	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
 
-	state.ps_active = DrawHasActivePixelShader(buffer);
+	state.ps_active       = DrawHasActivePixelShader(buffer);
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count == 0 && !with_depth && !state.ps_active) {

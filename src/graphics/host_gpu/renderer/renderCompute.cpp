@@ -139,6 +139,21 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 	}
 	auto& cache = command.GetContext().GetTextureCache();
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
+		// Recognized metadata-fill shaders access DCC as an ordinary storage buffer and may run
+		// before the render target is bound. TryConsumeDccFill either consumes registered state
+		// or retains a PendingDcc fill while allowing the dispatch to run.
+		const bool registered_metadata =
+		    cache.TryConsumeDccFill(descriptor.Base48(), size, packed_clear);
+		static std::atomic<uint32_t> logged_metadata_clears {0};
+		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: %s metadata clear shader=0x%016" PRIx64
+			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
+			     registered_metadata ? "tracked" : "deferred", input.stage.program->shader_hash,
+			     descriptor.Base48(), size, packed_clear);
+		}
+		if (registered_metadata) {
+			return true;
+		}
 		return false;
 	}
 	static std::atomic<uint32_t> logged_clears {0};

@@ -89,6 +89,8 @@ private:
 	            const void* source, uint64_t size);
 	[[nodiscard]] CachedBuffer& GetOrCreateBuffer(CommandBuffer& command, uint64_t vaddr,
 	                                              uint64_t size);
+	[[nodiscard]] bool SynchronizeBuffer(CommandBuffer& command, Buffer& buffer, uint64_t vaddr,
+	                                     uint64_t size, bool is_written, bool is_texel_buffer);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::vector<DownloadRange> RecordDownloads(std::span<const DownloadCopy> copies);
 	void PublishDownloads(std::span<const DownloadRange> downloads);

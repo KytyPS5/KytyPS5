@@ -454,6 +454,24 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
 	return *m_buffers.emplace(cached->vaddr, std::move(cached)).first->second;
 }
 
+bool BufferCache::SynchronizeBuffer(CommandBuffer& command, Buffer& buffer, uint64_t vaddr,
+                                    uint64_t size, bool is_written, bool is_texel_buffer) {
+	std::vector<std::pair<uint64_t, uint64_t>> uploads;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, is_written,
+	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
+	    [&]() noexcept {
+		    for (const auto& [address, bytes]: uploads) {
+			    Upload(command, buffer, buffer.Offset(address),
+			           reinterpret_cast<const void*>(address), bytes);
+		    }
+	    });
+	if (is_texel_buffer && !is_written) {
+		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return false;
+}
+
 BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
                                         bool is_written, bool is_read, bool is_formatted) {
 	if (command.IsInvalid() || command.IsExecute()) {
@@ -485,25 +503,14 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		(void)m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, true);
 	}
 
-	auto&                                      cached = GetOrCreateBuffer(command, vaddr, size);
-	std::vector<std::pair<uint64_t, uint64_t>> uploads;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
-	    [&]() noexcept {
-		    for (const auto& [address, bytes]: uploads) {
-			    Upload(command, *cached.buffer, cached.buffer->Offset(address),
-			           reinterpret_cast<const void*>(address), bytes);
-		    }
-	    });
+	auto& cached = GetOrCreateBuffer(command, vaddr, size);
+	(void)SynchronizeBuffer(command, *cached.buffer, vaddr, size, is_written,
+	                        is_formatted && is_read);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	auto     owner  = cached.buffer;
 	uint64_t offset = cached.buffer->Offset(vaddr);
-	if (is_formatted && is_read && !is_written) {
-		(void)SynchronizeBufferFromImage(*owner, vaddr, size);
-	}
 	return {owner, owner->Handle(), offset};
 }
 

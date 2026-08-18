@@ -1917,10 +1917,15 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
+				const bool gpu_authored =
+				    owner->usage.storage && !owner->usage.render_target && !owner->usage.video_out;
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}
 				if (safe && !pressured) {
+					continue;
+				}
+				if (gpu_authored) {
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {

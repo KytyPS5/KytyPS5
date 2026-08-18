@@ -9,7 +9,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail {
 
-// Declared, never defined: reaching this during constant evaluation is a compile error.
 [[noreturn]] void InvalidOpcodeTable();
 
 struct OpcodeMap {

@@ -52,7 +52,7 @@ static void PrintUsage() {
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
-	         "                                       Requires --vulkan-validation; very slow.\n");
+	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -276,6 +276,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
 		}
+	}
+
+	if (options.config.gpu_assisted_validation_enabled) {
+		options.config.vulkan_validation_enabled = true;
 	}
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());

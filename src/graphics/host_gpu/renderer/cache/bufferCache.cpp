@@ -531,6 +531,14 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 		--owner;
 		return owner->second->buffer->IsInBounds(vaddr, size) ? owner : m_buffers.end();
 	};
+	auto has_overlapping_owner = [&]() {
+		auto owner = m_buffers.lower_bound(vaddr + size);
+		if (owner == m_buffers.begin()) {
+			return false;
+		}
+		--owner;
+		return owner->second->vaddr + owner->second->size > vaddr;
+	};
 
 	{
 		const bool cpu_modified            = m_memory_tracker.IsRegionCpuModified(vaddr, size);
@@ -542,52 +550,13 @@ ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t siz
 
 		auto owner = find_owner();
 		if (has_dirty_buffer_source && owner == m_buffers.end()) {
-			CacheRange merged {.address = AlignDown(vaddr),
-			                   .size    = AlignUp(vaddr + size) - AlignDown(vaddr)};
-			using Iterator = decltype(m_buffers.begin());
-			std::vector<Iterator> overlaps;
-			auto                  first = m_buffers.lower_bound(merged.address);
-			if (first != m_buffers.begin()) {
-				auto previous = std::prev(first);
-				if (ResolveOverlap(merged, {previous->second->vaddr, previous->second->size})) {
-					first = previous;
-				}
-			}
-			for (auto candidate = first; candidate != m_buffers.end(); ++candidate) {
-				if (candidate->first >= merged.address + merged.size) {
-					break;
-				}
-				if (ResolveOverlap(merged, {candidate->second->vaddr, candidate->second->size})) {
-					overlaps.push_back(candidate);
-				}
-			}
-			if (overlaps.empty()) {
+			if (!has_overlapping_owner()) {
 				EXIT("BufferCache: GPU-dirty image source has no native buffer\n");
 			}
-
-			auto cached                = std::make_unique<CachedBuffer>();
-			cached->vaddr              = merged.address;
-			cached->size               = merged.size;
-			cached->tick_accessed_last = m_gc_tick;
-			cached->buffer =
-			    std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
-			                             merged.address, AllFlags, merged.size);
-			for (const auto overlap: overlaps) {
-				const auto& old = *overlap->second;
-				cached->buffer->CopyFrom(m_scheduler.Current(), *old.buffer, 0,
-				                         old.vaddr - cached->vaddr, old.size);
-				m_scheduler.Current().RetainResourceUntilFence(old.buffer);
-			}
-			for (const auto overlap: overlaps) {
-				if (overlap->second->size > m_total_used_memory) {
-					EXIT("BufferCache: allocation accounting underflow\n");
-				}
-				m_total_used_memory -= overlap->second->size;
-				m_buffers.erase(overlap);
-			}
-			m_total_used_memory += cached->size;
-			owner = m_buffers.emplace(cached->vaddr, std::move(cached)).first;
-			if (!owner->second->buffer->IsInBounds(vaddr, size)) {
+			auto& cached = GetOrCreateBuffer(m_scheduler.Current(), vaddr, size);
+			owner        = m_buffers.find(cached.vaddr);
+			if (owner == m_buffers.end() || owner->second.get() != &cached ||
+			    !cached.buffer->IsInBounds(vaddr, size)) {
 				EXIT("BufferCache: merged image source does not contain the requested range\n");
 			}
 		}

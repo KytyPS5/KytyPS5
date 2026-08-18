@@ -121,6 +121,12 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 			     depth.samples);
 		}
 	}
+	if (color_count == 0 && !with_depth) {
+		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
+		EXIT_IF(!static_cast<bool>(
+		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
+		    vulkan_sample_count(attachment_samples)));
+	}
 	EXIT_IF(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 

@@ -340,6 +340,9 @@ static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandB
 		framebuffer_extent = colors[0].extent;
 	} else if (depth.image_id) {
 		framebuffer_extent = {depth.width, depth.height};
+	} else {
+		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
 
 	const auto final_scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent);
@@ -648,8 +651,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
 	}
-	if (attachment_samples == 0 ||
-	    vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {}) {
+	if (color_count == 0 && !depth.image_id) {
+		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+		state.width        = limits.maxFramebufferWidth;
+		state.height       = limits.maxFramebufferHeight;
+	} else if (attachment_samples == 0 ||
+	           vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {}) {
 		EXIT("render state has no valid attachments\n");
 	}
 	if (state.num_layers == std::numeric_limits<uint32_t>::max()) {
@@ -941,14 +948,14 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	}
 	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
 
+	state.ps_active = DrawHasActivePixelShader(buffer);
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
-	if (state.color_count == 0 && !with_depth) {
+	if (state.color_count == 0 && !with_depth && !state.ps_active) {
 		LogFramebufferSkip(draw.name, state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, draw.flags);
 		return false;
 	}
-	state.ps_active = DrawHasActivePixelShader(buffer);
 
 	return true;
 }

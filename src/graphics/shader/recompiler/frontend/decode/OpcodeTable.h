@@ -9,6 +9,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail {
 
+// Declared, never defined: reaching this during constant evaluation is a compile error.
+[[noreturn]] void InvalidOpcodeTable();
+
 struct OpcodeMap {
 	uint32_t encoding = 0;
 	Opcode   decoded  = Opcode::UNKNOWN;
@@ -27,7 +30,7 @@ consteval auto MakeOpcodeTable(const Entry (&entries)[EntryCount]) {
 	for (size_t i = 0; i < EntryCount; i++) {
 		const auto encoding = entries[i].encoding;
 		if (encoding >= EncodingCount || table.indices[encoding] != 0) {
-			throw "invalid opcode table";
+			InvalidOpcodeTable();
 		}
 		table.entries[i]        = entries[i];
 		table.indices[encoding] = static_cast<uint16_t>(i + 1);

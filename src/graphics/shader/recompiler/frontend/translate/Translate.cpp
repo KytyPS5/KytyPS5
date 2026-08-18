@@ -321,7 +321,7 @@ IR::U64 Translator::ExpandWholeQuadMask(IR::U64 value) {
 	const auto merged2 = ir.Emit(IR::ValueOpcode::BitwiseOr64, {merged1, shifted2});
 	const auto merged3 = ir.Emit(IR::ValueOpcode::BitwiseOr64, {merged2, shifted3});
 	const auto low_bits =
-	    ir.Emit(IR::ValueOpcode::BitwiseAnd64, {merged3, IR::Value(0x1111111111111111ull)});
+	    ir.Emit(IR::ValueOpcode::BitwiseAnd64, {merged3, IR::Value(uint64_t {0x1111111111111111})});
 	return IR::U64(ir.Emit(IR::ValueOpcode::IMul64, {low_bits, IR::Value(uint64_t {0xfull})}));
 }
 

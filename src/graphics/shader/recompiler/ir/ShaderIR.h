@@ -11,6 +11,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -351,6 +352,17 @@ struct ShaderInfo {
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
+struct SpirvRequirements {
+	bool requires_exact_subgroup      = false;
+	bool subgroup_ballot              = false;
+	bool subgroup_shuffle             = false;
+	bool subgroup_local_invocation_id = false;
+	bool compute_derivatives          = false;
+	bool image_gather_extended        = false;
+	bool function_lds                 = false;
+	bool pixel_valid_mask             = false;
+};
+
 struct Program {
 	ShaderType                    stage               = ShaderType::Unknown;
 	ShaderLaneMaskMode            lane_mask_mode      = ShaderLaneMaskMode::NativeWave;
@@ -369,6 +381,8 @@ struct Program {
 	bool                          shader_info_complete       = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+
+	std::optional<SpirvRequirements> spirv_requirements;
 };
 
 bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,

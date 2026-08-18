@@ -668,6 +668,69 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+void TestSpirvRequirementsAnalysis() {
+  using namespace ShaderRecompiler::IR;
+
+  Program program;
+  program.stage = ShaderType::Pixel;
+  program.values = std::make_shared<ValueProgram>();
+  program.values->block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.values->block_storage.back().get();
+  program.values->blocks.push_back(block);
+  program.values->memory_info.push_back({.kind = ResourceKind::Lds});
+  program.values->export_info.push_back({.vm = true});
+
+  block->AppendNewInst(ValueOpcode::DppMoveU32, {Value(0u), Value(true)});
+  block->AppendNewInst(ValueOpcode::ImageQueryLod,
+                       {Value(0u), Value(0u), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ImageGatherRaw,
+                       {Value(0u), Value(0u), Value(0u)});
+  auto &shared = block->AppendNewInst(ValueOpcode::LoadSharedU32,
+                                      {Value(0u), Value(0u), Value(true)});
+  shared.SetFlags(MemoryFlags{.index = 0});
+  auto &export_value =
+      block->AppendNewInst(ValueOpcode::SetAttribute, {Value(0u), Value(true)});
+  export_value.SetFlags(ExportFlags{.index = 0});
+
+  const auto requirements =
+      ShaderRecompiler::Spirv::GetProgramRequirements(program);
+  Check(requirements.requires_exact_subgroup && requirements.subgroup_ballot &&
+            requirements.subgroup_shuffle &&
+            requirements.subgroup_local_invocation_id &&
+            requirements.compute_derivatives &&
+            requirements.image_gather_extended && requirements.function_lds &&
+            requirements.pixel_valid_mask,
+        "consolidated SPIR-V requirements missed an IR dependency");
+
+  program.stage = ShaderType::Compute;
+  const auto compute_requirements =
+      ShaderRecompiler::Spirv::GetProgramRequirements(program);
+  Check(!compute_requirements.function_lds &&
+            !compute_requirements.pixel_valid_mask,
+        "stage-specific SPIR-V requirements leaked into compute");
+
+  program.stage = ShaderType::Pixel;
+  shared.SetFlags(MemoryFlags{.index = 1});
+  export_value.SetFlags(ExportFlags{.index = 1});
+  const auto invalid_metadata =
+      ShaderRecompiler::Spirv::GetProgramRequirements(program);
+  Check(!invalid_metadata.function_lds && !invalid_metadata.pixel_valid_mask,
+        "invalid SPIR-V requirement metadata was accepted");
+
+  Program empty;
+  const auto empty_requirements =
+      ShaderRecompiler::Spirv::GetProgramRequirements(empty);
+  Check(!empty_requirements.requires_exact_subgroup &&
+            !empty_requirements.subgroup_ballot &&
+            !empty_requirements.subgroup_shuffle &&
+            !empty_requirements.subgroup_local_invocation_id &&
+            !empty_requirements.compute_derivatives &&
+            !empty_requirements.image_gather_extended &&
+            !empty_requirements.function_lds &&
+            !empty_requirements.pixel_valid_mask,
+        "empty IR unexpectedly requested SPIR-V features");
+}
+
 void TestNativeSubgroupPolicy() {
   const auto SetTypedValues = [](ShaderRecompiler::IR::Program &program,
                                  ShaderRecompiler::IR::ValueOpcode opcode =
@@ -686,6 +749,9 @@ void TestNativeSubgroupPolicy() {
       block->AppendNewInst(opcode, {Value(&resource), Value(0u), Value(true),
                                     Value(1u), Value(0u)});
     }
+    program.spirv_requirements.reset();
+    program.spirv_requirements =
+        ShaderRecompiler::Spirv::GetProgramRequirements(program);
   };
 
   GraphicContext context;
@@ -717,7 +783,8 @@ void TestNativeSubgroupPolicy() {
 
   ShaderRecompiler::IR::Program cross_lane = safe;
   SetTypedValues(cross_lane, ShaderRecompiler::IR::ValueOpcode::ReadLane);
-  Check(ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(cross_lane) &&
+  Check(ShaderRecompiler::Spirv::GetProgramRequirements(cross_lane)
+                .requires_exact_subgroup &&
             ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
                                     vk::ShaderStageFlagBits::eVertex,
                                     cross_lane)
@@ -734,7 +801,8 @@ void TestNativeSubgroupPolicy() {
   ShaderRecompiler::IR::Program zero_exec = safe;
   zero_exec.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
   SetTypedValues(zero_exec);
-  Check(!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(zero_exec) &&
+  Check(!ShaderRecompiler::Spirv::GetProgramRequirements(zero_exec)
+                .requires_exact_subgroup &&
             ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
                                     vk::ShaderStageFlagBits::eCompute,
                                     zero_exec)
@@ -744,18 +812,20 @@ void TestNativeSubgroupPolicy() {
 
   ShaderRecompiler::IR::Program selective_exec = safe;
   SetTypedValues(selective_exec, ShaderRecompiler::IR::ValueOpcode::Ballot);
-  Check(
-      ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(selective_exec),
-      "selective EXEC write was classified mask-free");
+  Check(ShaderRecompiler::Spirv::GetProgramRequirements(selective_exec)
+            .requires_exact_subgroup,
+        "selective EXEC write was classified mask-free");
 
   ShaderRecompiler::IR::Program carry = safe;
   SetTypedValues(carry, ShaderRecompiler::IR::ValueOpcode::Ballot);
-  Check(ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(carry),
+  Check(ShaderRecompiler::Spirv::GetProgramRequirements(carry)
+            .requires_exact_subgroup,
         "lane-varying VCC carry producer was classified mask-free");
 
   ShaderRecompiler::IR::Program vcc_branch = safe;
   SetTypedValues(vcc_branch, ShaderRecompiler::IR::ValueOpcode::Ballot);
-  Check(ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(vcc_branch),
+  Check(ShaderRecompiler::Spirv::GetProgramRequirements(vcc_branch)
+            .requires_exact_subgroup,
         "whole-wave VCC branch was classified mask-free");
 
   ShaderRecompiler::IR::Program ds_partial = safe;
@@ -9387,6 +9457,7 @@ int main() {
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
+  TestSpirvRequirementsAnalysis();
   TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();

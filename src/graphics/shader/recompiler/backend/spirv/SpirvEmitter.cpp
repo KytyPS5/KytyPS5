@@ -277,38 +277,108 @@ void CollectValueRegisterMirrors(const IR::ValueProgram&                program,
 	}
 }
 
-bool ValueProgramHasOpcode(const IR::ValueProgram& program, IR::ValueOpcode opcode) {
-	return std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
-		return std::ranges::any_of(
-		    *block, [opcode](const IR::Inst& inst) { return inst.GetOpcode() == opcode; });
-	});
-}
-
-bool ProgramRequiresExactSubgroupSize(const IR::Program& program) {
-	if (program.values == nullptr) {
-		return false;
+IR::SpirvRequirements GetProgramRequirements(const IR::Program& program) {
+	if (program.spirv_requirements.has_value()) {
+		return *program.spirv_requirements;
 	}
+	IR::SpirvRequirements requirements;
+	if (program.values == nullptr) {
+		return requirements;
+	}
+	const auto MarkExactSubgroup = [&] {
+		requirements.requires_exact_subgroup = true;
+		requirements.subgroup_ballot         = true;
+	};
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
 			switch (inst.GetOpcode()) {
-				case IR::ValueOpcode::Ballot:
+				case IR::ValueOpcode::Ballot: MarkExactSubgroup(); break;
 				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::ReadFirstLane:
+				case IR::ValueOpcode::ReadLane: {
+					MarkExactSubgroup();
+					requirements.subgroup_shuffle = true;
+					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+						requirements.subgroup_local_invocation_id = true;
+					}
+					break;
+				}
 				case IR::ValueOpcode::DppUpdateU32:
 				case IR::ValueOpcode::WqmMask:
-				case IR::ValueOpcode::ReadFirstLane:
-				case IR::ValueOpcode::ReadLane:
-				case IR::ValueOpcode::WriteLane:
+				case IR::ValueOpcode::WriteLane: {
+					MarkExactSubgroup();
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				}
 				case IR::ValueOpcode::Permlane16U32:
-				case IR::ValueOpcode::SwizzleU32:
-				case IR::ValueOpcode::DataAppend:
-				case IR::ValueOpcode::DataConsume:
 				case IR::ValueOpcode::GdsDataAppend:
-				case IR::ValueOpcode::GdsDataConsume: return true;
+				case IR::ValueOpcode::GdsDataConsume: {
+					MarkExactSubgroup();
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				}
+				case IR::ValueOpcode::SwizzleU32: {
+					MarkExactSubgroup();
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+					requirements.function_lds = program.stage != ShaderType::Compute;
+					break;
+				}
+				case IR::ValueOpcode::DataAppend:
+				case IR::ValueOpcode::DataConsume: {
+					MarkExactSubgroup();
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+					[[fallthrough]];
+				}
+				case IR::ValueOpcode::LoadSharedU8:
+				case IR::ValueOpcode::LoadSharedU16:
+				case IR::ValueOpcode::LoadSharedU32:
+				case IR::ValueOpcode::WriteSharedU8:
+				case IR::ValueOpcode::WriteSharedU16:
+				case IR::ValueOpcode::WriteSharedU32:
+				case IR::ValueOpcode::SharedAtomicFMin32:
+				case IR::ValueOpcode::SharedAtomicFMax32:
+				case IR::ValueOpcode::SharedAtomicSwap32:
+				case IR::ValueOpcode::SharedAtomicIAdd32:
+				case IR::ValueOpcode::SharedAtomicISub32:
+				case IR::ValueOpcode::SharedAtomicSMin32:
+				case IR::ValueOpcode::SharedAtomicUMin32:
+				case IR::ValueOpcode::SharedAtomicSMax32:
+				case IR::ValueOpcode::SharedAtomicUMax32:
+				case IR::ValueOpcode::SharedAtomicAnd32:
+				case IR::ValueOpcode::SharedAtomicOr32:
+				case IR::ValueOpcode::SharedAtomicXor32: {
+					const auto index = inst.Flags<IR::MemoryFlags>().index;
+					if (program.stage != ShaderType::Compute &&
+					    index < program.values->memory_info.size() &&
+					    program.values->memory_info[index].kind == IR::ResourceKind::Lds) {
+						requirements.function_lds = true;
+					}
+					break;
+				}
+				case IR::ValueOpcode::LaneId:
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
+				case IR::ValueOpcode::ImageGatherRaw:
+					requirements.image_gather_extended = true;
+					break;
+				case IR::ValueOpcode::SetAttribute: {
+					const auto index = inst.Flags<IR::ExportFlags>().index;
+					if (program.stage == ShaderType::Pixel &&
+					    index < program.values->export_info.size() &&
+					    program.values->export_info[index].vm) {
+						requirements.pixel_valid_mask = true;
+					}
+					break;
+				}
 				default: break;
 			}
 		}
 	}
-	return false;
+	return requirements;
 }
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
@@ -344,11 +414,12 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 		return false;
 	}
 	EmitterState state(program, resources, input_info);
+	const auto   requirements  = GetProgramRequirements(program);
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
 	state.exact_subgroup_operations =
-	    !state.per_invocation_masks && ProgramRequiresExactSubgroupSize(program);
+	    !state.per_invocation_masks && requirements.requires_exact_subgroup;
 	state.registers.reserve(InitialEmitterVectorReserve);
 	state.inputs.reserve(InitialEmitterVectorReserve);
 	state.outputs.reserve(InitialEmitterVectorReserve);
@@ -356,15 +427,13 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.reachable_blocks.reserve(InitialEmitterVectorReserve);
 	CollectValueRegisterMirrors(value_program, state.registers);
 	CopyProgramInputsAndOutputs(state, program);
-	state.needs_subgroup_ballot  = ProgramNeedsSubgroupBallot(program) ||
-	                               (!state.per_invocation_masks &&
-	                                ValueProgramHasOpcode(value_program, IR::ValueOpcode::Ballot));
-	state.needs_subgroup_shuffle = ProgramNeedsSubgroupShuffle(program);
-	state.needs_subgroup_local_invocation_id = ProgramNeedsSubgroupLocalInvocationId(program);
-	state.needs_compute_derivatives          = ProgramNeedsComputeDerivatives(program);
-	state.needs_image_gather_extended        = ProgramNeedsImageGatherExtended(program);
-	state.needs_function_lds                 = ProgramNeedsFunctionLds(program);
-	state.needs_pixel_valid_mask             = ProgramNeedsPixelValidMask(program);
+	state.needs_subgroup_ballot              = requirements.subgroup_ballot;
+	state.needs_subgroup_shuffle             = requirements.subgroup_shuffle;
+	state.needs_subgroup_local_invocation_id = requirements.subgroup_local_invocation_id;
+	state.needs_compute_derivatives          = requirements.compute_derivatives;
+	state.needs_image_gather_extended        = requirements.image_gather_extended;
+	state.needs_function_lds                 = requirements.function_lds;
+	state.needs_pixel_valid_mask             = requirements.pixel_valid_mask;
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
 	AllocateDescriptorVariables(state);

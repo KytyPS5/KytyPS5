@@ -631,20 +631,6 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
-bool ProgramNeedsComputeDerivatives(const IR::Program& program);
-
-bool ProgramNeedsImageGatherExtended(const IR::Program& program);
-
-bool ProgramNeedsFunctionLds(const IR::Program& program);
-
-bool ProgramNeedsPixelValidMask(const IR::Program& program);
-
-bool ProgramNeedsSubgroupBallot(const IR::Program& program);
-
-bool ProgramNeedsSubgroupShuffle(const IR::Program& program);
-
-bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program);
-
 uint32_t PointerForRegister(const EmitterState& state, IR::Register reg);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);

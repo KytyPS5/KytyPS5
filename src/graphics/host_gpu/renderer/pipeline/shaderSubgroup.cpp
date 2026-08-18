@@ -51,7 +51,7 @@ ShaderSubgroupConfiguration ConfigureShaderSubgroup(const ShaderSubgroupCapabili
 	    guest_wave_size <= capabilities.max_subgroup_size) {
 		return {ShaderSubgroupMode::Controlled, guest_wave_size};
 	}
-	if (!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(program)) {
+	if (!ShaderRecompiler::Spirv::GetProgramRequirements(program).requires_exact_subgroup) {
 		return {ShaderSubgroupMode::FlattenedMasks, 0};
 	}
 	return {};

@@ -401,16 +401,13 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
                                                           uint64_t size) {
 	const auto begin = AlignDown(vaddr);
 	const auto end   = AlignUp(vaddr + size);
-	auto       it    = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		auto previous = std::prev(it);
-		if (previous->second->buffer->IsInBounds(vaddr, size)) {
-			it = previous;
+	const auto next  = m_buffers.upper_bound(vaddr);
+	if (next != m_buffers.begin()) {
+		auto owner = std::prev(next);
+		if (owner->second->buffer->IsInBounds(vaddr, size)) {
+			owner->second->tick_accessed_last = m_gc_tick;
+			return *owner->second;
 		}
-	}
-	if (it != m_buffers.end() && it->second->buffer->IsInBounds(vaddr, size)) {
-		it->second->tick_accessed_last = m_gc_tick;
-		return *it->second;
 	}
 
 	CacheRange merged {.address = begin, .size = end - begin};

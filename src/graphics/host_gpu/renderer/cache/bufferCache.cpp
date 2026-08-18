@@ -431,21 +431,6 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
 			overlaps.push_back(candidate);
 		}
 	}
-	for (const auto overlap: overlaps) {
-		auto&                                      old = *overlap->second;
-		std::vector<std::pair<uint64_t, uint64_t>> uploads;
-		m_memory_tracker.ForEachUploadRange(
-		    old.vaddr, old.size, false,
-		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    uploads.emplace_back(address, bytes);
-		    },
-		    [&]() noexcept {
-			    for (const auto& [address, bytes]: uploads) {
-				    Upload(command, *old.buffer, old.buffer->Offset(address),
-				           reinterpret_cast<const void*>(address), bytes);
-			    }
-		    });
-	}
 
 	auto cached                = std::make_unique<CachedBuffer>();
 	cached->vaddr              = merged.address;

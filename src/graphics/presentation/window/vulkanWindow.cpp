@@ -554,6 +554,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
 	features12.timelineSemaphore = VK_TRUE;
 
+	if (Config::GpuAssistedValidationEnabled()) {
+		if (supported_features12.bufferDeviceAddress != VK_TRUE) {
+			EXIT("--gpu-assisted-validation requires bufferDeviceAddress, unsupported by this "
+			     "device\n");
+		}
+		features12.bufferDeviceAddress = VK_TRUE;
+	}
+
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
@@ -571,6 +579,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.vertexPipelineStoresAndAtomics =
 	    supported_features2.features.vertexPipelineStoresAndAtomics;
+	if (Config::GpuAssistedValidationEnabled()) {
+		device_features.shaderInt64 = supported_features2.features.shaderInt64;
+	}
 
 	if (graphics.subgroup_size_control_enabled &&
 	    supported_features13.subgroupSizeControl == VK_TRUE) {
@@ -833,23 +844,26 @@ void WindowContext::CreateVulkan() {
 	app_info.engineVersion      = 1;
 	app_info.apiVersion         = VULKAN_TARGET_API_VERSION; // NOLINT
 
-	vk::ValidationFeatureEnableEXT enabled_features[] = {
+	if (Config::SpirvDebugPrintfEnabled() && Config::GpuAssistedValidationEnabled()) {
+		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
+	}
+
+	vk::ValidationFeatureEnableEXT enabled_features[3] = {};
+	uint32_t                       enabled_features_count = 0;
 #ifdef KYTY_ENABLE_BEST_PRACTICES
-	    vk::ValidationFeatureEnableEXT::eBestPractices,
+	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
 #endif
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
-	    vk::ValidationFeatureEnableEXT::eDebugPrintf,
-#endif
-	};
-
-	uint32_t enabled_features_count =
-	    sizeof(enabled_features) / sizeof(vk::ValidationFeatureEnableEXT);
-
-#ifdef KYTY_ENABLE_DEBUG_PRINTF
-	if (!Config::SpirvDebugPrintfEnabled()) {
-		enabled_features_count--;
+	if (Config::SpirvDebugPrintfEnabled()) {
+		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eDebugPrintf;
 	}
 #endif
+	if (Config::GpuAssistedValidationEnabled()) {
+		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eGpuAssisted;
+		LOGF("Vulkan GPU-assisted validation is enabled; expect a large slowdown\n");
+		std::printf("Vulkan GPU-assisted validation is enabled; expect a large slowdown\n");
+		std::fflush(stdout);
+	}
 
 	vk::ValidationFeaturesEXT validation_features {};
 	validation_features.sType                          = vk::StructureType::eValidationFeaturesEXT;

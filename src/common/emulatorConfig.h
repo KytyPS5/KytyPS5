@@ -49,6 +49,7 @@ struct ConfigOptions {
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   spirv_debug_printf_enabled  = false;
+	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
@@ -83,6 +84,8 @@ std::filesystem::path GetPrintfOutputFile();
 ProfilerDirection GetProfilerDirection();
 
 bool SpirvDebugPrintfEnabled();
+
+bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();

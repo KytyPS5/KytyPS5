@@ -576,6 +576,7 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
+		audio_out2_port_tests
 	)
 endif()
 

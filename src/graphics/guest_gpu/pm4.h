@@ -984,8 +984,16 @@ constexpr uint32_t COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT  = 26;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FP16_OVFL_MASK   = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT   = 29;
 constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_MASK    = 0x1;
-constexpr uint32_t COMPUTE_PGM_RSRC1_W32_EN_SHIFT     = 30;
-constexpr uint32_t COMPUTE_PGM_RSRC1_W32_EN_MASK      = 0x1;
+
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;
+
+[[nodiscard]] constexpr uint8_t ComputeWaveSize(uint32_t dispatch_initiator) {
+	return ((dispatch_initiator >> COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
+	        COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) != 0u
+	           ? 32u
+	           : 64u;
+}
 
 constexpr uint32_t COMPUTE_PGM_RSRC2                      = 0x213;
 constexpr uint32_t COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT     = 0;

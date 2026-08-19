@@ -1108,6 +1108,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
 	// uint32_t local_y   = 1;

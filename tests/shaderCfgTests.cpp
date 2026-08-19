@@ -8137,23 +8137,11 @@ void TestNewShaderRecompilerU64PairLowering() {
         "dispatcher did not use one canonical U64 vector spill slot");
 }
 
-void TestComputeShaderInputWaveSize() {
-  const auto decode_wave_size = [](uint32_t rsrc1) {
-    const bool wave32 = (((rsrc1 >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-                          Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u);
-    return wave32 ? 32u : 64u;
-  };
-
-  constexpr uint32_t observed_wave32_rsrc1_a = 0x402c0146u;
-  constexpr uint32_t observed_wave32_rsrc1_b = 0x402c00c1u;
-  Check(decode_wave_size(observed_wave32_rsrc1_a) == 32u,
-        "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value A");
-  Check(decode_wave_size(observed_wave32_rsrc1_b) == 32u,
-        "COMPUTE_PGM_RSRC1 W32_EN bit did not match observed PS5 value B");
-
-  constexpr uint32_t w32_en_bit = 1u << Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT;
-  Check(decode_wave_size(observed_wave32_rsrc1_a & ~w32_en_bit) == 64u,
-        "cleared COMPUTE_PGM_RSRC1 W32_EN bit did not decode as wave64");
+void TestComputeDispatchWaveSize() {
+  Check(Pm4::ComputeWaveSize(0x00000041u) == 64u,
+        "dispatch without CS_W32_EN did not select wave64");
+  Check(Pm4::ComputeWaveSize(0x00008041u) == 32u,
+        "dispatch with CS_W32_EN did not select wave32");
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
@@ -11581,7 +11569,7 @@ int main() {
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerU64PairLowering();
-  TestComputeShaderInputWaveSize();
+  TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestNewShaderRecompilerPixelImageSampleLodSelection();

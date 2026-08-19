@@ -115,7 +115,7 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
 	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
 	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 32 && !input.tg_size_en && mode == 0x61u &&
+	    input.thread_ids_num == 1 && input.wave_size == 64 && !input.tg_size_en && mode == 0x61u &&
 	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
 	const auto size = BufferDescriptorSize(descriptor);
 	if (!full_dispatch || size == 0) {

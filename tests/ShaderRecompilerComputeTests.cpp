@@ -18780,14 +18780,14 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   compute.dispatch_threads_num[2] = 1;
   compute.group_id[0] = true;
   compute.dispatch_thread_dimensions = true;
-  compute.wave_size = 32;
+  compute.wave_size = 64;
   compute.thread_ids_num = 1;
   compute.workgroup_register = 8;
 
   const auto Compile = [&](const char *stage, const std::vector<u32> &code) {
     ShaderRecompiler::CompileOptions options;
     options.stage = ShaderType::Compute;
-    options.wave_size = 32;
+    options.wave_size = 64;
     options.user_data_base = 0;
     options.user_data_count = static_cast<u32>(user_data.size());
     options.user_data = user_data.data();

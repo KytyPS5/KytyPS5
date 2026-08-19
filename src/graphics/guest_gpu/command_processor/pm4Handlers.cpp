@@ -1360,10 +1360,6 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                         Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK) != 0u;
 			cs_regs.threadgroup_configuration = ((value >> Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT) &
 			                                     Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_MASK) != 0u;
-			cs_regs.wave_size                 = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-			                                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u)
-			                                        ? 32u
-			                                        : 64u;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
 			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &

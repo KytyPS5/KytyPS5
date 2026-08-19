@@ -1089,6 +1089,7 @@ public:
 	void SetPsShaderChksum(uint32_t value) { m_ps.ps_regs.chksum = value; }
 
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
+	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }
 
 	void SetPsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
 		m_ps.ps_user_sgpr.value[id] = value;

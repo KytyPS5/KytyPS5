@@ -25,68 +25,63 @@ uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition, uint32_t
 }
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
-	if (lhs == 0) return rhs;
-	if (rhs == 0) return lhs;
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                            uint32_t index, uint32_t offset, uint32_t soffset) {
-	auto&      state = ctx.state;
-	const auto packed =
-	    ConstantU32(state, StorageBufferPackedStride(state, mem, inst.Flags<IR::MemoryFlags>().pc));
-	if (mem.formatted && !mem.typed && inst.GetOpcode() == IR::ValueOpcode::StoreBufferU32) {
-		const auto add_tid_bit = Binary(
-		    state, OpBitwiseAnd, TypeU32(state),
-		    Binary(state, OpShiftRightLogical, TypeU32(state), packed, ConstantU32(state, 20)),
-		    ConstantU32(state, 1));
-		const auto add_tid =
-		    Binary(state, OpINotEqual, TypeBool(state), add_tid_bit, ConstantU32(state, 0));
+	auto&          state   = ctx.state;
+	const uint32_t packed  = StorageBufferPackedStride(state, mem);
+	const uint32_t stride  = packed & 0x3fffu;
+	const bool     swizzle = stride != 0u && ((packed >> 14u) & 1u) != 0u;
+	if (((packed >> 20u) & 1u) != 0u) {
 		const auto lane = Binary(state, OpBitwiseAnd, TypeU32(state),
-		                         EmitLocalInvocationIndex(state), ConstantU32(state, 63));
-		index           = Select(state, TypeU32(state), add_tid,
-		                         Binary(state, OpIAdd, TypeU32(state), index, lane), index);
+		                         EmitSubgroupLocalInvocationId(state), ConstantU32(state, 63));
+		index           = Binary(state, OpIAdd, TypeU32(state), index, lane);
 	}
-	const auto stride =
-	    Binary(state, OpBitwiseAnd, TypeU32(state), packed, ConstantU32(state, 0x3fffu));
-	const auto swizzle =
-	    Binary(state, OpBitwiseAnd, TypeU32(state),
-	           Binary(state, OpShiftRightLogical, TypeU32(state), packed, ConstantU32(state, 14)),
-	           ConstantU32(state, 1));
-	const auto use_swizzle =
-	    Binary(state, OpLogicalAnd, TypeBool(state),
-	           Binary(state, OpINotEqual, TypeBool(state), stride, ConstantU32(state, 0)),
-	           Binary(state, OpINotEqual, TypeBool(state), swizzle, ConstantU32(state, 0)));
-	const auto stride_enum =
-	    Binary(state, OpBitwiseAnd, TypeU32(state),
-	           Binary(state, OpShiftRightLogical, TypeU32(state), packed, ConstantU32(state, 16)),
-	           ConstantU32(state, 3));
-	const auto index_shift =
-	    Binary(state, OpIAdd, TypeU32(state), stride_enum, ConstantU32(state, 3));
-	const auto index_stride =
-	    Binary(state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 8), stride_enum);
-	const auto index_mask =
-	    Binary(state, OpISub, TypeU32(state), index_stride, ConstantU32(state, 1));
-	offset = Binary(state, OpIAdd, TypeU32(state), offset, ConstantU32(state, mem.offset));
-	const auto linear    = Binary(state, OpIAdd, TypeU32(state),
-	                              Binary(state, OpIMul, TypeU32(state), index, stride), offset);
-	const auto index_msb = Binary(state, OpShiftRightLogical, TypeU32(state), index, index_shift);
-	const auto index_lsb = Binary(state, OpBitwiseAnd, TypeU32(state), index, index_mask);
-	const auto offset_msb =
-	    Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u));
-	const auto offset_lsb =
-	    Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, 3));
-	const auto msb =
-	    Binary(state, OpIMul, TypeU32(state),
-	           Binary(state, OpIAdd, TypeU32(state),
-	                  Binary(state, OpIMul, TypeU32(state), index_msb, stride), offset_msb),
-	           index_stride);
-	const auto lsb =
-	    Binary(state, OpIAdd, TypeU32(state),
-	           Binary(state, OpShiftLeftLogical, TypeU32(state), index_lsb, ConstantU32(state, 2)),
-	           offset_lsb);
-	const auto address = Select(state, TypeU32(state), use_swizzle,
-	                            Binary(state, OpIAdd, TypeU32(state), msb, lsb), linear);
+	if (mem.offset != 0u) {
+		offset = Binary(state, OpIAdd, TypeU32(state), offset, ConstantU32(state, mem.offset));
+	}
+
+	uint32_t address = 0;
+	if (!swizzle) {
+		if (stride == 0u) {
+			address = offset;
+		} else {
+			const auto indexed = stride == 1u ? index
+			                                  : Binary(state, OpIMul, TypeU32(state), index,
+			                                           ConstantU32(state, stride));
+			address            = Binary(state, OpIAdd, TypeU32(state), indexed, offset);
+		}
+	} else {
+		const uint32_t stride_enum  = (packed >> 16u) & 3u;
+		const uint32_t index_stride = 8u << stride_enum;
+		const auto     index_msb    = Binary(state, OpShiftRightLogical, TypeU32(state), index,
+		                                     ConstantU32(state, stride_enum + 3u));
+		const auto     index_lsb    = Binary(state, OpBitwiseAnd, TypeU32(state), index,
+		                                     ConstantU32(state, index_stride - 1u));
+		const auto     offset_msb =
+		    Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u));
+		const auto offset_lsb =
+		    Binary(state, OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, 3u));
+		const auto indexed_msb = stride == 1u ? index_msb
+		                                      : Binary(state, OpIMul, TypeU32(state), index_msb,
+		                                               ConstantU32(state, stride));
+		const auto msb = Binary(state, OpIMul, TypeU32(state),
+		                        Binary(state, OpIAdd, TypeU32(state), indexed_msb, offset_msb),
+		                        ConstantU32(state, index_stride));
+		const auto lsb = Binary(
+		    state, OpIAdd, TypeU32(state),
+		    Binary(state, OpShiftLeftLogical, TypeU32(state), index_lsb, ConstantU32(state, 2u)),
+		    offset_lsb);
+		address = Binary(state, OpIAdd, TypeU32(state), msb, lsb);
+	}
+
+	const auto soffset_value = inst.Arg(3).Resolve();
+	if (soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
+	    soffset_value.U32() == 0u) {
+		return address;
+	}
 	return Binary(state, OpIAdd, TypeU32(state), address, soffset);
 }
 
@@ -156,68 +151,66 @@ uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	              ConstantU32(ctx.state, 2));
 }
 
-uint32_t InBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t index, uint32_t pc) {
-	if (mem.kind == IR::ResourceKind::Lds) {
-		return EmitLdsElementInBounds(ctx.state, index);
-	}
-	if (mem.kind == IR::ResourceKind::Gds) {
-		return EmitGdsElementInBounds(ctx.state, index);
-	}
-	return EmitStorageBufferElementInBounds(ctx.state, mem, index, pc);
+struct PreparedMemoryElement {
+	MemoryResourceAccess resource;
+	uint32_t             index = 0;
+};
+
+PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                           uint32_t raw_index) {
+	auto       resource = PrepareMemoryResourceAccess(ctx.state, mem);
+	const auto index    = EmitMemoryElementIndex(ctx.state, resource, raw_index);
+	return {.resource = resource, .index = index};
 }
 
-uint32_t Pointer(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t index, uint32_t pc) {
-	return EmitMemoryElementPointer(ctx.state, mem, index, pc);
-}
-
-uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
-                  uint32_t extra_offset = 0) {
-	mem.offset += extra_offset;
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
+uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto index = DwordIndex(ctx, inst, mem);
-		return EmitValueOrZeroIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			const auto value = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(
-			    {OpLoad, TypeU32(ctx.state), value, Pointer(ctx, mem, index, pc)});
-			return value;
-		});
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto value = ctx.state.builder.AllocateId();
+			    ctx.state.builder.AddFunction(
+			        {OpLoad, TypeU32(ctx.state), value,
+			         EmitMemoryElementPointer(ctx.state, access.resource, access.index)});
+			    return value;
+		    });
 	});
 }
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
-                     bool sign_extend, uint32_t extra_offset = 0) {
-	mem.offset += extra_offset;
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
+                     bool sign_extend) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto address = ByteAddress(ctx, inst, mem);
-		const auto index   = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
-		                            ConstantU32(ctx.state, 2));
-		return EmitValueOrZeroIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			const auto word = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(
-			    {OpLoad, TypeU32(ctx.state), word, Pointer(ctx, mem, index, pc)});
-			const auto byte  = Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address,
-			                          ConstantU32(ctx.state, 3));
-			const auto shift = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), byte,
-			                          ConstantU32(ctx.state, 3));
-			const auto value =
-			    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
-			           Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), word, shift),
-			           ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu));
-			if (!sign_extend) return value;
-			const auto left = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), value,
-			                         ConstantU32(ctx.state, 32u - bits));
-			return Binary(ctx.state, OpShiftRightArithmetic, TypeU32(ctx.state), left,
-			              ConstantU32(ctx.state, 32u - bits));
-		});
+		const auto address   = ByteAddress(ctx, inst, mem);
+		const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
+		                              ConstantU32(ctx.state, 2));
+		const auto access    = PrepareMemoryElement(ctx, mem, raw_index);
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto word = ctx.state.builder.AllocateId();
+			    ctx.state.builder.AddFunction(
+			        {OpLoad, TypeU32(ctx.state), word,
+			         EmitMemoryElementPointer(ctx.state, access.resource, access.index)});
+			    const auto byte  = Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address,
+			                              ConstantU32(ctx.state, 3));
+			    const auto shift = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), byte,
+			                              ConstantU32(ctx.state, 3));
+			    const auto value =
+			        Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
+			               Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), word, shift),
+			               ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu));
+			    if (!sign_extend) return value;
+			    const auto left = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), value,
+			                             ConstantU32(ctx.state, 32u - bits));
+			    return Binary(ctx.state, OpShiftRightArithmetic, TypeU32(ctx.state), left,
+			                  ConstantU32(ctx.state, 32u - bits));
+		    });
 	});
 }
 
 Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::Inst& inst,
                                     const IR::MemoryInfo& mem) {
 	return mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
-	                 : StorageBufferFormat(ctx.state, mem, inst.Flags<IR::MemoryFlags>().pc);
+	                 : StorageBufferFormat(ctx.state, mem);
 }
 
 IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, Prospero::BufferFormat format,
@@ -311,54 +304,55 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	return observed;
 }
 
-void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
-                  uint32_t extra_offset = 0) {
-	mem.offset += extra_offset;
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
+void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto address = ByteAddress(ctx, inst, mem);
-		const auto index   = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
-		                            ConstantU32(ctx.state, 2));
-		EmitIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			const auto pointer = Pointer(ctx, mem, index, pc);
-			const auto shift   = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-			                            Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address,
-			                                   ConstantU32(ctx.state, 3)),
-			                            ConstantU32(ctx.state, 3));
-			const auto mask  = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-			                          ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu), shift);
-			const auto value = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-			                          Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
-			                                 ctx.Arg(inst, inst.NumArgs() - 2),
-			                                 ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
-			                          shift);
-			const auto merge = [&](uint32_t old) {
-				return Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
-				              Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), old,
-				                     Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
-				              value);
-			};
-			if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-				AtomicUpdate(ctx.state, pointer, mem.kind, merge);
-			} else {
-				const auto old = ctx.state.builder.AllocateId();
-				ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
-				ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
-			}
-		});
+		const auto address   = ByteAddress(ctx, inst, mem);
+		const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
+		                              ConstantU32(ctx.state, 2));
+		const auto access    = PrepareMemoryElement(ctx, mem, raw_index);
+		EmitIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto pointer =
+			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
+			    const auto shift = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+			                              Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
+			                                     address, ConstantU32(ctx.state, 3)),
+			                              ConstantU32(ctx.state, 3));
+			    const auto mask =
+			        Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+			               ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu), shift);
+			    const auto value =
+			        Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+			               Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
+			                      ctx.Arg(inst, inst.NumArgs() - 2),
+			                      ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
+			               shift);
+			    const auto merge = [&](uint32_t old) {
+				    return Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+				                  Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), old,
+				                         Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
+				                  value);
+			    };
+			    if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
+				    AtomicUpdate(ctx.state, pointer, mem.kind, merge);
+			    } else {
+				    const auto old = ctx.state.builder.AllocateId();
+				    ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
+				    ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
+			    }
+		    });
 	});
 }
 
-void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
-               uint32_t extra_offset = 0) {
-	mem.offset += extra_offset;
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
+void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto index = DwordIndex(ctx, inst, mem);
-		EmitIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			ctx.state.builder.AddFunction(
-			    {OpStore, Pointer(ctx, mem, index, pc), ctx.Arg(inst, inst.NumArgs() - 2)});
-		});
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		EmitIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    ctx.state.builder.AddFunction(
+			        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			         ctx.Arg(inst, inst.NumArgs() - 2)});
+		    });
 	});
 }
 
@@ -417,29 +411,32 @@ uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 
 uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                     bool return_value) {
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
 	const auto result =
 	    EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		    const auto index = DwordIndex(ctx, inst, mem);
-		    return EmitValueOrZeroIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			    const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-			    const auto old   = ctx.state.builder.AllocateId();
-			    const auto scope = mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
-			    ctx.state.builder.AddFunction({AtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state),
-			                                   old, Pointer(ctx, mem, index, pc),
-			                                   ConstantU32(ctx.state, scope),
-			                                   ConstantU32(ctx.state, MemorySemanticsNone), value});
-			    if (mem.kind == IR::ResourceKind::Lds) {
-				    const auto semantics =
-				        MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
-				    ctx.state.builder.AddFunction({OpMemoryBarrier,
-				                                   ConstantU32(ctx.state, ScopeWorkgroup),
-				                                   ConstantU32(ctx.state, semantics)});
-			    } else {
-				    EmitDeviceAtomicMemoryBarrier(ctx.state);
-			    }
-			    return old;
-		    });
+		    const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		    return EmitValueOrZeroIfCondition(
+		        ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
+		        [&]() {
+			        const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+			        const auto old   = ctx.state.builder.AllocateId();
+			        const auto scope =
+			            mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+			        ctx.state.builder.AddFunction(
+			            {AtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old,
+			             EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			             ConstantU32(ctx.state, scope), ConstantU32(ctx.state, MemorySemanticsNone),
+			             value});
+			        if (mem.kind == IR::ResourceKind::Lds) {
+				        const auto semantics =
+				            MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+				        ctx.state.builder.AddFunction({OpMemoryBarrier,
+				                                       ConstantU32(ctx.state, ScopeWorkgroup),
+				                                       ConstantU32(ctx.state, semantics)});
+			        } else {
+				        EmitDeviceAtomicMemoryBarrier(ctx.state);
+			        }
+			        return old;
+		        });
 	    });
 	return return_value ? result : ConstantU32(ctx.state, 0);
 }
@@ -479,41 +476,46 @@ uint32_t FloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t sour
 
 uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      bool max_value) {
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto index = DwordIndex(ctx, inst, mem);
-		return EmitValueOrZeroIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			const auto pointer = Pointer(ctx, mem, index, pc);
-			const auto source  = ctx.Arg(inst, inst.NumArgs() - 2);
-			return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
-				return FloatAtomicReplacement(ctx.state, old, source, max_value);
-			});
-		});
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto pointer =
+			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
+			    const auto source = ctx.Arg(inst, inst.NumArgs() - 2);
+			    return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
+				    return FloatAtomicReplacement(ctx.state, old, source, max_value);
+			    });
+		    });
 	});
 }
 
 uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                            bool max_value) {
-	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto index = DwordIndex(ctx, inst, mem);
-		EmitIfCondition(ctx.state, InBounds(ctx, mem, index, pc), [&]() {
-			ctx.state.builder.AddFunction({OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 2)});
-			const auto data = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(
-			    {OpLoad, TypeU32(ctx.state), data, ctx.scratch_u32_variable});
-			AtomicUpdate(ctx.state, Pointer(ctx, mem, index, pc), mem.kind, [&](uint32_t old) {
-				const auto old_f = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), old);
-				const auto compare_f =
-				    Unary(ctx.state, OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 3));
-				const auto data_f  = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), data);
-				const auto compare = Binary(
-				    ctx.state, max_value ? OpFOrdGreaterThan : OpFOrdLessThan, TypeBool(ctx.state),
-				    max_value ? old_f : compare_f, max_value ? compare_f : old_f);
-				return Unary(ctx.state, OpBitcast, TypeU32(ctx.state),
-				             Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
-			});
-		});
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		EmitIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    ctx.state.builder.AddFunction(
+			        {OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 2)});
+			    const auto data = ctx.state.builder.AllocateId();
+			    ctx.state.builder.AddFunction(
+			        {OpLoad, TypeU32(ctx.state), data, ctx.scratch_u32_variable});
+			    AtomicUpdate(
+			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			        mem.kind, [&](uint32_t old) {
+				        const auto old_f = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), old);
+				        const auto compare_f =
+				            Unary(ctx.state, OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 3));
+				        const auto data_f = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), data);
+				        const auto compare =
+				            Binary(ctx.state, max_value ? OpFOrdGreaterThan : OpFOrdLessThan,
+				                   TypeBool(ctx.state), max_value ? old_f : compare_f,
+				                   max_value ? compare_f : old_f);
+				        return Unary(ctx.state, OpBitcast, TypeU32(ctx.state),
+				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
+			        });
+		    });
 	});
 	return 0;
 }
@@ -526,8 +528,12 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	const auto size = Binary(state, OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
 	const auto address =
 	    Binary(state, OpIAdd, TypeU32(state), base, ConstantU32(state, ctx.Memory(inst).offset));
-	const auto index =
+	const auto raw_index =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	auto mem          = ctx.Memory(inst);
+	mem.kind          = gds ? IR::ResourceKind::Gds : IR::ResourceKind::Lds;
+	const auto access = PrepareMemoryResourceAccess(state, mem);
+	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 2);
 	const auto ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
@@ -546,8 +552,7 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	                           ConstantU32(state, ScopeSubgroup), ballot});
 	const auto is_first =
 	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), first);
-	const auto storage_bounds =
-	    gds ? EmitGdsElementInBounds(state, index) : EmitLdsElementInBounds(state, index);
+	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
 	const auto m0_bounds =
 	    gds ? Binary(state, OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
 	        : Binary(state, OpULessThan, TypeBool(state),
@@ -556,11 +561,10 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	    state, is_first, AndCondition(state, exec, AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {append ? OpAtomicIAdd : OpAtomicISub, TypeU32(state), value,
-		     gds ? EmitGdsElementPointer(state, index) : EmitLdsElementPointer(state, index),
-		     ConstantU32(state, gds ? ScopeDevice : ScopeWorkgroup),
-		     ConstantU32(state, MemorySemanticsNone), count});
+		state.builder.AddFunction({append ? OpAtomicIAdd : OpAtomicISub, TypeU32(state), value,
+		                           EmitMemoryElementPointer(state, access, index),
+		                           ConstantU32(state, gds ? ScopeDevice : ScopeWorkgroup),
+		                           ConstantU32(state, MemorySemanticsNone), count});
 		return value;
 	});
 	const auto result = state.builder.AllocateId();
@@ -597,13 +601,14 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
 		const auto index =
 		    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-		const auto pc        = inst.Flags<IR::MemoryFlags>().pc;
-		const auto condition = EmitStorageBufferElementInBounds(state, mem, index, pc);
+		const auto access    = PrepareMemoryResourceAccess(state, mem);
+		const auto element   = EmitMemoryElementIndex(state, access, index);
+		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 			           const auto value = state.builder.AllocateId();
 			           state.builder.AddFunction(
 			               {OpLoad, TypeU32(state), value,
-			                EmitStorageBufferElementPointer(state, mem, index, pc)});
+			                EmitMemoryElementPointer(state, access, element)});
 			           return value;
 		           }));
 		return true;

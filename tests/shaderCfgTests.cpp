@@ -982,7 +982,10 @@ void TestSpirvRequirementsAnalysis() {
       block->AppendNewInst(ValueOpcode::SetAttribute, {Value(0u), Value(true)});
   export_value.SetFlags(ExportFlags{.index = 0});
 
-  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+  std::string analysis_error;
+  Check(ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program,
+                                                            &analysis_error),
+        "initial SPIR-V requirements analysis failed");
   const auto requirements = *program.spirv_requirements;
   Check(requirements.requires_exact_subgroup && requirements.subgroup_ballot &&
             requirements.subgroup_shuffle &&
@@ -993,7 +996,9 @@ void TestSpirvRequirementsAnalysis() {
         "consolidated SPIR-V requirements missed an IR dependency");
 
   program.stage = ShaderType::Compute;
-  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+  Check(ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program,
+                                                            &analysis_error),
+        "compute SPIR-V requirements analysis failed");
   const auto compute_requirements = *program.spirv_requirements;
   Check(!compute_requirements.function_lds &&
             !compute_requirements.pixel_valid_mask,
@@ -1001,14 +1006,69 @@ void TestSpirvRequirementsAnalysis() {
 
   program.stage = ShaderType::Pixel;
   shared.SetFlags(MemoryFlags{.index = 1});
+  analysis_error.clear();
+  Check(!ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program,
+                                                             &analysis_error) &&
+            !program.spirv_requirements.has_value() &&
+            Common::ContainsStr(analysis_error, "invalid memory metadata"),
+        "invalid shared-memory requirement metadata was accepted");
+
+  shared.SetFlags(MemoryFlags{.index = 0});
   export_value.SetFlags(ExportFlags{.index = 1});
-  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
-  const auto invalid_metadata = *program.spirv_requirements;
-  Check(!invalid_metadata.function_lds && !invalid_metadata.pixel_valid_mask,
-        "invalid SPIR-V requirement metadata was accepted");
+  analysis_error.clear();
+  Check(!ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program,
+                                                             &analysis_error) &&
+            !program.spirv_requirements.has_value() &&
+            Common::ContainsStr(analysis_error, "invalid metadata"),
+        "invalid export requirement metadata was accepted");
+
+  Program add_tid;
+  add_tid.stage = ShaderType::Compute;
+  add_tid.info.buffers.resize(1);
+  add_tid.info.buffers[0].packed_stride = 1u << 20u;
+  add_tid.values = std::make_shared<ValueProgram>();
+  add_tid.values->block_storage.push_back(std::make_unique<Block>());
+  auto *add_tid_block = add_tid.values->block_storage.back().get();
+  add_tid.values->blocks.push_back(add_tid_block);
+  add_tid.values->memory_info.push_back(
+      {.kind = ResourceKind::Buffer, .resource = 0});
+  auto &buffer = add_tid_block->AppendNewInst(
+      ValueOpcode::GetBufferResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &load = add_tid_block->AppendNewInst(
+      ValueOpcode::LoadBufferU32,
+      {Value(&buffer), Value(0u), Value(0u), Value(0u), Value(true)});
+  load.SetFlags(MemoryFlags{.index = 0});
+  Check(ShaderRecompiler::Spirv::AnalyzeProgramRequirements(add_tid,
+                                                            &analysis_error),
+        "ADD_TID SPIR-V requirements analysis failed");
+  const auto add_tid_requirements = *add_tid.spirv_requirements;
+  Check(add_tid_requirements.requires_exact_subgroup &&
+            add_tid_requirements.subgroup_local_invocation_id &&
+            !add_tid_requirements.subgroup_ballot &&
+            !add_tid_requirements.subgroup_shuffle,
+        "buffer ADD_TID requested the wrong subgroup contract");
+
+  add_tid.values->memory_info[0].resource = 1;
+  analysis_error.clear();
+  Check(!ShaderRecompiler::Spirv::AnalyzeProgramRequirements(add_tid,
+                                                             &analysis_error) &&
+            !add_tid.spirv_requirements.has_value() &&
+            Common::ContainsStr(analysis_error, "invalid resource metadata"),
+        "invalid buffer requirement metadata was accepted");
+  add_tid.values->memory_info[0].resource = 0;
+
+  add_tid.stage = ShaderType::Vertex;
+  analysis_error.clear();
+  Check(!ShaderRecompiler::Spirv::AnalyzeProgramRequirements(add_tid,
+                                                             &analysis_error) &&
+            Common::ContainsStr(analysis_error, "only valid for compute"),
+        "graphics buffer ADD_TID was accepted without an exact guest lane ID");
 
   Program empty;
-  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(empty);
+  Check(ShaderRecompiler::Spirv::AnalyzeProgramRequirements(empty,
+                                                            &analysis_error),
+        "empty SPIR-V requirements analysis failed");
   const auto empty_requirements = *empty.spirv_requirements;
   Check(!empty_requirements.requires_exact_subgroup &&
             !empty_requirements.subgroup_ballot &&
@@ -1036,10 +1096,15 @@ void TestNativeSubgroupPolicy() {
       block->AppendNewInst(opcode, {Value(true)});
     } else if (opcode == ValueOpcode::DataAppend) {
       auto &resource = block->AppendNewInst(ValueOpcode::GetLdsResource);
-      block->AppendNewInst(opcode, {Value(&resource), Value(0u), Value(true),
-                                    Value(1u), Value(0u)});
+      program.values->memory_info.push_back({.kind = ResourceKind::Lds});
+      auto &append =
+          block->AppendNewInst(opcode, {Value(&resource), Value(0u),
+                                        Value(true), Value(1u), Value(0u)});
+      append.SetFlags(MemoryFlags{.index = 0});
     }
-    ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+    std::string error;
+    Check(ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program, &error),
+          "native subgroup requirements analysis failed");
   };
 
   GraphicContext context;
@@ -10112,8 +10177,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 1988,
-                                    .instructions = 466,
+                                   {.words = 915,
+                                    .instructions = 254,
                                     .runtime_arrays = 1,
                                     .variables = 2,
                                     .loads = 9,

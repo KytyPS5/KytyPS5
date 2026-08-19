@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-void AnalyzeProgramRequirements(IR::Program& program);
+bool AnalyzeProgramRequirements(IR::Program& program, std::string* error);
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
                  ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv, std::string* error);

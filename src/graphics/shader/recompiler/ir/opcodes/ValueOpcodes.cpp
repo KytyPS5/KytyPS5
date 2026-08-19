@@ -71,15 +71,16 @@ std::string_view ValueOpcodeName(ValueOpcode opcode) {
 }
 
 bool HasSideEffects(ValueOpcode opcode) {
+	const auto buffer_access = BufferAccessOf(opcode);
+	if (buffer_access == BufferAccess::Write || buffer_access == BufferAccess::Atomic) {
+		return true;
+	}
 	switch (opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::StoreAddressU8:
 		case ValueOpcode::StoreAddressU16:
 		case ValueOpcode::StoreAddressU32:
-		case ValueOpcode::StoreBufferU8:
-		case ValueOpcode::StoreBufferU16:
-		case ValueOpcode::StoreBufferU32:
 		case ValueOpcode::WriteSharedU8:
 		case ValueOpcode::WriteSharedU16:
 		case ValueOpcode::WriteSharedU32:
@@ -110,18 +111,6 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::GdsAtomicAnd32:
 		case ValueOpcode::GdsAtomicOr32:
 		case ValueOpcode::GdsAtomicXor32:
-		case ValueOpcode::BufferAtomicSwap32:
-		case ValueOpcode::BufferAtomicIAdd32:
-		case ValueOpcode::BufferAtomicISub32:
-		case ValueOpcode::BufferAtomicSMin32:
-		case ValueOpcode::BufferAtomicUMin32:
-		case ValueOpcode::BufferAtomicSMax32:
-		case ValueOpcode::BufferAtomicUMax32:
-		case ValueOpcode::BufferAtomicAnd32:
-		case ValueOpcode::BufferAtomicOr32:
-		case ValueOpcode::BufferAtomicXor32:
-		case ValueOpcode::BufferAtomicFMin32:
-		case ValueOpcode::BufferAtomicFMax32:
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:
@@ -136,6 +125,31 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
+	}
+}
+
+BufferAccess BufferAccessOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::ReadConstBuffer:
+		case ValueOpcode::LoadBufferU8:
+		case ValueOpcode::LoadBufferU16:
+		case ValueOpcode::LoadBufferU32: return BufferAccess::Read;
+		case ValueOpcode::StoreBufferU8:
+		case ValueOpcode::StoreBufferU16:
+		case ValueOpcode::StoreBufferU32: return BufferAccess::Write;
+		case ValueOpcode::BufferAtomicSwap32:
+		case ValueOpcode::BufferAtomicIAdd32:
+		case ValueOpcode::BufferAtomicISub32:
+		case ValueOpcode::BufferAtomicSMin32:
+		case ValueOpcode::BufferAtomicUMin32:
+		case ValueOpcode::BufferAtomicSMax32:
+		case ValueOpcode::BufferAtomicUMax32:
+		case ValueOpcode::BufferAtomicAnd32:
+		case ValueOpcode::BufferAtomicOr32:
+		case ValueOpcode::BufferAtomicXor32:
+		case ValueOpcode::BufferAtomicFMin32:
+		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
+		default: return BufferAccess::None;
 	}
 }
 

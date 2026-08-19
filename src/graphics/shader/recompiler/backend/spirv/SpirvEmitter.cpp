@@ -6,8 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cinttypes>
-#include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -219,23 +217,12 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 
 } // namespace
 
-static constexpr size_t InitialEmitterVectorReserve = 4096;
-
-static void ReportReserveExceeded(const IR::Program& program, const char* vector_name,
-                                  size_t size) {
-	if (size <= InitialEmitterVectorReserve) {
-		return;
-	}
-	std::printf("SPIR-V emitter reserve exceeded: hash=0x%016" PRIx64
-	            " stage=%u vector=%s size=%zu reserve=%zu\n",
-	            program.shader_hash, static_cast<unsigned>(program.stage), vector_name, size,
-	            InitialEmitterVectorReserve);
-}
-
-void AnalyzeProgramRequirements(IR::Program& program) {
-	auto& requirements = program.spirv_requirements.emplace();
+bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
+	program.spirv_requirements.reset();
+	IR::SpirvRequirements requirements {};
 	if (program.values == nullptr) {
-		return;
+		program.spirv_requirements.emplace(requirements);
+		return true;
 	}
 	const auto MarkExactSubgroup = [&] {
 		requirements.requires_exact_subgroup = true;
@@ -243,6 +230,25 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 	};
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
+				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+				if (memory_index >= program.values->memory_info.size()) {
+					return Fail(error, "buffer operation has invalid memory metadata");
+				}
+				const auto& memory = program.values->memory_info[memory_index];
+				if (memory.kind == IR::ResourceKind::Buffer) {
+					if (memory.resource >= program.info.buffers.size()) {
+						return Fail(error, "buffer operation has invalid resource metadata");
+					}
+					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+						if (program.stage != ShaderType::Compute) {
+							return Fail(error, "buffer ADD_TID is only valid for compute shaders");
+						}
+						requirements.requires_exact_subgroup      = true;
+						requirements.subgroup_local_invocation_id = true;
+					}
+				}
+			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: MarkExactSubgroup(); break;
 				case IR::ValueOpcode::DppMoveU32:
@@ -302,8 +308,10 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				case IR::ValueOpcode::SharedAtomicOr32:
 				case IR::ValueOpcode::SharedAtomicXor32: {
 					const auto index = inst.Flags<IR::MemoryFlags>().index;
+					if (index >= program.values->memory_info.size()) {
+						return Fail(error, "shared operation has invalid memory metadata");
+					}
 					if (program.stage != ShaderType::Compute &&
-					    index < program.values->memory_info.size() &&
 					    program.values->memory_info[index].kind == IR::ResourceKind::Lds) {
 						requirements.function_lds = true;
 					}
@@ -318,8 +326,10 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					break;
 				case IR::ValueOpcode::SetAttribute: {
 					const auto index = inst.Flags<IR::ExportFlags>().index;
+					if (index >= program.values->export_info.size()) {
+						return Fail(error, "attribute export has invalid metadata");
+					}
 					if (program.stage == ShaderType::Pixel &&
-					    index < program.values->export_info.size() &&
 					    program.values->export_info[index].vm) {
 						requirements.pixel_valid_mask = true;
 					}
@@ -329,6 +339,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 			}
 		}
 	}
+	program.spirv_requirements.emplace(requirements);
+	return true;
 }
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
@@ -368,9 +380,9 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
-	state.inputs.reserve(InitialEmitterVectorReserve);
-	state.outputs.reserve(InitialEmitterVectorReserve);
-	state.interface_variables.reserve(InitialEmitterVectorReserve);
+	state.inputs.reserve(program.info.inputs.size());
+	state.outputs.reserve(program.info.outputs.size());
+	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
 	CopyProgramInputsAndOutputs(state, program);
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
@@ -378,10 +390,6 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	if (!EmitValueProgram(state, value_program, error)) {
 		return false;
 	}
-
-	ReportReserveExceeded(program, "inputs", state.inputs.size());
-	ReportReserveExceeded(program, "outputs", state.outputs.size());
-	ReportReserveExceeded(program, "interface_variables", state.interface_variables.size());
 
 	auto binary = state.builder.Build();
 	if (binary.empty()) {

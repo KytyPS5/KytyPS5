@@ -672,38 +672,32 @@ uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint3
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
-uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc);
+uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
-Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
-                                           uint32_t use_pc);
+Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 void EmitStorageBufferOffsets(EmitterState& state);
 
-DescriptorResourceBinding StorageBufferBindingForMemory(EmitterState&         state,
-                                                        const IR::MemoryInfo& mem, uint32_t use_pc);
-
-uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                        uint32_t use_pc);
-
-uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
-                                          uint32_t index, uint32_t use_pc);
-
-uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                         uint32_t index, uint32_t use_pc);
-
-uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index);
-
 uint32_t LdsDwordCount(const EmitterState& state);
 
-uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index);
+struct MemoryResourceAccess {
+	IR::ResourceKind kind             = IR::ResourceKind::None;
+	uint32_t         object_pointer   = 0;
+	uint32_t         length           = 0;
+	uint32_t         index_offset     = 0;
+	bool             add_index_offset = false;
+};
 
-uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index);
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
 
-uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index);
+uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t raw_index);
 
-uint32_t EmitMemoryElementPointer(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
-                                  uint32_t use_pc);
+uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                   uint32_t index);
+
+uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                  uint32_t index);
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value);
 
@@ -807,11 +801,6 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
-	if (condition == 0) {
-		fn();
-		return;
-	}
-
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
@@ -825,10 +814,6 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
-	if (condition == 0) {
-		return fn();
-	}
-
 	const auto then_label  = state.builder.AllocateId();
 	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();

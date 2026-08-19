@@ -36,9 +36,7 @@ uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint3
 	return ret;
 }
 
-uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc) {
-	(void)use_pc;
+uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer specialization is missing");
@@ -46,9 +44,7 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 	return state.program.info.buffers[mem.resource].packed_stride;
 }
 
-Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
-                                           uint32_t use_pc) {
-	(void)use_pc;
+Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer specialization is missing");
@@ -67,92 +63,6 @@ void EmitStorageBufferOffsets(EmitterState& state) {
 	}
 }
 
-bool IsAddressMemoryKind(IR::ResourceKind kind) {
-	return kind == IR::ResourceKind::ScalarAddress || kind == IR::ResourceKind::Flat ||
-	       kind == IR::ResourceKind::Global || kind == IR::ResourceKind::Scratch;
-}
-
-DescriptorResourceBinding
-StorageBufferBindingForMemory(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc) {
-	(void)use_pc;
-	const auto binding =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	if (state.storage_buffer_variable == 0) {
-		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
-		                             "storage buffer descriptor array was not emitted");
-	}
-	return binding;
-}
-
-uint32_t EmitStorageBufferIndex(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
-                                uint32_t use_pc) {
-	if (IsAddressMemoryKind(mem.kind)) {
-		return index;
-	}
-	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
-	return EmitAddU32(state, index, state.storage_buffer_offsets[binding.array_index]);
-}
-
-uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                        uint32_t use_pc) {
-	if (IsAddressMemoryKind(mem.kind)) {
-		if (state.address_memory_variable == 0) {
-			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
-			                             mem.resource, "address memory binding was not emitted");
-		}
-		const auto binding =
-		    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state), pointer,
-		                           state.address_memory_variable,
-		                           ConstantU32(state, binding.array_index)});
-		return pointer;
-	}
-	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state), pointer,
-	                           state.storage_buffer_variable,
-	                           ConstantU32(state, binding.array_index)});
-	return pointer;
-}
-
-uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
-                                          uint32_t index, uint32_t use_pc) {
-	index                = EmitStorageBufferIndex(state, mem, index, use_pc);
-	const auto object    = EmitStorageBufferObjectPointer(state, mem, use_pc);
-	const auto length    = state.builder.AllocateId();
-	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction({OpArrayLength, TypeU32(state), length, object, 0});
-	state.builder.AddFunction({OpULessThan, TypeBool(state), in_bounds, index, length});
-	return in_bounds;
-}
-
-uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                         uint32_t index, uint32_t use_pc) {
-	index = EmitStorageBufferIndex(state, mem, index, use_pc);
-	if (IsAddressMemoryKind(mem.kind)) {
-		if (state.address_memory_variable == 0) {
-			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
-			                             mem.resource, "address memory binding was not emitted");
-		}
-		const auto binding =
-		    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-		                           state.address_memory_variable,
-		                           ConstantU32(state, binding.array_index), ConstantU32(state, 0),
-		                           index});
-		return pointer;
-	}
-	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           state.storage_buffer_variable,
-	                           ConstantU32(state, binding.array_index), ConstantU32(state, 0),
-	                           index});
-	return pointer;
-}
-
 uint32_t LdsDwordCount(const EmitterState& state) {
 	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
 }
@@ -169,34 +79,89 @@ static void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
-uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index) {
-	EnsureLdsStorage(state);
-	const auto pointer = state.builder.AllocateId();
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
+	MemoryResourceAccess access {.kind = mem.kind};
+	switch (mem.kind) {
+		case IR::ResourceKind::Lds:
+			EnsureLdsStorage(state);
+			access.object_pointer = state.lds_variable;
+			access.length         = ConstantU32(state, LdsDwordCount(state));
+			return access;
+		case IR::ResourceKind::Gds:
+			if (state.gds_variable == 0) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Gds, mem.resource,
+				                             "GDS binding was not emitted");
+			}
+			access.object_pointer = state.gds_variable;
+			break;
+		case IR::ResourceKind::ScalarAddress:
+		case IR::ResourceKind::Flat:
+		case IR::ResourceKind::Global:
+		case IR::ResourceKind::Scratch: {
+			if (state.address_memory_variable == 0) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
+				                             mem.resource,
+				                             "address memory binding was not emitted");
+			}
+			const auto binding = ResourceForDescriptor(
+			    state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
+			access.object_pointer = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
+			                           access.object_pointer, state.address_memory_variable,
+			                           ConstantU32(state, binding.array_index)});
+			break;
+		}
+		case IR::ResourceKind::ScalarBuffer:
+		case IR::ResourceKind::Buffer: {
+			if (state.storage_buffer_variable == 0) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers,
+				                             mem.resource,
+				                             "storage buffer descriptor array was not emitted");
+			}
+			const auto binding =
+			    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+			access.object_pointer = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
+			                           access.object_pointer, state.storage_buffer_variable,
+			                           ConstantU32(state, binding.array_index)});
+			access.index_offset     = state.storage_buffer_offsets[binding.array_index];
+			access.add_index_offset = true;
+			break;
+		}
+		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
+	}
+	access.length = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpAccessChain,
-	     TypeLdsElementPointer(state, state.stage == ShaderType::Compute ? StorageClassWorkgroup
-	                                                                     : StorageClassFunction),
-	     pointer, state.lds_variable, index});
-	return pointer;
+	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	return access;
 }
 
-uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index) {
-	EnsureLdsStorage(state);
+uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t raw_index) {
+	return access.add_index_offset ? EmitAddU32(state, raw_index, access.index_offset) : raw_index;
+}
+
+uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                   uint32_t index) {
 	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpULessThan, TypeBool(state), in_bounds, index, ConstantU32(state, LdsDwordCount(state))});
+	state.builder.AddFunction({OpULessThan, TypeBool(state), in_bounds, index, access.length});
 	return in_bounds;
 }
 
-uint32_t EmitMemoryElementPointer(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
-                                  uint32_t use_pc) {
-	if (mem.kind == IR::ResourceKind::Lds) {
-		return EmitLdsElementPointer(state, index);
+uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                  uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	if (access.kind == IR::ResourceKind::Lds) {
+		state.builder.AddFunction({OpAccessChain,
+		                           TypeLdsElementPointer(state, state.stage == ShaderType::Compute
+		                                                            ? StorageClassWorkgroup
+		                                                            : StorageClassFunction),
+		                           pointer, access.object_pointer, index});
+	} else {
+		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                           access.object_pointer, ConstantU32(state, 0), index});
 	}
-	if (mem.kind == IR::ResourceKind::Gds) {
-		return EmitGdsElementPointer(state, index);
-	}
-	return EmitStorageBufferElementPointer(state, mem, index, use_pc);
+	return pointer;
 }
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value) {
@@ -336,21 +301,6 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
 	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsUniformMemory;
 	state.builder.AddFunction(
 	    {OpMemoryBarrier, ConstantU32(state, ScopeDevice), ConstantU32(state, semantics)});
-}
-
-uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index) {
-	const auto length    = state.builder.AllocateId();
-	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction({OpArrayLength, TypeU32(state), length, state.gds_variable, 0});
-	state.builder.AddFunction({OpULessThan, TypeBool(state), in_bounds, index, length});
-	return in_bounds;
-}
-
-uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index) {
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           state.gds_variable, ConstantU32(state, 0), index});
-	return pointer;
 }
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {

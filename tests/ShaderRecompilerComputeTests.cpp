@@ -12157,7 +12157,6 @@ TestCase Vop2SdwaSubNcExactByte2Destination() {
   test.code = code;
   test.expected = {0x000b0002u};
   test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpISub", "OpShiftLeftLogical"};
   return test;
 }
 
@@ -15338,16 +15337,21 @@ TestCase BufferStoreFormatXAddTidUsesLaneIndex() {
   TestCase test;
   test.name = "BufferStoreFormatXAddTidUsesLaneIndex";
   test.code = code;
-  test.initial = std::vector<u32>(4, 0);
-  test.expected = std::vector<u32>(4, 0x12345678u);
+  test.initial = std::vector<u32>(64, 0);
+  test.expected = std::vector<u32>(64, 0);
+  std::fill_n(test.expected.begin(), 32, 0x12345678u);
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
-  test.compute_info.thread_ids_num = 1;
+  test.compute_info.thread_ids_num = 0;
+  test.compute_info.wave_size = 32;
   test.has_compute_info = true;
-  test.user_data = MakeStructuredStorageBufferData(4, 4, true);
+  test.user_data = MakeStructuredStorageBufferData(4, 64, true);
   test.has_user_data = true;
+  test.required_spirv = {"BuiltIn SubgroupLocalInvocationId"};
+  test.forbidden_spirv = {"BuiltIn LocalInvocationId",
+                          "OpGroupNonUniformBallot"};
   return test;
 }
 
@@ -17457,7 +17461,9 @@ void CheckIndirectImageKeySwitch() {
 
   ShaderComputeInputInfo compute{};
   std::vector<u32> spirv;
-  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+  Require(name, "SPIR-V requirements",
+          ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program, &error),
+          error.c_str());
   Require(name, "SPIR-V emit",
           ShaderRecompiler::Spirv::EmitProgram(
               program, snapshot, {.compute = &compute}, spirv, &error),

@@ -942,7 +942,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::AllocateBindings(ir, layout_options, error)) {
 		return false;
 	}
-	Spirv::AnalyzeProgramRequirements(ir);
+	if (!Spirv::AnalyzeProgramRequirements(ir, error)) {
+		return false;
+	}
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(cfg, ir);

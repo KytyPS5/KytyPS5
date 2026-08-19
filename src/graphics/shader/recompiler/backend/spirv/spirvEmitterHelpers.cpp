@@ -115,7 +115,7 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
-		return ConstantU32(state, 0);
+		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(

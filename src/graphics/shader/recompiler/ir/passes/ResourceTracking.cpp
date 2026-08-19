@@ -25,46 +25,6 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-bool IsBufferAtomic(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::BufferAtomicSwap32:
-		case ValueOpcode::BufferAtomicIAdd32:
-		case ValueOpcode::BufferAtomicISub32:
-		case ValueOpcode::BufferAtomicSMin32:
-		case ValueOpcode::BufferAtomicUMin32:
-		case ValueOpcode::BufferAtomicSMax32:
-		case ValueOpcode::BufferAtomicUMax32:
-		case ValueOpcode::BufferAtomicAnd32:
-		case ValueOpcode::BufferAtomicOr32:
-		case ValueOpcode::BufferAtomicXor32:
-		case ValueOpcode::BufferAtomicFMin32:
-		case ValueOpcode::BufferAtomicFMax32: return true;
-		default: return false;
-	}
-}
-
-bool IsBufferStore(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::StoreBufferU8:
-		case ValueOpcode::StoreBufferU16:
-		case ValueOpcode::StoreBufferU32: return true;
-		default: return IsBufferAtomic(op);
-	}
-}
-
-bool IsBuffer(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU8:
-		case ValueOpcode::LoadBufferU16:
-		case ValueOpcode::LoadBufferU32:
-		case ValueOpcode::StoreBufferU8:
-		case ValueOpcode::StoreBufferU16:
-		case ValueOpcode::StoreBufferU32: return true;
-		default: return IsBufferAtomic(op);
-	}
-}
-
 bool IsAddressStore(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::StoreAddressU8:
@@ -393,7 +353,8 @@ private:
 		for (const auto* block: m_values.blocks) {
 			for (const auto& inst: *block) {
 				const auto op = inst.GetOpcode();
-				if ((!IsBuffer(op) && !IsAddress(op) && !IsImage(op)) || &inst == &owner) {
+				if ((BufferAccessOf(op) == BufferAccess::None && !IsAddress(op) && !IsImage(op)) ||
+				    &inst == &owner) {
 					continue;
 				}
 				if (inst.Flags<MemoryFlags>().index == index) {
@@ -669,8 +630,9 @@ private:
 
 	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
 	                  uint32_t pc) {
-		const bool atomic        = IsBufferAtomic(op);
-		const bool write         = IsBufferStore(op);
+		const auto access        = BufferAccessOf(op);
+		const bool atomic        = access == BufferAccess::Atomic;
+		const bool write         = access == BufferAccess::Write || atomic;
 		resource.first_use_pc    = std::min(resource.first_use_pc, pc);
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
@@ -813,7 +775,7 @@ private:
 
 	bool Collect(Inst& inst, std::string* error) {
 		const auto op = inst.GetOpcode();
-		if (!IsBuffer(op) && !IsAddress(op) && !IsImage(op)) {
+		if (BufferAccessOf(op) == BufferAccess::None && !IsAddress(op) && !IsImage(op)) {
 			return true;
 		}
 		const auto flags = inst.Flags<MemoryFlags>();
@@ -832,7 +794,7 @@ private:
 		uint32_t source   = 0;
 		uint32_t resource = 0;
 
-		if (IsBuffer(op)) {
+		if (BufferAccessOf(op) != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source,
 			               error)) {
 				return false;

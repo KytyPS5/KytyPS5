@@ -16,6 +16,11 @@ struct TypeAnnotation {
 	std::vector<uint32_t> operands;
 };
 
+struct DeferredPhi {
+	size_t word_offset    = 0;
+	size_t incoming_count = 0;
+};
+
 class Builder {
 public:
 	explicit Builder(uint32_t version = 0x00010300u);
@@ -36,14 +41,16 @@ public:
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class);
 	void     DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class);
 
-	void AddMemoryModel(std::initializer_list<uint32_t> operands);
-	void AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,
-	                   const std::vector<uint32_t>& interfaces);
-	void AddExecutionMode(std::initializer_list<uint32_t> operands);
-	void AddName(uint32_t target, const char* name);
-	void AddAnnotation(std::initializer_list<uint32_t> words);
-	void AddFunction(std::initializer_list<uint32_t> words);
-	void AddFunction(const std::vector<uint32_t>& words);
+	void        AddMemoryModel(std::initializer_list<uint32_t> operands);
+	void        AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,
+	                          const std::vector<uint32_t>& interfaces);
+	void        AddExecutionMode(std::initializer_list<uint32_t> operands);
+	void        AddName(uint32_t target, const char* name);
+	void        AddAnnotation(std::initializer_list<uint32_t> words);
+	void        AddFunction(std::initializer_list<uint32_t> words);
+	void        AddFunction(const std::vector<uint32_t>& words);
+	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
+	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 
 	[[nodiscard]] std::vector<uint32_t> Build() const;
 
@@ -74,6 +81,7 @@ private:
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	size_t                                    m_unpatched_phi_incomings = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

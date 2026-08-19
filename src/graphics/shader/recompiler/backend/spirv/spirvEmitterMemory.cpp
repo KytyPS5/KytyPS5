@@ -289,11 +289,11 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto observed  = state.builder.AllocateId();
 	const auto exchanged = state.builder.AllocateId();
 	state.builder.AddFunction({OpBranch, preheader});
-	state.builder.AddFunction({OpLabel, preheader});
+	EmitLabel(state, preheader);
 	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
 	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
 	state.builder.AddFunction({OpBranch, header});
-	state.builder.AddFunction({OpLabel, header});
+	EmitLabel(state, header);
 	state.builder.AddFunction(
 	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
 	const auto next = desired(observed);
@@ -303,9 +303,9 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto success = Binary(state, OpIEqual, TypeBool(state), exchanged, observed);
 	state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
 	state.builder.AddFunction({OpBranchConditional, success, merge, cont});
-	state.builder.AddFunction({OpLabel, cont});
+	EmitLabel(state, cont);
 	state.builder.AddFunction({OpBranch, header});
-	state.builder.AddFunction({OpLabel, merge});
+	EmitLabel(state, merge);
 	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
 	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
 	return observed;

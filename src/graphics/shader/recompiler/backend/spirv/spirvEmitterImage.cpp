@@ -589,17 +589,17 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 		state.builder.AddFunction(switch_words);
 		std::vector<uint32_t> phi_words {OpPhi, result_type, state.builder.AllocateId()};
-		state.builder.AddFunction({OpLabel, default_label});
+		EmitLabel(state, default_label);
 		phi_words.push_back(EmitSample(image.indirect_resources[0]));
 		phi_words.push_back(default_label);
 		state.builder.AddFunction({OpBranch, merge_label});
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
-			state.builder.AddFunction({OpLabel, labels[candidate - 1u]});
+			EmitLabel(state, labels[candidate - 1u]);
 			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
 			phi_words.push_back(labels[candidate - 1u]);
 			state.builder.AddFunction({OpBranch, merge_label});
 		}
-		state.builder.AddFunction({OpLabel, merge_label});
+		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
 		ctx.Define(inst, ResultVector(ctx, phi_words[2], integer, dref));
 		return true;

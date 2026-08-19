@@ -176,6 +176,10 @@ size_t Inst::NumArgs() const {
 	return args.size();
 }
 
+size_t Inst::NumPhiBlocks() const {
+	return phi_blocks.size();
+}
+
 Value Inst::Arg(size_t index) const {
 	EXIT_IF(index >= args.size());
 	return args[index];

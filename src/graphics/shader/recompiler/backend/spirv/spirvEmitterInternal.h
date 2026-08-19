@@ -323,15 +323,8 @@ struct EmitterState {
 	uint32_t                                         sampler_variable                      = 0;
 	uint32_t                                         main_func                             = 0;
 	uint32_t                                         entry_label                           = 0;
+	uint32_t                                         current_label                         = 0;
 	uint32_t                                         pixel_valid_mask_variable             = 0;
-	bool                                             dispatcher_fallback                   = false;
-	uint32_t                                         dispatch_pc_variable                  = 0;
-	uint32_t                                         dispatch_header_label                 = 0;
-	uint32_t                                         dispatch_select_label                 = 0;
-	uint32_t                                         dispatch_default_label                = 0;
-	uint32_t                                         dispatch_after_switch_label           = 0;
-	uint32_t                                         dispatch_continue_label               = 0;
-	uint32_t                                         dispatch_merge_label                  = 0;
 	uint32_t                                         subgroup_local_invocation_id_variable = 0;
 	uint32_t                                         per_vertex_variable                   = 0;
 	uint32_t                                         depth_variable                        = 0;
@@ -359,6 +352,11 @@ uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeLdsArrayPointer(EmitterState& state, uint32_t storage_class);
 uint32_t TypeLdsElementPointer(EmitterState& state, uint32_t storage_class);
 
+inline void EmitLabel(EmitterState& state, uint32_t label) {
+	state.current_label = label;
+	state.builder.AddFunction({OpLabel, label});
+}
+
 struct ValueEmitContext {
 	ValueEmitContext(EmitterState& state_, const IR::ValueProgram& program_)
 	    : state(state_), program(program_) {}
@@ -378,16 +376,15 @@ struct ValueEmitContext {
 	size_t                BlockIndex(const IR::Block* block) const;
 	void                  Fail(const IR::Inst& inst, const char* reason);
 
-	EmitterState&                                  state;
-	const IR::ValueProgram&                        program;
-	std::unordered_map<const IR::Inst*, uint32_t>  definitions;
-	std::unordered_map<const IR::Block*, uint32_t> labels;
-	std::unordered_map<const IR::Inst*, uint32_t>  phi_variables;
-	std::unordered_map<const IR::Inst*, uint32_t>  dispatcher_variables;
-	const IR::Block*                               current_block        = nullptr;
-	uint32_t                                       scratch_u32_variable = 0;
-	bool                                           failed               = false;
-	std::string                                    error;
+	EmitterState&                                        state;
+	const IR::ValueProgram&                              program;
+	std::unordered_map<const IR::Inst*, uint32_t>        definitions;
+	std::unordered_map<const IR::Block*, uint32_t>       labels;
+	const std::unordered_map<const IR::Inst*, uint32_t>* dispatcher_spills    = nullptr;
+	const IR::Block*                                     current_block        = nullptr;
+	uint32_t                                             scratch_u32_variable = 0;
+	bool                                                 failed               = false;
+	std::string                                          error;
 };
 
 enum class VertexInputScalarKind { Float, Sint, Uint };
@@ -819,10 +816,10 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, condition, then_label, merge_label});
-	state.builder.AddFunction({OpLabel, then_label});
+	EmitLabel(state, then_label);
 	fn();
 	state.builder.AddFunction({OpBranch, merge_label});
-	state.builder.AddFunction({OpLabel, merge_label});
+	EmitLabel(state, merge_label);
 }
 
 template <typename Fn>
@@ -838,14 +835,14 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, condition, then_label, else_label});
-	state.builder.AddFunction({OpLabel, then_label});
+	EmitLabel(state, then_label);
 	const auto then_value = fn();
 	state.builder.AddFunction({OpBranch, then_exit});
-	state.builder.AddFunction({OpLabel, then_exit});
+	EmitLabel(state, then_exit);
 	state.builder.AddFunction({OpBranch, merge_label});
-	state.builder.AddFunction({OpLabel, else_label});
+	EmitLabel(state, else_label);
 	state.builder.AddFunction({OpBranch, merge_label});
-	state.builder.AddFunction({OpLabel, merge_label});
+	EmitLabel(state, merge_label);
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpPhi, type, value, then_value, then_exit, default_value, else_label});

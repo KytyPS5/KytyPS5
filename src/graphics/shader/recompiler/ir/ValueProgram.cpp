@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -140,14 +141,159 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 	    program.blocks.size() != program.block_storage.size()) {
 		return Fail(error, "value IR block storage is inconsistent");
 	}
+	std::unordered_set<const Block*>           blocks;
+	std::unordered_map<uint32_t, const Block*> blocks_by_id;
+	std::unordered_set<const Inst*>            instructions;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto* block = program.blocks[block_index];
-		if (block != program.block_storage[block_index].get()) {
+		if (block == nullptr || program.block_storage[block_index] == nullptr ||
+		    block != program.block_storage[block_index].get()) {
 			return Fail(error, "value IR block pointer is inconsistent");
 		}
+		if (!blocks.insert(block).second) {
+			return Fail(error, "value IR block pointer is duplicated");
+		}
+		if (!blocks_by_id.emplace(program.block_info[block_index].id, block).second) {
+			return Fail(error, "value IR block id is duplicated");
+		}
+		for (const auto& inst: *block) {
+			if (!instructions.insert(&inst).second) {
+				return Fail(error, "value IR instruction is duplicated");
+			}
+		}
+	}
+
+	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
+		const auto*                      block = program.blocks[block_index];
+		std::unordered_set<const Block*> predecessors;
+		for (const auto* predecessor: block->ImmPredecessors()) {
+			if (predecessor == nullptr || !blocks.contains(predecessor)) {
+				return Fail(error, "value IR block has a foreign predecessor");
+			}
+			if (!predecessors.insert(predecessor).second) {
+				return Fail(error, "value IR block predecessor is duplicated");
+			}
+			if (std::ranges::find(predecessor->ImmSuccessors(), block) ==
+			    predecessor->ImmSuccessors().end()) {
+				return Fail(error, "value IR predecessor edge is not reciprocal");
+			}
+		}
+
+		std::unordered_set<const Block*> successors;
+		for (const auto* successor: block->ImmSuccessors()) {
+			if (successor == nullptr || !blocks.contains(successor)) {
+				return Fail(error, "value IR block has a foreign successor");
+			}
+			if (!successors.insert(successor).second) {
+				return Fail(error, "value IR block successor is duplicated");
+			}
+			if (std::ranges::find(successor->ImmPredecessors(), block) ==
+			    successor->ImmPredecessors().end()) {
+				return Fail(error, "value IR successor edge is not reciprocal");
+			}
+		}
+
+		std::unordered_set<const Block*> expected_successors;
+		const auto                       add_target = [&](uint32_t id) {
+			const auto found = blocks_by_id.find(id);
+			if (found == blocks_by_id.end()) {
+				return false;
+			}
+			expected_successors.insert(found->second);
+			return true;
+		};
+		const auto& terminator             = program.block_info[block_index].terminator;
+		const auto  validate_control_value = [&](Value value, Type type) {
+			if (value.IsEmpty() || value.GetType() != type) {
+				return false;
+			}
+			const auto* definition = value.TryInstruction();
+			return definition == nullptr || instructions.contains(definition);
+		};
+		switch (terminator.kind) {
+			case CFG::TerminatorKind::Branch:
+				if (!add_target(terminator.true_block)) {
+					return Fail(error, "value IR branch target is missing");
+				}
+				break;
+			case CFG::TerminatorKind::ConditionalBranch:
+				if (!add_target(terminator.true_block) || !add_target(terminator.false_block)) {
+					return Fail(error, "value IR conditional branch target is missing");
+				}
+				if (!validate_control_value(program.block_info[block_index].condition, Type::U1)) {
+					return Fail(error, "value IR conditional branch condition is invalid");
+				}
+				break;
+			case CFG::TerminatorKind::IndirectBranch:
+				if (!validate_control_value(program.block_info[block_index].indirect_target,
+				                            Type::U32)) {
+					return Fail(error, "value IR indirect branch selector is invalid");
+				}
+				for (const auto target: terminator.indirect_targets) {
+					if (!add_target(target)) {
+						return Fail(error, "value IR indirect branch target is missing");
+					}
+				}
+				if (terminator.indirect_selector_values.size() !=
+				    terminator.indirect_selector_targets.size()) {
+					return Fail(error, "value IR indirect selector table is inconsistent");
+				}
+				for (const auto target: terminator.indirect_selector_targets) {
+					const auto found = blocks_by_id.find(target);
+					if (found == blocks_by_id.end() ||
+					    !expected_successors.contains(found->second)) {
+						return Fail(error,
+						            "value IR indirect selector target is not a CFG successor");
+					}
+				}
+				break;
+			case CFG::TerminatorKind::Return:
+			case CFG::TerminatorKind::Unsupported: break;
+		}
+		if ((terminator.merge_block != UINT32_MAX &&
+		     !blocks_by_id.contains(terminator.merge_block)) ||
+		    (terminator.continue_block != UINT32_MAX &&
+		     !blocks_by_id.contains(terminator.continue_block))) {
+			return Fail(error, "value IR structured control target is missing");
+		}
+		if (successors != expected_successors) {
+			return Fail(error, "value IR terminator and successor graph disagree");
+		}
+
+		bool saw_non_phi = false;
 		for (const auto& inst: *block) {
 			if (inst.Parent() != block) {
 				return Fail(error, "value IR instruction has the wrong parent block");
+			}
+			if (inst.GetOpcode() == ValueOpcode::Phi) {
+				if (saw_non_phi) {
+					return Fail(error, "value IR Phi appears after a non-Phi instruction");
+				}
+				if (inst.NumPhiBlocks() != inst.NumArgs()) {
+					return Fail(error, "value IR Phi parent table is inconsistent");
+				}
+				if (inst.NumArgs() == 0) {
+					return Fail(error, "value IR Phi has no incoming values");
+				}
+				std::unordered_set<const Block*> incoming_blocks;
+				for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
+					const auto* predecessor = inst.PhiBlock(arg_index);
+					if (predecessor == nullptr || !blocks.contains(predecessor) ||
+					    !predecessors.contains(predecessor)) {
+						return Fail(error, "value IR Phi has a foreign or non-predecessor parent");
+					}
+					if (!incoming_blocks.insert(predecessor).second) {
+						return Fail(error, "value IR Phi parent is duplicated");
+					}
+					if (inst.Arg(arg_index).GetType() != inst.GetType()) {
+						return Fail(error, "value IR Phi incoming type does not match its result");
+					}
+				}
+				if (incoming_blocks != predecessors) {
+					return Fail(error, "value IR Phi does not cover every predecessor");
+				}
+			} else {
+				saw_non_phi = true;
 			}
 			if (require_ssa && IsRegisterStatePseudo(inst.GetOpcode())) {
 				return Fail(error, fmt::format("register-state pseudo {} survived SSA rewrite",
@@ -165,8 +311,8 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (const auto* definition = arg.TryInstruction();
-				    definition != nullptr && definition->Parent() == nullptr) {
-					return Fail(error, "value IR argument has a detached definition");
+				    definition != nullptr && !instructions.contains(definition)) {
+					return Fail(error, "value IR argument has a foreign definition");
 				}
 				if (const auto* definition = arg.TryInstruction(); definition != nullptr) {
 					const auto& uses = definition->Uses();

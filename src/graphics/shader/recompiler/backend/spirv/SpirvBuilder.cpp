@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 
+#include "common/debug.h"
+
 #include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -217,7 +219,27 @@ void Builder::AddFunction(const std::vector<uint32_t>& words) {
 	AppendInstructionWords(m_functions, words.data(), words.size());
 }
 
+DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {
+	std::vector<uint32_t> words {245u, type, result};
+	words.resize(words.size() + incoming_count * 2u);
+	const DeferredPhi phi {m_functions.size(), incoming_count};
+	AddFunction(words);
+	m_unpatched_phi_incomings += incoming_count;
+	return phi;
+}
+
+void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent) {
+	EXIT_IF(incoming >= phi.incoming_count || value == 0 || parent == 0);
+	const auto value_word  = phi.word_offset + 3u + incoming * 2u;
+	const auto parent_word = value_word + 1u;
+	EXIT_IF(m_functions.at(value_word) != 0 || m_functions.at(parent_word) != 0);
+	m_functions[value_word]  = value;
+	m_functions[parent_word] = parent;
+	m_unpatched_phi_incomings--;
+}
+
 std::vector<uint32_t> Builder::Build() const {
+	EXIT_IF(m_unpatched_phi_incomings != 0);
 
 	std::vector<uint32_t> module;
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +

@@ -321,11 +321,11 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_ima
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction(words);
 	for (uint32_t mip = 0; mip < image.mip_count; mip++) {
-		state.builder.AddFunction({OpLabel, labels[mip]});
+		EmitLabel(state, labels[mip]);
 		state.builder.AddFunction({OpImageWrite, LoadAt(binding.array_index + mip), coord, texel});
 		state.builder.AddFunction({OpBranch, merge_label});
 	}
-	state.builder.AddFunction({OpLabel, merge_label});
+	EmitLabel(state, merge_label);
 }
 
 uint32_t ExecutionModelForStage(ShaderType stage) {

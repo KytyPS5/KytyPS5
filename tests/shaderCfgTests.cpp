@@ -39,6 +39,8 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -189,6 +191,63 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
     i += word_count;
   }
   return count;
+}
+
+void CheckSpirvPhiParents(const std::vector<uint32_t> &binary) {
+  struct PhiParents {
+    uint32_t target = 0;
+    std::vector<uint32_t> parents;
+  };
+  std::unordered_map<uint32_t, std::unordered_set<uint32_t>> successors;
+  std::vector<PhiParents> phis;
+  uint32_t current_label = 0;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word_count = binary[i] >> 16u;
+    const uint32_t opcode = binary[i] & 0xffffu;
+    Check(word_count != 0u && i + word_count <= binary.size(),
+          "SPIR-V instruction stream is malformed");
+    switch (opcode) {
+    case 245u: { // OpPhi
+      Check(current_label != 0u && word_count >= 5u &&
+                ((word_count - 3u) % 2u) == 0u,
+            "OpPhi has malformed incoming operands");
+      PhiParents phi{.target = current_label};
+      for (size_t operand = 4; operand < word_count; operand += 2u) {
+        phi.parents.push_back(binary[i + operand]);
+      }
+      phis.push_back(std::move(phi));
+      break;
+    }
+    case 248u: // OpLabel
+      Check(word_count == 2u, "OpLabel has malformed operands");
+      current_label = binary[i + 1u];
+      break;
+    case 249u: // OpBranch
+      successors[current_label].insert(binary[i + 1u]);
+      break;
+    case 250u: // OpBranchConditional
+      successors[current_label].insert(binary[i + 2u]);
+      successors[current_label].insert(binary[i + 3u]);
+      break;
+    case 251u: // OpSwitch
+      successors[current_label].insert(binary[i + 2u]);
+      for (size_t operand = 4; operand < word_count; operand += 2u) {
+        successors[current_label].insert(binary[i + operand]);
+      }
+      break;
+    default:
+      break;
+    }
+    i += word_count;
+  }
+  for (const auto &phi : phis) {
+    std::unordered_set<uint32_t> unique_parents;
+    for (const auto parent : phi.parents) {
+      Check(unique_parents.insert(parent).second &&
+                successors[parent].contains(phi.target),
+            "OpPhi parent is not the physical block that branches to it");
+    }
+  }
 }
 
 struct SpirvMetrics {
@@ -6481,6 +6540,37 @@ void TestNewShaderRecompilerCfgIfElse() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgConsecutiveNativePhis() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 1),                         // s_cmp_eq_u32 s0, s1
+      EncodeSopp(0x05, 3),                            // s_cbranch_scc1 else
+      EncodeSMovB32(2, 129),                          // then: s2 = 1
+      EncodeSMovB32(3, 130),                          //       s3 = 2
+      EncodeSopp(0x02, 2),                            // merge
+      EncodeSMovB32(2, 131),                          // else: s2 = 3
+      EncodeSMovB32(3, 132),                          //       s3 = 4
+      EncodeVop1(0x01, 0, 2),                         // v_mov_b32 v0, s2
+      EncodeVop1(0x01, 1, 3),                         // v_mov_b32 v1, s3
+      EncodeExp0(0x0c, 0x3),  EncodeExp1(0, 0, 1, 0), // POS0.xy
+      EncodeSopp(0x01),
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  const bool compiled =
+      ShaderRecompiler::TryRecompile(shader, options, result, &error);
+  Check(compiled, error.c_str());
+  Check(CountSourceOccurrences(result.ir_dump, " = Phi") == 2u &&
+            SpirvInstructionOpcodeCount(result.spirv, 245u) == 2u,
+        "consecutive typed Phis were not emitted as two native OpPhi "
+        "instructions");
+  CheckSpirvPhiParents(result.spirv);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgTerminalExitMergePS() {
   const uint32_t shader[] = {
       EncodeSopp(0x04, 2),   // s_cbranch_scc0 end
@@ -6679,6 +6769,8 @@ void TestNewShaderRecompilerCfgLoopHeaderDsReadStructured() {
       EncodeSop2(0x00, 2, 2, 129), // s_add_u32 s2, s2, 1
       EncodeSopc(0x0a, 2, 130),    // s_cmp_lt_u32 s2, 2
       EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
+      EncodeMubuf0(0x1c),
+      EncodeMubuf1(0, 4, 1), // keep the guarded LDS result live
       0xbf810000u,
   };
 
@@ -6687,13 +6779,19 @@ void TestNewShaderRecompilerCfgLoopHeaderDsReadStructured() {
 
   ShaderRecompiler::CompileResult result;
   std::string error;
-  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
-        error.c_str());
+  const bool compiled =
+      ShaderRecompiler::TryRecompile(shader, options, result, &error);
+  Check(compiled, error.c_str());
   Check(Common::ContainsStr(result.ir_dump, "mode=structured") &&
             !result.program.dispatcher_fallback,
         "DS read loop header did not stay structured");
   Check(!SpirvContainsOpcode(result.spirv, 251),
         "DS read structured SPIR-V unexpectedly contains OpSwitch");
+  const auto metrics = MeasureSpirv(result.spirv);
+  Check(Common::ContainsStr(result.ir_dump, "Phi") && metrics.phis != 0u &&
+            metrics.selection_merges != 0u,
+        "guarded LDS loop did not exercise deferred Phi exit-label patching");
+  CheckSpirvPhiParents(result.spirv);
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8140,6 +8238,109 @@ void TestFinalSsaRejectsRegisterStatePseudos() {
 
   check_rejected(false);
   check_rejected(true);
+}
+
+void TestValuePhiValidation() {
+  using namespace ShaderRecompiler::IR;
+
+  enum class InvalidPhi {
+    None,
+    Empty,
+    MissingParent,
+    DuplicateParent,
+    NonPredecessorParent,
+    WrongType,
+    AfterInstruction,
+  };
+
+  const auto validate = [](InvalidPhi invalid, const char *expected_error) {
+    ValueProgram program;
+    const auto add_block = [&](uint32_t id) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      auto *block = program.block_storage.back().get();
+      program.blocks.push_back(block);
+      program.block_info.push_back({.id = id});
+      return block;
+    };
+
+    auto *entry = add_block(0);
+    auto *left = add_block(1);
+    auto *right = add_block(2);
+    auto *join = add_block(3);
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[0].terminator.false_block = 2;
+    program.block_info[0].condition = Value(true);
+    program.block_info[1].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[1].terminator.true_block = 3;
+    program.block_info[2].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[2].terminator.true_block = 3;
+    entry->AddBranch(left);
+    entry->AddBranch(right);
+    left->AddBranch(join);
+    right->AddBranch(join);
+
+    if (invalid == InvalidPhi::AfterInstruction) {
+      join->AppendNewInst(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
+    }
+    auto &phi = join->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    if (invalid != InvalidPhi::Empty) {
+      phi.AddPhiOperand(
+          invalid == InvalidPhi::NonPredecessorParent ? entry : left,
+          invalid == InvalidPhi::WrongType ? Value(true) : Value(7u));
+    }
+    if (invalid != InvalidPhi::Empty && invalid != InvalidPhi::MissingParent &&
+        invalid != InvalidPhi::WrongType) {
+      phi.AddPhiOperand(invalid == InvalidPhi::DuplicateParent ? left : right,
+                        Value(9u));
+    } else if (invalid == InvalidPhi::WrongType) {
+      phi.AddPhiOperand(right, Value(9u));
+    }
+
+    std::string error;
+    const bool valid = ValidateValueProgram(program, true, &error);
+    if (invalid == InvalidPhi::None) {
+      Check(valid, error.c_str());
+    } else {
+      Check(!valid && Common::ContainsStr(error, expected_error),
+            "malformed Phi was not rejected by its structural invariant");
+    }
+  };
+
+  validate(InvalidPhi::None, "");
+  validate(InvalidPhi::Empty, "no incoming");
+  validate(InvalidPhi::MissingParent, "cover every predecessor");
+  validate(InvalidPhi::DuplicateParent, "duplicated");
+  validate(InvalidPhi::NonPredecessorParent, "non-predecessor");
+  validate(InvalidPhi::WrongType, "incoming type");
+  validate(InvalidPhi::AfterInstruction, "after a non-Phi");
+
+  const auto validate_cfg = [](bool duplicate_id) {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 2; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      auto *block = program.block_storage.back().get();
+      program.blocks.push_back(block);
+      program.block_info.push_back({.id = duplicate_id ? 0u : id});
+    }
+    if (!duplicate_id) {
+      program.block_info[0].terminator.kind =
+          ShaderRecompiler::CFG::TerminatorKind::Branch;
+      program.block_info[0].terminator.true_block = 1;
+    }
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, duplicate_id
+                                             ? "id is duplicated"
+                                             : "successor graph disagree"),
+          "malformed Value CFG was not rejected before SPIR-V emission");
+  };
+  validate_cfg(true);
+  validate_cfg(false);
 }
 
 void TestNewShaderRecompilerZeroInitialRegisterState() {
@@ -9847,8 +10048,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
         ShaderRecompiler::CompileResult result;
         std::string error;
-        Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
-              error.c_str());
+        const bool compiled =
+            ShaderRecompiler::TryRecompile(shader, options, result, &error);
+        Check(compiled, error.c_str());
         CheckSpirvBinaryValidates(result.spirv);
         CheckSpirvBudget(name, result.spirv, budget);
         return result;
@@ -9875,18 +10077,32 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 147,
-                                          .instructions = 43,
-                                          .variables = 1,
-                                          .function_variables = 1,
-                                          .loads = 1,
-                                          .stores = 2,
+                                         {.words = 136,
+                                          .instructions = 39,
+                                          .phis = 1,
                                           .labels = 7,
                                           .loop_merges = 1,
                                           .branches = 5,
                                           .conditional_branches = 1});
+  const auto structured_metrics = MeasureSpirv(structured_result.spirv);
   Check(Common::ContainsStr(structured_result.ir_dump, "Phi"),
         "structured Phi size fixture no longer contains an IR Phi");
+  Check(structured_metrics.phis == 1u &&
+            structured_metrics.function_variables == 0u &&
+            structured_metrics.loads == 0u && structured_metrics.stores == 0u,
+        "structured Phi retained a spill variable or edge memory operation");
+  CheckSpirvPhiParents(structured_result.spirv);
+  const auto structured_repeat =
+      compile("structured-phi-repeat", structured_phi,
+              {.words = 136,
+               .instructions = 39,
+               .phis = 1,
+               .labels = 7,
+               .loop_merges = 1,
+               .branches = 5,
+               .conditional_branches = 1});
+  Check(structured_repeat.spirv == structured_result.spirv,
+        "deferred Phi patching is not deterministic");
 
   const uint32_t wide_buffer[] = {
       EncodeMubuf0(0x0e, 0),
@@ -9958,6 +10174,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                           .conditional_branches = 1,
                                           .switches = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
+            Common::ContainsStr(dispatcher_result.ir_dump, "Phi") &&
+            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 0u &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
         "dispatcher size fixture no longer exercises whole-function dispatch");
 }
@@ -9991,6 +10209,7 @@ int main() {
   TestNewShaderRecompilerFlatAddressProvenanceBoundaries();
   TestNewShaderRecompilerCfgStraightLine();
   TestNewShaderRecompilerCfgIfElse();
+  TestNewShaderRecompilerCfgConsecutiveNativePhis();
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();
@@ -10028,6 +10247,7 @@ int main() {
   TestNewShaderRecompilerSetpcDwordJumpTable();
   TestTypedEntryStateIsMinimal();
   TestFinalSsaRejectsRegisterStatePseudos();
+  TestValuePhiValidation();
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
   TestNewShaderRecompilerVertexExportUsesLaneExecMask();

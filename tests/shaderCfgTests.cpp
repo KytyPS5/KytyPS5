@@ -6957,11 +6957,8 @@ void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
   Check(graph.natural_loops.size() == 1u, "DS loop was not preserved");
-  Check(ShaderRecompiler::CFG::IsolateLoopHeader(
-            graph, graph.natural_loops.front().header, &error),
-        error.c_str());
   Check(graph.blocks.size() == original_block_count + 1u,
-        "DS loop did not add exactly one empty header");
+        "DS loop structurization did not add exactly one empty header");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "DS loop canonicalization duplicated semantic instructions");
@@ -7014,6 +7011,36 @@ void TestNewShaderRecompilerCfgLoopHeaderDsReadStructured() {
   Check(Common::ContainsStr(result.ir_dump, "Phi") && metrics.phis != 0u &&
             metrics.selection_merges != 0u,
         "guarded LDS loop did not exercise deferred Phi exit-label patching");
+  CheckSpirvPhiParents(result.spirv);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x77, (48u << 8u) | 32u), // loop: ds_read2_b64 v[0:3], v1
+      EncodeDs1(0, 0, 1),
+      EncodeSop2(0x00, 2, 2, 129), // s_add_u32 s2, s2, 1
+      EncodeSopc(0x0a, 2, 130),    // s_cmp_lt_u32 s2, 2
+      EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
+      EncodeMubuf0(0x1e),
+      EncodeMubuf1(0, 4, 1), // keep all four guarded LDS results live
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            !result.program.dispatcher_fallback,
+        "DS read2 b64 loop header did not stay structured");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ2_B64"),
+        "DS read2 b64 loop regression did not decode the captured opcode");
+  Check(!SpirvContainsOpcode(result.spirv, 251),
+        "DS read2 b64 structured SPIR-V unexpectedly contains OpSwitch");
   CheckSpirvPhiParents(result.spirv);
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -7439,8 +7466,8 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
   Check(graph.back_edges.size() == 2u,
         "multiple-latch fixture lacks two native backedges");
   Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
-  Check(graph.blocks.size() == original_block_count + 1u,
-        "multiple native latches did not create one synthetic continue");
+  Check(graph.blocks.size() == original_block_count + 2u,
+        "multiple native latches did not create one synthetic continue and one empty header");
   Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
         "multiple native latches were not coalesced to one SPIR-V backedge");
   const auto &loop = graph.natural_loops.front();
@@ -7527,13 +7554,13 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
         "nested early-exit fixture has the wrong native CFG");
   const bool structured = ShaderRecompiler::CFG::Structurize(graph, &error);
   Check(structured, error.c_str());
-  Check(graph.blocks.size() == original_block_count + 3u &&
+  Check(graph.blocks.size() == original_block_count + 4u &&
             CfgInstructionCoverage(graph, decoded.instructions.size()) ==
                 original_coverage &&
             std::ranges::count_if(graph.blocks,
                                   [](const auto &block) {
                                     return block.inst_begin == block.inst_end;
-                                  }) == original_empty_blocks + 3,
+                                  }) == original_empty_blocks + 4,
         "nested early-exit structurization changed semantic coverage");
   const auto *preheader = graph.FindBlockByPc(0x00u);
   const auto *outer = graph.FindBlockByPc(0x08u);
@@ -11213,12 +11240,12 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 136,
-                                          .instructions = 39,
+                                         {.words = 140,
+                                          .instructions = 41,
                                           .phis = 1,
-                                          .labels = 7,
+                                          .labels = 8,
                                           .loop_merges = 1,
-                                          .branches = 5,
+                                          .branches = 6,
                                           .conditional_branches = 1});
   const auto structured_metrics = MeasureSpirv(structured_result.spirv);
   Check(Common::ContainsStr(structured_result.ir_dump, "Phi"),
@@ -11230,12 +11257,12 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(structured_result.spirv);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 136,
-               .instructions = 39,
+              {.words = 140,
+               .instructions = 41,
                .phis = 1,
-               .labels = 7,
+               .labels = 8,
                .loop_merges = 1,
-               .branches = 5,
+               .branches = 6,
                .conditional_branches = 1});
   Check(structured_repeat.spirv == structured_result.spirv,
         "deferred Phi patching is not deterministic");
@@ -11467,6 +11494,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
+  TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
   TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
   TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();

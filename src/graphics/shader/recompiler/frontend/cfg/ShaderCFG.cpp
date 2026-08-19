@@ -1264,6 +1264,11 @@ bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& blo
 		};
 		return is_repeat_target(true_target) && is_repeat_target(false_target);
 	}
+	const bool true_in_body  = Contains(loop->body_blocks, true_target);
+	const bool false_in_body = Contains(loop->body_blocks, false_target);
+	if (true_in_body != false_in_body) {
+		return true;
+	}
 	const auto is_control_target = [&](uint32_t target) {
 		return target == loop->merge || target == loop->continue_block;
 	};
@@ -1339,6 +1344,37 @@ bool CanonicalizeNaturalLoops(Graph& graph, std::string* error) {
 
 	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
 	           "CFG loop canonicalization exceeded rewrite budget", error);
+	return false;
+}
+
+bool IsolateSemanticLoopHeaders(Graph& graph, std::string* error) {
+	const auto isolation_budget = graph.natural_loops.size() + 1u;
+	for (size_t isolation = 0; isolation < isolation_budget; isolation++) {
+		const auto loop = std::find_if(graph.natural_loops.begin(), graph.natural_loops.end(),
+		                               [&](const auto& value) {
+			                               const auto* header = graph.FindBlock(value.header);
+			                               return header != nullptr &&
+			                                      header->inst_begin != header->inst_end;
+		                               });
+		if (loop == graph.natural_loops.end()) {
+			return true;
+		}
+
+		// SPIR-V requires OpLoopMerge and its branch to remain in the loop header's
+		// physical block. Keep that header as a dedicated control node, exactly like
+		// the separate Loop node in shadPS4's structured AST. Guest instructions live
+		// in the body so later lowering may introduce bounds/EXEC control flow without
+		// displacing OpLoopMerge into a helper-created block.
+		if (!IsolateSemanticLoopHeader(graph, loop->header)) {
+			SetFailure(graph, FailureKind::StructuredControlFlow, loop->header,
+			           fmt::format("failed to isolate semantic loop header {}", loop->header),
+			           error);
+			return false;
+		}
+	}
+
+	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+	           "CFG semantic loop-header isolation exceeded rewrite budget", error);
 	return false;
 }
 
@@ -2113,6 +2149,9 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 	if (!SplitSharedMergeBlocks(graph, error)) {
 		return false;
 	}
+	if (!IsolateSemanticLoopHeaders(graph, error)) {
+		return false;
+	}
 	ClearStructuredTerminators(graph);
 
 	std::map<uint32_t, uint32_t> merge_headers;
@@ -2137,6 +2176,14 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 			    graph, FailureKind::StructuredControlFlow, loop.header,
 			    fmt::format("loop at block {} has no structured merge/continue", loop.header),
 			    error);
+			return false;
+		}
+		if (header->inst_begin != header->inst_end ||
+		    header->terminator.kind != TerminatorKind::Branch) {
+			SetFailure(graph, FailureKind::StructuredControlFlow, loop.header,
+			           fmt::format("loop header {} is not a dedicated empty control block",
+			                       loop.header),
+			           error);
 			return false;
 		}
 		if (!reserve_merge_block(loop.header, loop.merge)) {
@@ -2205,31 +2252,6 @@ bool Structurize(Graph& graph, std::string* error) {
 		*error = std::move(failed_error);
 	}
 	return false;
-}
-
-bool IsolateLoopHeader(Graph& graph, uint32_t header_id, std::string* error) {
-	const auto loop =
-	    std::find_if(graph.natural_loops.begin(), graph.natural_loops.end(),
-	                 [header_id](const auto& value) { return value.header == header_id; });
-	if (loop == graph.natural_loops.end()) {
-		SetFailure(graph, FailureKind::StructuredControlFlow, header_id,
-		           fmt::format("block {} is not a natural loop header", header_id), error);
-		return false;
-	}
-
-	ClearStructuredTerminators(graph);
-	if (!IsolateSemanticLoopHeader(graph, header_id)) {
-		SetFailure(graph, FailureKind::StructuredControlFlow, header_id,
-		           fmt::format("loop header block {} has no semantic instructions", header_id),
-		           error);
-		return false;
-	}
-
-	graph.unsupported   = false;
-	graph.failure_kind  = FailureKind::None;
-	graph.failure_block = UINT32_MAX;
-	graph.unsupported_reason.clear();
-	return Structurize(graph, error);
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

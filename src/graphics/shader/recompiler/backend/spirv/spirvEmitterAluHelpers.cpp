@@ -5,7 +5,7 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 uint32_t EmitSelectValueU32(EmitterState& state, uint32_t cond, uint32_t true_value,
                             uint32_t false_value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelect, state.uint_type, ret, cond, true_value, false_value});
+	state.builder.AddFunction({OpSelect, TypeU32(state), ret, cond, true_value, false_value});
 	return ret;
 }
 
@@ -26,20 +26,20 @@ void EmitShiftLeftLogicalU64Values(EmitterState& state, uint32_t low, uint32_t h
 	const auto high_less        = state.builder.AllocateId();
 	const auto high_ge          = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpULessThan, state.bool_type, less32, amount, ConstantU32(state, 32)});
+	    {OpULessThan, TypeBool(state), less32, amount, ConstantU32(state, 32)});
 	state.builder.AddFunction(
-	    {OpINotEqual, state.bool_type, non_zero, amount, ConstantU32(state, 0)});
+	    {OpINotEqual, TypeBool(state), non_zero, amount, ConstantU32(state, 0)});
 	state.builder.AddFunction(
-	    {OpISub, state.uint_type, carry_count_base, ConstantU32(state, 32), dword_shift});
+	    {OpISub, TypeU32(state), carry_count_base, ConstantU32(state, 32), dword_shift});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, carry_count, carry_count_base, ConstantU32(state, 31)});
-	state.builder.AddFunction({OpShiftLeftLogical, state.uint_type, low_part, low, dword_shift});
-	state.builder.AddFunction({OpShiftLeftLogical, state.uint_type, high_part, high, dword_shift});
-	state.builder.AddFunction({OpShiftRightLogical, state.uint_type, carry_part, low, carry_count});
+	    {OpBitwiseAnd, TypeU32(state), carry_count, carry_count_base, ConstantU32(state, 31)});
+	state.builder.AddFunction({OpShiftLeftLogical, TypeU32(state), low_part, low, dword_shift});
+	state.builder.AddFunction({OpShiftLeftLogical, TypeU32(state), high_part, high, dword_shift});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), carry_part, low, carry_count});
 	state.builder.AddFunction(
-	    {OpSelect, state.uint_type, carry, non_zero, carry_part, ConstantU32(state, 0)});
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, high_less, high_part, carry});
-	state.builder.AddFunction({OpShiftLeftLogical, state.uint_type, high_ge, low, dword_shift});
+	    {OpSelect, TypeU32(state), carry, non_zero, carry_part, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), high_less, high_part, carry});
+	state.builder.AddFunction({OpShiftLeftLogical, TypeU32(state), high_ge, low, dword_shift});
 	out_low  = EmitSelectValueU32(state, less32, low_part, ConstantU32(state, 0));
 	out_high = EmitSelectValueU32(state, less32, high_less, high_ge);
 }
@@ -59,28 +59,27 @@ void EmitShiftRightLogicalU64Values(EmitterState& state, uint32_t low, uint32_t 
 	const auto low_less         = state.builder.AllocateId();
 	const auto low_ge           = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpULessThan, state.bool_type, less32, amount, ConstantU32(state, 32)});
+	    {OpULessThan, TypeBool(state), less32, amount, ConstantU32(state, 32)});
 	state.builder.AddFunction(
-	    {OpINotEqual, state.bool_type, non_zero, amount, ConstantU32(state, 0)});
+	    {OpINotEqual, TypeBool(state), non_zero, amount, ConstantU32(state, 0)});
 	state.builder.AddFunction(
-	    {OpISub, state.uint_type, carry_count_base, ConstantU32(state, 32), dword_shift});
+	    {OpISub, TypeU32(state), carry_count_base, ConstantU32(state, 32), dword_shift});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, carry_count, carry_count_base, ConstantU32(state, 31)});
-	state.builder.AddFunction({OpShiftRightLogical, state.uint_type, low_part, low, dword_shift});
-	state.builder.AddFunction({OpShiftRightLogical, state.uint_type, high_part, high, dword_shift});
-	state.builder.AddFunction({OpShiftLeftLogical, state.uint_type, carry_part, high, carry_count});
+	    {OpBitwiseAnd, TypeU32(state), carry_count, carry_count_base, ConstantU32(state, 31)});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), low_part, low, dword_shift});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), high_part, high, dword_shift});
+	state.builder.AddFunction({OpShiftLeftLogical, TypeU32(state), carry_part, high, carry_count});
 	state.builder.AddFunction(
-	    {OpSelect, state.uint_type, carry, non_zero, carry_part, ConstantU32(state, 0)});
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, low_less, low_part, carry});
-	state.builder.AddFunction({OpShiftRightLogical, state.uint_type, low_ge, high, dword_shift});
+	    {OpSelect, TypeU32(state), carry, non_zero, carry_part, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), low_less, low_part, carry});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), low_ge, high, dword_shift});
 	out_low  = EmitSelectValueU32(state, less32, low_less, low_ge);
 	out_high = EmitSelectValueU32(state, less32, high_part, ConstantU32(state, 0));
 }
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, ret, value, ConstantU32(state, mask)});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), ret, value, ConstantU32(state, mask)});
 	return ret;
 }
 
@@ -93,45 +92,45 @@ AddCarryResult EmitAddCarryValues(EmitterState& state, uint32_t lhs, uint32_t rh
 	const auto sum1   = state.builder.AllocateId();
 	const auto carry1 = state.builder.AllocateId();
 	const auto carry  = state.builder.AllocateId();
-	state.builder.AddFunction({OpIAddCarry, state.uint_pair_type, pair0, lhs, rhs});
-	state.builder.AddFunction({OpCompositeExtract, state.uint_type, sum0, pair0, 0});
-	state.builder.AddFunction({OpCompositeExtract, state.uint_type, carry0, pair0, 1});
-	state.builder.AddFunction({OpIAddCarry, state.uint_pair_type, pair1, sum0, carry_in});
-	state.builder.AddFunction({OpCompositeExtract, state.uint_type, sum1, pair1, 0});
-	state.builder.AddFunction({OpCompositeExtract, state.uint_type, carry1, pair1, 1});
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, carry, carry0, carry1});
+	state.builder.AddFunction({OpIAddCarry, TypeU32Pair(state), pair0, lhs, rhs});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), sum0, pair0, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), carry0, pair0, 1});
+	state.builder.AddFunction({OpIAddCarry, TypeU32Pair(state), pair1, sum0, carry_in});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), sum1, pair1, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), carry1, pair1, 1});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), carry, carry0, carry1});
 	return {sum1, carry};
 }
 
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpShiftRightLogical, state.uint_type, ret, value, ConstantU32(state, shift)});
+	    {OpShiftRightLogical, TypeU32(state), ret, value, ConstantU32(state, shift)});
 	return ret;
 }
 
 uint32_t EmitOrU32(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, ret, lhs, rhs});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), ret, lhs, rhs});
 	return ret;
 }
 
 uint32_t EmitCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
                                 uint32_t constant) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, state.bool_type, ret, value, ConstantU32(state, constant)});
+	state.builder.AddFunction({opcode, TypeBool(state), ret, value, ConstantU32(state, constant)});
 	return ret;
 }
 
 uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpISub, state.uint_type, ret, ConstantU32(state, constant), value});
+	state.builder.AddFunction({OpISub, TypeU32(state), ret, ConstantU32(state, constant), value});
 	return ret;
 }
 
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto bits = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.uint_type, bits, f32});
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, f32});
 
 	const auto sign = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
 	const auto exp  = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 23), 0xffu);
@@ -142,12 +141,12 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto normal_mant    = EmitShiftRightConstant(state, mant, 13);
 	const auto normal_payload = state.builder.AllocateId();
 	const auto normal         = state.builder.AllocateId();
-	state.builder.AddFunction({OpISub, state.uint_type, half_exp, exp, ConstantU32(state, 112)});
+	state.builder.AddFunction({OpISub, TypeU32(state), half_exp, exp, ConstantU32(state, 112)});
 	state.builder.AddFunction(
-	    {OpShiftLeftLogical, state.uint_type, normal_exp, half_exp, ConstantU32(state, 10)});
+	    {OpShiftLeftLogical, TypeU32(state), normal_exp, half_exp, ConstantU32(state, 10)});
 	state.builder.AddFunction(
-	    {OpBitwiseOr, state.uint_type, normal_payload, normal_exp, normal_mant});
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, normal, sign, normal_payload});
+	    {OpBitwiseOr, TypeU32(state), normal_payload, normal_exp, normal_mant});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), normal, sign, normal_payload});
 
 	const auto mant_with_hidden = EmitOrU32(state, mant, ConstantU32(state, 0x00800000u));
 	const auto raw_sub_shift    = EmitSubConstantMinusU32(state, 126, exp);
@@ -160,8 +159,8 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto sub_mant  = state.builder.AllocateId();
 	const auto subnormal = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpShiftRightLogical, state.uint_type, sub_mant, mant_with_hidden, sub_shift});
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, subnormal, sign, sub_mant});
+	    {OpShiftRightLogical, TypeU32(state), sub_mant, mant_with_hidden, sub_shift});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), subnormal, sign, sub_mant});
 
 	const auto nan_payload =
 	    EmitOrU32(state, EmitShiftRightConstant(state, mant, 13), ConstantU32(state, 0x0200u));
@@ -185,8 +184,8 @@ uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {max_value ? OpUGreaterThan : OpULessThan, state.bool_type, cond, lhs, rhs});
-	state.builder.AddFunction({OpSelect, state.uint_type, ret, cond, lhs, rhs});
+	    {max_value ? OpUGreaterThan : OpULessThan, TypeBool(state), cond, lhs, rhs});
+	state.builder.AddFunction({OpSelect, TypeU32(state), ret, cond, lhs, rhs});
 	return ret;
 }
 
@@ -194,44 +193,44 @@ uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {max_value ? OpSGreaterThan : OpSLessThan, state.bool_type, cond, lhs, rhs});
-	state.builder.AddFunction({OpSelect, state.uint_type, ret, cond, lhs, rhs});
+	    {max_value ? OpSGreaterThan : OpSLessThan, TypeBool(state), cond, lhs, rhs});
+	state.builder.AddFunction({OpSelect, TypeU32(state), ret, cond, lhs, rhs});
 	return ret;
 }
 
 uint32_t EmitBitcastF32ToU32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.uint_type, ret, value});
+	state.builder.AddFunction({OpBitcast, TypeU32(state), ret, value});
 	return ret;
 }
 
 uint32_t EmitBitcastU32ToF32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.float_type, ret, value});
+	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, value});
 	return ret;
 }
 
 uint32_t EmitAndU32(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, ret, lhs, rhs});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), ret, lhs, rhs});
 	return ret;
 }
 
 uint32_t EmitLogicalAndBool(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpLogicalAnd, state.bool_type, ret, lhs, rhs});
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), ret, lhs, rhs});
 	return ret;
 }
 
 uint32_t EmitLogicalOrBool(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpLogicalOr, state.bool_type, ret, lhs, rhs});
+	state.builder.AddFunction({OpLogicalOr, TypeBool(state), ret, lhs, rhs});
 	return ret;
 }
 
 uint32_t EmitLogicalNotBool(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpLogicalNot, state.bool_type, ret, value});
+	state.builder.AddFunction({OpLogicalNot, TypeBool(state), ret, value});
 	return ret;
 }
 
@@ -316,7 +315,7 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
 	const auto numeric_cond = state.builder.AllocateId();
-	state.builder.AddFunction({max_value ? OpFOrdGreaterThanEqual : OpFOrdLessThan, state.bool_type,
+	state.builder.AddFunction({max_value ? OpFOrdGreaterThanEqual : OpFOrdLessThan, TypeBool(state),
 	                           numeric_cond, lhs, rhs});
 	const auto ordered_bits =
 	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
@@ -340,7 +339,7 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpExtInst, state.float_type, ret, state.glsl_std450, GlslTrunc, value});
+	    {OpExtInst, TypeF32(state), ret, GlslStd450(state), GlslTrunc, value});
 	return ret;
 }
 
@@ -353,18 +352,18 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	const auto flush     = state.builder.AllocateId();
 	const auto selected  = state.builder.AllocateId();
 	const auto ret       = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.uint_type, bits, value});
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
+	    {OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, sign_bits, bits, ConstantU32(state, 0x80000000u)});
+	    {OpBitwiseAnd, TypeU32(state), sign_bits, bits, ConstantU32(state, 0x80000000u)});
 	state.builder.AddFunction(
-	    {OpINotEqual, state.bool_type, non_zero, abs_bits, ConstantU32(state, 0)});
+	    {OpINotEqual, TypeBool(state), non_zero, abs_bits, ConstantU32(state, 0)});
 	state.builder.AddFunction(
-	    {OpULessThan, state.bool_type, subnormal, abs_bits, ConstantU32(state, 0x00800000u)});
-	state.builder.AddFunction({OpLogicalAnd, state.bool_type, flush, non_zero, subnormal});
-	state.builder.AddFunction({OpSelect, state.uint_type, selected, flush, sign_bits, bits});
-	state.builder.AddFunction({OpBitcast, state.float_type, ret, selected});
+	    {OpULessThan, TypeBool(state), subnormal, abs_bits, ConstantU32(state, 0x00800000u)});
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal});
+	state.builder.AddFunction({OpSelect, TypeU32(state), selected, flush, sign_bits, bits});
+	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, selected});
 	return ret;
 }
 
@@ -377,46 +376,45 @@ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signe
 	const auto large_finite = state.builder.AllocateId();
 	const auto reduced      = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpExtInst, state.float_type, fract, state.glsl_std450, GlslFract, src});
-	state.builder.AddFunction({OpBitcast, state.uint_type, bits, src});
+	    {OpExtInst, TypeF32(state), fract, GlslStd450(state), GlslFract, src});
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, src});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
+	    {OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
 	state.builder.AddFunction(
-	    {OpUGreaterThanEqual, state.bool_type, large, abs_bits, ConstantU32(state, 0x4b000000u)});
+	    {OpUGreaterThanEqual, TypeBool(state), large, abs_bits, ConstantU32(state, 0x4b000000u)});
 	state.builder.AddFunction(
-	    {OpULessThan, state.bool_type, finite, abs_bits, ConstantU32(state, 0x7f800000u)});
-	state.builder.AddFunction({OpLogicalAnd, state.bool_type, large_finite, large, finite});
+	    {OpULessThan, TypeBool(state), finite, abs_bits, ConstantU32(state, 0x7f800000u)});
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), large_finite, large, finite});
 	state.builder.AddFunction(
-	    {OpSelect, state.float_type, reduced, large_finite, ConstantF32(state, 0), fract});
+	    {OpSelect, TypeF32(state), reduced, large_finite, ConstantF32(state, 0), fract});
 	if (!preserve_signed_zero) {
 		return reduced;
 	}
 	const auto zero = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction({OpIEqual, state.bool_type, zero, abs_bits, ConstantU32(state, 0)});
-	state.builder.AddFunction({OpSelect, state.float_type, ret, zero, src, reduced});
+	state.builder.AddFunction({OpIEqual, TypeBool(state), zero, abs_bits, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpSelect, TypeF32(state), ret, zero, src, reduced});
 	return ret;
 }
 
 uint32_t EmitFNegateValue(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpFNegate, state.float_type, ret, value});
+	state.builder.AddFunction({OpFNegate, TypeF32(state), ret, value});
 	return ret;
 }
 
 uint32_t EmitFAbsValue(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpExtInst, state.float_type, ret, state.glsl_std450, GlslFAbs, value});
+	state.builder.AddFunction({OpExtInst, TypeF32(state), ret, GlslStd450(state), GlslFAbs, value});
 	return ret;
 }
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
 	const auto unpacked = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpExtInst, state.vec2_float_type, unpacked, state.glsl_std450, GlslUnpackHalf2x16, bits});
-	state.builder.AddFunction({OpCompositeExtract, state.float_type, ret, unpacked, 0});
+	state.builder.AddFunction({OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),
+	                           GlslUnpackHalf2x16, bits});
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), ret, unpacked, 0});
 	return ret;
 }
 

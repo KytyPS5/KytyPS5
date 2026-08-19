@@ -232,13 +232,10 @@ static void ReportReserveExceeded(const IR::Program& program, const char* vector
 	            InitialEmitterVectorReserve);
 }
 
-IR::SpirvRequirements GetProgramRequirements(const IR::Program& program) {
-	if (program.spirv_requirements.has_value()) {
-		return *program.spirv_requirements;
-	}
-	IR::SpirvRequirements requirements;
+void AnalyzeProgramRequirements(IR::Program& program) {
+	auto& requirements = program.spirv_requirements.emplace();
 	if (program.values == nullptr) {
-		return requirements;
+		return;
 	}
 	const auto MarkExactSubgroup = [&] {
 		requirements.requires_exact_subgroup = true;
@@ -277,7 +274,6 @@ IR::SpirvRequirements GetProgramRequirements(const IR::Program& program) {
 					MarkExactSubgroup();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
-					requirements.function_lds = program.stage != ShaderType::Compute;
 					break;
 				}
 				case IR::ValueOpcode::DataAppend:
@@ -333,7 +329,6 @@ IR::SpirvRequirements GetProgramRequirements(const IR::Program& program) {
 			}
 		}
 	}
-	return requirements;
 }
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
@@ -347,7 +342,8 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 		return false;
 	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
-	    !program.shader_info_complete || !program.binding_layout_complete) {
+	    !program.shader_info_complete || !program.binding_layout_complete ||
+	    !program.spirv_requirements.has_value()) {
 		SetError(error, "SPIR-V emitter requires a fully planned native shader program");
 		return false;
 	}
@@ -369,7 +365,6 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 		return false;
 	}
 	EmitterState state(program, resources, input_info);
-	const auto   requirements  = GetProgramRequirements(program);
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
@@ -377,17 +372,9 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.outputs.reserve(InitialEmitterVectorReserve);
 	state.interface_variables.reserve(InitialEmitterVectorReserve);
 	CopyProgramInputsAndOutputs(state, program);
-	state.needs_subgroup_ballot              = requirements.subgroup_ballot;
-	state.needs_subgroup_shuffle             = requirements.subgroup_shuffle;
-	state.needs_subgroup_local_invocation_id = requirements.subgroup_local_invocation_id;
-	state.needs_compute_derivatives          = requirements.compute_derivatives;
-	state.needs_image_gather_extended        = requirements.image_gather_extended;
-	state.needs_function_lds                 = requirements.function_lds;
-	state.needs_pixel_valid_mask             = requirements.pixel_valid_mask;
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
-	AllocateDescriptorVariables(state);
-	EmitHeaderAndTypes(state);
+	DefineModule(state);
 	if (!EmitValueProgram(state, value_program, error)) {
 		return false;
 	}

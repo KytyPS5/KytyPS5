@@ -1297,24 +1297,34 @@ std::vector<u32> MakePassthroughVertexSpirv() {
   using ShaderRecompiler::Spirv::Builder;
 
   Builder b;
-  const auto void_type = b.AllocateId();
-  const auto uint_type = b.AllocateId();
-  const auto float_type = b.AllocateId();
-  const auto vec2_type = b.AllocateId();
-  const auto vec4_type = b.AllocateId();
-  const auto per_vertex_type = b.AllocateId();
-  const auto ptr_input_vec2 = b.AllocateId();
-  const auto ptr_input_vec4 = b.AllocateId();
-  const auto ptr_output_vec4 = b.AllocateId();
-  const auto ptr_output_per_vertex = b.AllocateId();
-  const auto func_type = b.AllocateId();
-  const auto const_u32_0 = b.AllocateId();
-  const auto const_f32_0 = b.AllocateId();
-  const auto const_f32_1 = b.AllocateId();
-  const auto in_pos = b.AllocateId();
-  const auto in_color = b.AllocateId();
-  const auto out_color = b.AllocateId();
-  const auto per_vertex = b.AllocateId();
+  const auto void_type = b.Type(OpTypeVoid);
+  const auto uint_type = b.Type(OpTypeInt, {32, 0});
+  const auto float_type = b.Type(OpTypeFloat, {32});
+  const auto vec2_type = b.Type(OpTypeVector, {float_type, 2});
+  const auto vec4_type = b.Type(OpTypeVector, {float_type, 4});
+  const auto per_vertex_type = b.DecoratedType(
+      OpTypeStruct, {vec4_type},
+      {{OpDecorate, {DecorationBlock}},
+       {OpMemberDecorate, {0, DecorationBuiltIn, BuiltInPosition}}});
+  const auto ptr_input_vec2 =
+      b.Type(OpTypePointer, {StorageClassInput, vec2_type});
+  const auto ptr_input_vec4 =
+      b.Type(OpTypePointer, {StorageClassInput, vec4_type});
+  const auto ptr_output_vec4 =
+      b.Type(OpTypePointer, {StorageClassOutput, vec4_type});
+  const auto ptr_output_per_vertex =
+      b.Type(OpTypePointer, {StorageClassOutput, per_vertex_type});
+  const auto func_type = b.Type(OpTypeFunction, {void_type});
+  const auto const_u32_0 = b.Constant(OpConstant, uint_type, {0});
+  const auto const_f32_0 = b.Constant(OpConstant, float_type, {0x00000000u});
+  const auto const_f32_1 = b.Constant(OpConstant, float_type, {0x3f800000u});
+  const auto in_pos = b.DefineGlobalVariable(ptr_input_vec2, StorageClassInput);
+  const auto in_color =
+      b.DefineGlobalVariable(ptr_input_vec4, StorageClassInput);
+  const auto out_color =
+      b.DefineGlobalVariable(ptr_output_vec4, StorageClassOutput);
+  const auto per_vertex =
+      b.DefineGlobalVariable(ptr_output_per_vertex, StorageClassOutput);
   const auto main = b.AllocateId();
   const auto label = b.AllocateId();
   const auto pos2 = b.AllocateId();
@@ -1324,37 +1334,13 @@ std::vector<u32> MakePassthroughVertexSpirv() {
   const auto position = b.AllocateId();
   const auto position_ptr = b.AllocateId();
 
-  b.AddCapability({CapabilityShader});
+  b.RequireCapability(CapabilityShader);
   b.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
   b.AddEntryPoint(ExecutionModelVertex, main, "main",
                   {in_pos, in_color, per_vertex, out_color});
   b.AddAnnotation({OpDecorate, in_pos, DecorationLocation, 0});
   b.AddAnnotation({OpDecorate, in_color, DecorationLocation, 1});
   b.AddAnnotation({OpDecorate, out_color, DecorationLocation, 0});
-  b.AddAnnotation({OpDecorate, per_vertex_type, DecorationBlock});
-  b.AddAnnotation({OpMemberDecorate, per_vertex_type, 0, DecorationBuiltIn,
-                   BuiltInPosition});
-
-  b.AddType({OpTypeVoid, void_type});
-  b.AddType({OpTypeInt, uint_type, 32, 0});
-  b.AddType({OpTypeFloat, float_type, 32});
-  b.AddType({OpTypeVector, vec2_type, float_type, 2});
-  b.AddType({OpTypeVector, vec4_type, float_type, 4});
-  b.AddType({OpTypeStruct, per_vertex_type, vec4_type});
-  b.AddType({OpTypePointer, ptr_input_vec2, StorageClassInput, vec2_type});
-  b.AddType({OpTypePointer, ptr_input_vec4, StorageClassInput, vec4_type});
-  b.AddType({OpTypePointer, ptr_output_vec4, StorageClassOutput, vec4_type});
-  b.AddType({OpTypePointer, ptr_output_per_vertex, StorageClassOutput,
-             per_vertex_type});
-  b.AddType({OpTypeFunction, func_type, void_type});
-  b.AddType({OpConstant, uint_type, const_u32_0, 0});
-  b.AddType({OpConstant, float_type, const_f32_0, 0x00000000u});
-  b.AddType({OpConstant, float_type, const_f32_1, 0x3f800000u});
-  b.AddType({OpVariable, ptr_input_vec2, in_pos, StorageClassInput});
-  b.AddType({OpVariable, ptr_input_vec4, in_color, StorageClassInput});
-  b.AddType({OpVariable, ptr_output_vec4, out_color, StorageClassOutput});
-  b.AddType(
-      {OpVariable, ptr_output_per_vertex, per_vertex, StorageClassOutput});
 
   b.AddFunction({OpFunction, void_type, main, FunctionControlNone, func_type});
   b.AddFunction({OpLabel, label});
@@ -17471,6 +17457,7 @@ void CheckIndirectImageKeySwitch() {
 
   ShaderComputeInputInfo compute{};
   std::vector<u32> spirv;
+  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
   Require(name, "SPIR-V emit",
           ShaderRecompiler::Spirv::EmitProgram(
               program, snapshot, {.compute = &compute}, spirv, &error),
@@ -17644,9 +17631,9 @@ TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
   test.storage_image_dwords_per_pixel = 1;
   test.storage_image_rgba = std::vector<u32>(16, 0);
   test.expected_storage_image_rgba = expected_image;
-  test.required_spirv = {"OpCapability StorageImageReadWithoutFormat",
-                         "OpCapability StorageImageWriteWithoutFormat"};
-  test.forbidden_spirv = {"Rgba32f"};
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat"};
+  test.forbidden_spirv = {"OpCapability StorageImageReadWithoutFormat",
+                          "Rgba32f", "OpTypeSampler", "OpTypeSampledImage"};
   return test;
 }
 
@@ -17757,6 +17744,10 @@ TestCase ImageAtomicVariants() {
   test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD, O::IMAGE_ATOMIC_UMIN,
                   O::IMAGE_ATOMIC_AND,   O::IMAGE_ATOMIC_OR,  O::IMAGE_ATOMIC_XOR,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpImageTexelPointer", "R32ui"};
+  test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
+                          "StorageImageReadWithoutFormat",
+                          "StorageImageWriteWithoutFormat"};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {

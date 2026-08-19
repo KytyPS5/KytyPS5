@@ -132,6 +132,8 @@ enum : uint32_t {
 	OpTypeStruct                   = 30,
 	OpTypePointer                  = 32,
 	OpTypeFunction                 = 33,
+	OpConstantTrue                 = 41,
+	OpConstantFalse                = 42,
 	OpConstant                     = 43,
 	OpConstantComposite            = 44,
 	OpUndef                        = 1,
@@ -294,109 +296,31 @@ struct DescriptorResourceBinding {
 	uint32_t                     array_index = 0;
 };
 
-struct SampledImageDescriptors {
-	uint32_t image_type         = 0;
-	uint32_t sampled_image_type = 0;
-	uint32_t pointer_type       = 0;
-	uint32_t array_type         = 0;
-	uint32_t array_pointer_type = 0;
-	uint32_t variable           = 0;
-};
-
-struct StorageImageDescriptors {
-	uint32_t image_type         = 0;
-	uint32_t pointer_type       = 0;
-	uint32_t array_type         = 0;
-	uint32_t array_pointer_type = 0;
-	uint32_t variable           = 0;
-};
-
 struct EmitterState {
 	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
 	             ShaderStageInputInfo input_info_)
-	    : program(program_), resources(resources_), input_info(input_info_) {}
+	    : program(program_), resources(resources_), input_info(input_info_),
+	      requirements(*program_.spirv_requirements) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
 	const IR::ResourceSnapshot&                      resources;
 	ShaderStageInputInfo                             input_info;
-	ShaderType                                       stage     = ShaderType::Unknown;
-	uint32_t                                         wave_size = 64;
-	bool                                             per_invocation_masks         = false;
-	uint32_t                                         void_type                    = 0;
-	uint32_t                                         bool_type                    = 0;
-	uint32_t                                         uint_type                    = 0;
-	uint32_t                                         uint_pair_type               = 0;
-	uint32_t                                         int_pair_type                = 0;
-	uint32_t                                         int_type                     = 0;
-	uint32_t                                         float_type                   = 0;
-	uint32_t                                         vec2_uint_type               = 0;
-	uint32_t                                         vec3_uint_type               = 0;
-	uint32_t                                         vec4_uint_type               = 0;
-	uint32_t                                         vec2_int_type                = 0;
-	uint32_t                                         vec3_int_type                = 0;
-	uint32_t                                         vec4_int_type                = 0;
-	uint32_t                                         vec2_float_type              = 0;
-	uint32_t                                         vec3_float_type              = 0;
-	uint32_t                                         vec4_float_type              = 0;
-	uint32_t                                         ptr_func_uint                = 0;
-	uint32_t                                         ptr_func_bool                = 0;
-	uint32_t                                         ptr_func_float               = 0;
-	uint32_t                                         ptr_func_uint_pair           = 0;
-	uint32_t                                         ptr_func_vec4_uint           = 0;
-	uint32_t                                         ptr_func_vec2_float          = 0;
-	uint32_t                                         ptr_input_float              = 0;
-	uint32_t                                         ptr_input_bool               = 0;
-	uint32_t                                         ptr_input_int                = 0;
-	uint32_t                                         ptr_input_uint               = 0;
-	uint32_t                                         ptr_input_vec2_float         = 0;
-	uint32_t                                         ptr_input_vec3_float         = 0;
-	uint32_t                                         ptr_input_vec2_int           = 0;
-	uint32_t                                         ptr_input_vec3_int           = 0;
-	uint32_t                                         ptr_input_vec4_int           = 0;
-	uint32_t                                         ptr_input_vec2_uint          = 0;
-	uint32_t                                         ptr_input_vec3_uint          = 0;
-	uint32_t                                         ptr_input_vec4_uint          = 0;
-	uint32_t                                         ptr_input_vec4_float         = 0;
-	uint32_t                                         sample_mask_array_type       = 0;
-	uint32_t                                         ptr_output_int               = 0;
-	uint32_t                                         ptr_output_sample_mask_array = 0;
-	uint32_t                                         ptr_output_float             = 0;
-	uint32_t                                         ptr_output_vec4_float        = 0;
-	uint32_t                                         per_vertex_type              = 0;
-	uint32_t                                         ptr_output_per_vertex        = 0;
-	uint32_t                                         storage_runtime_array_type   = 0;
-	uint32_t                                         storage_buffer_type          = 0;
-	uint32_t                                         ptr_storage_buffer           = 0;
-	uint32_t                                         ptr_storage_buffer_uint      = 0;
-	uint32_t                                         storage_buffer_array_type    = 0;
-	uint32_t                                         ptr_storage_buffer_array     = 0;
-	uint32_t                                         storage_buffer_variable      = 0;
+	const IR::SpirvRequirements&                     requirements;
+	ShaderType                                       stage                   = ShaderType::Unknown;
+	uint32_t                                         wave_size               = 64;
+	bool                                             per_invocation_masks    = false;
+	uint32_t                                         storage_buffer_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> storage_buffer_offsets {};
-	uint32_t                                         address_memory_array_type = 0;
-	uint32_t                                         ptr_address_memory_array  = 0;
-	uint32_t                                         address_memory_variable   = 0;
-	uint32_t                                         gds_variable              = 0;
-	uint32_t                                         push_constant_array_type  = 0;
-	uint32_t                                         push_constant_block_type  = 0;
-	uint32_t                                         ptr_push_constant_block   = 0;
-	uint32_t                                         ptr_push_constant_uint    = 0;
-	uint32_t                                         push_constant_variable    = 0;
-	uint32_t                                         vsharp_storage_variable   = 0;
-	uint32_t                                         flattened_srt_variable    = 0;
-	uint32_t                                         lds_array_type            = 0;
-	uint32_t                                         ptr_workgroup_array       = 0;
-	uint32_t                                         ptr_workgroup_uint        = 0;
-	uint32_t                                         lds_variable              = 0;
-	std::array<SampledImageDescriptors, 14>          sampled_images;
-	std::array<StorageImageDescriptors, 10>          storage_images;
-	uint32_t                                         sampler_type                          = 0;
-	uint32_t                                         sampler_array_type                    = 0;
-	uint32_t                                         ptr_uniform_sampler                   = 0;
-	uint32_t                                         ptr_uniform_sampler_array             = 0;
+	uint32_t                                         address_memory_variable = 0;
+	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         push_constant_variable  = 0;
+	uint32_t                                         vsharp_storage_variable = 0;
+	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         lds_variable            = 0;
+	std::array<uint32_t, 14>                         sampled_image_variables {};
+	std::array<uint32_t, 10>                         storage_image_variables {};
 	uint32_t                                         sampler_variable                      = 0;
-	uint32_t                                         ptr_image_uint                        = 0;
-	uint32_t                                         func_type                             = 0;
 	uint32_t                                         main_func                             = 0;
 	uint32_t                                         entry_label                           = 0;
 	uint32_t                                         pixel_valid_mask_variable             = 0;
@@ -408,25 +332,32 @@ struct EmitterState {
 	uint32_t                                         dispatch_after_switch_label           = 0;
 	uint32_t                                         dispatch_continue_label               = 0;
 	uint32_t                                         dispatch_merge_label                  = 0;
-	uint32_t                                         glsl_std450                           = 0;
 	uint32_t                                         subgroup_local_invocation_id_variable = 0;
 	uint32_t                                         per_vertex_variable                   = 0;
 	uint32_t                                         depth_variable                        = 0;
 	uint32_t                                         sample_mask_variable                  = 0;
-	bool                                             needs_subgroup_ballot                 = false;
-	bool                                             needs_subgroup_shuffle                = false;
-	bool                                             needs_subgroup_local_invocation_id    = false;
-	bool                                             needs_compute_derivatives             = false;
-	bool                                             needs_image_gather_extended           = false;
-	bool                                             needs_function_lds                    = false;
-	bool                                             needs_pixel_valid_mask                = false;
 	std::vector<InputBinding>                        inputs;
 	std::vector<OutputBinding>                       outputs;
 	std::vector<uint32_t>                            interface_variables;
-	std::map<uint32_t, uint32_t>                     constants;
-	std::map<uint32_t, uint32_t>                     signed_constants;
-	std::map<uint32_t, uint32_t>                     float_constants;
 };
+
+uint32_t TypeVoid(EmitterState& state);
+uint32_t TypeBool(EmitterState& state);
+uint32_t TypeU32(EmitterState& state);
+uint32_t TypeU32Pair(EmitterState& state);
+uint32_t TypeI32(EmitterState& state);
+uint32_t TypeI32Pair(EmitterState& state);
+uint32_t TypeF32(EmitterState& state);
+uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
+uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
+uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
+uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t pointee);
+uint32_t TypeFunction(EmitterState& state);
+uint32_t TypeStorageBufferPointer(EmitterState& state);
+uint32_t TypeStorageBufferElementPointer(EmitterState& state);
+uint32_t TypePushConstantElementPointer(EmitterState& state);
+uint32_t TypeLdsArrayPointer(EmitterState& state, uint32_t storage_class);
+uint32_t TypeLdsElementPointer(EmitterState& state, uint32_t storage_class);
 
 struct ValueEmitContext {
 	ValueEmitContext(EmitterState& state_, const IR::ValueProgram& program_)
@@ -597,14 +528,14 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 
 uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input);
 
-uint32_t VertexParameterScalarType(const EmitterState& state, VertexInputScalarKind kind);
+uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-uint32_t VertexParameterScalarPointerType(const EmitterState& state, VertexInputScalarKind kind);
+uint32_t VertexParameterScalarPointerType(EmitterState& state, VertexInputScalarKind kind);
 
-uint32_t VertexParameterVectorOrScalarType(const EmitterState& state, VertexInputScalarKind kind,
+uint32_t VertexParameterVectorOrScalarType(EmitterState& state, VertexInputScalarKind kind,
                                            uint32_t components);
 
-uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputScalarKind kind,
+uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);
 
 void SetError(std::string* error, const char* message);
@@ -638,11 +569,15 @@ uint32_t ImageViewCoordinateComponents(ImageViewKind view);
 
 uint32_t ImageViewSpatialComponents(ImageViewKind view);
 
-uint32_t ImageViewImageType(const EmitterState& state, ImageViewKind view, bool integer);
+uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view, bool integer);
 
-uint32_t ImageViewSampledImageType(const EmitterState& state, ImageViewKind view, bool integer);
+uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view, bool integer);
 
-uint32_t ImageViewSizeType(const EmitterState& state, ImageViewKind view);
+uint32_t ImageViewSizeType(EmitterState& state, ImageViewKind view);
+
+uint32_t StorageImageType(EmitterState& state, bool uint_image, ImageViewKind view);
+
+uint32_t StorageImagePointerType(EmitterState& state, bool uint_image, ImageViewKind view);
 
 uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
                                     ImageViewKind view);
@@ -679,6 +614,14 @@ uint32_t FloatBits(float value);
 
 uint32_t ConstantF32Value(EmitterState& state, float value);
 
+uint32_t ConstantBool(EmitterState& state, bool value);
+
+uint32_t ConstantU64(EmitterState& state, uint64_t value);
+
+uint32_t ConstantU32x4Zero(EmitterState& state);
+
+uint32_t GlslStd450(EmitterState& state);
+
 void AllocateInputVariables(EmitterState& state);
 
 void AllocateOutputVariables(EmitterState& state);
@@ -694,9 +637,7 @@ void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name
 
 void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
-void EmitHeaderAndTypes(EmitterState& state);
-
-void AllocateDescriptorVariables(EmitterState& state);
+void DefineModule(EmitterState& state);
 
 uint32_t EmitTrueBool(EmitterState& state);
 
@@ -913,7 +854,7 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 
 template <typename Fn>
 uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
-	return EmitValueOrDefaultIfCondition(state, condition, state.uint_type, ConstantU32(state, 0),
+	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
 }
 

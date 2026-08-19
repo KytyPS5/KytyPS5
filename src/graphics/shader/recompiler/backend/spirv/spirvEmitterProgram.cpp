@@ -13,7 +13,7 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	const auto inactive    = state.builder.AllocateId();
-	state.builder.AddFunction({OpLogicalNot, state.bool_type, inactive, active});
+	state.builder.AddFunction({OpLogicalNot, TypeBool(state), inactive, active});
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, inactive, kill_label, merge_label});
 	state.builder.AddFunction({OpLabel, kill_label});
@@ -29,38 +29,26 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	const auto mask_value = state.builder.AllocateId();
 	const auto active     = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpLoad, state.uint_type, mask_value, state.pixel_valid_mask_variable});
+	    {OpLoad, TypeU32(state), mask_value, state.pixel_valid_mask_variable});
 	state.builder.AddFunction(
-	    {OpINotEqual, state.bool_type, active, mask_value, ConstantU32(state, 0)});
+	    {OpINotEqual, TypeBool(state), active, mask_value, ConstantU32(state, 0)});
 	EmitKillIfBoolFalse(state, active);
 }
 
-uint32_t BoolConstant(EmitterState& state, bool value) {
-	const auto id = state.builder.AllocateId();
-	state.builder.AddType({value ? 41u : 42u, state.bool_type, id});
-	return id;
-}
-
-uint32_t ConstantPair(EmitterState& state, uint64_t value) {
-	const auto id = state.builder.AllocateId();
-	state.builder.AddType({OpConstantComposite, state.uint_pair_type, id,
-	                       ConstantU32(state, static_cast<uint32_t>(value)),
-	                       ConstantU32(state, static_cast<uint32_t>(value >> 32u))});
-	return id;
-}
-
-uint32_t PhiPointerType(const EmitterState& state, IR::Type type) {
+uint32_t PhiPointerType(EmitterState& state, IR::Type type) {
 	switch (type) {
-		case IR::Type::U1: return state.ptr_func_bool;
+		case IR::Type::U1: return TypePointer(state, StorageClassFunction, TypeBool(state));
 		case IR::Type::U8:
 		case IR::Type::U16:
 		case IR::Type::U32:
-		case IR::Type::F16: return state.ptr_func_uint;
-		case IR::Type::F32: return state.ptr_func_float;
+		case IR::Type::F16: return TypePointer(state, StorageClassFunction, TypeU32(state));
+		case IR::Type::F32: return TypePointer(state, StorageClassFunction, TypeF32(state));
 		case IR::Type::U64:
-		case IR::Type::U32x2: return state.ptr_func_uint_pair;
-		case IR::Type::U32x4: return state.ptr_func_vec4_uint;
-		case IR::Type::F32x2: return state.ptr_func_vec2_float;
+		case IR::Type::U32x2: return TypePointer(state, StorageClassFunction, TypeU32Pair(state));
+		case IR::Type::U32x4:
+			return TypePointer(state, StorageClassFunction, TypeU32Vector(state, 4));
+		case IR::Type::F32x2:
+			return TypePointer(state, StorageClassFunction, TypeF32Vector(state, 2));
 		default: return 0;
 	}
 }
@@ -168,7 +156,7 @@ void EmitDispatcherTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			EmitDispatcherTarget(ctx, block, term.true_block);
 			EmitDispatcherTarget(ctx, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction({OpSelect, ctx.state.uint_type, selected,
+			ctx.state.builder.AddFunction({OpSelect, TypeU32(ctx.state), selected,
 			                               ctx.Def(info.condition),
 			                               ConstantU32(ctx.state, term.true_block),
 			                               ConstantU32(ctx.state, term.false_block)});
@@ -194,9 +182,9 @@ void EmitDispatcherTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				for (size_t index = 0; index < std::min(values.size(), targets.size()); index++) {
 					const auto match = ctx.state.builder.AllocateId();
 					const auto next  = ctx.state.builder.AllocateId();
-					ctx.state.builder.AddFunction({OpIEqual, ctx.state.bool_type, match, selector,
+					ctx.state.builder.AddFunction({OpIEqual, TypeBool(ctx.state), match, selector,
 					                               ConstantU32(ctx.state, values[index])});
-					ctx.state.builder.AddFunction({OpSelect, ctx.state.uint_type, next, match,
+					ctx.state.builder.AddFunction({OpSelect, TypeU32(ctx.state), next, match,
 					                               ConstantU32(ctx.state, targets[index]),
 					                               selected});
 					selected = next;
@@ -263,10 +251,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx) {
 
 	state.builder.AddFunction({OpLabel, state.dispatch_header_label});
 	const auto pc = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, state.uint_type, pc, state.dispatch_pc_variable});
+	state.builder.AddFunction({OpLoad, TypeU32(state), pc, state.dispatch_pc_variable});
 	const auto done = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpIEqual, state.bool_type, done, pc, ConstantU32(ctx.state, UINT32_MAX)});
+	    {OpIEqual, TypeBool(state), done, pc, ConstantU32(ctx.state, UINT32_MAX)});
 	state.builder.AddFunction(
 	    {OpLoopMerge, state.dispatch_merge_label, state.dispatch_continue_label, LoopControlNone});
 	state.builder.AddFunction(
@@ -303,16 +291,16 @@ void EmitDispatcherFunction(ValueEmitContext& ctx) {
 
 uint32_t ValueEmitContext::TypeId(IR::Type type) const {
 	switch (type) {
-		case IR::Type::U1: return state.bool_type;
+		case IR::Type::U1: return TypeBool(state);
 		case IR::Type::U8:
 		case IR::Type::U16:
 		case IR::Type::U32:
-		case IR::Type::F16: return state.uint_type;
+		case IR::Type::F16: return TypeU32(state);
 		case IR::Type::U64:
-		case IR::Type::U32x2: return state.uint_pair_type;
-		case IR::Type::F32: return state.float_type;
-		case IR::Type::U32x4: return state.vec4_uint_type;
-		case IR::Type::F32x2: return state.vec2_float_type;
+		case IR::Type::U32x2: return TypeU32Pair(state);
+		case IR::Type::F32: return TypeF32(state);
+		case IR::Type::U32x4: return TypeU32Vector(state, 4);
+		case IR::Type::F32x2: return TypeF32Vector(state, 2);
 		default: return 0;
 	}
 }
@@ -321,11 +309,11 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
 		switch (value.GetType()) {
-			case IR::Type::U1: return BoolConstant(state, value.U1());
+			case IR::Type::U1: return ConstantBool(state, value.U1());
 			case IR::Type::U8: return ConstantU32(state, value.U8());
 			case IR::Type::U16: return ConstantU32(state, value.U16());
 			case IR::Type::U32: return ConstantU32(state, value.U32());
-			case IR::Type::U64: return ConstantPair(state, value.U64());
+			case IR::Type::U64: return ConstantU64(state, value.U64());
 			case IR::Type::F16: return ConstantU32(state, value.F16Bits());
 			case IR::Type::F32:
 				return ConstantF32(state, std::bit_cast<uint32_t>(value.F32Value()));
@@ -430,7 +418,7 @@ void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) {
 
 bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std::string* error) {
 	ValueEmitContext ctx(state, program);
-	if (state.stage == ShaderType::Pixel && state.needs_pixel_valid_mask) {
+	if (state.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
@@ -502,19 +490,21 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		}
 	}
 	state.builder.AddFunction(
-	    {OpFunction, state.void_type, state.main_func, FunctionControlNone, state.func_type});
+	    {OpFunction, TypeVoid(state), state.main_func, FunctionControlNone, TypeFunction(state)});
 	state.builder.AddFunction({OpLabel, state.entry_label});
-	if (state.needs_function_lds) {
-		state.builder.AddFunction(
-		    {OpVariable, state.ptr_workgroup_array, state.lds_variable, StorageClassFunction});
+	if (state.requirements.function_lds) {
+		state.builder.AddFunction({OpVariable, TypeLdsArrayPointer(state, StorageClassFunction),
+		                           state.lds_variable, StorageClassFunction});
 	}
 	if (state.pixel_valid_mask_variable != 0) {
-		state.builder.AddFunction({OpVariable, state.ptr_func_uint, state.pixel_valid_mask_variable,
-		                           StorageClassFunction});
+		state.builder.AddFunction({OpVariable,
+		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
+		                           state.pixel_valid_mask_variable, StorageClassFunction});
 	}
 	if (program.dispatcher_fallback) {
-		state.builder.AddFunction(
-		    {OpVariable, state.ptr_func_uint, state.dispatch_pc_variable, StorageClassFunction});
+		state.builder.AddFunction({OpVariable,
+		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
+		                           state.dispatch_pc_variable, StorageClassFunction});
 	}
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -537,8 +527,9 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		}
 	}
 	if (ctx.scratch_u32_variable != 0) {
-		state.builder.AddFunction(
-		    {OpVariable, state.ptr_func_uint, ctx.scratch_u32_variable, StorageClassFunction});
+		state.builder.AddFunction({OpVariable,
+		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
+		                           ctx.scratch_u32_variable, StorageClassFunction});
 	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(

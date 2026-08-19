@@ -25,7 +25,8 @@ ShaderSubgroupConfiguration ConfigureShaderSubgroup(const ShaderSubgroupCapabili
                                                     vk::ShaderStageFlagBits           stage,
                                                     const ShaderRecompiler::IR::Program& program) {
 	const auto guest_wave_size = program.wave_size;
-	if (guest_wave_size != 32u && guest_wave_size != 64u) {
+	if ((guest_wave_size != 32u && guest_wave_size != 64u) ||
+	    !program.spirv_requirements.has_value()) {
 		return {};
 	}
 	if (stage != vk::ShaderStageFlagBits::eCompute) {
@@ -51,7 +52,7 @@ ShaderSubgroupConfiguration ConfigureShaderSubgroup(const ShaderSubgroupCapabili
 	    guest_wave_size <= capabilities.max_subgroup_size) {
 		return {ShaderSubgroupMode::Controlled, guest_wave_size};
 	}
-	if (!ShaderRecompiler::Spirv::GetProgramRequirements(program).requires_exact_subgroup) {
+	if (!program.spirv_requirements->requires_exact_subgroup) {
 		return {ShaderSubgroupMode::FlattenedMasks, 0};
 	}
 	return {};

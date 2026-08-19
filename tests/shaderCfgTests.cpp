@@ -184,6 +184,128 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
   return count;
 }
 
+struct SpirvMetrics {
+  size_t words = 0;
+  uint32_t instructions = 0;
+  uint32_t type_images = 0;
+  uint32_t variables = 0;
+  uint32_t loads = 0;
+  uint32_t stores = 0;
+  uint32_t array_lengths = 0;
+  uint32_t phis = 0;
+  uint32_t labels = 0;
+  uint32_t loop_merges = 0;
+  uint32_t selection_merges = 0;
+  uint32_t branches = 0;
+  uint32_t conditional_branches = 0;
+  uint32_t switches = 0;
+  uint32_t ballots = 0;
+  uint32_t quad_broadcasts = 0;
+};
+
+SpirvMetrics MeasureSpirv(const std::vector<uint32_t> &binary) {
+  SpirvMetrics metrics{};
+  metrics.words = binary.size();
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word = binary[i];
+    const uint32_t opcode = word & 0xffffu;
+    const uint32_t word_count = word >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      break;
+    }
+    metrics.instructions++;
+    switch (opcode) {
+    case 25u: // OpTypeImage
+      metrics.type_images++;
+      break;
+    case 59u: // OpVariable
+      metrics.variables++;
+      break;
+    case 61u: // OpLoad
+      metrics.loads++;
+      break;
+    case 62u: // OpStore
+      metrics.stores++;
+      break;
+    case 68u: // OpArrayLength
+      metrics.array_lengths++;
+      break;
+    case 245u: // OpPhi
+      metrics.phis++;
+      break;
+    case 246u: // OpLoopMerge
+      metrics.loop_merges++;
+      break;
+    case 247u: // OpSelectionMerge
+      metrics.selection_merges++;
+      break;
+    case 248u: // OpLabel
+      metrics.labels++;
+      break;
+    case 249u: // OpBranch
+      metrics.branches++;
+      break;
+    case 250u: // OpBranchConditional
+      metrics.conditional_branches++;
+      break;
+    case 251u: // OpSwitch
+      metrics.switches++;
+      break;
+    case 339u: // OpGroupNonUniformBallot
+      metrics.ballots++;
+      break;
+    case 365u: // OpGroupNonUniformQuadBroadcast
+      metrics.quad_broadcasts++;
+      break;
+    default:
+      break;
+    }
+    i += word_count;
+  }
+  return metrics;
+}
+
+void CheckSpirvBudget(const char *name, const std::vector<uint32_t> &binary,
+                      const SpirvMetrics &budget) {
+  const auto actual = MeasureSpirv(binary);
+  const bool within =
+      actual.words <= budget.words &&
+      actual.instructions <= budget.instructions &&
+      actual.type_images <= budget.type_images &&
+      actual.variables <= budget.variables && actual.loads <= budget.loads &&
+      actual.stores <= budget.stores &&
+      actual.array_lengths <= budget.array_lengths &&
+      actual.phis <= budget.phis && actual.labels <= budget.labels &&
+      actual.loop_merges <= budget.loop_merges &&
+      actual.selection_merges <= budget.selection_merges &&
+      actual.branches <= budget.branches &&
+      actual.conditional_branches <= budget.conditional_branches &&
+      actual.switches <= budget.switches && actual.ballots <= budget.ballots &&
+      actual.quad_broadcasts <= budget.quad_broadcasts;
+  if (!within) {
+    std::fprintf(
+        stderr,
+        "SPIR-V budget %s exceeded\n"
+        "  actual: words=%zu insts=%u images=%u vars=%u loads=%u stores=%u "
+        "lengths=%u phis=%u labels=%u loops=%u selections=%u branches=%u "
+        "cond=%u switches=%u ballots=%u quad=%u\n"
+        "  budget: words=%zu insts=%u images=%u vars=%u loads=%u stores=%u "
+        "lengths=%u phis=%u labels=%u loops=%u selections=%u branches=%u "
+        "cond=%u switches=%u ballots=%u quad=%u\n",
+        name, actual.words, actual.instructions, actual.type_images,
+        actual.variables, actual.loads, actual.stores, actual.array_lengths,
+        actual.phis, actual.labels, actual.loop_merges,
+        actual.selection_merges, actual.branches, actual.conditional_branches,
+        actual.switches, actual.ballots, actual.quad_broadcasts, budget.words,
+        budget.instructions, budget.type_images, budget.variables, budget.loads,
+        budget.stores, budget.array_lengths, budget.phis, budget.labels,
+        budget.loop_merges, budget.selection_merges, budget.branches,
+        budget.conditional_branches, budget.switches, budget.ballots,
+        budget.quad_broadcasts);
+    std::abort();
+  }
+}
+
 uint32_t SpirvArrayLengthCount(const std::vector<uint32_t> &binary,
                                uint32_t requested_length) {
   std::vector<uint32_t> length_ids;
@@ -9447,6 +9569,134 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
   }
 }
 
+void TestNewShaderRecompilerSpirvSizeBaselines() {
+  const auto compile = [](const char *name, std::span<const uint32_t> shader,
+                          const SpirvMetrics &budget,
+                          ShaderType stage = ShaderType::Compute,
+                          ShaderLaneMaskMode lane_mask_mode =
+                              ShaderLaneMaskMode::NativeWave) {
+    auto options = MakeCompileOptions(stage);
+    options.dump_ir = true;
+    options.lane_mask_mode = lane_mask_mode;
+
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+          error.c_str());
+    CheckSpirvBinaryValidates(result.spirv);
+    CheckSpirvBudget(name, result.spirv, budget);
+    return result;
+  };
+
+  const uint32_t empty[] = {EncodeSopp(0x01)};
+  compile("empty", empty,
+          {.words = 640, .instructions = 140, .type_images = 24,
+           .variables = 1, .labels = 4, .branches = 3});
+
+  const uint32_t structured_phi[] = {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 2),         // break when scc == 0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopp(0x02, 0xfffcu),   // continue/backedge
+      EncodeSopp(0x01),
+  };
+  const auto structured_result =
+      compile("structured-phi", structured_phi,
+              {.words = 705,
+               .instructions = 158,
+               .type_images = 24,
+               .variables = 2,
+               .loads = 1,
+               .stores = 2,
+               .phis = 1,
+               .labels = 7,
+               .loop_merges = 1,
+               .branches = 5,
+               .conditional_branches = 1});
+  Check(Common::ContainsStr(structured_result.ir_dump, "Phi"),
+        "structured Phi size fixture no longer contains an IR Phi");
+
+  const uint32_t wide_buffer[] = {
+      EncodeMubuf0(0x0e, 0),
+      EncodeMubuf1(0, 0, 1), // buffer_load_dwordx4 v[0:3]
+      EncodeMubuf0(0x1e, 16),
+      EncodeMubuf1(0, 0, 1), // buffer_store_dwordx4 v[0:3]
+      EncodeSopp(0x01),
+  };
+  const auto wide_result =
+      compile("wide-buffer", wide_buffer,
+              {.words = 2549,
+               .instructions = 583,
+               .type_images = 24,
+               .variables = 3,
+               .loads = 9,
+               .stores = 4,
+               .array_lengths = 8,
+               .phis = 8,
+               .labels = 52,
+               .selection_merges = 16,
+               .branches = 35,
+               .conditional_branches = 16});
+  Check(Common::ContainsStr(wide_result.decoded_dump,
+                            "BUFFER_LOAD_DWORDX4"),
+        "wide buffer size fixture no longer decodes its x4 load");
+  Check(Common::ContainsStr(wide_result.decoded_dump,
+                            "BUFFER_STORE_DWORDX4"),
+        "wide buffer size fixture no longer decodes its x4 store");
+
+  const uint32_t wqm[] = {
+      EncodeVopc(0xc1, 5 + 256, 8), // v_cmp_lt_u32 vcc, v5, v8
+      EncodeSop1(0x0a, 2, 106),     // s_wqm_b64 s[2:3], vcc
+      EncodeVop1(0x01, 0, 2),       // v_mov_b32 v0, s2
+      EncodeExp0(0x0c, 0x1),
+      EncodeExp1(0, 0, 0, 0), // POS0.x
+      EncodeSopp(0x01),
+  };
+  const auto wqm_result =
+      compile("wqm", wqm,
+              {.words = 1221,
+               .instructions = 260,
+               .type_images = 24,
+               .variables = 4,
+               .loads = 3,
+               .stores = 1,
+               .labels = 6,
+               .selection_merges = 1,
+               .branches = 4,
+               .conditional_branches = 1,
+               .ballots = 1,
+               .quad_broadcasts = 4},
+              ShaderType::Vertex, ShaderLaneMaskMode::PerInvocation);
+  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmMask"),
+        "WQM size fixture no longer reaches per-invocation WqmMask IR");
+
+  const uint32_t dispatcher[] = {
+      EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
+      EncodeSopp(0x02, 0),       // A -> C
+      EncodeSopp(0x05, 0xfffeu), // C -> A, fallthrough B
+      EncodeSopp(0x02, 0xfffeu), // B -> C
+      EncodeSopp(0x01),
+  };
+  const auto dispatcher_result =
+      compile("dispatcher", dispatcher,
+              {.words = 822,
+               .instructions = 195,
+               .type_images = 24,
+               .variables = 5,
+               .loads = 4,
+               .stores = 14,
+               .labels = 14,
+               .loop_merges = 1,
+               .selection_merges = 1,
+               .branches = 11,
+               .conditional_branches = 1,
+               .switches = 1});
+  Check(dispatcher_result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
+        "dispatcher size fixture no longer exercises whole-function dispatch");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -9458,6 +9708,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestSpirvRequirementsAnalysis();
+  TestNewShaderRecompilerSpirvSizeBaselines();
   TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();

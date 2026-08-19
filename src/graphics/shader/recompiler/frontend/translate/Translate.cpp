@@ -37,6 +37,29 @@ IR::Operand Translator::OffsetOperand(const IR::Operand& operand, uint32_t offse
 	return result;
 }
 
+IR::Operand Translator::ScalarDestinationOperand(const IR::Operand& operand, uint32_t offset) {
+	EXIT_IF(operand.kind != IR::OperandKind::Register);
+	uint32_t code = 0;
+	switch (operand.reg.file) {
+		case IR::RegisterFile::Scalar: code = operand.reg.index; break;
+		case IR::RegisterFile::Vcc: code = 106u + operand.reg.index; break;
+		default: EXIT("invalid scalar-memory destination");
+	}
+	code += offset;
+	IR::Operand result;
+	result.kind = IR::OperandKind::Register;
+	if (code < 106u) {
+		result.reg = {IR::RegisterFile::Scalar, code};
+	} else {
+		switch (code) {
+			case 106u: result.reg = {IR::RegisterFile::Vcc, 0u}; break;
+			case 107u: result.reg = {IR::RegisterFile::Vcc, 1u}; break;
+			default: EXIT("scalar-memory destination crosses an invalid register");
+		}
+	}
+	return result;
+}
+
 IR::Operand Translator::PlainOperand(const IR::Operand& operand) {
 	auto result               = operand;
 	result.sdwa_sel           = 6;
@@ -653,28 +676,13 @@ void Translator::WriteCompareResult(const IR::Operand& operand, IR::U1 value) {
 }
 
 bool Translator::TranslateBlock(const IR::BasicBlock& source, std::string* error) {
-	ScalarMemorySourceValues scalar_source_snapshot {};
-	uint32_t                 scalar_source_pc           = 0;
-	bool                     has_scalar_source_snapshot = false;
 	for (const auto& source_inst: source.instructions) {
 		current_opcode = source_inst.op;
 		current_pc     = source_inst.pc;
-		const bool grouped_scalar_load =
-		    IsScalarMemoryLoadOperation(source_inst.op) && source_inst.memory.component_count > 1u;
-		if (grouped_scalar_load &&
-		    (!has_scalar_source_snapshot || scalar_source_pc != source_inst.pc ||
-		     source_inst.memory.component_index == 0u)) {
-			scalar_source_snapshot     = ReadScalarMemorySource(source_inst);
-			scalar_source_pc           = source_inst.pc;
-			has_scalar_source_snapshot = true;
-		} else if (!grouped_scalar_load) {
-			has_scalar_source_snapshot = false;
-		}
 		if (static_cast<size_t>(source_inst.op) >= static_cast<size_t>(IR::Opcode::Count)) {
 			return Fail(error, "value IR input opcode is out of range");
 		}
-		if (TranslateInstruction(source_inst,
-		                         grouped_scalar_load ? &scalar_source_snapshot : nullptr)) {
+		if (TranslateInstruction(source_inst)) {
 			continue;
 		}
 		return Fail(error, fmt::format("opcode {} at 0x{:08x} has no typed Value IR lowering",

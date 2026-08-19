@@ -77,24 +77,40 @@ Opcode LoweredImageOpcode(Decoder::Opcode opcode) {
 
 bool LowerScalarMemoryLoadDword(const Decoder::Instruction& decoded, BasicBlock& block, Opcode op,
                                 std::string* error) {
-	for (uint32_t i = 0; i < decoded.data_dwords; i++) {
-		Instruction inst;
-		inst.pc        = decoded.pc;
-		inst.op        = op;
-		inst.src_count = 1;
-		const auto kind =
-		    op == Opcode::SLoadDword ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
-		inst.memory = OffsetMemoryInfo(decoded, kind, i);
-		// Raw s_load uses a two-SGPR pointer base; s_buffer_load uses a four-SGPR
-		// descriptor resource index.
-		inst.memory.resource = op == Opcode::SLoadDword ? RawScalarLoadBase(decoded.src0)
-		                                                : ResourceIndexFromOperand(decoded.src0);
-		if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, i), inst.dst, error) ||
-		    !LowerSourceOperand(decoded.src1, inst.src[0], error)) {
-			return false;
-		}
-		block.instructions.push_back(inst);
+	uint32_t destination_code = 0;
+	const auto alignment = decoded.data_dwords == 1u ? 1u
+	                       : decoded.data_dwords == 2u ? 2u
+	                                                    : 4u;
+	if (!TryGetEncodedScalarCode(decoded.dst, destination_code) ||
+	    destination_code % alignment != 0u ||
+	    destination_code + decoded.data_dwords > 108u) {
+		SetError(error, "scalar-memory destination has an invalid aligned SGPR span");
+		return false;
 	}
+	uint32_t base_code = 0;
+	const auto base_alignment = op == Opcode::SLoadDword ? 2u : 4u;
+	const auto base_width     = op == Opcode::SLoadDword ? 2u : 4u;
+	if (!TryGetEncodedScalarCode(decoded.src0, base_code) ||
+	    base_code % base_alignment != 0u || base_code + base_width > 108u) {
+		SetError(error, "scalar-memory base has an invalid aligned SGPR span");
+		return false;
+	}
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = op;
+	inst.src_count = 1;
+	const auto kind =
+	    op == Opcode::SLoadDword ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+	inst.memory = MemoryInfoFromDecoded(decoded, kind);
+	// Raw s_load uses a two-SGPR pointer base; s_buffer_load uses a four-SGPR
+	// descriptor resource index.
+	inst.memory.resource = op == Opcode::SLoadDword ? RawScalarLoadBase(decoded.src0)
+	                                                : ResourceIndexFromOperand(decoded.src0);
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerSourceOperand(decoded.src1, inst.src[0], error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
 	return true;
 }
 

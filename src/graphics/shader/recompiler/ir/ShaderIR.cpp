@@ -273,7 +273,7 @@ void ClearRegisterOffsetModifiers(Decoder::Operand& operand) {
 	operand.dpp                = false;
 }
 
-bool TryGetScalarDestinationCode(const Decoder::Operand& operand, uint32_t& code) {
+bool TryGetEncodedScalarCode(const Decoder::Operand& operand, uint32_t& code) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
 		case Decoder::OperandKind::VccLo: code = SCALAR_DST_VCC_LO; return true;
@@ -290,7 +290,7 @@ bool TryOffsetScalarDestination(const Decoder::Operand& operand, uint32_t index,
 	// aliases such as VCC and EXEC sit beside ordinary SGPRs. Re-decode after adding the
 	// dword index so s_buffer_load_dwordx2 vcc_lo writes vcc_lo, then vcc_hi.
 	uint32_t code = 0;
-	return TryGetScalarDestinationCode(operand, code) &&
+	return TryGetEncodedScalarCode(operand, code) &&
 	       Decoder::DecodeScalarDestination(code + index, 0, decoded, nullptr);
 }
 

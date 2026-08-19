@@ -181,19 +181,7 @@ IR::ValueOpcode Translator::SharedAtomicOpcode(IR::Opcode opcode) {
 	}
 }
 
-bool Translator::IsScalarMemoryLoadOperation(IR::Opcode opcode) {
-	return opcode == IR::Opcode::SLoadDword || opcode == IR::Opcode::SBufferLoadDword;
-}
-
-ScalarMemorySourceValues Translator::ReadScalarMemorySource(const IR::Instruction& inst) {
-	const auto resource = inst.op == IR::Opcode::SLoadDword
-	                          ? GetScalarAddressResource(inst.memory.resource)
-	                          : GetBufferResource(inst.memory);
-	return {resource, ReadU32(inst.src[0])};
-}
-
-bool Translator::TranslateScalarMemory(const IR::Instruction&          inst,
-                                       const ScalarMemorySourceValues* source_snapshot) {
+bool Translator::TranslateScalarMemory(const IR::Instruction& inst) {
 	switch (inst.op) {
 		case IR::Opcode::LoadSrtDword: {
 			const auto resource = ir.Emit(IR::ValueOpcode::GetSrtResource);
@@ -201,20 +189,30 @@ bool Translator::TranslateScalarMemory(const IR::Instruction&          inst,
 			             ir.Emit(IR::ValueOpcode::ReadConst, {resource, ReadU32(inst.src[0])}));
 			return true;
 		}
-		case IR::Opcode::SBufferLoadDword: {
-			const auto source =
-			    source_snapshot != nullptr ? *source_snapshot : ReadScalarMemorySource(inst);
-			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ReadConstBuffer,
-			                               {source.resource, source.offset}, AddMemoryInfo(inst)));
-			return true;
-		}
+		case IR::Opcode::SBufferLoadDword:
 		case IR::Opcode::SLoadDword: {
-			const auto source =
-			    source_snapshot != nullptr ? *source_snapshot : ReadScalarMemorySource(inst);
-			WriteOperand(inst.dst,
-			             ir.Emit(IR::ValueOpcode::LoadAddressU32,
-			                     {source.resource, source.offset, IR::Value(0u), IR::Value(true)},
-			                     AddMemoryInfo(inst)));
+			const auto resource = inst.op == IR::Opcode::SLoadDword
+			                          ? GetScalarAddressResource(inst.memory.resource)
+			                          : GetBufferResource(inst.memory);
+			const auto offset = ReadU32(inst.src[0]);
+			std::array<IR::Value, 16> loaded {};
+			for (uint32_t component = 0; component < inst.memory.data_dwords; component++) {
+				auto scalar             = inst;
+				scalar.memory.offset += component * sizeof(uint32_t);
+				scalar.memory.data_dwords     = 1u;
+				scalar.memory.component_index = component;
+				if (inst.op == IR::Opcode::SBufferLoadDword) {
+					loaded[component] = ir.Emit(IR::ValueOpcode::ReadConstBuffer,
+					                            {resource, offset}, AddMemoryInfo(scalar));
+				} else {
+					loaded[component] = ir.Emit(
+					    IR::ValueOpcode::LoadAddressU32,
+					    {resource, offset, IR::Value(0u), IR::Value(true)}, AddMemoryInfo(scalar));
+				}
+			}
+			for (uint32_t component = 0; component < inst.memory.data_dwords; component++) {
+				WriteOperand(ScalarDestinationOperand(inst.dst, component), loaded[component]);
+			}
 			return true;
 		}
 		default: return false;
@@ -681,13 +679,12 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 	}
 }
 
-bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
-                                          const ScalarMemorySourceValues* scalar_source_snapshot) {
+bool Translator::TranslateMemoryOperation(const IR::Instruction& inst) {
 	switch (inst.op) {
 		case IR::Opcode::LoadSrtDword:
 		case IR::Opcode::SLoadDword:
 		case IR::Opcode::SBufferLoadDword:
-			return TranslateScalarMemory(inst, scalar_source_snapshot);
+			return TranslateScalarMemory(inst);
 
 		case IR::Opcode::BufferLoadUbyte:
 		case IR::Opcode::BufferLoadSbyte:

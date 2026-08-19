@@ -311,6 +311,33 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				                               ValueOpcodeName(inst.GetOpcode()), inst.NumArgs(),
 				                               NumArgsOf(inst.GetOpcode())));
 			}
+			if (IsRuntimeRead(inst.GetOpcode())) {
+				const auto memory_index = inst.Flags<MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					return Fail(error, fmt::format("{} has an invalid memory-info index",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const auto& memory = program.memory_info[memory_index];
+				const bool scalar_buffer = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+				const bool scalar_address = memory.kind == ResourceKind::ScalarAddress;
+				if ((scalar_buffer && memory.kind != ResourceKind::ScalarBuffer) ||
+				    (!scalar_buffer && !scalar_address && memory.kind != ResourceKind::Flat &&
+				     memory.kind != ResourceKind::Global && memory.kind != ResourceKind::Scratch)) {
+					return Fail(error, fmt::format("{} has an invalid scalar-memory resource kind",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const bool scalar_memory = scalar_buffer || scalar_address;
+				const bool valid_group_width =
+				    scalar_memory ? memory.component_count == 1u || memory.component_count == 2u ||
+				                        memory.component_count == 4u || memory.component_count == 8u ||
+				                        memory.component_count == 16u
+				                  : memory.component_count >= 1u && memory.component_count <= 4u;
+				if (memory.data_bits != 32u || memory.data_dwords != 1u ||
+				    !valid_group_width || memory.component_index >= memory.component_count) {
+					return Fail(error, fmt::format("{} has inconsistent scalar-memory metadata",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+			}
 			const auto buffer_components = BufferComponentCount(inst.GetOpcode());
 			if (buffer_components != 0u) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;

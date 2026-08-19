@@ -5497,121 +5497,77 @@ void TestGraphicsCreateInterpolantMapping() {
         "interpolant identity tail was not filled");
 }
 
-void TestNewShaderRecompilerWideMemoryLowering() {
+void TestNewShaderRecompilerNativeWideScalarMemoryIr() {
   const uint32_t shader[] = {
-      EncodeSmem0(0x02, 4, 4),
-      0u, // s_load_dwordx4 s[4:7]
-      EncodeSmem0(0x0a, 8, 4),
-      0u, // s_buffer_load_dwordx4 s[8:11]
-      EncodeSmem0(0x09, 106, 4),
-      0u, // s_buffer_load_dwordx2 vcc_lo
-      EncodeMubuf0(0x0d, 16),
-      EncodeMubuf1(20, 0, 1), // buffer_load_dwordx2 v[20:21]
-      EncodeMubuf0(0x0f, 32),
-      EncodeMubuf1(24, 0, 1), // buffer_load_dwordx3 v[24:26]
-      EncodeMubuf0(0x0e, 48),
-      EncodeMubuf1(28, 0, 1), // buffer_load_dwordx4 v[28:31]
-      EncodeMubuf0(0x1d, 64),
-      EncodeMubuf1(32, 0, 1), // buffer_store_dwordx2 v[32:33]
-      EncodeMubuf0(0x1f, 80),
-      EncodeMubuf1(36, 0, 1), // buffer_store_dwordx3 v[36:38]
-      EncodeMubuf0(0x1e, 96),
-      EncodeMubuf1(40, 0, 1), // buffer_store_dwordx4 v[40:43]
-      EncodeMubuf0(0x08, 2),
-      EncodeMubuf1(44, 0, 1), // buffer_load_ubyte v44
-      EncodeMubuf0(0x0a, 4),
-      EncodeMubuf1(45, 0, 1), // buffer_load_ushort v45
-      EncodeFlat0(0x0c, 0, 4),
-      EncodeFlat1(50, 0x7d, 0, 1), // flat_load_dword
-      EncodeFlat0(0x0d, 1, 8),
-      EncodeFlat1(52, 0x7d, 0, 1), // scratch_load_dwordx2
-      EncodeFlat0(0x0e, 2, 12),
-      EncodeFlat1(56, 0x7d, 0, 1), // global_load_dwordx4
-      0xbf810000u,
+      EncodeSmem0(0x00, 0, 4), 125u << 25u,
+      EncodeSmem0(0x01, 2, 4), 125u << 25u,
+      EncodeSmem0(0x02, 4, 4), 125u << 25u,
+      EncodeSmem0(0x03, 8, 4), 125u << 25u,
+      EncodeSmem0(0x04, 92, 4), 125u << 25u,
+      EncodeSmem0(0x08, 32, 4), 125u << 25u,
+      EncodeSmem0(0x09, 106, 4), 125u << 25u,
+      EncodeSmem0(0x0a, 36, 4), 125u << 25u,
+      EncodeSmem0(0x0b, 40, 4), 125u << 25u,
+      EncodeSmem0(0x0c, 48, 4), 125u << 25u,
+      EncodeSopp(0x01),
   };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  options.flat_memory_base = 0;
-
-  ShaderRecompiler::CompileResult result;
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::CFG::Graph graph;
+  ShaderRecompiler::IR::Program ir;
   std::string error;
-  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+  Check(ShaderRecompiler::Decoder::DecodeProgram(shader, decoded, &error) &&
+            ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error) &&
+            ShaderRecompiler::IR::LowerProgram(decoded, graph,
+                                                ShaderType::Compute, 64, ir,
+                                                &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "s_load_dwordx4"),
-        "new decoder did not decode SMEM x4 load");
-  Check(Common::ContainsStr(result.decoded_dump, "s_buffer_load_dwordx4"),
-        "new decoder did not decode scalar-buffer x4 load");
-  Check(
-      Common::ContainsStr(result.decoded_dump, "s_buffer_load_dwordx2 vcc_lo"),
-      "new decoder did not decode scalar-buffer x2 load into VCC");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_dwordx2"),
-        "new decoder did not decode buffer x2 load");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_dwordx3"),
-        "new decoder did not decode buffer x3 load");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_dwordx4"),
-        "new decoder did not decode buffer x4 load");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_store_dwordx4"),
-        "new decoder did not decode buffer x4 store");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_ubyte"),
-        "new decoder did not decode buffer ubyte load");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_ushort"),
-        "new decoder did not decode buffer ushort load");
-  Check(Common::ContainsStr(result.decoded_dump, "flat_load_dword"),
-        "new decoder did not decode flat dword load");
-  Check(Common::ContainsStr(result.decoded_dump, "segment=1"),
-        "new decoder did not preserve scratch segment metadata");
-  Check(Common::ContainsStr(result.decoded_dump, "segment=2"),
-        "new decoder did not preserve global segment metadata");
-  Check(Common::ContainsStr(result.decoded_dump, "dwords=4 bits=32"),
-        "new decoder did not expose width metadata for wide memory ops");
-  Check(Common::ContainsStr(result.ir_dump, "SLoadDword s4"),
-        "s_load_dwordx4 did not expand to first scalar dword IR load");
-  Check(Common::ContainsStr(result.ir_dump, "SLoadDword s7"),
-        "s_load_dwordx4 did not expand to last scalar dword IR load");
-  Check(Common::ContainsStr(result.ir_dump, "SBufferLoadDword s8"),
-        "s_buffer_load_dwordx4 did not expand to first scalar-buffer IR load");
-  Check(Common::ContainsStr(result.ir_dump, "SBufferLoadDword s11"),
-        "s_buffer_load_dwordx4 did not expand to last scalar-buffer IR load");
-  Check(Common::ContainsStr(result.ir_dump, "SBufferLoadDword vcc_lo"),
-        "s_buffer_load_dwordx2 did not expand to VCC low dword");
-  Check(Common::ContainsStr(result.ir_dump, "SBufferLoadDword vcc_hi"),
-        "s_buffer_load_dwordx2 did not expand to VCC high dword");
-  Check(
-      CountSourceOccurrences(result.ir_dump, "BufferLoadDword v20") == 1u &&
-          CountSourceOccurrences(result.ir_dump, "BufferLoadDword v24") == 1u &&
-          CountSourceOccurrences(result.ir_dump, "BufferLoadDword v28") == 1u &&
-          !Common::ContainsStr(result.ir_dump, "BufferLoadDword v31"),
-      "wide buffer loads were not preserved as one native IR operation");
-  Check(CountSourceOccurrences(result.ir_dump, "BufferStoreDword null, v32") ==
-                1u &&
-            CountSourceOccurrences(result.ir_dump,
-                                   "BufferStoreDword null, v36") == 1u &&
-            CountSourceOccurrences(result.ir_dump,
-                                   "BufferStoreDword null, v40") == 1u &&
-            !Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v43"),
-        "wide buffer stores were not preserved as one native IR operation");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadUbyte v44"),
-        "buffer_load_ubyte did not lower to sub-dword IR load");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadUshort v45"),
-        "buffer_load_ushort did not lower to sub-dword IR load");
-  Check(Common::ContainsStr(result.ir_dump, "FlatLoadDword v50"),
-        "flat_load_dword did not lower to flat dword IR load");
-  Check(Common::ContainsStr(result.ir_dump, "scratch"),
-        "scratch segment load did not lower with scratch metadata");
-  Check(Common::ContainsStr(result.ir_dump, "global"),
-        "global segment load did not lower with global metadata");
-  Check(SpirvContainsOpcode(result.spirv, 65),
-        "SPIR-V binary does not contain OpAccessChain");
-  Check(SpirvContainsOpcode(result.spirv, 62),
-        "SPIR-V binary does not contain OpStore");
-  Check(SpirvContainsOpcode(result.spirv, 194),
-        "SPIR-V binary does not contain OpShiftRightLogical");
-  Check(SpirvContainsOpcode(result.spirv, 196),
-        "SPIR-V binary does not contain OpShiftLeftLogical");
-  Check(SpirvContainsOpcode(result.spirv, 199),
-        "SPIR-V binary does not contain OpBitwiseAnd");
-  CheckSpirvBinaryValidates(result.spirv);
+  std::vector<uint32_t> address_widths;
+  std::vector<uint32_t> buffer_widths;
+  bool buffer_x2_targets_vcc = false;
+  for (const auto &block : ir.blocks) {
+    for (const auto &inst : block.instructions) {
+      if (inst.op == ShaderRecompiler::IR::Opcode::SLoadDword) {
+        address_widths.push_back(inst.memory.data_dwords);
+      } else if (inst.op ==
+                 ShaderRecompiler::IR::Opcode::SBufferLoadDword) {
+        buffer_widths.push_back(inst.memory.data_dwords);
+        if (inst.memory.data_dwords == 2u) {
+          buffer_x2_targets_vcc =
+              inst.dst.reg.file == ShaderRecompiler::IR::RegisterFile::Vcc &&
+              inst.dst.reg.index == 0u;
+        }
+      }
+    }
+  }
+  const std::vector<uint32_t> expected{1u, 2u, 4u, 8u, 16u};
+  Check(address_widths == expected && buffer_widths == expected,
+        "SMEM x1/x2/x4/x8/x16 did not remain one width-bearing ShaderIR operation each");
+  Check(buffer_x2_targets_vcc,
+        "s_buffer_load_dwordx2 did not preserve its VCC destination span");
+
+  const auto reject = [&](uint32_t opcode, uint32_t dst, uint32_t sbase,
+                          const char *reason) {
+    const uint32_t invalid[] = {EncodeSmem0(opcode, dst, sbase),
+                                125u << 25u, EncodeSopp(0x01)};
+    ShaderRecompiler::Decoder::Program invalid_decoded;
+    ShaderRecompiler::CFG::Graph invalid_graph;
+    ShaderRecompiler::IR::Program invalid_ir;
+    std::string invalid_error;
+    Check(ShaderRecompiler::Decoder::DecodeProgram(invalid, invalid_decoded,
+                                                    &invalid_error) &&
+              ShaderRecompiler::CFG::BuildGraph(invalid_decoded, invalid_graph,
+                                                 &invalid_error) &&
+              !ShaderRecompiler::IR::LowerProgram(
+                  invalid_decoded, invalid_graph, ShaderType::Compute, 64,
+                  invalid_ir, &invalid_error) &&
+              Common::ContainsStr(invalid_error, reason),
+          "invalid SMEM register span was not rejected");
+  };
+  reject(0x01, 1, 4, "destination");
+  reject(0x02, 2, 4, "destination");
+  reject(0x02, 124, 4, "destination");
+  reject(0x00, 0, 63, "base");
+  reject(0x08, 0, 1, "base");
 }
 
 void TestNewShaderRecompilerNativeWideBufferIr() {
@@ -8619,6 +8575,22 @@ void TestNativeWideValueValidation() {
     ir.Emit(opcode, {resource, Value(0u), Value(0u), Value(0u), Value(true)},
             flags);
   };
+  const auto append_scalar_read = [](ValueProgram &program,
+                                     ValueOpcode opcode,
+                                     MemoryFlags flags) {
+    IREmitter ir(program.blocks.front());
+    if (opcode == ValueOpcode::ReadConstBuffer) {
+      const auto resource = ir.Emit(
+          ValueOpcode::GetBufferResource,
+          {Value(0u), Value(0u), Value(0u), Value(0u)});
+      ir.Emit(opcode, {resource, Value(0u)}, flags);
+    } else {
+      const auto resource =
+          ir.Emit(ValueOpcode::GetAddressResource, {Value(0u), Value(0u)});
+      ir.Emit(opcode,
+              {resource, Value(0u), Value(0u), Value(true)}, flags);
+    }
+  };
   const auto check_rejected = [](const ValueProgram &program,
                                  const char *expected) {
     std::string error;
@@ -8626,6 +8598,58 @@ void TestNativeWideValueValidation() {
               Common::ContainsStr(error, expected),
           "malformed native-wide value operation was not rejected");
   };
+
+  {
+    auto program = make_program();
+    append_scalar_read(program, ValueOpcode::ReadConstBuffer,
+                       MemoryFlags{.index = 1});
+    check_rejected(program, "invalid memory-info index");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    program.memory_info.push_back(memory);
+    append_scalar_read(program, ValueOpcode::ReadConstBuffer, {});
+    check_rejected(program, "invalid scalar-memory resource kind");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.data_bits = 16;
+    program.memory_info.push_back(memory);
+    append_scalar_read(program, ValueOpcode::LoadAddressU32, {});
+    check_rejected(program, "inconsistent scalar-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.data_dwords = 2;
+    program.memory_info.push_back(memory);
+    append_scalar_read(program, ValueOpcode::ReadConstBuffer, {});
+    check_rejected(program, "inconsistent scalar-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.component_count = 3;
+    program.memory_info.push_back(memory);
+    append_scalar_read(program, ValueOpcode::ReadConstBuffer, {});
+    check_rejected(program, "inconsistent scalar-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.component_count = 4;
+    memory.component_index = 4;
+    program.memory_info.push_back(memory);
+    append_scalar_read(program, ValueOpcode::LoadAddressU32, {});
+    check_rejected(program, "inconsistent scalar-memory metadata");
+  }
 
   {
     auto program = make_program();
@@ -9890,7 +9914,7 @@ void TestSrtWalkerRealSBufferLowering() {
         "real S_BUFFER_LOAD walk accepted a negative immediate");
 }
 
-void TestScalarMemoryLoadsSnapshotOverlappingOperands() {
+void TestScalarMemorySourcesCapturedBeforeWrites() {
   const auto CheckOverlap = [](uint32_t opcode, bool overlap_offset) {
     const uint32_t base_field = overlap_offset ? 4u : 0u;
     const uint32_t soffset = overlap_offset ? 0u : 125u;
@@ -9932,7 +9956,7 @@ void TestScalarMemoryLoadsSnapshotOverlappingOperands() {
           error.c_str());
     Check(flat.size() == table.size() &&
               std::equal(flat.begin(), flat.end(), table.begin()),
-          "overlapping scalar-memory load did not snapshot its sources");
+          "overlapping scalar-memory load did not capture its sources before writes");
     CheckFlattenedReadSlots(
         ir, 4, "overlapping scalar-memory patch used the wrong flat offsets");
   };
@@ -9974,6 +9998,39 @@ void TestScalarMemoryLoadCrossesIntoVcc() {
                                   ShaderRecompiler::IR::ValueOpcode::ReadConst,
           "wide SMEM descriptor lost a dword crossing into VCC");
   }
+}
+
+void TestScalarMemoryUnusedTailDce() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x0c, 16, 0),
+      4u << 25u,                 // s_buffer_load_dwordx16 s[16:31], s[0:3], s4
+      EncodeVop1(0x01, 0, 16),  // v_mov_b32 v0, s16
+      EncodeMubuf0(0x1c),
+      EncodeMubuf1(0, 2, 1),    // keep only the first loaded component live
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::IR::Program ir;
+  std::string error;
+  Check(LowerTypedPlanning(shader, static_cast<uint32_t>(std::size(shader)),
+                           ir, &error),
+        error.c_str());
+  uint32_t reads = 0;
+  for (const auto *block : ir.values->blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() !=
+          ShaderRecompiler::IR::ValueOpcode::ReadConstBuffer) {
+        continue;
+      }
+      reads++;
+      const auto flags = inst.Flags<ShaderRecompiler::IR::MemoryFlags>();
+      Check(flags.index < ir.values->memory_info.size() &&
+                ir.values->memory_info[flags.index].component_index == 0u &&
+                ir.values->memory_info[flags.index].component_count == 16u,
+            "live x16 SMEM component lost its native-width metadata");
+    }
+  }
+  Check(reads == 1u,
+        "grouped x16 SMEM prevented dead component reads from being eliminated");
 }
 
 void TestResourceTrackingRealDensePatching() {
@@ -10735,6 +10792,7 @@ int main() {
   TestDemandDrivenSpirvDeclarations();
   TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerMubufFormatLowering();
   TestNewShaderRecompilerTypedBufferLowering();
@@ -10809,8 +10867,9 @@ int main() {
   TestSrtWalkerRealSmemLowering();
   TestSrtWalkerVccBaseLowering();
   TestSrtWalkerRealSBufferLowering();
-  TestScalarMemoryLoadsSnapshotOverlappingOperands();
+  TestScalarMemorySourcesCapturedBeforeWrites();
   TestScalarMemoryLoadCrossesIntoVcc();
+  TestScalarMemoryUnusedTailDce();
   TestResourceTrackingRealDensePatching();
   TestLowerProgramResetsAnalysisState();
   TestNewShaderRecompilerNativeBindingPlan();

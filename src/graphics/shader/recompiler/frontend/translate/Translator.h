@@ -7,11 +7,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
 
-struct ScalarMemorySourceValues {
-	IR::Value resource;
-	IR::U32   offset;
-};
-
 class Translator {
 public:
 	Translator(IR::ValueProgram& program, IR::Block* block, uint32_t vector_limit,
@@ -25,6 +20,7 @@ public:
 
 private:
 	IR::Operand            OffsetOperand(const IR::Operand& operand, uint32_t offset);
+	IR::Operand            ScalarDestinationOperand(const IR::Operand& operand, uint32_t offset);
 	IR::Operand            PlainOperand(const IR::Operand& operand);
 	IR::U32                ReadPcRelativeU32(const IR::Operand& operand);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
@@ -85,10 +81,7 @@ private:
 	IR::Value       NarrowSubdword(IR::U32 value, uint32_t bits);
 	IR::ValueOpcode BufferAtomicOpcode(IR::Opcode opcode);
 	IR::ValueOpcode SharedAtomicOpcode(IR::Opcode opcode);
-	bool            IsScalarMemoryLoadOperation(IR::Opcode opcode);
-	ScalarMemorySourceValues ReadScalarMemorySource(const IR::Instruction& inst);
-	bool                     TranslateScalarMemory(const IR::Instruction&          inst,
-	                                               const ScalarMemorySourceValues* source_snapshot);
+	bool            TranslateScalarMemory(const IR::Instruction& inst);
 	bool                     TranslateBufferLoad(const IR::Instruction& inst);
 	bool                     TranslateBufferStore(const IR::Instruction& inst);
 	bool                     TranslateAtomicMemory(const IR::Instruction& inst);
@@ -105,15 +98,13 @@ private:
 	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
 
-	bool TranslateInstruction(const IR::Instruction&          inst,
-	                          const ScalarMemorySourceValues* scalar_source_snapshot);
+	bool TranslateInstruction(const IR::Instruction& inst);
 	bool TranslateStateOperation(const IR::Instruction& inst);
 	bool TranslateControlOperation(const IR::Instruction& inst);
 	bool TranslateMove(const IR::Instruction& inst);
 	bool TranslateLaneOperation(const IR::Instruction& inst);
 	bool TranslateAttributeOperation(const IR::Instruction& inst);
-	bool TranslateMemoryOperation(const IR::Instruction&          inst,
-	                              const ScalarMemorySourceValues* scalar_source_snapshot);
+	bool TranslateMemoryOperation(const IR::Instruction& inst);
 	bool TranslateIntegerCompare(const IR::Instruction& inst);
 	bool TranslateInteger16Compare(const IR::Instruction& inst);
 	bool TranslateFloatCompare(const IR::Instruction& inst);

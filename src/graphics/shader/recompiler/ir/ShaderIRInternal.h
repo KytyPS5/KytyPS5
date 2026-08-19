@@ -30,7 +30,7 @@ uint32_t         ResourceIndexFromOperand(const Decoder::Operand& operand);
 MemoryInfo       MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKind kind);
 uint32_t         RawScalarLoadBase(const Decoder::Operand& operand);
 void             ClearRegisterOffsetModifiers(Decoder::Operand& operand);
-bool             TryGetScalarDestinationCode(const Decoder::Operand& operand, uint32_t& code);
+bool             TryGetEncodedScalarCode(const Decoder::Operand& operand, uint32_t& code);
 bool             TryOffsetScalarDestination(const Decoder::Operand& operand, uint32_t index,
                                             Decoder::Operand& result);
 Decoder::Operand OffsetDecodedRegister(const Decoder::Operand& operand, uint32_t index);

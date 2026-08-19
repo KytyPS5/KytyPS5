@@ -12,20 +12,32 @@ using ShaderError::Fail;
 
 namespace {
 
-bool IsRegisterGet(ValueOpcode opcode) {
+bool IsRegisterStatePseudo(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::GetThreadBitScalarRegister:
+		case ValueOpcode::SetThreadBitScalarRegister:
 		case ValueOpcode::GetScalarRegister:
+		case ValueOpcode::SetScalarRegister:
 		case ValueOpcode::GetVectorRegister:
+		case ValueOpcode::SetVectorRegister:
 		case ValueOpcode::GetGotoVariable:
+		case ValueOpcode::SetGotoVariable:
 		case ValueOpcode::GetScc:
+		case ValueOpcode::SetScc:
 		case ValueOpcode::GetExec:
+		case ValueOpcode::SetExec:
 		case ValueOpcode::GetExecLo:
+		case ValueOpcode::SetExecLo:
 		case ValueOpcode::GetExecHi:
+		case ValueOpcode::SetExecHi:
 		case ValueOpcode::GetVcc:
+		case ValueOpcode::SetVcc:
 		case ValueOpcode::GetVccLo:
+		case ValueOpcode::SetVccLo:
 		case ValueOpcode::GetVccHi:
-		case ValueOpcode::GetM0: return true;
+		case ValueOpcode::SetVccHi:
+		case ValueOpcode::GetM0:
+		case ValueOpcode::SetM0: return true;
 		default: return false;
 	}
 }
@@ -137,8 +149,8 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 			if (inst.Parent() != block) {
 				return Fail(error, "value IR instruction has the wrong parent block");
 			}
-			if (require_ssa && IsRegisterGet(inst.GetOpcode())) {
-				return Fail(error, fmt::format("register getter {} survived SSA rewrite",
+			if (require_ssa && IsRegisterStatePseudo(inst.GetOpcode())) {
+				return Fail(error, fmt::format("register-state pseudo {} survived SSA rewrite",
 				                               ValueOpcodeName(inst.GetOpcode())));
 			}
 			if (inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity &&

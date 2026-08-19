@@ -430,6 +430,10 @@ void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) {
 
 bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std::string* error) {
 	ValueEmitContext ctx(state, program);
+	if (state.stage == ShaderType::Pixel && state.needs_pixel_valid_mask) {
+		state.pixel_valid_mask_variable = state.builder.AllocateId();
+		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
+	}
 	for (const auto* block: program.blocks) {
 		ctx.labels.emplace(block, state.builder.AllocateId());
 		for (const auto& inst: *block) {
@@ -512,10 +516,6 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		state.builder.AddFunction(
 		    {OpVariable, state.ptr_func_uint, state.dispatch_pc_variable, StorageClassFunction});
 	}
-	for (const auto& binding: state.registers) {
-		state.builder.AddFunction(
-		    {OpVariable, state.ptr_func_uint, binding.pointer_id, StorageClassFunction});
-	}
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
@@ -539,10 +539,6 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 	if (ctx.scratch_u32_variable != 0) {
 		state.builder.AddFunction(
 		    {OpVariable, state.ptr_func_uint, ctx.scratch_u32_variable, StorageClassFunction});
-	}
-	for (const auto& binding: state.registers) {
-		state.builder.AddFunction({OpStore, binding.pointer_id,
-		                           ConstantU32(state, InitialRegisterValue(state, binding.reg))});
 	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(

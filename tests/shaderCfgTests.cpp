@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -7506,93 +7507,6 @@ void TestComputeShaderInputWaveSize() {
         "cleared COMPUTE_PGM_RSRC1 W32_EN bit did not decode as wave64");
 }
 
-void TestNewShaderRecompilerWave32MasksExecHighStores() {
-  const uint32_t shader[] = {
-      EncodeSop1(0x04, 126, 193), // s_mov_b64 exec, -1
-      EncodeSopp(0x01),
-  };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  options.wave_size = 32;
-
-  ShaderRecompiler::CompileResult result;
-  std::string error;
-  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
-        error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "s_mov_b64 exec_lo, -1"),
-        "wave32 EXEC mask regression did not decode s_mov_b64 exec, -1");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(CountSourceOccurrences(source, "OpStore %exec_hi %uint_0") >= 2u,
-        "wave32 EXEC high half was not clamped to zero in SPIR-V stores");
-  Check(!Common::ContainsStr(source, "OpStore %exec_hi %uint_4294967295"),
-        "wave32 EXEC high half was stored as a full 64-lane mask");
-}
-
-void TestNewShaderRecompilerWave32VccHighScalarStores() {
-  const uint32_t shader[] = {
-      EncodeSmem0(0x09, 106, 4),
-      0u, // s_buffer_load_dwordx2 vcc_lo
-      EncodeSopp(0x01),
-  };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  options.wave_size = 32;
-
-  ShaderRecompiler::CompileResult result;
-  std::string error;
-  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
-        error.c_str());
-  Check(Common::ContainsStr(result.ir_dump, "SBufferLoadDword vcc_hi"),
-        "wave32 VCC scalar regression did not lower the high VCC dword load");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(CountSourceOccurrences(source, "OpStore %vcc_hi") >= 2u,
-        "wave32 VCC high scalar load did not store to vcc_hi");
-  Check(CountSourceOccurrences(source, "OpStore %vcc_hi %uint_0") == 1u,
-        "wave32 VCC high scalar load was clamped to zero instead of preserving "
-        "data");
-}
-
-void TestNewShaderRecompilerCompareMaskIsFullWaveBallot() {
-  const uint32_t shader[] = {
-      EncodeVopc(0xc1, 0 + 256, 1),  // v_cmp_lt_u32 vcc, v0, v1
-      EncodeSop2(0x0f, 2, 126, 106), // s_and_b64 s[2:3], exec, vcc
-      EncodeSop1(0x04, 126, 2),      // s_mov_b64 exec, s[2:3]
-      EncodeSopp(0x01),
-  };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  options.wave_size = 32;
-
-  ShaderRecompiler::CompileResult result;
-  std::string error;
-  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
-        error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "v_cmp_lt_u32"),
-        "compare-mask ballot regression did not decode V_CMP_LT_U32");
-  Check(Common::ContainsStr(result.ir_dump, "CompareLtU32 vcc_lo"),
-        "compare-mask ballot regression did not lower compare to VCC");
-  Check(
-      Common::ContainsStr(result.ir_dump, "BitwiseAndU64 s2, exec_lo, vcc_lo"),
-      "compare-mask ballot regression did not consume VCC through scalar mask "
-      "ALU");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "OpGroupNonUniformBallot"),
-        "compare-mask result was not materialized with a subgroup ballot");
-  Check(Common::ContainsStr(source, "OpStore %vcc_lo"),
-        "compare-mask ballot regression did not store VCC low mask");
-  Check(Common::ContainsStr(source, "OpStore %vcc_hi %uint_0"),
-        "wave32 compare-mask VCC high half was not cleared");
-}
-
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x0c),
@@ -7885,9 +7799,119 @@ void TestNewShaderRecompilerExpVertexOutputs() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestTypedEntryStateIsMinimal() {
+  using namespace ShaderRecompiler;
+
+  const auto translate = [](ShaderLaneMaskMode lane_mode, uint32_t wave_size) {
+    IR::Program source;
+    source.stage = ShaderType::Compute;
+    source.lane_mask_mode = lane_mode;
+    source.wave_size = wave_size;
+    source.user_data_count = 0;
+    source.blocks.emplace_back();
+    source.blocks.front().id = 0;
+    source.blocks.front().terminator.kind = CFG::TerminatorKind::Return;
+
+    IR::ValueProgram values;
+    ShaderComputeInputInfo compute{};
+    std::string error;
+    Check(Frontend::TranslateProgram(source, values, nullptr, nullptr, &compute,
+                                     &error),
+          error.c_str());
+    return values;
+  };
+
+  const auto check = [&](ShaderLaneMaskMode lane_mode, uint32_t wave_size) {
+    auto values = translate(lane_mode, wave_size);
+    uint32_t set_exec = 0;
+    uint32_t set_exec_lo = 0;
+    uint32_t set_exec_hi = 0;
+    IR::Value exec;
+    IR::Value exec_lo;
+    IR::Value exec_hi;
+    for (const auto *block : values.blocks) {
+      for (const auto &inst : *block) {
+        switch (inst.GetOpcode()) {
+        case IR::ValueOpcode::SetExec:
+          set_exec++;
+          exec = inst.Arg(0).Resolve();
+          break;
+        case IR::ValueOpcode::SetExecLo:
+          set_exec_lo++;
+          exec_lo = inst.Arg(0).Resolve();
+          break;
+        case IR::ValueOpcode::SetExecHi:
+          set_exec_hi++;
+          exec_hi = inst.Arg(0).Resolve();
+          break;
+        case IR::ValueOpcode::SetScalarRegister:
+        case IR::ValueOpcode::SetThreadBitScalarRegister:
+        case IR::ValueOpcode::SetVectorRegister:
+        case IR::ValueOpcode::SetScc:
+        case IR::ValueOpcode::SetVcc:
+        case IR::ValueOpcode::SetVccLo:
+        case IR::ValueOpcode::SetVccHi:
+        case IR::ValueOpcode::SetM0:
+          Check(false, "minimal typed entry contains redundant state writes");
+          break;
+        default:
+          break;
+        }
+      }
+    }
+    Check(set_exec == 1u && set_exec_lo == 1u && set_exec_hi == 1u &&
+              exec.IsImmediate() && exec.U1(),
+          "typed entry does not define EXEC exactly once");
+    if (lane_mode == ShaderLaneMaskMode::PerInvocation) {
+      Check(exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
+                exec_hi.IsImmediate() && exec_hi.U32() == 0u,
+            "per-invocation entry EXEC is not the local {1,0} mask");
+    } else {
+      Check(exec_lo.IsImmediate() && exec_lo.U32() == 0xffffffffu &&
+                exec_hi.IsImmediate() &&
+                exec_hi.U32() == (wave_size == 32u ? 0u : 0xffffffffu),
+            "native entry EXEC does not match the guest wave width");
+    }
+
+    IR::RewriteToSsa(values.blocks);
+    IR::RemoveIdentities(values.blocks);
+    IR::EliminateDeadCode(values.blocks);
+    std::string error;
+    Check(IR::ValidateValueProgram(values, true, &error), error.c_str());
+  };
+
+  check(ShaderLaneMaskMode::NativeWave, 32u);
+  check(ShaderLaneMaskMode::NativeWave, 64u);
+  check(ShaderLaneMaskMode::PerInvocation, 64u);
+}
+
+void TestFinalSsaRejectsRegisterStatePseudos() {
+  using namespace ShaderRecompiler::IR;
+
+  const auto check_rejected = [](bool setter) {
+    ValueProgram program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    program.block_info.emplace_back();
+    IREmitter ir(program.blocks.front());
+    if (setter) {
+      ir.SetScalarReg(ScalarReg{0}, U32(Value(1u)));
+    } else {
+      ir.Emit(ValueOpcode::ReferenceU32, {ir.GetScalarReg(ScalarReg{0})});
+    }
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "register-state pseudo"),
+          "final SSA accepted a register-state pseudo operation");
+  };
+
+  check_rejected(false);
+  check_rejected(true);
+}
+
 void TestNewShaderRecompilerZeroInitialRegisterState() {
   const uint32_t shader[] = {
-      EncodeVop1(0x01, 0, 0), // v_mov_b32 v0, s0
+      EncodeVop1(0x01, 0, 100), // v_mov_b32 v0, s100
       EncodeExp0(0x0c, 0xf),
       EncodeExp1(0, 1, 2, 3), // POS0
       EncodeSopp(0x01),
@@ -7901,14 +7925,31 @@ void TestNewShaderRecompilerZeroInitialRegisterState() {
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
   Check(!Common::ContainsStr(result.ir_dump, "UndefU32"),
-        "typed prologue left guest registers undefined");
+        "SSA initial state left guest registers undefined");
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(!Common::ContainsStr(source, "OpUndef"),
         "zero-initialized guest registers became SPIR-V undef values");
+  Check(!Common::ContainsStr(source, "%s100") &&
+            !Common::ContainsStr(source, "%v0"),
+        "final SPIR-V retained a guest register mirror");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t explicit_zero_shader[] = {
+      EncodeSMovB32(100, 128),   // s_mov_b32 s100, 0
+      EncodeVop1(0x01, 0, 100), // v_mov_b32 v0, s100
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 1, 2, 3), // POS0
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::CompileResult explicit_zero;
+  Check(ShaderRecompiler::TryRecompile(explicit_zero_shader, options,
+                                       explicit_zero, &error),
+        error.c_str());
+  Check(result.spirv == explicit_zero.spirv,
+        "implicit and explicit zero register state emitted different SPIR-V");
 }
 
-void TestNewShaderRecompilerVertexSystemVgprs() {
+void TestNewShaderRecompilerVertexSystemInputsWithoutMirrors() {
   using StageInputKind = ShaderRecompiler::IR::StageInputKind;
 
   const uint32_t shader[] = {
@@ -7932,10 +7973,6 @@ void TestNewShaderRecompilerVertexSystemVgprs() {
         "vertex shader missing VertexIndex input");
   Check(ProgramHasInput(result.program, StageInputKind::InstanceIndex),
         "vertex shader missing InstanceIndex input");
-  Check(Common::ContainsStr(result.ir_dump, "MoveU32 v0, v5"),
-        "vertex shader did not keep v5 as a guest VGPR source");
-  Check(Common::ContainsStr(result.ir_dump, "MoveU32 v1, v8"),
-        "vertex shader did not keep v8 as a guest VGPR source");
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
@@ -7943,10 +7980,9 @@ void TestNewShaderRecompilerVertexSystemVgprs() {
         "vertex SPIR-V does not load gl_VertexIndex");
   Check(CountSourceOccurrences(source, "OpLoad %int %gl_InstanceIndex") == 1u,
         "vertex SPIR-V does not load gl_InstanceIndex");
-  Check(CountSourceOccurrences(source, "OpStore %v5") >= 2u,
-        "vertex SPIR-V does not seed guest v5 from gl_VertexIndex");
-  Check(CountSourceOccurrences(source, "OpStore %v8") >= 2u,
-        "vertex SPIR-V does not seed guest v8 from gl_InstanceIndex");
+  Check(!Common::ContainsStr(source, "%v5") &&
+            !Common::ContainsStr(source, "%v8"),
+        "vertex system values were routed through guest VGPR mirrors");
 }
 
 void TestNewShaderRecompilerVertexExportUsesLaneExecMask() {
@@ -7988,9 +8024,9 @@ void TestNewShaderRecompilerVertexExportUsesLaneExecMask() {
         "per-invocation vertex export lost its EXEC guard");
 }
 
-void TestNewShaderRecompilerPerInvocationMasks() {
+void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   const uint32_t local_shader[] = {
-      EncodeVopc(0xc1, 0 + 256, 1),    // v_cmp_lt_u32 vcc, v0, v1
+      EncodeVopc(0xc1, 5 + 256, 8),    // v_cmp_lt_u32 vcc, v5, v8
       EncodeSop2(0x0f, 2, 126, 106),   // s_and_b64 s[2:3], exec, vcc
       EncodeSop1(0x24, 4, 126),        // s_and_saveexec_b64 s[4:5], exec
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
@@ -8016,17 +8052,13 @@ void TestNewShaderRecompilerPerInvocationMasks() {
       "per-invocation VCC producer still materialized a shared subgroup mask");
   Check(!Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
         "per-invocation BFM EXEC prefix still selected native subgroup lanes");
-  Check(Common::ContainsStr(source, "OpLogicalAnd") &&
-            Common::ContainsStr(source, "OpLogicalNot"),
-        "per-invocation wide mask ALU did not use Boolean operations");
-  Check(Common::ContainsStr(source, "OpStore %vcc_lo") &&
-            Common::ContainsStr(source, "OpStore %vcc_hi %uint_0"),
-        "per-invocation comparison did not store a local Boolean VCC pair");
-  Check(Common::ContainsStr(result.ir_dump, "SaveexecB64 s4, exec_lo"),
-        "per-invocation SAVEEXEC regression did not reach IR");
+  Check(!Common::ContainsStr(source, "%vcc_lo") &&
+            !Common::ContainsStr(source, "%vcc_hi"),
+        "per-invocation comparison retained VCC register mirrors");
 
   const uint32_t wqm_shader[] = {
       EncodeSop1(0x0a, 2, 126), // s_wqm_b64 s[2:3], exec
+      EncodeVop1(0x01, 0, 2),   // v_mov_b32 v0, s2
       EncodeExp0(0x0c, 0xf),
       EncodeExp1(0, 1, 2, 3), // POS0
       EncodeSopp(0x01),
@@ -9760,8 +9792,12 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerSetpcDwordJumpTable();
+  TestTypedEntryStateIsMinimal();
+  TestFinalSsaRejectsRegisterStatePseudos();
   TestNewShaderRecompilerZeroInitialRegisterState();
+  TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
   TestNewShaderRecompilerVertexExportUsesLaneExecMask();
+  TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();

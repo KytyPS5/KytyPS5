@@ -38,18 +38,6 @@ void SetError(std::string* error, const char* message) {
 	}
 }
 
-void CollectRegister(std::vector<RegisterBinding>& registers, IR::Register reg) {
-	if (std::any_of(registers.begin(), registers.end(),
-	                [reg](const RegisterBinding& binding) { return binding.reg == reg; })) {
-		return;
-	}
-	registers.push_back({reg, 0});
-}
-
-bool IsInactiveWave32ExecHigh(const EmitterState& state, IR::Register reg) {
-	return state.wave_size == 32u && reg.file == IR::RegisterFile::Exec && reg.index == 1u;
-}
-
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind,
                uint32_t index) {
 	return std::any_of(outputs.begin(), outputs.end(), [kind, index](const OutputBinding& binding) {
@@ -83,15 +71,6 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 		                               : IR::StageOutputKind::Parameter;
 		if (binding.kind == expected_kind && binding.index == exp.index) {
 			return binding.variable_id;
-		}
-	}
-	return 0;
-}
-
-uint32_t PointerForRegister(const EmitterState& state, IR::Register reg) {
-	for (const auto& binding: state.registers) {
-		if (binding.reg == reg) {
-			return binding.pointer_id;
 		}
 	}
 	return 0;

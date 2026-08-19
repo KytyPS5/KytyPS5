@@ -5,6 +5,19 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+bool UserDataDwordIndex(const EmitterState& state, IR::Register reg, uint32_t& dword_index) {
+	if (reg.file != IR::RegisterFile::Scalar) {
+		return false;
+	}
+	const auto& registers = state.program.bindings.user_data_registers;
+	const auto  found     = std::lower_bound(registers.begin(), registers.end(), reg.index);
+	if (found == registers.end() || *found != reg.index) {
+		return false;
+	}
+	dword_index = static_cast<uint32_t>(found - registers.begin());
+	return true;
+}
+
 uint32_t EmitWqmLaneU32(EmitterState& state, uint32_t src) {
 	uint32_t ret = ConstantU32(state, 0);
 	for (uint32_t i = 0; i < 8u; i++) {
@@ -30,19 +43,6 @@ uint32_t BoolAsU32(ValueEmitContext& ctx, uint32_t value) {
 	ctx.state.builder.AddFunction({OpSelect, ctx.state.uint_type, result, value,
 	                               ConstantU32(ctx.state, 1), ConstantU32(ctx.state, 0)});
 	return result;
-}
-
-void StoreRegisterMirror(ValueEmitContext& ctx, IR::Register reg, uint32_t value) {
-	if (const auto pointer = PointerForRegister(ctx.state, reg); pointer != 0) {
-		if (IsInactiveWave32ExecHigh(ctx.state, reg)) {
-			value = ConstantU32(ctx.state, 0);
-		}
-		ctx.state.builder.AddFunction({OpStore, pointer, value});
-	}
-}
-
-bool IsPrologue(const ValueEmitContext& ctx) {
-	return !ctx.program.blocks.empty() && ctx.current_block == ctx.program.blocks.front();
 }
 
 uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t component) {
@@ -338,61 +338,9 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 	switch (inst.GetOpcode()) {
 		case IR::ValueOpcode::Identity:
 		case IR::ValueOpcode::ConditionRef: ctx.Define(inst, ctx.Arg(inst, 0)); return true;
-		case IR::ValueOpcode::SetScalarRegister:
-			StoreRegisterMirror(
-			    ctx, {IR::RegisterFile::Scalar, IR::RegIndex(inst.Arg(0).ScalarRegister())},
-			    ctx.Arg(inst, 1));
-			return true;
-		case IR::ValueOpcode::SetThreadBitScalarRegister:
-			StoreRegisterMirror(
-			    ctx, {IR::RegisterFile::Scalar, IR::RegIndex(inst.Arg(0).ScalarRegister())},
-			    BoolAsU32(ctx, ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::SetVectorRegister:
-			StoreRegisterMirror(
-			    ctx, {IR::RegisterFile::Vector, IR::RegIndex(inst.Arg(0).VectorRegister())},
-			    ctx.Arg(inst, 1));
-			return true;
-		case IR::ValueOpcode::SetScc: ctx.Arg(inst, 0); return true;
-		case IR::ValueOpcode::SetExec: ctx.Arg(inst, 0); return true;
-		case IR::ValueOpcode::SetExecLo:
-		case IR::ValueOpcode::SetExecHi:
-			if (!IsPrologue(ctx)) {
-				StoreRegisterMirror(ctx,
-				                    {IR::RegisterFile::Exec,
-				                     inst.GetOpcode() == IR::ValueOpcode::SetExecLo ? 0u : 1u},
-				                    ctx.Arg(inst, 0));
-			}
-			return true;
-		case IR::ValueOpcode::SetVcc: ctx.Arg(inst, 0); return true;
-		case IR::ValueOpcode::SetVccLo:
-		case IR::ValueOpcode::SetVccHi:
-			if (!IsPrologue(ctx)) {
-				StoreRegisterMirror(ctx,
-				                    {IR::RegisterFile::Vcc,
-				                     inst.GetOpcode() == IR::ValueOpcode::SetVccLo ? 0u : 1u},
-				                    ctx.Arg(inst, 0));
-			}
-			return true;
-		case IR::ValueOpcode::SetM0:
-			StoreRegisterMirror(ctx, {IR::RegisterFile::M0, 0}, ctx.Arg(inst, 0));
-			return true;
-		case IR::ValueOpcode::GetScalarRegister:
-		case IR::ValueOpcode::GetThreadBitScalarRegister:
-		case IR::ValueOpcode::GetVectorRegister:
-		case IR::ValueOpcode::GetScc:
-		case IR::ValueOpcode::GetExec:
-		case IR::ValueOpcode::GetExecLo:
-		case IR::ValueOpcode::GetExecHi:
-		case IR::ValueOpcode::GetVcc:
-		case IR::ValueOpcode::GetVccLo:
-		case IR::ValueOpcode::GetVccHi:
-		case IR::ValueOpcode::GetM0: return true;
 		case IR::ValueOpcode::Void:
 		case IR::ValueOpcode::Reference:
 		case IR::ValueOpcode::ReferenceU32:
-		case IR::ValueOpcode::Prologue:
-		case IR::ValueOpcode::Epilogue:
 		case IR::ValueOpcode::ControlNop:
 		case IR::ValueOpcode::Waitcnt:
 		case IR::ValueOpcode::Sendmsg:

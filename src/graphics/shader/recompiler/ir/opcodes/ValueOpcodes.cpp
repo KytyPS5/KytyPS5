@@ -74,8 +74,6 @@ bool HasSideEffects(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
-		case ValueOpcode::Prologue:
-		case ValueOpcode::Epilogue:
 		case ValueOpcode::StoreAddressU8:
 		case ValueOpcode::StoreAddressU16:
 		case ValueOpcode::StoreAddressU32:

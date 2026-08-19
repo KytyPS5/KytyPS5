@@ -7,8 +7,6 @@ VALUE_OPCODE(Reference, Void, U1)
 VALUE_OPCODE(ReferenceU32, Void, U32)
 
 // Translation and register-state pseudo operations.
-VALUE_OPCODE(Prologue, Void)
-VALUE_OPCODE(Epilogue, Void)
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
 VALUE_OPCODE(GetShaderBase, U64)
 VALUE_OPCODE(GetBuiltin, U32, U32, U32)

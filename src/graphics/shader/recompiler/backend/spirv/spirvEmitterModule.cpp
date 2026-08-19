@@ -803,18 +803,6 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.builder.AddType({OpTypeFunction, state.func_type, state.void_type});
 }
 
-void AllocateRegisterVariables(EmitterState& state) {
-	if (state.stage == ShaderType::Pixel && state.needs_pixel_valid_mask) {
-		state.pixel_valid_mask_variable = state.builder.AllocateId();
-		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
-	}
-	for (auto& binding: state.registers) {
-		binding.pointer_id = state.builder.AllocateId();
-		const auto name    = IR::RegisterToString(binding.reg);
-		state.builder.AddName(binding.pointer_id, name.c_str());
-	}
-}
-
 void AllocateDescriptorVariables(EmitterState& state) {
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::Buffers) != nullptr) {
 		state.storage_buffer_variable = state.builder.AllocateId();

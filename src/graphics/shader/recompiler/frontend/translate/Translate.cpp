@@ -805,7 +805,7 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 			    return block.id;
 		    })->id;
 		if (max_id == UINT32_MAX) {
-			return Fail(error, "cannot allocate a typed prologue block id");
+			return Fail(error, "cannot allocate a typed entry block id");
 		}
 		CFG::Terminator terminator;
 		terminator.kind       = CFG::TerminatorKind::Branch;
@@ -831,47 +831,35 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 	}
 	if (!result.blocks.empty()) {
 		result.blocks.front()->AddBranch(result.blocks[1]);
-		IR::IREmitter prologue(result.blocks.front());
+		IR::IREmitter entry_ir(result.blocks.front());
 		const auto    builtin = [&](IR::StageInputKind kind, uint32_t component = 0u) {
 			return IR::U32(
-			    prologue.Emit(IR::ValueOpcode::GetBuiltin,
+			    entry_ir.Emit(IR::ValueOpcode::GetBuiltin,
 			                  {IR::Value(static_cast<uint32_t>(kind)), IR::Value(component)}));
 		};
-		prologue.Emit(IR::ValueOpcode::Prologue);
-		const IR::U32 zero(IR::Value(0u));
-		for (uint32_t index = 0; index < IR::NumScalarRegs; index++) {
-			prologue.SetScalarReg(static_cast<IR::ScalarReg>(index), zero);
-		}
-		for (uint32_t index = 0; index < vector_limit; index++) {
-			prologue.SetVectorReg(static_cast<IR::VectorReg>(index), zero);
-		}
 		for (uint32_t index = 0; index < source.user_data_count; index++) {
 			const auto reg = static_cast<IR::ScalarReg>(source.user_data_base + index);
 			if (IR::RegIndex(reg) >= IR::NumScalarRegs) {
 				break;
 			}
-			prologue.SetScalarReg(reg, prologue.GetUserData(reg));
+			entry_ir.SetScalarReg(reg, entry_ir.GetUserData(reg));
 		}
-		prologue.SetScc(IR::U1(IR::Value(false)));
-		prologue.SetExec(IR::U1(IR::Value(true)));
-		prologue.SetExecLo(IR::U32(IR::Value(0xffffffffu)));
-		prologue.SetExecHi(IR::U32(IR::Value(source.wave_size > 32u ? 0xffffffffu : 0u)));
-		prologue.SetVcc(IR::U1(IR::Value(false)));
-		prologue.SetVccLo(IR::U32(IR::Value(0u)));
-		prologue.SetVccHi(IR::U32(IR::Value(0u)));
-		prologue.SetM0(IR::U32(IR::Value(0u)));
+		entry_ir.SetExec(IR::U1(IR::Value(true)));
+		entry_ir.SetExecLo(IR::U32(IR::Value(per_invocation_masks ? 1u : 0xffffffffu)));
+		entry_ir.SetExecHi(IR::U32(IR::Value(
+		    !per_invocation_masks && source.wave_size > 32u ? 0xffffffffu : 0u)));
 		if (source.stage == ShaderType::Compute) {
 			const auto* cs = compute_input_info;
 			const auto  thread_ids =
 			    cs->thread_ids_num > 0 ? std::min<uint32_t>(cs->thread_ids_num, 3u) : 0u;
 			for (uint32_t index = 0; index < thread_ids; index++) {
-				prologue.SetVectorReg(static_cast<IR::VectorReg>(index),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(index),
 				                      builtin(IR::StageInputKind::LocalInvocationId, index));
 			}
 			uint32_t reg_offset = 0;
 			for (uint32_t index = 0; index < 3u; index++) {
 				if (cs->group_id[index]) {
-					prologue.SetScalarReg(
+					entry_ir.SetScalarReg(
 					    static_cast<IR::ScalarReg>(cs->workgroup_register + reg_offset++),
 					    builtin(IR::StageInputKind::WorkgroupId, index));
 				}
@@ -884,43 +872,43 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 				const auto waves = std::min((total_threads + wave_size - 1u) / wave_size, 0x3fu);
 				const auto local_index = builtin(IR::StageInputKind::LocalInvocationIndex);
 				const auto wave_id     = IR::U32(
-				    prologue.Emit(IR::ValueOpcode::UDiv32, {local_index, IR::Value(wave_size)}));
-				const auto wave_bits = prologue.ShiftLeftLogical(wave_id, IR::U32(IR::Value(20u)));
+				    entry_ir.Emit(IR::ValueOpcode::UDiv32, {local_index, IR::Value(wave_size)}));
+				const auto wave_bits = entry_ir.ShiftLeftLogical(wave_id, IR::U32(IR::Value(20u)));
 				const auto first_bit =
-				    prologue.Select(prologue.IEqual(wave_id, IR::U32(IR::Value(0u))),
+				    entry_ir.Select(entry_ir.IEqual(wave_id, IR::U32(IR::Value(0u))),
 				                    IR::U32(IR::Value(0x80000000u)), IR::U32(IR::Value(0u)));
-				prologue.SetScalarReg(
+				entry_ir.SetScalarReg(
 				    static_cast<IR::ScalarReg>(cs->workgroup_register + reg_offset),
-				    prologue.BitwiseOr(prologue.BitwiseOr(wave_bits, IR::U32(IR::Value(waves))),
+				    entry_ir.BitwiseOr(entry_ir.BitwiseOr(wave_bits, IR::U32(IR::Value(waves))),
 				                       first_bit));
 			}
 		} else if (source.stage == ShaderType::Pixel) {
 			const auto* ps  = pixel_input_info;
 			uint32_t    reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
-				prologue.SetVectorReg(static_cast<IR::VectorReg>(reg++),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::FragCoord, 0));
 			}
 			if (ps->ps_pos_y) {
-				prologue.SetVectorReg(static_cast<IR::VectorReg>(reg++),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::FragCoord, 1));
 			}
 			if (ps->ps_pos_z) {
-				prologue.SetVectorReg(static_cast<IR::VectorReg>(reg++),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::FragCoord, 2));
 			}
 			if (ps->ps_pos_w) {
-				prologue.SetVectorReg(static_cast<IR::VectorReg>(reg++),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::FragCoord, 3));
 			}
 			if (ps->ps_front_face) {
-				prologue.SetVectorReg(static_cast<IR::VectorReg>(reg),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg),
 				                      builtin(IR::StageInputKind::FrontFacing));
 			}
 		} else if (source.stage == ShaderType::Vertex) {
-			prologue.SetVectorReg(static_cast<IR::VectorReg>(5),
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
-			prologue.SetVectorReg(static_cast<IR::VectorReg>(8),
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}

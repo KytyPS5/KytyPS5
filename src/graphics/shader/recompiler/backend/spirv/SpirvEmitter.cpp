@@ -232,51 +232,6 @@ static void ReportReserveExceeded(const IR::Program& program, const char* vector
 	            InitialEmitterVectorReserve);
 }
 
-void CollectValueRegisterMirrors(const IR::ValueProgram&                program,
-                                 std::vector<Emitter::RegisterBinding>& registers) {
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			switch (inst.GetOpcode()) {
-				case IR::ValueOpcode::SetScalarRegister:
-				case IR::ValueOpcode::SetThreadBitScalarRegister:
-					if (block != program.blocks.front()) {
-						Emitter::CollectRegister(
-						    registers,
-						    {IR::RegisterFile::Scalar, IR::RegIndex(inst.Arg(0).ScalarRegister())});
-					}
-					break;
-				case IR::ValueOpcode::SetVectorRegister:
-					Emitter::CollectRegister(
-					    registers,
-					    {IR::RegisterFile::Vector, IR::RegIndex(inst.Arg(0).VectorRegister())});
-					break;
-				case IR::ValueOpcode::SetM0:
-					if (block != program.blocks.front()) {
-						Emitter::CollectRegister(registers, {IR::RegisterFile::M0, 0});
-					}
-					break;
-				case IR::ValueOpcode::SetExecLo:
-				case IR::ValueOpcode::SetExecHi:
-					if (block != program.blocks.front()) {
-						Emitter::CollectRegister(
-						    registers, {IR::RegisterFile::Exec,
-						                inst.GetOpcode() == IR::ValueOpcode::SetExecLo ? 0u : 1u});
-					}
-					break;
-				case IR::ValueOpcode::SetVccLo:
-				case IR::ValueOpcode::SetVccHi:
-					if (block != program.blocks.front()) {
-						Emitter::CollectRegister(
-						    registers, {IR::RegisterFile::Vcc,
-						                inst.GetOpcode() == IR::ValueOpcode::SetVccLo ? 0u : 1u});
-					}
-					break;
-				default: break;
-			}
-		}
-	}
-}
-
 IR::SpirvRequirements GetProgramRequirements(const IR::Program& program) {
 	if (program.spirv_requirements.has_value()) {
 		return *program.spirv_requirements;
@@ -418,14 +373,9 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
-	state.exact_subgroup_operations =
-	    !state.per_invocation_masks && requirements.requires_exact_subgroup;
-	state.registers.reserve(InitialEmitterVectorReserve);
 	state.inputs.reserve(InitialEmitterVectorReserve);
 	state.outputs.reserve(InitialEmitterVectorReserve);
 	state.interface_variables.reserve(InitialEmitterVectorReserve);
-	state.reachable_blocks.reserve(InitialEmitterVectorReserve);
-	CollectValueRegisterMirrors(value_program, state.registers);
 	CopyProgramInputsAndOutputs(state, program);
 	state.needs_subgroup_ballot              = requirements.subgroup_ballot;
 	state.needs_subgroup_shuffle             = requirements.subgroup_shuffle;
@@ -438,16 +388,13 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	AllocateOutputVariables(state);
 	AllocateDescriptorVariables(state);
 	EmitHeaderAndTypes(state);
-	AllocateRegisterVariables(state);
 	if (!EmitValueProgram(state, value_program, error)) {
 		return false;
 	}
 
-	ReportReserveExceeded(program, "registers", state.registers.size());
 	ReportReserveExceeded(program, "inputs", state.inputs.size());
 	ReportReserveExceeded(program, "outputs", state.outputs.size());
 	ReportReserveExceeded(program, "interface_variables", state.interface_variables.size());
-	ReportReserveExceeded(program, "reachable_blocks", state.reachable_blocks.size());
 
 	auto binary = state.builder.Build();
 	if (binary.empty()) {

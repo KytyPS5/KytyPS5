@@ -2,6 +2,28 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
+	if (state.push_constant_variable != 0) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, state.ptr_push_constant_uint, pointer,
+		                           state.push_constant_variable, ConstantU32(state, 0),
+		                           ConstantU32(state, dword_index)});
+		state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
+		return value;
+	}
+	if (state.vsharp_storage_variable != 0) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer_uint, pointer,
+		                           state.vsharp_storage_variable, ConstantU32(state, 0),
+		                           ConstantU32(state, dword_index)});
+		state.builder.AddFunction({OpLoad, state.uint_type, value, pointer});
+		return value;
+	}
+	return ConstantU32(state, 0);
+}
+
 uint32_t EmitAddU32(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction({OpIAdd, state.uint_type, ret, lhs, rhs});

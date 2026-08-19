@@ -273,11 +273,6 @@ enum : uint32_t {
 	GlslFindUMsb       = 75,
 };
 
-struct RegisterBinding {
-	IR::Register reg;
-	uint32_t     pointer_id = 0;
-};
-
 struct InputBinding {
 	IR::StageInputKind kind            = IR::StageInputKind::VertexIndex;
 	uint32_t           location        = 0;
@@ -327,7 +322,6 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	ShaderType                                       stage     = ShaderType::Unknown;
 	uint32_t                                         wave_size = 64;
-	bool                                             exact_subgroup_operations    = false;
 	bool                                             per_invocation_masks         = false;
 	uint32_t                                         void_type                    = 0;
 	uint32_t                                         bool_type                    = 0;
@@ -426,15 +420,9 @@ struct EmitterState {
 	bool                                             needs_image_gather_extended           = false;
 	bool                                             needs_function_lds                    = false;
 	bool                                             needs_pixel_valid_mask                = false;
-	bool                                             unsupported_ir_instruction            = false;
-	IR::Opcode                                       unsupported_ir_opcode = IR::Opcode::Count;
-	uint32_t                                         unsupported_ir_pc     = 0;
-	std::vector<RegisterBinding>                     registers;
 	std::vector<InputBinding>                        inputs;
 	std::vector<OutputBinding>                       outputs;
 	std::vector<uint32_t>                            interface_variables;
-	std::vector<bool>                                reachable_blocks;
-	std::map<uint32_t, uint32_t>                     block_labels;
 	std::map<uint32_t, uint32_t>                     constants;
 	std::map<uint32_t, uint32_t>                     signed_constants;
 	std::map<uint32_t, uint32_t>                     float_constants;
@@ -621,17 +609,11 @@ uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputS
 
 void SetError(std::string* error, const char* message);
 
-void CollectRegister(std::vector<RegisterBinding>& registers, IR::Register reg);
-
-bool IsInactiveWave32ExecHigh(const EmitterState& state, IR::Register reg);
-
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
-
-uint32_t PointerForRegister(const EmitterState& state, IR::Register reg);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -714,8 +696,6 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
 void EmitHeaderAndTypes(EmitterState& state);
 
-void AllocateRegisterVariables(EmitterState& state);
-
 void AllocateDescriptorVariables(EmitterState& state);
 
 uint32_t EmitTrueBool(EmitterState& state);
@@ -753,8 +733,6 @@ uint32_t EmitAddU32(EmitterState& state, uint32_t lhs, uint32_t rhs);
 uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
-
-bool UserDataDwordIndex(const EmitterState& state, IR::Register reg, uint32_t& dword_index);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem,
                                    uint32_t use_pc);
@@ -877,8 +855,6 @@ uint32_t EmitFNegateValue(EmitterState& state, uint32_t value);
 uint32_t EmitFAbsValue(EmitterState& state, uint32_t value);
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
-
-uint32_t InitialRegisterValue(const EmitterState& state, IR::Register reg);
 
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst);
 

@@ -1394,10 +1394,9 @@ static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
 static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
                                          std::span<const uint32_t> code,
                                          const std::string&        decoded_dump) {
-	// if (!Config::GraphicsDebugDumpEnabled()) {
-	//	return;
-	// }
-	return;
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
 	EXIT_IF(code.empty());
 
 	static std::atomic_int id = 0;
@@ -1416,6 +1415,9 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 	} else {
 		bin_file.Write(code.data(), code.size_bytes());
 		bin_file.Close();
+	}
+	if (decoded_dump.empty()) {
+		return;
 	}
 
 	Common::File text_file;

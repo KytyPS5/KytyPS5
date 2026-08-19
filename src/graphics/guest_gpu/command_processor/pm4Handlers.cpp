@@ -1248,23 +1248,16 @@ KYTY_HW_CTX_PARSER(HwCtxSetStencilInfo) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetStencilMask) {
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0026900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_STENCILREFMASK);
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0);
+	EXIT_NOT_IMPLEMENTED(cmd_offset < Pm4::DB_STENCILREFMASK);
+	EXIT_NOT_IMPLEMENTED(cmd_offset + num_values - 1u > Pm4::DB_STENCILREFMASK_BF);
 
-	HW::StencilMask r;
+	for (uint32_t i = 0; i < num_values; i++) {
+		g_hw_ctx_indirect_func[(cmd_offset + i) & (Pm4::CX_NUM - 1)](cp, cmd_offset + i, buffer[i]);
+	}
 
-	r.stencil_testval      = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILTESTVAL);
-	r.stencil_mask         = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILMASK);
-	r.stencil_writemask    = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILWRITEMASK);
-	r.stencil_opval        = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILOPVAL);
-	r.stencil_testval_bf   = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILTESTVAL_BF);
-	r.stencil_mask_bf      = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILMASK_BF);
-	r.stencil_writemask_bf = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILWRITEMASK_BF);
-	r.stencil_opval_bf     = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILOPVAL_BF);
-
-	cp.GetCtx().SetStencilMask(r);
-
-	return 2;
+	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetViewportScaleOffset) {

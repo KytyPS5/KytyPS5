@@ -632,7 +632,9 @@ uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputIn
 				continue;
 			}
 			const auto* load = FindEmbeddedFetchLoad(loads, inst.pc);
-			if (load == nullptr || inst.memory.component_index >= load->components) {
+			if (load == nullptr || inst.memory.data_dwords != load->components ||
+			    inst.dst.kind != IR::OperandKind::Register ||
+			    inst.dst.reg.file != IR::RegisterFile::Vector) {
 				continue;
 			}
 
@@ -644,16 +646,16 @@ uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputIn
 				continue;
 			}
 
-			inst.op              = IR::Opcode::LoadInputF32;
-			inst.input_info.attr = static_cast<uint32_t>(resource_id);
-			inst.input_info.chan = inst.memory.component_index;
-			inst.memory          = {};
-			inst.src_count       = 0;
-
+			inst.op                         = IR::Opcode::LoadInputF32;
+			inst.input_info.attr            = static_cast<uint32_t>(resource_id);
+			inst.input_info.chan            = 0;
+			inst.input_info.component_count = load->components;
+			inst.memory                     = {};
+			inst.src_count                  = 0;
 			mutable_input_info->resource_fetch_components[resource_id] =
 			    std::max(mutable_input_info->resource_fetch_components[resource_id],
-			             static_cast<int>(inst.input_info.chan + 1u));
-			rewritten++;
+			             static_cast<int>(load->components));
+			rewritten += load->components;
 		}
 	}
 

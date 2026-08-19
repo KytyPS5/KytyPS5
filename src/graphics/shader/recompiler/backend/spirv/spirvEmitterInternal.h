@@ -342,6 +342,8 @@ uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
+
+uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t pointee);
@@ -615,7 +617,7 @@ uint32_t ConstantBool(EmitterState& state, bool value);
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
-uint32_t ConstantU32x4Zero(EmitterState& state);
+uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
 uint32_t GlslStd450(EmitterState& state);
 

@@ -14910,6 +14910,202 @@ TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
   return test;
 }
 
+TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 8);
+  AppendBufferLoadOpcode(&code, 0x0e, 0, 20);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x33333333u, 0x44444444u, 0u, 0u};
+  test.storage_buffer_range_dwords = 4;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 1, 0xbbbbbbbbu);
+  AppendVMovLiteral(&code, 2, 0xccccccccu);
+  AppendVMovLiteral(&code, 3, 0xddddddddu);
+  AppendVMovU32(&code, 20, 8);
+  code.push_back(EncodeMubuf0(0x1eu));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreDwordx4DropsOnlyOutOfBoundsTail";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x11111111u, 0x22222222u, 0xaaaaaaaau, 0xbbbbbbbbu};
+  test.storage_buffer_range_dwords = 4;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORDX4, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferLoadFormatXyzwRejectsPartialRecord() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 8);
+  AppendBufferLoadOpcode(&code, 0x03, 0, 20);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXyzwRejectsPartialRecord";
+  test.code = std::move(code);
+  test.initial = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.expected = {0u, 0u, 0u, 0u};
+  test.storage_buffer_range_dwords = 4;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwDropsPartialRecord() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 1, 0xbbbbbbbbu);
+  AppendVMovLiteral(&code, 2, 0xccccccccu);
+  AppendVMovLiteral(&code, 3, 0xddddddddu);
+  AppendVMovU32(&code, 20, 8);
+  code.push_back(EncodeMubuf0(0x07u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwDropsPartialRecord";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = test.initial;
+  test.storage_buffer_range_dwords = 4;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferLoadFormatXChecksOnlyTransferredComponent() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 12);
+  AppendBufferLoadOpcode(&code, 0x00, 0, 20);
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXChecksOnlyTransferredComponent";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x44444444u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.storage_buffer_range_dwords = 4;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXChecksOnlyTransferredComponent() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xaaaaaaaau);
+  AppendVMovU32(&code, 20, 12);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXChecksOnlyTransferredComponent";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0xaaaaaaaau};
+  test.storage_buffer_range_dwords = 4;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferLoadFormatXyChecksOnlyTransferredComponents() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 8);
+  AppendBufferLoadOpcode(&code, 0x01, 0, 20);
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadFormatXyChecksOnlyTransferredComponents";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x33333333u, 0x44444444u, 0x33333333u, 0x44444444u};
+  test.storage_buffer_range_dwords = 4;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XY,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyChecksOnlyTransferredComponents() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 1, 0xbbbbbbbbu);
+  AppendVMovU32(&code, 20, 8);
+  code.push_back(EncodeMubuf0(0x05u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyChecksOnlyTransferredComponents";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x11111111u, 0x22222222u, 0xaaaaaaaau, 0xbbbbbbbbu};
+  test.storage_buffer_range_dwords = 4;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false,
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferStoreVariants() {
   using O = ShaderOpcode;
 
@@ -18202,6 +18398,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
+  AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
+  AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
+  AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
+  AddCase(BufferStoreFormatXyzwDropsPartialRecord);
+  AddCase(BufferLoadFormatXChecksOnlyTransferredComponent);
+  AddCase(BufferStoreFormatXChecksOnlyTransferredComponent);
+  AddCase(BufferLoadFormatXyChecksOnlyTransferredComponents);
+  AddCase(BufferStoreFormatXyChecksOnlyTransferredComponents);
   AddCase(BufferStoreVariants);
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);

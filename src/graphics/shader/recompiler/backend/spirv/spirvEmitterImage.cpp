@@ -392,7 +392,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
-		        state, condition, TypeU32Vector(state, 4), ConstantU32x4Zero(state), [&]() {
+		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&]() {
 			        const auto image = LoadSampledImageDescriptor(state, mem, pc, view);
 			        const auto color = state.builder.AllocateId();
 			        const auto coord = CoordU32(ctx, mem, *address, view);

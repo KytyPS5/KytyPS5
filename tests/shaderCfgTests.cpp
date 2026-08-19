@@ -5582,14 +5582,20 @@ void TestNewShaderRecompilerWideMemoryLowering() {
         "s_buffer_load_dwordx2 did not expand to VCC low dword");
   Check(Common::ContainsStr(result.ir_dump, "SBufferLoadDword vcc_hi"),
         "s_buffer_load_dwordx2 did not expand to VCC high dword");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v20"),
-        "buffer_load_dwordx2 did not expand to dword IR loads");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v31"),
-        "buffer_load_dwordx4 did not expand to the last dword IR load");
-  Check(Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v40"),
-        "buffer_store_dwordx4 did not expand to first dword IR store");
-  Check(Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v43"),
-        "buffer_store_dwordx4 did not expand to last dword IR store");
+  Check(
+      CountSourceOccurrences(result.ir_dump, "BufferLoadDword v20") == 1u &&
+          CountSourceOccurrences(result.ir_dump, "BufferLoadDword v24") == 1u &&
+          CountSourceOccurrences(result.ir_dump, "BufferLoadDword v28") == 1u &&
+          !Common::ContainsStr(result.ir_dump, "BufferLoadDword v31"),
+      "wide buffer loads were not preserved as one native IR operation");
+  Check(CountSourceOccurrences(result.ir_dump, "BufferStoreDword null, v32") ==
+                1u &&
+            CountSourceOccurrences(result.ir_dump,
+                                   "BufferStoreDword null, v36") == 1u &&
+            CountSourceOccurrences(result.ir_dump,
+                                   "BufferStoreDword null, v40") == 1u &&
+            !Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v43"),
+        "wide buffer stores were not preserved as one native IR operation");
   Check(Common::ContainsStr(result.ir_dump, "BufferLoadUbyte v44"),
         "buffer_load_ubyte did not lower to sub-dword IR load");
   Check(Common::ContainsStr(result.ir_dump, "BufferLoadUshort v45"),
@@ -5612,6 +5618,64 @@ void TestNewShaderRecompilerWideMemoryLowering() {
         "SPIR-V binary does not contain OpShiftLeftLogical");
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerNativeWideBufferIr() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x0d, 0),
+      EncodeMubuf1(0, 20, 1), // buffer_load_dwordx2 v[0:1]
+      EncodeMubuf0(0x1d, 16),
+      EncodeMubuf1(0, 20, 1), // buffer_store_dwordx2 v[0:1]
+      EncodeMubuf0(0x0f, 32),
+      EncodeMubuf1(4, 20, 1), // buffer_load_dwordx3 v[4:6]
+      EncodeMubuf0(0x1f, 48),
+      EncodeMubuf1(4, 20, 1), // buffer_store_dwordx3 v[4:6]
+      EncodeMubuf0(0x0e, 64),
+      EncodeMubuf1(8, 20, 1), // buffer_load_dwordx4 v[8:11]
+      EncodeMubuf0(0x1e, 80),
+      EncodeMubuf1(8, 20, 1), // buffer_store_dwordx4 v[8:11]
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  std::array<uint32_t, 7> counts{};
+  for (const auto *block : result.program.values->blocks) {
+    for (const auto &inst : *block) {
+      switch (inst.GetOpcode()) {
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32:
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32:
+        counts[0]++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x2:
+        counts[1]++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x2:
+        counts[2]++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x3:
+        counts[3]++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x3:
+        counts[4]++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x4:
+        counts[5]++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x4:
+        counts[6]++;
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  Check(counts == std::array<uint32_t, 7>{0u, 1u, 1u, 1u, 1u, 1u, 1u},
+        "native-wide buffer lowering retained scalar siblings or lost a width");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -5724,27 +5788,23 @@ void TestNewShaderRecompilerMubufFormatLowering() {
   std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_format_x"),
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_LOAD_FORMAT_X"),
         "new decoder did not decode MUBUF format-x load");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_load_format_xyzw"),
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_LOAD_FORMAT_XYZW"),
         "new decoder did not decode MUBUF format-xyzw load");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_store_format_x"),
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_X"),
         "new decoder did not decode MUBUF format-x store");
-  Check(Common::ContainsStr(result.decoded_dump, "buffer_store_format_xyzw"),
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_XYZW"),
         "new decoder did not decode MUBUF format-xyzw store");
   Check(Common::ContainsStr(result.decoded_dump, "typed=0 formatted=1"),
         "MUBUF format decode did not preserve formatted non-typed metadata");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v84"),
-        "MUBUF format-x load did not lower through shared buffer load IR");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v99"),
-        "MUBUF format-xyzw load did not expand to the last shared dword load");
-  Check(Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v100"),
-        "MUBUF format-x store did not lower through shared buffer store IR");
-  Check(
-      Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v115"),
-      "MUBUF format-xyzw store did not expand to the last shared dword store");
-  Check(Common::ContainsStr(result.ir_dump, "typed=0 formatted=1"),
-        "MUBUF format metadata did not survive into IR");
+  Check(!Common::ContainsStr(result.ir_dump, "BufferLoadDword v99"),
+        "MUBUF formatted load retained a scalar tail sibling");
+  Check(CountSourceOccurrences(result.ir_dump, "StoreBufferU32 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x2 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x3 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x4 ") == 1u,
+        "MUBUF formatted stores were not preserved as native-width operations");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
   Check(SpirvContainsOpcode(result.spirv, 61),
@@ -5817,19 +5877,19 @@ void TestNewShaderRecompilerTypedBufferLowering() {
   std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_load_format_x"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_LOAD_FORMAT_X"),
         "new decoder did not decode typed buffer format-x load");
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_load_format_xy"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_LOAD_FORMAT_XY"),
         "new decoder did not decode typed buffer format-xy load");
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_load_format_xyz"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_LOAD_FORMAT_XYZ"),
         "new decoder did not decode typed buffer format-xyz load");
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_load_format_xyzw"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_LOAD_FORMAT_XYZW"),
         "new decoder did not decode typed buffer format-xyzw load");
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_store_format_x"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_STORE_FORMAT_X"),
         "new decoder did not decode typed buffer format-x store");
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_store_format_xy"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_STORE_FORMAT_XY"),
         "new decoder did not decode typed buffer format-xy store");
-  Check(Common::ContainsStr(result.decoded_dump, "tbuffer_store_format_xyzw"),
+  Check(Common::ContainsStr(result.decoded_dump, "TBUFFER_STORE_FORMAT_XYZW"),
         "new decoder did not decode typed buffer format-xyzw store");
   Check(Common::ContainsStr(result.decoded_dump, "dfmt=14 nfmt=7"),
         "MTBUF decode did not expose dfmt/nfmt metadata");
@@ -5837,18 +5897,12 @@ void TestNewShaderRecompilerTypedBufferLowering() {
         "MTBUF decode did not preserve typed metadata");
   Check(Common::ContainsStr(result.decoded_dump, "offen=1"),
         "MTBUF decode did not preserve offen metadata");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v60"),
-        "typed buffer x load did not lower through shared buffer load IR");
-  Check(Common::ContainsStr(result.ir_dump, "BufferLoadDword v71"),
-        "typed buffer xyzw load did not expand to last shared dword load");
-  Check(Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v72"),
-        "typed buffer x store did not lower through shared buffer store IR");
-  Check(Common::ContainsStr(result.ir_dump, "BufferStoreDword null, v83"),
-        "typed buffer xyzw store did not expand to last shared dword store");
-  Check(Common::ContainsStr(result.ir_dump, "typed=1"),
-        "typed buffer metadata did not survive into IR");
-  Check(Common::ContainsStr(result.ir_dump, "dfmt=13 nfmt=7"),
-        "typed buffer format metadata did not survive into IR");
+  Check(!Common::ContainsStr(result.ir_dump, "BufferLoadDword v71"),
+        "typed buffer load retained a scalar tail sibling");
+  Check(CountSourceOccurrences(result.ir_dump, "StoreBufferU32 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x2 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x4 ") == 1u,
+        "typed buffer stores were not preserved as native-width operations");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
   Check(SpirvContainsOpcode(result.spirv, 61),
@@ -7764,6 +7818,47 @@ void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerDispatcherSpillsU32x3() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
+      EncodeSopp(0x02, 0),       // A -> C
+      EncodeSopp(0x05, 0xfffeu), // C -> A, fallthrough B
+      EncodeSopp(0x02, 0xfffeu), // B -> C
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  CompileResult result;
+  std::string error;
+  Check(TryRecompile(shader, options, result, &error), error.c_str());
+  Check(result.program.dispatcher_fallback &&
+            result.program.values->blocks.size() >= 2u,
+        "U32x3 spill fixture did not select dispatcher mode");
+
+  auto program = result.program;
+  IR::IREmitter definition(program.values->blocks[0]);
+  const auto vector = definition.Emit(IR::ValueOpcode::CompositeConstructU32x3,
+                                      {IR::Value(1u), IR::Value(2u),
+                                       IR::Value(3u)});
+  IR::IREmitter use(program.values->blocks[1]);
+  use.Emit(IR::ValueOpcode::CompositeExtractU32x3,
+           {vector, IR::Value(2u)});
+  Check(Spirv::AnalyzeProgramRequirements(program, &error), error.c_str());
+
+  std::vector<uint32_t> spirv;
+  Check(Spirv::EmitProgram(program, result.resources, options.input_info,
+                           spirv, &error),
+        error.c_str());
+  CheckSpirvBinaryValidates(spirv);
+  const auto before = MeasureSpirv(result.spirv);
+  const auto after = MeasureSpirv(spirv);
+  Check(after.function_variables == before.function_variables + 1u &&
+            after.loads == before.loads + 1u &&
+            after.stores == before.stores + 1u,
+        "dispatcher did not use one canonical U32x3 spill slot");
+}
+
 void TestComputeShaderInputWaveSize() {
   const auto decode_wave_size = [](uint32_t rsrc1) {
     const bool wave32 = (((rsrc1 >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
@@ -8406,6 +8501,82 @@ void TestValuePhiValidation() {
   };
   validate_cfg(true);
   validate_cfg(false);
+}
+
+void TestNativeWideValueValidation() {
+  using namespace ShaderRecompiler::IR;
+
+  const auto make_program = [] {
+    ValueProgram program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    program.block_info.emplace_back();
+    program.block_info.front().id = 0;
+    program.block_info.front().terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Return;
+    return program;
+  };
+  const auto append_load = [](ValueProgram &program, ValueOpcode opcode,
+                              MemoryFlags flags) {
+    IREmitter ir(program.blocks.front());
+    const auto resource = ir.Emit(ValueOpcode::GetBufferResource,
+                                  {Value(0u), Value(0u), Value(0u), Value(0u)});
+    ir.Emit(opcode,
+            {resource, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+  };
+  const auto check_rejected = [](const ValueProgram &program,
+                                 const char *expected) {
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, expected),
+          "malformed native-wide value operation was not rejected");
+  };
+
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.data_dwords = 3;
+    program.memory_info.push_back(memory);
+    append_load(program, ValueOpcode::LoadBufferU32x3,
+                MemoryFlags{.index = 1});
+    check_rejected(program, "invalid memory-info index");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Lds;
+    memory.data_dwords = 3;
+    program.memory_info.push_back(memory);
+    append_load(program, ValueOpcode::LoadBufferU32x3, {});
+    check_rejected(program, "non-buffer resource kind");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.data_dwords = 2;
+    program.memory_info.push_back(memory);
+    append_load(program, ValueOpcode::LoadBufferU32x3, {});
+    check_rejected(program, "inconsistent native-wide metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.data_dwords = 3;
+    program.memory_info.push_back(memory);
+    append_load(program, ValueOpcode::LoadBufferU32, {});
+    check_rejected(program, "scalar-sibling width metadata");
+  }
+  {
+    auto program = make_program();
+    IREmitter ir(program.blocks.front());
+    const auto vector = ir.Emit(ValueOpcode::CompositeConstructU32x3,
+                                {Value(1u), Value(2u), Value(3u)});
+    ir.Emit(ValueOpcode::CompositeExtractU32x3, {vector, Value(3u)});
+    check_rejected(program, "invalid component index");
+  }
 }
 
 void TestNewShaderRecompilerZeroInitialRegisterState() {
@@ -9658,9 +9829,15 @@ void TestResourceTrackingRealDensePatching() {
       case ShaderRecompiler::IR::ValueOpcode::LoadBufferU8:
       case ShaderRecompiler::IR::ValueOpcode::LoadBufferU16:
       case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32:
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x2:
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x3:
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x4:
       case ShaderRecompiler::IR::ValueOpcode::StoreBufferU8:
       case ShaderRecompiler::IR::ValueOpcode::StoreBufferU16:
-      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32: {
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32:
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x2:
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x3:
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x4: {
         const auto &memory =
             ir.values->memory_info
                 [inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index];
@@ -9694,7 +9871,7 @@ void TestResourceTrackingRealDensePatching() {
       }
     }
   }
-  Check(buffer_use == 4 && image_use == 2 && ir.info.buffers[0].read &&
+  Check(buffer_use == 3 && image_use == 2 && ir.info.buffers[0].read &&
             ir.info.buffers[1].written,
         "real tracked resource access facts were incomplete");
 }
@@ -10177,22 +10354,49 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 915,
-                                    .instructions = 254,
+                                   {.words = 797,
+                                    .instructions = 209,
                                     .runtime_arrays = 1,
                                     .variables = 2,
                                     .loads = 9,
                                     .stores = 4,
-                                    .array_lengths = 8,
-                                    .phis = 8,
-                                    .labels = 52,
-                                    .selection_merges = 16,
-                                    .branches = 35,
-                                    .conditional_branches = 16});
+                                    .array_lengths = 2,
+                                    .phis = 5,
+                                    .labels = 34,
+                                    .selection_merges = 10,
+                                    .branches = 23,
+                                    .conditional_branches = 10});
   Check(Common::ContainsStr(wide_result.decoded_dump, "BUFFER_LOAD_DWORDX4"),
         "wide buffer size fixture no longer decodes its x4 load");
   Check(Common::ContainsStr(wide_result.decoded_dump, "BUFFER_STORE_DWORDX4"),
         "wide buffer size fixture no longer decodes its x4 store");
+  uint32_t wide_loads = 0;
+  uint32_t wide_stores = 0;
+  uint32_t scalar_loads = 0;
+  uint32_t scalar_stores = 0;
+  for (const auto *block : wide_result.program.values->blocks) {
+    for (const auto &inst : *block) {
+      switch (inst.GetOpcode()) {
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32x4:
+        wide_loads++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32x4:
+        wide_stores++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::LoadBufferU32:
+        scalar_loads++;
+        break;
+      case ShaderRecompiler::IR::ValueOpcode::StoreBufferU32:
+        scalar_stores++;
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  Check(wide_loads == 1u && wide_stores == 1u && scalar_loads == 0u &&
+            scalar_stores == 0u,
+        "wide buffer fixture retained scalar sibling memory operations");
 
   const uint32_t wqm[] = {
       EncodeVopc(0xc1, 5 + 256, 8), // v_cmp_lt_u32 vcc, v5, v8
@@ -10260,6 +10464,9 @@ int main() {
   TestDemandDrivenSpirvDeclarations();
   TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerNativeWideBufferIr();
+  TestNewShaderRecompilerMubufFormatLowering();
+  TestNewShaderRecompilerTypedBufferLowering();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized direct SPIR-V are exercised by
@@ -10302,6 +10509,7 @@ int main() {
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
+  TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestComputeShaderInputWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
@@ -10313,6 +10521,7 @@ int main() {
   TestTypedEntryStateIsMinimal();
   TestFinalSsaRejectsRegisterStatePseudos();
   TestValuePhiValidation();
+  TestNativeWideValueValidation();
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
   TestNewShaderRecompilerVertexExportUsesLaneExecMask();

@@ -55,6 +55,7 @@ static_assert(std::is_trivially_copyable_v<ExportFlags>);
 [[nodiscard]] size_t           NumArgsOf(ValueOpcode opcode);
 [[nodiscard]] bool             HasSideEffects(ValueOpcode opcode);
 [[nodiscard]] BufferAccess     BufferAccessOf(ValueOpcode opcode);
+[[nodiscard]] uint32_t         BufferComponentCount(ValueOpcode opcode);
 [[nodiscard]] std::string_view ValueOpcodeName(ValueOpcode opcode);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

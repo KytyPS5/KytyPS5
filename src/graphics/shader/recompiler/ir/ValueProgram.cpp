@@ -304,6 +304,46 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				return Fail(error, fmt::format("untyped opcode {} survived translation",
 				                               ValueOpcodeName(inst.GetOpcode())));
 			}
+			const auto buffer_components = BufferComponentCount(inst.GetOpcode());
+			if (buffer_components != 0u) {
+				const auto memory_index = inst.Flags<MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					return Fail(error, fmt::format("{} has an invalid memory-info index",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const auto& memory = program.memory_info[memory_index];
+				if (memory.kind != ResourceKind::Buffer &&
+				    memory.kind != ResourceKind::ScalarBuffer) {
+					return Fail(error, fmt::format("{} has a non-buffer resource kind",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				if (buffer_components > 1u &&
+				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
+				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
+					return Fail(error, fmt::format("{} has inconsistent native-wide metadata",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				if (buffer_components == 1u &&
+				    (inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
+				     inst.GetOpcode() == ValueOpcode::StoreBufferU32) &&
+				    memory.data_dwords != 1u) {
+					return Fail(error, fmt::format("{} retains scalar-sibling width metadata",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+			}
+			uint32_t composite_components = 0u;
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::CompositeExtractU32x2: composite_components = 2u; break;
+				case ValueOpcode::CompositeExtractU32x3: composite_components = 3u; break;
+				case ValueOpcode::CompositeExtractU32x4: composite_components = 4u; break;
+				default: break;
+			}
+			if (composite_components != 0u &&
+			    (!inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32 ||
+			     inst.Arg(1).U32() >= composite_components)) {
+				return Fail(error, fmt::format("{} has an invalid component index",
+				                               ValueOpcodeName(inst.GetOpcode())));
+			}
 			for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
 				const auto arg = inst.Arg(arg_index);
 				if (arg.IsEmpty()) {

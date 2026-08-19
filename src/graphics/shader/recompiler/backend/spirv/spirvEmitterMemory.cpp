@@ -163,47 +163,78 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = index};
 }
 
+PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                           const MemoryResourceAccess& resource,
+                                           uint32_t                    raw_index) {
+	return {.resource = resource, .index = EmitMemoryElementIndex(ctx.state, resource, raw_index)};
+}
+
+uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
+                          uint32_t index);
+
+uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
+                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
+
+uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                          const MemoryResourceAccess& resource) {
+	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
+	return EmitValueOrZeroIfCondition(
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
+	    [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+}
+
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    const auto value = ctx.state.builder.AllocateId();
-			    ctx.state.builder.AddFunction(
-			        {OpLoad, TypeU32(ctx.state), value,
-			         EmitMemoryElementPointer(ctx.state, access.resource, access.index)});
-			    return value;
-		    });
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		return LoadWordPrepared(ctx, inst, mem, resource);
 	});
+}
+
+uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                             const MemoryResourceAccess& resource, uint32_t bits,
+                             bool sign_extend) {
+	const auto address   = ByteAddress(ctx, inst, mem);
+	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
+	                              ConstantU32(ctx.state, 2));
+	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	return EmitValueOrZeroIfCondition(
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+		    return LoadSubwordInBounds(ctx, access.resource, address, access.index, bits,
+		                               sign_extend);
+	    });
+}
+
+uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
+                          uint32_t index) {
+	const auto value   = ctx.state.builder.AllocateId();
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
+	return value;
+}
+
+uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
+                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
+	const auto word = LoadWordInBounds(ctx, resource, index);
+	const auto byte =
+	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address, ConstantU32(ctx.state, 3));
+	const auto shift =
+	    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), byte, ConstantU32(ctx.state, 3));
+	const auto value =
+	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
+	           Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), word, shift),
+	           ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu));
+	if (!sign_extend) return value;
+	const auto left = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), value,
+	                         ConstantU32(ctx.state, 32u - bits));
+	return Binary(ctx.state, OpShiftRightArithmetic, TypeU32(ctx.state), left,
+	              ConstantU32(ctx.state, 32u - bits));
 }
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto address   = ByteAddress(ctx, inst, mem);
-		const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
-		                              ConstantU32(ctx.state, 2));
-		const auto access    = PrepareMemoryElement(ctx, mem, raw_index);
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    const auto word = ctx.state.builder.AllocateId();
-			    ctx.state.builder.AddFunction(
-			        {OpLoad, TypeU32(ctx.state), word,
-			         EmitMemoryElementPointer(ctx.state, access.resource, access.index)});
-			    const auto byte  = Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address,
-			                              ConstantU32(ctx.state, 3));
-			    const auto shift = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), byte,
-			                              ConstantU32(ctx.state, 3));
-			    const auto value =
-			        Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
-			               Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), word, shift),
-			               ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu));
-			    if (!sign_extend) return value;
-			    const auto left = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), value,
-			                             ConstantU32(ctx.state, 32u - bits));
-			    return Binary(ctx.state, OpShiftRightArithmetic, TypeU32(ctx.state), left,
-			                  ConstantU32(ctx.state, 32u - bits));
-		    });
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
 	});
 }
 
@@ -215,58 +246,115 @@ Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::Inst&
 
 IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, Prospero::BufferFormat format,
                                         uint32_t component) {
-	if (!mem.typed) {
-		const auto component_slot = mem.component_index * 4u;
-		mem.offset                = mem.offset >= component_slot ? mem.offset - component_slot : 0u;
-		mem.offset += Format::GetFormatComponentByteOffset(format, component);
-	}
+	mem.offset += Format::GetFormatComponentByteOffset(format, component);
+	mem.data_dwords     = 1u;
+	mem.component_index = component;
 	return mem;
 }
 
-uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	const auto format = BufferFormat(ctx, inst, mem);
-	if (!Format::IsKnownFormat(format)) return LoadWord(ctx, inst, mem);
-	const auto info      = Format::GetFormatInfo(format);
-	auto       component = mem.component_index;
-	if (!mem.typed) {
-		const auto selector =
-		    GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle, component);
-		if (selector == 0u) return ConstantU32(ctx.state, 0);
-		if (selector == 1u) {
-			const auto integer = info.type == Format::ComponentType::Uint ||
-			                     info.type == Format::ComponentType::Sint;
-			return ConstantU32(ctx.state, integer ? 1u : 0x3f800000u);
-		}
-		if (selector < 4u) {
-			ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers,
-			                             mem.resource, "buffer descriptor has reserved dst_sel");
-		}
-		component = selector - 4u;
+IR::MemoryInfo RebaseRawComponent(IR::MemoryInfo mem, uint32_t component) {
+	mem.offset += component * 4u;
+	mem.data_dwords     = 1u;
+	mem.component_index = component;
+	return mem;
+}
+
+enum class FormattedSourceKind { Memory, Zero, One };
+
+struct FormattedSource {
+	FormattedSourceKind kind      = FormattedSourceKind::Zero;
+	uint32_t            component = 0;
+};
+
+FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                       const Format::BufferFormatInfo& info,
+                                       uint32_t                        output_component) {
+	if (mem.typed) {
+		return output_component < info.component_count
+		           ? FormattedSource {FormattedSourceKind::Memory, output_component}
+		           : FormattedSource {};
 	}
-	if (component >= info.component_count) return ConstantU32(ctx.state, 0);
-	uint32_t   raw  = 0;
-	const auto bits = info.component_bits[component];
+	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
+	                                output_component);
+	if (selector == 0u) return {};
+	if (selector == 1u) return {FormattedSourceKind::One, 0};
+	if (selector < 4u) {
+		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer descriptor has reserved dst_sel");
+	}
+	const auto component = selector - 4u;
+	return component < info.component_count
+	           ? FormattedSource {FormattedSourceKind::Memory, component}
+	           : FormattedSource {};
+}
+
+uint32_t FormattedConstant(ValueEmitContext& ctx, const Format::BufferFormatInfo& info,
+                           FormattedSourceKind kind) {
+	if (kind != FormattedSourceKind::One) return ConstantU32(ctx.state, 0);
+	const auto integer =
+	    info.type == Format::ComponentType::Uint || info.type == Format::ComponentType::Sint;
+	return ConstantU32(ctx.state, integer ? 1u : 0x3f800000u);
+}
+
+template <typename LoadWordFn, typename LoadSubwordFn>
+uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                Prospero::BufferFormat format, const Format::BufferFormatInfo& info,
+                                uint32_t output_component, LoadWordFn&& load_word,
+                                LoadSubwordFn&& load_subword) {
+	const auto source = ResolveFormattedSource(ctx, mem, info, output_component);
+	if (source.kind != FormattedSourceKind::Memory) {
+		return FormattedConstant(ctx, info, source.kind);
+	}
+	const auto component = source.component;
+	const auto bits      = info.component_bits[component];
+	uint32_t   raw       = 0;
 	if (info.packed_bitfield) {
-		raw = LoadWord(ctx, inst, RebaseFormattedComponent(mem, format, component));
+		raw = load_word(component);
 		const auto type =
 		    IsSignedFormatComponent(info.type) ? TypeI32(ctx.state) : TypeU32(ctx.state);
-		const auto source =
+		const auto source_value =
 		    type == TypeI32(ctx.state) ? Unary(ctx.state, OpBitcast, type, raw) : raw;
 		const auto extracted = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(
 		    {IsSignedFormatComponent(info.type) ? OpBitFieldSExtract : OpBitFieldUExtract, type,
-		     extracted, source, ConstantU32(ctx.state, info.component_bit_offset[component]),
+		     extracted, source_value, ConstantU32(ctx.state, info.component_bit_offset[component]),
 		     ConstantU32(ctx.state, bits)});
 		raw = type == TypeI32(ctx.state)
 		          ? Unary(ctx.state, OpBitcast, TypeU32(ctx.state), extracted)
 		          : extracted;
 	} else if (bits == 32u) {
-		raw = LoadWord(ctx, inst, RebaseFormattedComponent(mem, format, component));
+		raw = load_word(component);
 	} else {
-		raw = LoadSubword(ctx, inst, RebaseFormattedComponent(mem, format, component), bits,
-		                  IsSignedFormatComponent(info.type));
+		raw = load_subword(component, bits, IsSignedFormatComponent(info.type));
 	}
 	return NormalizeFormatComponent(ctx.state, info, component, raw);
+}
+
+uint32_t FormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
+                               const IR::MemoryInfo& mem, uint32_t output_component,
+                               const MemoryResourceAccess& resource) {
+	const auto format = BufferFormat(ctx, inst, mem);
+	if (!Format::IsKnownFormat(format)) {
+		return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, output_component), resource);
+	}
+	const auto info = Format::GetFormatInfo(format);
+	return LoadFormattedComponent(
+	    ctx, mem, format, info, output_component,
+	    [&](uint32_t component) {
+		    return LoadWordPrepared(ctx, inst, RebaseFormattedComponent(mem, format, component),
+		                            resource);
+	    },
+	    [&](uint32_t component, uint32_t bits, bool sign_extend) {
+		    return LoadSubwordPrepared(ctx, inst, RebaseFormattedComponent(mem, format, component),
+		                               resource, bits, sign_extend);
+	    });
+}
+
+uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		return FormattedLoadPrepared(ctx, inst, mem, 0u, resource);
+	});
 }
 
 template <typename Fn>
@@ -304,73 +392,102 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	return observed;
 }
 
+void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                          const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
+                          uint32_t bits, uint32_t data) {
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	const auto shift   = Binary(
+	    ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address, ConstantU32(ctx.state, 3)),
+	    ConstantU32(ctx.state, 3));
+	const auto mask  = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+	                          ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu), shift);
+	const auto value = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+	                          Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), data,
+	                                 ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
+	                          shift);
+	const auto merge = [&](uint32_t old) {
+		return Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+		              Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), old,
+		                     Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
+		              value);
+	};
+	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
+		AtomicUpdate(ctx.state, pointer, mem.kind, merge);
+	} else {
+		const auto old = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
+		ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
+	}
+}
+
+void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                          const MemoryResourceAccess& resource, uint32_t bits, uint32_t data) {
+	const auto address   = ByteAddress(ctx, inst, mem);
+	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
+	                              ConstantU32(ctx.state, 2));
+	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	EmitIfCondition(
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+		    StoreSubwordInBounds(ctx, mem, access.resource, address, access.index, bits, data);
+	    });
+}
+
 void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto address   = ByteAddress(ctx, inst, mem);
-		const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
-		                              ConstantU32(ctx.state, 2));
-		const auto access    = PrepareMemoryElement(ctx, mem, raw_index);
-		EmitIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    const auto pointer =
-			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
-			    const auto shift = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-			                              Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
-			                                     address, ConstantU32(ctx.state, 3)),
-			                              ConstantU32(ctx.state, 3));
-			    const auto mask =
-			        Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-			               ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu), shift);
-			    const auto value =
-			        Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-			               Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
-			                      ctx.Arg(inst, inst.NumArgs() - 2),
-			                      ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
-			               shift);
-			    const auto merge = [&](uint32_t old) {
-				    return Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
-				                  Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), old,
-				                         Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
-				                  value);
-			    };
-			    if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-				    AtomicUpdate(ctx.state, pointer, mem.kind, merge);
-			    } else {
-				    const auto old = ctx.state.builder.AllocateId();
-				    ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
-				    ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
-			    }
-		    });
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		StoreSubwordPrepared(ctx, inst, mem, resource, bits, ctx.Arg(inst, inst.NumArgs() - 2));
 	});
+}
+
+void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                       const MemoryResourceAccess& resource, uint32_t data) {
+	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
+	EmitIfCondition(
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+		    ctx.state.builder.AddFunction(
+		        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+		         data});
+	    });
+}
+
+void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                       uint32_t data) {
+	ctx.state.builder.AddFunction(
+	    {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		EmitIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    ctx.state.builder.AddFunction(
-			        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-			         ctx.Arg(inst, inst.NumArgs() - 2)});
-		    });
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		StoreWordPrepared(ctx, inst, mem, resource, ctx.Arg(inst, inst.NumArgs() - 2));
 	});
 }
 
-void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+void FormattedStorePrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                            uint32_t component, const MemoryResourceAccess& resource,
+                            uint32_t data) {
 	const auto format = BufferFormat(ctx, inst, mem);
 	if (!Format::IsKnownFormat(format)) {
-		StoreWord(ctx, inst, mem);
+		StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
 		return;
 	}
 	const auto info = Format::GetFormatInfo(format);
-	if (mem.component_index >= info.component_count) return;
-	const auto bits          = info.component_bits[mem.component_index];
-	const auto component_mem = RebaseFormattedComponent(mem, format, mem.component_index);
+	if (component >= info.component_count) return;
+	const auto bits          = info.component_bits[component];
+	const auto component_mem = RebaseFormattedComponent(mem, format, component);
 	if (bits == 8u || bits == 16u) {
-		StoreSubword(ctx, inst, component_mem, bits);
+		StoreSubwordPrepared(ctx, inst, component_mem, resource, bits, data);
 	} else {
-		StoreWord(ctx, inst, component_mem);
+		StoreWordPrepared(ctx, inst, component_mem, resource, data);
 	}
+}
+
+void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		FormattedStorePrepared(ctx, inst, mem, 0u, resource, ctx.Arg(inst, inst.NumArgs() - 2));
+	});
 }
 
 uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
@@ -573,11 +690,192 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	return result;
 }
 
+struct PreparedFormattedMemory {
+	Prospero::BufferFormat   format = Prospero::BufferFormat::kInvalid;
+	Format::BufferFormatInfo info;
+	MemoryResourceAccess     resource;
+	std::array<uint32_t, 4>  addresses {};
+	std::array<uint32_t, 4>  indices {};
+	uint32_t                 in_bounds = 0;
+};
+
+enum class FormattedAccess { Load, Store };
+
+PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::Inst& inst,
+                                               const IR::MemoryInfo&       mem,
+                                               const MemoryResourceAccess& resource,
+                                               uint32_t components, FormattedAccess access) {
+	PreparedFormattedMemory plan;
+	plan.format      = BufferFormat(ctx, inst, mem);
+	plan.info        = Format::GetFormatInfo(plan.format);
+	plan.resource    = resource;
+	std::array<bool, 4> required_components {};
+	if (access == FormattedAccess::Load) {
+		for (uint32_t output = 0; output < components; output++) {
+			const auto source = ResolveFormattedSource(ctx, mem, plan.info, output);
+			if (source.kind == FormattedSourceKind::Memory) {
+				required_components[source.component] = true;
+			}
+		}
+	} else {
+		for (uint32_t component = 0;
+		     component < std::min(components, plan.info.component_count); component++) {
+			required_components[component] = true;
+		}
+	}
+	bool first_bound = true;
+	for (uint32_t component = 0; component < plan.info.component_count; component++) {
+		if (!required_components[component]) continue;
+		const auto byte_offset = Format::GetFormatComponentByteOffset(plan.format, component);
+		bool       reused      = false;
+		for (uint32_t previous = 0; previous < component; previous++) {
+			if (required_components[previous] &&
+			    Format::GetFormatComponentByteOffset(plan.format, previous) == byte_offset) {
+				plan.addresses[component] = plan.addresses[previous];
+				plan.indices[component]   = plan.indices[previous];
+				reused                    = true;
+				break;
+			}
+		}
+		if (reused) continue;
+		const auto component_mem  = RebaseFormattedComponent(mem, plan.format, component);
+		plan.addresses[component] = ByteAddress(ctx, inst, component_mem);
+		const auto raw_index      = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state),
+		                                   plan.addresses[component], ConstantU32(ctx.state, 2));
+		plan.indices[component]   = EmitMemoryElementIndex(ctx.state, resource, raw_index);
+		const auto component_bound =
+		    EmitMemoryElementInBounds(ctx.state, resource, plan.indices[component]);
+		if (first_bound) {
+			plan.in_bounds = component_bound;
+			first_bound    = false;
+		} else {
+			plan.in_bounds = AndCondition(ctx.state, plan.in_bounds, component_bound);
+		}
+	}
+	if (first_bound) plan.in_bounds = ConstantBool(ctx.state, true);
+	return plan;
+}
+
+uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                               const PreparedFormattedMemory& plan, uint32_t output_component) {
+	return LoadFormattedComponent(
+	    ctx, mem, plan.format, plan.info, output_component,
+	    [&](uint32_t component) {
+		    return LoadWordInBounds(ctx, plan.resource, plan.indices[component]);
+	    },
+	    [&](uint32_t component, uint32_t bits, bool sign_extend) {
+		    return LoadSubwordInBounds(ctx, plan.resource, plan.addresses[component],
+		                               plan.indices[component], bits, sign_extend);
+	    });
+}
+
+uint32_t ConstructU32Composite(EmitterState& state, uint32_t components,
+                               const std::array<uint32_t, 4>& values) {
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> words {OpCompositeConstruct, TypeU32Composite(state, components), result};
+	words.insert(words.end(), values.begin(), values.begin() + components);
+	state.builder.AddFunction(words);
+	return result;
+}
+
+uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                   const PreparedFormattedMemory& plan, uint32_t components) {
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
+		values[component] = FormattedConstant(ctx, plan.info, source.kind);
+	}
+	return ConstructU32Composite(ctx.state, components, values);
+}
+
+void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                            const PreparedFormattedMemory& plan, uint32_t component,
+                            uint32_t data) {
+	if (component >= plan.info.component_count) return;
+	const auto bits = plan.info.component_bits[component];
+	if (bits == 8u || bits == 16u) {
+		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
+		                     plan.indices[component], bits, data);
+	} else {
+		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
+	}
+}
+
+uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
+	    ConstantU32CompositeZero(state, components), [&]() {
+		    const auto mem      = ctx.Memory(inst);
+		    const auto resource = PrepareMemoryResourceAccess(state, mem);
+		    const auto format =
+		        mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
+		    if (Format::IsKnownFormat(format)) {
+			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
+			                                            FormattedAccess::Load);
+			    return EmitValueOrDefaultIfCondition(
+			        state, plan.in_bounds, TypeU32Composite(state, components),
+			        FormattedOutOfBoundsValue(ctx, mem, plan, components), [&]() {
+				        std::array<uint32_t, 4> values {};
+				        for (uint32_t component = 0; component < components; component++) {
+					        values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
+				        }
+				        return ConstructU32Composite(state, components, values);
+			        });
+		    }
+		    std::array<uint32_t, 4> values {};
+		    for (uint32_t component = 0; component < components; component++) {
+			    values[component] =
+			        LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
+		    }
+		    return ConstructU32Composite(state, components, values);
+	    });
+}
+
+void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto mem       = ctx.Memory(inst);
+		const auto resource  = PrepareMemoryResourceAccess(state, mem);
+		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
+		const auto format =
+		    mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
+		if (Format::IsKnownFormat(format)) {
+			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
+			                                        FormattedAccess::Store);
+			EmitIfCondition(state, plan.in_bounds, [&]() {
+				for (uint32_t component = 0; component < components; component++) {
+					const auto data = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpCompositeExtract, TypeU32(state), data, composite, component});
+					StoreFormattedInBounds(ctx, mem, plan, component, data);
+				}
+			});
+			return;
+		}
+		for (uint32_t component = 0; component < components; component++) {
+			const auto data = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpCompositeExtract, TypeU32(state), data, composite, component});
+			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
+		}
+	});
+}
+
 } // namespace
 
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state = ctx.state;
-	const auto op    = inst.GetOpcode();
+	auto&      state             = ctx.state;
+	const auto op                = inst.GetOpcode();
+	const auto buffer_components = IR::BufferComponentCount(op);
+	if (buffer_components > 1u) {
+		if (IR::BufferAccessOf(op) == IR::BufferAccess::Read) {
+			ctx.Define(inst, LoadWideBuffer(ctx, inst, buffer_components));
+		} else {
+			StoreWideBuffer(ctx, inst, buffer_components);
+		}
+		return true;
+	}
 	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::ReadConstBuffer) &&
 	    ctx.Memory(inst).planning_only) {
 		return true;

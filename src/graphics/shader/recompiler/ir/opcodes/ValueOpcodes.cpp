@@ -34,6 +34,7 @@ constexpr Type U64             = Type::U64;
 constexpr Type F16             = Type::F16;
 constexpr Type F32             = Type::F32;
 constexpr Type U32x2           = Type::U32x2;
+constexpr Type U32x3           = Type::U32x3;
 constexpr Type U32x4           = Type::U32x4;
 constexpr Type F32x2           = Type::F32x2;
 constexpr Type SrtResource     = Type::SrtResource;
@@ -133,10 +134,16 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::ReadConstBuffer:
 		case ValueOpcode::LoadBufferU8:
 		case ValueOpcode::LoadBufferU16:
-		case ValueOpcode::LoadBufferU32: return BufferAccess::Read;
+		case ValueOpcode::LoadBufferU32:
+		case ValueOpcode::LoadBufferU32x2:
+		case ValueOpcode::LoadBufferU32x3:
+		case ValueOpcode::LoadBufferU32x4: return BufferAccess::Read;
 		case ValueOpcode::StoreBufferU8:
 		case ValueOpcode::StoreBufferU16:
-		case ValueOpcode::StoreBufferU32: return BufferAccess::Write;
+		case ValueOpcode::StoreBufferU32:
+		case ValueOpcode::StoreBufferU32x2:
+		case ValueOpcode::StoreBufferU32x3:
+		case ValueOpcode::StoreBufferU32x4: return BufferAccess::Write;
 		case ValueOpcode::BufferAtomicSwap32:
 		case ValueOpcode::BufferAtomicIAdd32:
 		case ValueOpcode::BufferAtomicISub32:
@@ -150,6 +157,18 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
 		default: return BufferAccess::None;
+	}
+}
+
+uint32_t BufferComponentCount(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadBufferU32x2:
+		case ValueOpcode::StoreBufferU32x2: return 2u;
+		case ValueOpcode::LoadBufferU32x3:
+		case ValueOpcode::StoreBufferU32x3: return 3u;
+		case ValueOpcode::LoadBufferU32x4:
+		case ValueOpcode::StoreBufferU32x4: return 4u;
+		default: return BufferAccessOf(opcode) == BufferAccess::None ? 0u : 1u;
 	}
 }
 

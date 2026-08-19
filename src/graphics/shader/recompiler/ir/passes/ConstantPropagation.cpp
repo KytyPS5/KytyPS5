@@ -287,6 +287,9 @@ void FoldInstruction(Inst& inst) {
 		case ValueOpcode::CompositeExtractU32x2:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x2, 2);
 			return;
+		case ValueOpcode::CompositeExtractU32x3:
+			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x3, 3);
+			return;
 		case ValueOpcode::CompositeExtractU32x4:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x4, 4);
 			return;

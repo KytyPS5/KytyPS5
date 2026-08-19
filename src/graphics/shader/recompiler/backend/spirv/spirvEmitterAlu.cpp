@@ -323,6 +323,10 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Emit(inst, OpCompositeConstruct, IR::Type::U32x2,
 			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
 			return true;
+		case IR::ValueOpcode::CompositeConstructU32x3:
+			ctx.Emit(inst, OpCompositeConstruct, IR::Type::U32x3,
+			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
+			return true;
 		case IR::ValueOpcode::CompositeConstructF32x2:
 			ctx.Emit(inst, OpCompositeConstruct, IR::Type::F32x2,
 			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
@@ -332,6 +336,7 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3)});
 			return true;
 		case IR::ValueOpcode::CompositeExtractU32x2:
+		case IR::ValueOpcode::CompositeExtractU32x3:
 		case IR::ValueOpcode::CompositeExtractU32x4:
 			ctx.Emit(inst, OpCompositeExtract, IR::Type::U32,
 			         {ctx.Arg(inst, 0), inst.Arg(1).U32()});

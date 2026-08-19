@@ -130,7 +130,8 @@ std::string InputInfoToString(Opcode op, const InputInfo& input) {
 	if (op != Opcode::LoadInputF32) {
 		return "";
 	}
-	return fmt::format(" ; input_attr={} input_chan={}", input.attr, input.chan);
+	return fmt::format(" ; input_attr={} input_chan={} input_components={}", input.attr, input.chan,
+	                   input.component_count);
 }
 
 std::string TerminatorToString(const CFG::Terminator& term) {

@@ -7,12 +7,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
 
-struct BufferAddressValues {
-	IR::U32 index;
-	IR::U32 offset;
-	IR::U32 soffset;
-};
-
 struct ScalarMemorySourceValues {
 	IR::Value resource;
 	IR::U32   offset;
@@ -70,6 +64,11 @@ private:
 		IR::Value low;
 		IR::Value high;
 	};
+	struct BufferAddress {
+		IR::U32 index;
+		IR::U32 offset;
+		IR::U32 soffset;
+	};
 	AddressOperands ReadAddressOperands(const IR::Instruction& inst, uint32_t first_source);
 	IR::U32         GetResourceDword(uint32_t index, uint32_t dword);
 	IR::Value       GetBufferResource(const IR::MemoryInfo& memory);
@@ -83,18 +82,16 @@ private:
 	void            WriteImageComponents(const IR::Operand& dst, IR::Value value, uint32_t dmask,
 	                                     uint32_t component_limit);
 	IR::ValueOpcode ImageAtomicOpcode(IR::Opcode opcode);
-	BufferAddressValues      ReadBufferAddress(const IR::Instruction& inst, uint32_t source_offset);
-	IR::U32                  WidenSubdword(IR::Value value, uint32_t bits, bool sign);
-	IR::Value                NarrowSubdword(IR::U32 value, uint32_t bits);
-	IR::ValueOpcode          BufferAtomicOpcode(IR::Opcode opcode);
-	IR::ValueOpcode          SharedAtomicOpcode(IR::Opcode opcode, bool gds);
-	bool                     IsBufferLoadOperation(IR::Opcode opcode);
-	bool                     IsScalarMemoryLoadOperation(IR::Opcode opcode);
+	BufferAddress   ReadBufferAddress(const IR::Instruction& inst, uint32_t source_offset);
+	IR::U32         WidenSubdword(IR::Value value, uint32_t bits, bool sign);
+	IR::Value       NarrowSubdword(IR::U32 value, uint32_t bits);
+	IR::ValueOpcode BufferAtomicOpcode(IR::Opcode opcode);
+	IR::ValueOpcode SharedAtomicOpcode(IR::Opcode opcode, bool gds);
+	bool            IsScalarMemoryLoadOperation(IR::Opcode opcode);
 	ScalarMemorySourceValues ReadScalarMemorySource(const IR::Instruction& inst);
 	bool                     TranslateScalarMemory(const IR::Instruction&          inst,
 	                                               const ScalarMemorySourceValues* source_snapshot);
-	bool                     TranslateBufferLoad(const IR::Instruction&     inst,
-	                                             const BufferAddressValues* address_snapshot);
+	bool                     TranslateBufferLoad(const IR::Instruction& inst);
 	bool                     TranslateBufferStore(const IR::Instruction& inst);
 	bool                     TranslateAtomicMemory(const IR::Instruction& inst);
 	bool                     TranslateFlatLoad(const IR::Instruction& inst);
@@ -111,7 +108,6 @@ private:
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
 
 	bool TranslateInstruction(const IR::Instruction&          inst,
-	                          const BufferAddressValues*      address_snapshot,
 	                          const ScalarMemorySourceValues* scalar_source_snapshot);
 	bool TranslateStateOperation(const IR::Instruction& inst);
 	bool TranslateControlOperation(const IR::Instruction& inst);
@@ -119,7 +115,6 @@ private:
 	bool TranslateLaneOperation(const IR::Instruction& inst);
 	bool TranslateAttributeOperation(const IR::Instruction& inst);
 	bool TranslateMemoryOperation(const IR::Instruction&          inst,
-	                              const BufferAddressValues*      address_snapshot,
 	                              const ScalarMemorySourceValues* scalar_source_snapshot);
 	bool TranslateIntegerCompare(const IR::Instruction& inst);
 	bool TranslateInteger16Compare(const IR::Instruction& inst);

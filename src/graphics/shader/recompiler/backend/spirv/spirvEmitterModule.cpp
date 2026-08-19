@@ -42,6 +42,11 @@ uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
 	return state.builder.Type(OpTypeVector, {TypeU32(state), components});
 }
 
+uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
+	EXIT_IF(components < 2u || components > 4u);
+	return components == 2u ? TypeU32Pair(state) : TypeU32Vector(state, components);
+}
+
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components) {
 	return state.builder.Type(OpTypeVector, {TypeI32(state), components});
 }
@@ -241,10 +246,11 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value) {
 	                               ConstantU32(state, static_cast<uint32_t>(value >> 32u))});
 }
 
-uint32_t ConstantU32x4Zero(EmitterState& state) {
-	const auto zero = ConstantU32(state, 0);
-	return state.builder.Constant(OpConstantComposite, TypeU32Vector(state, 4),
-	                              {zero, zero, zero, zero});
+uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {
+	EXIT_IF(components < 2u || components > 4u);
+	const auto            zero = ConstantU32(state, 0);
+	std::vector<uint32_t> values(components, zero);
+	return state.builder.Constant(OpConstantComposite, TypeU32Composite(state, components), values);
 }
 
 uint32_t GlslStd450(EmitterState& state) {

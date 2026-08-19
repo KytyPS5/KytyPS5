@@ -121,52 +121,29 @@ bool LowerBufferAddressSources(const Decoder::Instruction& decoded, Instruction&
 }
 
 bool LowerBufferLoad(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op                   = BufferLoadOpcode(decoded);
-	const auto count                   = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
-	const auto typed_format_components = TypedBufferFormatComponentCount(decoded);
-	for (uint32_t i = 0; i < count; i++) {
-		if (i >= typed_format_components) {
-			if (!LowerMoveImmediateU32(decoded.pc, OffsetDecodedRegister(decoded.dst, i), 0, block,
-			                           error)) {
-				return false;
-			}
-			continue;
-		}
-
-		Instruction inst;
-		inst.pc     = decoded.pc;
-		inst.op     = ir_op;
-		inst.memory = OffsetBufferMemoryInfo(decoded, i);
-		if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, i), inst.dst, error) ||
-		    !LowerBufferAddressSources(decoded, inst, 0, error)) {
-			return false;
-		}
-		block.instructions.push_back(inst);
+	Instruction inst;
+	inst.pc     = decoded.pc;
+	inst.op     = BufferLoadOpcode(decoded);
+	inst.memory = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerBufferAddressSources(decoded, inst, 0, error)) {
+		return false;
 	}
+	block.instructions.push_back(inst);
 	return true;
 }
 
 bool LowerBufferStore(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op = BufferStoreOpcode(decoded.data_bits);
-	auto       count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
-	if (decoded.data_bits == 32u) {
-		const auto typed_format_components = TypedBufferFormatComponentCount(decoded);
-		if (typed_format_components < count) {
-			count = typed_format_components;
-		}
+	Instruction inst;
+	inst.pc       = decoded.pc;
+	inst.op       = BufferStoreOpcode(decoded.data_bits);
+	inst.memory   = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	inst.dst.kind = OperandKind::Null;
+	if (!LowerSourceOperand(decoded.dst, inst.src[0], error) ||
+	    !LowerBufferAddressSources(decoded, inst, 1, error)) {
+		return false;
 	}
-	for (uint32_t i = 0; i < count; i++) {
-		Instruction inst;
-		inst.pc       = decoded.pc;
-		inst.op       = ir_op;
-		inst.memory   = OffsetBufferMemoryInfo(decoded, i);
-		inst.dst.kind = OperandKind::Null;
-		if (!LowerSourceOperand(OffsetDecodedRegister(decoded.dst, i), inst.src[0], error) ||
-		    !LowerBufferAddressSources(decoded, inst, 1, error)) {
-			return false;
-		}
-		block.instructions.push_back(inst);
-	}
+	block.instructions.push_back(inst);
 	return true;
 }
 

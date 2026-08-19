@@ -125,8 +125,8 @@ IR::ValueOpcode Translator::ImageAtomicOpcode(IR::Opcode opcode) {
 	}
 }
 
-BufferAddressValues Translator::ReadBufferAddress(const IR::Instruction& inst,
-                                                  uint32_t               first_source) {
+Translator::BufferAddress Translator::ReadBufferAddress(const IR::Instruction& inst,
+                                                        uint32_t               first_source) {
 	uint32_t   cursor = first_source;
 	const auto next   = [&]() {
 		return cursor < inst.src_count ? ReadU32(inst.src[cursor++]) : IR::U32(IR::Value(0u));
@@ -201,12 +201,6 @@ IR::ValueOpcode Translator::SharedAtomicOpcode(IR::Opcode opcode, bool gds) {
 	}
 }
 
-bool Translator::IsBufferLoadOperation(IR::Opcode opcode) {
-	return opcode == IR::Opcode::BufferLoadUbyte || opcode == IR::Opcode::BufferLoadSbyte ||
-	       opcode == IR::Opcode::BufferLoadUshort || opcode == IR::Opcode::BufferLoadSshort ||
-	       opcode == IR::Opcode::BufferLoadDword;
-}
-
 bool Translator::IsScalarMemoryLoadOperation(IR::Opcode opcode) {
 	return opcode == IR::Opcode::SLoadDword || opcode == IR::Opcode::SBufferLoadDword;
 }
@@ -247,8 +241,7 @@ bool Translator::TranslateScalarMemory(const IR::Instruction&          inst,
 	}
 }
 
-bool Translator::TranslateBufferLoad(const IR::Instruction&     inst,
-                                     const BufferAddressValues* address_snapshot) {
+bool Translator::TranslateBufferLoad(const IR::Instruction& inst) {
 	IR::ValueOpcode opcode;
 	uint32_t        bits;
 	bool            sign;
@@ -266,19 +259,33 @@ bool Translator::TranslateBufferLoad(const IR::Instruction&     inst,
 			sign   = inst.op == IR::Opcode::BufferLoadSshort;
 			break;
 		case IR::Opcode::BufferLoadDword:
-			opcode = IR::ValueOpcode::LoadBufferU32;
-			bits   = 32u;
-			sign   = false;
+			switch (inst.memory.data_dwords) {
+				case 1u: opcode = IR::ValueOpcode::LoadBufferU32; break;
+				case 2u: opcode = IR::ValueOpcode::LoadBufferU32x2; break;
+				case 3u: opcode = IR::ValueOpcode::LoadBufferU32x3; break;
+				case 4u: opcode = IR::ValueOpcode::LoadBufferU32x4; break;
+				default: return false;
+			}
+			bits = 32u;
+			sign = false;
 			break;
 		default: return false;
 	}
 	const auto resource = GetBufferResource(inst.memory);
-	const auto address =
-	    address_snapshot != nullptr ? *address_snapshot : ReadBufferAddress(inst, 0);
+	const auto address  = ReadBufferAddress(inst, 0);
 	const auto loaded =
 	    ir.Emit(opcode, {resource, address.index, address.offset, address.soffset, ir.GetExec()},
 	            AddMemoryInfo(inst));
-	WriteOperand(inst.dst, bits == 32u ? loaded : WidenSubdword(loaded, bits, sign));
+	if (bits != 32u) {
+		WriteOperand(inst.dst, WidenSubdword(loaded, bits, sign));
+	} else if (inst.memory.data_dwords == 1u) {
+		WriteOperand(inst.dst, loaded);
+	} else {
+		for (uint32_t component = 0; component < inst.memory.data_dwords; component++) {
+			WriteOperand(OffsetOperand(inst.dst, component),
+			             ir.CompositeExtract(loaded, component));
+		}
+	}
 	return true;
 }
 
@@ -298,8 +305,31 @@ bool Translator::TranslateBufferStore(const IR::Instruction& inst) {
 			value  = NarrowSubdword(data, 16u);
 			break;
 		case IR::Opcode::BufferStoreDword:
-			opcode = IR::ValueOpcode::StoreBufferU32;
-			value  = data;
+			switch (inst.memory.data_dwords) {
+				case 1u:
+					opcode = IR::ValueOpcode::StoreBufferU32;
+					value  = data;
+					break;
+				case 2u:
+					opcode = IR::ValueOpcode::StoreBufferU32x2;
+					value  = ir.Emit(IR::ValueOpcode::CompositeConstructU32x2,
+					                 {data, ReadU32(OffsetOperand(inst.src[0], 1u))});
+					break;
+				case 3u:
+					opcode = IR::ValueOpcode::StoreBufferU32x3;
+					value  = ir.Emit(IR::ValueOpcode::CompositeConstructU32x3,
+					                 {data, ReadU32(OffsetOperand(inst.src[0], 1u)),
+					                  ReadU32(OffsetOperand(inst.src[0], 2u))});
+					break;
+				case 4u:
+					opcode = IR::ValueOpcode::StoreBufferU32x4;
+					value  = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+					                 {data, ReadU32(OffsetOperand(inst.src[0], 1u)),
+					                  ReadU32(OffsetOperand(inst.src[0], 2u)),
+					                  ReadU32(OffsetOperand(inst.src[0], 3u))});
+					break;
+				default: return false;
+			}
 			break;
 		default: return false;
 	}
@@ -594,7 +624,6 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 }
 
 bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
-                                          const BufferAddressValues*      address_snapshot,
                                           const ScalarMemorySourceValues* scalar_source_snapshot) {
 	switch (inst.op) {
 		case IR::Opcode::LoadSrtDword:
@@ -606,7 +635,7 @@ bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
 		case IR::Opcode::BufferLoadSbyte:
 		case IR::Opcode::BufferLoadUshort:
 		case IR::Opcode::BufferLoadSshort:
-		case IR::Opcode::BufferLoadDword: return TranslateBufferLoad(inst, address_snapshot);
+		case IR::Opcode::BufferLoadDword: return TranslateBufferLoad(inst);
 
 		case IR::Opcode::BufferStoreByte:
 		case IR::Opcode::BufferStoreShort:

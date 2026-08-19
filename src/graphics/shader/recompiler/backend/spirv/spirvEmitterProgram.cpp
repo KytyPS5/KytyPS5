@@ -46,6 +46,8 @@ uint32_t SpillPointerType(EmitterState& state, IR::Type type) {
 		case IR::Type::F32: return TypePointer(state, StorageClassFunction, TypeF32(state));
 		case IR::Type::U64:
 		case IR::Type::U32x2: return TypePointer(state, StorageClassFunction, TypeU32Pair(state));
+		case IR::Type::U32x3:
+			return TypePointer(state, StorageClassFunction, TypeU32Vector(state, 3));
 		case IR::Type::U32x4:
 			return TypePointer(state, StorageClassFunction, TypeU32Vector(state, 4));
 		case IR::Type::F32x2:
@@ -405,6 +407,7 @@ uint32_t ValueEmitContext::TypeId(IR::Type type) const {
 		case IR::Type::U64:
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
+		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
 		default: return 0;

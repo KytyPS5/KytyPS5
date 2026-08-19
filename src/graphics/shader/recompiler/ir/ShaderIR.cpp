@@ -328,54 +328,6 @@ MemoryInfo OffsetMemoryInfo(const Decoder::Instruction& decoded, ResourceKind ki
 	return mem;
 }
 
-uint32_t TypedBufferComponentOffsetBytes(const Decoder::Instruction& decoded,
-                                         uint32_t                    component_index) {
-	if (!decoded.typed || !decoded.formatted) {
-		return component_index * 4u;
-	}
-
-	const auto format = Format::DecodeTBufferFormat(decoded.data_format, decoded.number_format);
-	if (!Format::IsKnownFormat(format)) {
-		return component_index * 4u;
-	}
-	return Format::GetFormatComponentByteOffset(format, component_index);
-}
-
-uint32_t TypedBufferFormatComponentCount(const Decoder::Instruction& decoded) {
-	if (!decoded.typed || !decoded.formatted) {
-		return decoded.data_dwords;
-	}
-
-	const auto format = Format::DecodeTBufferFormat(decoded.data_format, decoded.number_format);
-	if (!Format::IsKnownFormat(format)) {
-		return decoded.data_dwords;
-	}
-	return Format::GetFormatComponentCount(format);
-}
-
-bool LowerMoveImmediateU32(uint32_t pc, const Decoder::Operand& dst, uint32_t value,
-                           BasicBlock& block, std::string* error) {
-	Instruction inst;
-	inst.pc        = pc;
-	inst.op        = Opcode::MoveU32;
-	inst.src[0]    = MakeImmediateU32(value);
-	inst.src_count = 1;
-	if (!LowerRegisterOperand(dst, inst.dst, error)) {
-		return false;
-	}
-	block.instructions.push_back(inst);
-	return true;
-}
-
-MemoryInfo OffsetBufferMemoryInfo(const Decoder::Instruction& decoded, uint32_t component_index) {
-	auto mem = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
-	mem.offset += TypedBufferComponentOffsetBytes(decoded, component_index);
-	mem.data_dwords     = 1;
-	mem.component_index = component_index;
-	mem.component_count = decoded.data_dwords;
-	return mem;
-}
-
 MemoryInfo ByteOffsetMemoryInfo(const Decoder::Instruction& decoded, ResourceKind kind,
                                 uint32_t byte_offset) {
 	auto mem             = MemoryInfoFromDecoded(decoded, kind);

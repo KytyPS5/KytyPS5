@@ -13,9 +13,12 @@ IR::ExportFlags Translator::AddExportInfo(const IR::Instruction& inst) {
 
 bool Translator::TranslateAttributeOperation(const IR::Instruction& inst) {
 	if (inst.op == IR::Opcode::LoadInputF32) {
-		WriteOperand(inst.dst,
-		             ir.Emit(IR::ValueOpcode::GetAttribute,
-		                     {IR::Value(inst.input_info.attr), IR::Value(inst.input_info.chan)}));
+		for (uint32_t component = 0; component < inst.input_info.component_count; component++) {
+			WriteOperand(OffsetOperand(inst.dst, component),
+			             ir.Emit(IR::ValueOpcode::GetAttribute,
+			                     {IR::Value(inst.input_info.attr),
+			                      IR::Value(inst.input_info.chan + component)}));
+		}
 		return true;
 	}
 	if (inst.op == IR::Opcode::Export) {

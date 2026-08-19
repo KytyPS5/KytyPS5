@@ -668,26 +668,12 @@ void Translator::WriteCompareResult(const IR::Operand& operand, IR::U1 value) {
 }
 
 bool Translator::TranslateBlock(const IR::BasicBlock& source, std::string* error) {
-	BufferAddressValues      buffer_address_snapshot {};
 	ScalarMemorySourceValues scalar_source_snapshot {};
-	uint32_t                 buffer_address_pc           = 0;
-	uint32_t                 scalar_source_pc            = 0;
-	bool                     has_buffer_address_snapshot = false;
-	bool                     has_scalar_source_snapshot  = false;
+	uint32_t                 scalar_source_pc           = 0;
+	bool                     has_scalar_source_snapshot = false;
 	for (const auto& source_inst: source.instructions) {
 		current_opcode = source_inst.op;
 		current_pc     = source_inst.pc;
-		const bool grouped_buffer_load =
-		    IsBufferLoadOperation(source_inst.op) && source_inst.memory.component_count > 1u;
-		if (grouped_buffer_load &&
-		    (!has_buffer_address_snapshot || buffer_address_pc != source_inst.pc ||
-		     source_inst.memory.component_index == 0u)) {
-			buffer_address_snapshot     = ReadBufferAddress(source_inst, 0);
-			buffer_address_pc           = source_inst.pc;
-			has_buffer_address_snapshot = true;
-		} else if (!grouped_buffer_load) {
-			has_buffer_address_snapshot = false;
-		}
 		const bool grouped_scalar_load =
 		    IsScalarMemoryLoadOperation(source_inst.op) && source_inst.memory.component_count > 1u;
 		if (grouped_scalar_load &&
@@ -703,7 +689,6 @@ bool Translator::TranslateBlock(const IR::BasicBlock& source, std::string* error
 			return Fail(error, "value IR input opcode is out of range");
 		}
 		if (TranslateInstruction(source_inst,
-		                         grouped_buffer_load ? &buffer_address_snapshot : nullptr,
 		                         grouped_scalar_load ? &scalar_source_snapshot : nullptr)) {
 			continue;
 		}
@@ -780,11 +765,11 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 	const uint32_t wave_size        = source.wave_size;
 	const bool per_invocation_masks = source.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
 	uint32_t   vector_limit         = 1u;
-	const auto include_vector       = [&](const IR::Operand& operand) {
+	const auto include_vector       = [&](const IR::Operand& operand, uint32_t count = 1u) {
 		if (operand.kind == IR::OperandKind::Register &&
 		    operand.reg.file == IR::RegisterFile::Vector) {
 			vector_limit =
-			    std::min(IR::NumVectorRegs, std::max(vector_limit, operand.reg.index + 1u));
+			    std::min(IR::NumVectorRegs, std::max(vector_limit, operand.reg.index + count));
 		}
 	};
 	for (const auto& block: source.blocks) {
@@ -793,6 +778,13 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 			include_vector(inst.dst2);
 			for (uint32_t index = 0; index < inst.src_count; index++) {
 				include_vector(inst.src[index]);
+			}
+			if (inst.op == IR::Opcode::BufferLoadDword) {
+				include_vector(inst.dst, std::max(inst.memory.data_dwords, 1u));
+			} else if (inst.op == IR::Opcode::BufferStoreDword) {
+				include_vector(inst.src[0], std::max(inst.memory.data_dwords, 1u));
+			} else if (inst.op == IR::Opcode::LoadInputF32) {
+				include_vector(inst.dst, std::max(inst.input_info.component_count, 1u));
 			}
 		}
 	}
@@ -846,8 +838,8 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 		}
 		entry_ir.SetExec(IR::U1(IR::Value(true)));
 		entry_ir.SetExecLo(IR::U32(IR::Value(per_invocation_masks ? 1u : 0xffffffffu)));
-		entry_ir.SetExecHi(IR::U32(IR::Value(
-		    !per_invocation_masks && source.wave_size > 32u ? 0xffffffffu : 0u)));
+		entry_ir.SetExecHi(
+		    IR::U32(IR::Value(!per_invocation_masks && source.wave_size > 32u ? 0xffffffffu : 0u)));
 		if (source.stage == ShaderType::Compute) {
 			const auto* cs = compute_input_info;
 			const auto  thread_ids =

@@ -123,8 +123,9 @@ struct ExportInfo {
 };
 
 struct InputInfo {
-	uint32_t attr = 0;
-	uint32_t chan = 0;
+	uint32_t attr            = 0;
+	uint32_t chan            = 0;
+	uint32_t component_count = 1;
 
 	bool operator==(const InputInfo& other) const = default;
 };

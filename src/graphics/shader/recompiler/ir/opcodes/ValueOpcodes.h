@@ -17,6 +17,7 @@ enum class ValueOpcode {
 };
 
 enum class BufferAccess { None, Read, Write, Atomic };
+enum class SharedAccess { None, Read, Write, Atomic, Append, Consume };
 
 struct DppMoveFlags {
 	uint16_t control        = 0;
@@ -56,6 +57,8 @@ static_assert(std::is_trivially_copyable_v<ExportFlags>);
 [[nodiscard]] bool             HasSideEffects(ValueOpcode opcode);
 [[nodiscard]] BufferAccess     BufferAccessOf(ValueOpcode opcode);
 [[nodiscard]] uint32_t         BufferComponentCount(ValueOpcode opcode);
+[[nodiscard]] SharedAccess     SharedAccessOf(ValueOpcode opcode);
+[[nodiscard]] uint32_t         SharedComponentCount(ValueOpcode opcode);
 [[nodiscard]] std::string_view ValueOpcodeName(ValueOpcode opcode);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

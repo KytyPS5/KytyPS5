@@ -338,6 +338,34 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
+			const auto shared_components = SharedComponentCount(inst.GetOpcode());
+			if (shared_components != 0u) {
+				const auto memory_index = inst.Flags<MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					return Fail(error, fmt::format("{} has an invalid memory-info index",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const auto& memory = program.memory_info[memory_index];
+				if ((memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) ||
+				    memory.resource != 0u || memory.sampler != 0u || memory.component_count == 0u ||
+				    memory.component_index >= memory.component_count) {
+					return Fail(error, fmt::format("{} has invalid shared-memory metadata",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				uint32_t expected_bits = 32u;
+				if (inst.GetOpcode() == ValueOpcode::LoadSharedU8 ||
+				    inst.GetOpcode() == ValueOpcode::WriteSharedU8) {
+					expected_bits = 8u;
+				} else if (inst.GetOpcode() == ValueOpcode::LoadSharedU16 ||
+				           inst.GetOpcode() == ValueOpcode::WriteSharedU16) {
+					expected_bits = 16u;
+				}
+				if (memory.data_bits != expected_bits || memory.data_dwords != shared_components ||
+				    (shared_components > 1u && memory.component_index != 0u)) {
+					return Fail(error, fmt::format("{} has inconsistent shared-memory width",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+			}
 			uint32_t composite_components = 0u;
 			switch (inst.GetOpcode()) {
 				case ValueOpcode::CompositeExtractU32x2: composite_components = 2u; break;
@@ -358,10 +386,11 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (fixed_signature && arg.GetType() != ArgTypeOf(inst.GetOpcode(), arg_index)) {
-					return Fail(error, fmt::format("{} argument {} has type {}, expected {}",
-					                               ValueOpcodeName(inst.GetOpcode()), arg_index,
-					                               TypeName(arg.GetType()),
-					                               TypeName(ArgTypeOf(inst.GetOpcode(), arg_index))));
+					return Fail(error,
+					            fmt::format("{} argument {} has type {}, expected {}",
+					                        ValueOpcodeName(inst.GetOpcode()), arg_index,
+					                        TypeName(arg.GetType()),
+					                        TypeName(ArgTypeOf(inst.GetOpcode(), arg_index))));
 				}
 				if (const auto* definition = arg.TryInstruction();
 				    definition != nullptr && !instructions.contains(definition)) {

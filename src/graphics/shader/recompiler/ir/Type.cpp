@@ -31,8 +31,6 @@ std::string TypeName(Type type) {
 	    "AddressResource",
 	    "ImageResource",
 	    "SamplerResource",
-	    "LdsResource",
-	    "GdsResource",
 	    "ImageAddress",
 	};
 	const auto bits = static_cast<uint32_t>(type);

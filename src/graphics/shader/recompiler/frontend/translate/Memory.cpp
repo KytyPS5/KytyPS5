@@ -65,11 +65,6 @@ IR::Value Translator::GetSamplerResource(const IR::MemoryInfo& memory) {
 	                GetResourceDword(memory.sampler, 2), GetResourceDword(memory.sampler, 3)});
 }
 
-IR::Value Translator::GetSharedResource(IR::ResourceKind kind) {
-	return ir.Emit(kind == IR::ResourceKind::Gds ? IR::ValueOpcode::GetGdsResource
-	                                             : IR::ValueOpcode::GetLdsResource);
-}
-
 IR::Value Translator::MakeImageAddress(const IR::Instruction& inst, const IR::Operand& base) {
 	std::array<IR::Value, 13> components {};
 	components[0] = ReadRawU32(PlainOperand(base));
@@ -170,22 +165,7 @@ IR::ValueOpcode Translator::BufferAtomicOpcode(IR::Opcode opcode) {
 	}
 }
 
-IR::ValueOpcode Translator::SharedAtomicOpcode(IR::Opcode opcode, bool gds) {
-	if (gds) {
-		switch (opcode) {
-			case IR::Opcode::AtomicSwapU32: return IR::ValueOpcode::GdsAtomicSwap32;
-			case IR::Opcode::AtomicAddU32: return IR::ValueOpcode::GdsAtomicIAdd32;
-			case IR::Opcode::AtomicSubU32: return IR::ValueOpcode::GdsAtomicISub32;
-			case IR::Opcode::AtomicSMinI32: return IR::ValueOpcode::GdsAtomicSMin32;
-			case IR::Opcode::AtomicUMinU32: return IR::ValueOpcode::GdsAtomicUMin32;
-			case IR::Opcode::AtomicSMaxI32: return IR::ValueOpcode::GdsAtomicSMax32;
-			case IR::Opcode::AtomicUMaxU32: return IR::ValueOpcode::GdsAtomicUMax32;
-			case IR::Opcode::AtomicAndU32: return IR::ValueOpcode::GdsAtomicAnd32;
-			case IR::Opcode::AtomicOrU32: return IR::ValueOpcode::GdsAtomicOr32;
-			case IR::Opcode::AtomicXorU32: return IR::ValueOpcode::GdsAtomicXor32;
-			default: EXIT("invalid GDS atomic opcode");
-		}
-	}
+IR::ValueOpcode Translator::SharedAtomicOpcode(IR::Opcode opcode) {
 	switch (opcode) {
 		case IR::Opcode::AtomicSwapU32: return IR::ValueOpcode::SharedAtomicSwap32;
 		case IR::Opcode::AtomicAddU32: return IR::ValueOpcode::SharedAtomicIAdd32;
@@ -197,7 +177,7 @@ IR::ValueOpcode Translator::SharedAtomicOpcode(IR::Opcode opcode, bool gds) {
 		case IR::Opcode::AtomicAndU32: return IR::ValueOpcode::SharedAtomicAnd32;
 		case IR::Opcode::AtomicOrU32: return IR::ValueOpcode::SharedAtomicOr32;
 		case IR::Opcode::AtomicXorU32: return IR::ValueOpcode::SharedAtomicXor32;
-		default: EXIT("invalid LDS atomic opcode");
+		default: EXIT("invalid shared atomic opcode");
 	}
 }
 
@@ -363,13 +343,9 @@ bool Translator::TranslateAtomicMemory(const IR::Instruction& inst) {
 		}
 		case IR::ResourceKind::Lds:
 		case IR::ResourceKind::Gds: {
-			const bool gds      = inst.memory.kind == IR::ResourceKind::Gds;
-			const auto resource = GetSharedResource(inst.memory.kind);
-			const auto address =
-			    ir.IAdd(ReadU32(inst.src[1]), IR::U32(IR::Value(inst.memory.offset)));
-			result = ir.Emit(SharedAtomicOpcode(inst.op, gds),
-			                 {resource, address, ReadU32(inst.src[0]), ir.GetExec()},
-			                 AddMemoryInfo(inst));
+			const auto address = ReadU32(inst.src[1]);
+			result = ir.Emit(SharedAtomicOpcode(inst.op),
+			                 {address, ReadU32(inst.src[0]), ir.GetExec()}, AddMemoryInfo(inst));
 			break;
 		}
 		default: return false;
@@ -518,10 +494,51 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 	if (!shared && inst.op != IR::Opcode::DsSwizzleB32) {
 		return false;
 	}
-	const bool gds            = inst.memory.kind == IR::ResourceKind::Gds;
-	const auto resource       = shared ? GetSharedResource(inst.memory.kind) : IR::Value {};
-	const auto shared_address = [&](uint32_t source) {
-		return ir.IAdd(ReadU32(inst.src[source]), IR::U32(IR::Value(inst.memory.offset)));
+	const auto shared_address = [&](uint32_t source) { return ReadU32(inst.src[source]); };
+	const auto load_u32 = [&](uint32_t width, IR::U32 address, const IR::Instruction& source) {
+		IR::ValueOpcode opcode;
+		switch (width) {
+			case 1u: opcode = IR::ValueOpcode::LoadSharedU32; break;
+			case 2u: opcode = IR::ValueOpcode::LoadSharedU32x2; break;
+			case 3u: opcode = IR::ValueOpcode::LoadSharedU32x3; break;
+			case 4u: opcode = IR::ValueOpcode::LoadSharedU32x4; break;
+			default: EXIT("invalid shared load width");
+		}
+		return ir.Emit(opcode, {address, ir.GetExec()}, AddMemoryInfo(source));
+	};
+	const auto extract_u32 = [&](IR::Value value, uint32_t width, uint32_t index) {
+		if (width == 1u) {
+			return value;
+		}
+		const auto opcode = width == 2u   ? IR::ValueOpcode::CompositeExtractU32x2
+		                    : width == 3u ? IR::ValueOpcode::CompositeExtractU32x3
+		                                  : IR::ValueOpcode::CompositeExtractU32x4;
+		return ir.Emit(opcode, {value, IR::Value(index)});
+	};
+	const auto write_u32 = [&](uint32_t width, IR::U32 address,
+	                           const std::array<IR::Value, 4>& values,
+	                           const IR::Instruction&          source) {
+		switch (width) {
+			case 1u:
+				ir.Emit(IR::ValueOpcode::WriteSharedU32, {address, values[0], ir.GetExec()},
+				        AddMemoryInfo(source));
+				break;
+			case 2u:
+				ir.Emit(IR::ValueOpcode::WriteSharedU32x2,
+				        {address, values[0], values[1], ir.GetExec()}, AddMemoryInfo(source));
+				break;
+			case 3u:
+				ir.Emit(IR::ValueOpcode::WriteSharedU32x3,
+				        {address, values[0], values[1], values[2], ir.GetExec()},
+				        AddMemoryInfo(source));
+				break;
+			case 4u:
+				ir.Emit(IR::ValueOpcode::WriteSharedU32x4,
+				        {address, values[0], values[1], values[2], values[3], ir.GetExec()},
+				        AddMemoryInfo(source));
+				break;
+			default: EXIT("invalid shared store width");
+		}
 	};
 	switch (inst.op) {
 		case IR::Opcode::DsReadUbyte:
@@ -533,65 +550,109 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 			uint32_t        bits;
 			bool            sign;
 			if (inst.op == IR::Opcode::DsReadUbyte || inst.op == IR::Opcode::DsReadSbyte) {
-				opcode = gds ? IR::ValueOpcode::LoadGdsU8 : IR::ValueOpcode::LoadSharedU8;
+				opcode = IR::ValueOpcode::LoadSharedU8;
 				bits   = 8u;
 				sign   = inst.op == IR::Opcode::DsReadSbyte;
 			} else if (inst.op == IR::Opcode::DsReadUshort || inst.op == IR::Opcode::DsReadSshort) {
-				opcode = gds ? IR::ValueOpcode::LoadGdsU16 : IR::ValueOpcode::LoadSharedU16;
+				opcode = IR::ValueOpcode::LoadSharedU16;
 				bits   = 16u;
 				sign   = inst.op == IR::Opcode::DsReadSshort;
 			} else {
-				opcode = gds ? IR::ValueOpcode::LoadGdsU32 : IR::ValueOpcode::LoadSharedU32;
-				bits   = 32u;
-				sign   = false;
+				const auto width  = inst.memory.data_dwords;
+				const auto loaded = load_u32(width, shared_address(0), inst);
+				for (uint32_t index = 0; index < width; index++) {
+					WriteOperand(OffsetOperand(inst.dst, index), extract_u32(loaded, width, index));
+				}
+				return true;
 			}
 			const auto loaded =
-			    ir.Emit(opcode, {resource, shared_address(0), ir.GetExec()}, AddMemoryInfo(inst));
+			    ir.Emit(opcode, {shared_address(0), ir.GetExec()}, AddMemoryInfo(inst));
 			WriteOperand(inst.dst, bits == 32u ? loaded : WidenSubdword(loaded, bits, sign));
+			return true;
+		}
+		case IR::Opcode::DsRead2B32: {
+			const auto width             = inst.memory.data_dwords / 2u;
+			const auto address           = shared_address(0);
+			auto       first             = inst;
+			first.memory.data_dwords     = width;
+			first.memory.component_count = width;
+			const auto first_value       = load_u32(width, address, first);
+			IR::Value  second_value      = first_value;
+			if (inst.memory.secondary_offset != inst.memory.offset) {
+				auto second          = first;
+				second.memory.offset = inst.memory.secondary_offset;
+				second_value         = load_u32(width, address, second);
+			}
+			for (uint32_t index = 0; index < width; index++) {
+				WriteOperand(OffsetOperand(inst.dst, index),
+				             extract_u32(first_value, width, index));
+				WriteOperand(OffsetOperand(inst.dst, width + index),
+				             extract_u32(second_value, width, index));
+			}
 			return true;
 		}
 		case IR::Opcode::DsWriteByte:
 		case IR::Opcode::DsWriteShort:
 		case IR::Opcode::DsWriteB32: {
-			const auto      data    = ReadU32(inst.src[0]);
+			const auto               width = inst.memory.data_dwords;
+			std::array<IR::Value, 4> values {};
+			for (uint32_t index = 0; index < width; index++) {
+				values[index] = ReadU32(OffsetOperand(inst.src[0], index));
+			}
+			const auto      data    = IR::U32(values[0]);
 			const auto      address = shared_address(1);
 			IR::ValueOpcode opcode;
 			IR::Value       value;
 			if (inst.op == IR::Opcode::DsWriteByte) {
-				opcode = gds ? IR::ValueOpcode::WriteGdsU8 : IR::ValueOpcode::WriteSharedU8;
+				opcode = IR::ValueOpcode::WriteSharedU8;
 				value  = NarrowSubdword(data, 8u);
 			} else if (inst.op == IR::Opcode::DsWriteShort) {
-				opcode = gds ? IR::ValueOpcode::WriteGdsU16 : IR::ValueOpcode::WriteSharedU16;
+				opcode = IR::ValueOpcode::WriteSharedU16;
 				value  = NarrowSubdword(data, 16u);
 			} else {
-				opcode = gds ? IR::ValueOpcode::WriteGdsU32 : IR::ValueOpcode::WriteSharedU32;
-				value  = data;
+				write_u32(width, address, values, inst);
+				return true;
 			}
-			ir.Emit(opcode, {resource, address, value, ir.GetExec()}, AddMemoryInfo(inst));
+			ir.Emit(opcode, {address, value, ir.GetExec()}, AddMemoryInfo(inst));
+			return true;
+		}
+		case IR::Opcode::DsWrite2B32: {
+			const auto               width   = inst.memory.data_dwords / 2u;
+			const auto               address = shared_address(1);
+			std::array<IR::Value, 4> first_values {};
+			std::array<IR::Value, 4> second_values {};
+			for (uint32_t index = 0; index < width; index++) {
+				first_values[index]  = ReadU32(OffsetOperand(inst.src[0], index));
+				second_values[index] = ReadU32(OffsetOperand(inst.src[2], index));
+			}
+			auto first                   = inst;
+			first.memory.data_dwords     = width;
+			first.memory.component_count = width;
+			write_u32(width, address, first_values, first);
+			if (inst.memory.secondary_offset != inst.memory.offset) {
+				auto second          = first;
+				second.memory.offset = inst.memory.secondary_offset;
+				write_u32(width, address, second_values, second);
+			}
 			return true;
 		}
 		case IR::Opcode::DsMinF32:
 		case IR::Opcode::DsMaxF32: {
-			const auto opcode =
-			    gds ? (inst.op == IR::Opcode::DsMinF32 ? IR::ValueOpcode::GdsAtomicFMin32
-			                                           : IR::ValueOpcode::GdsAtomicFMax32)
-			        : (inst.op == IR::Opcode::DsMinF32 ? IR::ValueOpcode::SharedAtomicFMin32
-			                                           : IR::ValueOpcode::SharedAtomicFMax32);
+			const auto opcode = inst.op == IR::Opcode::DsMinF32
+			                        ? IR::ValueOpcode::SharedAtomicFMin32
+			                        : IR::ValueOpcode::SharedAtomicFMax32;
 			ir.Emit(opcode,
-			        {resource, shared_address(1), ReadU32(inst.src[0]), ReadU32(inst.src[2]),
-			         ir.GetExec()},
+			        {shared_address(1), ReadU32(inst.src[0]), ReadU32(inst.src[2]), ir.GetExec()},
 			        AddMemoryInfo(inst));
 			return true;
 		}
 		case IR::Opcode::DsAppend:
 		case IR::Opcode::DsConsume: {
 			const bool append = inst.op == IR::Opcode::DsAppend;
-			const auto opcode =
-			    gds ? (append ? IR::ValueOpcode::GdsDataAppend : IR::ValueOpcode::GdsDataConsume)
-			        : (append ? IR::ValueOpcode::DataAppend : IR::ValueOpcode::DataConsume);
+			const auto opcode = append ? IR::ValueOpcode::DataAppend : IR::ValueOpcode::DataConsume;
 			WriteOperand(inst.dst, ir.Emit(opcode,
-			                               {resource, ReadU32(inst.src[0]), ir.GetExec(),
-			                                ir.GetExecLo(), ir.GetExecHi()},
+			                               {ReadU32(inst.src[0]), ir.GetExec(), ir.GetExecLo(),
+			                                ir.GetExecHi()},
 			                               AddMemoryInfo(inst)));
 			return true;
 		}
@@ -601,16 +662,13 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 			const auto base =
 			    ir.BitwiseAnd(ReadU32(inst.src[m0_index]), IR::U32(IR::Value(0xffffu)));
 			const auto lane    = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
-			const auto address = ir.IAdd(ir.IAdd(base, IR::U32(IR::Value(inst.memory.offset))),
-			                             ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
+			const auto address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
 			if (inst.op == IR::Opcode::DsWriteAddtidB32) {
 				ir.Emit(IR::ValueOpcode::WriteSharedU32,
-				        {resource, address, ReadU32(inst.src[0]), ir.GetExec()},
-				        AddMemoryInfo(inst));
+				        {address, ReadU32(inst.src[0]), ir.GetExec()}, AddMemoryInfo(inst));
 			} else {
-				WriteOperand(inst.dst,
-				             ir.Emit(IR::ValueOpcode::LoadSharedU32,
-				                     {resource, address, ir.GetExec()}, AddMemoryInfo(inst)));
+				WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::LoadSharedU32,
+				                               {address, ir.GetExec()}, AddMemoryInfo(inst)));
 			}
 			return true;
 		}
@@ -676,9 +734,11 @@ bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
 		case IR::Opcode::DsReadUshort:
 		case IR::Opcode::DsReadSshort:
 		case IR::Opcode::DsReadB32:
+		case IR::Opcode::DsRead2B32:
 		case IR::Opcode::DsWriteByte:
 		case IR::Opcode::DsWriteShort:
 		case IR::Opcode::DsWriteB32:
+		case IR::Opcode::DsWrite2B32:
 		case IR::Opcode::DsMinF32:
 		case IR::Opcode::DsMaxF32:
 		case IR::Opcode::DsSwizzleB32:

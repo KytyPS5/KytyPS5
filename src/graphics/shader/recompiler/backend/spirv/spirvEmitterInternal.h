@@ -314,6 +314,7 @@ struct EmitterState {
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> storage_buffer_offsets {};
 	uint32_t                                         address_memory_variable = 0;
 	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         vsharp_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;

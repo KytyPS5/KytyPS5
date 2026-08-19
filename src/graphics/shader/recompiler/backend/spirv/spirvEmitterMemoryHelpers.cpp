@@ -93,7 +93,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 				                             "GDS binding was not emitted");
 			}
 			access.object_pointer = state.gds_variable;
-			break;
+			if (state.gds_length == 0) {
+				EXIT("GDS length was not prepared at function entry\n");
+			}
+			access.length = state.gds_length;
+			return access;
 		case IR::ResourceKind::ScalarAddress:
 		case IR::ResourceKind::Flat:
 		case IR::ResourceKind::Global:

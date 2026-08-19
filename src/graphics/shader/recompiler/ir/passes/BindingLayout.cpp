@@ -115,20 +115,25 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 	    {kind, static_cast<uint32_t>(layout.descriptors.size()), std::move(resources)});
 }
 
-bool UsesGds(const Program& program) {
+bool UsesGds(const Program& program, bool& uses_gds) {
+	uses_gds = false;
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
-			if (inst.GetOpcode() == ValueOpcode::GetGdsResource && inst.HasUses()) {
-				return true;
+			if (SharedAccessOf(inst.GetOpcode()) == SharedAccess::None) {
+				continue;
 			}
-			for (size_t index = 0; index < inst.NumArgs(); index++) {
-				if (inst.Arg(index).GetType() == Type::GdsResource) {
-					return true;
-				}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.values->memory_info.size()) {
+				return false;
 			}
+			const auto kind = program.values->memory_info[index].kind;
+			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
+				return false;
+			}
+			uses_gds |= kind == ResourceKind::Gds;
 		}
 	}
-	return false;
+	return true;
 }
 
 } // namespace
@@ -220,7 +225,14 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	bool uses_gds = false;
+	if (!UsesGds(program, uses_gds)) {
+		if (error != nullptr) {
+			*error = "typed shader contains invalid shared-memory metadata";
+		}
+		return false;
+	}
+	if (uses_gds) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (!program.info.addresses.empty()) {

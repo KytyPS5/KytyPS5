@@ -768,6 +768,14 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 				include_vector(inst.dst, std::max(inst.memory.data_dwords, 1u));
 			} else if (inst.op == IR::Opcode::BufferStoreDword) {
 				include_vector(inst.src[0], std::max(inst.memory.data_dwords, 1u));
+			} else if (inst.op == IR::Opcode::DsReadB32 || inst.op == IR::Opcode::DsRead2B32) {
+				include_vector(inst.dst, std::max(inst.memory.data_dwords, 1u));
+			} else if (inst.op == IR::Opcode::DsWriteB32) {
+				include_vector(inst.src[0], std::max(inst.memory.data_dwords, 1u));
+			} else if (inst.op == IR::Opcode::DsWrite2B32) {
+				const auto width = std::max(inst.memory.data_dwords / 2u, 1u);
+				include_vector(inst.src[0], width);
+				include_vector(inst.src[2], width);
 			} else if (inst.op == IR::Opcode::LoadInputF32) {
 				include_vector(inst.dst, std::max(inst.input_info.component_count, 1u));
 			}

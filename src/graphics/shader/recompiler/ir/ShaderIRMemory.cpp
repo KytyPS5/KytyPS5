@@ -168,42 +168,33 @@ ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
 }
 
 bool LowerDsRead(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op = DsReadOpcode(decoded);
-	const auto count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
-	for (uint32_t i = 0; i < count; i++) {
-		Instruction inst;
-		inst.pc        = decoded.pc;
-		inst.op        = ir_op;
-		inst.src_count = 1;
-		inst.memory    = OffsetMemoryInfo(decoded, DsMemoryKind(decoded), i);
-		if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, i), inst.dst, error) ||
-		    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
-			return false;
-		}
-		block.instructions.push_back(inst);
+	const auto  ir_op = DsReadOpcode(decoded);
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = ir_op;
+	inst.src_count = 1;
+	inst.memory    = MemoryInfoFromDecoded(decoded, DsMemoryKind(decoded));
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
+		return false;
 	}
+	block.instructions.push_back(inst);
 	return true;
 }
 
 bool LowerDsRead2(const Decoder::Instruction& decoded, BasicBlock& block, uint32_t dwords_per_read,
                   std::string* error) {
-	const uint32_t offsets[] = {decoded.offset, decoded.secondary_offset};
-	for (uint32_t read = 0; read < 2u; read++) {
-		for (uint32_t dword = 0; dword < dwords_per_read; dword++) {
-			const auto  index = read * dwords_per_read + dword;
-			Instruction inst;
-			inst.pc        = decoded.pc;
-			inst.op        = Opcode::DsReadB32;
-			inst.src_count = 1;
-			inst.memory =
-			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[read] + dword * 4u);
-			if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, index), inst.dst, error) ||
-			    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
-				return false;
-			}
-			block.instructions.push_back(inst);
-		}
+	Instruction inst;
+	inst.pc                 = decoded.pc;
+	inst.op                 = Opcode::DsRead2B32;
+	inst.src_count          = 1;
+	inst.memory             = MemoryInfoFromDecoded(decoded, DsMemoryKind(decoded));
+	inst.memory.data_dwords = dwords_per_read * 2u;
+	if (!LowerRegisterOperand(decoded.dst, inst.dst, error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
+		return false;
 	}
+	block.instructions.push_back(inst);
 	return true;
 }
 
@@ -408,45 +399,36 @@ bool LowerFlatStore(const Decoder::Instruction& decoded, BasicBlock& block, std:
 }
 
 bool LowerDsWrite(const Decoder::Instruction& decoded, BasicBlock& block, std::string* error) {
-	const auto ir_op = DsWriteOpcode(decoded.data_bits);
-	const auto count = decoded.data_bits == 32u ? decoded.data_dwords : 1u;
-	for (uint32_t i = 0; i < count; i++) {
-		Instruction inst;
-		inst.pc        = decoded.pc;
-		inst.op        = ir_op;
-		inst.src_count = 2;
-		inst.memory    = OffsetMemoryInfo(decoded, DsMemoryKind(decoded), i);
-		inst.dst.kind  = OperandKind::Null;
-		if (!LowerSourceOperand(OffsetDecodedRegister(decoded.src1, i), inst.src[0], error) ||
-		    !LowerSourceOperand(decoded.src0, inst.src[1], error)) {
-			return false;
-		}
-		block.instructions.push_back(inst);
+	const auto  ir_op = DsWriteOpcode(decoded.data_bits);
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = ir_op;
+	inst.src_count = 2;
+	inst.memory    = MemoryInfoFromDecoded(decoded, DsMemoryKind(decoded));
+	inst.dst.kind  = OperandKind::Null;
+	if (!LowerSourceOperand(decoded.src1, inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[1], error)) {
+		return false;
 	}
+	block.instructions.push_back(inst);
 	return true;
 }
 
 bool LowerDsWrite2(const Decoder::Instruction& decoded, BasicBlock& block,
                    uint32_t dwords_per_write, std::string* error) {
-	const Decoder::Operand* data[]    = {&decoded.src1, &decoded.src2};
-	const uint32_t          offsets[] = {decoded.offset, decoded.secondary_offset};
-	for (uint32_t write = 0; write < 2u; write++) {
-		for (uint32_t dword = 0; dword < dwords_per_write; dword++) {
-			Instruction inst;
-			inst.pc        = decoded.pc;
-			inst.op        = Opcode::DsWriteB32;
-			inst.src_count = 2;
-			inst.memory =
-			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[write] + dword * 4u);
-			inst.dst.kind = OperandKind::Null;
-			if (!LowerSourceOperand(OffsetDecodedRegister(*data[write], dword), inst.src[0],
-			                        error) ||
-			    !LowerSourceOperand(decoded.src0, inst.src[1], error)) {
-				return false;
-			}
-			block.instructions.push_back(inst);
-		}
+	Instruction inst;
+	inst.pc                 = decoded.pc;
+	inst.op                 = Opcode::DsWrite2B32;
+	inst.src_count          = 3;
+	inst.memory             = MemoryInfoFromDecoded(decoded, DsMemoryKind(decoded));
+	inst.memory.data_dwords = dwords_per_write * 2u;
+	inst.dst.kind           = OperandKind::Null;
+	if (!LowerSourceOperand(decoded.src1, inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src0, inst.src[1], error) ||
+	    !LowerSourceOperand(decoded.src2, inst.src[2], error)) {
+		return false;
 	}
+	block.instructions.push_back(inst);
 	return true;
 }
 
@@ -618,7 +600,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 			return LowerDsWriteAddtidB32(decoded, block, error);
 		case Decoder::Opcode::DS_READ_ADDTID_B32:
 			return LowerDsReadAddtidB32(decoded, block, error);
-		case Decoder::Opcode::DS_READ2_B32: return LowerDsRead2(decoded, block, 1, error);
+		case Decoder::Opcode::DS_READ2_B32:
+		case Decoder::Opcode::DS_READ2ST64_B32: return LowerDsRead2(decoded, block, 1, error);
 		case Decoder::Opcode::DS_READ2_B64:
 		case Decoder::Opcode::DS_READ2ST64_B64: return LowerDsRead2(decoded, block, 2, error);
 		case Decoder::Opcode::DS_READ_I8:
@@ -765,6 +748,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
 		case Decoder::Opcode::DS_READ2_B32:
+		case Decoder::Opcode::DS_READ2ST64_B32:
 		case Decoder::Opcode::DS_READ_B32:
 		case Decoder::Opcode::DS_READ_B64:
 		case Decoder::Opcode::DS_READ2_B64:

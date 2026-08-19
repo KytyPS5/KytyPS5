@@ -976,7 +976,7 @@ void TestSpirvRequirementsAnalysis() {
   block->AppendNewInst(ValueOpcode::ImageGatherRaw,
                        {Value(0u), Value(0u), Value(0u)});
   auto &shared = block->AppendNewInst(ValueOpcode::LoadSharedU32,
-                                      {Value(0u), Value(0u), Value(true)});
+                                      {Value(0u), Value(true)});
   shared.SetFlags(MemoryFlags{.index = 0});
   auto &export_value =
       block->AppendNewInst(ValueOpcode::SetAttribute, {Value(0u), Value(true)});
@@ -1095,11 +1095,9 @@ void TestNativeSubgroupPolicy() {
     } else if (opcode == ValueOpcode::Ballot) {
       block->AppendNewInst(opcode, {Value(true)});
     } else if (opcode == ValueOpcode::DataAppend) {
-      auto &resource = block->AppendNewInst(ValueOpcode::GetLdsResource);
       program.values->memory_info.push_back({.kind = ResourceKind::Lds});
-      auto &append =
-          block->AppendNewInst(opcode, {Value(&resource), Value(0u),
-                                        Value(true), Value(1u), Value(0u)});
+      auto &append = block->AppendNewInst(
+          opcode, {Value(0u), Value(true), Value(1u), Value(0u)});
       append.SetFlags(MemoryFlags{.index = 0});
     }
     std::string error;
@@ -1748,6 +1746,7 @@ void TestNewShaderRecompilerScalarVectorAlu() {
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
+
 }
 
 void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
@@ -4102,8 +4101,6 @@ void TestNewShaderRecompilerMemoryFamilyLowering() {
         "MIMG sample did not lower to IR");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 95),
@@ -5329,8 +5326,6 @@ void TestNewShaderRecompilerVintrpLowering() {
   Check(ProgramInputCount(result.program,
                           ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
         "VINTRP pixel shader did not reflect parameter inputs");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 81),
@@ -5608,8 +5603,6 @@ void TestNewShaderRecompilerWideMemoryLowering() {
         "global segment load did not lower with global metadata");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 194),
@@ -5807,8 +5800,6 @@ void TestNewShaderRecompilerMubufFormatLowering() {
         "MUBUF formatted stores were not preserved as native-width operations");
   Check(SpirvContainsOpcode(result.spirv, 65),
         "SPIR-V binary does not contain OpAccessChain");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   CheckSpirvBinaryValidates(result.spirv);
@@ -6283,18 +6274,60 @@ void TestNewShaderRecompilerDsReadWrite2Lowering() {
       0xbf810000u,
   };
 
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::CFG::Graph graph;
+  ShaderRecompiler::IR::Program lowered;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error) &&
+            ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error) &&
+            ShaderRecompiler::IR::LowerProgram(
+                decoded, graph, ShaderType::Compute, 64, lowered, &error),
+        error.c_str());
+  uint32_t pair_reads = 0;
+  uint32_t pair_writes = 0;
+  for (const auto &block : lowered.blocks) {
+    for (const auto &inst : block.instructions) {
+      pair_reads += inst.op == ShaderRecompiler::IR::Opcode::DsRead2B32;
+      pair_writes += inst.op == ShaderRecompiler::IR::Opcode::DsWrite2B32;
+    }
+  }
+  Check(pair_reads == 3u && pair_writes == 1u,
+        "DS read/write2 was split before typed SSA");
+  ShaderRecompiler::IR::ValueProgram typed;
+  ShaderComputeInputInfo compute{};
+  Check(ShaderRecompiler::Frontend::TranslateProgram(lowered, typed, nullptr,
+                                                     nullptr, &compute, &error),
+        error.c_str());
+  uint32_t scalar_loads = 0;
+  uint32_t vector_loads = 0;
+  uint32_t scalar_stores = 0;
+  for (const auto *block : typed.blocks) {
+    for (const auto &inst : *block) {
+      scalar_loads +=
+          inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::LoadSharedU32;
+      vector_loads += inst.GetOpcode() ==
+                      ShaderRecompiler::IR::ValueOpcode::LoadSharedU32x2;
+      scalar_stores +=
+          inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::WriteSharedU32;
+    }
+  }
+  Check(scalar_loads == 4u && vector_loads == 2u && scalar_stores == 2u,
+        "DS read/write2 did not use the native scalar/x2 transaction shape");
+
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
-  std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "ds_write2_b32"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_WRITE2_B32"),
         "new decoder did not decode old-backed DS write2");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_read2_b32"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ2_B32"),
         "new decoder did not decode old-backed DS read2");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_read2_b64"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ2ST64_B32"),
+        "new decoder did not preserve the DS read2st64 opcode identity");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ2_B64"),
         "new decoder did not decode old-backed DS read2 b64");
   Check(Common::ContainsStr(result.decoded_dump, "offset=4"),
         "DS write2 decode did not scale offset0 to bytes");
@@ -6316,24 +6349,6 @@ void TestNewShaderRecompilerDsReadWrite2Lowering() {
         "DS read/write2 decode did not preserve two-dword metadata");
   Check(Common::ContainsStr(result.decoded_dump, "dwords=4 bits=32"),
         "DS read2 b64 decode did not preserve four-dword metadata");
-  Check(Common::ContainsStr(result.ir_dump, "DsWriteB32 null, v60"),
-        "DS write2 did not lower first dword through shared LDS store IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsWriteB32 null, v61"),
-        "DS write2 did not lower second dword through shared LDS store IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v70"),
-        "DS read2 did not lower first dword through shared LDS load IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v71"),
-        "DS read2 did not lower second dword through shared LDS load IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v72"),
-        "DS read2 st64 did not lower first dword through shared LDS load IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v73"),
-        "DS read2 st64 did not lower second dword through shared LDS load IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v80"),
-        "DS read2 b64 did not lower first dword through shared LDS load IR");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v83"),
-        "DS read2 b64 did not lower fourth dword through shared LDS load IR");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 65),
@@ -6420,49 +6435,80 @@ void TestNewShaderRecompilerDsWideAndAtomicLowering() {
       0xbf810000u,
   };
 
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::CFG::Graph graph;
+  ShaderRecompiler::IR::Program lowered;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error) &&
+            ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error) &&
+            ShaderRecompiler::IR::LowerProgram(
+                decoded, graph, ShaderType::Compute, 64, lowered, &error),
+        error.c_str());
+  uint32_t native_reads = 0;
+  uint32_t native_writes = 0;
+  for (const auto &block : lowered.blocks) {
+    for (const auto &inst : block.instructions) {
+      native_reads += inst.op == ShaderRecompiler::IR::Opcode::DsReadB32;
+      native_writes += inst.op == ShaderRecompiler::IR::Opcode::DsWriteB32;
+    }
+  }
+  Check(native_reads == 3u && native_writes == 3u,
+        "wide DS transfers were split before typed SSA");
+  ShaderRecompiler::IR::ValueProgram typed;
+  ShaderComputeInputInfo compute{};
+  Check(ShaderRecompiler::Frontend::TranslateProgram(lowered, typed, nullptr,
+                                                     nullptr, &compute, &error),
+        error.c_str());
+  std::array<uint32_t, 3> load_widths{};
+  std::array<uint32_t, 3> store_widths{};
+  for (const auto *block : typed.blocks) {
+    for (const auto &inst : *block) {
+      using ShaderRecompiler::IR::ValueOpcode;
+      if (inst.GetOpcode() == ValueOpcode::LoadSharedU32x2)
+        load_widths[0]++;
+      if (inst.GetOpcode() == ValueOpcode::LoadSharedU32x3)
+        load_widths[1]++;
+      if (inst.GetOpcode() == ValueOpcode::LoadSharedU32x4)
+        load_widths[2]++;
+      if (inst.GetOpcode() == ValueOpcode::WriteSharedU32x2)
+        store_widths[0]++;
+      if (inst.GetOpcode() == ValueOpcode::WriteSharedU32x3)
+        store_widths[1]++;
+      if (inst.GetOpcode() == ValueOpcode::WriteSharedU32x4)
+        store_widths[2]++;
+    }
+  }
+  Check(load_widths == std::array<uint32_t, 3>{1u, 1u, 1u} &&
+            store_widths == std::array<uint32_t, 3>{1u, 1u, 1u},
+        "wide DS transfers retained scalar sibling operations");
+
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
-  std::string error;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(Common::ContainsStr(result.decoded_dump, "ds_write_b64"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_WRITE_B64"),
         "new decoder did not decode DS b64 write");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_write_b96"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_WRITE_B96"),
         "new decoder did not decode DS b96 write");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_write_b128"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_WRITE_B128"),
         "new decoder did not decode DS b128 write");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_read_b64"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ_B64"),
         "new decoder did not decode DS b64 read");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_read_b96"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ_B96"),
         "new decoder did not decode DS b96 read");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_read_b128"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ_B128"),
         "new decoder did not decode DS b128 read");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_min_u32"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_MIN_U32"),
         "new decoder did not decode DS min atomic");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_max_u32"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_MAX_U32"),
         "new decoder did not decode DS max atomic");
-  Check(Common::ContainsStr(result.decoded_dump, "ds_or_b32"),
+  Check(Common::ContainsStr(result.decoded_dump, "DS_OR_B32"),
         "new decoder did not decode DS or atomic");
   Check(Common::ContainsStr(result.decoded_dump, "dwords=4 bits=32"),
         "new decoder did not expose DS wide width metadata");
-  Check(Common::ContainsStr(result.ir_dump, "DsWriteB32 null, v10"),
-        "DS b64 write did not expand to first dword store");
-  Check(Common::ContainsStr(result.ir_dump, "DsWriteB32 null, v19"),
-        "DS b128 write did not expand to last dword store");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v20"),
-        "DS b64 read did not expand to first dword load");
-  Check(Common::ContainsStr(result.ir_dump, "DsReadB32 v31"),
-        "DS b128 read did not expand to last dword load");
-  Check(Common::ContainsStr(result.ir_dump, "AtomicUMinU32 null, v32"),
-        "DS min atomic did not lower to shared atomic IR");
-  Check(Common::ContainsStr(result.ir_dump, "AtomicUMaxU32 null, v33"),
-        "DS max atomic did not lower to shared atomic IR");
-  Check(Common::ContainsStr(result.ir_dump, "AtomicOrU32 null, v34"),
-        "DS or atomic did not lower to shared atomic IR");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   Check(SpirvContainsOpcode(result.spirv, 237),
@@ -6570,6 +6616,7 @@ void TestNewShaderRecompilerDsAddtidLowering() {
   Check(SpirvContainsOpcode(result.spirv, 199),
         "SPIR-V binary does not contain OpBitwiseAnd");
   CheckSpirvBinaryValidates(result.spirv);
+
 }
 
 void TestNewShaderRecompilerDsFloatMinMaxLowering() {
@@ -7838,17 +7885,16 @@ void TestNewShaderRecompilerDispatcherSpillsU32x3() {
 
   auto program = result.program;
   IR::IREmitter definition(program.values->blocks[0]);
-  const auto vector = definition.Emit(IR::ValueOpcode::CompositeConstructU32x3,
-                                      {IR::Value(1u), IR::Value(2u),
-                                       IR::Value(3u)});
+  const auto vector =
+      definition.Emit(IR::ValueOpcode::CompositeConstructU32x3,
+                      {IR::Value(1u), IR::Value(2u), IR::Value(3u)});
   IR::IREmitter use(program.values->blocks[1]);
-  use.Emit(IR::ValueOpcode::CompositeExtractU32x3,
-           {vector, IR::Value(2u)});
+  use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(2u)});
   Check(Spirv::AnalyzeProgramRequirements(program, &error), error.c_str());
 
   std::vector<uint32_t> spirv;
-  Check(Spirv::EmitProgram(program, result.resources, options.input_info,
-                           spirv, &error),
+  Check(Spirv::EmitProgram(program, result.resources, options.input_info, spirv,
+                           &error),
         error.c_str());
   CheckSpirvBinaryValidates(spirv);
   const auto before = MeasureSpirv(result.spirv);
@@ -8533,7 +8579,8 @@ void TestWqmConstantPropagation() {
           "WqmU64 constant propagation crossed a quad or dword boundary");
   }
 
-  const auto check_invalid_signature = [](ValueOpcode opcode, Value valid, Value invalid) {
+  const auto check_invalid_signature = [](ValueOpcode opcode, Value valid,
+                                          Value invalid) {
     ValueProgram malformed;
     malformed.block_storage.push_back(std::make_unique<Block>());
     malformed.blocks.push_back(malformed.block_storage.back().get());
@@ -8547,7 +8594,8 @@ void TestWqmConstantPropagation() {
           "value IR accepted a WQM operand that violates opcode metadata");
   };
   check_invalid_signature(ValueOpcode::WqmU64, Value(uint64_t{1}), Value(true));
-  check_invalid_signature(ValueOpcode::WqmMask, Value(true), Value(uint64_t{1}));
+  check_invalid_signature(ValueOpcode::WqmMask, Value(true),
+                          Value(uint64_t{1}));
 }
 
 void TestNativeWideValueValidation() {
@@ -8568,8 +8616,8 @@ void TestNativeWideValueValidation() {
     IREmitter ir(program.blocks.front());
     const auto resource = ir.Emit(ValueOpcode::GetBufferResource,
                                   {Value(0u), Value(0u), Value(0u), Value(0u)});
-    ir.Emit(opcode,
-            {resource, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+    ir.Emit(opcode, {resource, Value(0u), Value(0u), Value(0u), Value(true)},
+            flags);
   };
   const auto check_rejected = [](const ValueProgram &program,
                                  const char *expected) {
@@ -8585,8 +8633,7 @@ void TestNativeWideValueValidation() {
     memory.kind = ResourceKind::Buffer;
     memory.data_dwords = 3;
     program.memory_info.push_back(memory);
-    append_load(program, ValueOpcode::LoadBufferU32x3,
-                MemoryFlags{.index = 1});
+    append_load(program, ValueOpcode::LoadBufferU32x3, MemoryFlags{.index = 1});
     check_rejected(program, "invalid memory-info index");
   }
   {
@@ -8623,6 +8670,43 @@ void TestNativeWideValueValidation() {
                                 {Value(1u), Value(2u), Value(3u)});
     ir.Emit(ValueOpcode::CompositeExtractU32x3, {vector, Value(3u)});
     check_rejected(program, "invalid component index");
+  }
+  const auto append_shared = [](ValueProgram &program, ValueOpcode opcode,
+                                MemoryFlags flags) {
+    IREmitter ir(program.blocks.front());
+    ir.Emit(opcode, {Value(0u), Value(true)}, flags);
+  };
+  {
+    auto program = make_program();
+    append_shared(program, ValueOpcode::LoadSharedU32, MemoryFlags{.index = 1});
+    check_rejected(program, "invalid memory-info index");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    program.memory_info.push_back(memory);
+    append_shared(program, ValueOpcode::LoadSharedU32, {});
+    check_rejected(program, "invalid shared-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Gds;
+    memory.resource = 1;
+    program.memory_info.push_back(memory);
+    append_shared(program, ValueOpcode::LoadSharedU32, {});
+    check_rejected(program, "invalid shared-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Lds;
+    memory.data_dwords = 2;
+    memory.component_count = 2;
+    program.memory_info.push_back(memory);
+    append_shared(program, ValueOpcode::LoadSharedU32x3, {});
+    check_rejected(program, "inconsistent shared-memory width");
   }
 }
 
@@ -8800,7 +8884,7 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   const uint32_t native_wqm_shader[] = {
       EncodeSop1(0x0a, 2, 0), // s_wqm_b64 s[2:3], s[0:1]
       EncodeVop1(0x01, 0, 2), // v_mov_b32 v0, s2
-      EncodeExp0(0x0c, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+      EncodeExp0(0x0c, 0x1),  EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
   };
   auto native_options = options;
   native_options.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
@@ -8814,7 +8898,8 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
         "native scalar WQM retained frontend expansion or subgroup machinery");
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 2u &&
             SpirvInstructionOpcodeCount(result.spirv, 194u) == 4u,
-        "native scalar WQM emitter was folded away or did not use the compact path");
+        "native scalar WQM emitter was folded away or did not use the compact "
+        "path");
 
   const uint32_t native_special_wqm_shader[] = {
       EncodeSop1(0x04, 126, 0),   // s_mov_b64 exec, s[0:1]
@@ -8823,7 +8908,7 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
       EncodeSop1(0x0a, 106, 106), // s_wqm_b64 vcc, vcc
       EncodeVop1(0x01, 0, 126),   // v_mov_b32 v0, exec_lo
       EncodeVop1(0x01, 1, 106),   // v_mov_b32 v1, vcc_lo
-      EncodeExp0(0x0c, 0x3), EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01),
+      EncodeExp0(0x0c, 0x3),      EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01),
   };
   Check(ShaderRecompiler::TryRecompile(native_special_wqm_shader,
                                        native_options, result, &error),
@@ -10406,6 +10491,19 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             empty_metrics.type_pointers == 0u,
         "empty shader emitted unused core types or pointers");
 
+  const uint32_t dead_gds[] = {
+      EncodeDs0(0x36, 0) | (1u << 17u),
+      EncodeDs1(0, 0, 1),
+      EncodeSopp(0x01),
+  };
+  const auto dead_gds_result =
+      compile("dead-gds", dead_gds,
+              {.words = 64, .instructions = 20, .labels = 4, .branches = 3});
+  Check(ShaderRecompiler::IR::FindBinding(
+            dead_gds_result.program.bindings,
+            ShaderRecompiler::IR::DescriptorBindingKind::Gds) == nullptr,
+        "dead GDS load retained a descriptor binding");
+
   const uint32_t structured_phi[] = {
       EncodeSMovB32(0, 128),       // s0 = 0
       EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
@@ -10494,6 +10592,83 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             scalar_stores == 0u,
         "wide buffer fixture retained scalar sibling memory operations");
 
+  const uint32_t wide_lds[] = {
+      EncodeDs0(0xff, 0),  EncodeDs1(0, 0, 4), // ds_read_b128 v[0:3], v4
+      EncodeDs0(0xdf, 16), EncodeDs1(0, 0, 4), // ds_write_b128 v[0:3], v4
+      EncodeSopp(0x01),
+  };
+  const auto wide_lds_result = compile("wide-lds", wide_lds,
+                                       {.words = 548,
+                                        .instructions = 156,
+                                        .variables = 1,
+                                        .workgroup_variables = 1,
+                                        .loads = 4,
+                                        .stores = 4,
+                                        .phis = 5,
+                                        .labels = 34,
+                                        .selection_merges = 10,
+                                        .branches = 23,
+                                        .conditional_branches = 10});
+  const auto wide_lds_metrics = MeasureSpirv(wide_lds_result.spirv);
+  Check(wide_lds_metrics.workgroup_variables == 1u &&
+            wide_lds_metrics.runtime_arrays == 0u &&
+            wide_lds_metrics.array_lengths == 0u,
+        "native wide LDS fixture emitted the wrong storage topology");
+
+  const uint32_t wide_gds[] = {
+      EncodeDs0(0xff, 0) | (1u << 17u),
+      EncodeDs1(0, 0, 4),
+      EncodeDs0(0xdf, 16) | (1u << 17u),
+      EncodeDs1(0, 0, 4),
+      EncodeSopp(0x01),
+  };
+  const auto wide_gds_result = compile("wide-gds", wide_gds,
+                                       {.words = 577,
+                                        .instructions = 162,
+                                        .runtime_arrays = 1,
+                                        .variables = 1,
+                                        .loads = 4,
+                                        .stores = 4,
+                                        .array_lengths = 1,
+                                        .phis = 5,
+                                        .labels = 34,
+                                        .selection_merges = 10,
+                                        .branches = 23,
+                                        .conditional_branches = 10});
+  const auto wide_gds_metrics = MeasureSpirv(wide_gds_result.spirv);
+  Check(wide_gds_metrics.runtime_arrays == 1u &&
+            wide_gds_metrics.workgroup_variables == 0u &&
+            wide_gds_metrics.array_lengths == 1u,
+        "native wide GDS fixture did not share one entry-dominating length");
+  Check(ShaderRecompiler::IR::FindBinding(
+            wide_gds_result.program.bindings,
+            ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr,
+        "live native wide GDS access did not allocate its descriptor binding");
+  const auto count_shared = [](const ShaderRecompiler::CompileResult &result,
+                               ShaderRecompiler::IR::ValueOpcode opcode) {
+    uint32_t count = 0;
+    for (const auto *block : result.program.values->blocks) {
+      count += std::ranges::count(*block, opcode,
+                                  &ShaderRecompiler::IR::Inst::GetOpcode);
+    }
+    return count;
+  };
+  for (const auto *result : {&wide_lds_result, &wide_gds_result}) {
+    Check(count_shared(*result,
+                       ShaderRecompiler::IR::ValueOpcode::LoadSharedU32x4) ==
+                  1u &&
+              count_shared(
+                  *result,
+                  ShaderRecompiler::IR::ValueOpcode::WriteSharedU32x4) == 1u &&
+              count_shared(*result,
+                           ShaderRecompiler::IR::ValueOpcode::LoadSharedU32) ==
+                  0u &&
+              count_shared(*result,
+                           ShaderRecompiler::IR::ValueOpcode::WriteSharedU32) ==
+                  0u,
+          "native wide shared fixture retained scalar sibling operations");
+  }
+
   const uint32_t wqm[] = {
       EncodeVopc(0xc1, 5 + 256, 8), // v_cmp_lt_u32 vcc, v5, v8
       EncodeSop1(0x0a, 2, 106),     // s_wqm_b64 s[2:3], vcc
@@ -10563,6 +10738,8 @@ int main() {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerMubufFormatLowering();
   TestNewShaderRecompilerTypedBufferLowering();
+  TestNewShaderRecompilerDsReadWrite2Lowering();
+  TestNewShaderRecompilerDsWideAndAtomicLowering();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized direct SPIR-V are exercised by

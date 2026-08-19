@@ -95,12 +95,25 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
-	const auto uses_gds = program.values != nullptr &&
-	                      std::ranges::any_of(program.values->blocks, [](const IR::Block* block) {
-		                      return std::ranges::any_of(*block, [](const IR::Inst& inst) {
-			                      return inst.GetOpcode() == IR::ValueOpcode::GetGdsResource;
-		                      });
-	                      });
+	bool uses_gds = false;
+	if (program.values != nullptr) {
+		for (const auto* block: program.values->blocks) {
+			for (const auto& inst: *block) {
+				if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) {
+					continue;
+				}
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (index >= program.values->memory_info.size()) {
+					return Fail(error, "shared operation has invalid memory metadata");
+				}
+				const auto kind = program.values->memory_info[index].kind;
+				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
+					return Fail(error, "shared operation has invalid resource kind");
+				}
+				uses_gds |= kind == IR::ResourceKind::Gds;
+			}
+		}
+	}
 	if (uses_gds) {
 		Expect(Kind::Gds);
 	}
@@ -249,6 +262,26 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 					}
 				}
 			}
+			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+			if (shared_access != IR::SharedAccess::None) {
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (index >= program.values->memory_info.size()) {
+					return Fail(error, "shared operation has invalid memory metadata");
+				}
+				const auto kind = program.values->memory_info[index].kind;
+				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
+					return Fail(error, "shared operation has invalid resource kind");
+				}
+				if (program.stage != ShaderType::Compute && kind == IR::ResourceKind::Lds) {
+					requirements.function_lds = true;
+				}
+				if (shared_access == IR::SharedAccess::Append ||
+				    shared_access == IR::SharedAccess::Consume) {
+					MarkExactSubgroup();
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+				}
+			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: MarkExactSubgroup(); break;
 				case IR::ValueOpcode::DppMoveU32:
@@ -268,9 +301,7 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
-				case IR::ValueOpcode::Permlane16U32:
-				case IR::ValueOpcode::GdsDataAppend:
-				case IR::ValueOpcode::GdsDataConsume: {
+				case IR::ValueOpcode::Permlane16U32: {
 					MarkExactSubgroup();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
@@ -280,41 +311,6 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 					MarkExactSubgroup();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
-					break;
-				}
-				case IR::ValueOpcode::DataAppend:
-				case IR::ValueOpcode::DataConsume: {
-					MarkExactSubgroup();
-					requirements.subgroup_shuffle             = true;
-					requirements.subgroup_local_invocation_id = true;
-					[[fallthrough]];
-				}
-				case IR::ValueOpcode::LoadSharedU8:
-				case IR::ValueOpcode::LoadSharedU16:
-				case IR::ValueOpcode::LoadSharedU32:
-				case IR::ValueOpcode::WriteSharedU8:
-				case IR::ValueOpcode::WriteSharedU16:
-				case IR::ValueOpcode::WriteSharedU32:
-				case IR::ValueOpcode::SharedAtomicFMin32:
-				case IR::ValueOpcode::SharedAtomicFMax32:
-				case IR::ValueOpcode::SharedAtomicSwap32:
-				case IR::ValueOpcode::SharedAtomicIAdd32:
-				case IR::ValueOpcode::SharedAtomicISub32:
-				case IR::ValueOpcode::SharedAtomicSMin32:
-				case IR::ValueOpcode::SharedAtomicUMin32:
-				case IR::ValueOpcode::SharedAtomicSMax32:
-				case IR::ValueOpcode::SharedAtomicUMax32:
-				case IR::ValueOpcode::SharedAtomicAnd32:
-				case IR::ValueOpcode::SharedAtomicOr32:
-				case IR::ValueOpcode::SharedAtomicXor32: {
-					const auto index = inst.Flags<IR::MemoryFlags>().index;
-					if (index >= program.values->memory_info.size()) {
-						return Fail(error, "shared operation has invalid memory metadata");
-					}
-					if (program.stage != ShaderType::Compute &&
-					    program.values->memory_info[index].kind == IR::ResourceKind::Lds) {
-						requirements.function_lds = true;
-					}
 					break;
 				}
 				case IR::ValueOpcode::LaneId:

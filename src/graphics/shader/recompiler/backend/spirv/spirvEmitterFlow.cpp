@@ -25,16 +25,14 @@ uint32_t EmitWqmWordU32(EmitterState& state, uint32_t value) {
 	const auto merged_two  = state.builder.AllocateId();
 	const auto quad_bits   = state.builder.AllocateId();
 	const auto result      = state.builder.AllocateId();
-	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), shifted_one, value,
-	                           ConstantU32(state, 1)});
 	state.builder.AddFunction(
-	    {OpBitwiseOr, TypeU32(state), merged_one, value, shifted_one});
-	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), shifted_two, merged_one,
-	                           ConstantU32(state, 2)});
+	    {OpShiftRightLogical, TypeU32(state), shifted_one, value, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), merged_one, value, shifted_one});
 	state.builder.AddFunction(
-	    {OpBitwiseOr, TypeU32(state), merged_two, merged_one, shifted_two});
-	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), quad_bits, merged_two,
-	                           ConstantU32(state, 0x11111111u)});
+	    {OpShiftRightLogical, TypeU32(state), shifted_two, merged_one, ConstantU32(state, 2)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), merged_two, merged_one, shifted_two});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), quad_bits, merged_two, ConstantU32(state, 0x11111111u)});
 	state.builder.AddFunction(
 	    {OpIMul, TypeU32(state), result, quad_bits, ConstantU32(state, 0x0fu)});
 	return result;
@@ -103,7 +101,7 @@ uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 	                           ConstantU32(state, ScopeSubgroup), active});
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
-	const auto wqm_low = EmitWqmWordU32(state, low);
+	const auto wqm_low  = EmitWqmWordU32(state, low);
 	const auto lane     = EmitSubgroupLocalInvocationId(state);
 	uint32_t   mask     = wqm_low;
 	uint32_t   bit_lane = lane;
@@ -120,9 +118,9 @@ uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 		state.builder.AddFunction(
 		    {OpBitwiseAnd, TypeU32(state), bit_lane, lane, ConstantU32(state, 31)});
 	}
-	const auto bit      = state.builder.AllocateId();
-	const auto hit      = state.builder.AllocateId();
-	const auto result   = state.builder.AllocateId();
+	const auto bit    = state.builder.AllocateId();
+	const auto hit    = state.builder.AllocateId();
+	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpShiftLeftLogical, TypeU32(state), bit, ConstantU32(state, 1), bit_lane});
 	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), hit, mask, bit});
@@ -531,8 +529,6 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::GetAddressResource:
 		case IR::ValueOpcode::GetImageResource:
 		case IR::ValueOpcode::GetSamplerResource:
-		case IR::ValueOpcode::GetLdsResource:
-		case IR::ValueOpcode::GetGdsResource:
 		case IR::ValueOpcode::MakeImageAddress: return true;
 		default: return false;
 	}

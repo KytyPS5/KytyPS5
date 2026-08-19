@@ -75,7 +75,6 @@ private:
 	IR::Value       GetScalarAddressResource(uint32_t base);
 	IR::Value       GetImageResource(const IR::MemoryInfo& memory);
 	IR::Value       GetSamplerResource(const IR::MemoryInfo& memory);
-	IR::Value       GetSharedResource(IR::ResourceKind kind);
 	IR::Value       MakeImageAddress(const IR::Instruction& inst, const IR::Operand& base);
 	IR::Value       ConstructU32x4(const IR::Operand& base, uint32_t count);
 	void            WriteImageComponents(const IR::Operand& dst, IR::Value value, uint32_t dmask,
@@ -85,7 +84,7 @@ private:
 	IR::U32         WidenSubdword(IR::Value value, uint32_t bits, bool sign);
 	IR::Value       NarrowSubdword(IR::U32 value, uint32_t bits);
 	IR::ValueOpcode BufferAtomicOpcode(IR::Opcode opcode);
-	IR::ValueOpcode SharedAtomicOpcode(IR::Opcode opcode, bool gds);
+	IR::ValueOpcode SharedAtomicOpcode(IR::Opcode opcode);
 	bool            IsScalarMemoryLoadOperation(IR::Opcode opcode);
 	ScalarMemorySourceValues ReadScalarMemorySource(const IR::Instruction& inst);
 	bool                     TranslateScalarMemory(const IR::Instruction&          inst,

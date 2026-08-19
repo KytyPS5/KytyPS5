@@ -42,8 +42,6 @@ constexpr Type BufferResource  = Type::BufferResource;
 constexpr Type AddressResource = Type::AddressResource;
 constexpr Type ImageResource   = Type::ImageResource;
 constexpr Type SamplerResource = Type::SamplerResource;
-constexpr Type LdsResource     = Type::LdsResource;
-constexpr Type GdsResource     = Type::GdsResource;
 constexpr Type ImageAddress    = Type::ImageAddress;
 
 constexpr std::array<OpcodeMeta, static_cast<size_t>(ValueOpcode::Count)> MetaTable = {{
@@ -76,52 +74,23 @@ bool HasSideEffects(ValueOpcode opcode) {
 	if (buffer_access == BufferAccess::Write || buffer_access == BufferAccess::Atomic) {
 		return true;
 	}
+	const auto shared_access = SharedAccessOf(opcode);
+	if (shared_access == SharedAccess::Write || shared_access == SharedAccess::Atomic ||
+	    shared_access == SharedAccess::Append || shared_access == SharedAccess::Consume) {
+		return true;
+	}
 	switch (opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::StoreAddressU8:
 		case ValueOpcode::StoreAddressU16:
 		case ValueOpcode::StoreAddressU32:
-		case ValueOpcode::WriteSharedU8:
-		case ValueOpcode::WriteSharedU16:
-		case ValueOpcode::WriteSharedU32:
-		case ValueOpcode::WriteGdsU8:
-		case ValueOpcode::WriteGdsU16:
-		case ValueOpcode::WriteGdsU32:
-		case ValueOpcode::SharedAtomicFMin32:
-		case ValueOpcode::SharedAtomicFMax32:
-		case ValueOpcode::GdsAtomicFMin32:
-		case ValueOpcode::GdsAtomicFMax32:
-		case ValueOpcode::SharedAtomicSwap32:
-		case ValueOpcode::SharedAtomicIAdd32:
-		case ValueOpcode::SharedAtomicISub32:
-		case ValueOpcode::SharedAtomicSMin32:
-		case ValueOpcode::SharedAtomicUMin32:
-		case ValueOpcode::SharedAtomicSMax32:
-		case ValueOpcode::SharedAtomicUMax32:
-		case ValueOpcode::SharedAtomicAnd32:
-		case ValueOpcode::SharedAtomicOr32:
-		case ValueOpcode::SharedAtomicXor32:
-		case ValueOpcode::GdsAtomicSwap32:
-		case ValueOpcode::GdsAtomicIAdd32:
-		case ValueOpcode::GdsAtomicISub32:
-		case ValueOpcode::GdsAtomicSMin32:
-		case ValueOpcode::GdsAtomicUMin32:
-		case ValueOpcode::GdsAtomicSMax32:
-		case ValueOpcode::GdsAtomicUMax32:
-		case ValueOpcode::GdsAtomicAnd32:
-		case ValueOpcode::GdsAtomicOr32:
-		case ValueOpcode::GdsAtomicXor32:
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
-		case ValueOpcode::DataAppend:
-		case ValueOpcode::DataConsume:
-		case ValueOpcode::GdsDataAppend:
-		case ValueOpcode::GdsDataConsume:
 		case ValueOpcode::ImageWrite:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::Barrier: return true;
@@ -169,6 +138,50 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 		case ValueOpcode::LoadBufferU32x4:
 		case ValueOpcode::StoreBufferU32x4: return 4u;
 		default: return BufferAccessOf(opcode) == BufferAccess::None ? 0u : 1u;
+	}
+}
+
+SharedAccess SharedAccessOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadSharedU8:
+		case ValueOpcode::LoadSharedU16:
+		case ValueOpcode::LoadSharedU32:
+		case ValueOpcode::LoadSharedU32x2:
+		case ValueOpcode::LoadSharedU32x3:
+		case ValueOpcode::LoadSharedU32x4: return SharedAccess::Read;
+		case ValueOpcode::WriteSharedU8:
+		case ValueOpcode::WriteSharedU16:
+		case ValueOpcode::WriteSharedU32:
+		case ValueOpcode::WriteSharedU32x2:
+		case ValueOpcode::WriteSharedU32x3:
+		case ValueOpcode::WriteSharedU32x4: return SharedAccess::Write;
+		case ValueOpcode::SharedAtomicFMin32:
+		case ValueOpcode::SharedAtomicFMax32:
+		case ValueOpcode::SharedAtomicSwap32:
+		case ValueOpcode::SharedAtomicIAdd32:
+		case ValueOpcode::SharedAtomicISub32:
+		case ValueOpcode::SharedAtomicSMin32:
+		case ValueOpcode::SharedAtomicUMin32:
+		case ValueOpcode::SharedAtomicSMax32:
+		case ValueOpcode::SharedAtomicUMax32:
+		case ValueOpcode::SharedAtomicAnd32:
+		case ValueOpcode::SharedAtomicOr32:
+		case ValueOpcode::SharedAtomicXor32: return SharedAccess::Atomic;
+		case ValueOpcode::DataAppend: return SharedAccess::Append;
+		case ValueOpcode::DataConsume: return SharedAccess::Consume;
+		default: return SharedAccess::None;
+	}
+}
+
+uint32_t SharedComponentCount(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadSharedU32x2:
+		case ValueOpcode::WriteSharedU32x2: return 2u;
+		case ValueOpcode::LoadSharedU32x3:
+		case ValueOpcode::WriteSharedU32x3: return 3u;
+		case ValueOpcode::LoadSharedU32x4:
+		case ValueOpcode::WriteSharedU32x4: return 4u;
+		default: return SharedAccessOf(opcode) == SharedAccess::None ? 0u : 1u;
 	}
 }
 

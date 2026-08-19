@@ -974,7 +974,7 @@ void CheckRectListShaders() {
           shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
               shaders.evaluation.size() > 1 &&
               shaders.evaluation[1] == 0x00010500u,
-	        "shadPS4-compatible vector selection requires SPIR-V 1.5");
+          "shadPS4-compatible vector selection requires SPIR-V 1.5");
   ValidateSpirv(name, shaders.control);
   ValidateSpirv(name, shaders.evaluation);
 
@@ -1127,8 +1127,8 @@ CompiledShader CompileCase(const TestCase &test) {
             image != result.program.info.images.end() &&
                 image->mip_count == test.expected_storage_mip_descriptors,
             "runtime descriptor range did not specialize the mip count");
-    const auto resource = static_cast<u32>(
-        image - result.program.info.images.begin());
+    const auto resource =
+        static_cast<u32>(image - result.program.info.images.begin());
     const auto binding = std::ranges::find_if(
         result.program.bindings.descriptors, [&](const auto &group) {
           return std::ranges::find(group.resources, resource) !=
@@ -1156,8 +1156,9 @@ CompiledShader CompileCase(const TestCase &test) {
                 shader_data != nullptr,
             "offset-only shader data did not use its storage fallback");
     std::vector<u32> storage_spirv;
-    if (!ShaderRecompiler::Spirv::EmitProgram(
-            result.program, result.resources, options.input_info, storage_spirv, &error)) {
+    if (!ShaderRecompiler::Spirv::EmitProgram(result.program, result.resources,
+                                              options.input_info, storage_spirv,
+                                              &error)) {
       Fail(test.name, "SPIR-V emit", error.c_str());
     }
     result.spirv = std::move(storage_spirv);
@@ -2209,7 +2210,8 @@ public:
                sizeof(source_words));
     append_dma(0, memory_copy_dst, 0, memory_src, sizeof(source_words));
     append_dma(3, l2_copy_dst, 3, memory_src, sizeof(source_words));
-    append_dma(2, nowhere_dst, 3, nowhere_dst, sizeof(nowhere_words), 1u << 31u);
+    append_dma(2, nowhere_dst, 3, nowhere_dst, sizeof(nowhere_words),
+               1u << 31u);
     Require("GpuCommandLane", "DMA_DATA packet assembly",
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
@@ -2223,7 +2225,7 @@ public:
               buffer_cache.IsRegionRegistered(clean_cached_fill,
                                               sizeof(source_words)) &&
                   !buffer_cache.HasGpuDirtyBytes(nowhere_dst,
-                                                sizeof(nowhere_words)) &&
+                                                 sizeof(nowhere_words)) &&
                   buffer_cache.HasGpuDirtyBytes(immediate_dst,
                                                 sizeof(source_words)),
               "DMA prefetch modified ownership or did not establish a dirty "
@@ -2611,14 +2613,15 @@ public:
     depth_only_info.format = depth_stencil_info.pixel_format;
     const auto depth_only = depth_stencil.FindView(depth_only_info);
     auto combined_info = depth_only_info;
-    combined_info.aspect = vk::ImageAspectFlagBits::eDepth |
-                           vk::ImageAspectFlagBits::eStencil;
+    combined_info.aspect =
+        vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
     combined_info.mapping = {};
     combined_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
     const auto combined = depth_stencil.FindView(combined_info);
     Require(name, "depth/stencil aspects",
             depth_only != nullptr && combined != nullptr &&
-                depth_only != combined && depth_stencil.views.views.size() == 2 &&
+                depth_only != combined &&
+                depth_stencil.views.views.size() == 2 &&
                 depth_stencil.views.views[0].info.aspect ==
                     vk::ImageAspectFlagBits::eDepth &&
                 depth_stencil.views.views[1].info.aspect ==
@@ -3592,7 +3595,7 @@ public:
       };
 
       // A formatted Buffer read must use the private
-			// shadPS4-shaped image-copy path. Use a request larger
+      // shadPS4-shaped image-copy path. Use a request larger
       // than the stream shortcut and poison guest backing
       // after upload so stale CPU staging cannot accidentally
       // satisfy the content check.
@@ -4533,10 +4536,11 @@ public:
           texture_cache.FindImage(metadata_depth_a);
       const auto metadata_depth_b_id =
           texture_cache.FindImage(metadata_depth_b);
-      Require(name, "pending DCC/HTile separation",
-              !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
-                  !texture_cache.IsMeta(base + metadata_a),
-              "an unclassified PS5 DCC fill was exposed as registered metadata");
+      Require(
+          name, "pending DCC/HTile separation",
+          !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
+              !texture_cache.IsMeta(base + metadata_a),
+          "an unclassified PS5 DCC fill was exposed as registered metadata");
       const auto metadata_depth_a_view =
           texture_cache.FindDepthTarget(metadata_depth_a_id, metadata_depth_a);
       const auto metadata_depth_b_view =
@@ -4568,11 +4572,12 @@ public:
               texture_cache.IsMeta(base + metadata_b) &&
               texture_cache.IsMetaCleared(base + metadata_b, 0),
           "image discovery retired aliased metadata or its live depth image");
-      Require(name, "registered DCC/HTile separation",
-              texture_cache.TouchMeta(base + metadata_a, 0, false) &&
-                  !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
-                  !texture_cache.IsMetaCleared(base + metadata_a, 0),
-              "a PS5 DCC fill changed registered HTile state");
+      Require(
+          name, "registered DCC/HTile separation",
+          texture_cache.TouchMeta(base + metadata_a, 0, false) &&
+              !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
+              !texture_cache.IsMetaCleared(base + metadata_a, 0),
+          "a PS5 DCC fill changed registered HTile state");
       Require(
           name, "metadata first-touch state",
           texture_cache.TouchMeta(base + metadata_b, 0, true) &&
@@ -6356,17 +6361,15 @@ public:
               color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
               color.desc.info.metadata.range.address == dcc_address &&
               color.metadata_clear_supported &&
-              texture_cache.IsMetaCleared(dcc_address, 7,
-                                          &dcc_clear_value) &&
-              dcc_clear_value == 0 &&
-              !texture_cache.ClearMeta(dcc_address) &&
+              texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
+              dcc_clear_value == 0 && !texture_cache.ClearMeta(dcc_address) &&
               color.desc.view_info.type == vk::ImageViewType::e2D &&
               color.desc.view_info.layer_count == 1 &&
               image.backing.image_type == vk::ImageType::e3D &&
               static_cast<bool>(image.backing.flags &
                                 vk::ImageCreateFlagBits::e2DArrayCompatible) &&
               image.usage.render_target && image.IsGpuModified(),
-			        "dimension=2/depth=31 did not create the SDK-defined 32x32x32 "
+          "dimension=2/depth=31 did not create the SDK-defined 32x32x32 "
           "backing and 2D "
           "attachment slice");
 
@@ -6389,18 +6392,18 @@ public:
               sliced_rendering.num_layers == 1 &&
               sliced_rendering.color_attachments[0].is_clear &&
               sliced_rendering.color_attachments[0].clear_value ==
-                  vk::ClearColorValue {}.uint32 &&
+                  vk::ClearColorValue{}.uint32 &&
               !texture_cache.IsMetaCleared(dcc_address, 7),
           "a nonzero 3D attachment slice was treated as a Vulkan array layer");
       dcc_clear_value = 0;
-      Require(name, "registered DCC code state",
-              texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0xffffffffu) &&
-                  !texture_cache.IsMetaCleared(dcc_address, 7,
-                                               &dcc_clear_value) &&
-                  dcc_clear_value == 0xffffffffu &&
-                  texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0) &&
-                  texture_cache.IsMetaCleared(dcc_address, 7),
-              "DCC fill codes were not classified as clear or uncompressed");
+      Require(
+          name, "registered DCC code state",
+          texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0xffffffffu) &&
+              !texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
+              dcc_clear_value == 0xffffffffu &&
+              texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0) &&
+              texture_cache.IsMetaCleared(dcc_address, 7),
+          "DCC fill codes were not classified as clear or uncompressed");
 
       auto storage_desc = color.desc;
       storage_desc.type = BindingType::Storage;
@@ -6629,11 +6632,10 @@ public:
               .channel_type = Prospero::ChannelType::kFloat,
               .channel_order = Prospero::ChannelOrder::kStandard});
       registers.SetColorAttrib2(0, {.height = 63, .width = 63});
-      registers.SetColorAttrib3(
-          0, {.tile_mode = Prospero::TileMode::kDepth,
-              .dimension = 1,
-              .cmask_pipe_aligned = true,
-              .dcc_pipe_aligned = true});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kDepth,
+                                    .dimension = 1,
+                                    .cmask_pipe_aligned = true,
+                                    .dcc_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
@@ -6660,20 +6662,21 @@ public:
       scheduler.DrainPriorityOperations();
       std::vector<uint8_t> cleared(allocation_size);
       Require(name, "clear guest backing",
-              Libs::LibKernel::Memory::TryWriteBacking(
-                  base, cleared.data(), allocation_size),
+              Libs::LibKernel::Memory::TryWriteBacking(base, cleared.data(),
+                                                       allocation_size),
               "depth-tiled color backing could not be cleared");
-      Require(name, "readback queue",
-              TextureCacheTestAccess::TryDownload(texture_cache, color.image_id),
-              "depth-tiled color target could not be queued for readback");
+      Require(
+          name, "readback queue",
+          TextureCacheTestAccess::TryDownload(texture_cache, color.image_id),
+          "depth-tiled color target could not be queued for readback");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::vector<uint32_t> observed(expected.size());
       Require(name, "readback backing",
-              Libs::LibKernel::Memory::TryReadBacking(
-                  base, observed.data(), allocation_size),
+              Libs::LibKernel::Memory::TryReadBacking(base, observed.data(),
+                                                      allocation_size),
               "depth-tiled color readback is unavailable");
       bool recovered = true;
       for (uint32_t y = 0; y < height; ++y) {
@@ -7264,27 +7267,27 @@ public:
                                                writable_alias_bindings.vertex);
       RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
                                                *writable_alias_bindings.pixel);
-      Require(name, "forced-general descriptor capture",
-              writable_alias_bindings.vertex.resources.images[0].layout ==
-                      vk::ImageLayout::eGeneral &&
-                  writable_alias_bindings.pixel->resources.images[0].layout ==
-                      vk::ImageLayout::eGeneral &&
-                  DescriptorCacheTestAccess::MakeImageInfo(
-                      writable_alias_bindings.vertex.resources.images[0])
-                          .imageLayout == vk::ImageLayout::eGeneral &&
-                  DescriptorCacheTestAccess::MakeImageInfo(
-                      writable_alias_bindings.pixel->resources.images[0])
-                          .imageLayout == vk::ImageLayout::eGeneral &&
-                  texture_cache.GetImage(storage_id).backing.state.layout ==
-                      vk::ImageLayout::eGeneral &&
-                  texture_cache.GetImage(storage_id)
-                          .backing.state.access_mask ==
-                      (vk::AccessFlagBits2::eShaderRead |
-                       vk::AccessFlagBits2::eShaderWrite |
-                       vk::AccessFlagBits2::eColorAttachmentRead |
-                       vk::AccessFlagBits2::eColorAttachmentWrite),
-              "sampled/storage aliases did not retain the promoted general "
-              "layout and writable access in both generated descriptors");
+      Require(
+          name, "forced-general descriptor capture",
+          writable_alias_bindings.vertex.resources.images[0].layout ==
+                  vk::ImageLayout::eGeneral &&
+              writable_alias_bindings.pixel->resources.images[0].layout ==
+                  vk::ImageLayout::eGeneral &&
+              DescriptorCacheTestAccess::MakeImageInfo(
+                  writable_alias_bindings.vertex.resources.images[0])
+                      .imageLayout == vk::ImageLayout::eGeneral &&
+              DescriptorCacheTestAccess::MakeImageInfo(
+                  writable_alias_bindings.pixel->resources.images[0])
+                      .imageLayout == vk::ImageLayout::eGeneral &&
+              texture_cache.GetImage(storage_id).backing.state.layout ==
+                  vk::ImageLayout::eGeneral &&
+              texture_cache.GetImage(storage_id).backing.state.access_mask ==
+                  (vk::AccessFlagBits2::eShaderRead |
+                   vk::AccessFlagBits2::eShaderWrite |
+                   vk::AccessFlagBits2::eColorAttachmentRead |
+                   vk::AccessFlagBits2::eColorAttachmentWrite),
+          "sampled/storage aliases did not retain the promoted general "
+          "layout and writable access in both generated descriptors");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       const std::array<uint32_t, 3> split_mip_data{0x01020304u, 0x05060708u,
@@ -7564,8 +7567,7 @@ public:
                   vk::ImageAspectFlagBits::eColor &&
               sampled_depth_binding.desc.view_info.usage ==
                   vk::ImageUsageFlagBits::eSampled &&
-              sampled_depth_image.info.pixel_format ==
-                  vk::Format::eD32Sfloat &&
+              sampled_depth_image.info.pixel_format == vk::Format::eD32Sfloat &&
               sampled_depth_image.backing.format == vk::Format::eD32Sfloat &&
               sampled_depth_image.backing.image == sampled_depth_backing &&
               sampled_depth_view != nullptr && normalized_depth_view,
@@ -11225,8 +11227,8 @@ TestCase ScalarShiftCountsMaskLowBits() {
           code,
           {},
           {1, 2, 0x80000000u, 0x40000000u, 0x80000000u, 0xc0000000u},
-          {O::S_MOV_B32, O::S_LSHL_B32, O::S_LSHR_B32, O::S_ASHR_I32, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_LSHL_B32, O::S_LSHR_B32, O::S_ASHR_I32,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Rdna2ScalarOpcodes() {
@@ -11250,8 +11252,8 @@ TestCase Rdna2ScalarOpcodes() {
           code,
           {},
           {0x11u, 0x11u, 7u, 7u},
-          {O::S_MOV_B32, O::S_BITSET1_B32, O::S_SETREG_B32, O::S_ADD_I32, O::S_SLEEP,
-           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_BITSET1_B32, O::S_SETREG_B32, O::S_ADD_I32,
+           O::S_SLEEP, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarTrapDisabledFallsThroughExactRaw() {
@@ -11338,10 +11340,10 @@ TestCase ScalarExtendedArithmetic() {
           code,
           {},
           {0, 12, 15, 0xfffffffeu, 0xfffffffbu, 3, 3, 0xfffffffeu, 5, 33},
-          {O::S_MOV_B32, O::S_ADD_U32, O::S_ADDC_U32, O::S_ADD_I32, O::S_SUB_I32,
-           O::S_MIN_I32, O::S_MAX_I32, O::S_MIN_U32, O::S_MAX_U32, O::S_ABS_I32,
-           O::S_MOVK_I32, O::S_MULK_I32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_ADD_U32, O::S_ADDC_U32, O::S_ADD_I32,
+           O::S_SUB_I32, O::S_MIN_I32, O::S_MAX_I32, O::S_MIN_U32, O::S_MAX_U32,
+           O::S_ABS_I32, O::S_MOVK_I32, O::S_MULK_I32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarArithmeticSccCarryBorrowOverflow() {
@@ -11403,8 +11405,9 @@ TestCase ScalarArithmeticSccCarryBorrowOverflow() {
           code,
           {},
           {1, 0, 1, 0, 1, 0, 1, 0},
-          {O::S_MOV_B32, O::S_SUB_U32, O::S_ADD_I32, O::S_SUB_I32, O::S_CMP_EQ_U32,
-           O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_SUB_U32, O::S_ADD_I32, O::S_SUB_I32,
+           O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarMinMaxSccComparisonEdges() {
@@ -11447,8 +11450,8 @@ TestCase ScalarMinMaxSccComparisonEdges() {
           {},
           {1, 0, 1, 0, 1, 0, 1, 0},
           {O::S_MOV_B32, O::S_MIN_I32, O::S_MAX_I32, O::S_MIN_U32, O::S_MAX_U32,
-           O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+           O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarAbsI32UpdatesScc() {
@@ -11482,8 +11485,8 @@ TestCase ScalarAbsI32UpdatesScc() {
           code,
           {},
           {0, 0, 5, 1},
-          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_ABS_I32, O::S_CSELECT_B32, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_ABS_I32, O::S_CSELECT_B32,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarShiftLeftAddSccCarryEdges() {
@@ -11526,9 +11529,9 @@ TestCase ScalarShiftLeftAddSccCarryEdges() {
           code,
           {},
           {1, 0, 1, 0, 1, 0, 1, 0},
-          {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32, O::S_LSHL3_ADD_U32,
-           O::S_LSHL4_ADD_U32, O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32,
+           O::S_LSHL3_ADD_U32, O::S_LSHL4_ADD_U32, O::S_CMP_EQ_U32,
+           O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarCompareOps() {
@@ -11578,9 +11581,10 @@ TestCase ScalarCompareOps() {
           code,
           {},
           {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1},
-          {O::S_MOV_B32, O::S_CMP_EQ_I32, O::S_CMP_LG_I32, O::S_CMP_GT_I32, O::S_CMP_GE_I32,
-           O::S_CMP_LT_I32, O::S_CMP_LE_I32, O::S_CMP_LG_U32, O::S_CMP_GT_U32, O::S_CMP_GE_U32,
-           O::S_CMP_LE_U32, O::S_CMP_EQ_U64, O::S_CMP_LG_U64, O::S_CSELECT_B32, O::V_MOV_B32,
+          {O::S_MOV_B32, O::S_CMP_EQ_I32, O::S_CMP_LG_I32, O::S_CMP_GT_I32,
+           O::S_CMP_GE_I32, O::S_CMP_LT_I32, O::S_CMP_LE_I32, O::S_CMP_LG_U32,
+           O::S_CMP_GT_U32, O::S_CMP_GE_U32, O::S_CMP_LE_U32, O::S_CMP_EQ_U64,
+           O::S_CMP_LG_U64, O::S_CSELECT_B32, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -11619,9 +11623,10 @@ TestCase ScalarShiftAddAndMaskOps() {
           {},
           {7, 11, 19, 35, 0xfffffffeu, 1, 0x7fffffeeu, 0x7ffffffeu, 0xf00000ffu,
            0xf000000fu},
-          {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32, O::S_LSHL3_ADD_U32,
-           O::S_LSHL4_ADD_U32, O::S_ASHR_I32, O::S_MUL_HI_U32, O::S_NOT_B64, O::S_WQM_B64,
-           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32,
+           O::S_LSHL3_ADD_U32, O::S_LSHL4_ADD_U32, O::S_ASHR_I32,
+           O::S_MUL_HI_U32, O::S_NOT_B64, O::S_WQM_B64, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarNotB64UpdatesScc() {
@@ -11657,8 +11662,8 @@ TestCase ScalarNotB64UpdatesScc() {
           code,
           {},
           {0, 1, 0, 0, 1, 0},
-          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_NOT_B64, O::S_CSELECT_B32, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_NOT_B64, O::S_CSELECT_B32,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarFlbitI32B64Gpu() {
@@ -11691,8 +11696,8 @@ TestCase ScalarFlbitI32B64Gpu() {
           code,
           {},
           {0, 48, 0xffffffffu, 60},
-          {O::S_MOV_B32, O::S_FLBIT_I32_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_FLBIT_I32_B64, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarSaveExecOps() {
@@ -11732,8 +11737,9 @@ TestCase ScalarSaveExecOps() {
            0xffffffffu, 0xffffffffu, 0x00000003u, 0xffffffffu, 0x00000003u,
            0x00000002u, 0xffffffffu, 1},
           {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
-           O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32, O::S_ANDN1_SAVEEXEC_B32,
-           O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+           O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
+           O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
@@ -11848,10 +11854,10 @@ TestCase ScalarBitfieldPack() {
            0xddddbbbbu, 0xccccbbbbu, 0xccccaaaau, 1,           1,
            40,          5,           0xffffffffu, 0,           1},
           {O::S_MOV_B32, O::S_BREV_B32, O::S_BCNT1_I32_B32, O::S_BCNT1_I32_B64,
-           O::S_FF1_I32_B64, O::S_BITREPLICATE_B64_B32, O::S_BFM_B32, O::S_BFE_U32,
-           O::S_PACK_LL_B32_B16, O::S_PACK_LH_B32_B16, O::S_PACK_HH_B32_B16, O::S_BITCMP0_B32,
-           O::S_BITCMP1_B32, O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+           O::S_FF1_I32_B64, O::S_BITREPLICATE_B64_B32, O::S_BFM_B32,
+           O::S_BFE_U32, O::S_PACK_LL_B32_B16, O::S_PACK_LH_B32_B16,
+           O::S_PACK_HH_B32_B16, O::S_BITCMP0_B32, O::S_BITCMP1_B32,
+           O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarBrevB32PreservesScc() {
@@ -11885,8 +11891,8 @@ TestCase ScalarBrevB32PreservesScc() {
           code,
           {},
           {0x80000000u, 0, 0, 1},
-          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_BREV_B32, O::S_CSELECT_B32, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_BREV_B32, O::S_CSELECT_B32,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarBfeI32CapturedRawSignExtends() {
@@ -11912,8 +11918,9 @@ TestCase ScalarBfeI32CapturedRawSignExtends() {
   test.code = std::move(code);
   test.initial = {0xf0000000u, 0, 0, 0, 0};
   test.expected = {0xf0000000u, 0xffffffffu, 1, 0, 0};
-  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_BFE_I32,
-                  O::S_CSELECT_B32,     O::V_MOV_B32,           O::BUFFER_STORE_DWORD,
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_BFE_I32,         O::S_CSELECT_B32,
+                  O::V_MOV_B32,         O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.required_spirv = {"OpBitFieldSExtract"};
   return test;
@@ -11942,8 +11949,8 @@ TestCase BitfieldExtractWidthPastEndEdges() {
           code,
           {},
           {0x00000f00u, 1, 0x0000000fu},
-          {O::S_MOV_B32, O::S_BFE_U32, O::V_MOV_B32, O::V_BFE_U32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_BFE_U32, O::V_MOV_B32, O::V_BFE_U32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Scalar64BitOps() {
@@ -11990,10 +11997,11 @@ TestCase Scalar64BitOps() {
            0xf00ff00fu, 0x0f0f0f0fu, 0x00ff00ffu, 0xf0f0f0f0u, 0x0ff00ff0u,
            0xff0f0f0fu, 0x0000ff00u, 0xfffffff0u, 0x000000ffu, 0xffffffffu,
            0x7fffffffu, 0x000000f0u, 0,           0x0f0f0f0fu, 0x00ff00ffu},
-          {O::S_MOV_B32, O::S_MOV_B64, O::S_AND_B64, O::S_ANDN2_B64, O::S_OR_B64,
-           O::S_ORN2_B64, O::S_XOR_B64, O::S_NAND_B64, O::S_NOR_B64, O::S_XNOR_B64,
-           O::S_LSHL_B64, O::S_LSHR_B64, O::S_BFM_B64, O::S_BFE_U64, O::S_CMP_EQ_U32,
-           O::S_CSELECT_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_MOV_B64, O::S_AND_B64, O::S_ANDN2_B64,
+           O::S_OR_B64, O::S_ORN2_B64, O::S_XOR_B64, O::S_NAND_B64,
+           O::S_NOR_B64, O::S_XNOR_B64, O::S_LSHL_B64, O::S_LSHR_B64,
+           O::S_BFM_B64, O::S_BFE_U64, O::S_CMP_EQ_U32, O::S_CSELECT_B64,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarAndn2B64SccBranch() {
@@ -12065,7 +12073,8 @@ TestCase VectorVop3MoveAppliesFloatSourceModifiers() {
   test.name = "VectorVop3MoveAppliesFloatSourceModifiers";
   test.code = code;
   test.expected = {0xc0000000u};
-  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpFNegate"};
   return test;
 }
@@ -12133,13 +12142,16 @@ TestCase VectorIntegerOps() {
            32,          32,          0x0fffffffu, 0x0fffffffu, 0xffffffffu,
            0xffffffffu, 0xf0f0f0f0u, 0xf0000000u, 1,           30,
            7,           0xfffffff8u},
-          {O::V_MOV_B32,    O::V_MIN_I32,     O::V_MAX_I32,          O::V_MIN_U32,
-           O::V_MAX_U32,    O::V_ADD_NC_U32,   O::V_SUB_NC_U32,        O::V_SUBREV_NC_U32,
-           O::V_MUL_U32_U24, O::V_MUL_I32_I24,  O::V_AND_B32,          O::V_OR_B32,
-           O::V_XOR_B32,    O::V_XNOR_B32,    O::V_LSHL_B32,         O::V_LSHLREV_B32,
-           O::V_LSHR_B32,   O::V_LSHRREV_B32, O::V_ASHR_I32,         O::V_ASHRREV_I32,
-           O::V_NOT_B32,    O::V_BFREV_B32,   O::V_FFBL_B32,         O::V_FFBH_U32,
-           O::V_CMP_EQ_U32,  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32,     O::V_MIN_I32,       O::V_MAX_I32,
+           O::V_MIN_U32,     O::V_MAX_U32,       O::V_ADD_NC_U32,
+           O::V_SUB_NC_U32,  O::V_SUBREV_NC_U32, O::V_MUL_U32_U24,
+           O::V_MUL_I32_I24, O::V_AND_B32,       O::V_OR_B32,
+           O::V_XOR_B32,     O::V_XNOR_B32,      O::V_LSHL_B32,
+           O::V_LSHLREV_B32, O::V_LSHR_B32,      O::V_LSHRREV_B32,
+           O::V_ASHR_I32,    O::V_ASHRREV_I32,   O::V_NOT_B32,
+           O::V_BFREV_B32,   O::V_FFBL_B32,      O::V_FFBH_U32,
+           O::V_CMP_EQ_U32,  O::V_CNDMASK_B32,   O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaSubNcExactByte2Destination() {
@@ -12156,7 +12168,8 @@ TestCase Vop2SdwaSubNcExactByte2Destination() {
   test.name = "Vop2SdwaSubNcExactByte2Destination";
   test.code = code;
   test.expected = {0x000b0002u};
-  test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return test;
 }
 
@@ -12179,7 +12192,7 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.initial = {0x00010002u, 0};
   test.expected = {0x00010002u, 0x0006c3d4u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
-                  O::V_ADD_NC_U32,       O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+                  O::V_ADD_NC_U32,      O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
   test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
   return test;
 }
@@ -12190,8 +12203,7 @@ TestCase Vop2SdwaAshrrevCapturedWord0SignExtends() {
   std::vector<u32> code;
   AppendBufferLoadDword(&code, 1, 30);
   code.push_back(0x303202f9u);
-  code.push_back(
-      0x0c860686u); // v_ashrrev_i32 v25, 6, sign_extend(v1.word0)
+  code.push_back(0x0c860686u); // v_ashrrev_i32 v25, 6, sign_extend(v1.word0)
   AppendStoreVgpr(&code, 25, 1);
   AppendEnd(&code);
 
@@ -12277,8 +12289,8 @@ TestCase Vop3Med3I16Captured() {
   test.name = "Vop3Med3I16Captured";
   test.code = std::move(code);
   test.expected = {0xfc18cafeu};
-  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_MED3_I16, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_MED3_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000020: V_MED3_I16 v3.sdwa(sel=5,sext=0), "
                           "v5.opsel(lo=1,hi=0,neghi=0), s25, s27\n",
                           1}};
@@ -12307,7 +12319,8 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
   test.expected = {0xa1b20007u, 0xa1b2001fu};
-  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpULessThan", "OpSelect"};
   return test;
 }
@@ -12336,8 +12349,9 @@ TestCase VectorShiftCountsMaskLowBits() {
           code,
           {},
           {1, 2, 0x80000000u, 0x40000000u, 0x80000000u, 0xc0000000u},
-          {O::V_MOV_B32, O::V_LSHL_B32, O::V_LSHLREV_B32, O::V_LSHR_B32, O::V_LSHRREV_B32,
-           O::V_ASHR_I32, O::V_ASHRREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_LSHL_B32, O::V_LSHLREV_B32, O::V_LSHR_B32,
+           O::V_LSHRREV_B32, O::V_ASHR_I32, O::V_ASHRREV_I32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3IntegerOps() {
@@ -12429,14 +12443,17 @@ TestCase VectorVop3IntegerOps() {
            5,
            0xffffffffu,
            1},
-          {O::V_MOV_B32,    O::V_ADD3_U32,    O::V_MIN3_I32,         O::V_MAX3_I32,
-           O::V_MED3_I32,   O::V_MIN3_U32,    O::V_MAX3_U32,         O::V_MED3_U32,
-           O::V_SAD_U32,    O::V_LSHL_ADD_U32, O::V_ADD_LSHL_U32,      O::V_XAD_U32,
-           O::V_LSHL_OR_B32, O::V_AND_OR_B32,   O::V_OR3_B32,          O::V_XOR3_B32,
-           O::V_BFE_U32,    O::V_BFE_I32,     O::V_BFI_B32,          O::V_ALIGNBIT_B32,
-           O::V_BFM_B32,    O::V_MUL_LO_U32,   O::V_MUL_HI_U32,        O::V_MUL_LO_I32,
-           O::V_MUL_HI_I32,  O::V_MAD_I32_I24,  O::V_MAD_U32_U24,       O::V_ADD_I32,
-           O::V_SUB_I32,    O::V_SUBREV_I32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32,          O::V_ADD3_U32,     O::V_MIN3_I32,
+           O::V_MAX3_I32,         O::V_MED3_I32,     O::V_MIN3_U32,
+           O::V_MAX3_U32,         O::V_MED3_U32,     O::V_SAD_U32,
+           O::V_LSHL_ADD_U32,     O::V_ADD_LSHL_U32, O::V_XAD_U32,
+           O::V_LSHL_OR_B32,      O::V_AND_OR_B32,   O::V_OR3_B32,
+           O::V_XOR3_B32,         O::V_BFE_U32,      O::V_BFE_I32,
+           O::V_BFI_B32,          O::V_ALIGNBIT_B32, O::V_BFM_B32,
+           O::V_MUL_LO_U32,       O::V_MUL_HI_U32,   O::V_MUL_LO_I32,
+           O::V_MUL_HI_I32,       O::V_MAD_I32_I24,  O::V_MAD_U32_U24,
+           O::V_ADD_I32,          O::V_SUB_I32,      O::V_SUBREV_I32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorBfeI32SignExtendsField() {
@@ -12478,12 +12495,13 @@ TestCase VectorAlignByteUsesFiveBitByteOffset() {
   }
   AppendEnd(&code);
 
-  return {"VectorAlignByteUsesFiveBitByteOffset",
-          code,
-          {},
-          {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
-           0x00000011u, 0u, 0u},
-          {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {
+      "VectorAlignByteUsesFiveBitByteOffset",
+      code,
+      {},
+      {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
+       0x00000011u, 0u, 0u},
+      {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCarryAndBitCountOps() {
@@ -12538,8 +12556,12 @@ TestCase VectorMbcntUsesThreadMask() {
   test.name = "VectorMbcntUsesThreadMask";
   test.code = code;
   test.expected = {0, 1, 2, 3, 0, 1, 2, 3};
-  test.opcodes = {O::V_MOV_B32,        O::V_LSHLREV_B32,    O::V_ADD_NC_U32,
-                  O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32, O::BUFFER_STORE_DWORD,
+  test.opcodes = {O::V_MOV_B32,
+                  O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,
+                  O::V_MBCNT_LO_U32_B32,
+                  O::V_MBCNT_HI_U32_B32,
+                  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -12571,8 +12593,9 @@ TestCase VectorAddcUsesPerLaneCarryIn() {
   test.name = "VectorAddcUsesPerLaneCarryIn";
   test.code = code;
   test.expected = std::vector<u32>(8, 1);
-  test.opcodes = {O::V_MOV_B32,  O::V_LSHLREV_B32,      O::V_ADD_NC_U32, O::V_CMP_T_U32,
-                  O::V_ADDC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_T_U32, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12605,8 +12628,9 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   test.name = "VectorAddcWritesPerLaneCarryOut";
   test.code = code;
   test.expected = std::vector<u32>(8, 0x0fu);
-  test.opcodes = {O::V_MOV_B32,  O::V_LSHLREV_B32,      O::V_ADD_NC_U32, O::V_CMP_F_U32,
-                  O::V_ADDC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_F_U32, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12645,10 +12669,11 @@ TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
   test.name = "VectorSubrevCoCiU32ExactRawOnGpu";
   test.code = code;
   test.expected = {0xdeadbeefu, 0, 2, 3, 0, 0, 0, 0};
-  test.opcodes = {O::V_MOV_B32,        O::V_LSHLREV_B32, O::V_ADD_NC_U32,
-                  O::V_CMP_LT_U32,      O::S_MOV_B64,     O::V_CMP_NE_U32,
-                  O::V_SUBREV_CO_CI_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,       O::V_CMP_LT_U32,
+                  O::S_MOV_B64,          O::V_CMP_NE_U32,
+                  O::V_SUBREV_CO_CI_U32, O::V_CNDMASK_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpISub", "OpUGreaterThan"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -12685,10 +12710,11 @@ TestCase VectorVop3BSubrevCoCiUsesEncodedMasks() {
   test.name = "VectorVop3BSubrevCoCiUsesEncodedMasks";
   test.code = code;
   test.expected = {0xfffffffeu, 0xfffffffeu, 0, 1, 1, 1, 0, 0};
-  test.opcodes = {O::V_MOV_B32,        O::V_LSHLREV_B32, O::V_ADD_NC_U32,
-                  O::V_CMP_EQ_U32,      O::S_MOV_B64,     O::S_MOV_B32,
-                  O::V_SUBREV_CO_CI_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,       O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,          O::S_MOV_B32,
+                  O::V_SUBREV_CO_CI_U32, O::V_CNDMASK_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -12791,7 +12817,7 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
   test.name = "VectorVop3BSubCoU32UsesRdna2Opcode310";
   test.code = code;
   test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 9, 9, 9, 9};
-  test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32,        O::V_CNDMASK_B32,
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32,       O::V_CNDMASK_B32,
                   O::V_SUB_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -12865,10 +12891,11 @@ TestCase VectorLaneAndPackedOps() {
           {0x12345678u, 0x12345678u, 0x12345678u, 0x12345678u, 0x40003c00u,
            0x46004400u, 0x48004200u, 0x40003c00u, 0x44004200u, 0x48804400u,
            0x40000000u, 0xef015678u},
-          {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32, O::V_WRITELANE_B32,
-           O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32, O::V_PK_ADD_F16, O::V_PK_MUL_F16,
-           O::V_PK_MIN_F16, O::V_PK_MAX_F16, O::V_PK_FMA_F16, O::V_LDEXP_F32,
-           O::V_CVT_PK_U16_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_READFIRSTLANE_B32, O::V_READLANE_B32,
+           O::V_WRITELANE_B32, O::V_PERMLANE16_B32, O::V_CVT_PKRTZ_F16_F32,
+           O::V_PK_ADD_F16, O::V_PK_MUL_F16, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
+           O::V_PK_FMA_F16, O::V_LDEXP_F32, O::V_CVT_PK_U16_U32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
@@ -12916,11 +12943,12 @@ TestCase CvtPkU8F32PacksSelectedByte() {
   }
   AppendEnd(&code);
 
-  return {"CvtPkU8F32PacksSelectedByte",
-          code,
-          {},
-          {0x1122330cu, 0x1122ff44u, 0x11003344u, 0x00223344u},
-          {O::V_MOV_B32, O::V_CVT_PK_U8_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {
+      "CvtPkU8F32PacksSelectedByte",
+      code,
+      {},
+      {0x1122330cu, 0x1122ff44u, 0x11003344u, 0x00223344u},
+      {O::V_MOV_B32, O::V_CVT_PK_U8_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
@@ -12937,7 +12965,8 @@ TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
           code,
           {},
           {0x80010001u},
-          {O::V_MOV_B32, O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
@@ -12965,8 +12994,8 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
           code,
           {},
           {0x80004000u, 0x00004000u, 0x7f017f01u, 0x7f017f01u},
-          {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMinMaxF16Ops() {
@@ -13008,8 +13037,9 @@ TestCase VectorMinMaxF16Ops() {
           {},
           {0x66664200u, 0x77773c00u, 0x8888bc00u, 0xaaaa0000u, 0x55554000u,
            0x12344000u, 0x87653c00u, 0x99994000u},
-          {O::V_MOV_B32, O::V_ADD_F16, O::V_SUB_F16, O::V_SUBREV_F16, O::V_MUL_F16,
-           O::V_MAX_F16, O::V_MIN_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_ADD_F16, O::V_SUB_F16, O::V_SUBREV_F16,
+           O::V_MUL_F16, O::V_MAX_F16, O::V_MIN_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorCvtU16F16Sdwa() {
@@ -13237,7 +13267,7 @@ TestCase VectorPermlane16FetchInactiveZero() {
   test.name = "VectorPermlane16FetchInactiveZero";
   test.code = code;
   test.expected = {0};
-  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,        O::S_MOV_B32,
+  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,       O::S_MOV_B32,
                   O::V_PERMLANE16_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -13263,7 +13293,7 @@ TestCase VectorPermlane16FetchInactiveFi() {
   test.name = "VectorPermlane16FetchInactiveFi";
   test.code = code;
   test.expected = {11};
-  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,        O::S_MOV_B32,
+  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,       O::S_MOV_B32,
                   O::V_PERMLANE16_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -13288,8 +13318,8 @@ TestCase VectorDppQuadPermuteReverse() {
   test.name = "VectorDppQuadPermuteReverse";
   test.code = code;
   test.expected = {103, 102, 101, 100, 107, 106, 105, 104};
-  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13315,8 +13345,8 @@ TestCase VectorDppBankMaskPreservesDestination() {
   test.code = code;
   test.expected = {0xaaaaaaaau, 0xaaaaaaaau, 0xaaaaaaaau, 0xaaaaaaaau,
                    104,         105,         106,         107};
-  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13341,8 +13371,8 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   test.name = "VectorDppBoundsControlZeroPreservesDestination";
   test.code = code;
   test.expected = {0xaaaaaaaau, 100, 101, 102, 103, 104, 105, 106};
-  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13459,9 +13489,9 @@ TestCase VectorFloatSpecialOps() {
           {0x41400000u, 0x80017fffu, 0x8000ffffu, 0xaaaa4700u, 0x4700bbbbu,
            0x40800000u, 0x3f800000u, 0xc0000000u, 0x40c00000u},
           {O::V_MOV_B32, O::V_DOT2C_F32_F16, O::V_CVT_PKNORM_I16_F32,
-           O::V_CVT_PKNORM_U16_F32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16, O::V_CUBEID_F32,
-           O::V_CUBESC_F32, O::V_CUBETC_F32, O::V_CUBEMA_F32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+           O::V_CVT_PKNORM_U16_F32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16,
+           O::V_CUBEID_F32, O::V_CUBESC_F32, O::V_CUBETC_F32, O::V_CUBEMA_F32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase MadMixF16LiteralHalfSourceUsesOpsel() {
@@ -13485,8 +13515,8 @@ TestCase MadMixF16LiteralHalfSourceUsesOpsel() {
           code,
           {},
           {0xaaaa4200u, 0x40002222u},
-          {O::V_MOV_B32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase MadMixF16NegHiIsAbsAndNegIsIndependent() {
@@ -13510,8 +13540,8 @@ TestCase MadMixF16NegHiIsAbsAndNegIsIndependent() {
           code,
           {},
           {0xaaaa4200u, 0xbc002222u},
-          {O::V_MOV_B32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_MAD_MIXLO_F16, O::V_MAD_MIXHI_F16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3FmaF16UsesRdna2Opcode34b() {
@@ -13556,8 +13586,9 @@ TestCase VectorFloatControlContractPreservesInfNan() {
   test.name = "VectorFloatControlContractPreservesInfNan";
   test.code = std::move(code);
   test.expected = {1u};
-  test.opcodes = {O::S_BFM_B32, O::V_MOV_B32, O::V_MUL_F32, O::V_CMP_CLASS_F32,
-                  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::S_BFM_B32,       O::V_MOV_B32,     O::V_MUL_F32,
+                  O::V_CMP_CLASS_F32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"SPV_KHR_float_controls",
                          "SignedZeroInfNanPreserve 32"};
   return test;
@@ -13634,10 +13665,11 @@ TestCase VectorFloatArithmeticOps() {
            0x40a00000u, 0x40800000u, 0x40c00000u, 0x41000000u, 0x40400000u,
            0x40400000u, 0xbf800000u, 0x3f800000u, 0x3f800000u, 0x40800000u,
            0xbf800000u, 0x40c00000u, 0x40000000u, 0x40400000u},
-          {O::S_MOV_B32, O::V_MOV_B32, O::V_ADD_F32, O::V_SUB_F32, O::V_SUBREV_F32,
-           O::V_MUL_F32, O::V_MIN_F32, O::V_MAX_F32, O::V_MAC_F32, O::V_MAD_F32,
-           O::V_FMA_F32, O::V_MIN3_F32, O::V_MAX3_F32, O::V_MED3_F32, O::V_MADMK_F32,
-           O::V_MADAK_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::V_ADD_F32, O::V_SUB_F32,
+           O::V_SUBREV_F32, O::V_MUL_F32, O::V_MIN_F32, O::V_MAX_F32,
+           O::V_MAC_F32, O::V_MAD_F32, O::V_FMA_F32, O::V_MIN3_F32,
+           O::V_MAX3_F32, O::V_MED3_F32, O::V_MADMK_F32, O::V_MADAK_F32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
@@ -13671,8 +13703,8 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
           {},
           {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u, 0x7fe00001u,
            0x7fe00001u, 0x40000000u, 0x40000000u},
-          {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32, O::V_MAX3_F32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32,
+           O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorMed3F32NanUsesMin3Path() {
@@ -13768,15 +13800,15 @@ TestCase VectorFloatConversionOps() {
            0x40400000u, 0x40000000u, 0x40000000u, 0x40000000u, 0x40000000u,
            0x3f000000u, 0x40000000u, 0,           0x3f800000u, 0xbd800000u,
            0x3f800000u, 0x3f800000u, 0x40000000u},
-          {O::V_MOV_B32,       O::V_CVT_F32_I32,    O::V_CVT_F32_U32,
-           O::V_CVT_U32_F32,    O::V_CVT_I32_F32,    O::V_CVT_F16_F32,
+          {O::V_MOV_B32,        O::V_CVT_F32_I32,     O::V_CVT_F32_U32,
+           O::V_CVT_U32_F32,    O::V_CVT_I32_F32,     O::V_CVT_F16_F32,
            O::V_CVT_F32_F16,    O::V_CVT_RPI_I32_F32, O::V_CVT_FLR_I32_F32,
-           O::V_CVT_OFF_F32_I4,  O::V_CVT_F32_UBYTE0, O::V_CVT_F32_UBYTE1,
-           O::V_CVT_F32_UBYTE2, O::V_CVT_F32_UBYTE3, O::V_RCP_F32,
-           O::V_FRACT_F32,     O::V_TRUNC_F32,     O::V_CEIL_F32,
-           O::V_RNDNE_F32,     O::V_FLOOR_F32,     O::V_EXP_F32,
-           O::V_LOG_F32,       O::V_RSQ_F32,       O::V_SQRT_F32,
-           O::V_SIN_F32,       O::V_COS_F32,       O::BUFFER_STORE_DWORD,
+           O::V_CVT_OFF_F32_I4, O::V_CVT_F32_UBYTE0,  O::V_CVT_F32_UBYTE1,
+           O::V_CVT_F32_UBYTE2, O::V_CVT_F32_UBYTE3,  O::V_RCP_F32,
+           O::V_FRACT_F32,      O::V_TRUNC_F32,       O::V_CEIL_F32,
+           O::V_RNDNE_F32,      O::V_FLOOR_F32,       O::V_EXP_F32,
+           O::V_LOG_F32,        O::V_RSQ_F32,         O::V_SQRT_F32,
+           O::V_SIN_F32,        O::V_COS_F32,         O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
 }
 
@@ -13826,8 +13858,9 @@ TestCase VectorFrexpF32Edges() {
       0x3f7ffffeu, 0x3f000000u, 0x7f800000u, 0x7fc00000u, 0xff800000u,
       0x7fa00001u,
   };
-  test.opcodes = {O::V_MOV_B32,       O::BUFFER_LOAD_DWORD,  O::V_FREXP_EXP_I32_F32,
-                  O::V_FREXP_MANT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,           O::BUFFER_LOAD_DWORD,
+                  O::V_FREXP_EXP_I32_F32, O::V_FREXP_MANT_F32,
+                  O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
   test.decoded_counts = {{"V_FREXP_EXP_I32_F32", inputs.size()},
                          {"V_FREXP_MANT_F32", inputs.size()}};
   test.required_spirv = {"FindUMsb", "OpBitFieldUExtract",
@@ -13865,8 +13898,8 @@ TestCase CvtF32ToIntSaturatesNaNAndOutOfRange() {
           {},
           {0, 0, 0xffffffffu, 0xffffffffu, 0, 0x7fffffffu, 0x80000000u,
            0x7fffffffu},
-          {O::V_MOV_B32, O::V_CVT_U32_F32, O::V_CVT_I32_F32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_CVT_U32_F32, O::V_CVT_I32_F32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorSpecialF32FlushesDenormalInputs() {
@@ -13888,8 +13921,8 @@ TestCase VectorSpecialF32FlushesDenormalInputs() {
           code,
           {},
           {0xff800000u, 0x7f800000u, 0x7f800000u, 0x00000000u},
-          {O::V_MOV_B32, O::V_LOG_F32, O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_LOG_F32, O::V_RCP_F32, O::V_RSQ_F32,
+           O::V_SQRT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorRcpIflagF32IntegerReciprocal() {
@@ -13937,12 +13970,12 @@ TestCase VectorSinCosMaxFiniteSpecialCases() {
   AppendStoreVgpr(&code, 2, 1);
   AppendEnd(&code);
 
-  return {
-      "VectorSinCosMaxFiniteSpecialCases",
-      code,
-      {},
-      {0x00000000u, 0x3f800000u},
-      {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"VectorSinCosMaxFiniteSpecialCases",
+          code,
+          {},
+          {0x00000000u, 0x3f800000u},
+          {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorCompareOps() {
@@ -14031,15 +14064,18 @@ TestCase VectorCompareOps() {
           code,
           {},
           expected,
-          {O::V_MOV_B32,    O::V_CNDMASK_B32, O::V_CMP_F_F32,         O::V_CMP_LT_F32,
-           O::V_CMP_EQ_F32,  O::V_CMP_LE_F32,   O::V_CMP_GT_F32,        O::V_CMP_LG_F32,
-           O::V_CMP_GE_F32,  O::V_CMP_O_F32,    O::V_CMP_U_F32,         O::V_CMP_NGE_F32,
-           O::V_CMP_NLG_F32, O::V_CMP_NGT_F32,  O::V_CMP_NLE_F32,       O::V_CMP_NEQ_F32,
-           O::V_CMP_NLT_F32, O::V_CMP_TRU_F32,  O::V_CMP_F_I32,         O::V_CMP_LT_I32,
-           O::V_CMP_EQ_I32,  O::V_CMP_LE_I32,   O::V_CMP_GT_I32,        O::V_CMP_NE_I32,
-           O::V_CMP_GE_I32,  O::V_CMP_T_I32,    O::V_CMP_F_U32,         O::V_CMP_LT_U32,
-           O::V_CMP_EQ_U32,  O::V_CMP_LE_U32,   O::V_CMP_GT_U32,        O::V_CMP_NE_U32,
-           O::V_CMP_GE_U32,  O::V_CMP_T_U32,    O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32,     O::V_CNDMASK_B32,      O::V_CMP_F_F32,
+           O::V_CMP_LT_F32,  O::V_CMP_EQ_F32,       O::V_CMP_LE_F32,
+           O::V_CMP_GT_F32,  O::V_CMP_LG_F32,       O::V_CMP_GE_F32,
+           O::V_CMP_O_F32,   O::V_CMP_U_F32,        O::V_CMP_NGE_F32,
+           O::V_CMP_NLG_F32, O::V_CMP_NGT_F32,      O::V_CMP_NLE_F32,
+           O::V_CMP_NEQ_F32, O::V_CMP_NLT_F32,      O::V_CMP_TRU_F32,
+           O::V_CMP_F_I32,   O::V_CMP_LT_I32,       O::V_CMP_EQ_I32,
+           O::V_CMP_LE_I32,  O::V_CMP_GT_I32,       O::V_CMP_NE_I32,
+           O::V_CMP_GE_I32,  O::V_CMP_T_I32,        O::V_CMP_F_U32,
+           O::V_CMP_LT_U32,  O::V_CMP_EQ_U32,       O::V_CMP_LE_U32,
+           O::V_CMP_GT_U32,  O::V_CMP_NE_U32,       O::V_CMP_GE_U32,
+           O::V_CMP_T_U32,   O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CompareNeU64OnGpu() {
@@ -14066,8 +14102,8 @@ TestCase VectorVop3CompareNeU64OnGpu() {
           code,
           {},
           {0, 1},
-          {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_NE_U64, O::V_CNDMASK_B32, O::S_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_NE_U64, O::V_CNDMASK_B32,
+           O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CompareGtU64OnGpu() {
@@ -14135,8 +14171,8 @@ TestCase VectorVop3CompareEqI64OnGpu() {
           code,
           {},
           {1, 0},
-          {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_EQ_I64, O::V_CNDMASK_B32, O::S_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_EQ_I64, O::V_CNDMASK_B32,
+           O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCompareClassF32() {
@@ -14177,8 +14213,8 @@ TestCase VectorCompareClassF32() {
           code,
           {},
           expected,
-          {O::V_MOV_B32, O::V_CMP_CLASS_F32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_CMP_CLASS_F32, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorCompareF16Ops() {
@@ -14229,10 +14265,11 @@ TestCase VectorCompareF16Ops() {
           code,
           {},
           expected,
-          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_LT_F16, O::V_CMP_EQ_F16, O::V_CMP_LE_F16,
-           O::V_CMP_GT_F16, O::V_CMP_LG_F16, O::V_CMP_GE_F16, O::V_CMP_NEQ_F16,
-           O::V_CMPX_LT_F16, O::V_CMPX_EQ_F16, O::V_CMPX_LE_F16, O::V_CMPX_GT_F16,
-           O::V_CMPX_GE_F16, O::V_CMPX_NEQ_F16, O::V_CMPX_NLT_F16, O::V_CNDMASK_B32,
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_LT_F16, O::V_CMP_EQ_F16,
+           O::V_CMP_LE_F16, O::V_CMP_GT_F16, O::V_CMP_LG_F16, O::V_CMP_GE_F16,
+           O::V_CMP_NEQ_F16, O::V_CMPX_LT_F16, O::V_CMPX_EQ_F16,
+           O::V_CMPX_LE_F16, O::V_CMPX_GT_F16, O::V_CMPX_GE_F16,
+           O::V_CMPX_NEQ_F16, O::V_CMPX_NLT_F16, O::V_CNDMASK_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -14253,8 +14290,8 @@ TestCase Vop2SdwaCndmaskSourceModifier() {
           code,
           {},
           {0xbf800000u},
-          {O::V_MOV_B32, O::V_CMP_T_U32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::V_MOV_B32, O::V_CMP_T_U32, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
@@ -14277,7 +14314,7 @@ TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
   test.name = "Vop2SdwaCndmaskFullDestinationWithSubDwordSource";
   test.code = code;
   test.expected = {0x00001234u, 0x55667788u};
-  test.opcodes = {O::V_MOV_B32,     O::V_CMP_F_U32,         O::V_CMP_T_U32,
+  test.opcodes = {O::V_MOV_B32,     O::V_CMP_F_U32,        O::V_CMP_T_U32,
                   O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSelect"};
   return test;
@@ -14303,8 +14340,9 @@ TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
   test.name = "Vop3CndmaskUsesSgprMaskLaneBits";
   test.code = code;
   test.expected = {20, 10, 10, 10, 20, 10, 10, 10};
-  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,        O::V_CMP_F_U32,
-                  O::S_MOV_B32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_F_U32,        O::S_MOV_B32,     O::V_CNDMASK_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -14383,13 +14421,16 @@ TestCase VectorCompareExecOps() {
           code,
           {},
           std::vector<u32>(out, 1),
-          {O::S_MOV_B32,     O::V_MOV_B32,     O::V_CMPX_LT_F32,       O::V_CMPX_EQ_F32,
-           O::V_CMPX_LE_F32,  O::V_CMPX_GT_F32,  O::V_CMPX_LG_F32,       O::V_CMPX_GE_F32,
-           O::V_CMPX_NGE_F32, O::V_CMPX_NLG_F32, O::V_CMPX_NGT_F32,      O::V_CMPX_NLE_F32,
-           O::V_CMPX_NEQ_F32, O::V_CMPX_NLT_F32, O::V_CMPX_LT_I32,       O::V_CMPX_EQ_I32,
-           O::V_CMPX_LE_I32,  O::V_CMPX_GT_I32,  O::V_CMPX_NE_I32,       O::V_CMPX_GE_I32,
-           O::V_CMPX_LT_U32,  O::V_CMPX_EQ_U32,  O::V_CMPX_LE_U32,       O::V_CMPX_GT_U32,
-           O::V_CMPX_NE_U32,  O::V_CMPX_GE_U32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32,      O::V_MOV_B32,      O::V_CMPX_LT_F32,
+           O::V_CMPX_EQ_F32,  O::V_CMPX_LE_F32,  O::V_CMPX_GT_F32,
+           O::V_CMPX_LG_F32,  O::V_CMPX_GE_F32,  O::V_CMPX_NGE_F32,
+           O::V_CMPX_NLG_F32, O::V_CMPX_NGT_F32, O::V_CMPX_NLE_F32,
+           O::V_CMPX_NEQ_F32, O::V_CMPX_NLT_F32, O::V_CMPX_LT_I32,
+           O::V_CMPX_EQ_I32,  O::V_CMPX_LE_I32,  O::V_CMPX_GT_I32,
+           O::V_CMPX_NE_I32,  O::V_CMPX_GE_I32,  O::V_CMPX_LT_U32,
+           O::V_CMPX_EQ_U32,  O::V_CMPX_LE_U32,  O::V_CMPX_GT_U32,
+           O::V_CMPX_NE_U32,  O::V_CMPX_GE_U32,  O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase VectorVop3FloatCompareNegSourceModifier() {
@@ -14510,8 +14551,8 @@ TestCase SimpleLoop() {
           code,
           {},
           {4},
-          {O::S_MOV_B32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0, O::S_ADD_U32, O::S_BRANCH,
-           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0, O::S_ADD_U32,
+           O::S_BRANCH, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BranchVccnzUsesWholeMask() {
@@ -14536,7 +14577,7 @@ TestCase BranchVccnzUsesWholeMask() {
   test.code = code;
   test.expected = std::vector<u32>(8, 42);
   test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,   O::V_ADD_NC_U32,
-                  O::V_CMP_EQ_U32,        O::S_CBRANCH_VCCNZ, O::S_BRANCH,
+                  O::V_CMP_EQ_U32,       O::S_CBRANCH_VCCNZ, O::S_BRANCH,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -14603,9 +14644,9 @@ TestCase ScalarMemoryLoadVariants() {
           expected,
           {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
            O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
-           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORDX8,
-           O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
+           O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
@@ -14635,11 +14676,12 @@ TestCase BufferLoadStore() {
   code.push_back(EncodeVop1(0x01, 31, InlineU32(4)));
   AppendBufferStoreDword(&code, 0, 31);
   AppendEnd(&code);
-  return {"BufferLoadStore",
-          code,
-          {0x11223344u, 0},
-          {0x11223344u, 0x11223344u},
-          {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {
+      "BufferLoadStore",
+      code,
+      {0x11223344u, 0},
+      {0x11223344u, 0x11223344u},
+      {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset() {
@@ -14653,11 +14695,12 @@ TestCase BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset() {
   AppendStoreVgpr(&code, 0, 0);
   AppendEnd(&code);
 
-  return {"BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset",
-          code,
-          {0x11111111u, 0x22222222u, 0x33333333u},
-          {0x33333333u, 0x22222222u, 0x33333333u},
-          {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {
+      "BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset",
+      code,
+      {0x11111111u, 0x22222222u, 0x33333333u},
+      {0x33333333u, 0x22222222u, 0x33333333u},
+      {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset() {
@@ -14688,11 +14731,12 @@ TestCase BufferLoadDwordNoAddressFlagsIgnoresVaddr() {
   AppendStoreVgpr(&code, 0, 3);
   AppendEnd(&code);
 
-  return {"BufferLoadDwordNoAddressFlagsIgnoresVaddr",
-          code,
-          {0x11111111u, 0x22222222u, 0x33333333u, 0},
-          {0x11111111u, 0x22222222u, 0x33333333u, 0x11111111u},
-          {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {
+      "BufferLoadDwordNoAddressFlagsIgnoresVaddr",
+      code,
+      {0x11111111u, 0x22222222u, 0x33333333u, 0},
+      {0x11111111u, 0x22222222u, 0x33333333u, 0x11111111u},
+      {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordIdxenUsesDescriptorStride() {
@@ -14794,7 +14838,8 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   test.storage_buffer_range_dwords = 1;
   test.storage_buffer_offsets = {0, 12};
   test.force_shader_data_storage = true;
-  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return test;
 }
 
@@ -14828,8 +14873,9 @@ TestCase BufferLoadVariants() {
            0x11223344u, 0x55667788u, 0x99aabbccu, 0x11223344u, 0x55667788u,
            0x99aabbccu, 0xddeeff00u},
           {O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_SBYTE, O::BUFFER_LOAD_USHORT,
-           O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3,
-           O::BUFFER_LOAD_DWORDX4, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+           O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_DWORDX2,
+           O::BUFFER_LOAD_DWORDX3, O::BUFFER_LOAD_DWORDX4, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadDwordx4SnapshotsOverlappingAddress() {
@@ -14927,8 +14973,8 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.expected = {0x33333333u, 0x44444444u, 0u, 0u};
   test.storage_buffer_range_dwords = 4;
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return test;
 }
 
@@ -14973,8 +15019,7 @@ TestCase BufferLoadFormatXyzwRejectsPartialRecord() {
   test.expected = {0u, 0u, 0u, 0u};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false,
-      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -15001,8 +15046,7 @@ TestCase BufferStoreFormatXyzwDropsPartialRecord() {
   test.expected = test.initial;
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false,
-      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
   return test;
@@ -15024,11 +15068,10 @@ TestCase BufferLoadFormatXChecksOnlyTransferredComponent() {
   test.expected = {0x44444444u, 0x22222222u, 0x33333333u, 0x44444444u};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false,
-      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return test;
 }
 
@@ -15049,8 +15092,7 @@ TestCase BufferStoreFormatXChecksOnlyTransferredComponent() {
   test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0xaaaaaaaau};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false,
-      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   return test;
@@ -15073,11 +15115,10 @@ TestCase BufferLoadFormatXyChecksOnlyTransferredComponents() {
   test.expected = {0x33333333u, 0x44444444u, 0x33333333u, 0x44444444u};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false,
-      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XY,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   return test;
 }
 
@@ -15099,8 +15140,7 @@ TestCase BufferStoreFormatXyChecksOnlyTransferredComponents() {
   test.expected = {0x11111111u, 0x22222222u, 0xaaaaaaaau, 0xbbbbbbbbu};
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
-      0, 4, false,
-      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
   return test;
@@ -15139,8 +15179,8 @@ TestCase BufferStoreVariants() {
           {0xbbccaa00u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
            0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u},
           {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT,
-           O::BUFFER_STORE_DWORDX2, O::BUFFER_STORE_DWORDX3, O::BUFFER_STORE_DWORDX4,
-           O::S_ENDPGM}};
+           O::BUFFER_STORE_DWORDX2, O::BUFFER_STORE_DWORDX3,
+           O::BUFFER_STORE_DWORDX4, O::S_ENDPGM}};
 }
 
 TestCase BufferFormatVariants() {
@@ -15194,8 +15234,8 @@ TestCase BufferLoadFormatXyzwSnapshotsOverlappingAddress() {
                   0,           0,           0,           0};
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
                    0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(
       16, 2, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -15276,8 +15316,9 @@ TestCase BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress() {
   test.initial = {0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd, 0, 0, 0, 0};
   test.expected = {0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu, 0xddddddddu,
                    0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64,          O::BUFFER_LOAD_FORMAT_XYZW,
-                  O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {
+      O::V_MOV_B32, O::S_MOV_B64,          O::BUFFER_LOAD_FORMAT_XYZW,
+      O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(
       16, 2, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
@@ -15314,7 +15355,8 @@ TestCase BufferFormatStoreVariants() {
           {0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u, 0x41424344u,
            0x51525354u, 0x61626364u, 0x71727374u, 0x81828384u, 0x91929394u},
           {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
-           O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM}};
+           O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW,
+           O::S_ENDPGM}};
 }
 
 TestCase BufferLoadFormatXResource8UintZeroExtendsByte() {
@@ -15593,8 +15635,8 @@ TestCase TBufferLoadVariants() {
           {0x01020304u, 0x01020304u, 0x11121314u, 0x01020304u, 0x11121314u,
            0x21222324u, 0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u},
           {O::TBUFFER_LOAD_FORMAT_X, O::TBUFFER_LOAD_FORMAT_XY,
-           O::TBUFFER_LOAD_FORMAT_XYZ, O::TBUFFER_LOAD_FORMAT_XYZW, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+           O::TBUFFER_LOAD_FORMAT_XYZ, O::TBUFFER_LOAD_FORMAT_XYZW,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzwSnapshotsOverlappingAddress() {
@@ -15620,8 +15662,8 @@ TestCase TBufferLoadFormatXyzwSnapshotsOverlappingAddress() {
                   0,           0,           0,           0};
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
                    0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(16, 2);
   test.has_user_data = true;
   return test;
@@ -15647,8 +15689,8 @@ TestCase TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress() {
   test.code = std::move(code);
   test.initial = {0x44332211u, 0, 0, 0, 0, 0, 0, 0};
   test.expected = {0x44332211u, 0, 0, 0, 0x11u, 0x22u, 0x33u, 0x44u};
-  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(4, 8);
   test.has_user_data = true;
   return test;
@@ -15685,7 +15727,8 @@ TestCase TBufferLoadFormatX8UintZeroExtendsByte() {
           code,
           {0x11223344u, 0},
           {0x00000044u, 0},
-          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatX8888UintExtractsFirstByte() {
@@ -15702,7 +15745,8 @@ TestCase TBufferLoadFormatX8888UintExtractsFirstByte() {
           code,
           {0x44332211u, 0},
           {0x00000011u, 0},
-          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXIdxenUsesDescriptorStride() {
@@ -15741,7 +15785,8 @@ TestCase TBufferLoadFormatX16FloatConvertsToFloat() {
           code,
           {0x00003c00u, 0},
           {0x3f800000u, 0},
-          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXSintSignExtendsSubDword() {
@@ -15762,7 +15807,8 @@ TestCase TBufferLoadFormatXSintSignExtendsSubDword() {
           code,
           {0x00000080u, 0x00008001u},
           {0xffffff80u, 0xffff8001u},
-          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXSintWritesSubDword() {
@@ -15801,12 +15847,12 @@ TestCase TBufferLoadFormatXy88IntegerComponents() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXy8_8IntegerComponents",
-      code,
-      {0x0000807fu, 0x00007f80u, 0, 0},
-      {0x0000007fu, 0x00000080u, 0xffffff80u, 0x0000007fu},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXy8_8IntegerComponents",
+          code,
+          {0x0000807fu, 0x00007f80u, 0, 0},
+          {0x0000007fu, 0x00000080u, 0xffffff80u, 0x0000007fu},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXy88IntegerComponents() {
@@ -15847,12 +15893,12 @@ TestCase TBufferLoadFormatXy1616IntegerComponents() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXy16_16IntegerComponents",
-      code,
-      {0x80017fffu, 0x7fff8000u, 0, 0},
-      {0x00007fffu, 0x00008001u, 0xffff8000u, 0x00007fffu},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXy16_16IntegerComponents",
+          code,
+          {0x80017fffu, 0x7fff8000u, 0, 0},
+          {0x00007fffu, 0x00008001u, 0xffff8000u, 0x00007fffu},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXy1616IntegerComponents() {
@@ -15890,12 +15936,12 @@ TestCase TBufferLoadFormatXyz16161616UintLoadsHalfwords() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXyz16_16_16_16UintLoadsHalfwords",
-      code,
-      {0x22221111u, 0x44443333u, 0},
-      {0x00001111u, 0x00002222u, 0x00003333u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXyz16_16_16_16UintLoadsHalfwords",
+          code,
+          {0x22221111u, 0x44443333u, 0},
+          {0x00001111u, 0x00002222u, 0x00003333u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZ, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy88UnormConvertsToFloat() {
@@ -15909,12 +15955,12 @@ TestCase TBufferLoadFormatXy88UnormConvertsToFloat() {
   AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXy8_8UnormConvertsToFloat",
-      code,
-      {0x0000ff80u, 0},
-      {0x3f008081u, 0x3f800000u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXy8_8UnormConvertsToFloat",
+          code,
+          {0x0000ff80u, 0},
+          {0x3f008081u, 0x3f800000u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy88SnormConvertsToFloat() {
@@ -15928,12 +15974,12 @@ TestCase TBufferLoadFormatXy88SnormConvertsToFloat() {
   AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXy8_8SnormConvertsToFloat",
-      code,
-      {0x00007f80u, 0},
-      {0xbf800000u, 0x3f800000u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXy8_8SnormConvertsToFloat",
+          code,
+          {0x00007f80u, 0},
+          {0xbf800000u, 0x3f800000u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy1616UnormConvertsToFloat() {
@@ -15947,12 +15993,12 @@ TestCase TBufferLoadFormatXy1616UnormConvertsToFloat() {
   AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXy16_16UnormConvertsToFloat",
-      code,
-      {0xffff8000u, 0},
-      {0x3f000080u, 0x3f800000u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXy16_16UnormConvertsToFloat",
+          code,
+          {0xffff8000u, 0},
+          {0x3f000080u, 0x3f800000u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXy8888UnormConvertsFirstTwoComponents() {
@@ -15966,12 +16012,12 @@ TestCase TBufferLoadFormatXy8888UnormConvertsFirstTwoComponents() {
   AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXy8_8_8_8UnormConvertsFirstTwoComponents",
-      code,
-      {0x44332211u, 0xdeadbeefu},
-      {0x3d888889u, 0x3e088889u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXy8_8_8_8UnormConvertsFirstTwoComponents",
+          code,
+          {0x44332211u, 0xdeadbeefu},
+          {0x3d888889u, 0x3e088889u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzw8888UintExtractsBytes() {
@@ -15986,12 +16032,12 @@ TestCase TBufferLoadFormatXyzw8888UintExtractsBytes() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXyzw8_8_8_8UintExtractsBytes",
-      code,
-      {0x44332211u, 0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu},
-      {0x00000011u, 0x00000022u, 0x00000033u, 0x00000044u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXyzw8_8_8_8UintExtractsBytes",
+          code,
+          {0x44332211u, 0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu},
+          {0x00000011u, 0x00000022u, 0x00000033u, 0x00000044u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzw1010102SnormConvertsToFloat() {
@@ -16006,12 +16052,12 @@ TestCase TBufferLoadFormatXyzw1010102SnormConvertsToFloat() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXyzw10_10_10_2SnormConvertsToFloat",
-      code,
-      {0x800801ffu, 0, 0, 0},
-      {0x3f800000u, 0xbf800000u, 0, 0xbf800000u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXyzw10_10_10_2SnormConvertsToFloat",
+          code,
+          {0x800801ffu, 0, 0, 0},
+          {0x3f800000u, 0xbf800000u, 0, 0xbf800000u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyz111110FloatUnpacks() {
@@ -16026,12 +16072,12 @@ TestCase TBufferLoadFormatXyz111110FloatUnpacks() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXyz11_11_10FloatUnpacks",
-      code,
-      {0x781e03c0u, 0, 0},
-      {0x3f800000u, 0x3f800000u, 0x3f800000u},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXyz11_11_10FloatUnpacks",
+          code,
+          {0x781e03c0u, 0, 0},
+          {0x3f800000u, 0x3f800000u, 0x3f800000u},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZ, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferLoadFormatXyzw3232FloatZerosMissingComponents() {
@@ -16046,12 +16092,12 @@ TestCase TBufferLoadFormatXyzw3232FloatZerosMissingComponents() {
   }
   AppendEnd(&code);
 
-  return {
-      "TBufferLoadFormatXyzw32_32FloatZerosMissingComponents",
-      code,
-      {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
-      {0x11111111u, 0x22222222u, 0, 0},
-      {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {"TBufferLoadFormatXyzw32_32FloatZerosMissingComponents",
+          code,
+          {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
+          {0x11111111u, 0x22222222u, 0, 0},
+          {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase TBufferStoreFormatXyzw3232FloatWritesOnlyPresentComponents() {
@@ -16104,7 +16150,8 @@ TestCase TBufferStoreVariants() {
           {0x01020304u, 0x11121314u, 0x21222324u, 0x31323334u, 0x41424344u,
            0x51525354u, 0x61626364u, 0x71727374u, 0x81828384u, 0x91929394u},
           {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::TBUFFER_STORE_FORMAT_XY,
-           O::TBUFFER_STORE_FORMAT_XYZ, O::TBUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM}};
+           O::TBUFFER_STORE_FORMAT_XYZ, O::TBUFFER_STORE_FORMAT_XYZW,
+           O::S_ENDPGM}};
 }
 
 TestCase FlatLoadVariants() {
@@ -16145,8 +16192,8 @@ TestCase FlatLoadVariants() {
                  0x11223344u},
                 {O::V_MOV_B32, O::FLAT_LOAD_UBYTE, O::FLAT_LOAD_SBYTE,
                  O::FLAT_LOAD_USHORT, O::FLAT_LOAD_SSHORT, O::FLAT_LOAD_DWORD,
-                 O::FLAT_LOAD_DWORDX2, O::FLAT_LOAD_DWORDX3, O::FLAT_LOAD_DWORDX4,
-                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+                 O::FLAT_LOAD_DWORDX2, O::FLAT_LOAD_DWORDX3,
+                 O::FLAT_LOAD_DWORDX4, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.flat_memory_base = 0;
   return test;
 }
@@ -16172,9 +16219,9 @@ TestCase BranchVccnzUsesCarryProducedWholeMask() {
   test.name = "BranchVccnzUsesCarryProducedWholeMask";
   test.code = code;
   test.expected = std::vector<u32>(8, 42);
-  test.opcodes = {O::V_MOV_B32,  O::V_LSHLREV_B32,      O::V_ADD_NC_U32,
+  test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32,      O::V_ADD_NC_U32,
                   O::V_CMP_F_U32, O::V_ADDC_U32,         O::S_CBRANCH_VCCNZ,
-                  O::S_BRANCH,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+                  O::S_BRANCH,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16252,8 +16299,8 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
           code,
           {0x11111111u, 0x22222222u, 0x12345678u},
           {0x12345678u},
-          {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
@@ -16282,8 +16329,8 @@ TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   test.code = code;
   test.initial = initial;
   test.expected = {0x11111111u, 0x11111111u};
-  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.flat_memory_base = 0;
   return test;
 }
@@ -16331,8 +16378,8 @@ TestCase FlatStoreVariants() {
                  0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u,
                  0x88888888u, 0x99999999u, 0x11111111u, 0},
                 {O::V_MOV_B32, O::FLAT_STORE_BYTE, O::FLAT_STORE_SHORT,
-                 O::FLAT_STORE_DWORD, O::FLAT_STORE_DWORDX2, O::FLAT_STORE_DWORDX3,
-                 O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
+                 O::FLAT_STORE_DWORD, O::FLAT_STORE_DWORDX2,
+                 O::FLAT_STORE_DWORDX3, O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
   test.flat_memory_base = 0;
   return test;
 }
@@ -16398,8 +16445,8 @@ TestCase DsReadWriteVariants() {
           {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32, O::DS_WRITE_B8,
            O::DS_READ_U8, O::DS_READ_I8, O::DS_WRITE_B16, O::DS_READ_U16,
            O::DS_READ_I16, O::DS_WRITE_B64, O::DS_READ_B64, O::DS_WRITE_B96,
-           O::DS_READ_B96, O::DS_WRITE_B128, O::DS_READ_B128, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+           O::DS_READ_B96, O::DS_WRITE_B128, O::DS_READ_B128,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsReadWrite2Variants() {
@@ -16462,8 +16509,126 @@ TestCase DsReadWrite2Variants() {
            0x12345678u},
           {O::V_MOV_B32, O::DS_WRITE2_B32, O::DS_READ2_B32, O::DS_WRITE_B64,
            O::DS_READ2_B64, O::DS_WRITE2_B64, O::DS_WRITE2ST64_B32,
-           O::DS_WRITE2ST64_B64, O::DS_READ2ST64_B64, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+           O::DS_READ2ST64_B32, O::DS_WRITE2ST64_B64, O::DS_READ2ST64_B64,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsWideReadSnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 6, 0x11111111u);
+  AppendVMovLiteral(&code, 7, 0x22222222u);
+  code.push_back(EncodeDs0(0x4d, 0));
+  code.push_back(EncodeDs1(0, 6, 1));
+  AppendVMovLiteral(&code, 8, 0x33333333u);
+  AppendVMovLiteral(&code, 9, 0x44444444u);
+  code.push_back(EncodeDs0(0x4d, 16));
+  code.push_back(EncodeDs1(0, 8, 1));
+  code.push_back(EncodeDs0(0x77, 2u << 8u));
+  code.push_back(EncodeDs1Ex(1, 0, 0, 1));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 1u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"DsWideReadSnapshotsOverlappingAddress",
+          code,
+          std::vector<u32>(4, 0),
+          {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
+          {O::V_MOV_B32, O::DS_WRITE_B64, O::DS_READ2_B64,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsReadWrite2EqualOffsetsUseData0() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x11111111u);
+  AppendVMovLiteral(&code, 3, 0x22222222u);
+  code.push_back(EncodeDs0(0x0e, (1u << 8u) | 1u));
+  code.push_back(EncodeDs1Ex(0, 3, 2, 1));
+  AppendVMovLiteral(&code, 4, 0x33333333u);
+  AppendVMovLiteral(&code, 5, 0x44444444u);
+  AppendVMovLiteral(&code, 6, 0x55555555u);
+  AppendVMovLiteral(&code, 7, 0x66666666u);
+  code.push_back(EncodeDs0(0x4e, (2u << 8u) | 2u));
+  code.push_back(EncodeDs1Ex(0, 6, 4, 1));
+  code.push_back(EncodeDs0(0x37, (1u << 8u) | 1u));
+  code.push_back(EncodeDs1Ex(8, 0, 0, 1));
+  code.push_back(EncodeDs0(0x77, (2u << 8u) | 2u));
+  code.push_back(EncodeDs1Ex(10, 0, 0, 1));
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 8u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"DsReadWrite2EqualOffsetsUseData0",
+          code,
+          std::vector<u32>(6, 0),
+          {0x11111111u, 0x11111111u, 0x33333333u, 0x44444444u, 0x33333333u,
+           0x44444444u},
+          {O::V_MOV_B32, O::DS_WRITE2_B32, O::DS_WRITE2_B64, O::DS_READ2_B32,
+           O::DS_READ2_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsWideLdsPartialBounds() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x11111111u);
+  AppendVMovLiteral(&code, 3, 0x22222222u);
+  AppendVMovLiteral(&code, 4, 0x33333333u);
+  AppendVMovLiteral(&code, 5, 0x44444444u);
+  code.push_back(EncodeDs0(0xdf));
+  code.push_back(EncodeDs1(0, 2, 1));
+  code.push_back(EncodeDs0(0xff));
+  code.push_back(EncodeDs1(6, 0, 1));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 6u + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test{"DsWideLdsPartialBounds",
+                code,
+                std::vector<u32>(4, 0),
+                {0x11111111u, 0x22222222u, 0x33333333u, 0},
+                {O::V_MOV_B32, O::DS_WRITE_B128, O::DS_READ_B128,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.compute_info.lds_size_dwords = 3;
+  return test;
+}
+
+TestCase DsWideGdsPartialBounds() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x11111111u);
+  AppendVMovLiteral(&code, 3, 0x22222222u);
+  AppendVMovLiteral(&code, 4, 0x33333333u);
+  AppendVMovLiteral(&code, 5, 0x44444444u);
+  code.push_back(EncodeDs0(0xdf, 0, true));
+  code.push_back(EncodeDs1(0, 2, 1));
+  code.push_back(EncodeDs0(0xff, 0, true));
+  code.push_back(EncodeDs1(6, 0, 1));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 6u + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test{"DsWideGdsPartialBounds",
+                code,
+                std::vector<u32>(4, 0),
+                {0x11111111u, 0x22222222u, 0x33333333u, 0},
+                {O::V_MOV_B32, O::DS_WRITE_B128, O::DS_READ_B128,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.gds_initial = {0, 0, 0};
+  test.expected_gds = {0x11111111u, 0x22222222u, 0x33333333u};
+  return test;
 }
 
 TestCase DsAtomicNoReturnVariants() {
@@ -16494,9 +16659,10 @@ TestCase DsAtomicNoReturnVariants() {
           code,
           std::vector<u32>(9, 0),
           {15, 7, 0xfffffff0u, 5, 5, 20, 0x00f0u, 0xff00u, 0xf0f0u},
-          {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_U32, O::DS_SUB_U32, O::DS_MIN_I32,
-           O::DS_MAX_I32, O::DS_MIN_U32, O::DS_MAX_U32, O::DS_AND_B32, O::DS_OR_B32,
-           O::DS_XOR_B32, O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_U32, O::DS_SUB_U32,
+           O::DS_MIN_I32, O::DS_MAX_I32, O::DS_MIN_U32, O::DS_MAX_U32,
+           O::DS_AND_B32, O::DS_OR_B32, O::DS_XOR_B32, O::DS_READ_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsAtomicReturnVariants() {
@@ -16534,9 +16700,10 @@ TestCase DsAtomicReturnVariants() {
       {10, 10, 0xfffffff0u, 0xfffffff0u, 10, 10, 0xf0f0u, 0xf000u, 0xf00fu, 10,
        15, 7,  0xfffffff0u, 5,           5,  20, 0x00f0u, 0xff00u, 0xf0f0u, 99},
       {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_RTN_U32, O::DS_SUB_RTN_U32,
-       O::DS_MIN_RTN_I32, O::DS_MAX_RTN_I32, O::DS_MIN_RTN_U32, O::DS_MAX_RTN_U32,
-       O::DS_AND_RTN_B32, O::DS_OR_RTN_B32, O::DS_XOR_RTN_B32, O::DS_WRXCHG_RTN_B32,
-       O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+       O::DS_MIN_RTN_I32, O::DS_MAX_RTN_I32, O::DS_MIN_RTN_U32,
+       O::DS_MAX_RTN_U32, O::DS_AND_RTN_B32, O::DS_OR_RTN_B32,
+       O::DS_XOR_RTN_B32, O::DS_WRXCHG_RTN_B32, O::DS_READ_B32,
+       O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsMiscVariants() {
@@ -16582,10 +16749,17 @@ TestCase DsMiscVariants() {
   test.code = code;
   test.initial = std::vector<u32>(4, 0);
   test.expected = {0x40000000u, 0x40400000u, 0x12345678u, 0xabcdef01u};
-  test.opcodes = {O::V_MOV_B32,          O::S_MOV_B32,          O::DS_WRITE_B32,
-                  O::DS_MIN_F32,         O::DS_MAX_F32,         O::DS_READ_B32,
-                  O::DS_SWIZZLE_B32,     O::DS_WRITE_ADDTID_B32, O::DS_READ_ADDTID_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,
+                  O::S_MOV_B32,
+                  O::DS_WRITE_B32,
+                  O::DS_MIN_F32,
+                  O::DS_MAX_F32,
+                  O::DS_READ_B32,
+                  O::DS_SWIZZLE_B32,
+                  O::DS_WRITE_ADDTID_B32,
+                  O::DS_READ_ADDTID_B32,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16625,8 +16799,9 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
   test.expected = {0x41100000u, 0x3f800000u};
-  test.opcodes = {O::V_MOV_B32,   O::DS_WRITE_B32,       O::DS_MIN_F32, O::DS_MAX_F32,
-                  O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
+                  O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16684,10 +16859,11 @@ TestCase BufferAtomicVariants() {
       {100,     15,          7,       0xfffffff0u, 5,       5,      20,
        0x00f0u, 0xff00u,     0xf0f0u, 10,          10,      10,     0xfffffff0u,
        10,      0xfffffff0u, 10,      0xf0f0u,     0xf000u, 0xf00fu},
-      {O::V_MOV_B32, O::BUFFER_ATOMIC_SWAP, O::BUFFER_ATOMIC_ADD, O::BUFFER_ATOMIC_SUB,
-       O::BUFFER_ATOMIC_SMIN, O::BUFFER_ATOMIC_UMIN, O::BUFFER_ATOMIC_SMAX,
-       O::BUFFER_ATOMIC_UMAX, O::BUFFER_ATOMIC_AND, O::BUFFER_ATOMIC_OR,
-       O::BUFFER_ATOMIC_XOR, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+      {O::V_MOV_B32, O::BUFFER_ATOMIC_SWAP, O::BUFFER_ATOMIC_ADD,
+       O::BUFFER_ATOMIC_SUB, O::BUFFER_ATOMIC_SMIN, O::BUFFER_ATOMIC_UMIN,
+       O::BUFFER_ATOMIC_SMAX, O::BUFFER_ATOMIC_UMAX, O::BUFFER_ATOMIC_AND,
+       O::BUFFER_ATOMIC_OR, O::BUFFER_ATOMIC_XOR, O::BUFFER_STORE_DWORD,
+       O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
@@ -16700,11 +16876,12 @@ TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
   AppendStoreVgpr(&code, 0, 1);
   AppendEnd(&code);
 
-  return {"BufferAtomicGlc0DoesNotReturnOldValue",
-          code,
-          {10, 0},
-          {15, 5},
-          {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  return {
+      "BufferAtomicGlc0DoesNotReturnOldValue",
+      code,
+      {10, 0},
+      {15, 5},
+      {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicFMinExactRawGlcModes() {
@@ -16770,7 +16947,8 @@ TestCase BufferAtomicFMinSpecialValues() {
            0x80000000u, 0x00000000u, 0x00000000u, 0x80000001u, 0x40800000u,
            0xbf800000u, 0x7f800000u, 0x7fc00000u, 0x3f800000u, 0x80000000u,
            0x00000000u, 0x00000001u, 0x00000000u},
-          {O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicFMinContendedWorkgroup() {
@@ -16787,7 +16965,8 @@ TestCase BufferAtomicFMinContendedWorkgroup() {
   test.code = code;
   test.initial = {0x42c80000u};  // 100.0
   test.expected = {0x00000000u}; // min(100.0, 0.0 .. 63.0)
-  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN, O::S_ENDPGM};
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32, O::BUFFER_ATOMIC_FMIN,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16875,7 +17054,8 @@ TestCase BufferAtomicFMaxSpecialValues() {
            0x7f800000u, 0xff800000u, 0x7fc12345u, 0x3f800000u, 0x7fa54321u,
            0x3f800000u, 0x80000000u, 0x00000000u, 0x80000001u, 0x80000000u,
            0x00000000u, 0x00000001u},
-          {O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase BufferAtomicFMaxContendedWorkgroup() {
@@ -16892,7 +17072,8 @@ TestCase BufferAtomicFMaxContendedWorkgroup() {
   test.code = code;
   test.initial = {0xc2c80000u};  // -100.0
   test.expected = {0x427c0000u}; // max(-100.0, 0.0 .. 63.0)
-  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX, O::S_ENDPGM};
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32, O::BUFFER_ATOMIC_FMAX,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16944,8 +17125,9 @@ TestCase ImageLoadVariants() {
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u,
                    0x40800000u, 0x3f800000u, 0x40000000u,
                    0x40400000u, 0x40800000u, 4};
-  test.opcodes = {O::V_MOV_B32,         O::IMAGE_LOAD,        O::IMAGE_LOAD_MIP,
-                  O::IMAGE_GET_RESINFO, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::IMAGE_LOAD,
+                  O::IMAGE_LOAD_MIP,     O::IMAGE_GET_RESINFO,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   return test;
 }
@@ -16978,8 +17160,8 @@ TestCase DsAppendConsumeUsesEncodedLdsSelector() {
           code,
           {},
           {10, 74, 0, 10},
-          {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32, O::DS_APPEND,
-           O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32,
+           O::DS_APPEND, O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsAppendUsesEncodedGdsSelector() {
@@ -17008,12 +17190,12 @@ TestCase DsAppendUsesEncodedGdsSelector() {
   AppendStoreVgpr(&code, 5, 5);
   AppendEnd(&code);
 
-  TestCase test{
-      "DsAppendGdsSelector",
-      code,
-      {},
-      {10, 74, 20, 84, 40, 104},
-      {O::S_MOV_B32, O::DS_APPEND, O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"DsAppendGdsSelector",
+                code,
+                {},
+                {10, 74, 20, 84, 40, 104},
+                {O::S_MOV_B32, O::DS_APPEND, O::DS_CONSUME,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.gds_initial = {10, 20, 30, 40};
   test.expected_gds = {10, 20, 30, 40};
   return test;
@@ -17045,8 +17227,9 @@ TestCase DsGdsSubdwordAndAtomicWrites() {
   TestCase test;
   test.name = "DsGdsSubdwordAndAtomics";
   test.code = code;
-  test.opcodes = {O::V_MOV_B32,      O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::DS_WRITE_B8,
-                  O::DS_WRITE_B16, O::DS_ADD_U32,  O::DS_MIN_F32,    O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,   O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::DS_WRITE_B8, O::DS_WRITE_B16, O::DS_ADD_U32,
+                  O::DS_MIN_F32,  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -17072,7 +17255,8 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   test.name = "ImageLoadR32UintUsesIntegerSampledImage";
   test.code = code;
   test.expected = {0xdeadbeefu};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba.resize(16);
   test.sampled_image_rgba[6] = 0xdeadbeefu;
   test.sampled_image_format = vk::Format::eR32Uint;
@@ -17098,7 +17282,8 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   test.name = "ImageLoad1DUsesScalarCoordinate";
   test.code = code;
   test.expected = {0xdeadbeefu};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = {0, 0, 0xdeadbeefu, 0};
@@ -17129,7 +17314,8 @@ TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   test.name = "ImageLoad1DArrayUsesLayerCoordinate";
   test.code = code;
   test.expected = {0xcafebabeu};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = {0, 0, 0, 0, 0, 0, 0xcafebabeu, 0};
@@ -17160,7 +17346,8 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
   test.name = "ImageLoad1DArrayDescriptorUsesSelectedLayer";
   test.code = code;
   test.expected = {0xcafebabeu};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
   test.sampled_image_rgba = {
@@ -17204,7 +17391,8 @@ TestCase ImageLoadMipUsesVaddr2Lod2D() {
   test.name = "ImageLoadMipUsesVaddr2Lod2D";
   test.code = code;
   test.expected = {0x40000000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD_MIP, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD_MIP, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba_mips = {base, mip1};
   return test;
 }
@@ -17233,7 +17421,8 @@ TestCase ImageLoadMipNsaUsesSelectedAddressVgprs() {
   test.name = "ImageLoadMipNsaUsesSelectedAddressVgprs";
   test.code = code;
   test.expected = {0x40a00000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD_MIP, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD_MIP, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba_mips = {base, mip1};
   return test;
 }
@@ -17259,7 +17448,8 @@ TestCase ImageLoadA16UintCoordsOnGpu() {
   test.name = "ImageLoadA16UintCoordsOnGpu";
   test.code = code;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.required_spirv = {"OpShiftRightLogical", "OpBitwiseAnd"};
   test.forbidden_spirv = {"UnpackHalf2x16"};
@@ -17360,9 +17550,10 @@ TestCase ImageSampleAndGather() {
                    0x3f800000u,
                    0x3f800000u,
                    0};
-  test.opcodes = {O::V_MOV_B32,        O::IMAGE_SAMPLE,     O::IMAGE_GET_LOD,
-                  O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {
+      O::V_MOV_B32,        O::IMAGE_SAMPLE,       O::IMAGE_GET_LOD,
+      O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM};
   test.sampled_image_rgba = image;
   return test;
 }
@@ -17388,7 +17579,8 @@ TestCase ImageSampleA16SamplerCoordsOnGpu() {
   test.name = "ImageSampleA16SamplerCoordsOnGpu";
   test.code = code;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.required_spirv = {"UnpackHalf2x16"};
   return test;
@@ -17408,7 +17600,8 @@ TestCase ImageSampleOpcodeAliasUsesNormalCoords() {
   TestCase test;
   test.name = "ImageSampleOpcodeAliasUsesNormalCoords";
   test.code = code;
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpImageSampleExplicitLod"};
   test.forbidden_spirv = {"UnpackHalf2x16"};
   test.compile_only = true;
@@ -17438,7 +17631,8 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.name = "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu";
   test.code = code;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.required_spirv = {"UnpackHalf2x16"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
@@ -17460,7 +17654,8 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   TestCase test;
   test.name = "ImageSampleA16CompareBiasRdna2AddressOrder";
   test.code = code;
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
@@ -17501,9 +17696,10 @@ TestCase ImageGatherCompareOpcodes() {
   TestCase test;
   test.name = "ImageGatherCompareOpcodes";
   test.code = code;
-  test.opcodes = {O::V_MOV_B32,        O::IMAGE_GATHER4_C,    O::IMAGE_GATHER4_C_LZ,
-                  O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {
+      O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
+      O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM};
   test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
@@ -17572,14 +17768,14 @@ void CheckIndirectImageKeySwitch() {
   program.values->block_info.push_back({.id = 0});
 
   auto &key = block->AppendNewInst(ValueOpcode::LaneId);
-  auto &image = block->AppendNewInst(
-      ValueOpcode::GetImageResource,
-      {Value(&key), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-       Value(0u), Value(0u)});
+  auto &image =
+      block->AppendNewInst(ValueOpcode::GetImageResource,
+                           {Value(&key), Value(0u), Value(0u), Value(0u),
+                            Value(0u), Value(0u), Value(0u), Value(0u)});
   image.SetFlags<uint32_t>(0u);
-  auto &sampler = block->AppendNewInst(
-      ValueOpcode::GetSamplerResource,
-      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &sampler =
+      block->AppendNewInst(ValueOpcode::GetSamplerResource,
+                           {Value(0u), Value(0u), Value(0u), Value(0u)});
   sampler.SetFlags<uint32_t>(0u);
   auto &address = block->AppendNewInst(
       ValueOpcode::MakeImageAddress,
@@ -17600,8 +17796,7 @@ void CheckIndirectImageKeySwitch() {
   std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
   auto &sample = block->AppendNewInst(
       ValueOpcode::ImageSampleRaw,
-      {Value(&image), Value(&sampler), Value(&address)},
-      memory_flag_bits);
+      {Value(&image), Value(&sampler), Value(&address)}, memory_flag_bits);
   auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
                                         {Value(&sample), Value(0u)});
   block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
@@ -17630,15 +17825,14 @@ void CheckIndirectImageKeySwitch() {
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
   std::string error;
-  Require(name, "binding layout",
-          AllocateBindings(program, {}, &error), error.c_str());
+  Require(name, "binding layout", AllocateBindings(program, {}, &error),
+          error.c_str());
   ResourceSnapshot snapshot{};
   DescriptorValue descriptor{};
   descriptor.dword_count = 8;
   descriptor.dwords[0] = 0x20u;
   descriptor.dwords[1] =
-      static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float)
-      << 20u;
+      static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
   descriptor.dwords[2] = 3u | (3u << 14u);
   descriptor.dwords[3] =
       DstSel(4, 5, 6, 7) |
@@ -17697,9 +17891,9 @@ TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   test.name = "ImageStoreMipSelectsPpsa01340Descriptor";
   test.code = std::move(code);
   test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE_MIP, O::S_ENDPGM};
-  const std::array<u32, 8> descriptor{
-      0x0294dc00u, 0xc4700000u, 0x00b3c13fu, 0x91b31facu,
-      0x00000000u, 0x00700030u, 0xb07b0000u, 0x0002ac3cu};
+  const std::array<u32, 8> descriptor{0x0294dc00u, 0xc4700000u, 0x00b3c13fu,
+                                      0x91b31facu, 0x00000000u, 0x00700030u,
+                                      0xb07b0000u, 0x0002ac3cu};
   std::copy(descriptor.begin(), descriptor.end(), test.user_data.begin());
   test.has_user_data = true;
   test.compile_only = true;
@@ -17943,8 +18137,9 @@ TestCase ImageAtomicVariants() {
   test.name = "ImageAtomicVariants";
   test.code = code;
   test.expected = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
-  test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD, O::IMAGE_ATOMIC_UMIN,
-                  O::IMAGE_ATOMIC_AND,   O::IMAGE_ATOMIC_OR,  O::IMAGE_ATOMIC_XOR,
+  test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD,
+                  O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
+                  O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpImageTexelPointer", "R32ui"};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
@@ -18007,8 +18202,8 @@ GraphicsCase GraphicsInterpolationExport() {
   return {"GraphicsInterpolationExport",
           code,
           {0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u},
-          {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_INTERP_MOV_F32, O::V_MOV_B32,
-           O::EXP, O::S_ENDPGM}};
+          {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_INTERP_MOV_F32,
+           O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsFlatInterpolatorExport() {
@@ -18055,8 +18250,8 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
   return {"GraphicsDsAddtidScratchExport",
           code,
           {0x3f000000u, 0x3f000000u, 0x3f000000u, 0x3f000000u},
-          {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_ADDTID_B32, O::DS_READ_ADDTID_B32,
-           O::EXP, O::S_ENDPGM}};
+          {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_ADDTID_B32,
+           O::DS_READ_ADDTID_B32, O::EXP, O::S_ENDPGM}};
 }
 
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
@@ -18217,8 +18412,8 @@ GraphicsCase GraphicsBranchPathFinalVmExportDiscardsInactiveExec() {
   return {"GraphicsBranchPathFinalVmExportDiscardsInactiveExec",
           code,
           {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
-          {O::V_MOV_B32, O::EXP, O::S_MOV_B64, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC1,
-           O::S_MOV_B32, O::S_ENDPGM}};
+          {O::V_MOV_B32, O::EXP, O::S_MOV_B64, O::S_CMP_EQ_U32,
+           O::S_CBRANCH_SCC1, O::S_MOV_B32, O::S_ENDPGM}};
 }
 
 TestCase MultipleWorkitemsGlobalId() {
@@ -18238,8 +18433,8 @@ TestCase MultipleWorkitemsGlobalId() {
   test.name = "MultipleWorkitemsGlobalId";
   test.code = code;
   test.expected = {64, 65, 66, 67, 68, 69, 70, 71};
-  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -18267,7 +18462,7 @@ TestCase DispatcherIrreducibleControlFlow() {
   test.code = code;
   test.expected = {7};
   test.opcodes = {O::S_CBRANCH_SCC1, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
-                  O::S_CBRANCH_SCC0, O::S_BRANCH, O::S_ENDPGM};
+                  O::S_CBRANCH_SCC0, O::S_BRANCH,  O::S_ENDPGM};
   return test;
 }
 
@@ -18459,6 +18654,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
+  AddCase(DsWideReadSnapshotsOverlappingAddress);
+  AddCase(DsReadWrite2EqualOffsetsUseData0);
+  AddCase(DsWideLdsPartialBounds);
+  AddCase(DsWideGdsPartialBounds);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
   AddCase(DsMiscVariants);
@@ -19129,8 +19328,8 @@ void CheckSampledColorViews() {
        {"sampled-invalid-selector", "sampled-incompatible-format",
         "sampled-invalid-high", "sampled-depth-format", "sampled-depth-swizzle",
         "storage-incompatible-format", "storage-kind", "storage-no-write",
-        "storage-nonuint-atomic", "storage-compare",
-        "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
+        "storage-nonuint-atomic", "storage-compare", "storage-dimension",
+        "volume-mip-count", "volume-slice-range"}) {
     std::string command =
         std::string("\"") + path + "\" --image-view-death " + kind;
     std::vector<char> mutable_command(command.begin(), command.end());
@@ -20087,12 +20286,10 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "PPSA01340 mip-range descriptor",
           mip_range.Base40() == 0x294dc0000ull &&
               mip_range.Width5() + 1u == 1280 &&
-              mip_range.Height5() + 1u == 720 &&
-              mip_range.Depth() + 1u == 1 &&
+              mip_range.Height5() + 1u == 720 && mip_range.Depth() + 1u == 1 &&
               mip_range.BaseLevel() == 1 && mip_range.LastLevel() == 3 &&
               mip_range.MaxMip() == 3 &&
-              mip_range.Format() ==
-                  Prospero::BufferFormat::k16_16_16_16Float &&
+              mip_range.Format() == Prospero::BufferFormat::k16_16_16_16Float &&
               mip_range.TileMode() == Prospero::TileMode::kRenderTarget &&
               mip_range.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA01340 mip-range storage descriptor fixture is malformed");
@@ -20415,14 +20612,27 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "host",
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
           "GetModuleFileName failed");
-  for (const char *kind :
-       {"resource", "type", "standard256b-volume",
-        "base-mip-out-of-resource", "dynamic-mip-out-of-resource",
-        "inverted-mip-range", "swizzle", "linear-rgb1-read", "bgra-read",
-        "r16-float-read", "r8-unorm-read", "yzwx-read", "reserved-swizzle",
-        "array-base-out-of-range", "reserved", "uint-format",
-        "uint-resource-float-format", "atomic-format", "depth-tile-read",
-        "depth-tile-extent", "depth-tile-fmask"}) {
+  for (const char *kind : {"resource",
+                           "type",
+                           "standard256b-volume",
+                           "base-mip-out-of-resource",
+                           "dynamic-mip-out-of-resource",
+                           "inverted-mip-range",
+                           "swizzle",
+                           "linear-rgb1-read",
+                           "bgra-read",
+                           "r16-float-read",
+                           "r8-unorm-read",
+                           "yzwx-read",
+                           "reserved-swizzle",
+                           "array-base-out-of-range",
+                           "reserved",
+                           "uint-format",
+                           "uint-resource-float-format",
+                           "atomic-format",
+                           "depth-tile-read",
+                           "depth-tile-extent",
+                           "depth-tile-fmask"}) {
     std::string command = std::string("\"") + path +
                           "\" --storage-texture-descriptor-death " + kind;
     std::vector<char> mutable_command(command.begin(), command.end());
@@ -21330,8 +21540,7 @@ void CheckReferenceClockScale() {
 
 void CheckClipControlDepthClipState() {
   HW::ClipControl clip;
-  Require("ClipControlDepthClipState", "default",
-          clip.IsZClipEnabled(),
+  Require("ClipControlDepthClipState", "default", clip.IsZClipEnabled(),
           "default paired Z clipping was not enabled");
 
   clip.min_z_clip_disable = true;
@@ -21341,13 +21550,11 @@ void CheckClipControlDepthClipState() {
 
   clip.min_z_clip_disable = false;
   clip.max_z_clip_disable = true;
-  Require("ClipControlDepthClipState", "asymmetric far",
-          !clip.IsZClipEnabled(),
+  Require("ClipControlDepthClipState", "asymmetric far", !clip.IsZClipEnabled(),
           "far-plane disable did not disable paired host Z clipping");
 
   clip.min_z_clip_disable = true;
-  Require("ClipControlDepthClipState", "both disabled",
-          !clip.IsZClipEnabled(),
+  Require("ClipControlDepthClipState", "both disabled", !clip.IsZClipEnabled(),
           "paired Z-clip disable was not represented");
   std::printf("[host]    %-32s ok\n", "ClipControlDepthClipState");
 }

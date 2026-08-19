@@ -592,9 +592,7 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32 ||
 			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMin32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::GdsAtomicFMin32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::GdsAtomicFMax32;
+			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
 		    })) {
 			ctx.scratch_u32_variable = state.builder.AllocateId();
 			break;
@@ -630,6 +628,11 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		state.builder.AddFunction({OpVariable,
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           ctx.scratch_u32_variable, StorageClassFunction});
+	}
+	if (state.gds_variable != 0) {
+		state.gds_length = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpArrayLength, TypeU32(state), state.gds_length, state.gds_variable, 0});
 	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(

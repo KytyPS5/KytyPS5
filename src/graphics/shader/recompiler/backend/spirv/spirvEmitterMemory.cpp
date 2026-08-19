@@ -141,7 +141,11 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		                         ctx.Arg(inst, 3));
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-		return ctx.Arg(inst, 1);
+		if (mem.offset == 0u) {
+			return ctx.Arg(inst, 0);
+		}
+		return Binary(ctx.state, OpIAdd, TypeU32(ctx.state), ctx.Arg(inst, 0),
+		              ConstantU32(ctx.state, mem.offset));
 	}
 	return AddressByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2));
 }
@@ -493,35 +497,25 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::BufferAtomicSwap32:
-		case IR::ValueOpcode::SharedAtomicSwap32:
-		case IR::ValueOpcode::GdsAtomicSwap32: return OpAtomicExchange;
+		case IR::ValueOpcode::SharedAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
-		case IR::ValueOpcode::SharedAtomicIAdd32:
-		case IR::ValueOpcode::GdsAtomicIAdd32: return OpAtomicIAdd;
+		case IR::ValueOpcode::SharedAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
-		case IR::ValueOpcode::SharedAtomicISub32:
-		case IR::ValueOpcode::GdsAtomicISub32: return OpAtomicISub;
+		case IR::ValueOpcode::SharedAtomicISub32: return OpAtomicISub;
 		case IR::ValueOpcode::BufferAtomicSMin32:
-		case IR::ValueOpcode::SharedAtomicSMin32:
-		case IR::ValueOpcode::GdsAtomicSMin32: return OpAtomicSMin;
+		case IR::ValueOpcode::SharedAtomicSMin32: return OpAtomicSMin;
 		case IR::ValueOpcode::BufferAtomicUMin32:
-		case IR::ValueOpcode::SharedAtomicUMin32:
-		case IR::ValueOpcode::GdsAtomicUMin32: return OpAtomicUMin;
+		case IR::ValueOpcode::SharedAtomicUMin32: return OpAtomicUMin;
 		case IR::ValueOpcode::BufferAtomicSMax32:
-		case IR::ValueOpcode::SharedAtomicSMax32:
-		case IR::ValueOpcode::GdsAtomicSMax32: return OpAtomicSMax;
+		case IR::ValueOpcode::SharedAtomicSMax32: return OpAtomicSMax;
 		case IR::ValueOpcode::BufferAtomicUMax32:
-		case IR::ValueOpcode::SharedAtomicUMax32:
-		case IR::ValueOpcode::GdsAtomicUMax32: return OpAtomicUMax;
+		case IR::ValueOpcode::SharedAtomicUMax32: return OpAtomicUMax;
 		case IR::ValueOpcode::BufferAtomicAnd32:
-		case IR::ValueOpcode::SharedAtomicAnd32:
-		case IR::ValueOpcode::GdsAtomicAnd32: return OpAtomicAnd;
+		case IR::ValueOpcode::SharedAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
-		case IR::ValueOpcode::SharedAtomicOr32:
-		case IR::ValueOpcode::GdsAtomicOr32: return OpAtomicOr;
+		case IR::ValueOpcode::SharedAtomicOr32: return OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
-		case IR::ValueOpcode::SharedAtomicXor32:
-		case IR::ValueOpcode::GdsAtomicXor32: return OpAtomicXor;
+		case IR::ValueOpcode::SharedAtomicXor32: return OpAtomicXor;
 		default: return 0;
 	}
 }
@@ -614,7 +608,7 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		EmitIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
 			    ctx.state.builder.AddFunction(
-			        {OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 2)});
+			        {OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 1)});
 			    const auto data = ctx.state.builder.AllocateId();
 			    ctx.state.builder.AddFunction(
 			        {OpLoad, TypeU32(ctx.state), data, ctx.scratch_u32_variable});
@@ -623,7 +617,7 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 			        mem.kind, [&](uint32_t old) {
 				        const auto old_f = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), old);
 				        const auto compare_f =
-				            Unary(ctx.state, OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 3));
+				            Unary(ctx.state, OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
 				        const auto data_f = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), data);
 				        const auto compare =
 				            Binary(ctx.state, max_value ? OpFOrdGreaterThan : OpFOrdLessThan,
@@ -637,9 +631,9 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	return 0;
 }
 
-uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bool append) {
+uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append) {
 	auto&      state = ctx.state;
-	const auto m0    = ctx.Arg(inst, 1);
+	const auto m0    = ctx.Arg(inst, 0);
 	const auto base =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
 	const auto size = Binary(state, OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
@@ -647,11 +641,10 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	    Binary(state, OpIAdd, TypeU32(state), base, ConstantU32(state, ctx.Memory(inst).offset));
 	const auto raw_index =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-	auto mem          = ctx.Memory(inst);
-	mem.kind          = gds ? IR::ResourceKind::Gds : IR::ResourceKind::Lds;
+	const auto mem    = ctx.Memory(inst);
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
-	const auto exec   = ctx.Arg(inst, 2);
+	const auto exec   = ctx.Arg(inst, 1);
 	const auto ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
 	                           ConstantU32(state, ScopeSubgroup), exec});
@@ -659,8 +652,8 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
-	const auto count_low  = state.per_invocation_masks ? low : ctx.Arg(inst, 3);
-	const auto count_high = state.per_invocation_masks ? high : ctx.Arg(inst, 4);
+	const auto count_low  = state.per_invocation_masks ? low : ctx.Arg(inst, 2);
+	const auto count_high = state.per_invocation_masks ? high : ctx.Arg(inst, 3);
 	const auto count =
 	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), count_low),
 	           Unary(state, OpBitCount, TypeU32(state), count_high));
@@ -671,17 +664,19 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool gds, bo
 	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), first);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
 	const auto m0_bounds =
-	    gds ? Binary(state, OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
+	    mem.kind == IR::ResourceKind::Gds
+	        ? Binary(state, OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
 	        : Binary(state, OpULessThan, TypeBool(state),
 	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
 	const auto condition = AndCondition(
 	    state, is_first, AndCondition(state, exec, AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction({append ? OpAtomicIAdd : OpAtomicISub, TypeU32(state), value,
-		                           EmitMemoryElementPointer(state, access, index),
-		                           ConstantU32(state, gds ? ScopeDevice : ScopeWorkgroup),
-		                           ConstantU32(state, MemorySemanticsNone), count});
+		state.builder.AddFunction(
+		    {append ? OpAtomicIAdd : OpAtomicISub, TypeU32(state), value,
+		     EmitMemoryElementPointer(state, access, index),
+		     ConstantU32(state, mem.kind == IR::ResourceKind::Gds ? ScopeDevice : ScopeWorkgroup),
+		     ConstantU32(state, MemorySemanticsNone), count});
 		return value;
 	});
 	const auto result = state.builder.AllocateId();
@@ -706,9 +701,9 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
                                                const MemoryResourceAccess& resource,
                                                uint32_t components, FormattedAccess access) {
 	PreparedFormattedMemory plan;
-	plan.format      = BufferFormat(ctx, inst, mem);
-	plan.info        = Format::GetFormatInfo(plan.format);
-	plan.resource    = resource;
+	plan.format   = BufferFormat(ctx, inst, mem);
+	plan.info     = Format::GetFormatInfo(plan.format);
+	plan.resource = resource;
 	std::array<bool, 4> required_components {};
 	if (access == FormattedAccess::Load) {
 		for (uint32_t output = 0; output < components; output++) {
@@ -718,8 +713,8 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 			}
 		}
 	} else {
-		for (uint32_t component = 0;
-		     component < std::min(components, plan.info.component_count); component++) {
+		for (uint32_t component = 0; component < std::min(components, plan.info.component_count);
+		     component++) {
 			required_components[component] = true;
 		}
 	}
@@ -812,7 +807,7 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 		        mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
 		    if (Format::IsKnownFormat(format)) {
 			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
-			                                            FormattedAccess::Load);
+			                                             FormattedAccess::Load);
 			    return EmitValueOrDefaultIfCondition(
 			        state, plan.in_bounds, TypeU32Composite(state, components),
 			        FormattedOutOfBoundsValue(ctx, mem, plan, components), [&]() {
@@ -842,7 +837,7 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		    mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
 		if (Format::IsKnownFormat(format)) {
 			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
-			                                        FormattedAccess::Store);
+			                                         FormattedAccess::Store);
 			EmitIfCondition(state, plan.in_bounds, [&]() {
 				for (uint32_t component = 0; component < components; component++) {
 					const auto data = state.builder.AllocateId();
@@ -862,6 +857,54 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 	});
 }
 
+uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
+	    ConstantU32CompositeZero(state, components), [&]() {
+		    const auto              mem      = ctx.Memory(inst);
+		    const auto              resource = PrepareMemoryResourceAccess(state, mem);
+		    const auto              base     = ByteAddress(ctx, inst, mem);
+		    std::array<uint32_t, 4> values {};
+		    for (uint32_t component = 0; component < components; component++) {
+			    const auto address = component == 0u
+			                             ? base
+			                             : Binary(state, OpIAdd, TypeU32(state), base,
+			                                      ConstantU32(state, component * 4u));
+			    const auto raw_index = Binary(state, OpShiftRightLogical, TypeU32(state), address,
+			                                  ConstantU32(state, 2));
+			    const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+			    values[component]    = EmitValueOrZeroIfCondition(
+			        state, EmitMemoryElementInBounds(state, access.resource, access.index),
+			        [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+		    }
+		    return ConstructU32Composite(state, components, values);
+	    });
+}
+
+void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto mem      = ctx.Memory(inst);
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto base     = ByteAddress(ctx, inst, mem);
+		for (uint32_t component = 0; component < components; component++) {
+			const auto address = component == 0u
+			                         ? base
+			                         : Binary(state, OpIAdd, TypeU32(state), base,
+			                                  ConstantU32(state, component * 4u));
+			const auto raw_index =
+			    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+			const auto access = PrepareMemoryElement(ctx, mem, resource, raw_index);
+			EmitIfCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
+			                [&]() {
+				                StoreWordInBounds(ctx, access.resource, access.index,
+				                                  ctx.Arg(inst, component + 1u));
+			                });
+		}
+	});
+}
+
 } // namespace
 
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -873,6 +916,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, LoadWideBuffer(ctx, inst, buffer_components));
 		} else {
 			StoreWideBuffer(ctx, inst, buffer_components);
+		}
+		return true;
+	}
+	const auto shared_components = IR::SharedComponentCount(op);
+	if (shared_components > 1u) {
+		if (IR::SharedAccessOf(op) == IR::SharedAccess::Read) {
+			ctx.Define(inst, LoadWideShared(ctx, inst, shared_components));
+		} else {
+			StoreWideShared(ctx, inst, shared_components);
 		}
 		return true;
 	}
@@ -917,25 +969,17 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool load_buffer  = op == IR::ValueOpcode::LoadBufferU8 ||
 	                          op == IR::ValueOpcode::LoadBufferU16 ||
 	                          op == IR::ValueOpcode::LoadBufferU32;
-	const bool load_shared =
-	    op == IR::ValueOpcode::LoadSharedU8 || op == IR::ValueOpcode::LoadSharedU16 ||
-	    op == IR::ValueOpcode::LoadSharedU32 || op == IR::ValueOpcode::LoadGdsU8 ||
-	    op == IR::ValueOpcode::LoadGdsU16 || op == IR::ValueOpcode::LoadGdsU32;
+	const bool load_shared = IR::SharedAccessOf(op) == IR::SharedAccess::Read;
 	if (load_address || load_buffer || load_shared) {
-		auto mem = ctx.Memory(inst);
-		if (load_shared)
-			mem.kind = op == IR::ValueOpcode::LoadGdsU8 || op == IR::ValueOpcode::LoadGdsU16 ||
-			                   op == IR::ValueOpcode::LoadGdsU32
-			               ? IR::ResourceKind::Gds
-			               : IR::ResourceKind::Lds;
-		uint32_t value = 0;
+		const auto mem   = ctx.Memory(inst);
+		uint32_t   value = 0;
 		if (op == IR::ValueOpcode::LoadBufferU32 && mem.formatted)
 			value = FormattedLoad(ctx, inst, mem);
 		else if (op == IR::ValueOpcode::LoadAddressU8 || op == IR::ValueOpcode::LoadBufferU8 ||
-		         op == IR::ValueOpcode::LoadSharedU8 || op == IR::ValueOpcode::LoadGdsU8)
+		         op == IR::ValueOpcode::LoadSharedU8)
 			value = LoadSubword(ctx, inst, mem, 8, false);
 		else if (op == IR::ValueOpcode::LoadAddressU16 || op == IR::ValueOpcode::LoadBufferU16 ||
-		         op == IR::ValueOpcode::LoadSharedU16 || op == IR::ValueOpcode::LoadGdsU16)
+		         op == IR::ValueOpcode::LoadSharedU16)
 			value = LoadSubword(ctx, inst, mem, 16, false);
 		else
 			value = LoadWord(ctx, inst, mem);
@@ -948,24 +992,16 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool store_buffer  = op == IR::ValueOpcode::StoreBufferU8 ||
 	                           op == IR::ValueOpcode::StoreBufferU16 ||
 	                           op == IR::ValueOpcode::StoreBufferU32;
-	const bool store_shared =
-	    op == IR::ValueOpcode::WriteSharedU8 || op == IR::ValueOpcode::WriteSharedU16 ||
-	    op == IR::ValueOpcode::WriteSharedU32 || op == IR::ValueOpcode::WriteGdsU8 ||
-	    op == IR::ValueOpcode::WriteGdsU16 || op == IR::ValueOpcode::WriteGdsU32;
+	const bool store_shared = IR::SharedAccessOf(op) == IR::SharedAccess::Write;
 	if (store_address || store_buffer || store_shared) {
-		auto mem = ctx.Memory(inst);
-		if (store_shared)
-			mem.kind = op == IR::ValueOpcode::WriteGdsU8 || op == IR::ValueOpcode::WriteGdsU16 ||
-			                   op == IR::ValueOpcode::WriteGdsU32
-			               ? IR::ResourceKind::Gds
-			               : IR::ResourceKind::Lds;
+		const auto mem = ctx.Memory(inst);
 		if (op == IR::ValueOpcode::StoreBufferU32 && mem.formatted)
 			FormattedStore(ctx, inst, mem);
 		else if (op == IR::ValueOpcode::StoreAddressU8 || op == IR::ValueOpcode::StoreBufferU8 ||
-		         op == IR::ValueOpcode::WriteSharedU8 || op == IR::ValueOpcode::WriteGdsU8)
+		         op == IR::ValueOpcode::WriteSharedU8)
 			StoreSubword(ctx, inst, mem, 8);
 		else if (op == IR::ValueOpcode::StoreAddressU16 || op == IR::ValueOpcode::StoreBufferU16 ||
-		         op == IR::ValueOpcode::WriteSharedU16 || op == IR::ValueOpcode::WriteGdsU16)
+		         op == IR::ValueOpcode::WriteSharedU16)
 			StoreSubword(ctx, inst, mem, 16);
 		else
 			StoreWord(ctx, inst, mem);
@@ -973,12 +1009,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto atomic_opcode = AtomicOpcode(op);
 	if (atomic_opcode != 0) {
-		auto mem = ctx.Memory(inst);
-		if (op >= IR::ValueOpcode::SharedAtomicSwap32 && op <= IR::ValueOpcode::SharedAtomicXor32)
-			mem.kind = IR::ResourceKind::Lds;
-		else if (op >= IR::ValueOpcode::GdsAtomicSwap32 && op <= IR::ValueOpcode::GdsAtomicXor32)
-			mem.kind = IR::ResourceKind::Gds;
-		ctx.Define(inst, EmitAtomic(ctx, inst, mem, true));
+		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
 		return true;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {
@@ -986,24 +1017,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                             op == IR::ValueOpcode::BufferAtomicFMax32));
 		return true;
 	}
-	if (op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32 ||
-	    op == IR::ValueOpcode::GdsAtomicFMin32 || op == IR::ValueOpcode::GdsAtomicFMax32) {
-		auto mem = ctx.Memory(inst);
-		mem.kind = op == IR::ValueOpcode::GdsAtomicFMin32 || op == IR::ValueOpcode::GdsAtomicFMax32
-		               ? IR::ResourceKind::Gds
-		               : IR::ResourceKind::Lds;
-		SharedFloatAtomic(ctx, inst, mem,
-		                  op == IR::ValueOpcode::SharedAtomicFMax32 ||
-		                      op == IR::ValueOpcode::GdsAtomicFMax32);
+	if (op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32) {
+		SharedFloatAtomic(ctx, inst, ctx.Memory(inst), op == IR::ValueOpcode::SharedAtomicFMax32);
 		return true;
 	}
-	if (op == IR::ValueOpcode::DataAppend || op == IR::ValueOpcode::DataConsume ||
-	    op == IR::ValueOpcode::GdsDataAppend || op == IR::ValueOpcode::GdsDataConsume) {
-		ctx.Define(inst, AppendConsume(ctx, inst,
-		                               op == IR::ValueOpcode::GdsDataAppend ||
-		                                   op == IR::ValueOpcode::GdsDataConsume,
-		                               op == IR::ValueOpcode::DataAppend ||
-		                                   op == IR::ValueOpcode::GdsDataAppend));
+	if (op == IR::ValueOpcode::DataAppend || op == IR::ValueOpcode::DataConsume) {
+		ctx.Define(inst, AppendConsume(ctx, inst, op == IR::ValueOpcode::DataAppend));
 		return true;
 	}
 	if (op == IR::ValueOpcode::SwizzleU32) {

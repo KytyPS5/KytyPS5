@@ -256,8 +256,8 @@ void TestInvariantIndirectImageMaterialization() {
             fixture->program.values->descriptor_sources[source]
                 .indirect_image.has_value(),
         "indirect image source was not retained for runtime proof");
-  const auto image_handle = std::ranges::find_if(
-      *fixture->block, [](const Inst &inst) {
+  const auto image_handle =
+      std::ranges::find_if(*fixture->block, [](const Inst &inst) {
         return inst.GetOpcode() == ValueOpcode::GetImageResource;
       });
   Check(image_handle != fixture->block->end() &&
@@ -326,11 +326,12 @@ void TestInvariantIndirectImageMaterialization() {
   memory.words[(0x2020u - memory.base) / 4u + 3u] =
       image_descriptor[3] ^ (1u << 28u);
   ResourceSnapshot null_snapshot;
-  Check(MaterializeResources(fixture->program, runtime, null_snapshot, &error) &&
-            null_snapshot.indirect_images.empty() &&
-            std::ranges::all_of(null_snapshot.images[0].dwords,
-                                [](uint32_t dword) { return dword == 0u; }),
-        "stale typed null image descriptors were not canonicalized");
+  Check(
+      MaterializeResources(fixture->program, runtime, null_snapshot, &error) &&
+          null_snapshot.indirect_images.empty() &&
+          std::ranges::all_of(null_snapshot.images[0].dwords,
+                              [](uint32_t dword) { return dword == 0u; }),
+      "stale typed null image descriptors were not canonicalized");
 
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
@@ -380,11 +381,12 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSnapshot capacity_snapshot;
   for (const uint32_t records : {1u, 3u}) {
     user_data[2] = records;
-    Check(MaterializeResources(fixture->program, runtime, capacity_snapshot,
-                               &error) &&
-              ValidateResourceSpecialization(fixture->program,
-                                             capacity_snapshot, &error),
-          "runtime indirect key mapping rejected a fitting material-table size");
+    Check(
+        MaterializeResources(fixture->program, runtime, capacity_snapshot,
+                             &error) &&
+            ValidateResourceSpecialization(fixture->program, capacity_snapshot,
+                                           &error),
+        "runtime indirect key mapping rejected a fitting material-table size");
   }
   user_data[2] = 2u;
   memory.words[(0x2020u - memory.base) / 4u] =
@@ -396,11 +398,12 @@ void TestInvariantIndirectImageMaterialization() {
         image_descriptor[dword];
   }
   memory.words[(0x1000u - memory.base + 68u) / 4u] = 2u;
-  Check(!MaterializeResources(fixture->program, runtime, rebound_snapshot,
-                              &error) &&
-            error.find("candidate topology") != std::string::npos &&
-            same_snapshot(rebound_snapshot, collapsed_snapshot),
-        "larger indirect candidate topology reused or mutated a cached snapshot");
+  Check(
+      !MaterializeResources(fixture->program, runtime, rebound_snapshot,
+                            &error) &&
+          error.find("candidate topology") != std::string::npos &&
+          same_snapshot(rebound_snapshot, collapsed_snapshot),
+      "larger indirect candidate topology reused or mutated a cached snapshot");
 
   auto memory_backed = MakeIndirectImageFixture(false, 0u, true);
   memory_backed->PlanAndTrack();
@@ -985,14 +988,14 @@ void TestExecMaskedFlatAddressProvenance() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
   const auto high_root = fixture.UserData(1);
-  const auto active = fixture.Emit(
-      ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
+  const auto active =
+      fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
   const auto inactive_low = fixture.Emit(ValueOpcode::UndefU32);
   const auto inactive_high = fixture.Emit(ValueOpcode::UndefU32);
-  const auto low = fixture.Emit(ValueOpcode::SelectU32,
-                                {active, low_root, inactive_low});
-  const auto high = fixture.Emit(ValueOpcode::SelectU32,
-                                 {active, high_root, inactive_high});
+  const auto low =
+      fixture.Emit(ValueOpcode::SelectU32, {active, low_root, inactive_low});
+  const auto high =
+      fixture.Emit(ValueOpcode::SelectU32, {active, high_root, inactive_high});
   const auto address = fixture.Address(low, high, 0xa4);
   MemoryInfo flat;
   flat.kind = ResourceKind::Flat;
@@ -1015,19 +1018,18 @@ void TestExecMaskedFlatAddressProvenance() {
         "exec-masked FLAT address materialized the wrong user-data root");
 
   Fixture mismatch;
-  const auto mismatch_active = mismatch.Emit(
-      ValueOpcode::INotEqual32, {mismatch.UserData(2), Value(0u)});
-  const auto other_active = mismatch.Emit(ValueOpcode::LogicalNot,
-                                          {mismatch_active});
+  const auto mismatch_active = mismatch.Emit(ValueOpcode::INotEqual32,
+                                             {mismatch.UserData(2), Value(0u)});
+  const auto other_active =
+      mismatch.Emit(ValueOpcode::LogicalNot, {mismatch_active});
   const auto mismatch_low = mismatch.Emit(
-      ValueOpcode::SelectU32,
-      {mismatch_active, mismatch.UserData(0),
-       mismatch.Emit(ValueOpcode::UndefU32)});
+      ValueOpcode::SelectU32, {mismatch_active, mismatch.UserData(0),
+                               mismatch.Emit(ValueOpcode::UndefU32)});
   const auto mismatch_high = mismatch.Emit(
-      ValueOpcode::SelectU32,
-      {mismatch_active, mismatch.UserData(1),
-       mismatch.Emit(ValueOpcode::UndefU32)});
-  const auto mismatch_address = mismatch.Address(mismatch_low, mismatch_high, 0xa4);
+      ValueOpcode::SelectU32, {mismatch_active, mismatch.UserData(1),
+                               mismatch.Emit(ValueOpcode::UndefU32)});
+  const auto mismatch_address =
+      mismatch.Address(mismatch_low, mismatch_high, 0xa4);
   mismatch.Emit(ValueOpcode::LoadAddressU8,
                 {mismatch_address, mismatch_low, mismatch_high, other_active},
                 mismatch.AddMemory(flat, 0xa4));
@@ -1086,9 +1088,10 @@ void TestShaderInfoAndBindingLayout() {
       {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)),
        Value(2u)});
   fixture.Emit(ValueOpcode::BitwiseXor32, {Value(1u), Value(2u)});
-  const auto gds = fixture.Emit(ValueOpcode::GetGdsResource);
-  fixture.Emit(ValueOpcode::WriteGdsU32,
-               {gds, Value(0u), Value(1u), Value(true)});
+  MemoryInfo gds;
+  gds.kind = ResourceKind::Gds;
+  fixture.Emit(ValueOpcode::WriteSharedU32, {Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(gds, 8));
   fixture.PlanAndTrack();
 
   ShaderComputeInputInfo compute{};

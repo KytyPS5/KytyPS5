@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1127,6 +1128,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	m_presenter.Present(*r.frame);
+	Graphics::RenderDocOnGuestFlip();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||

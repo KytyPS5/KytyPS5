@@ -25,11 +25,13 @@ namespace Libs::Graphics {
 enum class RenderDocState : uint32_t {
 	Idle,
 	Requested,
+	Starting,
 	Capturing,
 };
 
 static RENDERDOC_API_1_6_0*        g_api             = nullptr;
 static std::atomic<RenderDocState> g_state           = RenderDocState::Idle;
+static std::atomic_uint32_t        g_captured_flips  = 0;
 static std::atomic_bool            g_unavailable_log = false;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -140,7 +142,7 @@ bool RenderDocCaptureInProgress() {
 
 void RenderDocStartCapture() {
 	RenderDocState expected = RenderDocState::Requested;
-	if (g_api == nullptr || !g_state.compare_exchange_strong(expected, RenderDocState::Capturing,
+	if (g_api == nullptr || !g_state.compare_exchange_strong(expected, RenderDocState::Starting,
 	                                                         std::memory_order_acq_rel)) {
 		return;
 	}
@@ -162,6 +164,8 @@ void RenderDocStartCapture() {
 		LOGF("RenderDoc: capture failed to start\n");
 		return;
 	}
+	g_captured_flips.store(0, std::memory_order_release);
+	g_state.store(RenderDocState::Capturing, std::memory_order_release);
 	LOGF("RenderDoc: capture started\n");
 }
 
@@ -173,6 +177,17 @@ void RenderDocEndCapture() {
 	const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
 	g_state.store(RenderDocState::Idle, std::memory_order_release);
 	LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
+}
+
+void RenderDocOnGuestFlip() {
+	if (!RenderDocCaptureInProgress()) {
+		return;
+	}
+	const auto flip = g_captured_flips.fetch_add(1, std::memory_order_acq_rel) + 1;
+	LOGF("RenderDoc: captured guest flip %u/2\n", flip);
+	if (flip >= 2) {
+		RenderDocEndCapture();
+	}
 }
 
 } // namespace Libs::Graphics

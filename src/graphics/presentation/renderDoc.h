@@ -7,6 +7,7 @@ void RenderDocInit();
 void RenderDocRequestCapture();
 void RenderDocStartCapture();
 void RenderDocEndCapture();
+void RenderDocOnGuestFlip();
 
 [[nodiscard]] bool RenderDocCaptureRequested();
 [[nodiscard]] bool RenderDocCaptureInProgress();

@@ -204,6 +204,11 @@ void GuestGpu::Done() {
 			Common::LockGuard render_lock(m_renderer.GetMutex());
 			RenderDocEndCapture();
 		});
+	} else if (RenderDocCaptureRequested()) {
+		SendCommandSync([this] {
+			Common::LockGuard render_lock(m_renderer.GetMutex());
+			RenderDocStartCapture();
+		});
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -566,10 +571,6 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
-	if (first_slice && RenderDocCaptureRequested()) {
-		Common::LockGuard render_lock(m_renderer.GetMutex());
-		RenderDocStartCapture();
-	}
 	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice && submission.reset_processor) {

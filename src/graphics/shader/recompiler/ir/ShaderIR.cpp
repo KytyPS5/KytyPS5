@@ -1181,12 +1181,11 @@ bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, Shader
 		EXIT("invalid shader wave size: %u\n", wave_size);
 	}
 
-	program                     = {};
-	program.stage               = stage;
-	program.wave_size           = wave_size;
-	program.dispatcher_fallback = cfg.irreducible;
-	program.cfg_failure_kind    = cfg.failure_kind;
-	program.fallback_reason     = cfg.unsupported_reason;
+	program                  = {};
+	program.stage            = stage;
+	program.wave_size        = wave_size;
+	program.cfg_failure_kind = cfg.failure_kind;
+	program.fallback_reason  = cfg.unsupported_reason;
 	program.blocks.clear();
 
 	if (cfg.blocks.empty()) {

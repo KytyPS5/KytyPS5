@@ -46,6 +46,7 @@ std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
 	dump += CFG::GraphToString(cfg);
 	dump += "\nIR:\n";
+	dump += fmt::format("mode={}\n", ir.dispatcher_fallback ? "dispatcher" : "structured");
 	dump += ir.values != nullptr ? IR::ValueProgramToString(*ir.values) : IR::ProgramToString(ir);
 	return dump;
 }

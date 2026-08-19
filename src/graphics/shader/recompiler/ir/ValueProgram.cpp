@@ -142,6 +142,7 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 		return Fail(error, "value IR block storage is inconsistent");
 	}
 	std::unordered_set<const Block*>           blocks;
+	std::unordered_map<const Block*, size_t>   block_indices;
 	std::unordered_map<uint32_t, const Block*> blocks_by_id;
 	std::unordered_set<const Inst*>            instructions;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
@@ -153,6 +154,10 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 		if (!blocks.insert(block).second) {
 			return Fail(error, "value IR block pointer is duplicated");
 		}
+		block_indices.emplace(block, block_index);
+		if (program.block_info[block_index].id == UINT32_MAX) {
+			return Fail(error, "value IR block uses the reserved exit id");
+		}
 		if (!blocks_by_id.emplace(program.block_info[block_index].id, block).second) {
 			return Fail(error, "value IR block id is duplicated");
 		}
@@ -161,6 +166,9 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				return Fail(error, "value IR instruction is duplicated");
 			}
 		}
+	}
+	if (!program.blocks.empty() && !program.blocks.front()->ImmPredecessors().empty()) {
+		return Fail(error, "value IR entry block has a predecessor");
 	}
 
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
@@ -224,12 +232,16 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					return Fail(error, "value IR conditional branch condition is invalid");
 				}
 				break;
-			case CFG::TerminatorKind::IndirectBranch:
+			case CFG::TerminatorKind::IndirectBranch: {
 				if (!validate_control_value(program.block_info[block_index].indirect_target,
 				                            Type::U32)) {
 					return Fail(error, "value IR indirect branch selector is invalid");
 				}
+				std::unordered_set<uint32_t> indirect_targets;
 				for (const auto target: terminator.indirect_targets) {
+					if (!indirect_targets.insert(target).second) {
+						return Fail(error, "value IR indirect branch target is duplicated");
+					}
 					if (!add_target(target)) {
 						return Fail(error, "value IR indirect branch target is missing");
 					}
@@ -247,6 +259,7 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					}
 				}
 				break;
+			}
 			case CFG::TerminatorKind::Return:
 			case CFG::TerminatorKind::Unsupported: break;
 		}
@@ -440,6 +453,100 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 			}
 		}
 	}
+
+	if (program.blocks.empty()) {
+		return true;
+	}
+
+	std::vector<bool>   reachable(program.blocks.size(), false);
+	std::vector<size_t> pending {0u};
+	while (!pending.empty()) {
+		const auto block_index = pending.back();
+		pending.pop_back();
+		if (reachable[block_index]) {
+			continue;
+		}
+		reachable[block_index] = true;
+		for (const auto* successor: program.blocks[block_index]->ImmSuccessors()) {
+			pending.push_back(block_indices.at(successor));
+		}
+	}
+	if (!std::ranges::all_of(reachable, [](bool value) { return value; })) {
+		return Fail(error, "value IR contains an unreachable block");
+	}
+
+	std::vector<std::vector<bool>> dominators(program.blocks.size(),
+	                                          std::vector<bool>(program.blocks.size(), true));
+	dominators.front().assign(program.blocks.size(), false);
+	dominators.front().front() = true;
+	bool changed               = true;
+	while (changed) {
+		changed = false;
+		for (size_t block_index = 1; block_index < program.blocks.size(); block_index++) {
+			std::vector<bool> next(program.blocks.size(), true);
+			for (const auto* predecessor: program.blocks[block_index]->ImmPredecessors()) {
+				const auto predecessor_index = block_indices.at(predecessor);
+				for (size_t candidate = 0; candidate < next.size(); candidate++) {
+					next[candidate] = next[candidate] && dominators[predecessor_index][candidate];
+				}
+			}
+			next[block_index] = true;
+			if (next != dominators[block_index]) {
+				dominators[block_index] = std::move(next);
+				changed                 = true;
+			}
+		}
+	}
+
+	std::unordered_map<const Inst*, size_t> instruction_positions;
+	for (const auto* block: program.blocks) {
+		size_t position = 0;
+		for (const auto& inst: *block) {
+			instruction_positions.emplace(&inst, position++);
+		}
+	}
+	const auto dominates = [&](const Block* definition, const Block* use) {
+		return dominators[block_indices.at(use)][block_indices.at(definition)];
+	};
+	const auto control_dominates = [&](Value value, const Block* use) {
+		const auto* definition = value.TryInstruction();
+		return definition == nullptr || definition->Parent() == use ||
+		       dominates(definition->Parent(), use);
+	};
+
+	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
+		const auto* block = program.blocks[block_index];
+		for (const auto& inst: *block) {
+			for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
+				const auto* definition = inst.Arg(arg_index).TryInstruction();
+				if (definition == nullptr) {
+					continue;
+				}
+				if (inst.GetOpcode() == ValueOpcode::Phi) {
+					const auto* predecessor = inst.PhiBlock(arg_index);
+					if (definition->Parent() != predecessor &&
+					    !dominates(definition->Parent(), predecessor)) {
+						return Fail(error,
+						            "value IR Phi incoming definition does not dominate its edge");
+					}
+				} else if (definition->Parent() == block) {
+					if (instruction_positions.at(definition) >= instruction_positions.at(&inst)) {
+						return Fail(error,
+						            "value IR instruction uses a same-block definition before it");
+					}
+				} else if (!dominates(definition->Parent(), block)) {
+					return Fail(error, "value IR instruction definition does not dominate its use");
+				}
+			}
+		}
+		const auto& info = program.block_info[block_index];
+		if (!info.condition.IsEmpty() && !control_dominates(info.condition, block)) {
+			return Fail(error, "value IR branch condition definition does not dominate its use");
+		}
+		if (!info.indirect_target.IsEmpty() && !control_dominates(info.indirect_target, block)) {
+			return Fail(error, "value IR indirect selector definition does not dominate its use");
+		}
+	}
 	return true;
 }
 
@@ -472,8 +579,7 @@ std::string ValueProgramToString(const ValueProgram& program) {
 		}
 	};
 
-	std::string text =
-	    fmt::format("mode={}\n", program.dispatcher_fallback ? "dispatcher" : "structured");
+	std::string text;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		text += fmt::format("Block ${} pc=0x{:08x}..0x{:08x}\n", block_index,
 		                    program.block_info[block_index].start_pc,

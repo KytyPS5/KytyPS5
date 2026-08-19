@@ -380,18 +380,18 @@ struct ValueEmitContext {
 	const IR::MemoryInfo& Memory(const IR::Inst& inst) const;
 	const IR::ExportInfo& Export(const IR::Inst& inst) const;
 	uint32_t              Label(const IR::Block* block) const;
-	size_t                BlockIndex(const IR::Block* block) const;
 	void                  Fail(const IR::Inst& inst, const char* reason);
 
-	EmitterState&                                        state;
-	const IR::ValueProgram&                              program;
-	std::unordered_map<const IR::Inst*, uint32_t>        definitions;
-	std::unordered_map<const IR::Block*, uint32_t>       labels;
-	const std::unordered_map<const IR::Inst*, uint32_t>* dispatcher_spills    = nullptr;
-	const IR::Block*                                     current_block        = nullptr;
-	uint32_t                                             scratch_u32_variable = 0;
-	bool                                                 failed               = false;
-	std::string                                          error;
+	EmitterState&                                                      state;
+	const IR::ValueProgram&                                            program;
+	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
+	std::unordered_map<const IR::Block*, uint32_t>                     labels;
+	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
+	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
+	const IR::Block*                                                   current_block = nullptr;
+	uint32_t                                                           scratch_u32_variable = 0;
+	bool                                                               failed               = false;
+	std::string                                                        error;
 };
 
 enum class VertexInputScalarKind { Float, Sint, Uint };

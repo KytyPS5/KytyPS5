@@ -36,24 +36,9 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	EmitKillIfBoolFalse(state, active);
 }
 
-uint32_t SpillPointerType(EmitterState& state, IR::Type type) {
-	switch (type) {
-		case IR::Type::U1: return TypePointer(state, StorageClassFunction, TypeBool(state));
-		case IR::Type::U8:
-		case IR::Type::U16:
-		case IR::Type::U32:
-		case IR::Type::F16: return TypePointer(state, StorageClassFunction, TypeU32(state));
-		case IR::Type::F32: return TypePointer(state, StorageClassFunction, TypeF32(state));
-		case IR::Type::U64: return TypePointer(state, StorageClassFunction, TypeU64(state));
-		case IR::Type::U32x2: return TypePointer(state, StorageClassFunction, TypeU32Pair(state));
-		case IR::Type::U32x3:
-			return TypePointer(state, StorageClassFunction, TypeU32Vector(state, 3));
-		case IR::Type::U32x4:
-			return TypePointer(state, StorageClassFunction, TypeU32Vector(state, 4));
-		case IR::Type::F32x2:
-			return TypePointer(state, StorageClassFunction, TypeF32Vector(state, 2));
-		default: return 0;
-	}
+uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
+	const auto value_type = ctx.TypeId(type);
+	return value_type == 0 ? 0 : TypePointer(ctx.state, StorageClassFunction, value_type);
 }
 
 struct DeferredPhiPatch {
@@ -68,10 +53,8 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::unordered_map<const IR::Inst*, uint32_t> spills;
-	uint32_t                                      pc_variable        = 0;
 	uint32_t                                      header_label       = 0;
 	uint32_t                                      select_label       = 0;
-	uint32_t                                      default_label      = 0;
 	uint32_t                                      after_switch_label = 0;
 	uint32_t                                      continue_label     = 0;
 	uint32_t                                      merge_label        = 0;
@@ -166,16 +149,13 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 	}
 }
 
-void EmitDispatcherTerminator(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                              const IR::Block* block, const IR::ValueBlockInfo& info,
-                              uint32_t exit_label) {
+uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+                              const IR::Block* block, const IR::ValueBlockInfo& info) {
 	const auto& term = info.terminator;
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
-			ctx.state.builder.AddFunction(
-			    {OpStore, dispatcher.pc_variable, ConstantU32(ctx.state, term.true_block)});
-			break;
+			return ConstantU32(ctx.state, term.true_block);
 		case CFG::TerminatorKind::ConditionalBranch: {
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
@@ -184,14 +164,10 @@ void EmitDispatcherTerminator(ValueEmitContext& ctx, const DispatcherFunctionSta
 			                               ctx.Def(info.condition),
 			                               ConstantU32(ctx.state, term.true_block),
 			                               ConstantU32(ctx.state, term.false_block)});
-			ctx.state.builder.AddFunction({OpStore, dispatcher.pc_variable, selected});
-			break;
+			return selected;
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
 			for (const auto target: term.indirect_targets) {
-				EmitDispatcherTarget(ctx, dispatcher, block, target);
-			}
-			for (const auto target: term.indirect_selector_targets) {
 				EmitDispatcherTarget(ctx, dispatcher, block, target);
 			}
 			uint32_t selected = ConstantU32(ctx.state, UINT32_MAX);
@@ -214,15 +190,10 @@ void EmitDispatcherTerminator(ValueEmitContext& ctx, const DispatcherFunctionSta
 					selected = next;
 				}
 			}
-			ctx.state.builder.AddFunction({OpStore, dispatcher.pc_variable, selected});
-			break;
+			return selected;
 		}
-		default:
-			ctx.state.builder.AddFunction(
-			    {OpStore, dispatcher.pc_variable, ConstantU32(ctx.state, UINT32_MAX)});
-			break;
+		default: return ConstantU32(ctx.state, UINT32_MAX);
 	}
-	ctx.state.builder.AddFunction({OpBranch, exit_label});
 }
 
 bool EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -346,12 +317,16 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	if (ctx.failed) {
 		return;
 	}
-	EmitDispatcherTerminator(ctx, dispatcher, entry, ctx.program.block_info.front(),
-	                         dispatcher.header_label);
+	const auto initial_pc =
+	    EmitDispatcherNextPc(ctx, dispatcher, entry, ctx.program.block_info.front());
+	const auto initial_parent = state.current_label;
+	state.builder.AddFunction({OpBranch, dispatcher.header_label});
 
 	EmitLabel(state, dispatcher.header_label);
-	const auto pc = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, TypeU32(state), pc, dispatcher.pc_variable});
+	const auto pc      = state.builder.AllocateId();
+	const auto next_pc = state.builder.AllocateId();
+	state.builder.AddFunction({OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
+	                           dispatcher.continue_label});
 	const auto done = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpIEqual, TypeBool(state), done, pc, ConstantU32(ctx.state, UINT32_MAX)});
@@ -363,16 +338,14 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	EmitLabel(state, dispatcher.select_label);
 	state.builder.AddFunction(
 	    {OpSelectionMerge, dispatcher.after_switch_label, SelectionControlNone});
-	std::vector<uint32_t> words {OpSwitch, pc, dispatcher.default_label};
+	std::vector<uint32_t> words {OpSwitch, pc, dispatcher.after_switch_label};
 	for (size_t index = 1; index < ctx.program.blocks.size(); index++) {
 		words.push_back(ctx.program.block_info[index].id);
 		words.push_back(ctx.Label(ctx.program.blocks[index]));
 	}
 	state.builder.AddFunction(words);
-	EmitLabel(state, dispatcher.default_label);
-	state.builder.AddFunction(
-	    {OpStore, dispatcher.pc_variable, ConstantU32(ctx.state, UINT32_MAX)});
-	state.builder.AddFunction({OpBranch, dispatcher.after_switch_label});
+	std::vector<uint32_t> next_pc_words {OpPhi, TypeU32(state), next_pc,
+	                                     ConstantU32(state, UINT32_MAX), dispatcher.select_label};
 
 	for (size_t index = 1; index < ctx.program.blocks.size() && !ctx.failed; index++) {
 		EmitBlock(ctx, ctx.program.blocks[index], [&](const IR::Inst& inst) {
@@ -381,13 +354,17 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		if (ctx.failed) {
 			break;
 		}
-		EmitDispatcherTerminator(ctx, dispatcher, ctx.program.blocks[index],
-		                         ctx.program.block_info[index], dispatcher.after_switch_label);
+		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, ctx.program.blocks[index],
+		                                           ctx.program.block_info[index]);
+		next_pc_words.push_back(selected);
+		next_pc_words.push_back(state.current_label);
+		state.builder.AddFunction({OpBranch, dispatcher.after_switch_label});
 	}
 	if (ctx.failed) {
 		return;
 	}
 	EmitLabel(state, dispatcher.after_switch_label);
+	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction({OpBranch, dispatcher.continue_label});
 	EmitLabel(state, dispatcher.continue_label);
 	state.builder.AddFunction({OpBranch, dispatcher.header_label});
@@ -438,8 +415,14 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	if (dispatcher_spills != nullptr && current_block != nullptr &&
 	    inst->Parent() != current_block) {
 		if (const auto found = dispatcher_spills->find(inst); found != dispatcher_spills->end()) {
+			if (const auto loaded = dispatcher_block_loads.find(inst);
+			    loaded != dispatcher_block_loads.end() &&
+			    loaded->second.first == state.current_label) {
+				return loaded->second.second;
+			}
 			const auto id = state.builder.AllocateId();
 			state.builder.AddFunction({OpLoad, TypeId(inst->GetType()), id, found->second});
+			dispatcher_block_loads.insert_or_assign(inst, std::pair {state.current_label, id});
 			return id;
 		}
 	}
@@ -515,10 +498,6 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 	return labels.at(block);
 }
 
-size_t ValueEmitContext::BlockIndex(const IR::Block* block) const {
-	return static_cast<size_t>(std::ranges::find(program.blocks, block) - program.blocks.begin());
-}
-
 void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) {
 	failed = true;
 	error  = fmt::format("typed opcode {} {}", IR::ValueOpcodeName(inst.GetOpcode()), reason);
@@ -534,14 +513,14 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 	for (const auto* block: program.blocks) {
 		ctx.labels.emplace(block, state.builder.AllocateId());
 	}
-	if (program.dispatcher_fallback) {
+	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
 					continue;
 				}
-				if (SpillPointerType(state, inst.GetType()) == 0) {
+				if (SpillPointerType(ctx, inst.GetType()) == 0) {
 					ctx.Fail(inst, "cannot be stored by the dispatcher");
 					break;
 				}
@@ -551,10 +530,11 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
 			value                  = value.Resolve();
 			const auto* definition = value.TryInstruction();
-			if (definition == nullptr || definition->Parent() == consumer) {
+			if (definition == nullptr || definition->Parent() == consumer ||
+			    definition->Parent() == program.blocks.front()) {
 				return;
 			}
-			if (SpillPointerType(state, definition->GetType()) == 0) {
+			if (SpillPointerType(ctx, definition->GetType()) == 0) {
 				ctx.Fail(*definition, "cannot be stored by the dispatcher");
 				return;
 			}
@@ -575,10 +555,8 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 			mark_cross_block(program.block_info[index].condition, program.blocks[index]);
 			mark_cross_block(program.block_info[index].indirect_target, program.blocks[index]);
 		}
-		dispatch.pc_variable        = state.builder.AllocateId();
 		dispatch.header_label       = state.builder.AllocateId();
 		dispatch.select_label       = state.builder.AllocateId();
-		dispatch.default_label      = state.builder.AllocateId();
 		dispatch.after_switch_label = state.builder.AllocateId();
 		dispatch.continue_label     = state.builder.AllocateId();
 		dispatch.merge_label        = state.builder.AllocateId();
@@ -610,15 +588,12 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           state.pixel_valid_mask_variable, StorageClassFunction});
 	}
-	if (program.dispatcher_fallback) {
-		state.builder.AddFunction({OpVariable,
-		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
-		                           dispatcher->pc_variable, StorageClassFunction});
+	if (state.program.dispatcher_fallback) {
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (const auto found = dispatcher->spills.find(&inst);
 				    found != dispatcher->spills.end()) {
-					state.builder.AddFunction({OpVariable, SpillPointerType(state, inst.GetType()),
+					state.builder.AddFunction({OpVariable, SpillPointerType(ctx, inst.GetType()),
 					                           found->second, StorageClassFunction});
 				}
 			}
@@ -641,7 +616,7 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 	EmitStorageBufferOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
-	} else if (program.dispatcher_fallback) {
+	} else if (state.program.dispatcher_fallback) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {
 		EmitStructuredFunction(ctx);

@@ -7854,7 +7854,7 @@ void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher() {
+void TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry() {
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),    // entry -> header, skipping unreachable entry
       EncodeSopp(0x02, 2),    // unreachable entry -> shared selection arm
@@ -7874,24 +7874,22 @@ void TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher() {
         error.c_str());
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(!ShaderRecompiler::CFG::Structurize(graph, &error) &&
-            Common::ContainsStr(error, "externally entered region block"),
-        "improper externally-entered selection was accepted as structured");
+  Check(original_coverage[1] == 0u,
+        "CFG retained an unreachable external selection entry");
+  Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
-        "externally-entered selection handling duplicated semantic code");
+        "selection structurization changed reachable semantic code");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   ShaderRecompiler::CompileResult result;
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
-  Check(result.program.dispatcher_fallback &&
-            Common::ContainsStr(result.ir_dump,
-                                "externally entered region block"),
-        "improper externally-entered selection lost its dispatcher reason");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0u,
-        "externally-entered selection dispatcher lacks OpSwitch");
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "unreachable selection entry still forced dispatcher mode");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7937,16 +7935,38 @@ void TestNewShaderRecompilerDispatcherSpillsU32x3() {
   std::string error;
   Check(TryRecompile(shader, options, result, &error), error.c_str());
   Check(result.program.dispatcher_fallback &&
-            result.program.values->blocks.size() >= 2u,
+            result.program.values->blocks.size() >= 3u,
         "U32x3 spill fixture did not select dispatcher mode");
+  const auto before = MeasureSpirv(result.spirv);
+  {
+    auto prologue_program = result.program;
+    IR::IREmitter definition(prologue_program.values->blocks[0]);
+    const auto vector =
+        definition.Emit(IR::ValueOpcode::CompositeConstructU32x3,
+                        {IR::Value(1u), IR::Value(2u), IR::Value(3u)});
+    IR::IREmitter use(prologue_program.values->blocks[1]);
+    use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(2u)});
+    Check(Spirv::AnalyzeProgramRequirements(prologue_program, &error),
+          error.c_str());
+    std::vector<uint32_t> spirv;
+    Check(Spirv::EmitProgram(prologue_program, result.resources,
+                             options.input_info, spirv, &error),
+          error.c_str());
+    CheckSpirvBinaryValidates(spirv);
+    const auto after = MeasureSpirv(spirv);
+    Check(after.function_variables == before.function_variables &&
+              after.loads == before.loads && after.stores == before.stores,
+          "dispatcher spilled a value defined by its dominating prologue");
+  }
 
   auto program = result.program;
-  IR::IREmitter definition(program.values->blocks[0]);
+  IR::IREmitter definition(program.values->blocks[1]);
   const auto vector =
       definition.Emit(IR::ValueOpcode::CompositeConstructU32x3,
                       {IR::Value(1u), IR::Value(2u), IR::Value(3u)});
-  IR::IREmitter use(program.values->blocks[1]);
+  IR::IREmitter use(program.values->blocks[2]);
   use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(2u)});
+  use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(1u)});
   Check(Spirv::AnalyzeProgramRequirements(program, &error), error.c_str());
 
   std::vector<uint32_t> spirv;
@@ -7954,7 +7974,6 @@ void TestNewShaderRecompilerDispatcherSpillsU32x3() {
                            &error),
         error.c_str());
   CheckSpirvBinaryValidates(spirv);
-  const auto before = MeasureSpirv(result.spirv);
   const auto after = MeasureSpirv(spirv);
   Check(after.function_variables == before.function_variables + 1u &&
             after.loads == before.loads + 1u &&
@@ -8025,13 +8044,13 @@ void TestNewShaderRecompilerU64PairLowering() {
   Check(TryRecompile(dispatcher_shader, options, result, &error),
         error.c_str());
   Check(result.program.dispatcher_fallback &&
-            result.program.values->blocks.size() >= 2u,
+            result.program.values->blocks.size() >= 3u,
         "U64 spill fixture did not select dispatcher mode");
   program = result.program;
-  IR::IREmitter definition(program.values->blocks[0]);
+  IR::IREmitter definition(program.values->blocks[1]);
   const auto vector = definition.Emit(IR::ValueOpcode::CompositeConstructU64,
                                       {IR::Value(1u), IR::Value(2u)});
-  IR::IREmitter use(program.values->blocks[1]);
+  IR::IREmitter use(program.values->blocks[2]);
   use.Emit(IR::ValueOpcode::CompositeExtractU64, {vector, IR::Value(1u)});
   Check(Spirv::AnalyzeProgramRequirements(program, &error), error.c_str());
   spirv.clear();
@@ -8262,8 +8281,62 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerPrunesUnreachableSetpcMetadata() {
+  const uint32_t shader[] = {
+      EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
+      EncodeSop2(0x1e, 0, 0, 131), // s_lshl_b32 s0, s0, 3
+      EncodeSop1(0x1f, 8, 0),      // s_getpc_b64 s[8:9]
+      EncodeSop2(0x00, 8, 8, 255), // s_add_u32 s8, s8, literal
+      0x0000003cu,
+      EncodeSop2(0x04, 9, 9, 128), // s_addc_u32 s9, s9, 0
+      EncodeSmem0(0x01, 4, 4),
+      0u,                  // reachable s_load_dwordx2 s[4:5]
+      EncodeSopp(0x02, 5), // skip the otherwise valid jump-table dispatch
+      EncodeSopp(0x0c, 0), // unreachable s_waitcnt 0
+      EncodeSop1(0x1f, 10, 0),
+      EncodeSop2(0x00, 10, 10, 4),
+      EncodeSop2(0x04, 11, 11, 5),
+      EncodeSop1(0x20, 0, 10), // unreachable s_setpc_b64 s[10:11]
+      EncodeSMovB32(1, 4),     // reachable use of the loaded s4
+      EncodeSopp(0x02, 1),
+      EncodeSMovB32(2, 129),
+      EncodeSopp(0x01, 0),
+      0x0000000cu,
+      0x00000000u,
+      0x00000014u,
+      0x00000000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  Check(!graph.irreducible && graph.code_table_load_pcs.empty(),
+        "unreachable S_SETPC retained jump-table metadata or dispatcher mode");
+
+  ShaderRecompiler::IR::Program ir;
+  Check(ShaderRecompiler::IR::LowerProgram(decoded, graph, ShaderType::Compute,
+                                           64u, ir, &error),
+        error.c_str());
+  const auto scalar_loads =
+      std::ranges::count_if(ir.blocks, [](const auto &block) {
+        return std::ranges::any_of(block.instructions, [](const auto &inst) {
+          return inst.op == ShaderRecompiler::IR::Opcode::SLoadDword &&
+                 inst.pc == 0x18u;
+        });
+      });
+  Check(scalar_loads == 1u,
+        "unreachable S_SETPC metadata suppressed a reachable scalar load");
+}
+
 void TestNewShaderRecompilerSetpcDwordJumpTable() {
   const uint32_t shader[] = {
+      EncodeSopp(0x02, 1),             // skip one unreachable block
+      EncodeSMovB32(100, 129),         // unreachable
       EncodeSop2(0x07, 106, 0, 130),   // s_min_u32 vcc_lo, s0, 2
       EncodeSop2(0x1e, 106, 106, 130), // s_lshl_b32 vcc_lo, vcc_lo, 2
       EncodeSop1(0x1f, 4, 0),          // s_getpc_b64 s[4:5]
@@ -8311,13 +8384,16 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   Check(jump != result.program.values->block_info.end() &&
             jump->terminator.indirect_targets.size() == 2 &&
             jump->terminator.indirect_target_pcs ==
-                std::vector<uint32_t>({0x30u, 0x38u}) &&
+                std::vector<uint32_t>({0x38u, 0x40u}) &&
             jump->terminator.indirect_selector_values ==
                 std::vector<uint32_t>({0u, 4u, 8u}) &&
             jump->terminator.indirect_selector_targets.size() == 3 &&
-            block_pc(jump->terminator.indirect_selector_targets[0]) == 0x30u &&
-            block_pc(jump->terminator.indirect_selector_targets[1]) == 0x38u &&
-            block_pc(jump->terminator.indirect_selector_targets[2]) == 0x30u,
+            block_pc(jump->terminator.indirect_selector_targets[0]) == 0x38u &&
+            block_pc(jump->terminator.indirect_selector_targets[1]) == 0x40u &&
+            block_pc(jump->terminator.indirect_selector_targets[2]) == 0x38u &&
+            std::ranges::none_of(
+                result.program.values->block_info,
+                [](const auto &info) { return info.start_pc == 0x04u; }),
         "subtractive S_SETPC_B64 table targets or selector mapping changed");
   Check(!Common::ContainsStr(result.ir_dump, "SLoadDword"),
         "subtractive S_SETPC_B64 table load reached normal IR");
@@ -8689,6 +8765,210 @@ void TestValuePhiValidation() {
   };
   validate_cfg(true);
   validate_cfg(false);
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 2; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[1].terminator.true_block = 0;
+    program.blocks[0]->AddBranch(program.blocks[1]);
+    program.blocks[1]->AddBranch(program.blocks[0]);
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "entry block has a predecessor"),
+          "value IR accepted a backedge to its synthetic entry block");
+  }
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 3; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    auto &indirect = program.block_info[1];
+    indirect.terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::IndirectBranch;
+    indirect.terminator.indirect_targets = {1};
+    indirect.terminator.indirect_selector_values = {0};
+    indirect.terminator.indirect_selector_targets = {2};
+    indirect.indirect_target = Value(0u);
+    program.blocks[0]->AddBranch(program.blocks[1]);
+    program.blocks[1]->AddBranch(program.blocks[1]);
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error,
+                                  "selector target is not a CFG successor"),
+          "value IR accepted an indirect selector target outside its target "
+          "set");
+  }
+  {
+    ValueProgram program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    program.block_info.push_back({.id = UINT32_MAX});
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "reserved exit id"),
+          "value IR accepted the dispatcher exit sentinel as a block id");
+  }
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 2; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    auto &indirect = program.block_info[1];
+    indirect.terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::IndirectBranch;
+    indirect.terminator.indirect_targets = {1, 1};
+    indirect.indirect_target = Value(0u);
+    program.blocks[0]->AddBranch(program.blocks[1]);
+    program.blocks[1]->AddBranch(program.blocks[1]);
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "target is duplicated"),
+          "value IR accepted duplicate indirect branch targets");
+  }
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 2; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "unreachable block"),
+          "value IR accepted an unreachable block");
+  }
+  {
+    ValueProgram program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.block_info.push_back({.id = 0});
+    auto &use =
+        block->AppendNewInst(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
+    auto &definition =
+        block->AppendNewInst(ValueOpcode::IAdd32, {Value(3u), Value(4u)});
+    use.SetArg(0, Value(&definition));
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "same-block definition"),
+          "value IR accepted a same-block forward use");
+  }
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 4; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[0].terminator.false_block = 2;
+    program.block_info[0].condition = Value(true);
+    for (uint32_t id : {1u, 2u}) {
+      program.block_info[id].terminator.kind =
+          ShaderRecompiler::CFG::TerminatorKind::Branch;
+      program.block_info[id].terminator.true_block = 3;
+    }
+    program.blocks[0]->AddBranch(program.blocks[1]);
+    program.blocks[0]->AddBranch(program.blocks[2]);
+    program.blocks[1]->AddBranch(program.blocks[3]);
+    program.blocks[2]->AddBranch(program.blocks[3]);
+    auto &definition = program.blocks[1]->AppendNewInst(ValueOpcode::IAdd32,
+                                                        {Value(1u), Value(2u)});
+    program.blocks[2]->AppendNewInst(ValueOpcode::IAdd32,
+                                     {Value(&definition), Value(3u)});
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "does not dominate its use"),
+          "value IR accepted a non-dominating ordinary definition");
+  }
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 4; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[0].terminator.false_block = 2;
+    program.block_info[0].condition = Value(true);
+    for (uint32_t id : {1u, 2u}) {
+      program.block_info[id].terminator.kind =
+          ShaderRecompiler::CFG::TerminatorKind::Branch;
+      program.block_info[id].terminator.true_block = 3;
+    }
+    program.blocks[0]->AddBranch(program.blocks[1]);
+    program.blocks[0]->AddBranch(program.blocks[2]);
+    program.blocks[1]->AddBranch(program.blocks[3]);
+    program.blocks[2]->AddBranch(program.blocks[3]);
+    auto &definition = program.blocks[1]->AppendNewInst(ValueOpcode::IAdd32,
+                                                        {Value(1u), Value(2u)});
+    auto &phi = program.blocks[3]->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(program.blocks[1], Value(3u));
+    phi.AddPhiOperand(program.blocks[2], Value(&definition));
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "does not dominate its edge"),
+          "value IR accepted an unavailable Phi-edge definition");
+  }
+  {
+    ValueProgram program;
+    for (uint32_t id = 0; id < 5; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[0].terminator.false_block = 2;
+    program.block_info[0].condition = Value(true);
+    program.block_info[1].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[1].terminator.true_block = 3;
+    program.block_info[2].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[2].terminator.true_block = 3;
+    program.block_info[2].terminator.false_block = 4;
+    program.block_info[3].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[3].terminator.true_block = 4;
+    program.blocks[0]->AddBranch(program.blocks[1]);
+    program.blocks[0]->AddBranch(program.blocks[2]);
+    program.blocks[1]->AddBranch(program.blocks[3]);
+    program.blocks[2]->AddBranch(program.blocks[3]);
+    program.blocks[2]->AddBranch(program.blocks[4]);
+    program.blocks[3]->AddBranch(program.blocks[4]);
+    auto &condition = program.blocks[1]->AppendNewInst(ValueOpcode::IEqual32,
+                                                       {Value(1u), Value(2u)});
+    program.block_info[2].condition = Value(&condition);
+    std::string error;
+    Check(!ValidateValueProgram(program, true, &error) &&
+              Common::ContainsStr(error, "branch condition definition"),
+          "value IR accepted a non-dominating branch condition");
+  }
 }
 
 void TestWqmConstantPropagation() {
@@ -10996,23 +11276,25 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 258,
-                                          .instructions = 78,
-                                          .variables = 4,
-                                          .function_variables = 4,
-                                          .loads = 4,
-                                          .stores = 14,
-                                          .labels = 14,
+                                         {.words = 242,
+                                          .instructions = 67,
+                                          .variables = 3,
+                                          .function_variables = 3,
+                                          .loads = 3,
+                                          .stores = 6,
+                                          .phis = 2,
+                                          .labels = 13,
                                           .loop_merges = 1,
                                           .selection_merges = 1,
-                                          .branches = 11,
+                                          .branches = 10,
                                           .conditional_branches = 1,
                                           .switches = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
             Common::ContainsStr(dispatcher_result.ir_dump, "Phi") &&
-            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 0u &&
+            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 2u &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
-        "dispatcher size fixture no longer exercises whole-function dispatch");
+        "dispatcher size fixture lost its two control Phis or switch");
+  CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
 } // namespace
@@ -11078,7 +11360,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
-  TestNewShaderRecompilerCfgExternallyEnteredSelectionDispatcher();
+  TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerU64PairLowering();
@@ -11089,6 +11371,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestNewShaderRecompilerSetpcJumpTable();
+  TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
   TestTypedEntryStateIsMinimal();
   TestWqmConstantPropagation();

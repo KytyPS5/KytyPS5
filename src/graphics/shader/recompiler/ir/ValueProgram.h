@@ -65,7 +65,6 @@ struct ValueProgram {
 	std::vector<DescriptorSource> descriptor_sources;
 	std::vector<SrtRead>          srt_reads;
 	std::vector<Value>            dynamic_reads;
-	bool                          dispatcher_fallback = false;
 };
 
 bool        ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::string* error);

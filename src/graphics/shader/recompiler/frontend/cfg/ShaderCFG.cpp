@@ -682,6 +682,66 @@ void RebuildPredecessors(Graph& graph) {
 	}
 }
 
+void PruneUnreachableBlocks(Graph& graph) {
+	if (graph.entry_block >= graph.blocks.size()) {
+		return;
+	}
+
+	std::vector<bool>     reachable(graph.blocks.size(), false);
+	std::vector<uint32_t> pending {graph.entry_block};
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (block_id >= graph.blocks.size() || reachable[block_id]) {
+			continue;
+		}
+		reachable[block_id] = true;
+		for (const auto successor: graph.blocks[block_id].successors) {
+			pending.push_back(successor);
+		}
+	}
+	if (std::ranges::all_of(reachable, [](bool value) { return value; })) {
+		return;
+	}
+
+	std::vector<uint32_t>   id_map(graph.blocks.size(), UINT32_MAX);
+	std::vector<BasicBlock> blocks;
+	blocks.reserve(std::ranges::count(reachable, true));
+	for (uint32_t old_id = 0; old_id < graph.blocks.size(); old_id++) {
+		if (!reachable[old_id]) {
+			continue;
+		}
+		id_map[old_id] = static_cast<uint32_t>(blocks.size());
+		blocks.push_back(std::move(graph.blocks[old_id]));
+	}
+
+	graph.entry_block   = RemapId(graph.entry_block, id_map);
+	graph.failure_block = RemapId(graph.failure_block, id_map);
+	graph.blocks        = std::move(blocks);
+	for (auto& block: graph.blocks) {
+		block.id = RemapId(block.id, id_map);
+		RemapIds(block.successors, id_map);
+		block.predecessors.clear();
+		block.dominators.clear();
+		block.post_dominators.clear();
+		auto& terminator          = block.terminator;
+		terminator.true_block     = RemapId(terminator.true_block, id_map);
+		terminator.false_block    = RemapId(terminator.false_block, id_map);
+		terminator.merge_block    = RemapId(terminator.merge_block, id_map);
+		terminator.continue_block = RemapId(terminator.continue_block, id_map);
+		for (auto& target: terminator.indirect_targets) {
+			target = RemapId(target, id_map);
+		}
+		for (auto& target: terminator.indirect_selector_targets) {
+			target = RemapId(target, id_map);
+		}
+	}
+	graph.back_edges.clear();
+	graph.natural_loops.clear();
+	graph.components.clear();
+	RebuildPredecessors(graph);
+}
+
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
@@ -1820,7 +1880,6 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 	labels.insert(end_pc);
 
 	std::map<uint32_t, SetpcTargetInfo> setpc_targets;
-	bool                                indirect_setpc = false;
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
@@ -1857,7 +1916,6 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 				}
 				labels.insert(target);
 			}
-			indirect_setpc = indirect_setpc || target_info.indirect;
 			setpc_targets.emplace(inst.pc, std::move(target_info));
 			if (next_pc <= end_pc) {
 				labels.insert(next_pc);
@@ -1935,9 +1993,6 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 					block.terminator.indirect_selector_targets.push_back(
 					    pc_to_block.at(target_info.selector_target_pcs[i]));
 				}
-				if (target_info.table_load_pc != UINT32_MAX) {
-					AddUnique(graph.code_table_load_pcs, target_info.table_load_pc);
-				}
 			} else {
 				block.terminator.kind       = TerminatorKind::Branch;
 				block.terminator.condition  = BranchCondition::Always;
@@ -1997,6 +2052,22 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 	}
 	for (auto& block: graph.blocks) {
 		SortUnique(block.predecessors);
+	}
+	PruneUnreachableBlocks(graph);
+	graph.code_table_load_pcs.clear();
+	bool indirect_setpc = false;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::IndirectBranch) {
+			continue;
+		}
+		indirect_setpc = true;
+		if (block.inst_begin >= block.inst_end || block.inst_end > program.instructions.size()) {
+			continue;
+		}
+		const auto found = setpc_targets.find(program.instructions[block.inst_end - 1u].pc);
+		if (found != setpc_targets.end() && found->second.table_load_pc != UINT32_MAX) {
+			AddUnique(graph.code_table_load_pcs, found->second.table_load_pc);
+		}
 	}
 	SortUnique(graph.code_table_load_pcs);
 

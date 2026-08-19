@@ -758,7 +758,6 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
                       const ShaderPixelInputInfo*   pixel_input_info,
                       const ShaderComputeInputInfo* compute_input_info, std::string* error) {
 	result                          = {};
-	result.dispatcher_fallback      = source.dispatcher_fallback;
 	const uint32_t wave_size        = source.wave_size;
 	const bool per_invocation_masks = source.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
 	uint32_t   vector_limit         = 1u;

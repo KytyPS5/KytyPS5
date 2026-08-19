@@ -170,10 +170,9 @@ bool Translator::TranslateMove(const IR::Instruction& inst) {
 			return true;
 		}
 		case IR::Opcode::WqmB64: {
-			if (!current_per_invocation_masks && inst.dst.kind == IR::OperandKind::Register &&
-			    inst.dst.reg.file == IR::RegisterFile::Scalar) {
-				const auto result =
-				    ExpandWholeQuadMask(IR::U64(ReadOperand(inst.src[0], IR::Type::U64)));
+			if (!current_per_invocation_masks) {
+				const auto result = IR::U64(ir.Emit(
+				    IR::ValueOpcode::WqmU64, {ReadOperand(inst.src[0], IR::Type::U64)}));
 				WriteOperand(inst.dst, result);
 				ir.SetScc(IR::U1(
 				    ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));

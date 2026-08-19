@@ -304,6 +304,13 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				return Fail(error, fmt::format("untyped opcode {} survived translation",
 				                               ValueOpcodeName(inst.GetOpcode())));
 			}
+			const bool fixed_signature =
+			    inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity;
+			if (fixed_signature && inst.NumArgs() != NumArgsOf(inst.GetOpcode())) {
+				return Fail(error, fmt::format("{} has {} arguments, expected {}",
+				                               ValueOpcodeName(inst.GetOpcode()), inst.NumArgs(),
+				                               NumArgsOf(inst.GetOpcode())));
+			}
 			const auto buffer_components = BufferComponentCount(inst.GetOpcode());
 			if (buffer_components != 0u) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
@@ -349,6 +356,12 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				if (arg.IsEmpty()) {
 					return Fail(error, fmt::format("{} has an empty argument",
 					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				if (fixed_signature && arg.GetType() != ArgTypeOf(inst.GetOpcode(), arg_index)) {
+					return Fail(error, fmt::format("{} argument {} has type {}, expected {}",
+					                               ValueOpcodeName(inst.GetOpcode()), arg_index,
+					                               TypeName(arg.GetType()),
+					                               TypeName(ArgTypeOf(inst.GetOpcode(), arg_index))));
 				}
 				if (const auto* definition = arg.TryInstruction();
 				    definition != nullptr && !instructions.contains(definition)) {

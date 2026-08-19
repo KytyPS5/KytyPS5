@@ -34,7 +34,6 @@ private:
 	IR::Value              ReadOperand(const IR::Operand& operand, IR::Type type);
 	IR::U1                 ThreadBit(IR::U32 low, IR::U32 high);
 	void                   WriteRawU32(const IR::Operand& operand, IR::U32 value);
-	IR::U64                ExpandWholeQuadMask(IR::U64 value);
 	IR::F32                ApplyF32ResultModifiers(const IR::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const IR::Operand& operand, IR::Value value);
 	IR::U32                PackHalf2x16(IR::F32 low, IR::F32 high);

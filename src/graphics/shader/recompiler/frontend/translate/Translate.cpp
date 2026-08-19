@@ -310,21 +310,6 @@ void Translator::WriteRawU32(const IR::Operand& operand, IR::U32 value) {
 	}
 }
 
-IR::U64 Translator::ExpandWholeQuadMask(IR::U64 value) {
-	const auto shifted1 =
-	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {value, IR::Value(1u)}));
-	const auto shifted2 =
-	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {value, IR::Value(2u)}));
-	const auto shifted3 =
-	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {value, IR::Value(3u)}));
-	const auto merged1 = ir.Emit(IR::ValueOpcode::BitwiseOr64, {value, shifted1});
-	const auto merged2 = ir.Emit(IR::ValueOpcode::BitwiseOr64, {merged1, shifted2});
-	const auto merged3 = ir.Emit(IR::ValueOpcode::BitwiseOr64, {merged2, shifted3});
-	const auto low_bits =
-	    ir.Emit(IR::ValueOpcode::BitwiseAnd64, {merged3, IR::Value(uint64_t {0x1111111111111111})});
-	return IR::U64(ir.Emit(IR::ValueOpcode::IMul64, {low_bits, IR::Value(uint64_t {0xfull})}));
-}
-
 IR::F32 Translator::ApplyF32ResultModifiers(const IR::Operand& operand, IR::F32 value) {
 	if (operand.omod != 0u) {
 		float multiplier = 0.5f;

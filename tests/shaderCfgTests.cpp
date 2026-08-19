@@ -8503,6 +8503,53 @@ void TestValuePhiValidation() {
   validate_cfg(false);
 }
 
+void TestWqmConstantPropagation() {
+  using namespace ShaderRecompiler::IR;
+
+  ValueProgram program;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  program.block_info.emplace_back();
+  IREmitter ir(program.blocks.front());
+
+  constexpr std::array cases = {
+      std::pair{uint64_t{0}, uint64_t{0}},
+      std::pair{uint64_t{1}, uint64_t{0xfull}},
+      std::pair{uint64_t{1} << 31u, uint64_t{0xf} << 28u},
+      std::pair{uint64_t{1} << 32u, uint64_t{0xf} << 32u},
+      std::pair{uint64_t{0x8000001180000001ull},
+                uint64_t{0xf00000fff000000full}},
+  };
+  std::array<Value, cases.size()> results;
+  for (size_t index = 0; index < cases.size(); index++) {
+    results[index] = ir.Emit(ValueOpcode::WqmU64, {Value(cases[index].first)});
+  }
+
+  ConstantPropagationPass(program.blocks);
+  for (size_t index = 0; index < cases.size(); index++) {
+    const auto value = results[index].Resolve();
+    Check(value.IsImmediate() && value.GetType() == Type::U64 &&
+              value.U64() == cases[index].second,
+          "WqmU64 constant propagation crossed a quad or dword boundary");
+  }
+
+  const auto check_invalid_signature = [](ValueOpcode opcode, Value valid, Value invalid) {
+    ValueProgram malformed;
+    malformed.block_storage.push_back(std::make_unique<Block>());
+    malformed.blocks.push_back(malformed.block_storage.back().get());
+    malformed.block_info.emplace_back();
+    IREmitter malformed_ir(malformed.blocks.front());
+    auto value = malformed_ir.Emit(opcode, {valid});
+    value.TryInstruction()->SetArg(0, invalid);
+    std::string error;
+    Check(!ValidateValueProgram(malformed, false, &error) &&
+              Common::ContainsStr(error, "argument 0 has type"),
+          "value IR accepted a WQM operand that violates opcode metadata");
+  };
+  check_invalid_signature(ValueOpcode::WqmU64, Value(uint64_t{1}), Value(true));
+  check_invalid_signature(ValueOpcode::WqmMask, Value(true), Value(uint64_t{1}));
+}
+
 void TestNativeWideValueValidation() {
   using namespace ShaderRecompiler::IR;
 
@@ -8738,6 +8785,55 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   Check(Common::ContainsStr(wqm_source, "OpCapability GroupNonUniformBallot") &&
             Common::ContainsStr(wqm_source, "OpGroupNonUniformBallot"),
         "per-invocation scalar WQM omitted its subgroup ballot capability");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 2u,
+        "wave64 WQM did not compact exactly two ballot words");
+
+  auto wave32_options = options;
+  wave32_options.wave_size = 32u;
+  Check(ShaderRecompiler::TryRecompile(wqm_shader, wave32_options, result,
+                                       &error),
+        error.c_str());
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
+        "wave32 WQM retained the unused high ballot-word expansion");
+
+  const uint32_t native_wqm_shader[] = {
+      EncodeSop1(0x0a, 2, 0), // s_wqm_b64 s[2:3], s[0:1]
+      EncodeVop1(0x01, 0, 2), // v_mov_b32 v0, s2
+      EncodeExp0(0x0c, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  auto native_options = options;
+  native_options.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
+  Check(ShaderRecompiler::TryRecompile(native_wqm_shader, native_options,
+                                       result, &error),
+        error.c_str());
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(Common::ContainsStr(result.ir_dump, "WqmU64") &&
+            !Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
+                                 "OpGroupNonUniformBallot"),
+        "native scalar WQM retained frontend expansion or subgroup machinery");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 2u &&
+            SpirvInstructionOpcodeCount(result.spirv, 194u) == 4u,
+        "native scalar WQM emitter was folded away or did not use the compact path");
+
+  const uint32_t native_special_wqm_shader[] = {
+      EncodeSop1(0x04, 126, 0),   // s_mov_b64 exec, s[0:1]
+      EncodeSop1(0x0a, 126, 126), // s_wqm_b64 exec, exec
+      EncodeSop1(0x04, 106, 0),   // s_mov_b64 vcc, s[0:1]
+      EncodeSop1(0x0a, 106, 106), // s_wqm_b64 vcc, vcc
+      EncodeVop1(0x01, 0, 126),   // v_mov_b32 v0, exec_lo
+      EncodeVop1(0x01, 1, 106),   // v_mov_b32 v1, vcc_lo
+      EncodeExp0(0x0c, 0x3), EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01),
+  };
+  Check(ShaderRecompiler::TryRecompile(native_special_wqm_shader,
+                                       native_options, result, &error),
+        error.c_str());
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto native_special_source = DisassembleSpirvBinary(result.spirv);
+  Check(CountSourceOccurrences(result.ir_dump, "WqmU64") == 2u &&
+            !Common::ContainsStr(native_special_source,
+                                 "OpGroupNonUniformBallot"),
+        "native EXEC/VCC WQM retained destination-dependent ballot lowering");
 
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
@@ -10408,8 +10504,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   };
   const auto wqm_result =
       compile("wqm", wqm,
-              {.words = 703,
-               .instructions = 155,
+              {.words = 407,
+               .instructions = 98,
                .variables = 4,
                .loads = 3,
                .stores = 1,
@@ -10519,6 +10615,7 @@ int main() {
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerSetpcDwordJumpTable();
   TestTypedEntryStateIsMinimal();
+  TestWqmConstantPropagation();
   TestFinalSsaRejectsRegisterStatePseudos();
   TestValuePhiValidation();
   TestNativeWideValueValidation();

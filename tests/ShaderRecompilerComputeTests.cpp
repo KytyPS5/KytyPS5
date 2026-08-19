@@ -11599,8 +11599,8 @@ TestCase ScalarShiftAddAndMaskOps() {
   AppendSMovLiteral(&code, 8, 0xffffffffu);
   code.push_back(EncodeSMovB32(9, InlineU32(2)));
   code.push_back(EncodeSop2(0x35, 10, 8, 9));
-  AppendSMovLiteral(&code, 12, 0x0f0f0f0fu);
-  AppendSMovLiteral(&code, 13, 0x00ff00ffu);
+  AppendSMovLiteral(&code, 12, 0x80000011u);
+  AppendSMovLiteral(&code, 13, 0x80000001u);
   code.push_back(EncodeSop1(0x08, 14, 12));
   code.push_back(EncodeSop1(0x0a, 16, 12));
 
@@ -11617,8 +11617,8 @@ TestCase ScalarShiftAddAndMaskOps() {
   return {"ScalarShiftAddAndMaskOps",
           code,
           {},
-          {7, 11, 19, 35, 0xfffffffeu, 1, 0xf0f0f0f0u, 0xff00ff00u, 0x0f0f0f0fu,
-           0x00ff00ffu},
+          {7, 11, 19, 35, 0xfffffffeu, 1, 0x7fffffeeu, 0x7ffffffeu, 0xf00000ffu,
+           0xf000000fu},
           {O::S_MOV_B32, O::S_LSHL1_ADD_U32, O::S_LSHL2_ADD_U32, O::S_LSHL3_ADD_U32,
            O::S_LSHL4_ADD_U32, O::S_ASHR_I32, O::S_MUL_HI_U32, O::S_NOT_B64, O::S_WQM_B64,
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};

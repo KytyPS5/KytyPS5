@@ -7684,6 +7684,54 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   }
 }
 
+void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // outer condition
+      EncodeSopp(0x04, 4),    // outer -> right arm or inner condition
+      EncodeSopc(0x06, 1, 1), // inner early-exit condition
+      EncodeSopp(0x04, 4),    // inner -> exit or left arm
+      EncodeSMovB32(2, 129),  // left arm
+      EncodeSopp(0x02, 1),    // left arm -> common tail
+      EncodeSMovB32(3, 129),  // right arm
+      EncodeSMovB32(4, 129),  // common tail
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "nested-tail routing changed semantic instruction coverage");
+  Check(std::ranges::count_if(graph.blocks, [](const auto &block) {
+          return block.terminator.condition ==
+                 ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+        }) == 1u &&
+            std::ranges::count_if(graph.blocks, [](const auto &block) {
+              return block.terminator.goto_value >= 0;
+            }) == 3u,
+        "nested-tail early exit did not use typed route state");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "nested-tail early exit selected dispatcher control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgLoopSharedRegion() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0),      // loop condition
@@ -11582,6 +11630,7 @@ int main() {
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
+  TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();

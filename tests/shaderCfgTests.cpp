@@ -7881,6 +7881,50 @@ void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // outer early-exit condition
+      EncodeSopp(0x04, 8),    // outer -> early exit or nested body
+      EncodeSopc(0x06, 1, 1), // nested body condition
+      EncodeSopp(0x04, 1),    // nested body -> right or left
+      EncodeSopp(0x02, 4),    // left -> body continuation
+      EncodeSopc(0x06, 2, 2), // right condition
+      EncodeSopp(0x04, 1),    // right -> join or work
+      EncodeSopp(0x02, 0),    // work -> join
+      EncodeSopp(0x02, 0),    // join -> body continuation
+      EncodeSopp(0x02, 1),    // body continuation -> shared terminal
+      EncodeSopp(0x02, 0),    // early exit -> shared terminal
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "shared-terminal structurization changed semantic instruction coverage");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured"),
+        "shared-terminal early exit selected dispatcher control flow");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "shared-terminal early exit unexpectedly used dispatcher OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry() {
   const uint32_t shader[] = {
       EncodeSopp(0x02, 1),    // entry -> header, skipping unreachable entry
@@ -11513,6 +11557,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
+  TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestNewShaderRecompilerDispatcherSpillsU32x3();

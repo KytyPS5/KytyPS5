@@ -1138,20 +1138,6 @@ bool IsLoopControlGateway(const Graph& graph, const NaturalLoop& loop, uint32_t 
 	       is_control_target(block->terminator.false_block);
 }
 
-bool HasLinearPathTo(const Graph& graph, uint32_t start, uint32_t target) {
-	std::vector<bool> visited(graph.blocks.size(), false);
-	for (auto block_id = start; block_id != target;) {
-		const auto* block = graph.FindBlock(block_id);
-		if (block == nullptr || block_id >= visited.size() || visited[block_id] ||
-		    block->successors.size() != 1) {
-			return false;
-		}
-		visited[block_id] = true;
-		block_id          = block->successors.front();
-	}
-	return true;
-}
-
 bool HasLinearPathToTerminal(const Graph& graph, uint32_t start) {
 	std::vector<bool> visited(graph.blocks.size(), false);
 	for (auto block_id = start;;) {
@@ -1213,13 +1199,6 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 		const auto  true_target  = block.terminator.true_block;
 		const auto  false_target = block.terminator.false_block;
 		if (global_block != nullptr && global_block->successors.empty()) {
-			// A terminal common post-dominator can hide the local continuation of a nested
-			// early-exit selection. Prefer that continuation as the structured merge.
-			const bool true_exits  = HasLinearPathTo(graph, true_target, global_merge);
-			const bool false_exits = HasLinearPathTo(graph, false_target, global_merge);
-			if (true_exits != false_exits) {
-				return true_exits ? false_target : true_target;
-			}
 			const bool false_reaches_true =
 			    CanReachBefore(graph, false_target, true_target, global_merge);
 			const bool true_reaches_false =
@@ -1511,7 +1490,11 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 		}
 		const auto region   = SelectionRegion(graph, *block, merge);
 		const auto external = std::find_if(region.begin(), region.end(), [&](uint32_t member) {
-			return !graph.Dominates(block_id, member);
+			const auto* member_block = graph.FindBlock(member);
+			return member_block != nullptr &&
+			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
+				       return predecessor != block_id && !Contains(region, predecessor);
+			       });
 		});
 		if (external != region.end()) {
 			SetFailure(

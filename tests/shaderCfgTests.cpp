@@ -8640,12 +8640,18 @@ void TestTypedEntryStateIsMinimal() {
     uint32_t set_exec = 0;
     uint32_t set_exec_lo = 0;
     uint32_t set_exec_hi = 0;
+    uint32_t ballots = 0;
     IR::Value exec;
     IR::Value exec_lo;
     IR::Value exec_hi;
+    const IR::Inst *ballot = nullptr;
     for (const auto *block : values.blocks) {
       for (const auto &inst : *block) {
         switch (inst.GetOpcode()) {
+        case IR::ValueOpcode::Ballot:
+          ballots++;
+          ballot = &inst;
+          break;
         case IR::ValueOpcode::SetExec:
           set_exec++;
           exec = inst.Arg(0).Resolve();
@@ -8677,14 +8683,29 @@ void TestTypedEntryStateIsMinimal() {
               exec.IsImmediate() && exec.U1(),
           "typed entry does not define EXEC exactly once");
     if (lane_mode == ShaderLaneMaskMode::PerInvocation) {
-      Check(exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
+      Check(ballots == 0u && exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
                 exec_hi.IsImmediate() && exec_hi.U32() == 0u,
             "per-invocation entry EXEC is not the local {1,0} mask");
     } else {
-      Check(exec_lo.IsImmediate() && exec_lo.U32() == 0xffffffffu &&
-                exec_hi.IsImmediate() &&
-                exec_hi.U32() == (wave_size == 32u ? 0u : 0xffffffffu),
-            "native entry EXEC does not match the guest wave width");
+      Check(ballots == 1u && !exec_lo.IsImmediate(),
+            "native compute entry EXEC does not use the active subgroup mask");
+      const auto *lo = exec_lo.ResolveInstruction();
+      Check(lo != nullptr &&
+                lo->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
+                lo->Arg(0).ResolveInstruction() == ballot &&
+                lo->Arg(1).Resolve().U32() == 0u,
+            "native compute EXEC_LO does not use ballot word zero");
+      if (wave_size == 32u) {
+        Check(exec_hi.IsImmediate() && exec_hi.U32() == 0u,
+              "native wave32 entry defined EXEC_HI");
+      } else {
+        const auto *hi = exec_hi.ResolveInstruction();
+        Check(hi != nullptr &&
+                  hi->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
+                  hi->Arg(0).ResolveInstruction() == ballot &&
+                  hi->Arg(1).Resolve().U32() == 1u,
+              "native wave64 EXEC_HI does not use ballot word one");
+      }
     }
 
     IR::RewriteToSsa(values.blocks);

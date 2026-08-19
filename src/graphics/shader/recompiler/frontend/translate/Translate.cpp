@@ -841,9 +841,16 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 			entry_ir.SetScalarReg(reg, entry_ir.GetUserData(reg));
 		}
 		entry_ir.SetExec(IR::U1(IR::Value(true)));
-		entry_ir.SetExecLo(IR::U32(IR::Value(per_invocation_masks ? 1u : 0xffffffffu)));
-		entry_ir.SetExecHi(
-		    IR::U32(IR::Value(!per_invocation_masks && source.wave_size > 32u ? 0xffffffffu : 0u)));
+		if (source.stage == ShaderType::Compute && !per_invocation_masks) {
+			const auto active = entry_ir.Emit(IR::ValueOpcode::Ballot, {IR::Value(true)});
+			entry_ir.SetExecLo(entry_ir.CompositeExtract(active, 0));
+			entry_ir.SetExecHi(source.wave_size > 32u ? entry_ir.CompositeExtract(active, 1)
+			                                               : IR::U32(IR::Value(0u)));
+		} else {
+			entry_ir.SetExecLo(IR::U32(IR::Value(per_invocation_masks ? 1u : 0xffffffffu)));
+			entry_ir.SetExecHi(IR::U32(
+			    IR::Value(!per_invocation_masks && source.wave_size > 32u ? 0xffffffffu : 0u)));
+		}
 		if (source.stage == ShaderType::Compute) {
 			const auto* cs = compute_input_info;
 			const auto  thread_ids =

@@ -11734,7 +11734,7 @@ TestCase ScalarSaveExecOps() {
   return {"ScalarSaveExecOps",
           code,
           {},
-          {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+          {0x00000001u, 0x00000000u, 0x00000001u, 0x00000000u, 0xffffffffu,
            0xffffffffu, 0xffffffffu, 0x00000003u, 0xffffffffu, 0x00000003u,
            0x00000002u, 0xffffffffu, 1},
           {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
@@ -17190,7 +17190,7 @@ TestCase DsAppendConsumeUsesEncodedLdsSelector() {
   return {"DsAppendConsumeLdsSelector",
           code,
           {},
-          {10, 74, 0, 10},
+          {10, 11, 0, 10},
           {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32,
            O::DS_APPEND, O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -17224,7 +17224,7 @@ TestCase DsAppendUsesEncodedGdsSelector() {
   TestCase test{"DsAppendGdsSelector",
                 code,
                 {},
-                {10, 74, 20, 84, 40, 104},
+                {10, 11, 20, 21, 40, 41},
                 {O::S_MOV_B32, O::DS_APPEND, O::DS_CONSUME,
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.gds_initial = {10, 20, 30, 40};

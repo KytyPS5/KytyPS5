@@ -94,13 +94,13 @@ uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, StorageClassPushConstant, TypeU32(state));
 }
 
-uint32_t TypeLdsArrayPointer(EmitterState& state, uint32_t storage_class) {
-	const auto count = ConstantU32(state, std::max(LdsDwordCount(state), 1u));
+uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords) {
+	const auto count = ConstantU32(state, std::max(dwords, 1u));
 	const auto array = state.builder.Type(OpTypeArray, {TypeU32(state), count});
 	return TypePointer(state, storage_class, array);
 }
 
-uint32_t TypeLdsElementPointer(EmitterState& state, uint32_t storage_class) {
+uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class) {
 	return TypePointer(state, storage_class, TypeU32(state));
 }
 
@@ -601,6 +601,9 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
+	if (state.requirements.function_scratch) {
+		state.scratch_variable = state.builder.AllocateId();
+	}
 	state.main_func   = state.builder.AllocateId();
 	state.entry_label = state.builder.AllocateId();
 
@@ -658,6 +661,9 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddName(state.main_func, "main");
 	if (state.requirements.function_lds) {
 		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
+	if (state.requirements.function_scratch) {
+		state.builder.AddName(state.scratch_variable, "scratch_dwords");
 	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);

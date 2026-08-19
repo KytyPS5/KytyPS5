@@ -535,6 +535,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::GetSrtResource:
 		case IR::ValueOpcode::GetBufferResource:
 		case IR::ValueOpcode::GetAddressResource:
+		case IR::ValueOpcode::GetScratchResource:
 		case IR::ValueOpcode::GetImageResource:
 		case IR::ValueOpcode::GetSamplerResource:
 		case IR::ValueOpcode::MakeImageAddress: return true;

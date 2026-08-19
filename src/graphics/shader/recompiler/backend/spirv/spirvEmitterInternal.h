@@ -321,6 +321,7 @@ struct EmitterState {
 	uint32_t                                         vsharp_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         scratch_variable        = 0;
 	std::array<uint32_t, 14>                         sampled_image_variables {};
 	std::array<uint32_t, 10>                         storage_image_variables {};
 	uint32_t                                         sampler_variable                      = 0;
@@ -356,8 +357,8 @@ uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferPointer(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
-uint32_t TypeLdsArrayPointer(EmitterState& state, uint32_t storage_class);
-uint32_t TypeLdsElementPointer(EmitterState& state, uint32_t storage_class);
+uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
+uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;

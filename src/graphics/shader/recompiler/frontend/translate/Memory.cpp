@@ -34,7 +34,7 @@ Translator::AddressOperands Translator::ReadAddressOperands(const IR::Instructio
 		                            high_or_base.reg.file != IR::RegisterFile::Vector
 		                        ? ReadU32(high_or_base)
 		                        : low;
-		return {GetAddressResource(offset, IR::Value(0u)), offset, IR::Value(0u)};
+		return {ir.Emit(IR::ValueOpcode::GetScratchResource), offset, IR::Value(0u)};
 	}
 	if (inst.memory.kind == IR::ResourceKind::Global &&
 	    high_or_base.kind == IR::OperandKind::Register &&

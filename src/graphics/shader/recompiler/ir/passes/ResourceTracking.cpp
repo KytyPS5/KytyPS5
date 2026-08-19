@@ -764,6 +764,18 @@ private:
 			if (!IsAddressResourceKind(memory.kind)) {
 				return Fail(flags.pc, error, "address operation has invalid resource kind");
 			}
+			if (memory.kind == ResourceKind::Scratch) {
+				handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetScratchResource ||
+				    handle->NumArgs() != 0) {
+					return Fail(flags.pc, error, "scratch operation requires GetScratchResource");
+				}
+				if (m_program.scratch_dwords == 0) {
+					return Fail(flags.pc, error,
+					            "scratch operation requires a nonzero AGC per-thread size");
+				}
+				return true;
+			}
 			bool unbased = false;
 			if (!GetAddressHandle(inst, inst.Arg(0), flags.pc, handle, source, unbased, error)) {
 				return false;

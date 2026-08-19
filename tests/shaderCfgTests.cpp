@@ -11059,6 +11059,22 @@ void TestComputeLdsAllocationIdentity() {
             ShaderGetIdCS(regs, lds_896, true),
         "compute pipeline identity omitted the LDS allocation");
 
+  mapped.scratch_size_dwords = 7;
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  regs.cs_regs.lds_size = decode_lds_field(lds_896_rsrc2);
+  ShaderComputeInputInfo scratch_info{};
+  std::span<const uint32_t> scratch_spirv;
+  Check(ShaderCompileInfoCS(regs, sh, scratch_info, scratch_spirv),
+        "compute scratch metadata shader did not compile");
+  Check(scratch_info.scratch_size_dwords == 7,
+        "AGC per-thread scratch size was not propagated");
+  Check(scratch_info.stage.program != nullptr &&
+            scratch_info.stage.program->scratch_dwords == 7,
+        "AGC per-thread scratch size did not reach the compiler program");
+  Check(ShaderGetIdCS(regs, scratch_info, true) !=
+            ShaderGetIdCS(regs, lds_896, true),
+        "compute pipeline identity omitted the scratch allocation");
+
   const uint32_t append_shader[] = {
       EncodeSMovB32(124, 132), // m0 = 4 bytes
       EncodeDs0(0x3e),
@@ -11217,18 +11233,21 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
   options.flat_memory_base = 0;
+  options.scratch_dwords = 1;
   ShaderRecompiler::CompileResult result;
   std::string error;
   const bool compiled =
       ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
   Check(compiled, error.c_str());
-  Check(result.program.info.addresses.size() == 2,
-        "segmented address resources were not tracked independently");
-  for (const auto &address : result.program.info.addresses) {
-    Check(
-        address.unbased && address.source == UINT32_MAX,
-        "GLOBAL/SCRATCH null-SADDR incorrectly inherited FLAT VGPR provenance");
-  }
+  Check(result.program.info.addresses.size() == 1 &&
+            result.program.info.addresses[0].kind ==
+                ShaderRecompiler::IR::ResourceKind::Global &&
+            result.program.info.addresses[0].unbased &&
+            result.program.info.addresses[0].source == UINT32_MAX,
+        "GLOBAL null-SADDR did not remain an unbased guest address");
+  Check(Common::ContainsStr(result.ir_dump, "GetScratchResource") &&
+            result.program.scratch_dwords == 1,
+        "SCRATCH incorrectly entered guest address tracking");
 }
 
 void TestNewShaderRecompilerSpirvSizeBaselines() {

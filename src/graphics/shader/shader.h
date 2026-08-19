@@ -89,21 +89,23 @@ struct ShaderVertexInputInfo {
 	int                     resource_fetch_components[RES_MAX] = {};
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
-	int                     resources_num     = 0;
-	int                     fetch_shader_reg  = 0;
-	int                     fetch_attrib_reg  = 0;
-	int                     fetch_buffer_reg  = 0;
-	int                     buffers_num       = 0;
-	int                     export_count      = 0;
-	uint32_t                param_export_mask = 0;
-	bool                    fetch_external    = false;
-	bool                    fetch_embedded    = false;
+	int                     resources_num       = 0;
+	int                     fetch_shader_reg    = 0;
+	int                     fetch_attrib_reg    = 0;
+	int                     fetch_buffer_reg    = 0;
+	int                     buffers_num         = 0;
+	int                     export_count        = 0;
+	uint32_t                scratch_size_dwords = 0;
+	uint32_t                param_export_mask   = 0;
+	bool                    fetch_external      = false;
+	bool                    fetch_embedded      = false;
 };
 
 struct ShaderComputeInputInfo {
 	uint32_t           threads_num[3]             = {0, 0, 0};
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           lds_size_dwords            = 0;
+	uint32_t           scratch_size_dwords        = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	uint32_t           wave_size                  = 64;
@@ -122,6 +124,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       mrt_output_mask              = 0;
 	uint32_t                                       descriptor_set               = 0;
 	uint32_t                                       push_constant_offset         = 0;
+	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_xy                    = false;
@@ -241,6 +244,7 @@ struct ShaderMappedData {
 	ShaderSemantic* input_semantics     = nullptr;
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
+	uint32_t        scratch_size_dwords = 0;
 };
 
 void ShaderInit();

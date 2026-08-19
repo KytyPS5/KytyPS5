@@ -679,11 +679,10 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		} else {
 			if (!runtime.flat_memory_base.has_value()) {
 				if (error != nullptr) {
-					*error =
-					    fmt::format("unbased {} address at pc 0x{:08x} requires runtime "
-					                "guest-address translation",
-					                address.kind == ResourceKind::Flat ? "FLAT" : "global/scratch",
-					                address.first_use_pc);
+					*error = fmt::format("unbased {} address at pc 0x{:08x} requires runtime "
+					                     "guest-address translation",
+					                     address.kind == ResourceKind::Flat ? "FLAT" : "global",
+					                     address.first_use_pc);
 				}
 				return false;
 			}

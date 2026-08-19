@@ -158,6 +158,11 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 						return Fail(error, "typed address handle has an invalid dense resource");
 					}
 					break;
+				case IR::ValueOpcode::GetScratchResource:
+					if (inst.NumArgs() != 0 || program.scratch_dwords == 0) {
+						return Fail(error, "typed scratch handle has invalid shader metadata");
+					}
+					break;
 				case IR::ValueOpcode::GetImageResource:
 					if (dense >= program.info.images.size()) {
 						return Fail(error, "typed image handle has an invalid dense resource");
@@ -198,6 +203,18 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 	};
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
+			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None) {
+				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+				if (memory_index >= program.values->memory_info.size()) {
+					return Fail(error, "address operation has invalid memory metadata");
+				}
+				if (program.values->memory_info[memory_index].kind == IR::ResourceKind::Scratch) {
+					if (program.scratch_dwords == 0) {
+						return Fail(error, "scratch operation has no per-thread storage");
+					}
+					requirements.function_scratch = true;
+				}
+			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
 				if (memory_index >= program.values->memory_info.size()) {

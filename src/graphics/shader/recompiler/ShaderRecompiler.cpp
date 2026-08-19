@@ -46,7 +46,8 @@ std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
 	dump += CFG::GraphToString(cfg);
 	dump += "\nIR:\n";
-	dump += fmt::format("mode={}\n", ir.dispatcher_fallback ? "dispatcher" : "structured");
+	dump += fmt::format("mode={} scratch_dwords={}\n",
+	                    ir.dispatcher_fallback ? "dispatcher" : "structured", ir.scratch_dwords);
 	dump += ir.values != nullptr ? IR::ValueProgramToString(*ir.values) : IR::ProgramToString(ir);
 	return dump;
 }
@@ -686,6 +687,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		output.shader_hash     = options.shader_hash;
 		output.user_data_base  = options.user_data_base;
 		output.user_data_count = options.user_data_count;
+		output.scratch_dwords  = options.scratch_dwords;
 		return true;
 	};
 	if (!lower_program(ir)) {

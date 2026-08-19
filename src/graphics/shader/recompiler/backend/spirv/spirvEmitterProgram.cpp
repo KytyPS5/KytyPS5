@@ -580,8 +580,15 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 	    {OpFunction, TypeVoid(state), state.main_func, FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
-		state.builder.AddFunction({OpVariable, TypeLdsArrayPointer(state, StorageClassFunction),
-		                           state.lds_variable, StorageClassFunction});
+		state.builder.AddFunction(
+		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsDwordCount(state)),
+		     state.lds_variable, StorageClassFunction});
+	}
+	if (state.requirements.function_scratch) {
+		state.builder.AddFunction(
+		    {OpVariable,
+		     TypeU32ArrayPointer(state, StorageClassFunction, state.program.scratch_dwords),
+		     state.scratch_variable, StorageClassFunction});
 	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction({OpVariable,

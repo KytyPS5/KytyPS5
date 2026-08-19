@@ -222,9 +222,9 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 		mem.image_nsa_addr[i] = decoded.image_nsa_addr[i];
 	}
 	mem.memory_segment = decoded.memory_segment;
-	mem.address_is_full =
-	    kind == ResourceKind::Flat || kind == ResourceKind::Scratch ||
-	    (kind == ResourceKind::Global && decoded.src1.kind == Decoder::OperandKind::Vgpr);
+	mem.address_is_full = kind == ResourceKind::Flat ||
+	                      (kind == ResourceKind::Global &&
+	                       decoded.src1.kind == Decoder::OperandKind::Vgpr);
 	mem.data_signed   = decoded.data_signed;
 	mem.typed         = decoded.typed;
 	mem.formatted     = decoded.formatted;
@@ -236,7 +236,7 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 	mem.offen         = decoded.offen;
 	mem.resource      = ResourceIndexFromOperand(decoded.src1);
 	mem.sampler       = ResourceIndexFromOperand(decoded.src2);
-	if (kind == ResourceKind::Lds || kind == ResourceKind::Gds) {
+	if (kind == ResourceKind::Lds || kind == ResourceKind::Gds || kind == ResourceKind::Scratch) {
 		mem.resource = 0;
 		mem.sampler  = 0;
 	}

@@ -430,6 +430,7 @@ struct SpirvRequirements {
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 };
 
@@ -440,6 +441,7 @@ struct Program {
 	uint32_t                      wave_size           = 64;
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;
+	uint32_t                      scratch_dwords      = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;

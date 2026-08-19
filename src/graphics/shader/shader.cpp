@@ -794,6 +794,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 		     shader_addr);
 		return false;
 	}
+	info.scratch_size_dwords = data.scratch_size_dwords;
 
 	if (data.user_data == nullptr) {
 		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
@@ -842,6 +843,12 @@ static void ShaderGetStaticInputInfoPS(
 	KYTY_PROFILER_FUNCTION();
 
 	ps_info = {};
+	ShaderMappedData data;
+	if (!ShaderGetMappedData(regs.ps_regs.data_addr, data)) {
+		EXIT("ShaderGetInputInfoPS(): shader=0x%016" PRIx64 " is missing from ShaderMap\n",
+		     regs.ps_regs.data_addr);
+	}
+	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
 	// flags in the hardware state and extract only the input count here.
@@ -891,17 +898,23 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        ShaderComputeInputInfo& info) {
 	info = {};
+	ShaderMappedData data;
+	if (!ShaderGetMappedData(regs.cs_regs.data_addr, data)) {
+		EXIT("ShaderGetInputInfoCS(): shader=0x%016" PRIx64 " is missing from ShaderMap\n",
+		     regs.cs_regs.data_addr);
+	}
 
-	info.threads_num[0]  = regs.cs_regs.num_thread_x;
-	info.threads_num[1]  = regs.cs_regs.num_thread_y;
-	info.threads_num[2]  = regs.cs_regs.num_thread_z;
-	info.lds_size_dwords = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
-	info.group_id[0]     = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]     = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]     = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size       = regs.cs_regs.wave_size;
-	info.thread_ids_num  = regs.cs_regs.tidig_comp_cnt + 1;
-	info.tg_size_en      = regs.cs_regs.tg_size_en != 0;
+	info.threads_num[0]      = regs.cs_regs.num_thread_x;
+	info.threads_num[1]      = regs.cs_regs.num_thread_y;
+	info.threads_num[2]      = regs.cs_regs.num_thread_z;
+	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
+	info.scratch_size_dwords = data.scratch_size_dwords;
+	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
+	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
+	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
+	info.wave_size           = regs.cs_regs.wave_size;
+	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
+	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
@@ -1450,6 +1463,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.shader_base                = shader_addr;
 	options.user_data_base             = 8;
 	options.user_data_count            = regs.gs_regs.rsrc2.user_sgpr;
+	options.scratch_dwords             = input_info.scratch_size_dwords;
 	options.user_data                  = regs.gs_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.descriptor_set             = 0;
@@ -1504,6 +1518,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.shader_hash                = shader_hash;
 	options.shader_base                = shader_addr;
 	options.user_data_count            = regs.ps_regs.rsrc2.user_sgpr;
+	options.scratch_dwords             = input_info.scratch_size_dwords;
 	options.user_data                  = regs.ps_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.descriptor_set             = input_info.descriptor_set;
@@ -1554,6 +1569,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.shader_hash                = shader_addr;
 	options.shader_base                = shader_addr;
 	options.user_data_count            = regs.cs_regs.user_sgpr;
+	options.scratch_dwords             = input_info.scratch_size_dwords;
 	options.user_data                  = regs.cs_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.descriptor_set             = 0;
@@ -1610,6 +1626,7 @@ ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInput
 	ret.ids.push_back(static_cast<uint32_t>(input_info.fetch_embedded));
 	ret.ids.push_back(input_info.resources_num);
 	ret.ids.push_back(input_info.export_count);
+	ret.ids.push_back(input_info.scratch_size_dwords);
 
 	for (int i = 0; i < input_info.resources_num; i++) {
 		const auto& r  = input_info.resources[i];
@@ -1663,6 +1680,7 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 
 	ret.ids.push_back(input_info.descriptor_set);
 	ret.ids.push_back(input_info.push_constant_offset);
+	ret.ids.push_back(input_info.scratch_size_dwords);
 	ret.ids.push_back(input_info.input_num);
 	ret.ids.push_back(input_info.ps_system_input_base);
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_x));
@@ -1726,6 +1744,7 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 	ret.ids.push_back(input_info.wave_size);
 	ret.ids.push_back(input_info.thread_ids_num);
 	ret.ids.push_back(input_info.lds_size_dwords);
+	ret.ids.push_back(input_info.scratch_size_dwords);
 
 	for (int i = 0; i < 3; i++) {
 		ret.ids.push_back(input_info.threads_num[i]);

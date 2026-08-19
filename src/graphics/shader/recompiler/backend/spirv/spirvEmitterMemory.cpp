@@ -105,12 +105,12 @@ uint32_t AddressByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const I
 	}
 	const auto immediate_low  = ConstantU32(state, static_cast<uint32_t>(immediate));
 	const auto immediate_high = ConstantU32(state, immediate < 0 ? UINT32_MAX : 0u);
-	const auto base           = state.program.info.addresses[mem.resource].specialized_base;
 	if (mem.kind == IR::ResourceKind::Scratch) {
 		low              = AddU64Low(state, low, high, immediate_low, immediate_high, high);
 		const auto valid = Binary(state, OpIEqual, TypeBool(state), high, ConstantU32(state, 0));
 		return Select(state, TypeU32(state), valid, low, ConstantU32(state, UINT32_MAX));
 	}
+	const auto base = state.program.info.addresses[mem.resource].specialized_base;
 	if (mem.kind == IR::ResourceKind::Flat ||
 	    (mem.kind == IR::ResourceKind::Global &&
 	     state.program.info.addresses[mem.resource].unbased)) {

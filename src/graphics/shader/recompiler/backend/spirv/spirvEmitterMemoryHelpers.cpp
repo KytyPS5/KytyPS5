@@ -75,7 +75,8 @@ static void EnsureLdsStorage(EmitterState& state) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
 	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeLdsArrayPointer(state, StorageClassWorkgroup), StorageClassWorkgroup);
+	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
+	    StorageClassWorkgroup);
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
@@ -98,10 +99,16 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			}
 			access.length = state.gds_length;
 			return access;
+		case IR::ResourceKind::Scratch:
+			if (state.scratch_variable == 0) {
+				EXIT("scratch storage was not prepared before SPIR-V function emission\n");
+			}
+			access.object_pointer = state.scratch_variable;
+			access.length         = ConstantU32(state, state.program.scratch_dwords);
+			return access;
 		case IR::ResourceKind::ScalarAddress:
 		case IR::ResourceKind::Flat:
-		case IR::ResourceKind::Global:
-		case IR::ResourceKind::Scratch: {
+		case IR::ResourceKind::Global: {
 			if (state.address_memory_variable == 0) {
 				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
 				                             mem.resource,
@@ -155,11 +162,11 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
-	if (access.kind == IR::ResourceKind::Lds) {
-		state.builder.AddFunction({OpAccessChain,
-		                           TypeLdsElementPointer(state, state.stage == ShaderType::Compute
-		                                                            ? StorageClassWorkgroup
-		                                                            : StorageClassFunction),
+	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
+		                           : state.stage == ShaderType::Compute     ? StorageClassWorkgroup
+		                                                                    : StorageClassFunction;
+		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                           pointer, access.object_pointer, index});
 	} else {
 		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,

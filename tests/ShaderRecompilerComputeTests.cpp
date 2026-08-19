@@ -1070,6 +1070,7 @@ CompiledShader CompileCase(const TestCase &test) {
   options.read_memory = ReadTestMemory;
   options.read_memory_data = const_cast<std::vector<u32> *>(&test.initial);
   options.flat_memory_base = test.flat_memory_base;
+  options.scratch_dwords = test.compute_info.scratch_size_dwords;
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
   }
@@ -16335,6 +16336,36 @@ TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   return test;
 }
 
+TestCase ScratchIsPrivatePerInvocation() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeFlat0(0x1c, 1, 4));
+  code.push_back(EncodeFlat1(0, 20, 0, 21));
+  code.push_back(EncodeFlat0(0x0c, 1, 4));
+  code.push_back(EncodeFlat1(5, 20, 0, 21));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScratchIsPrivatePerInvocation";
+  test.code = std::move(code);
+  test.expected = {0, 1, 2, 3};
+  test.opcodes = {O::S_MOV_B32,          O::V_MOV_B32,
+                  O::FLAT_STORE_DWORD,   O::FLAT_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.scratch_size_dwords = 2;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase FlatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -18648,6 +18679,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
+  AddCase(ScratchIsPrivatePerInvocation);
   AddCase(FlatStoreVariants);
   AddCase(DsReadWriteVariants);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);

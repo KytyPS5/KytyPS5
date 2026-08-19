@@ -192,6 +192,7 @@ VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1)
 VALUE_OPCODE(GetSrtResource, SrtResource)
 VALUE_OPCODE(GetBufferResource, BufferResource, U32, U32, U32, U32)
 VALUE_OPCODE(GetAddressResource, AddressResource, U32, U32)
+VALUE_OPCODE(GetScratchResource, AddressResource)
 VALUE_OPCODE(GetImageResource, ImageResource, U32, U32, U32, U32, U32, U32, U32, U32)
 VALUE_OPCODE(GetSamplerResource, SamplerResource, U32, U32, U32, U32)
 VALUE_OPCODE(MakeImageAddress, ImageAddress, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32,

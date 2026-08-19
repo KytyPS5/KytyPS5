@@ -1146,8 +1146,8 @@ void TestNativeSubgroupPolicy() {
   Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
                                 vk::ShaderStageFlagBits::eCompute,
                                 cross_lane_compute)
-                .mode == ShaderSubgroupMode::Unsupported,
-        "cross-lane compute mismatch bypassed the exact subgroup requirement");
+                .mode == ShaderSubgroupMode::FlattenedMasks,
+        "split wave64 compute did not use native subgroup operations");
 
   ShaderRecompiler::IR::Program zero_exec = safe;
   zero_exec.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
@@ -1180,8 +1180,8 @@ void TestNativeSubgroupPolicy() {
   SetTypedValues(ds_partial, ShaderRecompiler::IR::ValueOpcode::DataAppend);
   Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
                                 vk::ShaderStageFlagBits::eCompute, ds_partial)
-                .mode == ShaderSubgroupMode::Unsupported,
-        "partial wave64 DS append bypassed the exact subgroup requirement");
+                .mode == ShaderSubgroupMode::FlattenedMasks,
+        "split wave64 DS append did not use native subgroup operations");
   context.max_subgroup_size = 64;
   const auto controlled = ConfigureShaderSubgroup(
       ShaderSubgroupCapabilities{context}, vk::ShaderStageFlagBits::eCompute,
@@ -1201,8 +1201,8 @@ void TestNativeSubgroupPolicy() {
   Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
                                 vk::ShaderStageFlagBits::eCompute,
                                 cross_lane_compute)
-                .mode == ShaderSubgroupMode::Unsupported,
-        "inverse cross-lane compute mismatch was accepted");
+                .mode == ShaderSubgroupMode::FlattenedMasks,
+        "inverse compute mismatch did not use the native subgroup");
 }
 
 std::array<uint32_t, 64>

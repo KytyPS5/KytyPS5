@@ -134,14 +134,14 @@ U32 IREmitter::BitCastU32(F16 value) {
 	return U32(Emit(ValueOpcode::ConvertU32U16, {half}));
 }
 
-U64 IREmitter::PackUint2x32(U32 low, U32 high) {
-	const auto pair = Emit(ValueOpcode::CompositeConstructU32x2, {low, high});
-	return U64(Emit(ValueOpcode::PackUint2x32, {pair}));
+U64 IREmitter::ConstructU64(U32 low, U32 high) {
+	return U64(Emit(ValueOpcode::CompositeConstructU64, {low, high}));
 }
 
 U32 IREmitter::CompositeExtract(Value composite, uint32_t index) {
 	ValueOpcode opcode;
 	switch (composite.GetType()) {
+		case Type::U64: opcode = ValueOpcode::CompositeExtractU64; break;
 		case Type::U32x2: opcode = ValueOpcode::CompositeExtractU32x2; break;
 		case Type::U32x3: opcode = ValueOpcode::CompositeExtractU32x3; break;
 		case Type::U32x4: opcode = ValueOpcode::CompositeExtractU32x4; break;

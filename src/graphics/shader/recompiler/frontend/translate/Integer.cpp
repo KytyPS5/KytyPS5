@@ -157,6 +157,31 @@ bool Translator::TranslatePerInvocationU64Mask(const IR::Instruction& inst) {
 }
 
 bool Translator::TranslateSimpleInteger(const IR::Instruction& inst) {
+	if (inst.op == IR::Opcode::BitwiseAndU64 || inst.op == IR::Opcode::BitwiseOrU64 ||
+	    inst.op == IR::Opcode::BitwiseXorU64 || inst.op == IR::Opcode::BitwiseNotU64) {
+		const auto             lhs = ReadU32Pair(inst.src[0]);
+		std::array<IR::U32, 2> result;
+		if (inst.op == IR::Opcode::BitwiseNotU64) {
+			result = {ir.BitwiseNot(lhs[0]), ir.BitwiseNot(lhs[1])};
+		} else {
+			const auto rhs = ReadU32Pair(inst.src[1]);
+			for (uint32_t component = 0; component < 2; component++) {
+				switch (inst.op) {
+					case IR::Opcode::BitwiseAndU64:
+						result[component] = ir.BitwiseAnd(lhs[component], rhs[component]);
+						break;
+					case IR::Opcode::BitwiseOrU64:
+						result[component] = ir.BitwiseOr(lhs[component], rhs[component]);
+						break;
+					default:
+						result[component] = ir.BitwiseXor(lhs[component], rhs[component]);
+						break;
+				}
+			}
+		}
+		WriteU32Pair(inst.dst, result);
+		return true;
+	}
 	IR::ValueOpcode opcode {};
 	IR::Type        type = IR::Type::U32;
 	switch (inst.op) {
@@ -187,14 +212,6 @@ bool Translator::TranslateSimpleInteger(const IR::Instruction& inst) {
 			type   = IR::Type::U64;
 			break;
 		case IR::Opcode::FindLsbU32: opcode = IR::ValueOpcode::FindILsb32; break;
-		case IR::Opcode::BitwiseAndU64:
-			opcode = IR::ValueOpcode::BitwiseAnd64;
-			type   = IR::Type::U64;
-			break;
-		case IR::Opcode::BitwiseOrU64:
-			opcode = IR::ValueOpcode::BitwiseOr64;
-			type   = IR::Type::U64;
-			break;
 		case IR::Opcode::ShiftLeftLogicalU32: opcode = IR::ValueOpcode::ShiftLeftLogical32; break;
 		case IR::Opcode::ShiftRightLogicalU32: opcode = IR::ValueOpcode::ShiftRightLogical32; break;
 		case IR::Opcode::ShiftRightArithmeticI32:
@@ -219,10 +236,6 @@ bool Translator::TranslateSimpleInteger(const IR::Instruction& inst) {
 		                    opcode == IR::ValueOpcode::ShiftRightLogical32 ||
 		                    opcode == IR::ValueOpcode::ShiftRightArithmetic32)) {
 			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(31u)));
-		} else if (index == 1u && (opcode == IR::ValueOpcode::ShiftLeftLogical64 ||
-		                           opcode == IR::ValueOpcode::ShiftRightLogical64 ||
-		                           opcode == IR::ValueOpcode::ShiftRightArithmetic64)) {
-			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(63u)));
 		}
 	}
 	IR::Value result;
@@ -233,31 +246,45 @@ bool Translator::TranslateSimpleInteger(const IR::Instruction& inst) {
 		default: EXIT("invalid simple integer source count: %u", inst.src_count);
 	}
 	WriteOperand(inst.dst, result);
-	if (type == IR::Type::U64 && inst.dst.kind == IR::OperandKind::Register &&
-	    inst.dst.reg.file == IR::RegisterFile::Scalar) {
-		IR::U1 mask;
-		if (inst.op == IR::Opcode::BitwiseAndU64) {
-			mask = ir.LogicalAnd(ReadMask(inst.src[0]), ReadMask(inst.src[1]));
-		} else if (inst.op == IR::Opcode::BitwiseOrU64) {
-			mask = ir.LogicalOr(ReadMask(inst.src[0]), ReadMask(inst.src[1]));
-		}
-		if (!mask.IsEmpty()) {
-			ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.dst.reg.index), mask);
-		}
-	}
 	return true;
 }
 
 bool Translator::TranslateComposedInteger(const IR::Instruction& inst) {
+	if (inst.op == IR::Opcode::BitwiseAndNotU64 || inst.op == IR::Opcode::BitwiseOrNotU64 ||
+	    inst.op == IR::Opcode::BitwiseNandU64 || inst.op == IR::Opcode::BitwiseNorU64 ||
+	    inst.op == IR::Opcode::BitwiseXnorU64) {
+		const auto             lhs = ReadU32Pair(inst.src[0]);
+		const auto             rhs = ReadU32Pair(inst.src[1]);
+		std::array<IR::U32, 2> result;
+		for (uint32_t component = 0; component < 2; component++) {
+			switch (inst.op) {
+				case IR::Opcode::BitwiseAndNotU64:
+					result[component] =
+					    ir.BitwiseAnd(lhs[component], ir.BitwiseNot(rhs[component]));
+					break;
+				case IR::Opcode::BitwiseOrNotU64:
+					result[component] = ir.BitwiseOr(lhs[component], ir.BitwiseNot(rhs[component]));
+					break;
+				case IR::Opcode::BitwiseNandU64:
+					result[component] =
+					    ir.BitwiseNot(ir.BitwiseAnd(lhs[component], rhs[component]));
+					break;
+				case IR::Opcode::BitwiseNorU64:
+					result[component] = ir.BitwiseNot(ir.BitwiseOr(lhs[component], rhs[component]));
+					break;
+				default:
+					result[component] =
+					    ir.BitwiseNot(ir.BitwiseXor(lhs[component], rhs[component]));
+					break;
+			}
+		}
+		WriteU32Pair(inst.dst, result);
+		return true;
+	}
 	const auto binary_u32 = [&](auto operation) {
 		const auto lhs = ReadU32(inst.src[0]);
 		const auto rhs = ReadU32(inst.src[1]);
 		return operation(lhs, rhs);
-	};
-	const auto binary_u64 = [&](auto operation) {
-		const auto lhs = UnpackU64(ReadU64(inst.src[0]));
-		const auto rhs = UnpackU64(ReadU64(inst.src[1]));
-		return ir.PackUint2x32(operation(lhs[0], rhs[0]), operation(lhs[1], rhs[1]));
 	};
 
 	IR::Value result;
@@ -282,34 +309,6 @@ bool Translator::TranslateComposedInteger(const IR::Instruction& inst) {
 			result = binary_u32(
 			    [&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseNot(ir.BitwiseXor(lhs, rhs)); });
 			break;
-		case IR::Opcode::BitwiseXorU64:
-			result = binary_u64([&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseXor(lhs, rhs); });
-			break;
-		case IR::Opcode::BitwiseAndNotU64:
-			result = binary_u64(
-			    [&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseAnd(lhs, ir.BitwiseNot(rhs)); });
-			break;
-		case IR::Opcode::BitwiseOrNotU64:
-			result = binary_u64(
-			    [&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseOr(lhs, ir.BitwiseNot(rhs)); });
-			break;
-		case IR::Opcode::BitwiseNandU64:
-			result = binary_u64(
-			    [&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseNot(ir.BitwiseAnd(lhs, rhs)); });
-			break;
-		case IR::Opcode::BitwiseNorU64:
-			result = binary_u64(
-			    [&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseNot(ir.BitwiseOr(lhs, rhs)); });
-			break;
-		case IR::Opcode::BitwiseXnorU64:
-			result = binary_u64(
-			    [&](IR::U32 lhs, IR::U32 rhs) { return ir.BitwiseNot(ir.BitwiseXor(lhs, rhs)); });
-			break;
-		case IR::Opcode::BitwiseNotU64: {
-			const auto source = UnpackU64(ReadU64(inst.src[0]));
-			result            = ir.PackUint2x32(ir.BitwiseNot(source[0]), ir.BitwiseNot(source[1]));
-			break;
-		}
 		case IR::Opcode::BitwiseAndOrU32: {
 			const auto lhs = ReadU32(inst.src[0]);
 			const auto rhs = ReadU32(inst.src[1]);
@@ -326,7 +325,7 @@ bool Translator::TranslateComposedInteger(const IR::Instruction& inst) {
 			                       ReadU32(inst.src[2]));
 			break;
 		case IR::Opcode::FindLsbU64: {
-			const auto source        = UnpackU64(ReadU64(inst.src[0]));
+			const auto source        = ExtractU64(ReadU64(inst.src[0]));
 			const auto low_lsb       = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[0]}));
 			const auto high_lsb      = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[1]}));
 			const auto high_position = ir.IAdd(high_lsb, IR::U32(IR::Value(32u)));
@@ -349,44 +348,13 @@ bool Translator::TranslateComposedInteger(const IR::Instruction& inst) {
 			const auto position = ir.ISub(IR::U32(IR::Value(63u)), msb);
 			const auto nonzero  = IR::U1(
 			    ir.Emit(IR::ValueOpcode::INotEqual64,
-			            {source, ir.PackUint2x32(IR::U32(IR::Value(0u)), IR::U32(IR::Value(0u)))}));
+			            {source, ir.ConstructU64(IR::U32(IR::Value(0u)), IR::U32(IR::Value(0u)))}));
 			result = ir.Select(nonzero, position, IR::U32(IR::Value(0xffffffffu)));
 			break;
 		}
 		default: return false;
 	}
 	WriteOperand(inst.dst, result);
-	if (result.GetType() == IR::Type::U64 && inst.dst.kind == IR::OperandKind::Register &&
-	    inst.dst.reg.file == IR::RegisterFile::Scalar) {
-		const auto lhs = ReadMask(inst.src[0]);
-		IR::U1     mask;
-		switch (inst.op) {
-			case IR::Opcode::BitwiseXorU64:
-				mask = IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {lhs, ReadMask(inst.src[1])}));
-				break;
-			case IR::Opcode::BitwiseAndNotU64:
-				mask = ir.LogicalAnd(lhs, ir.LogicalNot(ReadMask(inst.src[1])));
-				break;
-			case IR::Opcode::BitwiseOrNotU64:
-				mask = ir.LogicalOr(lhs, ir.LogicalNot(ReadMask(inst.src[1])));
-				break;
-			case IR::Opcode::BitwiseNandU64:
-				mask = ir.LogicalNot(ir.LogicalAnd(lhs, ReadMask(inst.src[1])));
-				break;
-			case IR::Opcode::BitwiseNorU64:
-				mask = ir.LogicalNot(ir.LogicalOr(lhs, ReadMask(inst.src[1])));
-				break;
-			case IR::Opcode::BitwiseXnorU64:
-				mask = ir.LogicalNot(
-				    IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {lhs, ReadMask(inst.src[1])})));
-				break;
-			case IR::Opcode::BitwiseNotU64: mask = ir.LogicalNot(lhs); break;
-			default: break;
-		}
-		if (!mask.IsEmpty()) {
-			ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.dst.reg.index), mask);
-		}
-	}
 	return true;
 }
 
@@ -402,18 +370,12 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 		return IR::U32(
 		    ir.Emit(IR::ValueOpcode::BitFieldInsert, {imm(0), imm(0xffffffffu), imm(0), count}));
 	};
-	const auto select_u64 = [&](IR::U1 condition, IR::U64 true_value, IR::U64 false_value) {
-		const auto lhs = UnpackU64(true_value);
-		const auto rhs = UnpackU64(false_value);
-		return ir.PackUint2x32(ir.Select(condition, lhs[0], rhs[0]),
-		                       ir.Select(condition, lhs[1], rhs[1]));
-	};
 	const auto right_mask64 = [&](IR::U32 count) {
 		const auto below32    = IR::U1(ir.Emit(IR::ValueOpcode::ULessThan32, {count, imm(32)}));
 		const auto above32    = IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThan32, {count, imm(32)}));
 		const auto low_count  = ir.Select(below32, count, imm(32));
 		const auto high_count = ir.Select(above32, ir.ISub(count, imm(32)), imm(0));
-		return ir.PackUint2x32(right_mask32(low_count), right_mask32(high_count));
+		return ir.ConstructU64(right_mask32(low_count), right_mask32(high_count));
 	};
 
 	IR::Value result;
@@ -436,7 +398,7 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 		case IR::Opcode::UMadU64U32: {
 			const auto lhs       = ReadU32(inst.src[0]);
 			const auto rhs       = ReadU32(inst.src[1]);
-			const auto add       = UnpackU64(ReadU64(inst.src[2]));
+			const auto add       = ExtractU64(ReadU64(inst.src[2]));
 			const auto mul_low   = ir.IMul(lhs, rhs);
 			const auto mul_high  = IR::U32(ir.Emit(IR::ValueOpcode::UMulHi, {lhs, rhs}));
 			const auto low       = ir.IAdd(mul_low, add[0]);
@@ -445,7 +407,7 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			const auto carry0    = ir.ULessThan(high0, mul_high);
 			const auto high      = ir.IAdd(high0, ir.Select(carry_low, imm(1), imm(0)));
 			const auto carry1    = ir.ULessThan(high, high0);
-			WriteOperand(inst.dst, ir.PackUint2x32(low, high));
+			WriteOperand(inst.dst, ir.ConstructU64(low, high));
 			if (inst.dst2.kind != IR::OperandKind::Null) {
 				WriteMask(inst.dst2, ir.LogicalOr(carry0, carry1));
 			}
@@ -503,7 +465,7 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 				return ir.BitwiseOr(bits, ir.ShiftLeftLogical(bits, imm(1)));
 			};
 			const auto source = ReadU32(inst.src[0]);
-			result            = ir.PackUint2x32(replicate(mask(source, 0xffffu)),
+			result            = ir.ConstructU64(replicate(mask(source, 0xffffu)),
 			                                    replicate(ir.ShiftRightLogical(source, imm(16))));
 			break;
 		}
@@ -590,12 +552,12 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			const auto lo           = ReadU32(inst.src[1]);
 			const auto byte_offset  = mask(ReadU32(inst.src[2]), 31u);
 			const auto bit_offset   = ir.ShiftLeftLogical(byte_offset, imm(3));
-			const auto concatenated = ir.PackUint2x32(lo, hi);
+			const auto concatenated = ir.ConstructU64(lo, hi);
 			const auto shifted      = IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64,
 			                                          {concatenated, mask(bit_offset, 63u)}));
 			const auto in_range =
 			    IR::U1(ir.Emit(IR::ValueOpcode::ULessThan32, {byte_offset, imm(8)}));
-			result = ir.Select(in_range, UnpackU64(shifted)[0], imm(0));
+			result = ir.Select(in_range, ExtractU64(shifted)[0], imm(0));
 			break;
 		}
 		case IR::Opcode::ShiftLeftAddU32:
@@ -633,10 +595,14 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			                                ReadOperand(inst.src[2], IR::Type::F32)});
 			break;
 		}
-		case IR::Opcode::SelectU64:
-			result =
-			    select_u64(ReadCondition(inst.src[0]), ReadU64(inst.src[1]), ReadU64(inst.src[2]));
-			break;
+		case IR::Opcode::SelectU64: {
+			const auto condition = ReadCondition(inst.src[0]);
+			const auto lhs       = ReadU32Pair(inst.src[1]);
+			const auto rhs       = ReadU32Pair(inst.src[2]);
+			WriteU32Pair(inst.dst, {ir.Select(condition, lhs[0], rhs[0]),
+			                        ir.Select(condition, lhs[1], rhs[1])});
+			return true;
+		}
 		case IR::Opcode::PackLowLowU16:
 		case IR::Opcode::PackLowHighU16:
 		case IR::Opcode::PackHighHighU16:

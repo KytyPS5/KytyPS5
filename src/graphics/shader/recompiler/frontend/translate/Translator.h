@@ -36,6 +36,7 @@ private:
 	void                   WriteF16(const IR::Operand& operand, IR::F32 value);
 	void                   WriteU16(const IR::Operand& operand, IR::U32 value);
 	IR::U32                ReadU32(const IR::Operand& operand);
+	std::array<IR::U32, 2> ReadU32Pair(const IR::Operand& operand);
 	IR::U64                ReadU64(const IR::Operand& operand);
 	IR::F32                ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane);
 	IR::F32                ReadF16AsF32(const IR::Operand& operand);
@@ -44,13 +45,14 @@ private:
 	IR::U32 ReadU16LaneAsU32(const IR::Operand& operand, bool high_lane, bool sign_extend);
 	IR::U32 ReadU16AsU32(const IR::Operand& operand, bool sign_extend);
 	IR::U32 ReadF16LaneBits(const IR::Operand& operand, bool high_lane);
-	std::array<IR::U32, 2> UnpackU64(IR::U64 value);
-	IR::U1                 ReadCondition(const IR::Operand& operand);
-	IR::U32                ConditionBit(const IR::Operand& operand);
-	IR::U1                 ReadMask(const IR::Operand& operand);
-	void                   WriteMask(const IR::Operand& operand, IR::U1 value);
-	void                   WriteMask64(const IR::Operand& operand, IR::U1 value);
-	void                   WriteCompareResult(const IR::Operand& operand, IR::U1 value);
+	std::array<IR::U32, 2> ExtractU64(IR::U64 value);
+	void    WriteU32Pair(const IR::Operand& operand, const std::array<IR::U32, 2>& value);
+	IR::U1  ReadCondition(const IR::Operand& operand);
+	IR::U32 ConditionBit(const IR::Operand& operand);
+	IR::U1  ReadMask(const IR::Operand& operand);
+	void    WriteMask(const IR::Operand& operand, IR::U1 value);
+	void    WriteMask64(const IR::Operand& operand, IR::U1 value);
+	void    WriteCompareResult(const IR::Operand& operand, IR::U1 value);
 
 	IR::MemoryFlags AddMemoryInfo(const IR::Instruction& inst);
 	IR::ExportFlags AddExportInfo(const IR::Instruction& inst);
@@ -82,13 +84,13 @@ private:
 	IR::ValueOpcode BufferAtomicOpcode(IR::Opcode opcode);
 	IR::ValueOpcode SharedAtomicOpcode(IR::Opcode opcode);
 	bool            TranslateScalarMemory(const IR::Instruction& inst);
-	bool                     TranslateBufferLoad(const IR::Instruction& inst);
-	bool                     TranslateBufferStore(const IR::Instruction& inst);
-	bool                     TranslateAtomicMemory(const IR::Instruction& inst);
-	bool                     TranslateFlatLoad(const IR::Instruction& inst);
-	bool                     TranslateFlatStore(const IR::Instruction& inst);
-	bool                     TranslateImageMemory(const IR::Instruction& inst);
-	bool                     TranslateSharedMemory(const IR::Instruction& inst);
+	bool            TranslateBufferLoad(const IR::Instruction& inst);
+	bool            TranslateBufferStore(const IR::Instruction& inst);
+	bool            TranslateAtomicMemory(const IR::Instruction& inst);
+	bool            TranslateFlatLoad(const IR::Instruction& inst);
+	bool            TranslateFlatStore(const IR::Instruction& inst);
+	bool            TranslateImageMemory(const IR::Instruction& inst);
+	bool            TranslateSharedMemory(const IR::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
 	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,

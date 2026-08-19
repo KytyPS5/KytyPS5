@@ -1,8 +1,8 @@
+#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -133,16 +133,15 @@ void TestRawScalarComponentAlignment() {
   std::vector<uint32_t> flat;
   std::string error;
   Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
-  Check(flat == std::vector<uint32_t>{0x12345678u} &&
-            memory_image.reads == 1,
-        "raw scalar base, immediate, and offset were not aligned independently");
+  Check(
+      flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
+      "raw scalar base, immediate, and offset were not aligned independently");
 }
 
 void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
-  RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u),
-          raw_memory);
+  RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u), raw_memory);
   std::string error;
   Check(!BuildSrtPlan(raw.program, &error) &&
             error.find("incompatible scalar memory metadata") !=
@@ -151,11 +150,11 @@ void TestScalarMemoryDomainMismatchFails() {
 
   Fixture buffer;
   const auto buffer_memory = buffer.AddMemory(ResourceKind::ScalarAddress);
-  const auto resource = buffer.Emit(ValueOpcode::GetBufferResource,
-                                    {Value(0x1000u), Value(0u), Value(16u),
-                                     Value(0u)});
-  buffer.EmitMemory(ValueOpcode::ReadConstBuffer,
-                    {resource, Value(0u)}, buffer_memory);
+  const auto resource =
+      buffer.Emit(ValueOpcode::GetBufferResource,
+                  {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
+  buffer.EmitMemory(ValueOpcode::ReadConstBuffer, {resource, Value(0u)},
+                    buffer_memory);
   error.clear();
   Check(!BuildSrtPlan(buffer.program, &error) &&
             error.find("incompatible scalar memory metadata") !=
@@ -202,11 +201,10 @@ void TestNestedSrtWalk() {
 void TestShaderBaseAndUserData() {
   Fixture fixture;
   const auto base = fixture.Emit(ValueOpcode::GetShaderBase);
-  const auto pair = fixture.Emit(ValueOpcode::UnpackUint2x32, {base});
   const auto low =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(0u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {base, Value(0u)});
   const auto high =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(1u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {base, Value(1u)});
   const auto user = fixture.Emit(ValueOpcode::GetUserData,
                                  {Value(static_cast<ScalarReg>(2))});
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {user, Value(4u)});
@@ -310,13 +308,12 @@ void TestRuntime64BitDescriptorOps() {
   const auto masked =
       fixture.Emit(ValueOpcode::BitwiseAnd64,
                    {shifted, Value(uint64_t{0x0000ffff00000000ull})});
-  const auto combined = fixture.Emit(ValueOpcode::BitwiseOr64,
-                                     {masked, Value(uint64_t{0xabcdu})});
-  const auto pair = fixture.Emit(ValueOpcode::UnpackUint2x32, {combined});
+  const auto combined = fixture.Emit(
+      ValueOpcode::IAdd64, {masked, Value(uint64_t{0x000000010000abcdull})});
   const auto low =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(0u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(0u)});
   const auto high =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(1u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(1u)});
   fixture.Plan();
   fixture.program.values->descriptor_sources.push_back(
       {.dwords = {low, high}, .dword_count = 2});
@@ -324,8 +321,8 @@ void TestRuntime64BitDescriptorOps() {
   DescriptorValue result;
   std::string error;
   Check(EvaluateDescriptorSource(fixture.program, 0, 0, {}, result, &error) &&
-            result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1234u,
-        "64-bit typed descriptor shift/mask evaluation is incorrect");
+            result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
+        "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
 
 void TestConstantBufferBounds() {
@@ -458,9 +455,9 @@ int main() {
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.
 #include "../src/graphics/shader/recompiler/ir/Block.cpp"
-#include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
-#include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
 #include "../src/graphics/shader/recompiler/ir/Type.cpp"
 #include "../src/graphics/shader/recompiler/ir/Value.cpp"
-#include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "../src/graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
+#include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
+#include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"

@@ -76,10 +76,10 @@ bool IsDescriptorHandle(ValueOpcode opcode) {
 
 bool IsRuntimeIntegerOp(ValueOpcode op) {
 	switch (op) {
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
-		case ValueOpcode::PackUint2x32:
-		case ValueOpcode::UnpackUint2x32:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
@@ -100,7 +100,6 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseAnd32:
 		case ValueOpcode::BitwiseAnd64:
 		case ValueOpcode::BitwiseOr32:
-		case ValueOpcode::BitwiseOr64:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
 		case ValueOpcode::SelectU1:
@@ -211,10 +210,10 @@ private:
 				reason = fmt::format("contains a non-scalar {}", ValueOpcodeName(op));
 				return finish(false);
 			}
-		} else if (op == ValueOpcode::PackUint2x32) {
-			const auto* pair = inst->NumArgs() == 1 ? inst->Arg(0).ResolveInstruction() : nullptr;
-			if (pair == nullptr || pair->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
-				reason = "contains an unsupported packed runtime value";
+		} else if (op == ValueOpcode::CompositeExtractU64) {
+			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
+				reason = "contains an invalid U64 component index";
 				return finish(false);
 			}
 		} else if (op == ValueOpcode::CompositeExtractU32x2) {
@@ -223,7 +222,6 @@ private:
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
 			    index.U32() >= 2u ||
 			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
-			     source->GetOpcode() != ValueOpcode::UnpackUint2x32 &&
 			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
 				reason = "contains an unsupported composite runtime source";
 				return finish(false);
@@ -484,21 +482,24 @@ private:
 		if (!index.IsImmediate() || index.GetType() != Type::U32) {
 			return Fail(error, "dynamic composite extract in runtime expression");
 		}
-		const auto  component = index.U32();
-		const auto* source    = inst.Arg(0).ResolveInstruction();
-		if (source == nullptr || component >= 2u) {
+		const auto component = index.U32();
+		if (component >= 2u) {
 			return Fail(error, "unsupported composite runtime source");
 		}
-		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-			return EvaluateWide(source->Arg(component), result, error);
-		}
-		if (source->GetOpcode() == ValueOpcode::UnpackUint2x32) {
+		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
 			uint64_t packed = 0;
-			if (!Arg(*source, 0, packed, error)) {
+			if (!Arg(inst, 0, packed, error)) {
 				return false;
 			}
 			result = static_cast<uint32_t>(packed >> (component * 32u));
 			return true;
+		}
+		const auto* source = inst.Arg(0).ResolveInstruction();
+		if (source == nullptr) {
+			return Fail(error, "unsupported composite runtime source");
+		}
+		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+			return EvaluateWide(source->Arg(component), result, error);
 		}
 		if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
 			uint64_t lhs = 0;
@@ -596,17 +597,15 @@ private:
 			}
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result, error);
+			case ValueOpcode::CompositeExtractU64:
 			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result, error);
-			case ValueOpcode::PackUint2x32: {
-				const auto* pair = inst.Arg(0).ResolveInstruction();
-				if (pair == nullptr || pair->GetOpcode() != ValueOpcode::CompositeConstructU32x2 ||
-				    !Arg(*pair, 0, a, error) || !Arg(*pair, 1, b, error)) {
-					return Fail(error, "unsupported packed runtime value");
+			case ValueOpcode::CompositeConstructU64:
+				if (!binary()) {
+					return false;
 				}
 				result = static_cast<uint32_t>(a) |
 				         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 				return true;
-			}
 			case ValueOpcode::ReadConst: {
 				const auto slot = inst.Arg(1).Resolve();
 				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
@@ -684,12 +683,6 @@ private:
 			case ValueOpcode::BitwiseOr32:
 				if (binary()) {
 					result = static_cast<uint32_t>(a | b);
-					return true;
-				}
-				return false;
-			case ValueOpcode::BitwiseOr64:
-				if (binary()) {
-					result = a | b;
 					return true;
 				}
 				return false;

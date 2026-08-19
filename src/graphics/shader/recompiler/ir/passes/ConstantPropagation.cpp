@@ -170,6 +170,10 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	}
 	const auto  component = index.U32();
 	const auto* producer  = composite.TryInstruction();
+	if (IsImmediate(composite, Type::U64)) {
+		Replace(inst, Value(static_cast<uint32_t>(composite.U64() >> (component * 32u))));
+		return true;
+	}
 	if (producer != nullptr && producer->GetOpcode() == construct) {
 		Replace(inst, producer->Arg(component));
 		return true;
@@ -182,14 +186,6 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 			const auto sum = static_cast<uint64_t>(lhs.U32()) + rhs.U32();
 			Replace(inst, Value(component == 0u ? static_cast<uint32_t>(sum)
 			                                    : static_cast<uint32_t>(sum >> 32u)));
-			return true;
-		}
-	}
-	if (component < 2u && producer != nullptr &&
-	    producer->GetOpcode() == ValueOpcode::UnpackUint2x32) {
-		const auto packed = producer->Arg(0).Resolve();
-		if (IsImmediate(packed, Type::U64)) {
-			Replace(inst, Value(static_cast<uint32_t>(packed.U64() >> (component * 32u))));
 			return true;
 		}
 	}
@@ -284,6 +280,9 @@ void FoldInstruction(Inst& inst) {
 			}
 			return;
 		}
+		case ValueOpcode::CompositeExtractU64:
+			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU64, 2);
+			return;
 		case ValueOpcode::CompositeExtractU32x2:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x2, 2);
 			return;
@@ -293,27 +292,12 @@ void FoldInstruction(Inst& inst) {
 		case ValueOpcode::CompositeExtractU32x4:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x4, 4);
 			return;
-		case ValueOpcode::PackUint2x32: {
-			const auto  value    = Arg(inst, 0);
-			const auto* producer = value.TryInstruction();
-			if (producer != nullptr && producer->GetOpcode() == ValueOpcode::UnpackUint2x32) {
-				Replace(inst, producer->Arg(0));
-			} else if (producer != nullptr &&
-			           producer->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-				const auto low  = producer->Arg(0).Resolve();
-				const auto high = producer->Arg(1).Resolve();
-				if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
-					Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
-					                    (static_cast<uint64_t>(high.U32()) << 32u)));
-				}
-			}
-			return;
-		}
-		case ValueOpcode::UnpackUint2x32: {
-			const auto  value    = Arg(inst, 0);
-			const auto* producer = value.TryInstruction();
-			if (producer != nullptr && producer->GetOpcode() == ValueOpcode::PackUint2x32) {
-				Replace(inst, producer->Arg(0));
+		case ValueOpcode::CompositeConstructU64: {
+			const auto low  = Arg(inst, 0);
+			const auto high = Arg(inst, 1);
+			if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
+				Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
+				                    (static_cast<uint64_t>(high.U32()) << 32u)));
 			}
 			return;
 		}
@@ -367,8 +351,8 @@ void FoldInstruction(Inst& inst) {
 				};
 				const auto low  = expand(static_cast<uint32_t>(value.U64()));
 				const auto high = expand(static_cast<uint32_t>(value.U64() >> 32u));
-				Replace(inst, Value(static_cast<uint64_t>(low) |
-				                    (static_cast<uint64_t>(high) << 32u)));
+				Replace(inst,
+				        Value(static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32u)));
 			}
 			return;
 		}
@@ -459,11 +443,6 @@ void FoldInstruction(Inst& inst) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
 			    })) {
 				ReplaceBinaryIdentity(inst, Type::U32, 0u);
-			}
-			return;
-		case ValueOpcode::BitwiseOr64:
-			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a | b; })) {
-				ReplaceBinaryIdentity(inst, Type::U64, 0u);
 			}
 			return;
 		case ValueOpcode::BitwiseNot32: {

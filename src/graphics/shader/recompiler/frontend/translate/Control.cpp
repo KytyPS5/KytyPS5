@@ -27,7 +27,7 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 			const auto result_high =
 			    inst.op == IR::Opcode::SaveexecB64 ? apply(old_high, src_high) : old_high;
 			if (inst.op == IR::Opcode::SaveexecB64) {
-				WriteOperand(inst.dst, ir.PackUint2x32(old_low, old_high));
+				WriteU32Pair(inst.dst, {old_low, old_high});
 			} else {
 				WriteOperand(inst.dst, old_low);
 			}
@@ -157,12 +157,11 @@ bool Translator::TranslateMove(const IR::Instruction& inst) {
 			WriteOperand(inst.dst, ReadOperand(inst.src[0], IR::Type::F32));
 			return true;
 		case IR::Opcode::MoveU64: {
-			const bool scalar_pair = inst.dst.kind == IR::OperandKind::Register &&
-			                         inst.src[0].kind == IR::OperandKind::Register &&
-			                         inst.dst.reg.file == IR::RegisterFile::Scalar &&
-			                         inst.src[0].reg.file == IR::RegisterFile::Scalar;
-			WriteOperand(inst.dst, ReadOperand(inst.src[0], IR::Type::U64));
-			if (scalar_pair) {
+			WriteU32Pair(inst.dst, ReadU32Pair(inst.src[0]));
+			if (inst.dst.kind == IR::OperandKind::Register &&
+			    inst.src[0].kind == IR::OperandKind::Register &&
+			    inst.dst.reg.file == IR::RegisterFile::Scalar &&
+			    inst.src[0].reg.file == IR::RegisterFile::Scalar) {
 				ir.SetThreadBitScalarReg(
 				    static_cast<IR::ScalarReg>(inst.dst.reg.index),
 				    ir.GetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.src[0].reg.index)));
@@ -171,8 +170,8 @@ bool Translator::TranslateMove(const IR::Instruction& inst) {
 		}
 		case IR::Opcode::WqmB64: {
 			if (!current_per_invocation_masks) {
-				const auto result = IR::U64(ir.Emit(
-				    IR::ValueOpcode::WqmU64, {ReadOperand(inst.src[0], IR::Type::U64)}));
+				const auto result = IR::U64(
+				    ir.Emit(IR::ValueOpcode::WqmU64, {ReadOperand(inst.src[0], IR::Type::U64)}));
 				WriteOperand(inst.dst, result);
 				ir.SetScc(IR::U1(
 				    ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));

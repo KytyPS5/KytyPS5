@@ -39,23 +39,22 @@ Pair ExtractPair(EmitterState& state, uint32_t value) {
 
 uint32_t MakePair(EmitterState& state, uint32_t low, uint32_t high) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpCompositeConstruct, TypeU32Pair(state), result, low, high});
+	state.builder.AddFunction({OpCompositeConstruct, TypeU64(state), result, low, high});
 	return result;
 }
 
-uint32_t Compare64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
-                   uint32_t high_compare, uint32_t low_compare, bool equal_compare = false,
-                   bool not_equal = false) {
-	const auto lhs        = ExtractPair(state, lhs_value);
-	const auto rhs        = ExtractPair(state, rhs_value);
-	const auto high_equal = NewBinary(state, OpIEqual, TypeBool(state), lhs.high, rhs.high);
-	const auto low_equal  = NewBinary(state, OpIEqual, TypeBool(state), lhs.low, rhs.low);
-	if (equal_compare) {
-		return NewBinary(
-		    state, not_equal ? OpLogicalOr : OpLogicalAnd, TypeBool(state),
-		    not_equal ? NewUnary(state, OpLogicalNot, TypeBool(state), high_equal) : high_equal,
-		    not_equal ? NewUnary(state, OpLogicalNot, TypeBool(state), low_equal) : low_equal);
-	}
+uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
+                        bool not_equal) {
+	const auto compare = NewBinary(state, not_equal ? OpINotEqual : OpIEqual,
+	                               TypeBoolVector(state, 2), lhs_value, rhs_value);
+	return NewUnary(state, not_equal ? OpAny : OpAll, TypeBool(state), compare);
+}
+
+uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
+                          uint32_t high_compare, uint32_t low_compare) {
+	const auto lhs         = ExtractPair(state, lhs_value);
+	const auto rhs         = ExtractPair(state, rhs_value);
+	const auto high_equal  = NewBinary(state, OpIEqual, TypeBool(state), lhs.high, rhs.high);
 	const auto high_result = NewBinary(state, high_compare, TypeBool(state), lhs.high, rhs.high);
 	const auto low_result  = NewBinary(state, low_compare, TypeBool(state), lhs.low, rhs.low);
 	const auto low_path = NewBinary(state, OpLogicalAnd, TypeBool(state), high_equal, low_result);
@@ -63,12 +62,17 @@ uint32_t Compare64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
 }
 
 uint32_t EmitAdd64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) {
-	const auto lhs   = ExtractPair(state, lhs_value);
-	const auto rhs   = ExtractPair(state, rhs_value);
-	const auto carry = EmitAddCarryValues(state, lhs.low, rhs.low, ConstantU32(state, 0));
+	const auto lhs      = ExtractPair(state, lhs_value);
+	const auto rhs      = ExtractPair(state, rhs_value);
+	const auto low_pair = state.builder.AllocateId();
+	const auto low      = state.builder.AllocateId();
+	const auto carry    = state.builder.AllocateId();
+	state.builder.AddFunction({OpIAddCarry, TypeU32Pair(state), low_pair, lhs.low, rhs.low});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, low_pair, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), carry, low_pair, 1});
 	const auto high0 = NewBinary(state, OpIAdd, TypeU32(state), lhs.high, rhs.high);
-	const auto high  = NewBinary(state, OpIAdd, TypeU32(state), high0, carry.carry);
-	return MakePair(state, carry.sum, high);
+	const auto high  = NewBinary(state, OpIAdd, TypeU32(state), high0, carry);
+	return MakePair(state, low, high);
 }
 
 uint32_t EmitSub64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) {
@@ -112,14 +116,6 @@ uint32_t EmitMul64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) 
 	                          NewBinary(state, OpIAdd, TypeU32(state), high0, high1), high2));
 }
 
-uint32_t EmitBitwise64(EmitterState& state, uint32_t opcode, uint32_t lhs_value,
-                       uint32_t rhs_value) {
-	const auto lhs = ExtractPair(state, lhs_value);
-	const auto rhs = ExtractPair(state, rhs_value);
-	return MakePair(state, NewBinary(state, opcode, TypeU32(state), lhs.low, rhs.low),
-	                NewBinary(state, opcode, TypeU32(state), lhs.high, rhs.high));
-}
-
 uint32_t EmitShift64(EmitterState& state, uint32_t opcode, uint32_t value, uint32_t shift) {
 	const auto pair = ExtractPair(state, value);
 	uint32_t   low  = 0;
@@ -129,35 +125,77 @@ uint32_t EmitShift64(EmitterState& state, uint32_t opcode, uint32_t value, uint3
 	} else if (opcode == OpShiftRightLogical) {
 		EmitShiftRightLogicalU64Values(state, pair.low, pair.high, shift, low, high);
 	} else {
-		const auto logical      = EmitShift64(state, OpShiftRightLogical, value, shift);
-		const auto logical_pair = ExtractPair(state, logical);
-		const auto sign =
-		    NewBinary(state, OpSLessThan, TypeBool(state), pair.high, ConstantU32(state, 0));
-		const auto inverse =
-		    NewBinary(state, OpISub, TypeU32(state), ConstantU32(state, 64), shift);
-		const auto fill = NewBinary(state, OpShiftLeftLogical, TypeU32(state),
-		                            ConstantU32(state, 0xffffffffu), inverse);
-		const auto high_shift =
-		    NewBinary(state, OpISub, TypeU32(state), shift, ConstantU32(state, 32));
-		const auto high_fill = NewSelect(
-		    state, TypeU32(state),
-		    NewBinary(state, OpUGreaterThanEqual, TypeBool(state), shift, ConstantU32(state, 32)),
-		    ConstantU32(state, 0xffffffffu), fill);
-		const auto fill_low =
-		    NewSelect(state, TypeU32(state), sign,
-		              NewSelect(state, TypeU32(state),
-		                        NewBinary(state, OpUGreaterThanEqual, TypeBool(state), shift,
-		                                  ConstantU32(state, 32)),
-		                        NewBinary(state, OpShiftLeftLogical, TypeU32(state),
-		                                  ConstantU32(state, 0xffffffffu), high_shift),
-		                        ConstantU32(state, 0)),
+		const auto amount =
+		    NewBinary(state, OpBitwiseAnd, TypeU32(state), shift, ConstantU32(state, 63));
+		const auto word_shift =
+		    NewBinary(state, OpBitwiseAnd, TypeU32(state), amount, ConstantU32(state, 31));
+		const auto at_least_32 =
+		    NewBinary(state, OpUGreaterThanEqual, TypeBool(state), amount, ConstantU32(state, 32));
+		const auto nonzero =
+		    NewBinary(state, OpINotEqual, TypeBool(state), amount, ConstantU32(state, 0));
+		const auto high_shifted =
+		    NewBinary(state, OpShiftRightArithmetic, TypeU32(state), pair.high, word_shift);
+		const auto low_shifted =
+		    NewBinary(state, OpShiftRightLogical, TypeU32(state), pair.low, word_shift);
+		const auto carry_count =
+		    NewBinary(state, OpBitwiseAnd, TypeU32(state),
+		              NewBinary(state, OpISub, TypeU32(state), ConstantU32(state, 32), word_shift),
+		              ConstantU32(state, 31));
+		const auto carry =
+		    NewSelect(state, TypeU32(state), nonzero,
+		              NewBinary(state, OpShiftLeftLogical, TypeU32(state), pair.high, carry_count),
 		              ConstantU32(state, 0));
-		const auto fill_high =
-		    NewSelect(state, TypeU32(state), sign, high_fill, ConstantU32(state, 0));
-		return MakePair(
-		    state, NewBinary(state, OpBitwiseOr, TypeU32(state), logical_pair.low, fill_low),
-		    NewBinary(state, OpBitwiseOr, TypeU32(state), logical_pair.high, fill_high));
+		const auto low_below_32 = NewBinary(state, OpBitwiseOr, TypeU32(state), low_shifted, carry);
+		const auto negative =
+		    NewBinary(state, OpSLessThan, TypeBool(state), pair.high, ConstantU32(state, 0));
+		const auto sign_fill = NewSelect(state, TypeU32(state), negative,
+		                                 ConstantU32(state, 0xffffffffu), ConstantU32(state, 0));
+		return MakePair(state,
+		                NewSelect(state, TypeU32(state), at_least_32, high_shifted, low_below_32),
+		                NewSelect(state, TypeU32(state), at_least_32, sign_fill, high_shifted));
 	}
+	return MakePair(state, low, high);
+}
+
+uint32_t EmitConstantShift64(EmitterState& state, uint32_t opcode, uint32_t value, uint32_t shift) {
+	shift &= 63u;
+	if (shift == 0u) {
+		return value;
+	}
+	const auto pair = ExtractPair(state, value);
+	if (opcode == OpShiftLeftLogical) {
+		if (shift < 32u) {
+			const auto low  = NewBinary(state, OpShiftLeftLogical, TypeU32(state), pair.low,
+			                            ConstantU32(state, shift));
+			const auto high = NewBinary(state, OpBitwiseOr, TypeU32(state),
+			                            NewBinary(state, OpShiftLeftLogical, TypeU32(state),
+			                                      pair.high, ConstantU32(state, shift)),
+			                            NewBinary(state, OpShiftRightLogical, TypeU32(state),
+			                                      pair.low, ConstantU32(state, 32u - shift)));
+			return MakePair(state, low, high);
+		}
+		return MakePair(state, ConstantU32(state, 0),
+		                shift == 32u ? pair.low
+		                             : NewBinary(state, OpShiftLeftLogical, TypeU32(state),
+		                                         pair.low, ConstantU32(state, shift - 32u)));
+	}
+	if (shift < 32u) {
+		const auto low = NewBinary(state, OpBitwiseOr, TypeU32(state),
+		                           NewBinary(state, OpShiftRightLogical, TypeU32(state), pair.low,
+		                                     ConstantU32(state, shift)),
+		                           NewBinary(state, OpShiftLeftLogical, TypeU32(state), pair.high,
+		                                     ConstantU32(state, 32u - shift)));
+		const auto high =
+		    NewBinary(state, opcode, TypeU32(state), pair.high, ConstantU32(state, shift));
+		return MakePair(state, low, high);
+	}
+	const auto high = opcode == OpShiftRightArithmetic
+	                      ? NewBinary(state, OpShiftRightArithmetic, TypeU32(state), pair.high,
+	                                  ConstantU32(state, 31u))
+	                      : ConstantU32(state, 0);
+	const auto low  = shift == 32u ? pair.high
+	                               : NewBinary(state, opcode, TypeU32(state), pair.high,
+	                                           ConstantU32(state, shift - 32u));
 	return MakePair(state, low, high);
 }
 
@@ -285,8 +323,6 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::BitCastF16U16:
 		case IR::ValueOpcode::ConvertU32U16:
 		case IR::ValueOpcode::ConvertU32U8:
-		case IR::ValueOpcode::PackUint2x32:
-		case IR::ValueOpcode::UnpackUint2x32: ctx.Define(inst, ctx.Arg(inst, 0)); return true;
 		case IR::ValueOpcode::BitCastU32F32: return unary(OpBitcast, IR::Type::U32);
 		case IR::ValueOpcode::BitCastF32U32: return unary(OpBitcast, IR::Type::F32);
 		case IR::ValueOpcode::ConvertU16U32:
@@ -319,6 +355,10 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		case IR::ValueOpcode::ConvertF32U32: return unary(OpConvertUToF, IR::Type::F32);
+		case IR::ValueOpcode::CompositeConstructU64:
+			ctx.Emit(inst, OpCompositeConstruct, IR::Type::U64,
+			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
+			return true;
 		case IR::ValueOpcode::CompositeConstructU32x2:
 			ctx.Emit(inst, OpCompositeConstruct, IR::Type::U32x2,
 			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
@@ -335,6 +375,7 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Emit(inst, OpCompositeConstruct, IR::Type::U32x4,
 			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3)});
 			return true;
+		case IR::ValueOpcode::CompositeExtractU64:
 		case IR::ValueOpcode::CompositeExtractU32x2:
 		case IR::ValueOpcode::CompositeExtractU32x3:
 		case IR::ValueOpcode::CompositeExtractU32x4:
@@ -429,15 +470,25 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::ShiftRightArithmetic32:
 			return binary(OpShiftRightArithmetic, IR::Type::U32);
 		case IR::ValueOpcode::ShiftLeftLogical64:
-			ctx.Define(inst,
-			           EmitShift64(state, OpShiftLeftLogical, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
+			ctx.Define(inst, inst.Arg(1).Resolve().IsImmediate()
+			                     ? EmitConstantShift64(state, OpShiftLeftLogical, ctx.Arg(inst, 0),
+			                                           inst.Arg(1).Resolve().U32())
+			                     : EmitShift64(state, OpShiftLeftLogical, ctx.Arg(inst, 0),
+			                                   ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::ShiftRightLogical64:
-			ctx.Define(inst,
-			           EmitShift64(state, OpShiftRightLogical, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
+			ctx.Define(inst, inst.Arg(1).Resolve().IsImmediate()
+			                     ? EmitConstantShift64(state, OpShiftRightLogical, ctx.Arg(inst, 0),
+			                                           inst.Arg(1).Resolve().U32())
+			                     : EmitShift64(state, OpShiftRightLogical, ctx.Arg(inst, 0),
+			                                   ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::ShiftRightArithmetic64:
-			ctx.Define(inst, EmitShift64(state, OpShiftRightArithmetic, ctx.Arg(inst, 0),
+			ctx.Define(inst,
+			           inst.Arg(1).Resolve().IsImmediate()
+			               ? EmitConstantShift64(state, OpShiftRightArithmetic, ctx.Arg(inst, 0),
+			                                     inst.Arg(1).Resolve().U32())
+			               : EmitShift64(state, OpShiftRightArithmetic, ctx.Arg(inst, 0),
 			                             ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::BitwiseAnd32: return binary(OpBitwiseAnd, IR::Type::U32);
@@ -445,19 +496,15 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::BitwiseXor32: return binary(OpBitwiseXor, IR::Type::U32);
 		case IR::ValueOpcode::BitwiseNot32: return unary(OpNot, IR::Type::U32);
 		case IR::ValueOpcode::BitwiseAnd64:
-			ctx.Define(inst,
-			           EmitBitwise64(state, OpBitwiseAnd, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::BitwiseOr64:
-			ctx.Define(inst, EmitBitwise64(state, OpBitwiseOr, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
+			ctx.Define(inst, NewBinary(state, OpBitwiseAnd, TypeU64(state), ctx.Arg(inst, 0),
+			                           ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::BitReverse32: return unary(OpBitReverse, IR::Type::U32);
 		case IR::ValueOpcode::BitCount32: return unary(OpBitCount, IR::Type::U32);
 		case IR::ValueOpcode::BitCount64: {
-			const auto pair = ExtractPair(state, ctx.Arg(inst, 0));
-			ctx.Define(inst, NewBinary(state, OpIAdd, TypeU32(state),
-			                           NewUnary(state, OpBitCount, TypeU32(state), pair.low),
-			                           NewUnary(state, OpBitCount, TypeU32(state), pair.high)));
+			const auto pair =
+			    ExtractPair(state, NewUnary(state, OpBitCount, TypeU64(state), ctx.Arg(inst, 0)));
+			ctx.Define(inst, NewBinary(state, OpIAdd, TypeU32(state), pair.low, pair.high));
 			return true;
 		}
 		case IR::ValueOpcode::FindILsb32: {
@@ -527,53 +574,43 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::SGreaterThanEqual32: return binary(OpSGreaterThanEqual, IR::Type::U1);
 		case IR::ValueOpcode::UGreaterThanEqual32: return binary(OpUGreaterThanEqual, IR::Type::U1);
 		case IR::ValueOpcode::IEqual64:
-			ctx.Define(inst,
-			           Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), 0, 0, true, false));
+			ctx.Define(inst, CompareEqual64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
 			return true;
 		case IR::ValueOpcode::INotEqual64:
-			ctx.Define(inst,
-			           Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), 0, 0, true, true));
+			ctx.Define(inst, CompareEqual64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), true));
 			return true;
 		case IR::ValueOpcode::ULessThan64:
-			ctx.Define(inst, Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), OpULessThan,
-			                           OpULessThan));
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpULessThan, OpULessThan));
 			return true;
 		case IR::ValueOpcode::SLessThan64:
-			ctx.Define(inst, Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), OpSLessThan,
-			                           OpULessThan));
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpSLessThan, OpULessThan));
 			return true;
 		case IR::ValueOpcode::UGreaterThan64:
-			ctx.Define(inst, Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), OpUGreaterThan,
-			                           OpUGreaterThan));
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpUGreaterThan, OpUGreaterThan));
 			return true;
 		case IR::ValueOpcode::SGreaterThan64:
-			ctx.Define(inst, Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), OpSGreaterThan,
-			                           OpUGreaterThan));
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpSGreaterThan, OpUGreaterThan));
 			return true;
-		case IR::ValueOpcode::ULessThanEqual64: {
-			const auto greater = Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                               OpUGreaterThan, OpUGreaterThan);
-			ctx.Define(inst, NewUnary(state, OpLogicalNot, TypeBool(state), greater));
+		case IR::ValueOpcode::ULessThanEqual64:
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpULessThan, OpULessThanEqual));
 			return true;
-		}
-		case IR::ValueOpcode::SLessThanEqual64: {
-			const auto greater = Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                               OpSGreaterThan, OpUGreaterThan);
-			ctx.Define(inst, NewUnary(state, OpLogicalNot, TypeBool(state), greater));
+		case IR::ValueOpcode::SLessThanEqual64:
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpSLessThan, OpULessThanEqual));
 			return true;
-		}
-		case IR::ValueOpcode::UGreaterThanEqual64: {
-			const auto less =
-			    Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), OpULessThan, OpULessThan);
-			ctx.Define(inst, NewUnary(state, OpLogicalNot, TypeBool(state), less));
+		case IR::ValueOpcode::UGreaterThanEqual64:
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpUGreaterThan, OpUGreaterThanEqual));
 			return true;
-		}
-		case IR::ValueOpcode::SGreaterThanEqual64: {
-			const auto less =
-			    Compare64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), OpSLessThan, OpULessThan);
-			ctx.Define(inst, NewUnary(state, OpLogicalNot, TypeBool(state), less));
+		case IR::ValueOpcode::SGreaterThanEqual64:
+			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+			                                  OpSGreaterThan, OpUGreaterThanEqual));
 			return true;
-		}
 		case IR::ValueOpcode::LogicalOr: return binary(OpLogicalOr, IR::Type::U1);
 		case IR::ValueOpcode::LogicalAnd: return binary(OpLogicalAnd, IR::Type::U1);
 		case IR::ValueOpcode::LogicalXor: return binary(OpLogicalNotEqual, IR::Type::U1);

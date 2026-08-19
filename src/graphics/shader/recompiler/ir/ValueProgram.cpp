@@ -317,9 +317,9 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					return Fail(error, fmt::format("{} has an invalid memory-info index",
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
-				const auto& memory = program.memory_info[memory_index];
-				const bool scalar_buffer = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
-				const bool scalar_address = memory.kind == ResourceKind::ScalarAddress;
+				const auto& memory         = program.memory_info[memory_index];
+				const bool  scalar_buffer  = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+				const bool  scalar_address = memory.kind == ResourceKind::ScalarAddress;
 				if ((scalar_buffer && memory.kind != ResourceKind::ScalarBuffer) ||
 				    (!scalar_buffer && !scalar_address && memory.kind != ResourceKind::Flat &&
 				     memory.kind != ResourceKind::Global && memory.kind != ResourceKind::Scratch)) {
@@ -328,12 +328,13 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				}
 				const bool scalar_memory = scalar_buffer || scalar_address;
 				const bool valid_group_width =
-				    scalar_memory ? memory.component_count == 1u || memory.component_count == 2u ||
-				                        memory.component_count == 4u || memory.component_count == 8u ||
-				                        memory.component_count == 16u
-				                  : memory.component_count >= 1u && memory.component_count <= 4u;
-				if (memory.data_bits != 32u || memory.data_dwords != 1u ||
-				    !valid_group_width || memory.component_index >= memory.component_count) {
+				    scalar_memory
+				        ? memory.component_count == 1u || memory.component_count == 2u ||
+				              memory.component_count == 4u || memory.component_count == 8u ||
+				              memory.component_count == 16u
+				        : memory.component_count >= 1u && memory.component_count <= 4u;
+				if (memory.data_bits != 32u || memory.data_dwords != 1u || !valid_group_width ||
+				    memory.component_index >= memory.component_count) {
 					return Fail(error, fmt::format("{} has inconsistent scalar-memory metadata",
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
@@ -395,6 +396,7 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 			}
 			uint32_t composite_components = 0u;
 			switch (inst.GetOpcode()) {
+				case ValueOpcode::CompositeExtractU64: composite_components = 2u; break;
 				case ValueOpcode::CompositeExtractU32x2: composite_components = 2u; break;
 				case ValueOpcode::CompositeExtractU32x3: composite_components = 3u; break;
 				case ValueOpcode::CompositeExtractU32x4: composite_components = 4u; break;

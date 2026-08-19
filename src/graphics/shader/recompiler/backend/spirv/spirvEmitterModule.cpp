@@ -16,8 +16,16 @@ uint32_t TypeBool(EmitterState& state) {
 	return state.builder.Type(OpTypeBool);
 }
 
+uint32_t TypeBoolVector(EmitterState& state, uint32_t components) {
+	return state.builder.Type(OpTypeVector, {TypeBool(state), components});
+}
+
 uint32_t TypeU32(EmitterState& state) {
 	return state.builder.Type(OpTypeInt, {32, 0});
+}
+
+uint32_t TypeU64(EmitterState& state) {
+	return TypeU32Vector(state, 2);
 }
 
 uint32_t TypeU32Pair(EmitterState& state) {
@@ -241,7 +249,7 @@ uint32_t ConstantBool(EmitterState& state, bool value) {
 }
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(OpConstantComposite, TypeU32Pair(state),
+	return state.builder.Constant(OpConstantComposite, TypeU64(state),
 	                              {ConstantU32(state, static_cast<uint32_t>(value)),
 	                               ConstantU32(state, static_cast<uint32_t>(value >> 32u))});
 }

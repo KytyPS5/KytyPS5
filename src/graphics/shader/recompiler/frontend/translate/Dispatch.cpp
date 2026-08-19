@@ -6,7 +6,8 @@ bool Translator::TranslateU64MaskOperation(const IR::Instruction& inst) {
 	if (current_per_invocation_masks) {
 		return TranslatePerInvocationU64Mask(inst);
 	}
-	return inst.op == IR::Opcode::BitwiseAndU64 || inst.op == IR::Opcode::BitwiseOrU64
+	return inst.op == IR::Opcode::BitwiseAndU64 || inst.op == IR::Opcode::BitwiseOrU64 ||
+	               inst.op == IR::Opcode::BitwiseXorU64 || inst.op == IR::Opcode::BitwiseNotU64
 	           ? TranslateSimpleInteger(inst)
 	           : TranslateComposedInteger(inst);
 }

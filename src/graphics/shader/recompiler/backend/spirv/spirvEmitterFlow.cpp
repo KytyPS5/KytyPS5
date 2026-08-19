@@ -39,13 +39,22 @@ uint32_t EmitWqmWordU32(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
-	const auto low  = state.builder.AllocateId();
-	const auto high = state.builder.AllocateId();
-	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, value, 0});
-	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, value, 1});
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpCompositeConstruct, TypeU32Pair(state), result,
-	                           EmitWqmWordU32(state, low), EmitWqmWordU32(state, high)});
+	const auto shifted_one = state.builder.AllocateId();
+	const auto merged_one  = state.builder.AllocateId();
+	const auto shifted_two = state.builder.AllocateId();
+	const auto merged_two  = state.builder.AllocateId();
+	const auto quad_bits   = state.builder.AllocateId();
+	const auto result      = state.builder.AllocateId();
+	state.builder.AddFunction({OpShiftRightLogical, TypeU64(state), shifted_one, value,
+	                           ConstantU64(state, 0x0000000100000001ull)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), merged_one, value, shifted_one});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU64(state), shifted_two, merged_one,
+	                           ConstantU64(state, 0x0000000200000002ull)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), merged_two, merged_one, shifted_two});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU64(state), quad_bits, merged_two,
+	                           ConstantU64(state, 0x1111111111111111ull)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU64(state), result, quad_bits, ConstantU64(state, 0x0000000f0000000full)});
 	return result;
 }
 

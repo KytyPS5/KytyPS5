@@ -182,6 +182,8 @@ enum : uint32_t {
 	OpIAddCarry                    = 149,
 	OpUMulExtended                 = 151,
 	OpSMulExtended                 = 152,
+	OpAny                          = 154,
+	OpAll                          = 155,
 	OpLogicalNotEqual              = 165,
 	OpLogicalOr                    = 166,
 	OpLogicalAnd                   = 167,
@@ -337,7 +339,9 @@ struct EmitterState {
 
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
+uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
+uint32_t TypeU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -504,11 +508,6 @@ constexpr uint32_t ImageSpirvArrayed(ImageViewKind view) {
 constexpr uint32_t ImageSpirvMultisampled(ImageViewKind view) {
 	return view == ImageViewKind::Dim2DMsaa || view == ImageViewKind::Dim2DMsaaArray ? 1u : 0u;
 }
-
-struct AddCarryResult {
-	uint32_t sum   = 0;
-	uint32_t carry = 0;
-};
 
 struct F32Class {
 	uint32_t bits       = 0;
@@ -730,8 +729,6 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 uint32_t EmitSelectValueU32(EmitterState& state, uint32_t cond, uint32_t true_value,
                             uint32_t false_value);
 
-uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
-
 void EmitShiftLeftLogicalU64Values(EmitterState& state, uint32_t low, uint32_t high, uint32_t shift,
                                    uint32_t& out_low, uint32_t& out_high);
 
@@ -739,9 +736,6 @@ void EmitShiftRightLogicalU64Values(EmitterState& state, uint32_t low, uint32_t 
                                     uint32_t shift, uint32_t& out_low, uint32_t& out_high);
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
-
-AddCarryResult EmitAddCarryValues(EmitterState& state, uint32_t lhs, uint32_t rhs,
-                                  uint32_t carry_in);
 
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
 

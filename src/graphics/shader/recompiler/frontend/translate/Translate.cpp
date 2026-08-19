@@ -87,10 +87,7 @@ IR::U32 Translator::ReadPcRelativeU32(const IR::Operand& operand) {
 	const auto address =
 	    ir.Emit(IR::ValueOpcode::IAdd64, {ir.Emit(IR::ValueOpcode::GetShaderBase),
 	                                      IR::Value(static_cast<uint64_t>(operand.imm))});
-	const auto pair = ir.Emit(IR::ValueOpcode::UnpackUint2x32, {address});
-	return IR::U32(
-	    ir.Emit(IR::ValueOpcode::CompositeExtractU32x2,
-	            {pair, IR::Value(operand.kind == IR::OperandKind::PcRelativeU32 ? 0u : 1u)}));
+	return ir.CompositeExtract(address, operand.kind == IR::OperandKind::PcRelativeU32 ? 0u : 1u);
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
@@ -205,22 +202,8 @@ IR::Value Translator::ReadOperand(const IR::Operand& operand, IR::Type type) {
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 	if (type == IR::Type::U64) {
-		if (operand.kind == IR::OperandKind::Register &&
-		    operand.reg.file == IR::RegisterFile::Exec) {
-			return ir.PackUint2x32(ir.GetExecLo(), ir.GetExecHi());
-		}
-		if (operand.kind == IR::OperandKind::Register &&
-		    operand.reg.file == IR::RegisterFile::Vcc) {
-			return ir.PackUint2x32(ir.GetVccLo(), ir.GetVccHi());
-		}
-		const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
-		IR::U32    high(IR::Value(0u));
-		if (operand.kind == IR::OperandKind::Register) {
-			high = ReadRawU32(OffsetOperand(operand, 1));
-		} else if (operand.kind == IR::OperandKind::ImmediateU32 && operand.sext_64) {
-			high = IR::U32(IR::Value(0xffffffffu));
-		}
-		return ir.PackUint2x32(low, high);
+		const auto pair = ReadU32Pair(operand);
+		return ir.ConstructU64(pair[0], pair[1]);
 	}
 	auto bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	if (TypesOverlap(type, IR::Type::F32) && !TypesOverlap(type, IR::Type::U32)) {
@@ -396,31 +379,7 @@ void Translator::WriteOperand(const IR::Operand& operand, IR::Value value) {
 		return;
 	}
 	if (type == IR::Type::U64) {
-		const auto unpacked = ir.Emit(IR::ValueOpcode::UnpackUint2x32, {value});
-		const auto low      = ir.CompositeExtract(unpacked, 0);
-		const auto high     = ir.CompositeExtract(unpacked, 1);
-		if (operand.kind == IR::OperandKind::Register) {
-			const auto thread_bit = ThreadBit(low, high);
-			switch (operand.reg.file) {
-				case IR::RegisterFile::Exec:
-					ir.SetExec(thread_bit);
-					ir.SetExecLo(low);
-					ir.SetExecHi(high);
-					return;
-				case IR::RegisterFile::Vcc:
-					ir.SetVcc(thread_bit);
-					ir.SetVccLo(low);
-					ir.SetVccHi(high);
-					return;
-				case IR::RegisterFile::Scalar:
-					ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(operand.reg.index),
-					                         thread_bit);
-					break;
-				default: break;
-			}
-		}
-		WriteRawU32(operand, low);
-		WriteRawU32(OffsetOperand(operand, 1), high);
+		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
 		return;
 	}
 	if (type == IR::Type::F32) {
@@ -472,6 +431,25 @@ void Translator::WriteU16(const IR::Operand& operand, IR::U32 value) {
 
 IR::U32 Translator::ReadU32(const IR::Operand& operand) {
 	return IR::U32(ReadOperand(operand, IR::Type::U32));
+}
+
+std::array<IR::U32, 2> Translator::ReadU32Pair(const IR::Operand& operand) {
+	if (operand.kind == IR::OperandKind::Register) {
+		if (operand.reg.file == IR::RegisterFile::Exec) {
+			return {ir.GetExecLo(), ir.GetExecHi()};
+		}
+		if (operand.reg.file == IR::RegisterFile::Vcc) {
+			return {ir.GetVccLo(), ir.GetVccHi()};
+		}
+	}
+	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
+	IR::U32    high(IR::Value(0u));
+	if (operand.kind == IR::OperandKind::Register) {
+		high = ReadRawU32(OffsetOperand(operand, 1));
+	} else if (operand.kind == IR::OperandKind::ImmediateU32 && operand.sext_64) {
+		high = IR::U32(IR::Value(0xffffffffu));
+	}
+	return {low, high};
 }
 
 IR::U64 Translator::ReadU64(const IR::Operand& operand) {
@@ -560,9 +538,35 @@ IR::U32 Translator::ReadF16LaneBits(const IR::Operand& operand, bool high_lane) 
 	return value;
 }
 
-std::array<IR::U32, 2> Translator::UnpackU64(IR::U64 value) {
-	const auto unpacked = ir.Emit(IR::ValueOpcode::UnpackUint2x32, {value});
-	return {ir.CompositeExtract(unpacked, 0), ir.CompositeExtract(unpacked, 1)};
+std::array<IR::U32, 2> Translator::ExtractU64(IR::U64 value) {
+	return {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)};
+}
+
+void Translator::WriteU32Pair(const IR::Operand& operand, const std::array<IR::U32, 2>& value) {
+	if (operand.kind == IR::OperandKind::Null) {
+		return;
+	}
+	if (operand.kind == IR::OperandKind::Register) {
+		const auto thread_bit = ThreadBit(value[0], value[1]);
+		switch (operand.reg.file) {
+			case IR::RegisterFile::Exec:
+				ir.SetExec(thread_bit);
+				ir.SetExecLo(value[0]);
+				ir.SetExecHi(value[1]);
+				return;
+			case IR::RegisterFile::Vcc:
+				ir.SetVcc(thread_bit);
+				ir.SetVccLo(value[0]);
+				ir.SetVccHi(value[1]);
+				return;
+			case IR::RegisterFile::Scalar:
+				ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(operand.reg.index), thread_bit);
+				break;
+			default: break;
+		}
+	}
+	WriteRawU32(operand, value[0]);
+	WriteRawU32(OffsetOperand(operand, 1), value[1]);
 }
 
 IR::U1 Translator::ThreadBit(IR::U32 low, IR::U32 high) {

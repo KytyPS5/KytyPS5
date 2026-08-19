@@ -83,25 +83,6 @@ uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
 	return ret;
 }
 
-AddCarryResult EmitAddCarryValues(EmitterState& state, uint32_t lhs, uint32_t rhs,
-                                  uint32_t carry_in) {
-	const auto pair0  = state.builder.AllocateId();
-	const auto sum0   = state.builder.AllocateId();
-	const auto carry0 = state.builder.AllocateId();
-	const auto pair1  = state.builder.AllocateId();
-	const auto sum1   = state.builder.AllocateId();
-	const auto carry1 = state.builder.AllocateId();
-	const auto carry  = state.builder.AllocateId();
-	state.builder.AddFunction({OpIAddCarry, TypeU32Pair(state), pair0, lhs, rhs});
-	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), sum0, pair0, 0});
-	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), carry0, pair0, 1});
-	state.builder.AddFunction({OpIAddCarry, TypeU32Pair(state), pair1, sum0, carry_in});
-	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), sum1, pair1, 0});
-	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), carry1, pair1, 1});
-	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), carry, carry0, carry1});
-	return {sum1, carry};
-}
-
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(

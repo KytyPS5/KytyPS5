@@ -3532,6 +3532,50 @@ public:
               null_image && null_repeat == null_image && null_image != exact,
               "typed null-image lookup was not stable");
 
+      constexpr uint64_t extent_alias_offset = 0x2400000;
+      auto narrow_target = sampled;
+      narrow_target.type = BindingType::RenderTarget;
+      narrow_target.info.data = {base + extent_alias_offset, 0x10000};
+      narrow_target.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+      narrow_target.info.guest_format =
+          Prospero::BufferFormat::k16_16_16_16Float;
+      narrow_target.info.extent = {1, 1, 1};
+      narrow_target.info.pitch = 128;
+      narrow_target.info.bytes_per_block = 8;
+      narrow_target.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      narrow_target.info.mip_layout[0] = {0, 0x10000, 128, 1};
+      narrow_target.view_info.format = narrow_target.info.pixel_format;
+      narrow_target.view_info.usage =
+          vk::ImageUsageFlagBits::eColorAttachment;
+      const auto narrow_target_id = texture_cache.FindImage(narrow_target);
+      const auto narrow_target_view =
+          texture_cache.FindRenderTarget(narrow_target_id, narrow_target);
+
+      auto wide_target = narrow_target;
+      wide_target.info.extent.width = 9;
+      const auto wide_target_id = texture_cache.FindImage(wide_target);
+      const auto wide_target_view =
+          texture_cache.FindRenderTarget(wide_target_id, wide_target);
+      const auto wide_owner =
+          TextureCacheTestAccess::Owner(texture_cache, wide_target_id);
+      Require(name, "equal-allocation render-target growth",
+              narrow_target_view != nullptr && wide_target_view != nullptr &&
+                  wide_target_id != narrow_target_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    narrow_target_id) &&
+                  wide_owner != nullptr &&
+                  wide_owner->info.extent == vk::Extent3D{9, 1, 1} &&
+                  wide_owner->backing.extent == vk::Extent3D{9, 1, 1},
+              "a 9x1 render target reused its equal-size 1x1 native backing");
+
+      auto narrow_again = narrow_target;
+      const auto narrow_again_id = texture_cache.FindImage(narrow_again);
+      Require(name, "larger render-target backing reuse",
+              narrow_again_id == wide_target_id &&
+                  texture_cache.GetImage(narrow_again_id).backing.extent ==
+                      vk::Extent3D{9, 1, 1},
+              "a smaller render area replaced its compatible larger backing");
+
       auto MakeLinearDesc =
           [&](uint64_t address, uint64_t size, vk::Format format,
               Prospero::BufferFormat guest_format, Prospero::ImageType type,

@@ -779,6 +779,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			}
 			return {merged_id};
 		}
+		// PPSA08394
+		if (requested.data.size == cached.info.data.size &&
+		    requested.resources == cached.info.resources && requested.type == cached.info.type &&
+		    requested.extent.width > cached.info.extent.width &&
+		    requested.extent.height >= cached.info.extent.height &&
+		    requested.extent.depth >= cached.info.extent.depth &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;

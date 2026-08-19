@@ -1803,7 +1803,8 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 
 			const auto continuation = graph.FindNearestCommonPostDominator(shared, body);
 			const auto* continuation_block = graph.FindBlock(continuation);
-			if (continuation_block == nullptr || continuation == other) {
+			if (continuation_block == nullptr || continuation == other ||
+			    CanReachBefore(graph, other, continuation, UINT32_MAX)) {
 				continue;
 			}
 			std::vector<uint32_t> outer_predecessors;

@@ -7686,14 +7686,23 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
 
 void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   const uint32_t shader[] = {
-      EncodeSopc(0x06, 0, 0), // outer condition
+      EncodeSopc(0x06, 0, 0), // preceding outer condition
+      EncodeSopp(0x04, 6),    // preceding outer -> shared tail or inner
+      EncodeSopc(0x06, 1, 1), // preceding inner condition
+      EncodeSopp(0x04, 2),    // preceding inner -> body or arm
+      EncodeSMovB32(2, 129),  // preceding arm
+      EncodeSopp(0x02, 0),    // preceding arm -> body
+      EncodeSMovB32(3, 129),  // preceding body
+      EncodeSopp(0x02, 0),    // preceding body -> shared tail
+      EncodeSMovB32(4, 129),  // preceding shared tail
+      EncodeSopc(0x06, 5, 5), // outer condition
       EncodeSopp(0x04, 4),    // outer -> right arm or inner condition
-      EncodeSopc(0x06, 1, 1), // inner early-exit condition
+      EncodeSopc(0x06, 6, 6), // inner early-exit condition
       EncodeSopp(0x04, 4),    // inner -> exit or left arm
-      EncodeSMovB32(2, 129),  // left arm
+      EncodeSMovB32(7, 129),  // left arm
       EncodeSopp(0x02, 1),    // left arm -> common tail
-      EncodeSMovB32(3, 129),  // right arm
-      EncodeSMovB32(4, 129),  // common tail
+      EncodeSMovB32(8, 129),  // right arm
+      EncodeSMovB32(9, 129),  // common tail
       0xbf810000u,
   };
 

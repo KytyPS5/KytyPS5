@@ -520,13 +520,6 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::FindUMsb64:
 			ctx.Define(inst, EmitFindMsb64(state, ctx.Arg(inst, 0)));
 			return true;
-		case IR::ValueOpcode::FindSMsb32: {
-			const auto value =
-			    EmitExt(state, TypeI32(state), 74u,
-			            {NewUnary(state, OpBitcast, TypeI32(state), ctx.Arg(inst, 0))});
-			ctx.Define(inst, NewUnary(state, OpBitcast, TypeU32(state), value));
-			return true;
-		}
 		case IR::ValueOpcode::SMin32:
 			ctx.Define(inst, EmitMinMaxI32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
 			return true;
@@ -590,26 +583,6 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::UGreaterThan64:
 			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
 			                                  OpUGreaterThan, OpUGreaterThan));
-			return true;
-		case IR::ValueOpcode::SGreaterThan64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  OpSGreaterThan, OpUGreaterThan));
-			return true;
-		case IR::ValueOpcode::ULessThanEqual64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  OpULessThan, OpULessThanEqual));
-			return true;
-		case IR::ValueOpcode::SLessThanEqual64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  OpSLessThan, OpULessThanEqual));
-			return true;
-		case IR::ValueOpcode::UGreaterThanEqual64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  OpUGreaterThan, OpUGreaterThanEqual));
-			return true;
-		case IR::ValueOpcode::SGreaterThanEqual64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  OpSGreaterThan, OpUGreaterThanEqual));
 			return true;
 		case IR::ValueOpcode::LogicalOr: return binary(OpLogicalOr, IR::Type::U1);
 		case IR::ValueOpcode::LogicalAnd: return binary(OpLogicalAnd, IR::Type::U1);

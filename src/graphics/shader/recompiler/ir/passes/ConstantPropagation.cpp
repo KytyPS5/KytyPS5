@@ -525,28 +525,12 @@ void FoldInstruction(Inst& inst) {
 		case ValueOpcode::ULessThan64:
 			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a < b; });
 			return;
-		case ValueOpcode::ULessThanEqual64:
-			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a <= b; });
-			return;
 		case ValueOpcode::UGreaterThan64:
 			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a > b; });
 			return;
-		case ValueOpcode::UGreaterThanEqual64:
-			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a >= b; });
-			return;
 		case ValueOpcode::SLessThan64:
-		case ValueOpcode::SLessThanEqual64:
-		case ValueOpcode::SGreaterThan64:
-		case ValueOpcode::SGreaterThanEqual64:
-			FoldU64Compare(inst, [opcode = inst.GetOpcode()](uint64_t a, uint64_t b) {
-				const auto lhs = std::bit_cast<int64_t>(a);
-				const auto rhs = std::bit_cast<int64_t>(b);
-				switch (opcode) {
-					case ValueOpcode::SLessThan64: return lhs < rhs;
-					case ValueOpcode::SLessThanEqual64: return lhs <= rhs;
-					case ValueOpcode::SGreaterThan64: return lhs > rhs;
-					default: return lhs >= rhs;
-				}
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) {
+				return std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);
 			});
 			return;
 		case ValueOpcode::LogicalAnd:

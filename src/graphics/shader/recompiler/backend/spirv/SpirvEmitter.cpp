@@ -13,51 +13,6 @@ using ShaderError::Fail;
 
 namespace {
 
-bool ImageBinding(const IR::ImageResource& image, IR::DescriptorBindingKind& kind) {
-	using Kind = IR::DescriptorBindingKind;
-	using Dim  = Decoder::ImageDimension;
-	if (image.kind == IR::ResourceKind::Image || image.kind == IR::ResourceKind::ImageUint) {
-		const bool integer = image.kind == IR::ResourceKind::ImageUint;
-		switch (image.dimension) {
-			case Dim::Dim1D: kind = integer ? Kind::SampledUint1D : Kind::Sampled1D; return true;
-			case Dim::Dim1DArray:
-				kind = integer ? Kind::SampledUint1DArray : Kind::Sampled1DArray;
-				return true;
-			case Dim::Dim2D: kind = integer ? Kind::SampledUint2D : Kind::Sampled2D; return true;
-			case Dim::Dim2DMsaa:
-				kind = integer ? Kind::SampledUint2DMsaa : Kind::Sampled2DMsaa;
-				return true;
-			case Dim::Dim3D: kind = integer ? Kind::SampledUint3D : Kind::Sampled3D; return true;
-			case Dim::Dim2DArray:
-				kind = integer ? Kind::SampledUint2DArray : Kind::Sampled2DArray;
-				return true;
-			case Dim::Dim2DMsaaArray:
-				kind = integer ? Kind::SampledUint2DMsaaArray : Kind::Sampled2DMsaaArray;
-				return true;
-			case Dim::Unknown: return false;
-		}
-	}
-	const bool uint_image = image.kind == IR::ResourceKind::StorageImageUint;
-	if (image.kind != IR::ResourceKind::StorageImage && !uint_image) {
-		return false;
-	}
-	switch (image.dimension) {
-		case Dim::Dim1D: kind = uint_image ? Kind::StorageUint1D : Kind::Storage1D; return true;
-		case Dim::Dim1DArray:
-			kind = uint_image ? Kind::StorageUint1DArray : Kind::Storage1DArray;
-			return true;
-		case Dim::Dim2D: kind = uint_image ? Kind::StorageUint2D : Kind::Storage2D; return true;
-		case Dim::Dim3D: kind = uint_image ? Kind::StorageUint3D : Kind::Storage3D; return true;
-		case Dim::Dim2DArray:
-			kind = uint_image ? Kind::StorageUint2DArray : Kind::Storage2DArray;
-			return true;
-		case Dim::Dim2DMsaa:
-		case Dim::Dim2DMsaaArray: return false;
-		case Dim::Unknown: return false;
-	}
-	return false;
-}
-
 bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	using Kind                                             = IR::DescriptorBindingKind;
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
@@ -79,18 +34,18 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		Kind kind;
-		if (!ImageBinding(program.info.images[i], kind)) {
+		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
+		if (!kind.has_value()) {
 			return Fail(error, "native shader plan has an invalid image class");
 		}
-		present[static_cast<size_t>(kind)] = true;
+		present[static_cast<size_t>(*kind)] = true;
 		const auto dynamic = program.info.images[i].mip_mode == IR::ImageMipMode::DynamicStorage;
 		const auto count   = dynamic ? program.info.images[i].mip_count : 1u;
 		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
 			return Fail(error, "native shader plan has an invalid image mip descriptor count");
 		}
-		expected[static_cast<size_t>(kind)].insert(expected[static_cast<size_t>(kind)].end(), count,
-		                                           i);
+		expected[static_cast<size_t>(*kind)].insert(expected[static_cast<size_t>(*kind)].end(),
+		                                            count, i);
 	}
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));

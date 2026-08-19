@@ -363,8 +363,7 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	switch (inst.GetOpcode()) {
-		case IR::ValueOpcode::Identity:
-		case IR::ValueOpcode::ConditionRef: ctx.Define(inst, ctx.Arg(inst, 0)); return true;
+		case IR::ValueOpcode::Identity: ctx.Define(inst, ctx.Arg(inst, 0)); return true;
 		case IR::ValueOpcode::Void:
 		case IR::ValueOpcode::Reference:
 		case IR::ValueOpcode::ReferenceU32:

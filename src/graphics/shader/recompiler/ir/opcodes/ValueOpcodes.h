@@ -18,6 +18,20 @@ enum class ValueOpcode {
 
 enum class BufferAccess { None, Read, Write, Atomic };
 enum class SharedAccess { None, Read, Write, Atomic, Append, Consume };
+enum class AddressAccess { None, Read, Write };
+enum class ImageAccess { None, Read, Write, Atomic };
+enum class ImageResourceClass { None, Sampled, Storage, StorageUint };
+
+struct AddressOpcodeInfo {
+	AddressAccess access    = AddressAccess::None;
+	uint32_t      data_bits = 0;
+};
+
+struct ImageOpcodeInfo {
+	ImageAccess        access         = ImageAccess::None;
+	ImageResourceClass resource_class = ImageResourceClass::None;
+	bool               needs_sampler  = false;
+};
 
 struct DppMoveFlags {
 	uint16_t control        = 0;
@@ -51,14 +65,16 @@ struct ExportFlags {
 static_assert(sizeof(ExportFlags) == sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<ExportFlags>);
 
-[[nodiscard]] Type             TypeOf(ValueOpcode opcode);
-[[nodiscard]] Type             ArgTypeOf(ValueOpcode opcode, size_t index);
-[[nodiscard]] size_t           NumArgsOf(ValueOpcode opcode);
-[[nodiscard]] bool             HasSideEffects(ValueOpcode opcode);
-[[nodiscard]] BufferAccess     BufferAccessOf(ValueOpcode opcode);
-[[nodiscard]] uint32_t         BufferComponentCount(ValueOpcode opcode);
-[[nodiscard]] SharedAccess     SharedAccessOf(ValueOpcode opcode);
-[[nodiscard]] uint32_t         SharedComponentCount(ValueOpcode opcode);
-[[nodiscard]] std::string_view ValueOpcodeName(ValueOpcode opcode);
+[[nodiscard]] Type              TypeOf(ValueOpcode opcode);
+[[nodiscard]] Type              ArgTypeOf(ValueOpcode opcode, size_t index);
+[[nodiscard]] size_t            NumArgsOf(ValueOpcode opcode);
+[[nodiscard]] bool              HasSideEffects(ValueOpcode opcode);
+[[nodiscard]] BufferAccess      BufferAccessOf(ValueOpcode opcode);
+[[nodiscard]] uint32_t          BufferComponentCount(ValueOpcode opcode);
+[[nodiscard]] SharedAccess      SharedAccessOf(ValueOpcode opcode);
+[[nodiscard]] uint32_t          SharedComponentCount(ValueOpcode opcode);
+[[nodiscard]] AddressOpcodeInfo AddressOpcodeInfoOf(ValueOpcode opcode);
+[[nodiscard]] ImageOpcodeInfo   ImageOpcodeInfoOf(ValueOpcode opcode);
+[[nodiscard]] std::string_view  ValueOpcodeName(ValueOpcode opcode);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -9118,7 +9118,7 @@ void TestNativeWideValueValidation() {
     memory.data_bits = 16;
     program.memory_info.push_back(memory);
     append_scalar_read(program, ValueOpcode::LoadAddressU32, {});
-    check_rejected(program, "inconsistent scalar-memory metadata");
+    check_rejected(program, "inconsistent address-memory metadata");
   }
   {
     auto program = make_program();
@@ -9146,7 +9146,7 @@ void TestNativeWideValueValidation() {
     memory.component_index = 4;
     program.memory_info.push_back(memory);
     append_scalar_read(program, ValueOpcode::LoadAddressU32, {});
-    check_rejected(program, "inconsistent scalar-memory metadata");
+    check_rejected(program, "inconsistent address-memory metadata");
   }
 
   {
@@ -9247,6 +9247,131 @@ void TestNativeWideValueValidation() {
     program.memory_info.push_back(memory);
     append_shared(program, ValueOpcode::LoadSharedU32x3, {});
     check_rejected(program, "inconsistent shared-memory width");
+  }
+  const auto append_address = [](ValueProgram &program, ValueOpcode opcode,
+                                 MemoryFlags flags) {
+    IREmitter ir(program.blocks.front());
+    const auto resource =
+        ir.Emit(ValueOpcode::GetAddressResource, {Value(0u), Value(0u)});
+    if (opcode == ValueOpcode::StoreAddressU32) {
+      ir.Emit(opcode, {resource, Value(0u), Value(0u), Value(0u), Value(true)},
+              flags);
+    } else {
+      ir.Emit(opcode, {resource, Value(0u), Value(0u), Value(true)}, flags);
+    }
+  };
+  {
+    auto program = make_program();
+    append_address(program, ValueOpcode::StoreAddressU32,
+                   MemoryFlags{.index = 1});
+    check_rejected(program, "invalid memory-info index");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    program.memory_info.push_back(memory);
+    append_address(program, ValueOpcode::StoreAddressU32, {});
+    check_rejected(program, "invalid address resource kind");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Global;
+    program.memory_info.push_back(memory);
+    append_address(program, ValueOpcode::LoadAddressU8, {});
+    check_rejected(program, "inconsistent address-memory metadata");
+  }
+  const auto append_image = [](ValueProgram &program, ValueOpcode opcode,
+                               MemoryFlags flags) {
+    IREmitter ir(program.blocks.front());
+    const auto image = ir.Emit(ValueOpcode::GetImageResource,
+                               {Value(0u), Value(0u), Value(0u), Value(0u),
+                                Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto address =
+        ir.Emit(ValueOpcode::MakeImageAddress,
+                {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                 Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                 Value(0u), Value(0u), Value(0u)});
+    const auto image_info = ImageOpcodeInfoOf(opcode);
+    if (opcode == ValueOpcode::ImageWrite) {
+      const auto data = ir.Emit(ValueOpcode::CompositeConstructU32x4,
+                                {Value(0u), Value(0u), Value(0u), Value(0u)});
+      ir.Emit(opcode, {image, address, data, Value(true)}, flags);
+    } else if (image_info.access == ImageAccess::Atomic) {
+      ir.Emit(opcode, {image, address, Value(0u), Value(true)}, flags);
+    } else if (image_info.needs_sampler) {
+      const auto sampler =
+          ir.Emit(ValueOpcode::GetSamplerResource,
+                  {Value(0u), Value(0u), Value(0u), Value(0u)});
+      ir.Emit(opcode, {image, sampler, address}, flags);
+    } else if (opcode == ValueOpcode::ImageQueryDimensions) {
+      ir.Emit(opcode, {image, address}, flags);
+    } else {
+      ir.Emit(opcode, {image, address, Value(true)}, flags);
+    }
+  };
+  {
+    auto program = make_program();
+    append_image(program, ValueOpcode::ImageRead, MemoryFlags{.index = 1});
+    check_rejected(program, "invalid memory-info index");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    program.memory_info.push_back(memory);
+    append_image(program, ValueOpcode::ImageRead, {});
+    check_rejected(program, "invalid image-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    program.memory_info.push_back(memory);
+    append_image(program, ValueOpcode::ImageRead, {});
+    check_rejected(program, "invalid image-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImageUint;
+    program.memory_info.push_back(memory);
+    append_image(program, ValueOpcode::ImageQueryDimensions, {});
+    check_rejected(program, "invalid image-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    program.memory_info.push_back(memory);
+    append_image(program, ValueOpcode::ImageWrite, {});
+    check_rejected(program, "invalid image-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    program.memory_info.push_back(memory);
+    append_image(program, ValueOpcode::ImageSampleRaw, {});
+    check_rejected(program, "invalid image-memory metadata");
+  }
+  {
+    auto program = make_program();
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    program.memory_info.push_back(memory);
+    append_image(program, ValueOpcode::ImageAtomicIAdd32, {});
+    check_rejected(program, "invalid image-memory metadata");
+  }
+  {
+    auto program = make_program();
+    IREmitter ir(program.blocks.front());
+    const auto data = ir.Emit(ValueOpcode::CompositeConstructU32x4,
+                              {Value(0u), Value(0u), Value(0u), Value(0u)});
+    ir.Emit(ValueOpcode::SetAttribute, {data, Value(true)},
+            ExportFlags{.index = 1});
+    check_rejected(program, "invalid export-info index");
   }
 }
 

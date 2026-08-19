@@ -24,8 +24,6 @@ std::string TypeName(Type type) {
 	    "U32x3",
 	    "U32x4",
 	    "F32x2",
-	    "F32x3",
-	    "F32x4",
 	    "SrtResource",
 	    "BufferResource",
 	    "AddressResource",

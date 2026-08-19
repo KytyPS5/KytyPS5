@@ -597,7 +597,7 @@ void TestImagesSamplersAndAliases() {
 
   const auto storage = fixture.Image(image_words, 16);
   MemoryInfo storage_memory;
-  storage_memory.kind = ResourceKind::StorageImage;
+  storage_memory.kind = ResourceKind::StorageImageUint;
   storage_memory.image_dimension = Decoder::ImageDimension::Dim2D;
   fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
                {storage, image_address, Value(1u), Value(true)},
@@ -1146,6 +1146,79 @@ void TestResourceLimitIsTransactional() {
         "resource-limit failure partially mutated typed resource state");
 }
 
+void TestMalformedMemoryKindsRejected() {
+  {
+    Fixture fixture;
+    const auto address = fixture.Address(Value(0u), Value(0u), 4);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreAddressU32,
+                 {address, Value(0u), Value(0u), Value(1u), Value(true)},
+                 fixture.AddMemory(memory, 4));
+    std::string error;
+    Check(BuildSrtPlan(fixture.program, &error) &&
+              !TrackResources(fixture.program, &error) &&
+              error.find("address operation has invalid resource kind") !=
+                  std::string::npos,
+          "resource tracking accepted an address opcode with buffer metadata");
+  }
+  {
+    Fixture fixture;
+    const auto image =
+        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                       Value(0u), Value(0u), Value(0u)},
+                      8);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Flat;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {image, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 8));
+    std::string error;
+    Check(BuildSrtPlan(fixture.program, &error) &&
+              !TrackResources(fixture.program, &error) &&
+              error.find("image operation has invalid resource kind") !=
+                  std::string::npos,
+          "resource tracking accepted an image opcode with address metadata");
+  }
+  {
+    Fixture fixture;
+    const auto image =
+        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                       Value(0u), Value(0u), Value(0u)},
+                      12);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {image, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 12));
+    std::string error;
+    Check(BuildSrtPlan(fixture.program, &error) &&
+              !TrackResources(fixture.program, &error) &&
+              error.find("image operation has invalid resource kind") !=
+                  std::string::npos,
+          "resource tracking accepted a sampled read with storage metadata");
+  }
+  {
+    Fixture fixture;
+    const auto image =
+        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                       Value(0u), Value(0u), Value(0u)},
+                      16);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
+                 {image, fixture.ImageAddress(), Value(1u), Value(true)},
+                 fixture.AddMemory(memory, 16));
+    std::string error;
+    Check(
+        BuildSrtPlan(fixture.program, &error) &&
+            !TrackResources(fixture.program, &error) &&
+            error.find("image operation has invalid resource kind") !=
+                std::string::npos,
+        "resource tracking accepted a uint atomic with float storage metadata");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1173,6 +1246,7 @@ int main() {
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
+    Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

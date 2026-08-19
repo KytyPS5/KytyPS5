@@ -44,7 +44,8 @@ bool IsRegisterStatePseudo(ValueOpcode opcode) {
 }
 
 bool IsRuntimeRead(ValueOpcode opcode) {
-	return opcode == ValueOpcode::LoadAddressU32 || opcode == ValueOpcode::ReadConstBuffer;
+	return opcode == ValueOpcode::ReadConstBuffer ||
+	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
 bool EquivalentValue(const ValueProgram& program, Value left, Value right,
@@ -324,31 +325,52 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 				                               ValueOpcodeName(inst.GetOpcode()), inst.NumArgs(),
 				                               NumArgsOf(inst.GetOpcode())));
 			}
-			if (IsRuntimeRead(inst.GetOpcode())) {
+			if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
 					return Fail(error, fmt::format("{} has an invalid memory-info index",
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
-				const auto& memory         = program.memory_info[memory_index];
-				const bool  scalar_buffer  = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
-				const bool  scalar_address = memory.kind == ResourceKind::ScalarAddress;
-				if ((scalar_buffer && memory.kind != ResourceKind::ScalarBuffer) ||
-				    (!scalar_buffer && !scalar_address && memory.kind != ResourceKind::Flat &&
-				     memory.kind != ResourceKind::Global && memory.kind != ResourceKind::Scratch)) {
+				const auto& memory = program.memory_info[memory_index];
+				if (memory.kind != ResourceKind::ScalarBuffer) {
 					return Fail(error, fmt::format("{} has an invalid scalar-memory resource kind",
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
-				const bool scalar_memory = scalar_buffer || scalar_address;
 				const bool valid_group_width =
-				    scalar_memory
+				    memory.component_count == 1u || memory.component_count == 2u ||
+				    memory.component_count == 4u || memory.component_count == 8u ||
+				    memory.component_count == 16u;
+				if (memory.data_bits != 32u || memory.data_dwords != 1u || !valid_group_width ||
+				    memory.component_index >= memory.component_count) {
+					return Fail(error, fmt::format("{} has inconsistent scalar-memory metadata",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+			}
+			const auto address_info = AddressOpcodeInfoOf(inst.GetOpcode());
+			if (address_info.access != AddressAccess::None) {
+				const auto memory_index = inst.Flags<MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					return Fail(error, fmt::format("{} has an invalid memory-info index",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const auto& memory = program.memory_info[memory_index];
+				if (!IsAddressResourceKind(memory.kind) ||
+				    (memory.kind == ResourceKind::ScalarAddress &&
+				     inst.GetOpcode() != ValueOpcode::LoadAddressU32)) {
+					return Fail(error, fmt::format("{} has an invalid address resource kind",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const bool scalar_address = memory.kind == ResourceKind::ScalarAddress;
+				const bool valid_group_width =
+				    scalar_address
 				        ? memory.component_count == 1u || memory.component_count == 2u ||
 				              memory.component_count == 4u || memory.component_count == 8u ||
 				              memory.component_count == 16u
 				        : memory.component_count >= 1u && memory.component_count <= 4u;
-				if (memory.data_bits != 32u || memory.data_dwords != 1u || !valid_group_width ||
-				    memory.component_index >= memory.component_count) {
-					return Fail(error, fmt::format("{} has inconsistent scalar-memory metadata",
+				if (memory.data_bits != address_info.data_bits || memory.data_dwords != 1u ||
+				    !valid_group_width || memory.component_index >= memory.component_count ||
+				    memory.sampler != 0u) {
+					return Fail(error, fmt::format("{} has inconsistent address-memory metadata",
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
@@ -406,6 +428,23 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 					return Fail(error, fmt::format("{} has inconsistent shared-memory width",
 					                               ValueOpcodeName(inst.GetOpcode())));
 				}
+			}
+			const auto image_info = ImageOpcodeInfoOf(inst.GetOpcode());
+			if (image_info.access != ImageAccess::None) {
+				const auto memory_index = inst.Flags<MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					return Fail(error, fmt::format("{} has an invalid memory-info index",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+				const auto& memory = program.memory_info[memory_index];
+				if (!ImageResourceKindMatches(memory.kind, image_info.resource_class)) {
+					return Fail(error, fmt::format("{} has invalid image-memory metadata",
+					                               ValueOpcodeName(inst.GetOpcode())));
+				}
+			}
+			if (inst.GetOpcode() == ValueOpcode::SetAttribute &&
+			    inst.Flags<ExportFlags>().index >= program.export_info.size()) {
+				return Fail(error, "SetAttribute has an invalid export-info index");
 			}
 			uint32_t composite_components = 0u;
 			switch (inst.GetOpcode()) {

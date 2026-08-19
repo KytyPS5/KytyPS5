@@ -79,19 +79,16 @@ bool HasSideEffects(ValueOpcode opcode) {
 	    shared_access == SharedAccess::Append || shared_access == SharedAccess::Consume) {
 		return true;
 	}
+	if (AddressOpcodeInfoOf(opcode).access == AddressAccess::Write) {
+		return true;
+	}
+	const auto image_info = ImageOpcodeInfoOf(opcode);
+	if (image_info.access == ImageAccess::Write || image_info.access == ImageAccess::Atomic) {
+		return true;
+	}
 	switch (opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
-		case ValueOpcode::StoreAddressU8:
-		case ValueOpcode::StoreAddressU16:
-		case ValueOpcode::StoreAddressU32:
-		case ValueOpcode::ImageAtomicIAdd32:
-		case ValueOpcode::ImageAtomicUMin32:
-		case ValueOpcode::ImageAtomicUMax32:
-		case ValueOpcode::ImageAtomicAnd32:
-		case ValueOpcode::ImageAtomicOr32:
-		case ValueOpcode::ImageAtomicXor32:
-		case ValueOpcode::ImageWrite:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
@@ -182,6 +179,39 @@ uint32_t SharedComponentCount(ValueOpcode opcode) {
 		case ValueOpcode::LoadSharedU32x4:
 		case ValueOpcode::WriteSharedU32x4: return 4u;
 		default: return SharedAccessOf(opcode) == SharedAccess::None ? 0u : 1u;
+	}
+}
+
+AddressOpcodeInfo AddressOpcodeInfoOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadAddressU8: return {AddressAccess::Read, 8u};
+		case ValueOpcode::LoadAddressU16: return {AddressAccess::Read, 16u};
+		case ValueOpcode::LoadAddressU32: return {AddressAccess::Read, 32u};
+		case ValueOpcode::StoreAddressU8: return {AddressAccess::Write, 8u};
+		case ValueOpcode::StoreAddressU16: return {AddressAccess::Write, 16u};
+		case ValueOpcode::StoreAddressU32: return {AddressAccess::Write, 32u};
+		default: return {};
+	}
+}
+
+ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::ImageQueryDimensions:
+		case ValueOpcode::ImageRead: return {ImageAccess::Read, ImageResourceClass::Sampled, false};
+		case ValueOpcode::ImageQueryLod:
+		case ValueOpcode::ImageSampleRaw:
+		case ValueOpcode::ImageGatherRaw:
+			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
+		case ValueOpcode::ImageWrite:
+			return {ImageAccess::Write, ImageResourceClass::Storage, false};
+		case ValueOpcode::ImageAtomicIAdd32:
+		case ValueOpcode::ImageAtomicUMin32:
+		case ValueOpcode::ImageAtomicUMax32:
+		case ValueOpcode::ImageAtomicAnd32:
+		case ValueOpcode::ImageAtomicOr32:
+		case ValueOpcode::ImageAtomicXor32:
+			return {ImageAccess::Atomic, ImageResourceClass::StorageUint, false};
+		default: return {};
 	}
 }
 

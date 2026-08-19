@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/opcodes/Opcodes.h"
+#include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
@@ -73,6 +74,24 @@ enum class ResourceKind {
 	StorageImageUint,
 	Sampler
 };
+
+[[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
+	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
+	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
+}
+
+[[nodiscard]] constexpr bool ImageResourceKindMatches(ResourceKind       kind,
+                                                      ImageResourceClass resource_class) {
+	switch (resource_class) {
+		case ImageResourceClass::Sampled:
+			return kind == ResourceKind::Image || kind == ResourceKind::ImageUint;
+		case ImageResourceClass::Storage:
+			return kind == ResourceKind::StorageImage || kind == ResourceKind::StorageImageUint;
+		case ImageResourceClass::StorageUint: return kind == ResourceKind::StorageImageUint;
+		case ImageResourceClass::None: return false;
+	}
+	return false;
+}
 
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
@@ -308,6 +327,56 @@ enum class DescriptorBindingKind {
 	UserData,
 	Count,
 };
+
+[[nodiscard]] inline std::optional<DescriptorBindingKind>
+DescriptorBindingForImage(const ImageResource& image) {
+	using Dimension = Decoder::ImageDimension;
+	using Kind      = DescriptorBindingKind;
+
+	switch (image.kind) {
+		case ResourceKind::Image:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::Sampled1D;
+				case Dimension::Dim1DArray: return Kind::Sampled1DArray;
+				case Dimension::Dim2D: return Kind::Sampled2D;
+				case Dimension::Dim2DArray: return Kind::Sampled2DArray;
+				case Dimension::Dim2DMsaa: return Kind::Sampled2DMsaa;
+				case Dimension::Dim2DMsaaArray: return Kind::Sampled2DMsaaArray;
+				case Dimension::Dim3D: return Kind::Sampled3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::ImageUint:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::SampledUint1D;
+				case Dimension::Dim1DArray: return Kind::SampledUint1DArray;
+				case Dimension::Dim2D: return Kind::SampledUint2D;
+				case Dimension::Dim2DArray: return Kind::SampledUint2DArray;
+				case Dimension::Dim2DMsaa: return Kind::SampledUint2DMsaa;
+				case Dimension::Dim2DMsaaArray: return Kind::SampledUint2DMsaaArray;
+				case Dimension::Dim3D: return Kind::SampledUint3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::StorageImage:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::Storage1D;
+				case Dimension::Dim1DArray: return Kind::Storage1DArray;
+				case Dimension::Dim2D: return Kind::Storage2D;
+				case Dimension::Dim2DArray: return Kind::Storage2DArray;
+				case Dimension::Dim3D: return Kind::Storage3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::StorageImageUint:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::StorageUint1D;
+				case Dimension::Dim1DArray: return Kind::StorageUint1DArray;
+				case Dimension::Dim2D: return Kind::StorageUint2D;
+				case Dimension::Dim2DArray: return Kind::StorageUint2DArray;
+				case Dimension::Dim3D: return Kind::StorageUint3D;
+				default: return std::nullopt;
+			}
+		default: return std::nullopt;
+	}
+}
 
 struct DescriptorBinding {
 	DescriptorBindingKind kind    = DescriptorBindingKind::Buffers;

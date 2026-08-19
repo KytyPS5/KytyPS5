@@ -867,10 +867,9 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 		    const auto              base     = ByteAddress(ctx, inst, mem);
 		    std::array<uint32_t, 4> values {};
 		    for (uint32_t component = 0; component < components; component++) {
-			    const auto address = component == 0u
-			                             ? base
-			                             : Binary(state, OpIAdd, TypeU32(state), base,
-			                                      ConstantU32(state, component * 4u));
+			    const auto address   = component == 0u ? base
+			                                           : Binary(state, OpIAdd, TypeU32(state), base,
+			                                                    ConstantU32(state, component * 4u));
 			    const auto raw_index = Binary(state, OpShiftRightLogical, TypeU32(state), address,
 			                                  ConstantU32(state, 2));
 			    const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
@@ -889,10 +888,9 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		const auto resource = PrepareMemoryResourceAccess(state, mem);
 		const auto base     = ByteAddress(ctx, inst, mem);
 		for (uint32_t component = 0; component < components; component++) {
-			const auto address = component == 0u
-			                         ? base
-			                         : Binary(state, OpIAdd, TypeU32(state), base,
-			                                  ConstantU32(state, component * 4u));
+			const auto address = component == 0u ? base
+			                                     : Binary(state, OpIAdd, TypeU32(state), base,
+			                                              ConstantU32(state, component * 4u));
 			const auto raw_index =
 			    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 			const auto access = PrepareMemoryElement(ctx, mem, resource, raw_index);
@@ -963,13 +961,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           }));
 		return true;
 	}
-	const bool load_address = op == IR::ValueOpcode::LoadAddressU8 ||
-	                          op == IR::ValueOpcode::LoadAddressU16 ||
-	                          op == IR::ValueOpcode::LoadAddressU32;
+	const auto address_info = IR::AddressOpcodeInfoOf(op);
+	const bool load_address = address_info.access == IR::AddressAccess::Read;
 	const bool load_buffer  = op == IR::ValueOpcode::LoadBufferU8 ||
 	                          op == IR::ValueOpcode::LoadBufferU16 ||
 	                          op == IR::ValueOpcode::LoadBufferU32;
-	const bool load_shared = IR::SharedAccessOf(op) == IR::SharedAccess::Read;
+	const bool load_shared  = IR::SharedAccessOf(op) == IR::SharedAccess::Read;
 	if (load_address || load_buffer || load_shared) {
 		const auto mem   = ctx.Memory(inst);
 		uint32_t   value = 0;
@@ -986,13 +983,11 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, value);
 		return true;
 	}
-	const bool store_address = op == IR::ValueOpcode::StoreAddressU8 ||
-	                           op == IR::ValueOpcode::StoreAddressU16 ||
-	                           op == IR::ValueOpcode::StoreAddressU32;
+	const bool store_address = address_info.access == IR::AddressAccess::Write;
 	const bool store_buffer  = op == IR::ValueOpcode::StoreBufferU8 ||
 	                           op == IR::ValueOpcode::StoreBufferU16 ||
 	                           op == IR::ValueOpcode::StoreBufferU32;
-	const bool store_shared = IR::SharedAccessOf(op) == IR::SharedAccess::Write;
+	const bool store_shared  = IR::SharedAccessOf(op) == IR::SharedAccess::Write;
 	if (store_address || store_buffer || store_shared) {
 		const auto mem = ctx.Memory(inst);
 		if (op == IR::ValueOpcode::StoreBufferU32 && mem.formatted)

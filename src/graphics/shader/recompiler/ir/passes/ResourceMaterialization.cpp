@@ -264,24 +264,6 @@ uint64_t AddressSpecialization(const AddressResource&           resource,
 	           : snapshot.guest_base - snapshot.binding_base;
 }
 
-bool IsImageOp(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::ImageQueryDimensions:
-		case ValueOpcode::ImageQueryLod:
-		case ValueOpcode::ImageRead:
-		case ValueOpcode::ImageWrite:
-		case ValueOpcode::ImageSampleRaw:
-		case ValueOpcode::ImageGatherRaw:
-		case ValueOpcode::ImageAtomicIAdd32:
-		case ValueOpcode::ImageAtomicUMin32:
-		case ValueOpcode::ImageAtomicUMax32:
-		case ValueOpcode::ImageAtomicAnd32:
-		case ValueOpcode::ImageAtomicOr32:
-		case ValueOpcode::ImageAtomicXor32: return true;
-		default: return false;
-	}
-}
-
 size_t FlattenedRuntimeDwords(const Program& program) {
 	size_t size = program.values != nullptr ? program.values->srt_reads.size() : 0u;
 	for (uint32_t resource = 0; resource < program.info.images.size(); resource++) {
@@ -915,7 +897,7 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 	auto memory_info = program.values->memory_info;
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
-			if (!IsImageOp(inst.GetOpcode())) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;

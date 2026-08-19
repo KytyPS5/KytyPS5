@@ -39,55 +39,6 @@ constexpr std::array ImageBindingKinds = {
     DescriptorBindingKind::StorageUint3D,
 };
 
-bool ImageBinding(const ImageResource& image, DescriptorBindingKind& result) {
-	using Dimension = Decoder::ImageDimension;
-	using Kind      = DescriptorBindingKind;
-
-	switch (image.kind) {
-		case ResourceKind::Image:
-			switch (image.dimension) {
-				case Dimension::Dim1D: result = Kind::Sampled1D; return true;
-				case Dimension::Dim1DArray: result = Kind::Sampled1DArray; return true;
-				case Dimension::Dim2D: result = Kind::Sampled2D; return true;
-				case Dimension::Dim2DArray: result = Kind::Sampled2DArray; return true;
-				case Dimension::Dim2DMsaa: result = Kind::Sampled2DMsaa; return true;
-				case Dimension::Dim2DMsaaArray: result = Kind::Sampled2DMsaaArray; return true;
-				case Dimension::Dim3D: result = Kind::Sampled3D; return true;
-				default: return false;
-			}
-		case ResourceKind::ImageUint:
-			switch (image.dimension) {
-				case Dimension::Dim1D: result = Kind::SampledUint1D; return true;
-				case Dimension::Dim1DArray: result = Kind::SampledUint1DArray; return true;
-				case Dimension::Dim2D: result = Kind::SampledUint2D; return true;
-				case Dimension::Dim2DArray: result = Kind::SampledUint2DArray; return true;
-				case Dimension::Dim2DMsaa: result = Kind::SampledUint2DMsaa; return true;
-				case Dimension::Dim2DMsaaArray: result = Kind::SampledUint2DMsaaArray; return true;
-				case Dimension::Dim3D: result = Kind::SampledUint3D; return true;
-				default: return false;
-			}
-		case ResourceKind::StorageImage:
-			switch (image.dimension) {
-				case Dimension::Dim1D: result = Kind::Storage1D; return true;
-				case Dimension::Dim1DArray: result = Kind::Storage1DArray; return true;
-				case Dimension::Dim2D: result = Kind::Storage2D; return true;
-				case Dimension::Dim2DArray: result = Kind::Storage2DArray; return true;
-				case Dimension::Dim3D: result = Kind::Storage3D; return true;
-				default: return false;
-			}
-		case ResourceKind::StorageImageUint:
-			switch (image.dimension) {
-				case Dimension::Dim1D: result = Kind::StorageUint1D; return true;
-				case Dimension::Dim1DArray: result = Kind::StorageUint1DArray; return true;
-				case Dimension::Dim2D: result = Kind::StorageUint2D; return true;
-				case Dimension::Dim2DArray: result = Kind::StorageUint2DArray; return true;
-				case Dimension::Dim3D: result = Kind::StorageUint3D; return true;
-				default: return false;
-			}
-		default: return false;
-	}
-}
-
 bool CollectUserData(const Program& program, std::vector<uint32_t>& result) {
 	std::set<uint32_t> registers;
 	for (const auto* block: program.values->blocks) {
@@ -187,14 +138,14 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 
 	std::array<std::vector<uint32_t>, ImageBindingKinds.size()> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		DescriptorBindingKind kind;
-		if (!ImageBinding(program.info.images[i], kind)) {
+		const auto kind = DescriptorBindingForImage(program.info.images[i]);
+		if (!kind.has_value()) {
 			if (error != nullptr) {
 				*error = "shader info contains an invalid image binding class";
 			}
 			return false;
 		}
-		const auto group = std::find(ImageBindingKinds.begin(), ImageBindingKinds.end(), kind);
+		const auto group = std::find(ImageBindingKinds.begin(), ImageBindingKinds.end(), *kind);
 		if (group == ImageBindingKinds.end()) {
 			if (error != nullptr) {
 				*error = "shader info contains an unmapped image binding class";

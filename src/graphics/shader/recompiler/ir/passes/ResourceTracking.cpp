@@ -25,60 +25,6 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-bool IsAddressStore(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::StoreAddressU8:
-		case ValueOpcode::StoreAddressU16:
-		case ValueOpcode::StoreAddressU32: return true;
-		default: return false;
-	}
-}
-
-bool IsAddress(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::LoadAddressU8:
-		case ValueOpcode::LoadAddressU16:
-		case ValueOpcode::LoadAddressU32:
-		case ValueOpcode::StoreAddressU8:
-		case ValueOpcode::StoreAddressU16:
-		case ValueOpcode::StoreAddressU32: return true;
-		default: return false;
-	}
-}
-
-bool IsImageAtomic(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::ImageAtomicIAdd32:
-		case ValueOpcode::ImageAtomicUMin32:
-		case ValueOpcode::ImageAtomicUMax32:
-		case ValueOpcode::ImageAtomicAnd32:
-		case ValueOpcode::ImageAtomicOr32:
-		case ValueOpcode::ImageAtomicXor32: return true;
-		default: return false;
-	}
-}
-
-bool IsImageStore(ValueOpcode op) {
-	return op == ValueOpcode::ImageWrite || IsImageAtomic(op);
-}
-
-bool IsImage(ValueOpcode op) {
-	switch (op) {
-		case ValueOpcode::ImageQueryDimensions:
-		case ValueOpcode::ImageQueryLod:
-		case ValueOpcode::ImageRead:
-		case ValueOpcode::ImageWrite:
-		case ValueOpcode::ImageSampleRaw:
-		case ValueOpcode::ImageGatherRaw: return true;
-		default: return IsImageAtomic(op);
-	}
-}
-
-bool NeedsSampler(ValueOpcode op) {
-	return op == ValueOpcode::ImageQueryLod || op == ValueOpcode::ImageSampleRaw ||
-	       op == ValueOpcode::ImageGatherRaw;
-}
-
 uint32_t ByteExtent(const MemoryInfo& memory) {
 	const auto bytes = std::max((memory.data_bits + 7u) / 8u, 1u);
 	const auto count = std::max(memory.data_dwords, 1u);
@@ -353,7 +299,9 @@ private:
 		for (const auto* block: m_values.blocks) {
 			for (const auto& inst: *block) {
 				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None && !IsAddress(op) && !IsImage(op)) ||
+				if ((BufferAccessOf(op) == BufferAccess::None &&
+				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
+				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
 				    &inst == &owner) {
 					continue;
 				}
@@ -534,7 +482,8 @@ private:
 	void PlanIndirectImages() {
 		for (auto* block: m_values.blocks) {
 			for (auto& inst: *block) {
-				if (!IsImage(inst.GetOpcode()) || inst.NumArgs() == 0u) {
+				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+				    inst.NumArgs() == 0u) {
 					continue;
 				}
 				auto* handle = inst.Arg(0).Resolve().TryInstruction();
@@ -671,8 +620,9 @@ private:
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
-		const bool atomic  = IsImageAtomic(op);
-		const bool write   = IsImageStore(op);
+		const auto access  = ImageOpcodeInfoOf(op).access;
+		const bool atomic  = access == ImageAccess::Atomic;
+		const bool write   = access == ImageAccess::Write || atomic;
 		image.first_use_pc = std::min(image.first_use_pc, pc);
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
@@ -693,8 +643,8 @@ private:
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
 	}
 
-	uint32_t AddAddress(uint32_t source, bool unbased, const MemoryInfo& memory, ValueOpcode op,
-	                    uint32_t pc) {
+	uint32_t AddAddress(uint32_t source, bool unbased, const MemoryInfo& memory,
+	                    AddressAccess access, uint32_t pc) {
 		auto immediate = static_cast<int32_t>(memory.offset);
 		if (memory.kind == ResourceKind::ScalarAddress) {
 			immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
@@ -706,8 +656,8 @@ private:
 			    address.kind == memory.kind) {
 				address.first_use_pc = std::min(address.first_use_pc, pc);
 				address.min_offset   = std::min(address.min_offset, min_offset);
-				address.read         = address.read || !IsAddressStore(op);
-				address.written      = address.written || IsAddressStore(op);
+				address.read         = address.read || access == AddressAccess::Read;
+				address.written      = address.written || access == AddressAccess::Write;
 				return i;
 			}
 		}
@@ -720,8 +670,8 @@ private:
 		address.kind         = memory.kind;
 		address.min_offset   = min_offset;
 		address.unbased      = unbased;
-		address.read         = !IsAddressStore(op);
-		address.written      = IsAddressStore(op);
+		address.read         = access == AddressAccess::Read;
+		address.written      = access == AddressAccess::Write;
 		m_info.addresses.push_back(address);
 		return static_cast<uint32_t>(m_info.addresses.size() - 1);
 	}
@@ -774,8 +724,12 @@ private:
 	}
 
 	bool Collect(Inst& inst, std::string* error) {
-		const auto op = inst.GetOpcode();
-		if (BufferAccessOf(op) == BufferAccess::None && !IsAddress(op) && !IsImage(op)) {
+		const auto op           = inst.GetOpcode();
+		const auto buffer       = BufferAccessOf(op);
+		const auto address_info = AddressOpcodeInfoOf(op);
+		const auto image_info   = ImageOpcodeInfoOf(op);
+		if (buffer == BufferAccess::None && address_info.access == AddressAccess::None &&
+		    image_info.access == ImageAccess::None) {
 			return true;
 		}
 		const auto flags = inst.Flags<MemoryFlags>();
@@ -794,7 +748,7 @@ private:
 		uint32_t source   = 0;
 		uint32_t resource = 0;
 
-		if (BufferAccessOf(op) != BufferAccess::None) {
+		if (buffer != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source,
 			               error)) {
 				return false;
@@ -806,12 +760,15 @@ private:
 			return AddHandlePatch(handle, resource, flags.pc, error) &&
 			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc, error);
 		}
-		if (IsAddress(op)) {
+		if (address_info.access != AddressAccess::None) {
+			if (!IsAddressResourceKind(memory.kind)) {
+				return Fail(flags.pc, error, "address operation has invalid resource kind");
+			}
 			bool unbased = false;
 			if (!GetAddressHandle(inst, inst.Arg(0), flags.pc, handle, source, unbased, error)) {
 				return false;
 			}
-			resource = AddAddress(source, unbased, memory, op, flags.pc);
+			resource = AddAddress(source, unbased, memory, address_info.access, flags.pc);
 			if (resource == UINT32_MAX) {
 				return Fail(flags.pc, error, "address resource limit exceeded");
 			}
@@ -819,6 +776,9 @@ private:
 			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc, error);
 		}
 
+		if (!ImageResourceKindMatches(memory.kind, image_info.resource_class)) {
+			return Fail(flags.pc, error, "image operation has invalid resource kind");
+		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
 		if (indirect != nullptr) {
@@ -835,7 +795,7 @@ private:
 			return false;
 		}
 		uint32_t sampler = 0;
-		if (NeedsSampler(op)) {
+		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
 				return Fail(flags.pc, error, "sampled image operation has no sampler handle");
 			}
@@ -854,7 +814,8 @@ private:
 				return false;
 			}
 		}
-		return AddMemoryPatch(flags.index, resource, sampler, NeedsSampler(op), flags.pc, error);
+		return AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc,
+		                      error);
 	}
 
 	const DescriptorSource* Source(uint32_t source) const {

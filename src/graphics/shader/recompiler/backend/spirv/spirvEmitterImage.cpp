@@ -345,8 +345,9 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 } // namespace
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto op = inst.GetOpcode();
-	if (op < IR::ValueOpcode::ImageQueryDimensions || op > IR::ValueOpcode::ImageAtomicXor32) {
+	const auto op         = inst.GetOpcode();
+	const auto image_info = IR::ImageOpcodeInfoOf(op);
+	if (image_info.access == IR::ImageAccess::None) {
 		return false;
 	}
 	auto&       state     = ctx.state;
@@ -354,10 +355,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  pc        = inst.Flags<IR::MemoryFlags>().pc;
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
-	const bool  sampled = op == IR::ValueOpcode::ImageQueryLod ||
-	                      op == IR::ValueOpcode::ImageSampleRaw ||
-	                      op == IR::ValueOpcode::ImageGatherRaw;
-	const auto* address = ctx.ImageAddress(inst.Arg(sampled ? 2 : 1));
+	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (address == nullptr) return true;
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(CapabilityImageQuery);
@@ -392,7 +390,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
-		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&]() {
+		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
+		        [&]() {
 			        const auto image = LoadSampledImageDescriptor(state, mem, pc, view);
 			        const auto color = state.builder.AllocateId();
 			        const auto coord = CoordU32(ctx, mem, *address, view);

@@ -633,6 +633,93 @@ void TestImagesSamplersAndAliases() {
         "buffer/image descriptor alias was not linked");
 }
 
+void TestSampleAdjustSamplerScratch() {
+  Fixture fixture(ShaderType::Pixel);
+  const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
+  const auto lane = fixture.Emit(ValueOpcode::SelectU32,
+                                 {active, Value(1u), Value(0u)});
+  const auto low = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                {lane, Value(0xffu)});
+  const auto high = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                 {lane, Value(0xffu)});
+  const auto quads = fixture.Emit(
+      ValueOpcode::BitwiseOr32,
+      {low, fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                         {high, Value(8u)})});
+  const auto scratch = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                    {quads, Value(12u)});
+  const auto word3 = fixture.Emit(ValueOpcode::BitwiseOr32,
+                                  {fixture.UserData(3), scratch});
+  const auto image = fixture.Image(
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)},
+      0x1ec);
+  const auto sampler = fixture.Sampler(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), word3},
+      0x1ec);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x1ec));
+  fixture.PlanAndTrack();
+
+  const auto source = fixture.program.info.samplers[0].source;
+  const auto stored = fixture.program.values->descriptor_sources[source]
+                          .dwords[3]
+                          .Resolve()
+                          .TryInstruction();
+  Check(stored != nullptr && stored->GetOpcode() == ValueOpcode::GetUserData,
+        "SampleAdjust reserved scratch remained in sampler identity");
+  std::array<uint32_t, 4> user_data{4u, 1u, 2u, 0x80000abcu};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  std::string error;
+  Check(EvaluateDescriptorSource(fixture.program, source, 0x1ec, runtime,
+                                 descriptor, &error) &&
+            descriptor.dwords[3] == 0x80000abcu,
+        "SampleAdjust canonicalization lost sampler border fields");
+
+  const auto CheckRejected = [](uint32_t flags, uint32_t shift,
+                                const char *message) {
+    Fixture rejected(ShaderType::Pixel);
+    const auto condition =
+        rejected.Emit(ValueOpcode::WqmMask, {Value(true)});
+    const auto bit = rejected.Emit(ValueOpcode::SelectU32,
+                                   {condition, Value(1u), Value(0u)});
+    const auto dynamic = rejected.Emit(ValueOpcode::ShiftLeftLogical32,
+                                       {bit, Value(shift)});
+    const auto dynamic_word3 = rejected.Emit(
+        ValueOpcode::BitwiseOr32, {rejected.UserData(3), dynamic});
+    const auto rejected_image = rejected.Image(
+        {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u)},
+        0x200);
+    const auto rejected_sampler = rejected.Sampler(
+        {rejected.UserData(0), rejected.UserData(1), rejected.UserData(2),
+         dynamic_word3},
+        0x200);
+    MemoryInfo rejected_memory;
+    rejected_memory.kind = ResourceKind::Image;
+    rejected_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    rejected_memory.image_sample_flags = flags;
+    rejected.Emit(ValueOpcode::ImageSampleRaw,
+                  {rejected_image, rejected_sampler, rejected.ImageAddress()},
+                  rejected.AddMemory(rejected_memory, 0x200));
+    std::string rejected_error;
+    Check(BuildSrtPlan(rejected.program, &rejected_error) &&
+              !TrackResources(rejected.program, &rejected_error) &&
+              rejected_error.find("WqmMask") != std::string::npos,
+          message);
+  };
+  CheckRejected(0u, 12u,
+                "ordinary sampling accepted SampleAdjust reserved scratch");
+  CheckRejected(Decoder::ImageSampleFlagAdjust, 30u,
+                "SampleAdjust canonicalization discarded border-mode bits");
+}
+
 void TestDynamicStorageMipTracking() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -1234,6 +1321,7 @@ int main() {
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
+    Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

@@ -140,6 +140,7 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 	AppendFlag(&text, &first, flags, ImageSampleFlagA16, "a16");
 	AppendFlag(&text, &first, flags, ImageSampleFlagCd, "cd");
 	AppendFlag(&text, &first, flags, ImageSampleFlagGatherHorizontal, "gather_horizontal");
+	AppendFlag(&text, &first, flags, ImageSampleFlagAdjust, "adjust");
 	return text;
 }
 

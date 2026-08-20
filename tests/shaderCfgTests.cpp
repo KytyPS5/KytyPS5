@@ -4550,9 +4550,11 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
         "MIMG opcode 0xa8 should decode as image_sample_c_a alias");
   Check(Common::ContainsStr(result.decoded_dump, "image_sample_c_b_a"),
         "MIMG opcode 0xad should decode as image_sample_c_b_a alias");
-  Check(Common::ContainsStr(result.decoded_dump, "sample_flags=none"),
-        "opcode 0xa0 alias should use normal 32-bit sample coordinates");
-  Check(Common::ContainsStr(result.decoded_dump, "sample_flags=bias|compare"),
+  Check(Common::ContainsStr(result.decoded_dump, "sample_flags=adjust"),
+        "opcode 0xa0 alias should expose SampleAdjust with normal 32-bit "
+        "coordinates");
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "sample_flags=bias|compare|adjust"),
         "compare+bias opcode alias did not expose expected sample flags");
   Check(!Common::ContainsStr(result.decoded_dump, "a16"),
         "A16 must come from MIMG bit 62, not from the opcode alias");

@@ -14,6 +14,55 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask = (1u << 2u) | (1u << 5u) | (1u << 8u);
+constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+
+uint32_t PossibleU32Bits(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 ? value.U32() : UINT32_MAX;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return UINT32_MAX;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::BitwiseAnd32:
+			return PossibleU32Bits(inst->Arg(0)) & PossibleU32Bits(inst->Arg(1));
+		case ValueOpcode::BitwiseOr32:
+			return PossibleU32Bits(inst->Arg(0)) | PossibleU32Bits(inst->Arg(1));
+		case ValueOpcode::ShiftLeftLogical32: {
+			const auto shift = inst->Arg(1).Resolve();
+			return shift.IsImmediate() && shift.GetType() == Type::U32
+			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
+			           : UINT32_MAX;
+		}
+		default: return UINT32_MAX;
+	}
+}
+
+Value CanonicalizeSampleAdjustDword3(Value value) {
+	for (;;) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32) {
+			return value;
+		}
+		const auto left           = inst->Arg(0).Resolve();
+		const auto right          = inst->Arg(1).Resolve();
+		const bool left_reserved  = (PossibleU32Bits(left) & ~SamplerDword3ReservedMask) == 0;
+		const bool right_reserved = (PossibleU32Bits(right) & ~SamplerDword3ReservedMask) == 0;
+		if (left_reserved && right_reserved) {
+			return Value(0u);
+		}
+		if (left_reserved) {
+			value = right;
+		} else if (right_reserved) {
+			value = left;
+		} else {
+			return value;
+		}
+	}
+}
 
 const char* StageName(ShaderType stage) {
 	switch (stage) {
@@ -211,8 +260,8 @@ private:
 		return true;
 	}
 
-	bool MakeSource(const Inst& handle, uint32_t width, bool sampler, DescriptorSource& descriptor,
-	                uint32_t pc, std::string* error) const {
+	bool MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
+	                DescriptorSource& descriptor, uint32_t pc, std::string* error) const {
 		if (handle.NumArgs() != width) {
 			return Fail(pc, error,
 			            fmt::format("{} has {} descriptor dwords, expected {}",
@@ -221,6 +270,9 @@ private:
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
 			descriptor.dwords[i] = handle.Arg(i).Resolve();
+		}
+		if (sample_adjust) {
+			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
 		const auto dword0 = descriptor.dwords[0].Resolve();
 		if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&
@@ -316,7 +368,7 @@ private:
 	bool MakeRuntimeBufferSource(const Inst& handle, uint32_t pc, uint32_t& source,
 	                             DescriptorSource& descriptor) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource ||
-		    !MakeSource(handle, 4u, false, descriptor, pc, nullptr)) {
+		    !MakeSource(handle, 4u, false, false, descriptor, pc, nullptr)) {
 			return false;
 		}
 		std::string reason;
@@ -499,14 +551,15 @@ private:
 	}
 
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
-	               uint32_t& source, std::string* error, bool sampler = false) {
+	               uint32_t& source, std::string* error, bool sampler = false,
+	               bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			return Fail(pc, error,
 			            fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
 		DescriptorSource descriptor;
-		if (!MakeSource(*handle, width, sampler, descriptor, pc, error)) {
+		if (!MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc, error)) {
 			return false;
 		}
 		std::string reason;
@@ -539,7 +592,7 @@ private:
 				source  = UINT32_MAX;
 				return true;
 			}
-		} else if (!MakeSource(*handle, 2, false, descriptor, pc, error)) {
+		} else if (!MakeSource(*handle, 2, false, false, descriptor, pc, error)) {
 			return false;
 		}
 		std::string reason;
@@ -813,8 +866,10 @@ private:
 			}
 			Inst*    sampler_handle = nullptr;
 			uint32_t sampler_source = 0;
+			const bool sample_adjust =
+			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
 			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-			               sampler_handle, sampler_source, error, true)) {
+			               sampler_handle, sampler_source, error, true, sample_adjust)) {
 				return false;
 			}
 			sampler = AddSampler(sampler_source, flags.pc);

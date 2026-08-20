@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
@@ -201,15 +202,15 @@ uint32_t FloatBits(ValueEmitContext& ctx, uint32_t value) {
 uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool dref,
                       const IR::MemoryInfo& mem, bool gather = false) {
 	if (mem.data_bits == 16u) {
-		uint32_t packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
-		                      ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
-		const auto scalar = [&](uint32_t index) {
+		uint32_t   packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
+		                        ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
+		const auto scalar    = [&](uint32_t index) {
 			if (dref) return value;
 			const auto component = gather ? index : DmaskComponent(mem.dmask, index);
 			const auto result    = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(
-			    {OpCompositeExtract, integer ? TypeU32(ctx.state) : TypeF32(ctx.state), result,
-			     value, component});
+			ctx.state.builder.AddFunction({OpCompositeExtract,
+			                               integer ? TypeU32(ctx.state) : TypeF32(ctx.state),
+			                               result, value, component});
 			return result;
 		};
 		for (uint32_t word = 0; word < mem.data_dwords; word++) {
@@ -221,12 +222,12 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool 
 			                      : (integer ? ConstantU32(ctx.state, 0) : ZeroF32(ctx.state));
 			if (integer) {
 				const auto mask = ConstantU32(ctx.state, 0xffffu);
-				packed[word] = Binary(
-				    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
-				    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low, mask),
-				    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high, mask),
-				           ConstantU32(ctx.state, 16u)));
+				packed[word] =
+				    Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low, mask),
+				           Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+				                  Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high, mask),
+				                  ConstantU32(ctx.state, 16u)));
 			} else {
 				const auto pair = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(
@@ -357,8 +358,120 @@ uint32_t InverseSwizzle(uint32_t swizzle, uint32_t component) {
 	return UINT32_MAX;
 }
 
+Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
+                                               const IR::MemoryInfo& mem) {
+	const auto format = state.program.info.images[mem.resource].conversion_format;
+	if (format == Prospero::BufferFormat::kInvalid) return {};
+	const auto info = Format::GetFormatInfo(format);
+	EXIT_IF(!Prospero::IsSampledTextureFormat(format) ||
+	        !Prospero::IsUintTextureFormat(format) ||
+	        Prospero::RemapTextureFormat(format) == format ||
+	        info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
+	        info.byte_size != sizeof(uint32_t) || info.component_count == 0u ||
+	        info.component_count > 4u);
+	return info;
+}
+
+uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+	const auto info = ImageConversionFormat(ctx.state, mem);
+	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+
+	const auto packed = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpCompositeExtract, TypeU32(ctx.state), packed, texel, 0u});
+	uint32_t components[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
+	                          ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
+	for (uint32_t component = 0; component < info.component_count; component++) {
+		components[component] = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction({OpBitFieldUExtract, TypeU32(ctx.state),
+		                               components[component], packed,
+		                               ConstantU32(ctx.state, info.component_bit_offset[component]),
+		                               ConstantU32(ctx.state, info.component_bits[component])});
+	}
+	for (uint32_t component = info.component_count; component < 4u; component++) {
+		components[component] = components[component % info.component_count];
+	}
+
+	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
+	uint32_t   selected[4] {};
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto selector = (swizzle >> (component * 3u)) & 7u;
+		if (selector == 1u) {
+			selected[component] = ConstantU32(ctx.state, 1u);
+		} else if (selector >= 4u) {
+			selected[component] = components[selector - 4u];
+		} else {
+			selected[component] = ConstantU32(ctx.state, 0u);
+		}
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
+	                               selected[0], selected[1], selected[2], selected[3]});
+	return result;
+}
+
+uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
+	const auto info = ImageConversionFormat(ctx.state, mem);
+	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
+
+	const auto component = ImageGatherComponent(mem.dmask);
+	const auto selector =
+	    (ctx.state.program.info.images[mem.resource].shader_swizzle >> (component * 3u)) & 7u;
+	if (selector < 4u) {
+		const auto value = ConstantU32(ctx.state, selector == 1u ? 1u : 0u);
+		return ctx.state.builder.Constant(OpConstantComposite, TypeU32Vector(ctx.state, 4),
+		                                  {value, value, value, value});
+	}
+
+	uint32_t values[4] {};
+	for (uint32_t lane = 0; lane < 4u; lane++) {
+		const auto packed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpCompositeExtract, TypeU32(ctx.state), packed, gathered, lane});
+		values[lane]        = ctx.state.builder.AllocateId();
+		const auto physical = (selector - 4u) % info.component_count;
+		ctx.state.builder.AddFunction({OpBitFieldUExtract, TypeU32(ctx.state), values[lane], packed,
+		                               ConstantU32(ctx.state, info.component_bit_offset[physical]),
+		                               ConstantU32(ctx.state, info.component_bits[physical])});
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
+	                               values[0], values[1], values[2], values[3]});
+	return result;
+}
+
+uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+	const auto info = ImageConversionFormat(ctx.state, mem);
+	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+
+	auto packed = ConstantU32(ctx.state, 0u);
+	for (uint32_t component = 0; component < info.component_count; component++) {
+		const auto value = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpCompositeExtract, TypeU32(ctx.state), value, texel, component});
+		const auto maximum =
+		    ConstantU32(ctx.state, info.component_bits[component] == 32u
+		                               ? UINT32_MAX
+		                               : (1u << info.component_bits[component]) - 1u);
+		const auto within  = Binary(ctx.state, OpULessThan, TypeBool(ctx.state), value, maximum);
+		const auto clamped = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpSelect, TypeU32(ctx.state), clamped, within, value, maximum});
+		const auto shifted =
+		    info.component_bit_offset[component] == 0u
+		        ? clamped
+		        : Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), clamped,
+		                 ConstantU32(ctx.state, info.component_bit_offset[component]));
+		packed = Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state), packed, shifted);
+	}
+	const auto zero   = ConstantU32(ctx.state, 0u);
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(
+	    {OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result, packed, zero, zero, zero});
+	return result;
+}
+
 uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t data, bool integer) {
-	const auto swizzle = ctx.state.program.info.images[mem.resource].storage_swizzle;
+	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
 	uint32_t   values[4] {};
 	const auto dmask = mem.dmask != 0u ? mem.dmask : 1u;
 	for (uint32_t component = 0; component < 4u; component++) {
@@ -380,15 +493,15 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 			}
 		}
 		values[component] = integer ? raw
-		                            : mem.data_bits == 16u ? EmitF16BitsToF32(ctx.state, raw)
-		                                                   : Unary(ctx.state, OpBitcast,
-		                                                           TypeF32(ctx.state), raw);
+		                    : mem.data_bits == 16u
+		                        ? EmitF16BitsToF32(ctx.state, raw)
+		                        : Unary(ctx.state, OpBitcast, TypeF32(ctx.state), raw);
 	}
 	const auto texel = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(
 	    {OpCompositeConstruct, integer ? TypeU32Vector(ctx.state, 4) : TypeF32Vector(ctx.state, 4),
 	     texel, values[0], values[1], values[2], values[3]});
-	return texel;
+	return PackImageTexel(ctx, mem, texel);
 }
 
 uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
@@ -468,7 +581,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
 				             image, coord, ImageOperandsLodMask, LodU32(ctx, mem, *address, view)});
 			        }
-			        return ResultVector(ctx, color, integer, false, mem);
+			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), integer, false,
+			                            mem);
 		        }));
 		return true;
 	}
@@ -491,6 +605,11 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto layout  = Layout(mem, view);
 		const bool integer = mem.kind == IR::ResourceKind::ImageUint;
 		const bool dref    = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		if (dref && state.program.info.images[mem.resource].conversion_format !=
+		                Prospero::BufferFormat::kInvalid) {
+			ctx.Fail(inst, "uses depth comparison with a packed integer image");
+			return true;
+		}
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
@@ -511,7 +630,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			               sample,
 			               sampled,
 			               coord,
-			               ConstantU32(state, ImageGatherComponent(mem.dmask))};
+			               ConstantU32(state, ImageConversionFormat(state, mem).format ==
+			                                          Prospero::BufferFormat::kInvalid
+			                                      ? ImageGatherComponent(mem.dmask)
+			                                      : 0u)};
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(ImageOperandsConstOffsetsMask);
 				words.push_back(HorizontalOffsets(state, view));
@@ -520,7 +642,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
 			}
 			state.builder.AddFunction(words);
-			ctx.Define(inst, ResultVector(ctx, sample, integer && !dref, false, mem, true));
+			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+			                              integer && !dref, false, mem, true));
 			return true;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
@@ -570,7 +693,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		};
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
-			ctx.Define(inst, ResultVector(ctx, EmitSample(mem.resource), integer, dref, mem));
+			const auto sample = EmitSample(mem.resource);
+			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
+			                              integer, dref, mem));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -661,7 +786,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		ctx.Define(inst, ResultVector(ctx, phi_words[2], integer, dref, mem));
+		ctx.Define(inst,
+		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
+		                        integer, dref, mem));
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

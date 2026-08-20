@@ -261,13 +261,12 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	                                  descriptor.BaseArray5() <= descriptor.Depth() &&
 	                                  descriptor.Depth() < image.info.resources.layers;
 	const bool levels_ok =
-	    multisampled
-	        ? descriptor.BaseLevel() == 0 && descriptor.LastLevel() >= 1 &&
-	              descriptor.LastLevel() <= 3 &&
-	              (r128 || descriptor.MaxMip() == descriptor.LastLevel()) &&
-	              image.info.resources.levels == 1 && image.info.samples == samples
-	        : descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
-	              (r128 || descriptor.MaxMip() == 0) && image.info.samples == 1;
+	    multisampled ? descriptor.BaseLevel() == 0 && descriptor.LastLevel() >= 1 &&
+	                       descriptor.LastLevel() <= 3 &&
+	                       (r128 || descriptor.MaxMip() == descriptor.LastLevel()) &&
+	                       image.info.resources.levels == 1 && image.info.samples == samples
+	                 : descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
+	                       (r128 || descriptor.MaxMip() == 0) && image.info.samples == 1;
 	return image.info.IsDepth() && width == image.info.extent.width &&
 	       height == image.info.extent.height &&
 	       (supported_2d || supported_array || supported_cube || supported_msaa_2d ||
@@ -289,9 +288,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
-	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
-	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	                    descriptor.fields[3] == field3_expected;
+	const bool         common          = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
+	                                     (descriptor.fields[2] & field2_reserved_mask) == 0 &&
+	                                     descriptor.fields[3] == field3_expected;
 	if (r128) {
 		return common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
 		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
@@ -422,9 +421,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	       !descriptor.MsaaDepth();
 }
 
-static bool IsSupportedStorageTextureEncoding(
-    const ShaderRecompiler::IR::ImageResource& resource,
-    const ShaderTextureResource& descriptor) {
+static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageResource& resource,
+                                              const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	constexpr uint32_t field5_expected      = 0x00700000u;
@@ -458,9 +456,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage || (Prospero::IsSupportedTextureFormat(format) &&
-	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
-	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	    raw_sint_storage ||
+	    (Prospero::IsSampledTextureFormat(format) &&
+	     uint_resource == Prospero::IsUintTextureFormat(format) &&
+	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -567,15 +566,17 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
-                                     bool storage, uint32_t view_levels, uint32_t image_layers) {
+	                                 bool shader_conversion, bool storage,
+                                     uint32_t view_levels, uint32_t image_layers) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
-	view.mapping =
-	    storage ? vk::ComponentMapping {} : TextureGetComponentMapping(descriptor.DstSelXYZW());
+	view.usage   = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
+	view.mapping = storage || shader_conversion
+	                   ? vk::ComponentMapping {}
+	                   : TextureGetComponentMapping(descriptor.DstSelXYZW());
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
@@ -658,8 +659,8 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
 	if ((!multisampled && (base_level > view_last_level || view_last_level >= levels)) ||
 	    (multisampled &&
-	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level || !msaa_tile ||
-	      (descriptor.MsaaDepth() && !depth_tile) ||
+	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
+	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "kind=%u dimension=%u mip_mode=%u read=%d written=%d "
@@ -675,11 +676,16 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
 	    multisampled ? 1u : static_cast<uint32_t>(view_last_level - base_level) + 1u;
-	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
-	const auto format = descriptor.Format();
+	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+	const auto format         = descriptor.Format();
+	const auto surface_format = TextureGetSurfaceFormatInfo(format);
+	const bool shader_conversion =
+	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage || ((resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
-	                Prospero::IsUintTextureFormat(format));
+	    storage ||
+	    (Prospero::IsSampledTextureFormat(format) &&
+	     (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
+	         Prospero::IsUintTextureFormat(format));
 	if (!storage &&
 	    (resource.kind == ShaderRecompiler::IR::ResourceKind::Image ||
 	     resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) &&
@@ -715,7 +721,7 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto pixel_format        = TextureGetFormat(format);
+	const auto pixel_format        = surface_format.vk_format;
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
@@ -740,11 +746,11 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, storage, view_levels,
-	                                 desc.info.resources.layers);
+	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
+	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc);
+	auto id = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -779,6 +785,9 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	                                       });
 	if (!depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
+	}
+	if (program.info.samplers[index].force_point_filtering) {
+		descriptor.SetPointFiltering();
 	}
 	return context.GetSamplerCache().GetSampler(descriptor);
 }

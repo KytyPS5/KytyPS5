@@ -210,7 +210,7 @@ struct BufferResource {
 
 enum class ImageMipMode { None, DynamicStorage };
 
-constexpr uint32_t StorageImageIdentitySwizzle = 0x00000facu;
+constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
@@ -221,7 +221,8 @@ struct ImageResource {
 	Decoder::ImageDimension dimension                 = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode                  = ImageMipMode::None;
 	uint32_t                mip_count                 = 1;
-	uint32_t                storage_swizzle           = StorageImageIdentitySwizzle;
+	Prospero::BufferFormat  conversion_format         = Prospero::BufferFormat::kInvalid;
+	uint32_t                shader_swizzle            = ShaderImageIdentitySwizzle;
 	bool                    read                      = false;
 	bool                    written                   = false;
 	bool                    atomic                    = false;
@@ -237,8 +238,9 @@ struct ImageResource {
 };
 
 struct SamplerResource {
-	uint32_t source       = 0;
-	uint32_t first_use_pc = 0;
+	uint32_t source                = 0;
+	uint32_t first_use_pc          = 0;
+	bool     force_point_filtering = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };

@@ -3,7 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
-#include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -17,6 +17,15 @@ struct RenderTargetFormatInfo {
 	vk::Format                      format            = vk::Format::eUndefined;
 	uint32_t                        bytes_per_element = 0;
 	Prospero::ColorComponentMapping export_mapping;
+};
+
+struct SurfaceFormatInfo {
+	explicit constexpr SurfaceFormatInfo(vk::Format format,
+	                                     Prospero::BufferFormat conversion_format)
+	    : vk_format(format), conversion_format(conversion_format) {}
+
+	vk::Format             vk_format;
+	Prospero::BufferFormat conversion_format;
 };
 
 struct TextureUploadMipLayout {
@@ -35,7 +44,7 @@ struct TextureUploadLayout {
 };
 
 vk::ComponentMapping   TextureGetComponentMapping(uint32_t swizzle);
-vk::Format             TextureGetFormat(Prospero::BufferFormat format);
+SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);

@@ -864,6 +864,7 @@ struct TestCase {
   size_t storage_buffer_range_dwords = 0;
   std::vector<u32> storage_buffer_offsets;
   bool force_shader_data_storage = false;
+  bool expected_force_point_sampler = false;
   std::optional<uint64_t> flat_memory_base;
   std::vector<u32> gds_initial;
   std::vector<u32> expected_gds;
@@ -9946,30 +9947,52 @@ public:
       constexpr u32 width = 128, height = 128, levels = 8;
       TileSurfaceLayout surface{};
       const TileSurfaceDescription description{
-          format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+          format, tile, TileSurfaceDimension::Dim2D, width, height, 1,
+          levels, 1};
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, 1, levels, tile, false,
                               total);
       const bool built = TileGetTiledTextureLayout(description, surface);
-      constexpr u32 tail_xy[7][2] = {
-          {64, 0}, {0, 64}, {32, 0}, {0, 32}, {16, 0}, {8, 16}, {0, 24}};
-      bool valid = built && Prospero::NumBytesPerElement(format) == 4 &&
-                   Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
-                   Prospero::IsSupportedTextureFormat(format) &&
-                   Prospero::IsUintTextureFormat(format) &&
-                   surface.texture.block.block_width == 128 &&
-                   surface.texture.block.block_height == 128 &&
-                   surface.texture.block.block_depth == 1 &&
-                   surface.first_tail_level == 1 &&
-                   surface.mips[0].offset == 0x10000 && total.size == 0x20000 &&
-                   total.align == 0x10000;
+      const auto surface_format = TextureGetSurfaceFormatInfo(format);
+      constexpr u32 tail_xy[7][2] = {{64, 0}, {0, 64}, {32, 0}, {0, 32},
+                                     {16, 0}, {8, 16}, {0, 24}};
+      bool valid =
+          built && Prospero::NumBytesPerElement(format) == 4 &&
+          Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
+          Prospero::IsSampledTextureFormat(format) &&
+          Prospero::IsUintTextureFormat(format) &&
+          Prospero::RemapTextureFormat(format) ==
+              Prospero::BufferFormat::k32UInt &&
+          surface_format.vk_format == vk::Format::eR32Uint &&
+          surface_format.conversion_format == format &&
+          VulkanFormat(format) == vk::Format::eUndefined &&
+          surface.texture.block.block_width == 128 &&
+          surface.texture.block.block_height == 128 &&
+          surface.texture.block.block_depth == 1 &&
+          surface.first_tail_level == 1 && surface.mips[0].offset == 0x10000 &&
+          total.size == 0x20000 && total.align == 0x10000;
       for (u32 level = 1; level < levels && valid; level++) {
         valid &= surface.mips[level].offset == 0 &&
                  surface.mips[level].tail_x == tail_xy[level - 1][0] &&
                  surface.mips[level].tail_y == tail_xy[level - 1][1];
       }
       Require(name, "11_11_10 uint layout", valid,
-              "PS5 packed integer texture metadata or Standard64KB mip tail changed");
+              "PS5 packed integer texture metadata or Standard64KB mip tail "
+              "changed");
+
+      const auto storage_only_format = Prospero::BufferFormat::k32SInt;
+      const auto storage_only_surface =
+          TextureGetSurfaceFormatInfo(storage_only_format);
+      Require(
+          name, "storage-only surface mapping",
+          !Prospero::IsSampledTextureFormat(storage_only_format) &&
+              !Prospero::IsUintTextureFormat(storage_only_format) &&
+              Prospero::RemapTextureFormat(storage_only_format) ==
+                  storage_only_format &&
+              storage_only_surface.vk_format == vk::Format::eR32Sint &&
+              storage_only_surface.conversion_format ==
+                  Prospero::BufferFormat::kInvalid,
+          "storage-only native backing was conflated with sampled support");
     }
 
     {
@@ -10914,10 +10937,16 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
     Require(test.name, "resource specialization",
             !compiled.program.info.images.empty() &&
-                compiled.program.info.images[0].storage_swizzle ==
+                compiled.program.info.images[0].shader_swizzle ==
                     test.image_descriptor_swizzle,
             "storage image descriptor swizzle did not reach the specialized "
             "program");
+  }
+  if (test.expected_force_point_sampler) {
+    Require(test.name, "sampler specialization",
+            compiled.program.info.samplers.size() == 1u &&
+                compiled.program.info.samplers[0].force_point_filtering,
+            "bit-packed sampled image did not force point filtering");
   }
   if (test.compile_only) {
     std::printf("[compute] %-32s ok\n", test.name);
@@ -17658,6 +17687,72 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 component = 0; component < 4; component++) {
+    AppendStoreVgpr(&code, component, component);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadPackedUintUnpacksAndSwizzles";
+  test.code = std::move(code);
+  test.expected = {0x2abu, 0x456u, 0x321u, 0x321u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = 0xaae2b321u;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data =
+      MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UInt);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(6, 5, 4, 7);
+  test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract"};
+  return test;
+}
+
+TestCase ImageSamplePackedUintConvertsSampleAndGather() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f200000u);
+  AppendVMovLiteral(&code, 21, 0x3ec00000u);
+  code.push_back(EncodeMimg0(0x20, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  code.push_back(EncodeMimg0(0x47, 0x2));
+  code.push_back(EncodeMimg1(4, 20));
+  for (u32 component = 0; component < 8; component++) {
+    AppendStoreVgpr(&code, component, component);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageSamplePackedUintConvertsSampleAndGather";
+  test.code = std::move(code);
+  test.expected = {0x2abu, 0x456u, 0x321u, 0x321u,
+                   0x456u, 0x456u, 0x456u, 0x456u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba = std::vector<u32>(16, 0xaae2b321u);
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data =
+      MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UInt);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(6, 5, 4, 7);
+  test.expected_force_point_sampler = true;
+  test.required_spirv = {"OpImageSampleExplicitLod", "OpImageGather",
+                         "OpBitFieldUExtract"};
+  return test;
+}
+
 TestCase ImageLoadR128IgnoresAdjacentMaskSgprs() {
   using O = ShaderOpcode;
 
@@ -18569,6 +18664,67 @@ TestCase ImageStoreR32UintUsesUintStorageImage() {
   return test;
 }
 
+TestCase ImageStorePackedUintSaturatesChannels() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 0, 0x800u);
+  AppendVMovLiteral(&code, 1, UINT32_MAX);
+  AppendVMovU32(&code, 2, 0x400u);
+  AppendVMovU32(&code, 3, 0x55u);
+  code.push_back(EncodeMimg0(0x08, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendEnd(&code);
+
+  std::vector<u32> expected_image(16, 0);
+  expected_image[1 * 4 + 2] = UINT32_MAX;
+
+  TestCase test;
+  test.name = "ImageStorePackedUintSaturatesChannels";
+  test.code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+  test.user_data =
+      MakeStorageTextureData(Prospero::BufferFormat::k11_11_10UInt);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 0);
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::move(expected_image);
+  test.required_spirv = {"R32ui", "OpULessThan", "OpSelect"};
+  return test;
+}
+
+TestCase ImageStorePackedUintHonorsSparseDmask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 0, 0x321u);
+  AppendVMovU32(&code, 1, 0x2abu);
+  code.push_back(EncodeMimg0(0x08, 0x5));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendEnd(&code);
+
+  std::vector<u32> expected_image(16, 0);
+  expected_image[1 * 4 + 2] = 0xaac00321u;
+
+  TestCase test;
+  test.name = "ImageStorePackedUintHonorsSparseDmask";
+  test.code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+  test.user_data =
+      MakeStorageTextureData(Prospero::BufferFormat::k11_11_10UInt);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 0);
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::move(expected_image);
+  return test;
+}
+
 TestCase ComputeTgSizeSgprUsesWaveMetadata() {
   using O = ShaderOpcode;
 
@@ -19157,6 +19313,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
@@ -19183,6 +19341,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreR32FloatUsesFormatlessStorageImage);
   AddCase(ImageStoreR32SintUsesRawUintView);
   AddCase(ImageStoreR32UintUsesUintStorageImage);
+  AddCase(ImageStorePackedUintSaturatesChannels);
+  AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageAtomicVariants);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
@@ -21227,7 +21387,7 @@ void CheckStorageTextureDepthTileUploadLayout() {
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
-void CheckStorageImageSwizzleSpecializationId() {
+void CheckImageSpecializationId() {
   std::array<u32, 1> code{};
   HW::ComputeShaderInfo regs{};
   regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
@@ -21239,7 +21399,10 @@ void CheckStorageImageSwizzleSpecializationId() {
   image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   identity_program.info.images.push_back(image);
   auto rgb1_program = identity_program;
-  rgb1_program.info.images[0].storage_swizzle = DstSel(4, 5, 6, 1);
+  rgb1_program.info.images[0].shader_swizzle = DstSel(4, 5, 6, 1);
+  auto converted_program = identity_program;
+  converted_program.info.images[0].conversion_format =
+      Prospero::BufferFormat::k11_11_10UInt;
   auto mip1_program = identity_program;
   mip1_program.info.images[0].mip_mode =
       ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
@@ -21260,6 +21423,9 @@ void CheckStorageImageSwizzleSpecializationId() {
   auto rgb1_info = identity_info;
   rgb1_info.stage.program =
       std::make_shared<const ShaderRecompiler::IR::Program>(rgb1_program);
+  auto converted_info = identity_info;
+  converted_info.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(converted_program);
   auto mip1_info = identity_info;
   mip1_info.stage.program =
       std::make_shared<const ShaderRecompiler::IR::Program>(mip1_program);
@@ -21275,17 +21441,109 @@ void CheckStorageImageSwizzleSpecializationId() {
 
   const auto identity_id = ShaderGetIdCS(regs, identity_info, true);
   const auto rgb1_id = ShaderGetIdCS(regs, rgb1_info, true);
+  const auto converted_id = ShaderGetIdCS(regs, converted_info, true);
   const auto mip1_id = ShaderGetIdCS(regs, mip1_info, true);
   const auto mip3_id = ShaderGetIdCS(regs, mip3_info, true);
   const auto array_id = ShaderGetIdCS(regs, array_info, true);
   const auto cube_id = ShaderGetIdCS(regs, cube_info, true);
-  Require("StorageImageSwizzleSpecializationId", "pipeline cache key",
+  Require("ImageSpecializationId", "pipeline cache key",
           identity_id != rgb1_id &&
               identity_id.ids.size() == rgb1_id.ids.size() &&
+              identity_id != converted_id &&
+              identity_id.ids.size() == converted_id.ids.size() &&
               mip1_id != mip3_id && mip1_id.ids.size() == mip3_id.ids.size() &&
               array_id != cube_id && array_id.ids.size() == cube_id.ids.size(),
-          "storage swizzle, mip-count, or cube variants share a pipeline ID");
-  std::printf("[host]    %-32s ok\n", "StorageImageSwizzlePipelineId");
+          "image conversion, swizzle, mip-count, or cube variants share a "
+          "pipeline ID");
+
+  ShaderSamplerResource filtered_sampler{};
+  filtered_sampler.fields[2] =
+      (1u << 20u) | (3u << 22u) | (2u << 24u) | (2u << 26u);
+  filtered_sampler.SetPointFiltering();
+  Require("ImageSpecializationId", "forced point sampler",
+          filtered_sampler.XyMagFilter() == 0u &&
+              filtered_sampler.XyMinFilter() == 0u &&
+              filtered_sampler.ZFilter() == 1u &&
+              filtered_sampler.MipFilter() == 1u,
+          "point-only image format retained a filtered sampler mode");
+
+  ShaderSamplerResource base_mip_sampler{};
+  base_mip_sampler.fields[2] = (3u << 20u) | (1u << 22u) | (2u << 24u);
+  base_mip_sampler.SetPointFiltering();
+  Require("ImageSpecializationId", "base-mip point sampler",
+          base_mip_sampler.XyMagFilter() == 0u &&
+              base_mip_sampler.XyMinFilter() == 0u &&
+              base_mip_sampler.ZFilter() == 1u &&
+              base_mip_sampler.MipFilter() == 0u,
+          "forcing point filtering enabled mipmapping on a base-mip sampler");
+
+  ShaderRecompiler::IR::Program mixed_sampler_program;
+  mixed_sampler_program.values =
+      std::make_shared<ShaderRecompiler::IR::ValueProgram>();
+  mixed_sampler_program.resource_tracking_complete = true;
+  ShaderRecompiler::IR::ImageResource sampled_image;
+  sampled_image.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  sampled_image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  sampled_image.read = true;
+  mixed_sampler_program.info.images = {sampled_image, sampled_image};
+  mixed_sampler_program.info.samplers.push_back({0u, 4u});
+  mixed_sampler_program.info.sampled_pairs = {{0u, 0u, 8u}, {1u, 0u, 12u}};
+
+  ShaderRecompiler::IR::DescriptorValue native_image_descriptor{};
+  native_image_descriptor.dword_count = 8;
+  native_image_descriptor.dwords[0] = 0x1000u;
+  native_image_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u;
+  native_image_descriptor.dwords[2] = 3u | (3u << 14u);
+  native_image_descriptor.dwords[3] =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+  auto packed_image_descriptor = native_image_descriptor;
+  packed_image_descriptor.dwords[0] = 0x2000u;
+  packed_image_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10UInt) << 20u;
+
+  ShaderRecompiler::IR::ResourceSnapshot mixed_sampler_snapshot;
+  mixed_sampler_snapshot.images = {native_image_descriptor,
+                                   packed_image_descriptor};
+  ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
+  sampler_descriptor.dword_count = 4;
+  mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
+  std::string specialization_error;
+  Require("ImageSpecializationId", "mixed sampler specialization",
+          ShaderRecompiler::IR::SpecializeResources(mixed_sampler_program,
+                                                    mixed_sampler_snapshot,
+                                                    &specialization_error),
+          specialization_error);
+  Require("ImageSpecializationId", "mixed sampler variant",
+          mixed_sampler_program.info.samplers.size() == 2u &&
+              !mixed_sampler_program.info.samplers[0].force_point_filtering &&
+              mixed_sampler_program.info.samplers[1].force_point_filtering &&
+              mixed_sampler_program.info.sampled_pairs[0].sampler == 0u &&
+              mixed_sampler_program.info.sampled_pairs[1].sampler == 1u &&
+              mixed_sampler_snapshot.samplers.size() == 2u,
+          "a shared native/bit-packed sampler was not split into point and "
+          "native variants");
+
+  ShaderRecompiler::IR::Program packed_atomic_program;
+  packed_atomic_program.values =
+      std::make_shared<ShaderRecompiler::IR::ValueProgram>();
+  packed_atomic_program.resource_tracking_complete = true;
+  auto packed_atomic_image = sampled_image;
+  packed_atomic_image.kind =
+      ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  packed_atomic_image.written = true;
+  packed_atomic_image.atomic = true;
+  packed_atomic_program.info.images.push_back(packed_atomic_image);
+  ShaderRecompiler::IR::ResourceSnapshot packed_atomic_snapshot;
+  packed_atomic_snapshot.images.push_back(packed_image_descriptor);
+  std::string atomic_error;
+  Require("ImageSpecializationId", "packed atomic rejection",
+          !ShaderRecompiler::IR::SpecializeResources(
+              packed_atomic_program, packed_atomic_snapshot, &atomic_error) &&
+              atomic_error.find("unsupported format 34") != std::string::npos,
+          "a non-atomic PS5 packed format entered the typed atomic path");
+  std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
 
 void CheckStorageTextureVolumeUploadLayout() {
@@ -22910,7 +23168,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
-    CheckStorageImageSwizzleSpecializationId();
+    CheckImageSpecializationId();
     CheckIndirectImageKeySwitch();
     return 0;
   }
@@ -22952,7 +23210,7 @@ int main(int argc, char **argv) {
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
-  CheckStorageImageSwizzleSpecializationId();
+  CheckImageSpecializationId();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureVolumeMipRegions();

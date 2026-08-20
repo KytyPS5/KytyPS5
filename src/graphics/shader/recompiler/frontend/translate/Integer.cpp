@@ -469,6 +469,21 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 			                                    replicate(ir.ShiftRightLogical(source, imm(16))));
 			break;
 		}
+		case IR::Opcode::QuadmaskB64: {
+			const auto compact = [&](IR::U32 value) {
+				auto bits = ir.BitwiseOr(value, ir.ShiftRightLogical(value, imm(1)));
+				bits      = ir.BitwiseOr(bits, ir.ShiftRightLogical(bits, imm(2)));
+				bits      = mask(bits, 0x11111111u);
+				bits = mask(ir.BitwiseOr(bits, ir.ShiftRightLogical(bits, imm(3))), 0x03030303u);
+				bits = mask(ir.BitwiseOr(bits, ir.ShiftRightLogical(bits, imm(6))), 0x000f000fu);
+				return mask(ir.BitwiseOr(bits, ir.ShiftRightLogical(bits, imm(12))), 0xffu);
+			};
+			const auto source = ReadU32Pair(inst.src[0]);
+			const auto quads =
+			    ir.BitwiseOr(compact(source[0]), ir.ShiftLeftLogical(compact(source[1]), imm(8)));
+			result = ir.ConstructU64(quads, imm(0));
+			break;
+		}
 		case IR::Opcode::BitFieldMaskU32: {
 			const auto count  = mask(ReadU32(inst.src[0]), 31u);
 			const auto offset = mask(ReadU32(inst.src[1]), 31u);

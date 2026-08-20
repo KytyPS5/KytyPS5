@@ -11711,6 +11711,37 @@ TestCase ScalarNotB64UpdatesScc() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarQuadmaskB64() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  auto capture_scc = [&](u32 dst_sgpr) {
+    code.push_back(EncodeSop2(0x0a, dst_sgpr, InlineU32(1), InlineU32(0)));
+  };
+
+  AppendSMovLiteral(&code, 106, 0x80000011u);
+  AppendSMovLiteral(&code, 107, 0x000000f0u);
+  code.push_back(EncodeSop1(0x2d, 106, 106));
+  capture_scc(0);
+  AppendStoreSgprPair(&code, 106, 0);
+  AppendStoreSgpr(&code, 0, 2);
+
+  code.push_back(EncodeSMovB32(106, InlineU32(0)));
+  code.push_back(EncodeSMovB32(107, InlineU32(0)));
+  code.push_back(EncodeSop1(0x2d, 106, 106));
+  capture_scc(0);
+  AppendStoreSgprPair(&code, 106, 3);
+  AppendStoreSgpr(&code, 0, 5);
+  AppendEnd(&code);
+
+  return {"ScalarQuadmaskB64",
+          code,
+          {},
+          {0x00000283u, 0, 1, 0, 0, 0},
+          {O::S_MOV_B32, O::S_QUADMASK_B64, O::S_CSELECT_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarFlbitI32B64Gpu() {
   using O = ShaderOpcode;
 
@@ -18564,6 +18595,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarCompareOps);
   AddCase(ScalarShiftAddAndMaskOps);
   AddCase(ScalarNotB64UpdatesScc);
+  AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);

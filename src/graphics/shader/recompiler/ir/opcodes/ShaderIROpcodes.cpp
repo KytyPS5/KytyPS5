@@ -28,6 +28,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::S_FF1_I32_B64, Opcode::FindLsbU64},
     {Decoder::Opcode::S_FLBIT_I32_B64, Opcode::FindMsbFromHighU64},
     {Decoder::Opcode::S_BITREPLICATE_B64_B32, Opcode::BitReplicateB64B32},
+    {Decoder::Opcode::S_QUADMASK_B64, Opcode::QuadmaskB64},
     {Decoder::Opcode::S_NOT_B32, Opcode::BitwiseNotU32},
     {Decoder::Opcode::S_NOT_B64, Opcode::BitwiseNotU64},
     {Decoder::Opcode::S_ADD_U32, Opcode::IAddU32},
@@ -511,7 +512,8 @@ bool ScalarResultWritesSccNonZero(Decoder::Opcode opcode) {
 		case Decoder::Opcode::S_LSHL_B64:
 		case Decoder::Opcode::S_LSHR_B64:
 		case Decoder::Opcode::S_BFE_U64:
-		case Decoder::Opcode::S_WQM_B64: return true;
+		case Decoder::Opcode::S_WQM_B64:
+		case Decoder::Opcode::S_QUADMASK_B64: return true;
 		default: return false;
 	}
 }
@@ -530,7 +532,8 @@ bool ScalarResultIs64Bit(Decoder::Opcode opcode) {
 		case Decoder::Opcode::S_LSHL_B64:
 		case Decoder::Opcode::S_LSHR_B64:
 		case Decoder::Opcode::S_BFE_U64:
-		case Decoder::Opcode::S_WQM_B64: return true;
+		case Decoder::Opcode::S_WQM_B64:
+		case Decoder::Opcode::S_QUADMASK_B64: return true;
 		default: return false;
 	}
 }

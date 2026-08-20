@@ -266,20 +266,24 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
+		const bool native_2x_one_frag = rt.info.fmask_compression_enable &&
+		                                !rt.info.fmask_data_compression_disable &&
+		                                rt.info.cmask_fast_clear_enable && rt.fmask.addr != 0 &&
+		                                rt.cmask.addr != 0 && rt.attrib.num_samples == 1 &&
+		                                rt.attrib.num_fragments == 1;
+		EXIT_NOT_IMPLEMENTED(rt.info.fmask_one_frag_mode && !native_2x_one_frag);
 		if (rt.info.fmask_compression_enable) {
 			EXIT_NOT_IMPLEMENTED(rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
 			static bool logged = false;
 			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 FMASK metadata for single-sample MSAA "
-				     "fallback, fmask=0x%016" PRIx64 "\n",
+				LOGF("RenderTarget: using native Vulkan MSAA without guest FMASK metadata, "
+				     "fmask=0x%016" PRIx64 "\n",
 				     rt.fmask.addr);
 				logged = true;
 			}
 		}
 
-		// EXIT_NOT_IMPLEMENTED(rt.info.fmask_compression_mode != 0x00000000);
 		EXIT_NOT_IMPLEMENTED(rt.info.fmask_data_compression_disable != false);
-		EXIT_NOT_IMPLEMENTED(rt.info.fmask_one_frag_mode != false);
 
 		if (rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable) {
 			static bool logged = false;

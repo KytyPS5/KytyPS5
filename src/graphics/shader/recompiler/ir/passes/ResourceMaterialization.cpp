@@ -52,10 +52,14 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
-bool ValidImageDescriptor(const DescriptorValue& descriptor) {
+bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
+		return false;
+	}
+	if (r128 && type != Prospero::ImageType::kColor1D &&
+	    type != Prospero::ImageType::kColor2D && type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
@@ -63,7 +67,8 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor) {
 		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
 		const auto fragments  = (descriptor.dwords[3] >> 16u) & 0xfu;
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
-		return base_level == 0 && fragments >= 1 && fragments <= 3 && max_mip == fragments;
+		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
+		       (r128 || max_mip == fragments);
 	}
 	return true;
 }
@@ -644,7 +649,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			}
 		} else {
 			auto descriptor = *cursor++;
-			if (!ValidImageDescriptor(descriptor)) {
+			if (!ValidImageDescriptor(descriptor, image.r128)) {
 				descriptor.dwords.fill(0);
 			}
 			next.images[image_index]   = descriptor;

@@ -157,6 +157,9 @@ std::string FormatMimg(const Instruction& inst) {
 	if (inst.data_bits == 16u) {
 		text += " d16=1";
 	}
+	if (inst.image_r128) {
+		text += " r128=1";
+	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_GATHER4_LZ:

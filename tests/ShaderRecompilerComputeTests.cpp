@@ -570,10 +570,11 @@ constexpr u32 EncodeSmem1(u32 offset, u32 soffset = 0) {
 }
 
 constexpr u32 EncodeMimg0(u32 opcode, u32 dmask, u32 nsa_dwords = 0,
-                          bool glc = false, u32 dim = 1) {
+                          bool glc = false, u32 dim = 1, bool r128 = false) {
   return (0x3cu << 26u) | ((opcode >> 7u) & 0x1u) |
          ((nsa_dwords & 0x3u) << 1u) | ((dim & 0x7u) << 3u) |
          ((dmask & 0xfu) << 8u) | (glc ? (1u << 13u) : 0u) |
+         (r128 ? (1u << 15u) : 0u) |
          ((opcode & 0x7fu) << 18u);
 }
 
@@ -17625,6 +17626,35 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadR128IgnoresAdjacentMaskSgprs() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeSop1(0x04, 4, 126)); // s_mov_b64 s[4:5], exec
+  code.push_back(EncodeMimg0(0x00, 0x1, 0, false, 1, true));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadR128IgnoresAdjacentMaskSgprs";
+  test.code = code;
+  test.expected = {0xdeadbeefu};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::IMAGE_LOAD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = 0xdeadbeefu;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  test.decoded_counts = {{"r128=1", 1}};
+  test.native_ir_counts = {{"image_r128=1", 1}};
+  return test;
+}
+
 TestCase ImageLoad1DUsesScalarCoordinate() {
   using O = ShaderOpcode;
 
@@ -19095,6 +19125,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
@@ -20278,6 +20309,13 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
           "valid uncompressed MSAA depth descriptor required an HTILE "
           "compatibility flag");
 
+  auto r128_msaa = uncompressed_msaa;
+  std::fill(r128_msaa.fields + 4, r128_msaa.fields + 8, 0u);
+  Require("SampledDepthDescriptor", "R128 uncompressed 2x MSAA depth",
+          IsSupportedDepthTargetDescriptor(r128_msaa, msaa_image, true) &&
+              IsSupportedDepthTextureEncoding(r128_msaa, msaa_image, true),
+          "valid R128 MSAA depth descriptor required omitted dwords");
+
   descriptor.fields[3] =
       (descriptor.fields[3] & ~(0xfu << 28u)) |
       (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
@@ -20669,6 +20707,19 @@ void CheckBasicStorageTextureDescriptor() {
               bgra.DstSelXYZW() == DstSel(6, 5, 4, 7),
           "PPSA02604 BGRA 2D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), bgra, 0x870000);
+
+  const ShaderTextureResource r128{{0x0202e500u, 0xc8200000u, 0x010dc1dfu,
+                                    0x91b00facu, 0, 0, 0, 0}};
+  auto r128_resource = BasicBgraStorageTextureResource();
+  r128_resource.r128 = true;
+  Require("BasicStorageTexture", "PPSA01736 R128 descriptor",
+          r128.Base40() == 0x202e50000ull && r128.Width5() + 1u == 1920 &&
+              r128.Height5() + 1u == 1080 && r128.Depth() + 1u == 1 &&
+              r128.Format() == Prospero::BufferFormat::k8_8_8_8Srgb &&
+              r128.TileMode() == Prospero::TileMode::kRenderTarget &&
+              r128.DstSelXYZW() == DstSel(4, 5, 6, 7),
+          "PPSA01736 R128 storage descriptor fixture is malformed");
+  ValidateStorageTexture(r128_resource, r128, 0x870000);
 
   const auto r11g11b10 = Ppsa06228R11G11B10StorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA06228 R11G11B10 descriptor",

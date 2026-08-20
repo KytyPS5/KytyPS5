@@ -119,6 +119,7 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_cube                                            = false;
+	bool                    image_r128                                            = false;
 	bool                    glc                                                   = false;
 	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;
@@ -226,6 +227,7 @@ struct ImageResource {
 	bool                    atomic                    = false;
 	bool                    depth_compare             = false;
 	bool                    cube                      = false;
+	bool                    r128                      = false;
 	uint32_t                indirect_root             = NoIndirectImage;
 	uint32_t                indirect_mapping_offset   = 0;
 	uint32_t                indirect_mapping_capacity = 0;

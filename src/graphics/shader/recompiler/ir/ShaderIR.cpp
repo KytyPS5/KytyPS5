@@ -232,6 +232,7 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 	mem.formatted     = decoded.formatted;
 	mem.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                    decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
+	mem.image_r128    = decoded.image_r128;
 	mem.glc           = decoded.glc;
 	mem.slc           = decoded.slc;
 	mem.idxen         = decoded.idxen;

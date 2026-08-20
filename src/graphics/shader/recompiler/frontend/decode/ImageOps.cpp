@@ -309,6 +309,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t vaddr  = word1 & 0xffu;
 	const uint32_t srsrc  = (word1 >> 16u) & 0x1fu;
 	const uint32_t ssamp  = (word1 >> 21u) & 0x1fu;
+	const bool     r128   = ((word0 >> 15u) & 0x1u) != 0u;
 	const bool     a16    = ((word1 >> 30u) & 0x1u) != 0u;
 	const bool     d16    = ((word1 >> 31u) & 0x1u) != 0u;
 	const auto*    sample = LookupSample(opcode);
@@ -332,6 +333,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_sample_flags |= ImageSampleFlagA16;
 	}
 	inst.image_dimension  = dimension;
+	inst.image_r128       = r128;
 	inst.image_nsa_dwords = nsa_dwords;
 	for (uint32_t i = 0; i < nsa_dwords * 4u; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;

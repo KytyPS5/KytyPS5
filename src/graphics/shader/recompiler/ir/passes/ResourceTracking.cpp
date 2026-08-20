@@ -652,7 +652,7 @@ private:
 			auto& image = m_info.images[i];
 			if (image.source == source && image.kind == memory.kind &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -667,6 +667,7 @@ private:
 		image.dimension     = memory.image_dimension;
 		image.mip_mode      = mip;
 		image.depth_compare = depth;
+		image.r128          = memory.image_r128;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);

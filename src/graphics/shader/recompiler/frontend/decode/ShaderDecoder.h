@@ -667,6 +667,7 @@ struct Instruction {
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
+	bool           image_r128                                   = false;
 	int32_t        branch_offset                                = 0;
 	uint32_t       branch_target                                = 0;
 	struct {

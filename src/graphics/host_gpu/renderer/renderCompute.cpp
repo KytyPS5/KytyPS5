@@ -279,7 +279,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
 			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
 			         ? 1u
-			         : static_cast<uint32_t>(r.MaxMip()) + 1u,
+			         : static_cast<uint32_t>(image.r128 ? r.LastLevel() : r.MaxMip()) + 1u,
 			     static_cast<uint32_t>(r.TileMode()));
 		}
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {

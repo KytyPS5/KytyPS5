@@ -52,11 +52,13 @@ IR::Value Translator::GetScalarAddressResource(uint32_t base) {
 }
 
 IR::Value Translator::GetImageResource(const IR::MemoryInfo& memory) {
+	const auto dword = [&](uint32_t index) {
+		return memory.image_r128 && index >= 4u ? IR::U32(IR::Value(0u))
+		                                         : GetResourceDword(memory.resource, index);
+	};
 	return ir.Emit(IR::ValueOpcode::GetImageResource,
-	               {GetResourceDword(memory.resource, 0), GetResourceDword(memory.resource, 1),
-	                GetResourceDword(memory.resource, 2), GetResourceDword(memory.resource, 3),
-	                GetResourceDword(memory.resource, 4), GetResourceDword(memory.resource, 5),
-	                GetResourceDword(memory.resource, 6), GetResourceDword(memory.resource, 7)});
+	               {dword(0), dword(1), dword(2), dword(3), dword(4), dword(5), dword(6),
+	                dword(7)});
 }
 
 IR::Value Translator::GetSamplerResource(const IR::MemoryInfo& memory) {

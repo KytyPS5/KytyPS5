@@ -98,14 +98,14 @@ std::string MemoryInfoToString(const MemoryInfo& mem) {
 	    " ; {} resource={} sampler={} offset={} offset2={} dmask=0x{:x} data_dwords={} "
 	    "data_bits={} component={}/{} dfmt={} nfmt={} signed={} typed={} formatted={} segment={} "
 	    "glc={} slc={} idxen={} offen={} image_flags=0x{:x} image_dim={} image_addr={} "
-	    "image_mip={}",
+	    "image_mip={} image_r128={}",
 	    ResourceKindToString(mem.kind).c_str(), mem.resource, mem.sampler, mem.offset,
 	    mem.secondary_offset, mem.dmask, mem.data_dwords, mem.data_bits, mem.component_index,
 	    mem.component_count, mem.data_format, mem.number_format, mem.data_signed ? 1u : 0u,
 	    mem.typed ? 1u : 0u, mem.formatted ? 1u : 0u, mem.memory_segment, mem.glc ? 1u : 0u,
 	    mem.slc ? 1u : 0u, mem.idxen ? 1u : 0u, mem.offen ? 1u : 0u, mem.image_sample_flags,
 	    Decoder::ImageDimensionToString(mem.image_dimension), mem.image_address_components,
-	    mem.image_has_mip ? 1u : 0u);
+	    mem.image_has_mip ? 1u : 0u, mem.image_r128 ? 1u : 0u);
 	if (mem.image_nsa_dwords != 0) {
 		text += fmt::format(" image_nsa_dwords={} image_nsa_addr=", mem.image_nsa_dwords);
 		const auto count =

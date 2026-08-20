@@ -3846,6 +3846,42 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
+      constexpr uint64_t raw_d16_offset = 0x27d0000;
+      constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
+      std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),
+                  sizeof(raw_d16_values));
+      auto raw_d16 = MakeLinearDesc(
+          base + raw_d16_offset, sizeof(raw_d16_values),
+          vk::Format::eD16Unorm, Prospero::BufferFormat::k16UNorm,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(uint16_t), 1);
+      raw_d16.type = BindingType::DepthTarget;
+      raw_d16.view_info.format = vk::Format::eD16Unorm;
+      raw_d16.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      raw_d16.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto raw_d16_image = texture_cache.FindImage(raw_d16);
+      (void)texture_cache.FindDepthTarget(raw_d16_image, raw_d16);
+
+      auto raw_d16_uint = raw_d16;
+      raw_d16_uint.type = BindingType::Texture;
+      raw_d16_uint.info.pixel_format = vk::Format::eR16Uint;
+      raw_d16_uint.info.guest_format = Prospero::BufferFormat::k16UInt;
+      raw_d16_uint.view_info.format = vk::Format::eR16Uint;
+      raw_d16_uint.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      raw_d16_uint.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto raw_d16_uint_image = texture_cache.FindImage(raw_d16_uint);
+      Require(name, "raw D16 uint texture backing",
+              raw_d16_uint_image && raw_d16_uint_image != raw_d16_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    raw_d16_image) &&
+                  texture_cache.GetImage(raw_d16_uint_image)
+                          .backing.format == vk::Format::eR16Uint,
+              "D16 uint sampling did not recreate a true integer color backing");
+      Require(name, "raw D16 uint texture view",
+              texture_cache.FindTexture(raw_d16_uint_image, raw_d16_uint) !=
+                  nullptr,
+              "D16 uint sampling did not create an integer sampled view");
+
       auto native_array_info = array_desc.info;
       native_array_info.data = {};
       auto native_volume_info = volume_desc.info;

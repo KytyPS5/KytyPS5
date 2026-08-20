@@ -185,8 +185,9 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
 		    z.stencil_read_base_addr == 0 ||
-		    z.stencil_write_base_addr != z.stencil_read_base_addr ||
-		    (z.stencil_read_base_addr & 0xffffu) != 0 || z.depth_view.stencil_write_disable) {
+		    (!z.depth_view.stencil_write_disable &&
+		     z.stencil_write_base_addr != z.stencil_read_base_addr) ||
+		    (z.stencil_read_base_addr & 0xffffu) != 0) {
 			DepthFatal("unsupported stencil attachment state");
 		}
 	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0 ||
@@ -287,18 +288,22 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();
 	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
-	r.stencil_clear_enable = has_stencil && rc.stencil_clear_enable;
+	r.stencil_clear_enable =
+	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
 	r.stencil_clear_value  = hw.GetStencilClearValue();
 	r.stencil_test_enable  = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
-		const uint8_t front_write_mask = rc.stencil_clear_enable ? 0 : sm.stencil_writemask;
-		const uint8_t back_write_mask  = rc.stencil_clear_enable ? 0 : sm.stencil_writemask_bf;
+		const bool stencil_ops_disabled =
+		    rc.stencil_clear_enable || z.depth_view.stencil_write_disable;
+		const uint8_t front_write_mask = stencil_ops_disabled ? 0 : sm.stencil_writemask;
+		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
-		    (UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
+		    (front_write_mask != 0 &&
+		     UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
 		     sm.stencil_opval != sm.stencil_testval) ||
-		    (dc.backface_enable &&
+		    (dc.backface_enable && back_write_mask != 0 &&
 		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
 		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
 			DepthFatal("unsupported stencil compare or replacement state");

@@ -7651,27 +7651,69 @@ public:
 
       auto read_only_depth_target = phased_depth_target;
       read_only_depth_target.z_write_base_addr = 0;
+      read_only_depth_target.stencil_write_base_addr = 0;
       read_only_depth_target.depth_view.depth_write_disable = true;
+      read_only_depth_target.depth_view.stencil_write_disable = true;
       registers.SetDepthRenderTarget(read_only_depth_target);
       auto read_only_depth_control = phased_depth_control;
       read_only_depth_control.z_write_enable = false;
+      read_only_depth_control.zfunc =
+          static_cast<uint8_t>(vk::CompareOp::eAlways);
+      read_only_depth_control.stencil_enable = true;
+      read_only_depth_control.stencilfunc =
+          static_cast<uint8_t>(vk::CompareOp::eAlways);
       registers.SetDepthControl(read_only_depth_control);
+      HW::StencilControl read_only_stencil_control{};
+      read_only_stencil_control.stencil_zpass =
+          static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
+      registers.SetStencilControl(read_only_stencil_control);
+      HW::StencilMask read_only_stencil_mask{};
+      read_only_stencil_mask.stencil_testval = 0x12;
+      read_only_stencil_mask.stencil_mask = 0xff;
+      read_only_stencil_mask.stencil_writemask = 0xff;
+      read_only_stencil_mask.stencil_opval = 0x34;
+      registers.SetStencilMask(read_only_stencil_mask);
       RenderDepthInfo read_only_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, 1, scheduler.Current(), read_only_depth);
       Require(
-          name, "read-only depth target without write address",
+          name, "read-only depth/stencil target without write addresses",
           read_only_depth.image_id == phased_depth.image_id &&
               read_only_depth.depth_buffer_vaddr == phased_depth_address &&
+              read_only_depth.stencil_buffer_vaddr == phased_stencil_address &&
               !read_only_depth.depth_write_enable &&
+              !read_only_depth.stencil_clear_enable &&
+              read_only_depth.stencil_test_enable &&
+              read_only_depth.stencil_dynamic_front.writeMask == 0 &&
+              read_only_depth.stencil_dynamic_back.writeMask == 0 &&
+              read_only_depth.stencil_static_front.passOp ==
+                  vk::StencilOp::eKeep &&
               !read_only_depth.AttachmentWriteAspects() &&
               depth_attachment_layout(read_only_depth) ==
                   vk::ImageLayout::eDepthStencilReadOnlyOptimal,
-          "a PS5 read-only depth target required a depth write address or "
-          "selected a writable host layout");
+          "a PS5 read-only depth/stencil target required write addresses or "
+          "retained host writes");
+
+      auto read_only_render_control = phased_render_control;
+      read_only_render_control.stencil_clear_enable = true;
+      registers.SetRenderControl(read_only_render_control);
+      RenderDepthInfo read_only_clear_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), read_only_clear_depth);
+      Require(
+          name, "read-only stencil clear suppression",
+          read_only_clear_depth.image_id == phased_depth.image_id &&
+              !read_only_clear_depth.stencil_clear_enable &&
+              !read_only_clear_depth.AttachmentWriteAspects() &&
+              depth_attachment_layout(read_only_clear_depth) ==
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+          "a PS5 target-level stencil write disable retained a host clear");
 
       registers.SetDepthRenderTarget(phased_depth_target);
       registers.SetDepthControl(phased_depth_control);
+      registers.SetStencilControl({});
+      registers.SetStencilMask({});
+      registers.SetRenderControl(phased_render_control);
       RenderColorInfo no_color{};
       auto phased_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &no_color, 0, phased_depth);

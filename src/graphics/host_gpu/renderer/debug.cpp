@@ -567,13 +567,9 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 		}
 		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable &&
 		                     z.z_read_base_addr != z.z_write_base_addr);
-		EXIT_NOT_IMPLEMENTED(z.stencil_read_base_addr != z.stencil_write_base_addr);
+		EXIT_NOT_IMPLEMENTED(!z.depth_view.stencil_write_disable &&
+		                     z.stencil_read_base_addr != z.stencil_write_base_addr);
 		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable && z.z_write_base_addr == 0);
-		if (z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
-		    z.stencil_write_base_addr == 0) {
-			LOGF("\t warning: stencil format is set without a stencil base address, continuing "
-			     "without stencil attachment\n");
-		}
 		// EXIT_NOT_IMPLEMENTED(z.pitch_div8_minus1 != 0x000000ff);
 		// EXIT_NOT_IMPLEMENTED(z.height_div8_minus1 != 0x0000008f);
 		// EXIT_NOT_IMPLEMENTED(z.slice_div64_minus1 != 0x00008fff);

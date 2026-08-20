@@ -71,19 +71,6 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
-// Indirect Cx descriptors retain their selector. Selector 1 offsets 0..31 address the
-// SPI_PS_INPUT_CNTL register bank; ordinary context-register offsets remain unchanged.
-constexpr uint32_t DecodeIndirectCxRegisterOffset(uint32_t raw_offset) {
-	const auto offset = NormalizeRegisterOffset(raw_offset);
-	return (raw_offset & RegisterSelectorMask) == Pm4::CX_PS_SHADER_USAGE_BASE && offset < 32u
-	           ? Pm4::SPI_PS_INPUT_CNTL_0 + offset
-	           : offset;
-}
-
-static_assert(DecodeIndirectCxRegisterOffset(Pm4::CX_PS_SHADER_USAGE_BASE + 2u) ==
-              Pm4::SPI_PS_INPUT_CNTL_0 + 2u);
-static_assert(DecodeIndirectCxRegisterOffset(Pm4::DB_Z_INFO) == Pm4::DB_Z_INFO);
-
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
 	return eop_event_type != 0x28u ||
 	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
@@ -2370,10 +2357,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		// Keep the encoded offset for packet control values, and use the decoded offset only
-		// for register dispatch.
+		// Keep the encoded offset for packet control values, and use the normalized offset
+		// only for register dispatch.
 		auto raw_cmd_offset = indirect_buffer[0];
-		auto cmd_offset     = DecodeIndirectCxRegisterOffset(raw_cmd_offset);
+		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {

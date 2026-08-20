@@ -5504,10 +5504,20 @@ void TestGraphicsCreateInterpolantMapping() {
   Check(Gen5::AgcCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
         "null pixel shader interpolant mapping failed");
   for (uint32_t i = 0; i < 32u; i++) {
-    Check(regs[i].offset == Pm4::CX_PS_SHADER_USAGE_BASE + i,
+    Check(regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
           "identity interpolant register offset was unexpected");
     Check(regs[i].value == i,
           "identity interpolant register value was unexpected");
+  }
+
+  ShaderRegister native_regs[32] = {};
+  Check(Gen5::AgcCreateInterpolantMapping2(native_regs, nullptr, nullptr) == 0,
+        "native interpolant mapping identity path failed");
+  for (uint32_t i = 0; i < 32u; i++) {
+    Check(native_regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
+          "native interpolant register offset was unexpected");
+    Check(native_regs[i].value == i,
+          "native interpolant register value was unexpected");
   }
 
   ShaderSemantic gs_semantics[3] = {};
@@ -5523,7 +5533,7 @@ void TestGraphicsCreateInterpolantMapping() {
   gs.output_semantics = gs_semantics;
   gs.num_output_semantics = static_cast<uint16_t>(std::size(gs_semantics));
 
-  ShaderSemantic ps_semantics[4] = {};
+  ShaderSemantic ps_semantics[6] = {};
   ps_semantics[0].semantic = 7;
   ps_semantics[1].semantic = 8;
   ps_semantics[1].default_value = 2;
@@ -5535,6 +5545,13 @@ void TestGraphicsCreateInterpolantMapping() {
   ps_semantics[3].is_f16 = 1;
   ps_semantics[3].default_value = 3;
   ps_semantics[3].default_value_hi = 2;
+  ps_semantics[4].semantic = 10;
+  ps_semantics[4].is_f16 = 2;
+  ps_semantics[4].default_value_hi = 3;
+  ps_semantics[5].semantic = 11;
+  ps_semantics[5].is_f16 = 1;
+  ps_semantics[5].default_value = 2;
+  ps_semantics[5].default_value_hi = 1;
 
   Shader ps{};
   ps.input_semantics = ps_semantics;
@@ -5550,9 +5567,25 @@ void TestGraphicsCreateInterpolantMapping() {
         "flat/custom interpolant mapping bits were unexpected");
   Check(regs[3].value == 0x01580304u,
         "f16 interpolant mapping bits were unexpected");
-  Check(regs[4].offset == Pm4::CX_PS_SHADER_USAGE_BASE + 4u &&
-            regs[4].value == 4u,
+  Check(regs[6].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 6u &&
+            regs[6].value == 6u,
         "interpolant identity tail was not filled");
+
+  Check(Gen5::AgcCreateInterpolantMapping2(native_regs, &gs, &ps) == 0,
+        "native shader interpolant mapping failed");
+  Check(native_regs[0].value == 0x00000005u &&
+            native_regs[1].value == 0x00000220u &&
+            native_regs[2].value == 0x0000052cu &&
+            native_regs[3].value == 0x01580304u,
+        "native shader interpolant values were unexpected");
+  Check(native_regs[4].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 4u &&
+            native_regs[4].value == 0x02680324u &&
+            native_regs[5].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 5u &&
+            native_regs[5].value == 0x01380220u,
+        "native mode-specific interpolant values were unexpected");
+  Check(native_regs[6].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 6u &&
+            native_regs[6].value == 6u,
+        "native interpolant identity tail was not filled");
 }
 
 void TestNewShaderRecompilerNativeWideScalarMemoryIr() {

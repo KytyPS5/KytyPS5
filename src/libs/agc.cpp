@@ -1353,9 +1353,7 @@ static const ShaderSemantic* find_interpolant_output_semantic(const Shader* gs, 
 }
 
 static void set_interpolant_register(ShaderRegister* regs, uint32_t index, uint32_t value) {
-	// Interpolant mappings contain encoded Cx descriptors. Indirect PM4 ingestion resolves
-	// this selector and slot to the physical SPI_PS_INPUT_CNTL register.
-	regs[index].offset = Pm4::CX_PS_SHADER_USAGE_BASE + index;
+	regs[index].offset = Pm4::SPI_PS_INPUT_CNTL_0 + index;
 	regs[index].value  = value;
 }
 
@@ -1403,6 +1401,96 @@ int KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader
 	}
 
 	set_identity_interpolant_registers(regs, ps->num_input_semantics);
+
+	return OK;
+}
+
+static uint32_t apply_interpolant_two_bit_field(uint32_t value, uint32_t field,
+                                                uint32_t shift) {
+	const auto mask = 0x3u << shift;
+	return (value & ~mask) | ((field & 0x3u) << shift);
+}
+
+static uint32_t apply_interpolant_final_mask(uint32_t flags, uint32_t source,
+                                             uint32_t mask) {
+	flags = (flags & 0xffffffe0u) | ((mask >> 8u) & 0x1fu);
+	flags = (flags & 0xfffffbffu) |
+	        ((source & 0x400000u) != 0 ? 0x400u : ((source >> 14u) & 0x400u));
+	return flags;
+}
+
+int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shader* gs,
+                                               const Shader* ps) {
+	PRINT_NAME();
+
+	LOGF("\t regs = 0x%016" PRIx64 "\n"
+	     "\t gs   = 0x%016" PRIx64 "\n"
+	     "\t ps   = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(regs), reinterpret_cast<uint64_t>(gs),
+	     reinterpret_cast<uint64_t>(ps));
+
+	EXIT_NOT_IMPLEMENTED(regs == nullptr);
+	EXIT_NOT_IMPLEMENTED(ps != nullptr && ps->num_input_semantics != 0 &&
+	                     ps->input_semantics == nullptr);
+
+	if (ps == nullptr || ps->num_input_semantics == 0) {
+		set_identity_interpolant_registers(regs, 0);
+		return OK;
+	}
+
+	EXIT_NOT_IMPLEMENTED(gs == nullptr);
+	EXIT_NOT_IMPLEMENTED(gs->num_output_semantics != 0 && gs->output_semantics == nullptr);
+
+	for (uint32_t i = 0; i < ps->num_input_semantics; i++) {
+		const auto source     = shader_semantic_word(ps->input_semantics[i]);
+		auto       mask_index = static_cast<uint32_t>(gs->num_output_semantics);
+
+		for (uint32_t j = 0; j < gs->num_output_semantics; j++) {
+			if (gs->output_semantics[j].semantic == static_cast<uint8_t>(source)) {
+				mask_index = j;
+				break;
+			}
+		}
+
+		const bool has_mask = mask_index < gs->num_output_semantics;
+		const auto mask     = has_mask ? shader_semantic_word(gs->output_semantics[mask_index]) : 0u;
+		const auto mode     = (source >> 20u) & 0x3u;
+		auto       flags    = 0u;
+
+		if (mode == 0) {
+			flags = (((source >> 24u) & 0x1u) | (has_mask ? 0u : 1u)) << 5u;
+			flags = apply_interpolant_two_bit_field(flags, source >> 28u, 8u);
+		} else {
+			flags = ((source << 4u) & 0x03000000u) + 0x80000u;
+
+			if (mode == 2) {
+				flags &= 0xffefffdfu;
+				flags |= has_mask ? ((~(mask & source) >> 16u) & 0x20u) : 0x20u;
+				flags = apply_interpolant_two_bit_field(flags, source >> 30u, 8u);
+				flags = apply_interpolant_two_bit_field(flags, source >> 30u, 21u);
+			} else {
+				if (has_mask) {
+					const auto masked = mask & source;
+					flags = (flags & 0xffffffdfu) | ((masked >> 15u) & 0x20u);
+					flags ^= 0x20u;
+					flags = (flags & 0xffefffffu) | ((~masked >> 1u) & 0x100000u);
+					flags = apply_interpolant_two_bit_field(flags, source >> 28u, 8u);
+				} else {
+					flags |= 0x100020u;
+					flags = apply_interpolant_two_bit_field(flags, source >> 28u, 8u);
+				}
+				flags = apply_interpolant_two_bit_field(flags, source >> 30u, 21u);
+			}
+		}
+
+		flags = has_mask ? apply_interpolant_final_mask(flags, source, mask)
+		                 : (flags & 0xfffffbe0u);
+		set_interpolant_register(regs, i, flags);
+	}
+
+	if (ps->num_input_semantics < 32u) {
+		set_identity_interpolant_registers(regs, ps->num_input_semantics);
+	}
 
 	return OK;
 }

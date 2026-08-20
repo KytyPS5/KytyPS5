@@ -387,9 +387,6 @@ constexpr uint32_t SPI_SHADER_POS_FORMAT  = 0x1C3;
 constexpr uint32_t SPI_SHADER_Z_FORMAT    = 0x1C4;
 constexpr uint32_t SPI_SHADER_COL_FORMAT  = 0x1C5;
 
-// Indirect Cx descriptor selector for the 32-entry PS input-control register bank.
-constexpr uint32_t CX_PS_SHADER_USAGE_BASE = 0x10000000u;
-
 constexpr uint32_t CB_BLEND0_CONTROL                            = 0x1E0;
 constexpr uint32_t CB_BLEND0_CONTROL_COLOR_SRCBLEND_SHIFT       = 0;
 constexpr uint32_t CB_BLEND0_CONTROL_COLOR_SRCBLEND_MASK        = 0x1F;

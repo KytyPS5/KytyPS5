@@ -3,8 +3,6 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
-#include <cstring>
-
 namespace Libs {
 
 namespace LibGen5 {
@@ -12,143 +10,6 @@ namespace LibGen5 {
 LIB_VERSION("Graphics5", 1, "Graphics5", 1, 1);
 
 namespace Gen5 = Graphics::Gen5;
-
-template <class T>
-static T ReadUnaligned(const uint8_t* ptr, uint32_t offset) {
-	T ret {};
-	std::memcpy(&ret, ptr + offset, sizeof(T));
-	return ret;
-}
-
-static uint32_t BitExtract(uint32_t value, uint32_t start, uint32_t len) {
-	return (value >> start) & ((1u << len) - 1u);
-}
-
-static void Graphics5UnknownDbWriteDefault(uint64_t* out, uint32_t first) {
-	constexpr uint64_t default_entry = 0x10000000ull;
-
-	for (uint32_t i = first; i < 32u; i++) {
-		const auto low  = static_cast<uint32_t>(default_entry) + i;
-		const auto high = static_cast<uint32_t>(default_entry >> 37u) * 32u + i;
-		out[i]          = (static_cast<uint64_t>(high) << 32u) | low;
-	}
-}
-
-static uint32_t Graphics5UnknownDbApplyTwoBitField(uint32_t value, uint32_t field, uint32_t shift) {
-	const auto mask = 0x3u << shift;
-
-	switch (field & 0x3u) {
-		case 0: return value & ~mask;
-		case 1: return (value & ~mask) | (0x1u << shift);
-		case 2: return (value & ~mask) | (0x2u << shift);
-		default: return value | mask;
-	}
-}
-
-static uint32_t Graphics5UnknownDbApplyFinalMask(uint32_t flags, uint32_t src,
-                                                 uint32_t mask_value) {
-	flags &= 0xffffffe0u;
-	flags |= BitExtract(mask_value, 8u, 5u);
-	flags &= 0xfffffbffu;
-	flags |= ((src & 0x400000u) != 0 ? 0x400u : ((src >> 14u) & 0x400u));
-	return flags;
-}
-
-static int KYTY_SYSV_ABI AgcUnknownDbOlWdppb4o(uint64_t arg0, uint64_t arg1, uint64_t arg2,
-                                               uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-	PRINT_NAME();
-
-	(void)arg3;
-	(void)arg4;
-	(void)arg5;
-
-	auto* out = reinterpret_cast<uint64_t*>(arg0);
-
-	if (arg2 == 0) {
-		Graphics5UnknownDbWriteDefault(out, 0);
-		return 0;
-	}
-
-	const auto* desc = reinterpret_cast<const uint8_t*>(arg1);
-	const auto* src  = reinterpret_cast<const uint8_t*>(arg2);
-
-	const auto count = ReadUnaligned<uint32_t>(src, 0x50u);
-
-	if (count == 0) {
-		Graphics5UnknownDbWriteDefault(out, 0);
-		return 0;
-	}
-
-	const auto  mask_count = ReadUnaligned<uint16_t>(desc, 0x56u);
-	const auto* masks = reinterpret_cast<const uint32_t*>(ReadUnaligned<uint64_t>(desc, 0x38u));
-	const auto* src_entries =
-	    reinterpret_cast<const uint32_t*>(ReadUnaligned<uint64_t>(src, 0x30u));
-
-	for (uint32_t i = 0; i < count; i++) {
-		auto src_value  = src_entries[i];
-		auto mask_index = static_cast<uint32_t>(mask_count);
-
-		for (uint32_t j = 0; j < mask_count; j++) {
-			if ((static_cast<uint8_t>(masks[j]) ^ static_cast<uint8_t>(src_value)) == 0) {
-				mask_index = j;
-				break;
-			}
-		}
-
-		const bool has_mask = (mask_index < mask_count);
-		const auto mode     = (src_value >> 20u) & 0x3u;
-		auto       flags    = 0u;
-
-		if (mode == 0) {
-			flags = (((src_value >> 24u) & 0x1u) | (has_mask ? 0u : 1u)) << 5u;
-			flags = Graphics5UnknownDbApplyTwoBitField(flags, (src_value >> 28u) & 0x3u, 8u);
-		} else {
-			const auto shifted_mode = (src_value << 4u) & 0x03000000u;
-			flags                   = shifted_mode + 0x80000u;
-
-			if (mode == 2) {
-				flags &= 0xffefffdfu;
-				if (has_mask) {
-					flags |= ((~(masks[mask_index] & src_value) >> 16u) & 0x20u);
-				} else {
-					flags |= 0x20u;
-				}
-				flags = Graphics5UnknownDbApplyTwoBitField(flags, (src_value >> 30u) & 0x3u, 8u);
-				flags = Graphics5UnknownDbApplyTwoBitField(flags, (src_value >> 30u) & 0x3u, 21u);
-			} else {
-				if (has_mask) {
-					const auto masked = masks[mask_index] & src_value;
-					flags &= 0xffffffdfu;
-					flags |= (masked >> 15u) & 0x20u;
-					flags ^= 0x20u;
-					flags &= 0xffefffffu;
-					flags |= ((~masked >> 1u) & 0x100000u);
-					flags =
-					    Graphics5UnknownDbApplyTwoBitField(flags, (src_value >> 30u) & 0x3u, 8u);
-				} else {
-					flags |= 0x100020u;
-					flags =
-					    Graphics5UnknownDbApplyTwoBitField(flags, (src_value >> 28u) & 0x3u, 8u);
-				}
-				flags = Graphics5UnknownDbApplyTwoBitField(flags, (src_value >> 30u) & 0x3u, 21u);
-			}
-		}
-
-		if (has_mask) {
-			flags = Graphics5UnknownDbApplyFinalMask(flags, src_value, masks[mask_index]);
-		} else {
-			flags &= 0xfffffbe0u;
-		}
-
-		out[i] = (static_cast<uint64_t>(flags) << 32u) | (0x10000000u + i);
-	}
-
-	if (count < 32u) {
-		Graphics5UnknownDbWriteDefault(out, count);
-	}
-
-	return 0;
-}
 
 LIB_DEFINE(InitAgcDriver_1) {
 	PRINT_NAME_ENABLE(true);
@@ -182,7 +43,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("qj7QZpgr9Uw", Gen5::AgcDcbContextStateOp);
 	LIB_FUNC("H6vHS5cidSA", Gen5::AgcDcbContextStateOpGetSize);
 	LIB_FUNC("BfBDZGbti7A", Gen5::AgcGetIsTrinityMode);
-	LIB_FUNC("dbOlWdppb4o", LibGen5::AgcUnknownDbOlWdppb4o);
+	LIB_FUNC("dbOlWdppb4o", Gen5::AgcCreateInterpolantMapping2);
 
 	LIB_FUNC("F0ZXt5q0ZTA", Gen5::AgcDriverGetDefaultOwner);
 	LIB_FUNC("F0Y42t-3e18", Gen5::AgcDriverInitResourceRegistration);

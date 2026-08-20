@@ -26,6 +26,27 @@
 
 namespace Libs::Graphics {
 
+// Allocation priority for VK_EXT_memory_priority: 0.0 means "demote this
+// first", 1.0 means "demote this last", and VMA uses 0.5 when nothing is
+// specified. It is a hint about relative value, so raising one class is
+// enough to order it against everything left at the default.
+//
+// Only images are raised here, deliberately. A demoted render target has to
+// be paged back in before the next pass that samples it, whereas most buffer
+// content can be re-uploaded from guest memory the emulator still holds. The
+// generic CreateBuffer() path also serves vertex/index buffers that may be
+// just as hot as an image, so lowering it wholesale would be guessing, and a
+// wrong guess here costs performance silently. Finer classification (staging
+// and tiler scratch really are cheap to lose) is a sensible follow-up once
+// someone measures it.
+//
+// This complements TextureCache::RunGarbageCollector() rather than replacing
+// it: the GC still frees things, this just gives the driver a cheaper option
+// one step earlier.
+namespace {
+constexpr float MEMORY_PRIORITY_IMAGE = 0.8F;
+} // namespace
+
 namespace {
 
 struct MemoryStats {
@@ -73,6 +94,11 @@ bool GraphicContext::CreateAllocator() {
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
 	info.flags = memory_budget_ext_enabled ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0;
+	// Without this bit VMA ignores VmaAllocationCreateInfo::priority entirely,
+	// so the per-allocation priorities set below would be silently inert.
+	if (memory_priority_ext_enabled) {
+		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
@@ -222,6 +248,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory.property);
 	alloc_info.preferredFlags =
 	    static_cast<vk::MemoryPropertyFlags::MaskType>(memory.preferred_property);
+	alloc_info.priority = MEMORY_PRIORITY_IMAGE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto       result       = static_cast<vk::Result>(

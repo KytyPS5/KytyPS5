@@ -1930,6 +1930,76 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 	return first_cmd;
 }
 
+uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs) {
+	PRINT_NAME();
+
+	LOGF("\t regs     = 0x%016" PRIx64 "\n"
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(regs), num_regs);
+
+	if (num_regs == 0) {
+		return nullptr;
+	}
+
+	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+	EXIT_NOT_IMPLEMENTED(regs == nullptr);
+
+	buf->DbgDump();
+
+	// Original implementation stages register values in a temporary DWORD array. It reads each new run only
+	// after the preceding run has been allocated, so preserve that ordering around grow callbacks.
+	std::vector<uint32_t> values(num_regs);
+	values[0] = regs[0].value;
+
+	uint32_t* first_cmd        = nullptr;
+	uint32_t  run_start_index  = 0;
+	uint32_t  run_start_offset = regs[0].offset;
+	uint32_t  prev_offset      = run_start_offset;
+	uint32_t  i                = 1;
+
+	for (;;) {
+		if (i < num_regs) {
+			const auto offset = regs[i].offset;
+			if (offset == prev_offset + 1u) {
+				values[i]   = regs[i].value;
+				prev_offset = offset;
+				i++;
+				continue;
+			}
+		}
+
+		const auto run_count = i - run_start_index;
+		auto*      cmd       = buf->AllocateDW(run_count + 2u);
+
+		if (cmd != nullptr) {
+			if (first_cmd == nullptr) {
+				first_cmd = cmd;
+			}
+
+			cmd[0] = KYTY_PM4(run_count + 2u, Pm4::IT_SET_UCONFIG_REG, 0u);
+			cmd[1] = run_start_offset & 0xffffu;
+			memcpy(cmd + 2, values.data() + run_start_index,
+			       static_cast<size_t>(run_count) * sizeof(uint32_t));
+		} else {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t failed to allocate set-uc-registers-direct command\n");
+		}
+
+		if (i == num_regs) {
+			return first_cmd;
+		}
+
+		// Original implementation skips an intermediate run whose grow callback fails, then keeps scanning.
+		run_start_index  = i;
+		run_start_offset = regs[i].offset;
+		prev_offset      = run_start_offset;
+		values[i]        = regs[i].value;
+		i++;
+	}
+}
+
 int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
 	PRINT_NAME();
 
@@ -2831,6 +2901,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	}
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
+	PRINT_NAME();
+
+	return (event_type & 0xfeu) == 0x38u ? 16u : 8u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,

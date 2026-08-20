@@ -107,6 +107,9 @@ uint32_t KYTY_SYSV_ABI  AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values
 uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
                                                   const volatile ShaderRegister* regs,
                                                   uint32_t                       num_regs);
+uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs);
 uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,
                                         uint8_t dst, uint8_t cache_policy,
                                         const volatile Label* address, uint8_t data_sel,
@@ -179,6 +182,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 uint32_t KYTY_SYSV_ABI  AgcDcbDispatchIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address);
+uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type);
 uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles);

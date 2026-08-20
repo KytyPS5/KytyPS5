@@ -202,6 +202,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("n2fD4A+pb+g", Gen5::AgcCbSetShRegisterRangeDirect);
 	LIB_FUNC("bxGoVxpdSPQ", Gen5::AgcCbSetShRegisterRangeDirectGetSize);
 	LIB_FUNC("UZbQjYAwwXM", Gen5::AgcCbSetShRegistersDirect);
+	LIB_FUNC("03RZmELWWzw", Gen5::AgcCbSetUcRegistersDirect);
 	LIB_FUNC("wr23dPKyWc0", Gen5::AgcCbReleaseMem);
 	LIB_FUNC("hL7C0IRpWZI", Gen5::AgcCbQueueEndOfPipeActionGetSize);
 	LIB_FUNC("T6xuVw0KUJo", Gen5::AgcDebugRaiseException);
@@ -254,6 +255,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("CtB+A9-VxO0", Gen5::AgcDcbDispatchIndirect);
 	LIB_FUNC("w8HVkEeXPv8", Gen5::AgcDcbDispatchIndirectGetSize);
 	LIB_FUNC("aJf+j5yntiU", Gen5::AgcDcbEventWrite);
+	LIB_FUNC("C4l9fB17t8w", Gen5::AgcDcbEventWriteGetSize);
 	LIB_FUNC("57labkp+rSQ", Gen5::AgcDcbAcquireMem);
 	LIB_FUNC("-vnlTPPXPrw", Gen5::AgcDcbAcquireMemGetSize);
 	LIB_FUNC("1rZSWUv1IRc", Gen5::AgcDcbCopyData);

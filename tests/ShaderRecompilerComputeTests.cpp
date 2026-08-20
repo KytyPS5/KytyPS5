@@ -14684,29 +14684,32 @@ TestCase Vop2SdwaCndmaskSourceModifier() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase Vop2SdwaCndmaskFullDestinationWithSubDwordSource() {
+TestCase Vop2SdwaCndmaskCapturedByte3Source() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0xabcd1234u);
-  AppendVMovLiteral(&code, 1, 0x55667788u);
+  AppendVMovLiteral(&code, 0, 0x55667788u);
+  AppendBufferLoadDword(&code, 3, 30);
   code.push_back(EncodeVopc(0xc0, Vgpr(0), 0)); // v_cmp_f_u32
-  code.push_back(0x020e02f9u);
-  code.push_back(0x06040600u);
-  AppendStoreVgpr(&code, 7, 0);
+  code.push_back(0x023a00f9u);
+  code.push_back(0x06030603u);
+  AppendStoreVgpr(&code, 29, 1);
   code.push_back(EncodeVopc(0xc7, Vgpr(0), 0)); // v_cmp_t_u32
-  code.push_back(0x020e02f9u);
-  code.push_back(0x06040600u);
-  AppendStoreVgpr(&code, 7, 1);
+  code.push_back(0x023a00f9u);
+  code.push_back(0x06030603u);
+  AppendStoreVgpr(&code, 29, 2);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "Vop2SdwaCndmaskFullDestinationWithSubDwordSource";
+  test.name = "Vop2SdwaCndmaskCapturedByte3Source";
   test.code = code;
-  test.expected = {0x00001234u, 0x55667788u};
-  test.opcodes = {O::V_MOV_B32,     O::V_CMP_F_U32,        O::V_CMP_T_U32,
-                  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpSelect"};
+  test.initial = {0xabcd1234u, 0, 0};
+  test.expected = {0xabcd1234u, 0x000000abu, 0x55667788u};
+  test.opcodes = {O::V_MOV_B32,   O::BUFFER_LOAD_DWORD, O::V_CMP_F_U32,
+                  O::V_CMP_T_U32, O::V_CNDMASK_B32,     O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_CNDMASK_B32 v29, v3.sdwa(sel=3,sext=0), v0", 2}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpSelect"};
   return test;
 }
 
@@ -19291,7 +19294,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareClassF32);
   AddCase(VectorCompareF16Ops);
   AddCase(Vop2SdwaCndmaskSourceModifier);
-  AddCase(Vop2SdwaCndmaskFullDestinationWithSubDwordSource);
+  AddCase(Vop2SdwaCndmaskCapturedByte3Source);
   AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
   AddCase(Vop3CndmaskAllowsDataSourceModifier);
   AddCase(VectorCompareExecOps);

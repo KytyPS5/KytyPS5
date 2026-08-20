@@ -11,7 +11,6 @@ using Detail::OpcodeMap;
 // architectural SDWA legality classes.
 enum class Vop2SdwaProfile {
 	None,
-	Cndmask,
 	Float32,
 	Float16,
 	IntegerFullDestination,
@@ -29,7 +28,7 @@ struct Vop2OpcodeInfo {
 };
 
 constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
-    {0x01u, Opcode::V_CNDMASK_B32, Vop2SdwaProfile::Cndmask},
+    {0x01u, Opcode::V_CNDMASK_B32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x02u, Opcode::V_DOT2C_F32_F16},
     {0x03u, Opcode::V_ADD_F32, Vop2SdwaProfile::Float32},
     {0x04u, Opcode::V_SUB_F32, Vop2SdwaProfile::Float32},
@@ -929,8 +928,6 @@ constexpr uint32_t SdwaSelAll() {
 
 constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {},
-    {SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
-     true, false},
     {SdwaSelFull(), SdwaSelFull(), SdwaSelFull(), false, true},
     {SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
      true, true},

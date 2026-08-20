@@ -530,22 +530,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
 	return num_values;
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetBlendColor) {
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0046900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::CB_BLEND_RED);
-
-	HW::BlendColor r;
-
-	r.red   = *reinterpret_cast<const float*>(&buffer[0]);
-	r.green = *reinterpret_cast<const float*>(&buffer[1]);
-	r.blue  = *reinterpret_cast<const float*>(&buffer[2]);
-	r.alpha = *reinterpret_cast<const float*>(&buffer[3]);
-
-	cp.GetCtx().SetBlendColor(r);
-
-	return 4;
-}
-
 KYTY_HW_CTX_PARSER(HwCtxSetBlendControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 

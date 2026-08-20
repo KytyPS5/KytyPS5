@@ -22146,6 +22146,71 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4GuardBandRegisterRanges");
 }
 
+void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  processor.GetCtx().SetBlendColor({1.0f, 2.0f, 3.0f, 4.0f});
+
+  constexpr std::array<std::pair<uint32_t, float>, 4> singleton_values{{
+      {Pm4::CB_BLEND_RED, 5.0f},
+      {Pm4::CB_BLEND_BLUE, 7.0f},
+      {Pm4::CB_BLEND_GREEN, 6.0f},
+      {Pm4::CB_BLEND_ALPHA, 8.0f},
+  }};
+  bool singletons_complete = true;
+  for (const auto &[offset, value] : singleton_values) {
+    std::array<uint32_t, 3> packet{
+        KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+        offset,
+        std::bit_cast<uint32_t>(value),
+    };
+    Pm4Execution execution;
+    singletons_complete &=
+        processor.Process(execution, packet.data(), packet.size()) ==
+        Pm4ProcessResult::Complete;
+  }
+  const auto &singletons = processor.GetCtx().GetBlendColor();
+  Require("Pm4BlendColorRegisterRanges", "single registers",
+          singletons_complete && singletons.red == 5.0f &&
+              singletons.green == 6.0f && singletons.blue == 7.0f &&
+              singletons.alpha == 8.0f,
+          "single blend-color writes did not follow native PS5 register order");
+
+  std::array<uint32_t, 4> partial{
+      KYTY_PM4(4, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::CB_BLEND_BLUE,
+      std::bit_cast<uint32_t>(9.0f),
+      std::bit_cast<uint32_t>(10.0f),
+  };
+  Pm4Execution partial_execution;
+  const auto partial_result =
+      processor.Process(partial_execution, partial.data(), partial.size());
+  const auto &partial_color = processor.GetCtx().GetBlendColor();
+  Require("Pm4BlendColorRegisterRanges", "partial range",
+          partial_result == Pm4ProcessResult::Complete &&
+              partial_color.red == 5.0f && partial_color.green == 10.0f &&
+              partial_color.blue == 9.0f && partial_color.alpha == 8.0f,
+          "partial blend-color range changed the wrong channels");
+
+  std::array<uint32_t, 6> full{
+      KYTY_PM4(6, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::CB_BLEND_RED,
+      std::bit_cast<uint32_t>(11.0f),
+      std::bit_cast<uint32_t>(13.0f),
+      std::bit_cast<uint32_t>(12.0f),
+      std::bit_cast<uint32_t>(14.0f),
+  };
+  Pm4Execution full_execution;
+  const auto full_result = processor.Process(full_execution, full.data(), full.size());
+  const auto &full_color = processor.GetCtx().GetBlendColor();
+  Require("Pm4BlendColorRegisterRanges", "full range",
+          full_result == Pm4ProcessResult::Complete && full_color.red == 11.0f &&
+              full_color.green == 12.0f && full_color.blue == 13.0f &&
+              full_color.alpha == 14.0f,
+          "full blend-color range did not preserve native PS5 register order");
+  std::printf("[host]    %-32s ok\n", "Pm4BlendColorRegisterRanges");
+}
+
 void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer);
@@ -22709,6 +22774,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
     VulkanHarness vulkan;
+    CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
@@ -22881,6 +22947,7 @@ int main(int argc, char **argv) {
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
+  CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());

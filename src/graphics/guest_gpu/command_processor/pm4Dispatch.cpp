@@ -35,7 +35,6 @@ constexpr auto MakeContextDispatchTable() {
 	}
 	g_hw_ctx_func[Pm4::CB_TARGET_MASK]                 = HwCtxSetRenderTargetMask;
 	g_hw_ctx_func[Pm4::PA_SC_GENERIC_SCISSOR_TL]       = HwCtxSetGenericScissor;
-	g_hw_ctx_func[Pm4::CB_BLEND_RED]                   = HwCtxSetBlendColor;
 	g_hw_ctx_func[Pm4::CB_DCC_CONTROL]                 = HwCtxSetCbDccControl;
 	g_hw_ctx_func[Pm4::DB_STENCIL_CONTROL]             = HwCtxSetStencilControl;
 	g_hw_ctx_func[Pm4::DB_STENCILREFMASK]              = HwCtxSetStencilMask;

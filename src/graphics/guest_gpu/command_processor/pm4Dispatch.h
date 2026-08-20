@@ -56,7 +56,6 @@ uint32_t HwCtxSetWindowScissor(CommandProcessor&, uint32_t, uint32_t, const uint
 uint32_t HwCtxSetClipRect(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetRenderTargetMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetGenericScissor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetBlendColor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetCbDccControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetStencilControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetStencilMask(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

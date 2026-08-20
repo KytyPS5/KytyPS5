@@ -317,8 +317,8 @@ constexpr uint32_t FSR_RECURSIONS1              = 0xF2;
 constexpr uint32_t VGT_MULTI_PRIM_IB_RESET_INDX = 0x103;
 constexpr uint32_t CB_RMI_GL2_CACHE_CONTROL     = 0x104;
 constexpr uint32_t CB_BLEND_RED                 = 0x105;
-constexpr uint32_t CB_BLEND_GREEN               = 0x106;
-constexpr uint32_t CB_BLEND_BLUE                = 0x107;
+constexpr uint32_t CB_BLEND_BLUE                = 0x106;
+constexpr uint32_t CB_BLEND_GREEN               = 0x107;
 constexpr uint32_t CB_BLEND_ALPHA               = 0x108;
 constexpr uint32_t CB_DCC_CONTROL               = 0x109;
 

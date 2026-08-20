@@ -2853,6 +2853,20 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	auto pfunc = g_hw_sh_func[cmd_offset];
 
 	if (pfunc == nullptr) {
+		auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+		bool handled    = num_values != 0;
+		for (uint32_t i = 0; i < num_values; i++) {
+			if (cmd_offset + i >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset + i] == nullptr) {
+				handled = false;
+				break;
+			}
+		}
+		if (handled) {
+			for (uint32_t i = 0; i < num_values; i++) {
+				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
+			}
+			return num_values + 1u;
+		}
 		EXIT("unknown shader register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 		     "\n\tcmd_offset = %08" PRIx32 "\n",
 		     num_dw - dw, cmd_id, cmd_offset);

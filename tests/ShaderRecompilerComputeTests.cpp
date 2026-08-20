@@ -22084,6 +22084,25 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
 }
 
+void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  constexpr uint64_t shader_address = 0x0000123456789a00ull;
+  std::array<uint32_t, 4> packet{
+      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+      Pm4::SPI_SHADER_PGM_LO_ES,
+      static_cast<uint32_t>(shader_address >> 8u),
+      static_cast<uint32_t>(shader_address >> 40u),
+  };
+  Pm4Execution execution;
+  Require("Pm4DirectShaderRegisterFallback", "ES program base",
+          processor.Process(execution, packet.data(), packet.size()) ==
+                  Pm4ProcessResult::Complete &&
+              processor.GetShCtx().GetVs().es_regs.data_addr == shader_address,
+          "direct SET_SH_REG did not route its ES base pair through the register handlers");
+  std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
+}
+
 void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer);
@@ -22676,6 +22695,7 @@ int main(int argc, char **argv) {
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+  CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());

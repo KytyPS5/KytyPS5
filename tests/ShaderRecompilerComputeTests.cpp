@@ -9941,6 +9941,38 @@ public:
             "no CPU-supported standard formats were tested");
 
     {
+      constexpr auto format = Prospero::BufferFormat::k11_11_10UInt;
+      constexpr auto tile = Prospero::TileMode::kStandard64KB;
+      constexpr u32 width = 128, height = 128, levels = 8;
+      TileSurfaceLayout surface{};
+      const TileSurfaceDescription description{
+          format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(format, width, height, 1, levels, tile, false,
+                              total);
+      const bool built = TileGetTiledTextureLayout(description, surface);
+      constexpr u32 tail_xy[7][2] = {
+          {64, 0}, {0, 64}, {32, 0}, {0, 32}, {16, 0}, {8, 16}, {0, 24}};
+      bool valid = built && Prospero::NumBytesPerElement(format) == 4 &&
+                   Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
+                   Prospero::IsSupportedTextureFormat(format) &&
+                   Prospero::IsUintTextureFormat(format) &&
+                   surface.texture.block.block_width == 128 &&
+                   surface.texture.block.block_height == 128 &&
+                   surface.texture.block.block_depth == 1 &&
+                   surface.first_tail_level == 1 &&
+                   surface.mips[0].offset == 0x10000 && total.size == 0x20000 &&
+                   total.align == 0x10000;
+      for (u32 level = 1; level < levels && valid; level++) {
+        valid &= surface.mips[level].offset == 0 &&
+                 surface.mips[level].tail_x == tail_xy[level - 1][0] &&
+                 surface.mips[level].tail_y == tail_xy[level - 1][1];
+      }
+      Require(name, "11_11_10 uint layout", valid,
+              "PS5 packed integer texture metadata or Standard64KB mip tail changed");
+    }
+
+    {
       constexpr auto format = Prospero::BufferFormat::k32_32_32Float;
       TileTextureElementLayout element{};
       Require(name, "RGB32 texture policy",

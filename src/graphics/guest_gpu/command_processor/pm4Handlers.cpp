@@ -859,20 +859,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetClipRect) {
 	return value_count;
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetGuardBands) {
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0046900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_CL_GB_VERT_CLIP_ADJ);
-
-	auto vert_clip    = *reinterpret_cast<const float*>(&buffer[0]); // PA_CL_GB_VERT_CLIP_ADJ
-	auto vert_discard = *reinterpret_cast<const float*>(&buffer[1]); // PA_CL_GB_VERT_DISC_ADJ
-	auto horz_clip    = *reinterpret_cast<const float*>(&buffer[2]); // PA_CL_GB_HORZ_CLIP_ADJ
-	auto horz_discard = *reinterpret_cast<const float*>(&buffer[3]); // PA_CL_GB_HORZ_DISC_ADJ
-
-	cp.GetCtx().SetGuardBands(horz_clip, vert_clip, horz_discard, vert_discard);
-
-	return 4;
-}
-
 KYTY_HW_CTX_PARSER(HwCtxSetHardwareScreenOffset) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SU_HARDWARE_SCREEN_OFFSET);

@@ -22103,6 +22103,49 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
 }
 
+void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
+
+  std::array<uint32_t, 3> single{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::PA_CL_GB_VERT_CLIP_ADJ,
+      std::bit_cast<uint32_t>(6.0f),
+  };
+  Pm4Execution single_execution;
+  const auto single_result =
+      processor.Process(single_execution, single.data(), single.size());
+  const auto &single_viewport = processor.GetCtx().GetScreenViewport();
+  Require("Pm4GuardBandRegisterRanges", "single register",
+          single_result == Pm4ProcessResult::Complete &&
+              single_viewport.guard_band_horz_clip == 2.0f &&
+              single_viewport.guard_band_vert_clip == 6.0f &&
+              single_viewport.guard_band_horz_discard == 4.0f &&
+              single_viewport.guard_band_vert_discard == 5.0f,
+          "single guard-band write changed the wrong context state");
+
+  std::array<uint32_t, 6> range{
+      KYTY_PM4(6, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::PA_CL_GB_VERT_CLIP_ADJ,
+      std::bit_cast<uint32_t>(7.0f),
+      std::bit_cast<uint32_t>(8.0f),
+      std::bit_cast<uint32_t>(9.0f),
+      std::bit_cast<uint32_t>(10.0f),
+  };
+  Pm4Execution range_execution;
+  const auto range_result = processor.Process(range_execution, range.data(), range.size());
+  const auto &range_viewport = processor.GetCtx().GetScreenViewport();
+  Require("Pm4GuardBandRegisterRanges", "full range",
+          range_result == Pm4ProcessResult::Complete &&
+              range_viewport.guard_band_horz_clip == 9.0f &&
+              range_viewport.guard_band_vert_clip == 7.0f &&
+              range_viewport.guard_band_horz_discard == 10.0f &&
+              range_viewport.guard_band_vert_discard == 8.0f,
+          "full guard-band range did not preserve hardware register order");
+  std::printf("[host]    %-32s ok\n", "Pm4GuardBandRegisterRanges");
+}
+
 void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer);
@@ -22696,6 +22739,7 @@ int main(int argc, char **argv) {
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
+  CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());

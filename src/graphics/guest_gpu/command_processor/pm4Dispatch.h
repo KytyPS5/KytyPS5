@@ -90,7 +90,6 @@ uint32_t HwCtxSetDrawPayloadControl(CommandProcessor&, uint32_t, uint32_t, const
 uint32_t HwCtxSetPrimitiveIdReset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetObjprimIdControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetShaderStages(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetGuardBands(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetRenderTarget(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetColorInfo(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetBlendControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

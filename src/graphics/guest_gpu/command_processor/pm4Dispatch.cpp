@@ -82,7 +82,6 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
 	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;
 	g_hw_ctx_func[Pm4::VGT_SHADER_STAGES_EN]                  = HwCtxSetShaderStages;
-	g_hw_ctx_func[Pm4::PA_CL_GB_VERT_CLIP_ADJ]                = HwCtxSetGuardBands;
 
 	for (uint32_t slot = 0; slot < 8; slot++) {
 		g_hw_ctx_func[Pm4::CB_COLOR0_BASE + slot * 15] = HwCtxSetRenderTarget;

@@ -7491,7 +7491,30 @@ public:
               !texture_cache.GetImage(phased_depth.image_id).usage.depth_target,
           "valid PS5 texture-compatibility policy changed logical depth image "
           "identity or discovery side effects");
+
+      auto read_only_depth_target = phased_depth_target;
+      read_only_depth_target.z_write_base_addr = 0;
+      read_only_depth_target.depth_view.depth_write_disable = true;
+      registers.SetDepthRenderTarget(read_only_depth_target);
+      auto read_only_depth_control = phased_depth_control;
+      read_only_depth_control.z_write_enable = false;
+      registers.SetDepthControl(read_only_depth_control);
+      RenderDepthInfo read_only_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), read_only_depth);
+      Require(
+          name, "read-only depth target without write address",
+          read_only_depth.image_id == phased_depth.image_id &&
+              read_only_depth.depth_buffer_vaddr == phased_depth_address &&
+              !read_only_depth.depth_write_enable &&
+              !read_only_depth.AttachmentWriteAspects() &&
+              depth_attachment_layout(read_only_depth) ==
+                  vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+          "a PS5 read-only depth target required a depth write address or "
+          "selected a writable host layout");
+
       registers.SetDepthRenderTarget(phased_depth_target);
+      registers.SetDepthControl(phased_depth_control);
       RenderColorInfo no_color{};
       auto phased_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &no_color, 0, phased_depth);

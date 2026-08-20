@@ -177,7 +177,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	    z.htile_surface.htile_uses_preload_win != 0 || z.htile_surface.preload != 0 ||
 	    z.htile_surface.prefetch_width != 0 || z.htile_surface.prefetch_height != 0 ||
 	    z.htile_surface.dst_outside_zero_to_one != 0 || z.z_read_base_addr == 0 ||
-	    z.z_write_base_addr != z.z_read_base_addr || (z.z_read_base_addr & 0xffffu) != 0 ||
+	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
+	    (z.z_read_base_addr & 0xffffu) != 0 ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
 		DepthFatal("unsupported depth register state");
 	}

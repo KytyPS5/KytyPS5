@@ -456,7 +456,21 @@ IR::U64 Translator::ReadU64(const IR::Operand& operand) {
 	return IR::U64(ReadOperand(operand, IR::Type::U64));
 }
 
-IR::F32 Translator::ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane) {
+IR::F32 Translator::ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane, bool packed) {
+	if (operand.float_inline) {
+		const bool use_zero = packed && (high_lane ? operand.op_sel_hi : operand.op_sel);
+		auto value = use_zero ? IR::F32(IR::Value::F32(0.0f))
+		                      : ir.BitCastF32(IR::U32(IR::Value(operand.imm)));
+		const auto half = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
+		value           = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
+		if (operand.absolute) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+		}
+		if (high_lane ? operand.negate_hi : operand.negate) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
+		}
+		return value;
+	}
 	auto raw_operand      = operand;
 	raw_operand.sdwa_sel  = 6;
 	raw_operand.sdwa_sext = false;

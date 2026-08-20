@@ -37,6 +37,7 @@ struct Operand {
 	OperandKind kind = OperandKind::Null;
 	Register    reg;
 	uint32_t    imm                = 0;
+	bool        float_inline       = false;
 	bool        sext_64            = false;
 	uint32_t    sdwa_sel           = 6;
 	uint32_t    sdwa_dst_unused    = 2;

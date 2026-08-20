@@ -16,11 +16,12 @@ bool Translator::TranslatePackedFloat16(const IR::Instruction& inst) {
 		default: return false;
 	}
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src[0], high);
-		const auto rhs = ReadF16LaneAsF32(inst.src[1], high);
+		const auto lhs = ReadF16LaneAsF32(inst.src[0], high, true);
+		const auto rhs = ReadF16LaneAsF32(inst.src[1], high, true);
 		IR::F32    result;
 		if (inst.src_count == 3u) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src[2], high)}));
+			result = IR::F32(
+			    ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src[2], high, true)}));
 		} else {
 			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
 		}

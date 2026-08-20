@@ -157,10 +157,11 @@ bool LowerSourceOperand(const Decoder::Operand& decoded, Operand& operand, std::
 		case Decoder::OperandKind::FloatInlineConstant:
 			operand = {};
 			CopyOperandModifiers(decoded, operand);
-			operand.kind    = OperandKind::ImmediateU32;
-			operand.imm     = decoded.value;
-			operand.sext_64 = decoded.kind == Decoder::OperandKind::IntegerInlineConstant &&
-			                  decoded.signed_val < 0;
+			operand.kind         = OperandKind::ImmediateU32;
+			operand.imm          = decoded.value;
+			operand.float_inline = decoded.kind == Decoder::OperandKind::FloatInlineConstant;
+			operand.sext_64      = decoded.kind == Decoder::OperandKind::IntegerInlineConstant &&
+			                       decoded.signed_val < 0;
 			return true;
 		case Decoder::OperandKind::Null:
 		case Decoder::OperandKind::PopsExitingWaveId:

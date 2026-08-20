@@ -38,7 +38,8 @@ private:
 	IR::U32                ReadU32(const IR::Operand& operand);
 	std::array<IR::U32, 2> ReadU32Pair(const IR::Operand& operand);
 	IR::U64                ReadU64(const IR::Operand& operand);
-	IR::F32                ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane);
+	IR::F32                ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane,
+	                                       bool packed = false);
 	IR::F32                ReadF16AsF32(const IR::Operand& operand);
 	IR::F32                ReadMixF32(const IR::Operand& operand);
 	IR::U32                ReadU16LaneRaw(const IR::Operand& operand, bool high_lane);

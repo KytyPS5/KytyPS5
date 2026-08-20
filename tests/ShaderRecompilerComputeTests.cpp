@@ -13867,6 +13867,34 @@ TestCase VectorVop3FmaF16UsesRdna2Opcode34b() {
           {O::V_MOV_B32, O::V_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase FloatInlineConstantF16UsesNumericValue() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x38003800u); // 0.5h, 0.5h
+  AppendVMovLiteral(&code, 2, 0x3c003c00u); // 1.0h, 1.0h
+  AppendVMovLiteral(&code, 10, 0xaaaa0000u);
+  AppendVMovLiteral(&code, 12, 0xbbbb0000u);
+
+  AppendVop3(&code, 0x34bu, 10, 246u, Vgpr(1), Vgpr(2));
+  AppendVop3p(&code, 0x0eu, 11, 246u, Vgpr(1), Vgpr(2), 0x1u);
+  AppendVop3(&code, 0x34bu, 12, 248u, 242u, 128u);
+
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreVgpr(&code, 12, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "FloatInlineConstantF16UsesNumericValue";
+  test.code = std::move(code);
+  test.expected = {0xaaaa4200u, 0x3c004200u, 0xbbbb3118u};
+  test.opcodes = {O::V_MOV_B32, O::V_FMA_F16, O::V_PK_FMA_F16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"4.000000", 2}, {"0.159155", 1}};
+  return test;
+}
+
 TestCase VectorFloatControlContractPreservesInfNan() {
   using O = ShaderOpcode;
 
@@ -18941,6 +18969,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
   AddCase(MadMixF16NegHiIsAbsAndNegIsIndependent);
   AddCase(VectorVop3FmaF16UsesRdna2Opcode34b);
+  AddCase(FloatInlineConstantF16UsesNumericValue);
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);

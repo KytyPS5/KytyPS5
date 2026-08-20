@@ -14,6 +14,13 @@ uint32_t DmaskComponentIndex(uint32_t dmask, uint32_t component) {
 	return index;
 }
 
+uint32_t DmaskComponent(uint32_t dmask, uint32_t index) {
+	for (uint32_t component = 0; component < 4u; component++) {
+		if (((dmask >> component) & 1u) != 0u && index-- == 0u) return component;
+	}
+	return 0u;
+}
+
 uint32_t ImageGatherComponent(uint32_t dmask) {
 	switch (dmask) {
 		case 0x2u: return 1;
@@ -191,7 +198,49 @@ uint32_t FloatBits(ValueEmitContext& ctx, uint32_t value) {
 	return Unary(ctx.state, OpBitcast, TypeU32(ctx.state), value);
 }
 
-uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool dref) {
+uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool dref,
+                      const IR::MemoryInfo& mem, bool gather = false) {
+	if (mem.data_bits == 16u) {
+		uint32_t packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
+		                      ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
+		const auto scalar = [&](uint32_t index) {
+			if (dref) return value;
+			const auto component = gather ? index : DmaskComponent(mem.dmask, index);
+			const auto result    = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(
+			    {OpCompositeExtract, integer ? TypeU32(ctx.state) : TypeF32(ctx.state), result,
+			     value, component});
+			return result;
+		};
+		for (uint32_t word = 0; word < mem.data_dwords; word++) {
+			const auto low_index  = word * 2u;
+			const auto high_index = low_index + 1u;
+			const auto low        = scalar(low_index);
+			const auto high = high_index < mem.component_count
+			                      ? scalar(high_index)
+			                      : (integer ? ConstantU32(ctx.state, 0) : ZeroF32(ctx.state));
+			if (integer) {
+				const auto mask = ConstantU32(ctx.state, 0xffffu);
+				packed[word] = Binary(
+				    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+				    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low, mask),
+				    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high, mask),
+				           ConstantU32(ctx.state, 16u)));
+			} else {
+				const auto pair = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(
+				    {OpCompositeConstruct, TypeF32Vector(ctx.state, 2), pair, low, high});
+				packed[word] = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction({OpExtInst, TypeU32(ctx.state), packed[word],
+				                               GlslStd450(ctx.state), GlslPackHalf2x16, pair});
+			}
+		}
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
+		                               packed[0], packed[1], packed[2], packed[3]});
+		return result;
+	}
 	uint32_t component[4] {};
 	for (uint32_t index = 0; index < 4u; index++) {
 		if (dref) {
@@ -319,9 +368,21 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 			const auto packed_index = DmaskComponentIndex(dmask, source);
 			raw                     = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
-			    {OpCompositeExtract, TypeU32(ctx.state), raw, data, packed_index});
+			    {OpCompositeExtract, TypeU32(ctx.state), raw, data,
+			     mem.data_bits == 16u ? packed_index / 2u : packed_index});
+			if (mem.data_bits == 16u) {
+				if ((packed_index & 1u) != 0u) {
+					raw = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), raw,
+					             ConstantU32(ctx.state, 16u));
+				}
+				raw = Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), raw,
+				             ConstantU32(ctx.state, 0xffffu));
+			}
 		}
-		values[component] = integer ? raw : Unary(ctx.state, OpBitcast, TypeF32(ctx.state), raw);
+		values[component] = integer ? raw
+		                            : mem.data_bits == 16u ? EmitF16BitsToF32(ctx.state, raw)
+		                                                   : Unary(ctx.state, OpBitcast,
+		                                                           TypeF32(ctx.state), raw);
 	}
 	const auto texel = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(
@@ -407,7 +468,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
 				             image, coord, ImageOperandsLodMask, LodU32(ctx, mem, *address, view)});
 			        }
-			        return ResultVector(ctx, color, integer, false);
+			        return ResultVector(ctx, color, integer, false, mem);
 		        }));
 		return true;
 	}
@@ -459,7 +520,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
 			}
 			state.builder.AddFunction(words);
-			ctx.Define(inst, ResultVector(ctx, sample, integer && !dref, false));
+			ctx.Define(inst, ResultVector(ctx, sample, integer && !dref, false, mem, true));
 			return true;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
@@ -509,7 +570,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		};
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
-			ctx.Define(inst, ResultVector(ctx, EmitSample(mem.resource), integer, dref));
+			ctx.Define(inst, ResultVector(ctx, EmitSample(mem.resource), integer, dref, mem));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -600,7 +661,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		ctx.Define(inst, ResultVector(ctx, phi_words[2], integer, dref));
+		ctx.Define(inst, ResultVector(ctx, phi_words[2], integer, dref, mem));
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

@@ -578,9 +578,10 @@ constexpr u32 EncodeMimg0(u32 opcode, u32 dmask, u32 nsa_dwords = 0,
 }
 
 constexpr u32 EncodeMimg1(u32 vdata, u32 vaddr, u32 srsrc = 0, u32 ssamp = 0,
-                          bool a16 = false) {
+                          bool a16 = false, bool d16 = false) {
   return ((ssamp & 0x1fu) << 21u) | ((srsrc & 0x1fu) << 16u) |
-         ((vdata & 0xffu) << 8u) | (vaddr & 0xffu) | (a16 ? (1u << 30u) : 0u);
+         ((vdata & 0xffu) << 8u) | (vaddr & 0xffu) |
+         (a16 ? (1u << 30u) : 0u) | (d16 ? (1u << 31u) : 0u);
 }
 
 constexpr u32 EncodeVintrp(u32 opcode, u32 dst, u32 attr, u32 chan, u32 src) {
@@ -17886,6 +17887,39 @@ TestCase ImageSampleAndGather() {
   return test;
 }
 
+TestCase ImageD16GatherPacksHalfPairs() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f000000u);
+  AppendVMovU32(&code, 22, 0);
+  code.push_back(EncodeMimg0(0x47, 0x1));
+  code.push_back(EncodeMimg1(0, 20, 0, 0, false, true));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&image, 4, x, y, 0x3f000000u, 0, 0, 0);
+    }
+  }
+
+  TestCase test;
+  test.name = "ImageD16GatherPacksHalfPairs";
+  test.code = code;
+  test.expected = {0x38003800u, 0x38003800u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.decoded_counts = {{"d16=1", 1}};
+  test.native_ir_counts = {{"dmask=0x1 data_dwords=2 data_bits=16 component=0/4", 1}};
+  test.required_spirv = {"OpImageGather", "PackHalf2x16"};
+  return test;
+}
+
 TestCase ImageSampleA16SamplerCoordsOnGpu() {
   using O = ShaderOpcode;
 
@@ -18075,6 +18109,35 @@ TestCase ImageStoreVariants() {
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_rgba = expected_image;
+  return test;
+}
+
+TestCase ImageD16StoreUnpacksHalfPairs() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 1);
+  AppendVMovU32(&code, 21, 2);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovLiteral(&code, 0, 0x38003400u);
+  AppendVMovLiteral(&code, 1, 0x3c003a00u);
+  code.push_back(EncodeMimg0(0x08, 0xf));
+  code.push_back(EncodeMimg1(0, 20, 0, 0, false, true));
+  AppendEnd(&code);
+
+  auto expected_image = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&expected_image, 4, 1, 2, 0x3e800000u, 0x3f000000u,
+               0x3f400000u, 0x3f800000u);
+
+  TestCase test;
+  test.name = "ImageD16StoreUnpacksHalfPairs";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
+  test.storage_image_rgba = MakeRgbaImage(4, 4);
+  test.expected_storage_image_rgba = expected_image;
+  test.decoded_counts = {{"d16=1", 1}};
+  test.native_ir_counts = {{"dmask=0xf data_dwords=2 data_bits=16 component=0/4", 1}};
+  test.required_spirv = {"UnpackHalf2x16", "OpImageWrite"};
   return test;
 }
 
@@ -19012,12 +19075,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
+  AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
+  AddCase(ImageD16StoreUnpacksHalfPairs);
   AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
   AddCase(ImageStoreRgbOneUsesInverseSwizzle);
   AddCase(ImageStoreDuplicateSelectorUsesInverseSwizzle);

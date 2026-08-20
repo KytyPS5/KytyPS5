@@ -154,6 +154,9 @@ std::string FormatMimg(const Instruction& inst) {
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
 	                OperandToString(inst.src1).c_str(), OperandToString(inst.src2).c_str(),
 	                inst.dmask, ImageDimensionToString(inst.image_dimension));
+	if (inst.data_bits == 16u) {
+		text += " d16=1";
+	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_GATHER4_LZ:

@@ -648,6 +648,7 @@ struct Instruction {
 	uint32_t       offset                                       = 0;
 	uint32_t       secondary_offset                             = 0;
 	uint32_t       dmask                                        = 0;
+	uint32_t       data_components                              = 0;
 	uint32_t       data_dwords                                  = 1;
 	uint32_t       data_bits                                    = 32;
 	uint32_t       data_format                                  = 0;

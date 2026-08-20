@@ -75,8 +75,8 @@ private:
 	IR::Value       GetSamplerResource(const IR::MemoryInfo& memory);
 	IR::Value       MakeImageAddress(const IR::Instruction& inst, const IR::Operand& base);
 	IR::Value       ConstructU32x4(const IR::Operand& base, uint32_t count);
-	void            WriteImageComponents(const IR::Operand& dst, IR::Value value, uint32_t dmask,
-	                                     uint32_t component_limit);
+	void            WriteImageComponents(const IR::Operand& dst, IR::Value value,
+	                                     const IR::MemoryInfo& memory, uint32_t component_limit);
 	IR::ValueOpcode ImageAtomicOpcode(IR::Opcode opcode);
 	BufferAddress   ReadBufferAddress(const IR::Instruction& inst, uint32_t source_offset);
 	IR::U32         WidenSubdword(IR::Value value, uint32_t bits, bool sign);

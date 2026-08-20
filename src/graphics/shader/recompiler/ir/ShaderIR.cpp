@@ -211,7 +211,8 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 	mem.dmask                    = decoded.dmask;
 	mem.data_dwords              = decoded.data_dwords;
 	mem.data_bits                = decoded.data_bits;
-	mem.component_count          = decoded.data_dwords;
+	mem.component_count          = decoded.data_components != 0u ? decoded.data_components
+	                                                            : decoded.data_dwords;
 	mem.data_format              = decoded.data_format;
 	mem.number_format            = decoded.number_format;
 	mem.image_sample_flags       = decoded.image_sample_flags;

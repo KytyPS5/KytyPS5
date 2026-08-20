@@ -94,9 +94,17 @@ IR::Value Translator::ConstructU32x4(const IR::Operand& base, uint32_t count) {
 	               {components[0], components[1], components[2], components[3]});
 }
 
-void Translator::WriteImageComponents(const IR::Operand& dst, IR::Value value, uint32_t dmask,
-                                      uint32_t component_limit) {
-	const auto mask      = dmask != 0u ? dmask : 1u;
+void Translator::WriteImageComponents(const IR::Operand& dst, IR::Value value,
+                                      const IR::MemoryInfo& memory, uint32_t component_limit) {
+	if (memory.data_bits == 16u) {
+		for (uint32_t index = 0; index < memory.data_dwords; index++) {
+			WriteOperand(OffsetOperand(dst, index),
+			             ir.Emit(IR::ValueOpcode::CompositeExtractU32x4,
+			                     {value, IR::Value(index)}));
+		}
+		return;
+	}
+	const auto mask      = memory.dmask != 0u ? memory.dmask : 1u;
 	uint32_t   dst_index = 0;
 	for (uint32_t component = 0; component < component_limit; component++) {
 		if (((mask >> component) & 1u) == 0u) {
@@ -435,20 +443,20 @@ bool Translator::TranslateImageMemory(const IR::Instruction& inst) {
 		case IR::Opcode::ImageGetResinfo: {
 			const auto result =
 			    ir.Emit(IR::ValueOpcode::ImageQueryDimensions, {resource, address}, flags);
-			WriteImageComponents(inst.dst, result, inst.memory.dmask, 4u);
+			WriteImageComponents(inst.dst, result, inst.memory, 4u);
 			return true;
 		}
 		case IR::Opcode::ImageGetLod: {
 			const auto sampler = GetSamplerResource(inst.memory);
 			const auto result =
 			    ir.Emit(IR::ValueOpcode::ImageQueryLod, {resource, sampler, address}, flags);
-			WriteImageComponents(inst.dst, result, inst.memory.dmask, 2u);
+			WriteImageComponents(inst.dst, result, inst.memory, 2u);
 			return true;
 		}
 		case IR::Opcode::ImageLoad: {
 			const auto result =
 			    ir.Emit(IR::ValueOpcode::ImageRead, {resource, address, ir.GetExec()}, flags);
-			WriteImageComponents(inst.dst, result, inst.memory.dmask, 4u);
+			WriteImageComponents(inst.dst, result, inst.memory, 4u);
 			return true;
 		}
 		case IR::Opcode::ImageStore: {
@@ -465,7 +473,7 @@ bool Translator::TranslateImageMemory(const IR::Instruction& inst) {
 			const auto result  = ir.Emit(opcode, {resource, sampler, address}, flags);
 			const bool dref =
 			    (inst.memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u;
-			if (inst.op == IR::Opcode::ImageSample && dref) {
+			if (inst.op == IR::Opcode::ImageSample && dref && inst.memory.data_bits != 16u) {
 				const auto component =
 				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(0u)});
 				for (uint32_t index = 0; index < inst.memory.data_dwords; index++) {
@@ -478,7 +486,7 @@ bool Translator::TranslateImageMemory(const IR::Instruction& inst) {
 					                     {result, IR::Value(index)}));
 				}
 			} else {
-				WriteImageComponents(inst.dst, result, inst.memory.dmask, 4u);
+				WriteImageComponents(inst.dst, result, inst.memory, 4u);
 			}
 			return true;
 		}

@@ -310,6 +310,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t srsrc  = (word1 >> 16u) & 0x1fu;
 	const uint32_t ssamp  = (word1 >> 21u) & 0x1fu;
 	const bool     a16    = ((word1 >> 30u) & 0x1u) != 0u;
+	const bool     d16    = ((word1 >> 31u) & 0x1u) != 0u;
 	const auto*    sample = LookupSample(opcode);
 	const auto*    gather = LookupGather(opcode);
 	const auto*    atomic = LookupAtomic(opcode);
@@ -321,7 +322,9 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.opcode_id          = opcode;
 	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic);
 	inst.dmask              = (word0 >> 8u) & 0xfu;
-	inst.data_dwords        = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
+	inst.data_components    = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
+	inst.data_bits          = d16 ? 16u : 32u;
+	inst.data_dwords        = d16 ? (inst.data_components + 1u) / 2u : inst.data_components;
 	inst.glc                = ((word0 >> 13u) & 1u) != 0;
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
 	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
@@ -343,6 +346,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "MIMG image gather requires exactly one dmask bit");
+	}
+	const bool supports_d16 = sample != nullptr || gather != nullptr || opcode == 0x00u ||
+	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
+	if (d16 && !supports_d16) {
+		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

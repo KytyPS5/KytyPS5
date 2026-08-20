@@ -3705,6 +3705,33 @@ uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_poli
 	return cmd;
 }
 
+static constexpr uint32_t AGC_WAIT_USER_DATA_REGISTER     = 0x342u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG = 0xc8010000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG = 0xc8020000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG      = 0xc8000000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW     = 4u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_END_DW       = 3u;
+
+static uint32_t* get_agc_wait_packet(uint32_t* cmd) {
+	if (cmd == nullptr || KYTY_PM4_LEN(cmd[0]) != AGC_WAIT_USER_DATA_BEGIN_DW ||
+	    !AgcIsWaitUserDataPacket(cmd[0], cmd + 1)) {
+		return nullptr;
+	}
+
+	auto*      wait = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
+	const auto op   = (wait[0] >> 8u) & 0xffu;
+	const auto len  = KYTY_PM4_LEN(wait[0]);
+	const auto tag  = cmd[2] & 0xffff0000u;
+	if (KYTY_PM4_R(wait[0]) != 0u ||
+	    !((op == Pm4::IT_WAIT_REG_MEM && len == 7u && tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG) ||
+	      (op == Pm4::IT_WAIT_REG_MEM_64 && len == 9u &&
+	       tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG))) {
+		return nullptr;
+	}
+
+	return wait;
+}
+
 int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address) {
 	PRINT_NAME();
 
@@ -3712,20 +3739,19 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 	     "\t address = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
 
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
-	auto vaddr = reinterpret_cast<uint64_t>(address);
-	auto op    = (cmd[0] >> 8u) & 0xffu;
-
-	if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_WAIT_MEM_32) {
-		cmd[1] = static_cast<uint32_t>(vaddr) & ~0x3u;
-		cmd[2] = static_cast<uint32_t>(vaddr >> 32u) & 0x3ffffu;
-	} else if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_WAIT_MEM_64) {
-		cmd[1] = static_cast<uint32_t>(vaddr) & ~0x7u;
-		cmd[2] = static_cast<uint32_t>(vaddr >> 32u) & 0x3ffffu;
-	} else {
-		EXIT("unsupported waitOnAddress packet for address patch: 0x%08" PRIx32 "\n", cmd[0]);
+	auto* wait = get_agc_wait_packet(cmd);
+	if (wait == nullptr) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
+
+	const auto vaddr = reinterpret_cast<uint64_t>(address);
+	const auto op    = (wait[0] >> 8u) & 0xffu;
+	const auto align_mask = (op == Pm4::IT_WAIT_REG_MEM ? 0x3u : 0x7u);
+	cmd[2]           = (cmd[2] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
+	cmd[3]           = static_cast<uint32_t>(vaddr);
+	wait[2]          = (wait[2] & align_mask) | (static_cast<uint32_t>(vaddr) & ~align_mask);
+	wait[3]          = (wait[3] & 0xfffc0000u) |
+	          (static_cast<uint32_t>(vaddr >> 32u) & 0x3ffffu);
 
 	return OK;
 }
@@ -3737,18 +3763,13 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference)
 	     "\t reference = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(cmd), reference);
 
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
-	auto op = (cmd[0] >> 8u) & 0xffu;
-
-	if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_WAIT_MEM_32) {
-		cmd[4] = static_cast<uint32_t>(reference & 0xffffffffu);
-	} else if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_WAIT_MEM_64) {
-		cmd[5] = static_cast<uint32_t>(reference & 0xffffffffu);
-		cmd[6] = static_cast<uint32_t>((reference >> 32u) & 0xffffffffu);
-	} else {
-		EXIT("unsupported waitOnAddress packet for reference patch: 0x%08" PRIx32 "\n", cmd[0]);
+	auto* wait = get_agc_wait_packet(cmd);
+	if (wait == nullptr) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
+
+	// The native patch helper changes only the low reference DWORD for both packet sizes.
+	wait[4] = static_cast<uint32_t>(reference);
 
 	return OK;
 }
@@ -3837,6 +3858,22 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 	       ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 }
 
+bool AgcIsWaitUserDataPacket(uint32_t cmd_id, const uint32_t* payload) {
+	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
+	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_WAIT_USER_DATA_REGISTER) {
+		return false;
+	}
+
+	const auto size_dw = KYTY_PM4_LEN(cmd_id);
+	if (size_dw != AGC_WAIT_USER_DATA_BEGIN_DW && size_dw != AGC_WAIT_USER_DATA_END_DW) {
+		return false;
+	}
+	const auto tag     = payload[1] & 0xffff0000u;
+	return (size_dw == AGC_WAIT_USER_DATA_BEGIN_DW &&
+	        (tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG)) ||
+	       (size_dw == AGC_WAIT_USER_DATA_END_DW && payload[1] == AGC_WAIT_USER_DATA_END_TAG);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t op, uint8_t cache_policy,
                                          const volatile void* address, uint64_t reference,
@@ -3872,39 +3909,53 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	auto address_value = reinterpret_cast<uint64_t>(address);
 	bool wait32        = (size == 0);
 	auto poll          = wait_reg_mem_poll_cycles_to_packet(poll_cycles);
+	const auto wait_dw  = wait32 ? 7u : 9u;
+	const auto total_dw = AGC_WAIT_USER_DATA_BEGIN_DW + wait_dw + AGC_WAIT_USER_DATA_END_DW;
 
-	auto* cmd = buf->AllocateDW(wait32 ? 7 : 9);
+	auto* cmd = buf->AllocateDW(total_dw);
 
 	if (cmd == nullptr) {
 		return nullptr;
 	}
 
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[1] = AGC_WAIT_USER_DATA_REGISTER;
+	cmd[2] = (wait32 ? AGC_WAIT_USER_DATA_BEGIN_32_TAG : AGC_WAIT_USER_DATA_BEGIN_64_TAG) |
+	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
+	cmd[3] = static_cast<uint32_t>(address_value);
+
+	auto* wait = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
+	auto* end  = wait + wait_dw;
+	end[0]     = KYTY_PM4(AGC_WAIT_USER_DATA_END_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	end[1]     = AGC_WAIT_USER_DATA_REGISTER;
+	end[2]     = AGC_WAIT_USER_DATA_END_TAG;
+
 	if (wait32) {
-		cmd[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_MEM_32);
-		cmd[1] = static_cast<uint32_t>(address_value) & ~0x3u;
-		cmd[2] = static_cast<uint32_t>(address_value >> 32u) & 0x3ffffu;
-		cmd[3] = static_cast<uint32_t>(mask & 0xffffffffu);
-		cmd[4] = static_cast<uint32_t>(reference & 0xffffffffu);
-		cmd[5] = wait_reg_mem32_control(compare_function, op, cache_policy);
-		cmd[6] = poll;
+		wait[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0u);
+		wait[1] = wait_reg_mem32_control(compare_function, op, cache_policy);
+		wait[2] = static_cast<uint32_t>(address_value) & ~0x3u;
+		wait[3] = static_cast<uint32_t>(address_value >> 32u) & 0x3ffffu;
+		wait[4] = static_cast<uint32_t>(reference);
+		wait[5] = static_cast<uint32_t>(mask);
+		wait[6] = poll;
 
 		return cmd;
 	}
 
-	cmd[0] = KYTY_PM4(9, Pm4::IT_NOP, Pm4::R_WAIT_MEM_64);
-	cmd[1] = static_cast<uint32_t>(address_value) & ~0x7u;
-	cmd[2] = static_cast<uint32_t>(address_value >> 32u) & 0x3ffffu;
-	cmd[3] = static_cast<uint32_t>(reinterpret_cast<uint64_t>(mask) & 0xffffffffu);
-	cmd[4] = static_cast<uint32_t>((reinterpret_cast<uint64_t>(mask) >> 32u) & 0xffffffffu);
-	cmd[5] = static_cast<uint32_t>(reinterpret_cast<uint64_t>(reference) & 0xffffffffu);
-	cmd[6] = static_cast<uint32_t>((reinterpret_cast<uint64_t>(reference) >> 32u) & 0xffffffffu);
-	cmd[7] = wait_reg_mem64_control(compare_function, op, cache_policy);
-	cmd[8] = poll;
+	wait[0] = KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0u);
+	wait[1] = wait_reg_mem64_control(compare_function, op, cache_policy);
+	wait[2] = static_cast<uint32_t>(address_value) & ~0x7u;
+	wait[3] = static_cast<uint32_t>(address_value >> 32u) & 0x3ffffu;
+	wait[4] = static_cast<uint32_t>(reference);
+	wait[5] = static_cast<uint32_t>(reference >> 32u);
+	wait[6] = static_cast<uint32_t>(mask);
+	wait[7] = static_cast<uint32_t>(mask >> 32u);
+	wait[8] = poll;
 
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
+uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
 	PRINT_NAME();
 
 	switch (size) {

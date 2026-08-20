@@ -2035,12 +2035,12 @@ public:
     commands[2] = static_cast<uint32_t>(address(&prefix));
     commands[3] = static_cast<uint32_t>(address(&prefix) >> 32u);
     commands[4] = 11;
-    commands[5] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_MEM_32);
-    commands[6] = static_cast<uint32_t>(address(&label));
-    commands[7] = static_cast<uint32_t>(address(&label) >> 32u);
-    commands[8] = UINT32_MAX;
+    commands[5] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+    commands[6] = 0x10u | 3u;
+    commands[7] = static_cast<uint32_t>(address(&label));
+    commands[8] = static_cast<uint32_t>(address(&label) >> 32u);
     commands[9] = 1;
-    commands[10] = 0x10u | 3u;
+    commands[10] = UINT32_MAX;
     commands[12] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
     commands[13] = 0;
     commands[14] = static_cast<uint32_t>(address(&suffix));
@@ -22184,24 +22184,159 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4PolygonOffset");
 }
 
+struct AgcCommandBufferLayout {
+  using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
+                                          void *);
+
+  uint32_t *bottom;
+  uint32_t *top;
+  uint32_t *cursor_up;
+  uint32_t *cursor_down;
+  Callback callback;
+  void *user_data;
+  uint32_t reserved_dw;
+};
+static_assert(offsetof(AgcCommandBufferLayout, cursor_up) == 0x10);
+static_assert(offsetof(AgcCommandBufferLayout, reserved_dw) == 0x30);
+
+void CheckAgcWaitPackets(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
+  const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
+    Pm4Execution execution;
+    return processor.Process(execution, packet, size_dw) ==
+           Pm4ProcessResult::Complete;
+  };
+
+  alignas(8) uint32_t label32 = 0x11223344u;
+  std::array<uint32_t, 16> packet32{};
+  AgcCommandBufferLayout dcb32{packet32.data(),
+                               packet32.data() + packet32.size(),
+                               packet32.data(),
+                               packet32.data() + packet32.size(),
+                               nullptr,
+                               nullptr,
+                               0};
+  const auto address32 = reinterpret_cast<uint64_t>(&label32);
+  auto *emitted32 = Gen5::AgcDcbWaitRegMem(
+      reinterpret_cast<Gen5::CommandBuffer *>(&dcb32), 0, 3, 0, 0,
+      &label32, label32, UINT32_MAX, 400);
+  Require(
+      "AgcWaitPackets", "native 32-bit packet",
+      Gen5::AgcDcbWaitOnAddressGetSize(0) == 56 &&
+          emitted32 == packet32.data() &&
+          dcb32.cursor_up == packet32.data() + 14 &&
+          packet32[0] == 0xc0027904u && packet32[1] == 0x342u &&
+          packet32[2] ==
+              (0xc8010000u |
+               (static_cast<uint32_t>(address32 >> 32u) & 0xffffu)) &&
+          packet32[3] == static_cast<uint32_t>(address32) &&
+          packet32[4] == 0xc0053c00u && packet32[5] == 0x13u &&
+          packet32[6] == (static_cast<uint32_t>(address32) & ~0x3u) &&
+          packet32[7] ==
+              (static_cast<uint32_t>(address32 >> 32u) & 0x3ffffu) &&
+          packet32[8] == label32 && packet32[9] == UINT32_MAX &&
+          packet32[10] == 25u && packet32[11] == 0xc0017904u &&
+          packet32[12] == 0x342u && packet32[13] == 0xc8000000u &&
+          execute(packet32.data(), 14),
+      "32-bit waitOnAddress stream differs from native AGC");
+
+  alignas(8) uint32_t patched_label32 = 0xaabbccddu;
+  const auto patched_address32 = reinterpret_cast<uint64_t>(&patched_label32);
+  packet32[6] |= 0x2u;
+  packet32[7] |= 0xa5a40000u;
+  Require(
+      "AgcWaitPackets", "native 32-bit patch",
+      Gen5::AgcWaitRegMemPatchAddress(packet32.data(), &patched_label32) == 0 &&
+          Gen5::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) == 0 &&
+          packet32[2] ==
+              (0xc8010000u |
+               (static_cast<uint32_t>(patched_address32 >> 32u) & 0xffffu)) &&
+          packet32[3] == static_cast<uint32_t>(patched_address32) &&
+          packet32[6] ==
+              ((static_cast<uint32_t>(patched_address32) & ~0x3u) | 0x2u) &&
+          packet32[7] ==
+              ((static_cast<uint32_t>(patched_address32 >> 32u) & 0x3ffffu) |
+               0xa5a40000u) &&
+          packet32[8] == patched_label32 && execute(packet32.data(), 14),
+      "32-bit native wait patch did not update metadata and hardware packet");
+
+  alignas(8) uint64_t label64 = 0x1122334455667788ull;
+  std::array<uint32_t, 16> packet64{};
+  AgcCommandBufferLayout dcb64{packet64.data(),
+                               packet64.data() + packet64.size(),
+                               packet64.data(),
+                               packet64.data() + packet64.size(),
+                               nullptr,
+                               nullptr,
+                               0};
+  const auto address64 = reinterpret_cast<uint64_t>(&label64);
+  auto *emitted64 = Gen5::AgcDcbWaitRegMem(
+      reinterpret_cast<Gen5::CommandBuffer *>(&dcb64), 1, 3, 0, 0,
+      &label64, label64, UINT64_MAX, 400);
+  Require(
+      "AgcWaitPackets", "native 64-bit packet",
+      Gen5::AgcDcbWaitOnAddressGetSize(1) == 64 &&
+          Gen5::AgcDcbWaitOnAddressGetSize(2) == 0 &&
+          emitted64 == packet64.data() &&
+          dcb64.cursor_up == packet64.data() + packet64.size() &&
+          packet64[0] == 0xc0027904u && packet64[1] == 0x342u &&
+          packet64[2] ==
+              (0xc8020000u |
+               (static_cast<uint32_t>(address64 >> 32u) & 0xffffu)) &&
+          packet64[3] == static_cast<uint32_t>(address64) &&
+          packet64[4] == 0xc0079300u && packet64[5] == 0x13u &&
+          packet64[6] == (static_cast<uint32_t>(address64) & ~0x7u) &&
+          packet64[7] ==
+              (static_cast<uint32_t>(address64 >> 32u) & 0x3ffffu) &&
+          packet64[8] == static_cast<uint32_t>(label64) &&
+          packet64[9] == static_cast<uint32_t>(label64 >> 32u) &&
+          packet64[10] == UINT32_MAX && packet64[11] == UINT32_MAX &&
+          packet64[12] == 25u && packet64[13] == 0xc0017904u &&
+          packet64[14] == 0x342u && packet64[15] == 0xc8000000u &&
+          execute(packet64.data(), packet64.size()),
+      "64-bit waitOnAddress stream differs from native AGC");
+
+  alignas(8) uint64_t patched_label64 = 0x11223344aabbccddull;
+  const auto patched_address64 = reinterpret_cast<uint64_t>(&patched_label64);
+  packet64[6] |= 0x5u;
+  packet64[7] |= 0x5a580000u;
+  Require(
+      "AgcWaitPackets", "native 64-bit patch",
+      Gen5::AgcWaitRegMemPatchAddress(packet64.data(), &patched_label64) == 0 &&
+          Gen5::AgcWaitRegMemPatchReference(packet64.data(),
+                                            0xdeadbeefaabbccddull) == 0 &&
+          packet64[2] ==
+              (0xc8020000u |
+               (static_cast<uint32_t>(patched_address64 >> 32u) & 0xffffu)) &&
+          packet64[3] == static_cast<uint32_t>(patched_address64) &&
+          packet64[6] ==
+              ((static_cast<uint32_t>(patched_address64) & ~0x7u) | 0x5u) &&
+          packet64[7] ==
+              ((static_cast<uint32_t>(patched_address64 >> 32u) & 0x3ffffu) |
+               0x5a580000u) &&
+          packet64[8] == 0xaabbccddu && packet64[9] == 0x11223344u &&
+          execute(packet64.data(), packet64.size()),
+      "64-bit native wait patch did not preserve the native high reference DWORD");
+
+  std::array<uint32_t, 16> invalid{};
+  const uint32_t short_payload = 0x342u;
+  Require("AgcWaitPackets", "invalid packet",
+          Gen5::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
+                  packet_mismatch &&
+              Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
+                  packet_mismatch &&
+              !Gen5::AgcIsWaitUserDataPacket(
+                  KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
+          "native wait patch accepted a packet without the AGC metadata prefix");
+  std::printf("[host]    %-32s ok\n", "AgcWaitPackets");
+}
+
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer);
   constexpr auto primitive_type = static_cast<Prospero::PrimitiveType>(0x35u);
-  struct AgcCommandBufferLayout {
-    using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
-                                            void *);
-
-    uint32_t *bottom;
-    uint32_t *top;
-    uint32_t *cursor_up;
-    uint32_t *cursor_down;
-    Callback callback;
-    void *user_data;
-    uint32_t reserved_dw;
-  };
-  static_assert(offsetof(AgcCommandBufferLayout, cursor_up) == 0x10);
-  static_assert(offsetof(AgcCommandBufferLayout, reserved_dw) == 0x30);
 
   HW::RenderControl original_control{};
   original_control.depth_clear_enable = true;
@@ -22366,12 +22501,12 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   child[2] = static_cast<uint32_t>(address(&child_observation));
   child[3] = static_cast<uint32_t>(address(&child_observation) >> 32u);
   child[4] = 0;
-  child[5] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_MEM_32);
-  child[6] = static_cast<uint32_t>(address(&label));
-  child[7] = static_cast<uint32_t>(address(&label) >> 32u);
-  child[8] = UINT32_MAX;
+  child[5] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+  child[6] = 0x10u | 3u;
+  child[7] = static_cast<uint32_t>(address(&label));
+  child[8] = static_cast<uint32_t>(address(&label) >> 32u);
   child[9] = 1;
-  child[10] = 0x10u | 3u;
+  child[10] = UINT32_MAX;
 
   std::array<uint32_t, 4> nested{};
   nested[0] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
@@ -22578,6 +22713,12 @@ int main(int argc, char **argv) {
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--agc-wait-only") == 0) {
+    VulkanHarness vulkan;
+    CheckAgcWaitPackets(vulkan.RuntimeRenderer());
+    CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -22741,6 +22882,7 @@ int main(int argc, char **argv) {
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
+  CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());

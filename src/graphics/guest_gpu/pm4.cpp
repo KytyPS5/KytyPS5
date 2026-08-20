@@ -21,12 +21,10 @@ constexpr auto MakeRegisterNames() {
 	names[R_DRAW_RESET]     = "R_DRAW_RESET";
 	names[R_WAIT_FLIP_DONE] = "R_WAIT_FLIP_DONE";
 	names[R_DISPATCH_RESET] = "R_DISPATCH_RESET";
-	names[R_WAIT_MEM_32]    = "R_WAIT_MEM_32";
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
 	names[R_ACQUIRE_MEM]    = "R_ACQUIRE_MEM";
 	names[R_WRITE_DATA]     = "R_WRITE_DATA";
-	names[R_WAIT_MEM_64]    = "R_WAIT_MEM_64";
 	names[R_FLIP]           = "R_FLIP";
 	names[R_RELEASE_MEM]    = "R_RELEASE_MEM";
 	names[R_DMA_DATA]       = "R_DMA_DATA";
@@ -62,6 +60,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_WRITE_DATA]                = "IT_WRITE_DATA";
 	names[IT_MEM_SEMAPHORE]             = "IT_MEM_SEMAPHORE";
 	names[IT_DRAW_INDEX_INDIRECT_MULTI] = "IT_DRAW_INDEX_INDIRECT_MULTI";
+	names[IT_WAIT_REG_MEM]               = "IT_WAIT_REG_MEM";
 	names[IT_INDIRECT_BUFFER]           = "IT_INDIRECT_BUFFER";
 	names[IT_COPY_DATA]                 = "IT_COPY_DATA";
 	names[IT_CP_DMA]                    = "IT_CP_DMA";
@@ -91,6 +90,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_DISPATCH_DRAW_PREAMBLE]    = "IT_DISPATCH_DRAW_PREAMBLE";
 	names[IT_DISPATCH_DRAW]             = "IT_DISPATCH_DRAW";
 	names[IT_GET_LOD_STATS]             = "IT_GET_LOD_STATS";
+	names[IT_WAIT_REG_MEM_64]           = "IT_WAIT_REG_MEM_64";
 	names[IT_SET_CONTEXT_REG_INDIRECT]  = "IT_SET_CONTEXT_REG_INDIRECT";
 	return names;
 }

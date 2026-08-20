@@ -2866,6 +2866,10 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
+	if (Gen5::AgcIsWaitUserDataPacket(cmd_id, buffer)) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
+
 	auto raw_cmd_offset = buffer[0];
 	auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 
@@ -2956,19 +2960,21 @@ template <typename T>
 static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
-	constexpr auto value_dw   = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
+	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
 	constexpr auto payload_dw = 4u + value_dw * 2u;
 	constexpr auto packet_dw  = payload_dw + 1u;
-	constexpr auto register_id =
-	    (sizeof(T) == sizeof(uint32_t) ? Pm4::R_WAIT_MEM_32 : Pm4::R_WAIT_MEM_64);
+	constexpr auto opcode =
+	    (sizeof(T) == sizeof(uint32_t) ? Pm4::IT_WAIT_REG_MEM : Pm4::IT_WAIT_REG_MEM_64);
 
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_R(cmd_id) != register_id);
+	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != opcode || KYTY_PM4_R(cmd_id) != 0u);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
 
-	auto* addr = reinterpret_cast<const T*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 2u);
-	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 2u + value_dw);
-	auto  ctrl = buffer[2u + value_dw * 2u];
+	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
+	auto  ctrl = buffer[0];
+	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
+	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
+	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
+	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 3u + value_dw);
 	auto  poll = buffer[3u + value_dw * 2u];
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);

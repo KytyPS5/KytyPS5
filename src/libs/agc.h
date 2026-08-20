@@ -270,7 +270,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint8_t op, uint8_t cache_policy,
                                          const volatile void* address, uint64_t reference,
                                          uint64_t mask, uint32_t poll_cycles);
-uint32_t KYTY_SYSV_ABI  AgcDcbWaitOnAddressGetSize(uint32_t size);
+uint64_t KYTY_SYSV_ABI  AgcDcbWaitOnAddressGetSize(uint32_t size);
+bool                    AgcIsWaitUserDataPacket(uint32_t cmd_id, const uint32_t* payload);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);

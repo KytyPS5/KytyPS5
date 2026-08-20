@@ -144,7 +144,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 
 	vk::Pipeline pipeline = nullptr;
 	RequireVulkanSuccess(
-	    m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+	    m_graphics.device.createGraphicsPipelines(m_graphics.pipeline_cache, 1, &create, nullptr, &pipeline),
 	    "create color-to-MS-depth pipeline");
 	m_pipelines.push_back({key, pipeline});
 	return pipeline;

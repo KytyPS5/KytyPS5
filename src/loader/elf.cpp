@@ -1,5 +1,7 @@
 #include "loader/elf.h"
 
+#include "loader/bootFailure.h"
+
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -344,6 +346,7 @@ void Elf64::Clear() {
 	m_str_table_size = 0;
 	m_dynamic.reset();
 	m_dynamic_data.reset();
+	m_boot_failure = BootFailure::None;
 }
 
 void Elf64::DbgDump(const std::string& folder) {
@@ -462,71 +465,7 @@ bool Elf64::IsSelf() const {
 }
 
 bool Elf64::IsValid() const {
-	if (m_f == nullptr || m_f->IsInvalid()) {
-		return false;
-	}
-
-	if (m_ehdr == nullptr) {
-		return false;
-	}
-
-	if (m_ehdr->e_ident[EI_MAG0] != '\x7f' || m_ehdr->e_ident[EI_MAG1] != 'E' ||
-	    m_ehdr->e_ident[EI_MAG2] != 'L' || m_ehdr->e_ident[EI_MAG3] != 'F') {
-		LOGF("Not an ELF file\n");
-		return false;
-	}
-
-	if (m_ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
-		LOGF("ehdr->e_ident[EI_CLASS] (0x%x) != ELFCLASS64\n", m_ehdr->e_ident[EI_CLASS]);
-		return false;
-	}
-
-	if (m_ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
-		LOGF("ehdr->e_ident[EI_DATA] (0x%x) != ELFDATA2LSB\n", m_ehdr->e_ident[EI_DATA]);
-		return false;
-	}
-
-	if (m_ehdr->e_ident[EI_VERSION] != EV_CURRENT) {
-		LOGF("ehdr->e_ident[EI_VERSION] != EV_CURRENT\n");
-		return false;
-	}
-
-	if (m_ehdr->e_ident[EI_OSABI] != ELFOSABI_FREEBSD) {
-		LOGF("ehdr->e_ident[EI_OSABI] (0x%x) != ELFOSABI_FREEBSD\n", m_ehdr->e_ident[EI_OSABI]);
-		return false;
-	}
-
-	if (m_ehdr->e_ident[EI_ABIVERSION] != 0 && m_ehdr->e_ident[EI_ABIVERSION] != 2) {
-		LOGF("ehdr->e_ident[EI_ABIVERSION] (0x%x) != (0 or 2)\n", m_ehdr->e_ident[EI_ABIVERSION]);
-		return false;
-	}
-
-	if (m_ehdr->e_type != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC) {
-		LOGF("ehdr->e_type (%04x) != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC\n", m_ehdr->e_type);
-		return false;
-	}
-
-	if (m_ehdr->e_machine != EM_X86_64) {
-		LOGF("ehdr->e_machine (%04x) != EM_X86_64\n", m_ehdr->e_machine);
-		return false;
-	}
-
-	if (m_ehdr->e_version != EV_CURRENT) {
-		LOGF("ehdr->e_version != EV_CURRENT\n");
-		return false;
-	}
-
-	if (m_ehdr->e_phentsize != sizeof(Elf64_Phdr)) {
-		LOGF("ehdr->e_phentsize != sizeof(Elf64_Phdr)\n");
-		return false;
-	}
-
-	if (m_ehdr->e_shentsize > 0 && m_ehdr->e_shentsize != sizeof(Elf64_Shdr)) {
-		LOGF("ehdr->e_shentsize (%d) != sizeof(Elf64_Shdr)\n", m_ehdr->e_shentsize);
-		return false;
-	}
-
-	return true;
+	return m_boot_failure == BootFailure::None && m_ehdr != nullptr;
 }
 
 void Elf64::Open(const std::filesystem::path& file_name) {
@@ -536,7 +475,10 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 	m_f->Open(file_name, Common::File::Mode::Read);
 
 	if (m_f->IsInvalid()) {
-		EXIT("Can't open %s\n", Common::PathToString(file_name).c_str());
+		// Not fatal here any more. The caller reports the classified reason, which
+		// is more use to someone filing a compatibility report than a raw path.
+		m_boot_failure = BootFailure::FileNotFound;
+		return;
 	}
 
 	m_self = LoadSelf(*m_f);
@@ -552,7 +494,15 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 
 	m_ehdr = LoadEhdr64(*m_f);
 
-	if (!IsValid()) {
+	// The eleven header checks that used to be an inline ladder here now live in
+	// one pure function, so every rejection has a name the loader can report and a
+	// test can pin down. See loader/bootFailure.h.
+	m_boot_failure =
+	    (m_ehdr == nullptr ? BootFailure::HeaderUnreadable : ClassifyElfHeader(*m_ehdr));
+
+	if (m_boot_failure != BootFailure::None) {
+		LOGF("ELF rejected: %s - %s\n", BootFailureToString(m_boot_failure).data(),
+		     BootFailureExplain(m_boot_failure).data());
 		m_ehdr.reset();
 	}
 

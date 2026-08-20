@@ -24,6 +24,8 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -43,6 +45,16 @@ namespace Libs::Graphics {
 
 static RenderContext* g_renderer = nullptr;
 
+// The emulator's normal exit is std::quick_exit() (see Emulator::Execute), which
+// runs no atexit handlers, no static destructors and no Subsystems teardown. So
+// neither the pipeline cache nor the shader cache would ever reach disk if they
+// were written from a destructor. std::at_quick_exit is the hook that does run,
+// and at that point the device and both caches are still alive.
+static void FlushCachesAtQuickExit() {
+	WindowFlushCaches();
+	ShaderSaveDiskCache();
+}
+
 void Initialize() {
 	// Some games lock up if this is not called first
 	if (Config::RenderDocEnabled()) {
@@ -57,6 +69,11 @@ void Initialize() {
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
 	ShaderInit();
+
+	const int registered = std::at_quick_exit(FlushCachesAtQuickExit);
+	if (registered != 0) {
+		LOGF("Could not register the cache flush; caches will not persist this run\n");
+	}
 }
 
 void Shutdown() {

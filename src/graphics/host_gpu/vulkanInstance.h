@@ -23,7 +23,17 @@ struct VulkanInstance {
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties = {};
 	vk::Device                         device                            = nullptr;
 	VmaAllocator                       allocator                         = nullptr;
+	// Driver-side pipeline cache, persisted across runs. Distinct from
+	// PipelineCache in renderer/pipeline: that one dedupes vk::Pipeline
+	// handles within a single run, this is what stops the driver
+	// recompiling the same SPIR-V on every launch.
+	vk::PipelineCache                  pipeline_cache                    = nullptr;
 	bool                               memory_budget_ext_enabled         = false;
+	// VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory. Both are
+	// optional and are enabled together: priority is what tells the driver
+	// which allocations to demote first, and pageable_device_local_memory is
+	// what lets it demote instead of failing the allocation outright.
+	bool                               memory_priority_ext_enabled       = false;
 	bool                               rt_extensions_enabled             = false;
 	bool                               subgroup_size_control_enabled     = false;
 	bool                               sample_rate_shading_enabled       = false;

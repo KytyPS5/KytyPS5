@@ -540,6 +540,25 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		supported_features12.pNext = &supported_robustness2;
 	}
 
+	// VK_EXT_pageable_device_local_memory carries a feature bit that must be
+	// enabled explicitly at device creation; using the extension without it
+	// is invalid usage, so query it here and only turn the pair on if the
+	// driver really reports it.
+	const auto pageable_ext_enabled =
+	    HasExtension(device_extensions, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+
+	vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT supported_pageable {};
+	supported_pageable.sType =
+	    vk::StructureType::ePhysicalDevicePageableDeviceLocalMemoryFeaturesEXT;
+	supported_pageable.pNext = nullptr;
+	if (pageable_ext_enabled) {
+		if (robustness2_ext_enabled) {
+			supported_robustness2.pNext = &supported_pageable;
+		} else {
+			supported_features12.pNext = &supported_pageable;
+		}
+	}
+
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
 	supported_features2.pNext = &supported_features13;
@@ -610,9 +629,23 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
 
+	// Chain the pageable-memory enable in front of features13 when the driver
+	// reported support. Left out entirely otherwise, so a driver without the
+	// extension sees exactly the chain it saw before this change.
+	vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_features {};
+	pageable_features.sType =
+	    vk::StructureType::ePhysicalDevicePageableDeviceLocalMemoryFeaturesEXT;
+	pageable_features.pageableDeviceLocalMemory = VK_TRUE;
+	pageable_features.pNext                     = &features13;
+
+	const bool enable_pageable =
+	    pageable_ext_enabled && supported_pageable.pageableDeviceLocalMemory == VK_TRUE;
+
 	vk::DeviceCreateInfo create_info {};
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
-	create_info.pNext                   = &features13;
+	create_info.pNext                   = enable_pageable
+	                                          ? static_cast<const void*>(&pageable_features)
+	                                          : static_cast<const void*>(&features13);
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -974,6 +1007,20 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 		}
+		// Memory priority lets the driver demote low-value allocations under
+		// pressure instead of the texture cache having to delete and later
+		// recreate them, so it complements RunGarbageCollector() rather than
+		// replacing it: the GC stays the backstop, this reduces how often it
+		// has to fire. pageable_device_local_memory is required alongside it
+		// for the driver to actually page device-local memory rather than
+		// returning VK_ERROR_OUT_OF_DEVICE_MEMORY, so both or neither.
+		if (HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) &&
+		    HasExtension(available_extensions,
+		                 VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+			graphic_ctx.memory_priority_ext_enabled = true;
+		}
 	}
 
 	memcpy(device_name, device_properties.deviceName, sizeof(device_name));
@@ -991,6 +1038,8 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+
+	graphic_ctx.CreatePipelineCache();
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1029,6 +1078,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		graphic_ctx.DestroyPipelineCache();
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

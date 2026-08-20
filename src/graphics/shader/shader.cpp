@@ -1,5 +1,7 @@
 #include "graphics/shader/shader.h"
 
+#include "graphics/shader/shaderDiskCache.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -163,10 +165,77 @@ static std::span<const uint32_t> MakeShaderSpirvView(const std::vector<uint32_t>
 	return {spirv.data(), spirv.size()};
 }
 
+// Repopulates the in-memory program cache from disk. Entries that arrive here
+// are not trusted: each one still has to satisfy the same runtime
+// specialization check an in-run permutation does (TryUse*Permutation ->
+// ShaderMaterializeStageRuntime), so a stale entry costs a recompile, never a
+// wrong frame.
+static void ShaderLoadDiskCache() {
+	const auto path = Config::GetShaderCacheFile();
+	if (path.empty()) {
+		return;
+	}
+
+	auto entries = ShaderDiskCacheLoad(path);
+
+	std::scoped_lock lock(g_shader_program_cache_mutex);
+	for (auto& entry: entries) {
+		ShaderStageProgramKey key {};
+		key.stage             = entry.stage;
+		key.lane_mask_mode    = entry.lane_mask_mode;
+		key.shader_hash       = entry.shader_hash;
+		key.program_id        = entry.program_id;
+		key.optimization_type = entry.optimization_type;
+
+		auto& permutations = g_shader_program_cache[key];
+		if (permutations.size() >= ShaderMaxPermutationsPerProgram) {
+			continue;
+		}
+
+		auto permutation     = std::make_unique<ShaderProgramPermutation>();
+		permutation->spirv   = std::move(entry.spirv);
+		permutation->program = std::move(entry.program);
+		permutations.push_back(std::move(permutation));
+	}
+}
+
+void ShaderSaveDiskCache() {
+	const auto path = Config::GetShaderCacheFile();
+	if (path.empty()) {
+		return;
+	}
+
+	std::vector<ShaderDiskCacheEntry> entries;
+
+	{
+		std::scoped_lock lock(g_shader_program_cache_mutex);
+		for (const auto& [key, permutations]: g_shader_program_cache) {
+			for (const auto& permutation: permutations) {
+				if (permutation->program == nullptr || permutation->spirv.empty()) {
+					continue;
+				}
+				ShaderDiskCacheEntry entry {};
+				entry.stage             = key.stage;
+				entry.lane_mask_mode    = key.lane_mask_mode;
+				entry.shader_hash       = key.shader_hash;
+				entry.program_id        = key.program_id;
+				entry.optimization_type = key.optimization_type;
+				entry.program           = permutation->program;
+				entry.spirv             = permutation->spirv;
+				entries.push_back(std::move(entry));
+			}
+		}
+	}
+
+	ShaderDiskCacheSave(path, entries);
+}
+
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
 
 	g_shader_map = std::make_unique<std::unordered_map<uint64_t, ShaderMappedData>>();
+
+	ShaderLoadDiskCache();
 }
 
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {

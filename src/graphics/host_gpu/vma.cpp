@@ -15,6 +15,7 @@
 #endif
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -23,8 +24,35 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <system_error>
+#include <vector>
 
 namespace Libs::Graphics {
+
+// Allocation priority for VK_EXT_memory_priority: 0.0 means "demote this
+// first", 1.0 means "demote this last", and VMA uses 0.5 when nothing is
+// specified. It is a hint about relative value, so raising one class is
+// enough to order it against everything left at the default.
+//
+// Only images are raised here, deliberately. A demoted render target has to
+// be paged back in before the next pass that samples it, whereas most buffer
+// content can be re-uploaded from guest memory the emulator still holds. The
+// generic CreateBuffer() path also serves vertex/index buffers that may be
+// just as hot as an image, so lowering it wholesale would be guessing, and a
+// wrong guess here costs performance silently. Finer classification (staging
+// and tiler scratch really are cheap to lose) is a sensible follow-up once
+// someone measures it.
+//
+// This complements TextureCache::RunGarbageCollector() rather than replacing
+// it: the GC still frees things, this just gives the driver a cheaper option
+// one step earlier.
+namespace {
+constexpr float MEMORY_PRIORITY_IMAGE = 0.8F;
+} // namespace
 
 namespace {
 
@@ -73,6 +101,11 @@ bool GraphicContext::CreateAllocator() {
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
 	info.flags = memory_budget_ext_enabled ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0;
+	// Without this bit VMA ignores VmaAllocationCreateInfo::priority entirely,
+	// so the per-allocation priorities set below would be silently inert.
+	if (memory_priority_ext_enabled) {
+		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
@@ -80,6 +113,159 @@ bool GraphicContext::CreateAllocator() {
 		return false;
 	}
 	return true;
+}
+
+// ── Persistent pipeline cache ────────────────────────────────────────────
+//
+// Every createGraphicsPipelines/createComputePipelines call in the renderer
+// used to pass a null VkPipelineCache, so the driver recompiled each pipeline
+// from scratch on every launch. PipelineCache in renderer/pipeline is a
+// software map of vk::Pipeline handles: it stops us asking the driver twice
+// in one run, but it does not survive process exit and it is not what the
+// driver consults when it does compile.
+//
+// The blob on disk is untrusted input. It may have been written by a
+// different GPU, or by an older driver, or by a run that was killed
+// mid-write. Vulkan puts a header on it precisely so this can be checked, so
+// validate vendor/device id and the pipeline-cache UUID against the device we
+// actually bound to before handing anything to the driver. A mismatch is the
+// normal consequence of a driver update, not an error worth shouting about.
+
+namespace {
+
+constexpr uint32_t PIPELINE_CACHE_HEADER_BYTES = 32;
+constexpr uint32_t PIPELINE_CACHE_VERSION_ONE  = 1;
+
+uint32_t ReadLe32(const uint8_t* p) {
+	return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8U) |
+	       (static_cast<uint32_t>(p[2]) << 16U) | (static_cast<uint32_t>(p[3]) << 24U);
+}
+
+// True when the blob's header describes the device we are running on.
+bool PipelineCacheMatchesDevice(const std::vector<uint8_t>&         blob,
+                                 const vk::PhysicalDeviceProperties& props) {
+	if (blob.size() < PIPELINE_CACHE_HEADER_BYTES) {
+		return false;
+	}
+	const auto* h           = blob.data();
+	const auto  header_size = ReadLe32(h + 0);
+	const auto  header_ver  = ReadLe32(h + 4);
+	const auto  vendor_id   = ReadLe32(h + 8);
+	const auto  device_id   = ReadLe32(h + 12);
+
+	return header_size >= PIPELINE_CACHE_HEADER_BYTES && header_size <= blob.size() &&
+	       header_ver == PIPELINE_CACHE_VERSION_ONE && vendor_id == props.vendorID &&
+	       device_id == props.deviceID &&
+	       std::memcmp(h + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+}
+
+std::vector<uint8_t> ReadPipelineCacheFile(const std::filesystem::path& path) {
+	std::error_code ec;
+	if (!std::filesystem::exists(path, ec) || ec) {
+		return {}; // first run
+	}
+	std::ifstream in(path, std::ios::binary);
+	if (!in) {
+		return {};
+	}
+	std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)),
+	                           std::istreambuf_iterator<char>());
+	return blob;
+}
+
+} // namespace
+
+void GraphicContext::CreatePipelineCache() {
+	EXIT_IF(device == nullptr);
+
+	const auto path = Config::GetPipelineCacheFile();
+
+	std::vector<uint8_t> blob;
+	if (!path.empty()) {
+		blob = ReadPipelineCacheFile(path);
+		if (!blob.empty() && !PipelineCacheMatchesDevice(blob, physical_device_properties)) {
+			LOGF("Pipeline cache does not match this device/driver, starting cold\n");
+			blob.clear();
+		}
+	}
+
+	vk::PipelineCacheCreateInfo info {};
+	info.sType           = vk::StructureType::ePipelineCacheCreateInfo;
+	info.initialDataSize = blob.size();
+	info.pInitialData    = blob.empty() ? nullptr : blob.data();
+
+	auto result = device.createPipelineCache(&info, nullptr, &pipeline_cache);
+	if (result != vk::Result::eSuccess && !blob.empty()) {
+		// The header matched but the driver still refused it. Try cold rather
+		// than run without a cache at all.
+		LOGF("Pipeline cache rejected by the driver (%s), retrying empty\n",
+		     VulkanToString(result).c_str());
+		info.initialDataSize = 0;
+		info.pInitialData    = nullptr;
+		result               = device.createPipelineCache(&info, nullptr, &pipeline_cache);
+	}
+	if (result != vk::Result::eSuccess) {
+		LOGF("vkCreatePipelineCache failed: %s\n", VulkanToString(result).c_str());
+		pipeline_cache = nullptr;
+		return;
+	}
+
+	LOGF("Pipeline cache: %zu bytes loaded from %s\n", blob.size(),
+	     path.empty() ? "(disabled)" : path.string().c_str());
+}
+
+void GraphicContext::SavePipelineCache() {
+	if (pipeline_cache == nullptr) {
+		return;
+	}
+
+	const auto path = Config::GetPipelineCacheFile();
+	if (!path.empty()) {
+		size_t     size   = 0;
+		const auto sized  = device.getPipelineCacheData(pipeline_cache, &size, nullptr);
+		if (sized == vk::Result::eSuccess && size > 0) {
+			std::vector<uint8_t> blob(size);
+			if (device.getPipelineCacheData(pipeline_cache, &size, blob.data()) ==
+			    vk::Result::eSuccess) {
+				// temp + rename: an interrupted shutdown must not leave a torn
+				// file for the next run to detect and discard.
+				std::error_code ec;
+				auto            tmp = path;
+				tmp += ".tmp";
+				{
+					std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+					if (out) {
+						out.write(reinterpret_cast<const char*>(blob.data()),
+						          static_cast<std::streamsize>(blob.size()));
+					}
+					if (!out) {
+						std::filesystem::remove(tmp, ec);
+						tmp.clear();
+					}
+				}
+				if (!tmp.empty()) {
+					std::filesystem::rename(tmp, path, ec);
+					if (ec) {
+						std::filesystem::remove(tmp, ec);
+					} else {
+						LOGF("Pipeline cache: %zu bytes written to %s\n", blob.size(),
+						     path.string().c_str());
+					}
+				}
+			}
+		}
+	}
+
+}
+
+void GraphicContext::DestroyPipelineCache() {
+	if (pipeline_cache == nullptr) {
+		return;
+	}
+
+	SavePipelineCache();
+	device.destroyPipelineCache(pipeline_cache, nullptr);
+	pipeline_cache = nullptr;
 }
 
 void GraphicContext::DestroyAllocator() {
@@ -222,6 +408,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory.property);
 	alloc_info.preferredFlags =
 	    static_cast<vk::MemoryPropertyFlags::MaskType>(memory.preferred_property);
+	alloc_info.priority = MEMORY_PRIORITY_IMAGE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto       result       = static_cast<vk::Result>(

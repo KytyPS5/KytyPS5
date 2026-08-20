@@ -281,7 +281,7 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	create.stage  = stage;
 	create.layout = m_pipeline_layout;
 	const auto result =
-	    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_pipelines[slot]);
+	    m_graphics.device.createComputePipelines(m_graphics.pipeline_cache, 1, &create, nullptr, &m_pipelines[slot]);
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create TileManager pipeline");
 	return m_pipelines[slot];
@@ -499,7 +499,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 		create.stage  = stage;
 		create.layout = m_pipeline_layout;
 		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+		    m_graphics.device.createComputePipelines(m_graphics.pipeline_cache, 1, &create, nullptr, &pipeline);
 		m_graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create D16 conversion pipeline");
 	}
@@ -643,7 +643,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 		create.stage  = stage;
 		create.layout = m_pipeline_layout;
 		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_swap_bgra16);
+		    m_graphics.device.createComputePipelines(m_graphics.pipeline_cache, 1, &create, nullptr, &m_swap_bgra16);
 		m_graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create BGRA16 swap pipeline");
 	}

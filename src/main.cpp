@@ -1,6 +1,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
+#include "common/diagnostics.h"
 #include "common/file.h"
 #include "common/magicEnum.h"
 #include "common/platform/sysDbg.h"
@@ -8,6 +9,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "kytyGitVersion.h"
 
 #include <charconv>
@@ -17,29 +19,8 @@
 using namespace Common;
 using namespace Emulator;
 
-static std::string GetBuildString() {
-	Date date = Date::FromMacros(std::string(__DATE__));
-
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	std::string type = "Debug";
-#elif KYTY_BUILD == KYTY_BUILD_RELEASE
-	std::string type = "Release";
-#else
-	std::string type = "????";
-#endif
-
-	std::string compiler =
-	    Debug::GetCompiler() + "-" + Debug::GetLinker() + "-" + Debug::GetBitness();
-
-	std::string str =
-	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
-	                KYTY_VERSION, KYTY_GIT_VERSION, date.ToString().c_str());
-
-	return str;
-}
-
 static void PrintUsage() {
-	::printf("%s\n", GetBuildString().c_str());
+	::printf("%s\n", Common::Diagnostics::BuildString().c_str());
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
@@ -72,6 +53,9 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --diagnostics                        Print a report for bug reports, then exit.\n");
+	::printf("  --log-repeat-limit <num>             Messages one log line may write before it\n"
+	         "                                       is sampled. 0 disables. Default: 256.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -122,8 +106,10 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 	return true;
 }
 
-static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
-	show_help = false;
+static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help,
+                      bool& show_diagnostics) {
+	show_help        = false;
+	show_diagnostics = false;
 
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);
@@ -131,6 +117,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--help" || arg == "-h") {
 			show_help = true;
+			continue;
+		}
+
+		if (arg == "--diagnostics") {
+			show_diagnostics = true;
 			continue;
 		}
 
@@ -205,6 +196,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
 			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+		} else if (arg == "--log-repeat-limit") {
+			uint64_t   limit = 0;
+			const auto parsed =
+			    std::from_chars(value.data(), value.data() + value.size(), limit);
+			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size()) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.log_repeat_limit = limit;
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
@@ -296,20 +296,29 @@ int main(int argc, char* argv[]) {
 	InitializeThreads();
 
 	RunOptions options;
-	bool       show_help = false;
+	bool       show_help        = false;
+	bool       show_diagnostics = false;
 
 	if (argc < 2) {
 		PrintUsage();
 		return 0;
 	}
 
-	if (!ParseArgs(argc, argv, options, show_help)) {
+	if (!ParseArgs(argc, argv, options, show_help, show_diagnostics)) {
 		PrintUsage();
 		return 1;
 	}
 
 	if (show_help) {
 		PrintUsage();
+		return 0;
+	}
+
+	// Before anything that needs a game: the report is most wanted by people
+	// whose emulator will not start at all.
+	if (show_diagnostics) {
+		::printf("%s", Common::Diagnostics::BuildReport().c_str());
+		::printf("%s", Libs::Graphics::BuildVulkanReport().c_str());
 		return 0;
 	}
 

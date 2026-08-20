@@ -8781,7 +8781,11 @@ public:
             Count(Kind::StorageUint1D) == 0 &&
             Count(Kind::StorageUint1DArray) == 0 &&
             Count(Kind::StorageUint2DArray) == 0 &&
-            Count(Kind::StorageUint3D) == 0,
+            Count(Kind::StorageUint3D) == 0 &&
+            Count(Kind::StorageAtomic1D) == 0 &&
+            Count(Kind::StorageAtomic1DArray) == 0 &&
+            Count(Kind::StorageAtomic2DArray) == 0 &&
+            Count(Kind::StorageAtomic3D) == 0,
         "unsupported array/3D image cases must provide matching Vulkan test "
         "views "
         "before dispatch");
@@ -8834,6 +8838,11 @@ public:
       case Kind::StorageUint2D:
       case Kind::StorageUint2DArray:
       case Kind::StorageUint3D:
+      case Kind::StorageAtomic1D:
+      case Kind::StorageAtomic1DArray:
+      case Kind::StorageAtomic2D:
+      case Kind::StorageAtomic2DArray:
+      case Kind::StorageAtomic3D:
         type = vk::DescriptorType::eStorageImage;
         break;
       case Kind::Samplers:
@@ -8926,7 +8935,10 @@ public:
             Count(Kind::Storage2D) + Count(Kind::Storage2DArray) +
             Count(Kind::Storage3D) + Count(Kind::StorageUint1D) +
             Count(Kind::StorageUint1DArray) + Count(Kind::StorageUint2D) +
-            Count(Kind::StorageUint2DArray) + Count(Kind::StorageUint3D));
+            Count(Kind::StorageUint2DArray) + Count(Kind::StorageUint3D) +
+            Count(Kind::StorageAtomic1D) + Count(Kind::StorageAtomic1DArray) +
+            Count(Kind::StorageAtomic2D) + Count(Kind::StorageAtomic2DArray) +
+            Count(Kind::StorageAtomic3D));
     add_pool_size(vk::DescriptorType::eSampler, Count(Kind::Samplers));
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
@@ -8955,6 +8967,7 @@ public:
     std::vector<vk::DescriptorImageInfo> sampled_infos;
     std::vector<vk::DescriptorImageInfo> storage_infos;
     std::vector<vk::DescriptorImageInfo> storage_uint_infos;
+    std::vector<vk::DescriptorImageInfo> storage_atomic_infos;
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
@@ -9078,45 +9091,34 @@ public:
     }
     const auto *storage = Binding(Kind::Storage2D);
     const auto *storage_uint = Binding(Kind::StorageUint2D);
-    if (storage != nullptr || storage_uint != nullptr) {
-      Require(test.name, "dispatch", storage_image != nullptr,
-              "storage image descriptor requested but no storage image was "
+    const auto *storage_atomic = Binding(Kind::StorageAtomic2D);
+    const auto BindStorage =
+        [&](const ShaderRecompiler::IR::DescriptorBinding *binding,
+            const Image *image, std::vector<vk::DescriptorImageInfo> *infos) {
+          if (binding == nullptr) {
+            return;
+          }
+          Require(
+              test.name, "dispatch", image != nullptr,
+              "storage image descriptor requested but no matching image was "
               "provided");
-      Require(test.name, "dispatch", storage_image_uint != nullptr,
-              "uint storage image descriptor requested but no uint storage "
-              "image was provided");
-      storage_infos.resize(storage != nullptr ? storage->resources.size() : 0u);
-      storage_uint_infos.resize(
-          storage_uint != nullptr ? storage_uint->resources.size() : 0u);
-      for (auto &info : storage_infos) {
-        info.imageView = storage_image->view;
-        info.imageLayout = storage_image->layout;
-      }
-      for (auto &info : storage_uint_infos) {
-        info.imageView = storage_image_uint->view;
-        info.imageLayout = storage_image_uint->layout;
-      }
-      if (storage != nullptr) {
-        vk::WriteDescriptorSet write{};
-        write.sType = vk::StructureType::eWriteDescriptorSet;
-        write.dstSet = descriptor_set;
-        write.dstBinding = storage->binding;
-        write.descriptorCount = static_cast<u32>(storage_infos.size());
-        write.descriptorType = vk::DescriptorType::eStorageImage;
-        write.pImageInfo = storage_infos.data();
-        writes.push_back(write);
-      }
-      if (storage_uint != nullptr) {
-        vk::WriteDescriptorSet write{};
-        write.sType = vk::StructureType::eWriteDescriptorSet;
-        write.dstSet = descriptor_set;
-        write.dstBinding = storage_uint->binding;
-        write.descriptorCount = static_cast<u32>(storage_uint_infos.size());
-        write.descriptorType = vk::DescriptorType::eStorageImage;
-        write.pImageInfo = storage_uint_infos.data();
-        writes.push_back(write);
-      }
-    }
+          infos->resize(binding->resources.size());
+          for (auto &info : *infos) {
+            info.imageView = image->view;
+            info.imageLayout = image->layout;
+          }
+          vk::WriteDescriptorSet write{};
+          write.sType = vk::StructureType::eWriteDescriptorSet;
+          write.dstSet = descriptor_set;
+          write.dstBinding = binding->binding;
+          write.descriptorCount = static_cast<u32>(infos->size());
+          write.descriptorType = vk::DescriptorType::eStorageImage;
+          write.pImageInfo = infos->data();
+          writes.push_back(write);
+        };
+    BindStorage(storage, storage_image, &storage_infos);
+    BindStorage(storage_uint, storage_image_uint, &storage_uint_infos);
+    BindStorage(storage_atomic, storage_image_uint, &storage_atomic_infos);
     const auto *samplers = Binding(Kind::Samplers);
     if (samplers != nullptr) {
       Require(test.name, "dispatch", sampler != nullptr,
@@ -10583,9 +10585,6 @@ private:
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
     Require("VulkanHarness", "dispatch",
-            available_features.shaderStorageImageReadWithoutFormat == true,
-            "shaderStorageImageReadWithoutFormat is not supported");
-    Require("VulkanHarness", "dispatch",
             available_features12.timelineSemaphore == true,
             "timeline semaphores are not supported");
     Require("VulkanHarness", "dispatch",
@@ -10622,7 +10621,6 @@ private:
     device_info.pNext = &device_features13;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
-    device_features.shaderStorageImageReadWithoutFormat = true;
     device_features.sampleRateShading = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
@@ -10977,7 +10975,10 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
       Has(Kind::Storage2D) || Has(Kind::Storage2DArray) ||
       Has(Kind::Storage3D) || Has(Kind::StorageUint2D) ||
       Has(Kind::StorageUint1D) || Has(Kind::StorageUint1DArray) ||
-      Has(Kind::StorageUint2DArray) || Has(Kind::StorageUint3D);
+      Has(Kind::StorageUint2DArray) || Has(Kind::StorageUint3D) ||
+      Has(Kind::StorageAtomic1D) || Has(Kind::StorageAtomic1DArray) ||
+      Has(Kind::StorageAtomic2D) || Has(Kind::StorageAtomic2DArray) ||
+      Has(Kind::StorageAtomic3D);
   const bool needs_sampler = Has(Kind::Samplers);
   const bool needs_gds = Has(Kind::Gds);
   if (needs_gds) {
@@ -18632,11 +18633,13 @@ TestCase ImageStoreR32SintUsesRawUintView() {
   test.has_user_data = true;
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
-  test.required_spirv = {"storage_uint_2d"};
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
+                         "storage_uint_2d"};
+  test.forbidden_spirv = {"R32ui"};
   return test;
 }
 
-TestCase ImageStoreR32UintUsesUintStorageImage() {
+TestCase ImageStoreR32UintUsesFormatlessStorageImage() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -18652,7 +18655,7 @@ TestCase ImageStoreR32UintUsesUintStorageImage() {
   expected_image[1 * 4 + 2] = 0x12345678u;
 
   TestCase test;
-  test.name = "ImageStoreR32UintUsesUintStorageImage";
+  test.name = "ImageStoreR32UintUsesFormatlessStorageImage";
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::S_ENDPGM};
   test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
@@ -18660,7 +18663,9 @@ TestCase ImageStoreR32UintUsesUintStorageImage() {
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
-  test.required_spirv = {"R32ui", "storage_uint_2d"};
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
+                         "storage_uint_2d"};
+  test.forbidden_spirv = {"R32ui"};
   return test;
 }
 
@@ -18692,7 +18697,9 @@ TestCase ImageStorePackedUintSaturatesChannels() {
   test.image_descriptor_swizzle = DstSel(4, 5, 6, 0);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
-  test.required_spirv = {"R32ui", "OpULessThan", "OpSelect"};
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
+                         "storage_uint_2d", "OpULessThan", "OpSelect"};
+  test.forbidden_spirv = {"R32ui"};
   return test;
 }
 
@@ -18722,6 +18729,9 @@ TestCase ImageStorePackedUintHonorsSparseDmask() {
   test.image_descriptor_swizzle = DstSel(4, 5, 6, 0);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
+                         "storage_uint_2d"};
+  test.forbidden_spirv = {"R32ui"};
   return test;
 }
 
@@ -18748,6 +18758,82 @@ TestCase ComputeTgSizeSgprUsesWaveMetadata() {
   test.has_compute_info = true;
   test.compile_only = true;
   test.required_spirv = {"OpUDiv", "OpShiftLeftLogical", "2147483648"};
+  return test;
+}
+
+TestCase ImageStoreAndAtomicShareTypedBinding() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 0, 5);
+  code.push_back(EncodeMimg0(0x08, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendVMovU32(&code, 0, 3);
+  code.push_back(EncodeMimg0(0x11, 0x1, 0, true));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  std::vector<u32> expected_image(16, 0);
+  expected_image[1 * 4 + 2] = 8;
+
+  TestCase test;
+  test.name = "ImageStoreAndAtomicShareTypedBinding";
+  test.code = std::move(code);
+  test.expected = {5};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::IMAGE_ATOMIC_ADD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::move(expected_image);
+  test.required_spirv = {"OpImageWrite", "OpImageTexelPointer", "R32ui",
+                         "storage_atomic_2d"};
+  test.forbidden_spirv = {"StorageImageReadWithoutFormat",
+                          "StorageImageWriteWithoutFormat", "storage_uint_2d"};
+  return test;
+}
+
+TestCase ImageStoreAndAtomicUseSeparateBindings() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 0, 5);
+  code.push_back(EncodeMimg0(0x08, 0x1));
+  code.push_back(EncodeMimg1(0, 20, 0));
+  AppendVMovU32(&code, 0, 3);
+  code.push_back(EncodeMimg0(0x11, 0x1, 0, true));
+  code.push_back(EncodeMimg1(0, 20, 2));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  auto user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+  std::copy_n(user_data.begin(), 8, user_data.begin() + 8);
+  std::vector<u32> expected_image(16, 0);
+  expected_image[1 * 4 + 2] = 8;
+
+  TestCase test;
+  test.name = "ImageStoreAndAtomicUseSeparateBindings";
+  test.code = std::move(code);
+  test.expected = {5};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::IMAGE_ATOMIC_ADD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = user_data;
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::move(expected_image);
+  test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
+                         "OpImageWrite",
+                         "OpImageTexelPointer",
+                         "R32ui",
+                         "storage_uint_2d",
+                         "storage_atomic_2d"};
   return test;
 }
 
@@ -18778,10 +18864,10 @@ TestCase ImageAtomicVariants() {
                   O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
                   O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpImageTexelPointer", "R32ui"};
+  test.required_spirv = {"OpImageTexelPointer", "R32ui", "storage_atomic_2d"};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
                           "StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat"};
+                          "StorageImageWriteWithoutFormat", "storage_uint_2d"};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {
@@ -19340,10 +19426,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreYzwxUsesInverseSwizzle);
   AddCase(ImageStoreR32FloatUsesFormatlessStorageImage);
   AddCase(ImageStoreR32SintUsesRawUintView);
-  AddCase(ImageStoreR32UintUsesUintStorageImage);
+  AddCase(ImageStoreR32UintUsesFormatlessStorageImage);
   AddCase(ImageStorePackedUintSaturatesChannels);
   AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
+  AddCase(ImageStoreAndAtomicShareTypedBinding);
+  AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);

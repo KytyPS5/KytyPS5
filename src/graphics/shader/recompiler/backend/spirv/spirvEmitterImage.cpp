@@ -588,7 +588,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (op == IR::ValueOpcode::ImageWrite) {
 		const auto uint_image = mem.kind == IR::ResourceKind::StorageImageUint;
-		const auto view       = StorageImageViewKind(state, mem, uint_image, pc);
+		const auto view       = StorageImageViewKind(mem);
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
 			const auto mip_lod =
 			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::DynamicStorage
@@ -596,7 +596,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			        : 0u;
 			const auto coord = CoordU32(ctx, mem, *address, view);
 			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, uint_image, view, mip_lod, coord, texel);
+			EmitStorageImageWrite(state, mem.resource, view, mip_lod, coord, texel);
 		});
 		return true;
 	}
@@ -793,14 +793,14 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != 0u) {
-		const auto view = StorageImageViewKind(state, mem, true, pc);
+		const auto view = StorageImageViewKind(mem);
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
 			           const auto pointer = state.builder.AllocateId();
 			           const auto pointer_type =
 			               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
 			           state.builder.AddFunction(
 			               {OpImageTexelPointer, pointer_type, pointer,
-			                StorageImageDescriptorPointer(state, mem.resource, true, pc, view),
+			                StorageImageDescriptorPointer(state, mem.resource, view),
 			                CoordU32(ctx, mem, *address, view), ConstantU32(state, 0)});
 			           const auto old = state.builder.AllocateId();
 			           state.builder.AddFunction({atomic_opcode, TypeU32(state), old, pointer,

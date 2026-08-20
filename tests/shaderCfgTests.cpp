@@ -8625,8 +8625,10 @@ void TestDemandDrivenSpirvDeclarations() {
             SpirvInstructionOpcodeCount(declaration_binary, 59u) == 2u,
         "canonical builder emitted duplicate declarations");
 
-  const auto compile = [](std::span<const uint32_t> shader) {
+  const auto compile = [](std::span<const uint32_t> shader,
+                          Prospero::BufferFormat format) {
     auto user_data = ImageTestUserData();
+    SetImageTestFormat(&user_data, 0, format);
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.user_data = user_data.data();
     ShaderRecompiler::CompileResult result;
@@ -8664,7 +8666,7 @@ void TestDemandDrivenSpirvDeclarations() {
 
   const uint32_t store[] = {EncodeMimg0(0x08, 0xf), EncodeMimg1(0, 0, 0, 20),
                             EncodeSopp(0x01)};
-  const auto store_spirv = compile(store);
+  const auto store_spirv = compile(store, Prospero::BufferFormat::k8UNorm);
   Check(SpirvInstructionOpcodeCount(store_spirv, 99u) == 1u,
         "storage image fixture did not reach OpImageWrite");
   const auto store_metrics = MeasureSpirv(store_spirv);
@@ -8676,7 +8678,7 @@ void TestDemandDrivenSpirvDeclarations() {
 
   const uint32_t atomic[] = {EncodeMimg0(0x11, 0x1, true),
                              EncodeMimg1(0, 0, 0, 20), EncodeSopp(0x01)};
-  const auto atomic_spirv = compile(atomic);
+  const auto atomic_spirv = compile(atomic, Prospero::BufferFormat::k32UInt);
   Check(SpirvInstructionOpcodeCount(atomic_spirv, 60u) == 1u,
         "image atomic fixture did not reach OpImageTexelPointer");
   const auto atomic_metrics = MeasureSpirv(atomic_spirv);
@@ -10170,6 +10172,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   };
 
   auto user_data = ImageTestUserData();
+  SetImageTestFormat(&user_data, 6, Prospero::BufferFormat::k32UInt);
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data.data();
@@ -10185,8 +10188,8 @@ void TestNewShaderRecompilerNativeBindingPlan() {
       result.program.bindings, BindingKind::Sampled2D);
   const auto *storage = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, BindingKind::Storage2D);
-  const auto *uint_storage = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::StorageUint2D);
+  const auto *atomic_storage = ShaderRecompiler::IR::FindBinding(
+      result.program.bindings, BindingKind::StorageAtomic2D);
   const auto *samplers = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, BindingKind::Samplers);
   Check(buffers != nullptr && buffers->resources.size() == 2,
@@ -10195,8 +10198,8 @@ void TestNewShaderRecompilerNativeBindingPlan() {
         "native binding plan did not allocate the sampled image");
   Check(storage != nullptr && storage->resources.size() == 1,
         "native binding plan did not allocate the float storage image");
-  Check(uint_storage != nullptr && uint_storage->resources.size() == 1,
-        "native binding plan did not allocate the uint storage image");
+  Check(atomic_storage != nullptr && atomic_storage->resources.size() == 1,
+        "native binding plan did not allocate the atomic storage image");
   Check(samplers != nullptr && samplers->resources.size() == 1,
         "native binding plan did not allocate the sampler");
   Check(SpirvContainsOpcode(result.spirv, 86),

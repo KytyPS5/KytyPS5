@@ -42,7 +42,6 @@ enum : uint32_t {
 	CapabilitySampled1D                      = 43,
 	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
-	CapabilityStorageImageReadWithoutFormat  = 55,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
 	CapabilityGroupNonUniformBallot          = 64,
@@ -298,6 +297,27 @@ struct DescriptorResourceBinding {
 	uint32_t                     array_index = 0;
 };
 
+enum class ImageViewKind {
+	Dim1D,
+	Dim1DArray,
+	Dim2D,
+	Dim2DArray,
+	Dim3D,
+	Dim2DMsaa,
+	Dim2DMsaaArray,
+	Count,
+};
+
+constexpr uint32_t SampledImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
+constexpr uint32_t StorageImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Dim2DMsaa);
+
+enum class StorageImageClass : uint32_t {
+	FormatlessFloat,
+	FormatlessUint,
+	AtomicUint,
+	Count,
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
 	             ShaderStageInputInfo input_info_)
@@ -322,8 +342,10 @@ struct EmitterState {
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         scratch_variable        = 0;
-	std::array<uint32_t, 14>                         sampled_image_variables {};
-	std::array<uint32_t, 10>                         storage_image_variables {};
+	std::array<uint32_t, 2u * SampledImageViewKindCount> sampled_image_variables {};
+	std::array<uint32_t,
+	           static_cast<uint32_t>(StorageImageClass::Count) * StorageImageViewKindCount>
+	                                                 storage_image_variables {};
 	uint32_t                                         sampler_variable                      = 0;
 	uint32_t                                         main_func                             = 0;
 	uint32_t                                         entry_label                           = 0;
@@ -414,26 +436,23 @@ struct ImageSampleLayout {
 	uint32_t grad_y = NoImageComponent;
 };
 
-enum class ImageViewKind {
-	Dim1D,
-	Dim1DArray,
-	Dim2D,
-	Dim2DArray,
-	Dim3D,
-	Dim2DMsaa,
-	Dim2DMsaaArray,
-	Count,
-};
-
-constexpr uint32_t SampledImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
-constexpr uint32_t StorageImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Dim2DMsaa);
-
 constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
 	return static_cast<uint32_t>(view) + (integer ? SampledImageViewKindCount : 0u);
 }
 
-constexpr uint32_t StorageImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? StorageImageViewKindCount : 0u);
+constexpr StorageImageClass StorageImageClassFor(bool uint_image, bool atomic) {
+	if (atomic) {
+		return StorageImageClass::AtomicUint;
+	}
+	if (uint_image) {
+		return StorageImageClass::FormatlessUint;
+	}
+	return StorageImageClass::FormatlessFloat;
+}
+
+constexpr uint32_t StorageImageIndex(StorageImageClass image_class, ImageViewKind view) {
+	return static_cast<uint32_t>(view) +
+	       static_cast<uint32_t>(image_class) * StorageImageViewKindCount;
 }
 
 constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
@@ -463,24 +482,44 @@ constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKi
 	return IR::DescriptorBindingKind::Count;
 }
 
-constexpr IR::DescriptorBindingKind StorageBindingKind(bool integer, ImageViewKind view) {
-	if (integer) {
-		switch (view) {
-			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageUint1D;
-			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::StorageUint1DArray;
-			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageUint2D;
-			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::StorageUint2DArray;
-			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
-			default: break;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Storage1D;
-		case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Storage1DArray;
-		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Storage2D;
-		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
-		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Storage3D;
-		default: break;
+constexpr IR::DescriptorBindingKind StorageBindingKind(StorageImageClass image_class,
+                                                       ImageViewKind     view) {
+	switch (image_class) {
+		case StorageImageClass::FormatlessFloat:
+			switch (view) {
+				case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Storage1D;
+				case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Storage1DArray;
+				case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Storage2D;
+				case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
+				case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Storage3D;
+				default: break;
+			}
+			break;
+		case StorageImageClass::FormatlessUint:
+			switch (view) {
+				case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageUint1D;
+				case ImageViewKind::Dim1DArray:
+					return IR::DescriptorBindingKind::StorageUint1DArray;
+				case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageUint2D;
+				case ImageViewKind::Dim2DArray:
+					return IR::DescriptorBindingKind::StorageUint2DArray;
+				case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
+				default: break;
+			}
+			break;
+		case StorageImageClass::AtomicUint:
+			switch (view) {
+				case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageAtomic1D;
+				case ImageViewKind::Dim1DArray:
+					return IR::DescriptorBindingKind::StorageAtomic1DArray;
+				case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageAtomic2D;
+				case ImageViewKind::Dim2DArray:
+					return IR::DescriptorBindingKind::StorageAtomic2DArray;
+				case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageAtomic3D;
+				default: break;
+			}
+			break;
+		case StorageImageClass::Count: break;
 	}
 	return IR::DescriptorBindingKind::Count;
 }
@@ -575,9 +614,10 @@ uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view, bool
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageViewKind view);
 
-uint32_t StorageImageType(EmitterState& state, bool uint_image, ImageViewKind view);
+uint32_t StorageImageType(EmitterState& state, StorageImageClass image_class, ImageViewKind view);
 
-uint32_t StorageImagePointerType(EmitterState& state, bool uint_image, ImageViewKind view);
+uint32_t StorageImagePointerType(EmitterState& state, StorageImageClass image_class,
+                                 ImageViewKind view);
 
 uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
                                     ImageViewKind view);
@@ -589,18 +629,12 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
                           ImageViewKind view, uint32_t image_resource);
 
-ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   bool uint_image, uint32_t use_pc);
+ImageViewKind StorageImageViewKind(const IR::MemoryInfo& mem);
 
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, bool uint_image,
-                                       uint32_t      use_pc = UINT32_MAX,
-                                       ImageViewKind view   = ImageViewKind::Dim2D);
+uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, ImageViewKind view);
 
-uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool uint_image,
-                                    uint32_t use_pc, ImageViewKind view = ImageViewKind::Dim2D);
-
-void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_image,
-                           ImageViewKind view, uint32_t mip_lod, uint32_t coord, uint32_t texel);
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, ImageViewKind view,
+                           uint32_t mip_lod, uint32_t coord, uint32_t texel);
 
 uint32_t ExecutionModelForStage(ShaderType stage);
 

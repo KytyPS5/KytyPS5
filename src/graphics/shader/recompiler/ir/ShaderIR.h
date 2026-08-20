@@ -325,6 +325,11 @@ enum class DescriptorBindingKind {
 	StorageUint2D,
 	StorageUint2DArray,
 	StorageUint3D,
+	StorageAtomic1D,
+	StorageAtomic1DArray,
+	StorageAtomic2D,
+	StorageAtomic2DArray,
+	StorageAtomic3D,
 	Samplers,
 	Gds,
 	AddressMemory,
@@ -362,6 +367,9 @@ DescriptorBindingForImage(const ImageResource& image) {
 				default: return std::nullopt;
 			}
 		case ResourceKind::StorageImage:
+			if (image.atomic) {
+				return std::nullopt;
+			}
 			switch (image.dimension) {
 				case Dimension::Dim1D: return Kind::Storage1D;
 				case Dimension::Dim1DArray: return Kind::Storage1DArray;
@@ -372,11 +380,31 @@ DescriptorBindingForImage(const ImageResource& image) {
 			}
 		case ResourceKind::StorageImageUint:
 			switch (image.dimension) {
-				case Dimension::Dim1D: return Kind::StorageUint1D;
-				case Dimension::Dim1DArray: return Kind::StorageUint1DArray;
-				case Dimension::Dim2D: return Kind::StorageUint2D;
-				case Dimension::Dim2DArray: return Kind::StorageUint2DArray;
-				case Dimension::Dim3D: return Kind::StorageUint3D;
+				case Dimension::Dim1D:
+					if (image.atomic) {
+						return Kind::StorageAtomic1D;
+					}
+					return Kind::StorageUint1D;
+				case Dimension::Dim1DArray:
+					if (image.atomic) {
+						return Kind::StorageAtomic1DArray;
+					}
+					return Kind::StorageUint1DArray;
+				case Dimension::Dim2D:
+					if (image.atomic) {
+						return Kind::StorageAtomic2D;
+					}
+					return Kind::StorageUint2D;
+				case Dimension::Dim2DArray:
+					if (image.atomic) {
+						return Kind::StorageAtomic2DArray;
+					}
+					return Kind::StorageUint2DArray;
+				case Dimension::Dim3D:
+					if (image.atomic) {
+						return Kind::StorageAtomic3D;
+					}
+					return Kind::StorageUint3D;
 				default: return std::nullopt;
 			}
 		default: return std::nullopt;

@@ -37,6 +37,11 @@ constexpr std::array ImageBindingKinds = {
     DescriptorBindingKind::StorageUint2D,
     DescriptorBindingKind::StorageUint2DArray,
     DescriptorBindingKind::StorageUint3D,
+    DescriptorBindingKind::StorageAtomic1D,
+    DescriptorBindingKind::StorageAtomic1DArray,
+    DescriptorBindingKind::StorageAtomic2D,
+    DescriptorBindingKind::StorageAtomic2DArray,
+    DescriptorBindingKind::StorageAtomic3D,
 };
 
 bool CollectUserData(const Program& program, std::vector<uint32_t>& result) {

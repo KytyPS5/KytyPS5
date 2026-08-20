@@ -81,10 +81,15 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
 }
 
+bool IsStorageImage(ResourceKind kind) {
+	return kind == ResourceKind::StorageImage || kind == ResourceKind::StorageImageUint;
+}
+
 ImageMipMode MipMode(const MemoryInfo& memory) {
-	const bool storage =
-	    memory.kind == ResourceKind::StorageImage || memory.kind == ResourceKind::StorageImageUint;
-	return storage && memory.image_has_mip ? ImageMipMode::DynamicStorage : ImageMipMode::None;
+	if (IsStorageImage(memory.kind) && memory.image_has_mip) {
+		return ImageMipMode::DynamicStorage;
+	}
+	return ImageMipMode::None;
 }
 
 class Tracker {
@@ -650,9 +655,14 @@ private:
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
 			auto& image = m_info.images[i];
-			if (image.source == source && image.kind == memory.kind &&
+			const bool compatible_kind = image.kind == memory.kind || (IsStorageImage(image.kind) &&
+			                                                           IsStorageImage(memory.kind));
+			if (image.source == source && compatible_kind &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+				if (memory.kind == ResourceKind::StorageImageUint) {
+					image.kind = ResourceKind::StorageImageUint;
+				}
 				Merge(image, op, pc);
 				return i;
 			}

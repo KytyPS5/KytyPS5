@@ -286,10 +286,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("shaderStorageImageWriteWithoutFormat is not supported\n");
 			skip_device = true;
 		}
-		if (device_features2.features.shaderStorageImageReadWithoutFormat != VK_TRUE) {
-			LOGF("shaderStorageImageReadWithoutFormat is not supported\n");
-			skip_device = true;
-		}
 
 		if (device_features2.features.shaderImageGatherExtended != VK_TRUE) {
 			LOGF("shaderImageGatherExtended is not supported\n");
@@ -570,7 +566,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-	device_features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;

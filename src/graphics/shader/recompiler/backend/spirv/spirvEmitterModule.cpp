@@ -179,14 +179,14 @@ void DefineDescriptorVariables(EmitterState& state) {
 		}
 	}
 	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
-		const auto view    = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		const bool integer = i >= StorageImageViewKindCount;
-		const auto kind    = StorageBindingKind(integer, view);
+		const auto view        = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
+		const auto kind        = StorageBindingKind(image_class, view);
 		if (DescriptorBinding(state, kind) == nullptr) {
 			continue;
 		}
 		const auto count        = ConstantU32(state, DescriptorCount(state, kind));
-		const auto image_type   = StorageImageType(state, integer, view);
+		const auto image_type   = StorageImageType(state, image_class, view);
 		const auto array_type   = state.builder.Type(OpTypeArray, {image_type, count});
 		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
 		state.storage_image_variables[i] =
@@ -563,11 +563,17 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "storage_uint_1d_array",
 	                                        "storage_uint_2d",
 	                                        "storage_uint_2d_array",
-	                                        "storage_uint_3d"};
+	                                        "storage_uint_3d",
+	                                        "storage_atomic_1d",
+	                                        "storage_atomic_1d_array",
+	                                        "storage_atomic_2d",
+	                                        "storage_atomic_2d_array",
+	                                        "storage_atomic_3d"};
 	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
 		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
 		Decorate(state.storage_image_variables[i], StorageNames[i],
-		         StorageBindingKind(i >= StorageImageViewKindCount, view));
+		         StorageBindingKind(image_class, view));
 	}
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);

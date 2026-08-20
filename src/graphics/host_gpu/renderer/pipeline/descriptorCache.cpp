@@ -51,7 +51,12 @@ bool IsStorageImage(BindingKind kind) {
 		case BindingKind::StorageUint1DArray:
 		case BindingKind::StorageUint2D:
 		case BindingKind::StorageUint2DArray:
-		case BindingKind::StorageUint3D: return true;
+		case BindingKind::StorageUint3D:
+		case BindingKind::StorageAtomic1D:
+		case BindingKind::StorageAtomic1DArray:
+		case BindingKind::StorageAtomic2D:
+		case BindingKind::StorageAtomic2DArray:
+		case BindingKind::StorageAtomic3D: return true;
 		default: return false;
 	}
 }

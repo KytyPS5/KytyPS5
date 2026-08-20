@@ -694,6 +694,26 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    requested.tile_mode == cached.info.tile_mode && !requested.HasStencil() &&
 	    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
+	// PPSA04264
+	const bool retain_cached_layout =
+	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
+	    requested.bytes_per_block == cached.info.bytes_per_block &&
+	    requested.data.address == cached.info.data.address &&
+	    requested.data.size < cached.info.data.size && requested.extent == cached.info.extent &&
+	    requested.resources.levels == 1 && cached.info.resources.levels == 1 &&
+	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
+	    requested.resources.layers < cached.info.resources.layers &&
+	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
+	    requested.tile_mode == cached.info.tile_mode && requested.mip_layout[0].offset == 0 &&
+	    cached.info.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].size == requested.data.size &&
+	    cached.info.mip_layout[0].size == cached.info.data.size &&
+	    requested.data.size % requested.resources.layers == 0 &&
+	    cached.info.data.size % cached.info.resources.layers == 0 &&
+	    requested.data.size / requested.resources.layers ==
+	        cached.info.data.size / cached.info.resources.layers &&
+	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
+	    !cached.info.HasMetadata();
 	bool       recreate      = cached.info.resources < requested.resources;
 	switch (binding) {
 		case BindingType::Texture:
@@ -713,8 +733,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	RefreshImage(cached_id,
 	             ImageDesc {.info = cached.info, .view_info = {}, .type = UploadBinding(cached)});
-	auto info                 = requested;
-	info.resources            = std::max(requested.resources, cached.info.resources);
+	auto info = requested;
+	if (retain_cached_layout) {
+		info.data       = cached.info.data;
+		info.resources  = cached.info.resources;
+		info.mip_layout = cached.info.mip_layout;
+	} else {
+		info.resources = std::max(requested.resources, cached.info.resources);
+	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = ResolveImage(replacement_id);

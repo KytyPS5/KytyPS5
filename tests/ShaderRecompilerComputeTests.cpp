@@ -3882,6 +3882,127 @@ public:
                   nullptr,
               "D16 uint sampling did not create an integer sampled view");
 
+      constexpr uint64_t layered_raw_d16_offset = raw_d16_offset + 0x1000;
+      constexpr std::array<uint16_t, 12> layered_raw_d16_values{
+          0x0102u, 0x0304u, 0x1112u, 0x1314u, 0x2122u, 0x2324u,
+          0x3132u, 0x3334u, 0x4142u, 0x4344u, 0x5152u, 0x5354u};
+      std::memcpy(memory + layered_raw_d16_offset,
+                  layered_raw_d16_values.data(),
+                  sizeof(layered_raw_d16_values));
+      auto layered_d16_color = MakeLinearDesc(
+          base + layered_raw_d16_offset, sizeof(layered_raw_d16_values),
+          vk::Format::eR16Unorm, Prospero::BufferFormat::k16UNorm,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 6, sizeof(uint16_t), 1);
+      const auto layered_d16_color_image =
+          texture_cache.FindImage(layered_d16_color);
+      (void)texture_cache.FindTexture(layered_d16_color_image,
+                                      layered_d16_color);
+      auto &layered_d16_color_native =
+          texture_cache.GetImage(layered_d16_color_image);
+      layered_d16_color_native.Transit(
+          vk::ImageLayout::eTransferDstOptimal,
+          vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+      vk::ClearColorValue layered_raw_d16_clear_value{};
+      layered_raw_d16_clear_value.float32[0] = 1.0f;
+      const vk::ImageSubresourceRange layered_raw_d16_clear_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6};
+      scheduler.Current().Handle().clearColorImage(
+          layered_d16_color_native.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, &layered_raw_d16_clear_value, 1,
+          &layered_raw_d16_clear_range);
+      texture_cache.MarkGpuWritten(layered_d16_color_image);
+
+      auto layered_raw_d16_depth = layered_d16_color;
+      layered_raw_d16_depth.type = BindingType::DepthTarget;
+      layered_raw_d16_depth.info.data.size =
+          sizeof(uint16_t) * 2 * 5;
+      layered_raw_d16_depth.info.pixel_format = vk::Format::eD16Unorm;
+      layered_raw_d16_depth.info.guest_format =
+          Prospero::BufferFormat::k16UNorm;
+      layered_raw_d16_depth.info.resources.layers = 5;
+      layered_raw_d16_depth.info.mip_layout[0].size =
+          layered_raw_d16_depth.info.data.size;
+      layered_raw_d16_depth.view_info.format = vk::Format::eD16Unorm;
+      layered_raw_d16_depth.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth;
+      layered_raw_d16_depth.view_info.layer_count = 5;
+      layered_raw_d16_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto layered_raw_d16_depth_image =
+          texture_cache.FindImage(layered_raw_d16_depth);
+      const auto &layered_depth_owner =
+          texture_cache.GetImage(layered_raw_d16_depth_image);
+      Require(
+          name, "layered raw D16 owner layout",
+          layered_raw_d16_depth_image != layered_d16_color_image &&
+              !TextureCacheTestAccess::Contains(
+                  texture_cache, layered_d16_color_image) &&
+              layered_depth_owner.info.resources.layers == 6 &&
+              layered_depth_owner.info.data.size ==
+                  sizeof(layered_raw_d16_values) &&
+              layered_depth_owner.info.mip_layout[0].size ==
+                  sizeof(layered_raw_d16_values),
+          "a partial depth view detached the retained six-layer owner from "
+          "its full guest range");
+      (void)texture_cache.FindDepthTarget(layered_raw_d16_depth_image,
+                                          layered_raw_d16_depth);
+
+      auto reacquired_layered_raw_d16_uint = layered_d16_color;
+      reacquired_layered_raw_d16_uint.info.pixel_format =
+          vk::Format::eR16Uint;
+      reacquired_layered_raw_d16_uint.info.guest_format =
+          Prospero::BufferFormat::k16UInt;
+      reacquired_layered_raw_d16_uint.view_info.format =
+          vk::Format::eR16Uint;
+      const auto reacquired_layered_raw_d16_uint_image =
+          texture_cache.FindImage(reacquired_layered_raw_d16_uint);
+      const auto reacquired_layered_raw_d16_uint_view =
+          texture_cache.FindTexture(reacquired_layered_raw_d16_uint_image,
+                                    reacquired_layered_raw_d16_uint);
+      auto layered_raw_d16_readback = CreateHostBuffer(
+          name, sizeof(layered_raw_d16_values),
+          vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>(6, 0));
+      auto &reacquired_layered_raw_d16_native =
+          texture_cache.GetImage(reacquired_layered_raw_d16_uint_image);
+      reacquired_layered_raw_d16_native.Transit(
+          vk::ImageLayout::eTransferSrcOptimal,
+          vk::AccessFlagBits2::eTransferRead, {}, scheduler.Current().Handle());
+      vk::BufferImageCopy layered_raw_d16_copy{};
+      layered_raw_d16_copy.bufferRowLength = 2;
+      layered_raw_d16_copy.imageSubresource = {
+          vk::ImageAspectFlagBits::eColor, 0, 0, 6};
+      layered_raw_d16_copy.imageExtent = {2, 1, 1};
+      scheduler.Current().Handle().copyImageToBuffer(
+          reacquired_layered_raw_d16_native.backing.image,
+          vk::ImageLayout::eTransferSrcOptimal,
+          layered_raw_d16_readback.buffer, 1, &layered_raw_d16_copy);
+      HostReadBarrier(layered_raw_d16_readback.buffer,
+                      layered_raw_d16_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.FinishCurrent();
+      const auto layered_raw_d16_words =
+          ReadBuffer(name, layered_raw_d16_readback, 6);
+      std::array<uint16_t, 12> layered_raw_d16_after{};
+      std::memcpy(layered_raw_d16_after.data(), layered_raw_d16_words.data(),
+                  sizeof(layered_raw_d16_after));
+      std::array<uint16_t, 12> layered_raw_d16_expected{};
+      layered_raw_d16_expected.fill(UINT16_MAX);
+      Require(
+          name, "layered raw D16 round trip",
+          reacquired_layered_raw_d16_uint_image &&
+              reacquired_layered_raw_d16_uint_image !=
+                  layered_raw_d16_depth_image &&
+              !TextureCacheTestAccess::Contains(
+                  texture_cache, layered_raw_d16_depth_image) &&
+              reacquired_layered_raw_d16_native.backing.format ==
+                  vk::Format::eR16Uint &&
+              reacquired_layered_raw_d16_uint_view != nullptr &&
+              layered_raw_d16_after == layered_raw_d16_expected,
+          "the partial depth view lost a layer or failed to restore raw UINT "
+          "sampling");
+      DestroyBuffer(&layered_raw_d16_readback);
+
       auto native_array_info = array_desc.info;
       native_array_info.data = {};
       auto native_volume_info = volume_desc.info;

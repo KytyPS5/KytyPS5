@@ -22706,6 +22706,47 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
 }
 
+void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  constexpr uint64_t untouched = 0x1122334455667788ull;
+  constexpr uint64_t ready_bit = 1ull << 63u;
+  alignas(16) std::array<std::array<uint64_t, 2>, 16> results;
+  for (auto &pair : results) {
+    pair.fill(untouched);
+  }
+
+  const auto dump = [&](uint64_t *address) {
+    const auto raw_address = reinterpret_cast<uint64_t>(address);
+    std::array<uint32_t, 4> packet{
+        KYTY_PM4(4, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO), 0x00000139u,
+        static_cast<uint32_t>(raw_address),
+        static_cast<uint32_t>(raw_address >> 32u)};
+    Pm4Execution execution;
+    return processor.Process(execution, packet.data(), packet.size());
+  };
+
+  const auto begin_result = dump(&results[0][0]);
+  bool begin_written = begin_result == Pm4ProcessResult::Complete;
+  for (const auto &pair : results) {
+    begin_written &= pair[0] == ready_bit && pair[1] == untouched;
+  }
+
+  const auto end_result = dump(&results[0][1]);
+  bool end_written = end_result == Pm4ProcessResult::Complete;
+  uint64_t visible_samples = 0;
+  for (const auto &pair : results) {
+    end_written &= pair[0] == ready_bit && pair[1] == (ready_bit | 1u);
+    visible_samples += pair[1] - pair[0];
+  }
+
+  Require("Pm4SyntheticOcclusionCounterDump", "always-visible result",
+          begin_written && end_written && visible_samples == results.size(),
+          "EVENT_WRITE did not publish valid nonzero begin/end counters to "
+          "every PS5 DB");
+  std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
+}
+
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   CommandProcessor processor(renderer);
   constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
@@ -23409,6 +23450,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSchedulerTimeline();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--descriptor-heap-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDescriptorHeapLargeSet();
@@ -23651,6 +23697,7 @@ int main(int argc, char **argv) {
   CheckReferenceClockScale();
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
+  CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());

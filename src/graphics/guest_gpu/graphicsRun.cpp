@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -1467,12 +1468,14 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
 }
 
-void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
+void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
+                                    uint64_t event_address) {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
-		     "\t event_index = 0x%08" PRIx32 "\n",
-		     event_type, event_index);
+		     "\t event_index = 0x%08" PRIx32 "\n"
+		     "\t address     = 0x%016" PRIx64 "\n",
+		     event_type, event_index, event_address);
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
@@ -1509,12 +1512,36 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 		case 0x0000001a:
 		case 0x0000001b:
 		case 0x00000038:
-		case 0x00000039:
 		case 0x0000003a:
 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
 			break;
+		case 0x00000039: {
+			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
+				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
+				     "\n",
+				     event_index, event_address);
+			}
+			static std::once_flag warning_once;
+			std::call_once(warning_once, [] {
+				std::printf("Warning: game uses occlusion queries, which are currently treated as "
+				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+			});
+
+			// Until host occlusion queries are implemented, publish an always-visible result. The
+			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
+			// ready.
+			constexpr uint64_t ready_bit    = 1ull << 63u;
+			constexpr uint64_t counter_mask = ready_bit - 1u;
+			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
+			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			for (uint32_t db = 0; db < 16u; db++) {
+				results[db * 2u] = value;
+			}
+			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			break;
+		}
 		default:
 			EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type, event_index);
 	}

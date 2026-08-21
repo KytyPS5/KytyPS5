@@ -103,7 +103,7 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
-	void TriggerEvent(uint32_t event_type, uint32_t event_index);
+	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
 	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
@@ -178,8 +178,9 @@ private:
 	uint32_t m_const_ram[0x3000] = {0};
 
 	FlipInfo m_flip;
-	uint64_t m_submit_id      = 0;
-	bool     m_predicate_skip = false;
+	uint64_t m_submit_id                   = 0;
+	uint64_t m_synthetic_occlusion_counter = 0;
+	bool     m_predicate_skip              = false;
 };
 
 } // namespace Libs::Graphics

@@ -2147,12 +2147,19 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
-	uint32_t event_index = (buffer[0] >> 8u) & 0x7u;
-	uint32_t event_type  = (buffer[0]) & 0x3fu;
+	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
+	uint32_t   event_index    = (buffer[0] >> 8u) & 0x7u;
+	uint32_t   event_type     = (buffer[0]) & 0x3fu;
+	uint64_t   event_address  = 0;
 
-	cp.TriggerEvent(event_type, event_index);
+	if (event_type == 0x39u) {
+		EXIT_NOT_IMPLEMENTED(packet_size_dw != 4u);
+		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	}
 
-	return KYTY_PM4_LEN(cmd_id) - 1u;
+	cp.TriggerEvent(event_type, event_index, event_address);
+
+	return packet_size_dw - 1u;
 }
 
 KYTY_CP_OP_PARSER(CpOpEventWriteEop) {

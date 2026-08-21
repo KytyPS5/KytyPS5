@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -435,6 +436,9 @@ BufferCache::CachedBuffer& BufferCache::GetOrCreateBuffer(CommandBuffer& command
 	cached->tick_accessed_last = m_gc_tick;
 	cached->buffer = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
 	                                          merged.address, AllFlags, merged.size);
+	SetVulkanObjectNameF(m_graphics.device, cached->buffer->Handle(),
+	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", cached->vaddr,
+	                     cached->size);
 	for (const auto overlap: overlaps) {
 		const auto& old = *overlap->second;
 		cached->buffer->CopyFrom(command, *old.buffer, 0, old.vaddr - cached->vaddr, old.size);

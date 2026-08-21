@@ -142,18 +142,6 @@ static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer
 	                   (bc0.separate_alpha_blend && (IsDualSourceBlendFactor(bc0.alpha_srcblend) ||
 	                                                 IsDualSourceBlendFactor(bc0.alpha_destblend)));
 
-	for (uint32_t i = 1; i < 8; i++) {
-		const auto& rt = ctx.GetRenderTarget(i);
-		if (rt.base.addr != 0 || ps_input_info.target_output_mode[i] != 0 ||
-		    ((rt_mask >> (i * 4u)) & 0x0fu) != 0 || ((cb_shader_mask >> (i * 4u)) & 0x0fu) != 0) {
-			interesting = true;
-		}
-	}
-
-	if (!interesting) {
-		return;
-	}
-
 	auto log_id = g_mrt_state_log_count.fetch_add(1);
 	if (log_id >= 32) {
 		return;
@@ -553,8 +541,7 @@ struct DrawCallInfo {
 };
 
 static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
-                                      const ImageViewInfo& view,
-                                      vk::ClearColorValue& clear_value) {
+                                      const ImageViewInfo& view, vk::ClearColorValue& clear_value) {
 	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return false;
 	}
@@ -641,6 +628,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		target.image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto& image       = cache.GetImage(target.image_id);
+		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
+		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
+		                     target.target_slot, image.info.data.address, image.info.data.size,
+		                     static_cast<uint32_t>(image.info.pixel_format));
+		SetVulkanObjectNameF(m_context.GetGraphics().device, target.image_view,
+		                     "Kyty.MRT{}.View[guest=0x{:016x} mip={} layer={}+{}]",
+		                     target.target_slot, image.info.data.address,
+		                     target.desc.view_info.base_level, target.desc.view_info.base_layer,
+		                     target.desc.view_info.layer_count);
 		EXIT_IF(image.backing.samples != target.samples || target.image_view == nullptr);
 		if (attachment_samples == 0) {
 			attachment_samples = target.samples;
@@ -657,15 +653,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width                 = std::min(state.width, target.extent.width);
-		state.height                = std::min(state.height, target.extent.height);
-		state.num_layers            = std::min(state.num_layers, view.layer_count);
-		auto& attachment            = state.color_attachments[i];
-		attachment.image_view       = target.image_view;
-		attachment.image_layout     = layout;
-		attachment.clear_value      = target.color_clear_value.uint32;
+		state.width             = std::min(state.width, target.extent.width);
+		state.height            = std::min(state.height, target.extent.height);
+		state.num_layers        = std::min(state.num_layers, view.layer_count);
+		auto& attachment        = state.color_attachments[i];
+		attachment.image_view   = target.image_view;
+		attachment.image_layout = layout;
+		attachment.clear_value  = target.color_clear_value.uint32;
 		vk::ClearColorValue metadata_clear_value {};
-		const bool metadata_clear =
+		const bool          metadata_clear =
 		    ResolveDccAttachmentClear(cache, target, view, metadata_clear_value);
 		if (metadata_clear) {
 			attachment.clear_value = metadata_clear_value.uint32;
@@ -690,6 +686,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
+		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
+		                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
+		                     image.info.data.address, image.info.data.size,
+		                     static_cast<uint32_t>(image.info.pixel_format));
+		SetVulkanObjectNameF(m_context.GetGraphics().device, depth.image_view,
+		                     "Kyty.DepthTarget.View[guest=0x{:016x} layer={}+{}]",
+		                     image.info.data.address, depth.desc.view_info.base_layer,
+		                     depth.desc.view_info.layer_count);
 		EXIT_IF(depth.image_view == nullptr || image.backing.samples != depth.samples);
 		if (attachment_samples == 0) {
 			attachment_samples = depth.samples;
@@ -862,6 +866,9 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(buffer, range.base_address, size);
+		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, range.binding.buffer,
+		                     "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]",
+		                     range.base_address, size);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -894,6 +901,10 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 
 		prepared.buffers[i] = range->binding.buffer;
 		prepared.offsets[i] = range->binding.offset + vertex.addr - range->base_address;
+		SetVulkanObjectNameF(
+		    buffer.GetContext().GetGraphics().device, prepared.buffers[i],
+		    "Kyty.VertexBuffer[slot={} guest=0x{:016x} size=0x{:x} stride={} records={}]", i,
+		    vertex.addr, size, vertex.stride, vertex.num_records);
 	}
 
 	if (null_owner != nullptr) {
@@ -1103,6 +1114,15 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 		prepared.owner  = std::move(binding.owner);
 		prepared.buffer = binding.buffer;
 		prepared.offset = binding.offset;
+	}
+	if (source.host_data != nullptr) {
+		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
+		                     "Kyty.IndexBuffer[guest=transient size=0x{:x} type={}]", source.size,
+		                     static_cast<uint32_t>(source.type));
+	} else {
+		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
+		                     "Kyty.IndexBuffer[guest=0x{:016x} size=0x{:x} type={}]",
+		                     source.address, source.size, static_cast<uint32_t>(source.type));
 	}
 	return prepared;
 }

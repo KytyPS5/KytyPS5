@@ -45,6 +45,16 @@
 
 namespace Libs::Graphics {
 
+static const char* ShaderStageResourceName(DescriptorCache::Stage stage) {
+	switch (stage) {
+		case DescriptorCache::Stage::Vertex: return "Vertex";
+		case DescriptorCache::Stage::Pixel: return "Pixel";
+		case DescriptorCache::Stage::Compute: return "Compute";
+		case DescriptorCache::Stage::Unknown: return "Unknown";
+	}
+	return "Unknown";
+}
+
 static void BindNullStorageBuffer(RenderContext& context, BufferView& dst) {
 	auto owner = context.GetBufferCache().ObtainNullBuffer();
 	dst.buffer = owner->Handle();
@@ -82,7 +92,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& command_buffer,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
-                                      uint32_t&                                   buffer_offset) {
+                                      DescriptorCache::Stage stage, uint32_t slot,
+                                      uint32_t& buffer_offset) {
 	BufferView result;
 	buffer_offset = 0;
 
@@ -117,6 +128,11 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	result.buffer = binding.buffer;
 	result.offset = aligned_offset;
 	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	SetVulkanObjectNameF(
+	    graphics.device, result.buffer,
+	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
+	    ShaderStageResourceName(stage), slot, address, size,
+	    resource.written ? (resource.read ? "ReadWrite" : "Write") : "Read", resource.formatted);
 	return result;
 }
 
@@ -124,7 +140,7 @@ static BufferView
 NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
                     const ShaderRecompiler::IR::AddressResource&           resource,
                     const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
-                    uint32_t&                                              address_offset) {
+                    DescriptorCache::Stage stage, uint32_t slot, uint32_t& address_offset) {
 	BufferView result;
 	address_offset = 0;
 	if (address.binding_base == 0) {
@@ -147,17 +163,20 @@ NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	auto binding =
+	auto        binding =
 	    context.GetBufferCache().ObtainBuffer(command_buffer, address.binding_base, size);
 	const auto aligned_offset = binding.offset - binding.offset % alignment;
 	const auto adjustment     = binding.offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	const auto visible_size = std::min(size, static_cast<uint64_t>(max_range - adjustment));
-	address_offset = static_cast<uint32_t>(adjustment);
-	result.owner  = std::move(binding.owner);
-	result.buffer = binding.buffer;
-	result.offset = aligned_offset;
-	result.range  = static_cast<vk::DeviceSize>(visible_size + adjustment);
+	const auto visible_size   = std::min(size, static_cast<uint64_t>(max_range - adjustment));
+	address_offset            = static_cast<uint32_t>(adjustment);
+	result.owner              = std::move(binding.owner);
+	result.buffer             = binding.buffer;
+	result.offset             = aligned_offset;
+	result.range              = static_cast<vk::DeviceSize>(visible_size + adjustment);
+	SetVulkanObjectNameF(graphics.device, result.buffer,
+	                     "Kyty.{}.AddressBuffer[slot={} guest=0x{:016x} size=0x{:x}]",
+	                     ShaderStageResourceName(stage), slot, address.binding_base, visible_size);
 	return result;
 }
 
@@ -458,10 +477,9 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage ||
-	    (Prospero::IsSampledTextureFormat(format) &&
-	     uint_resource == Prospero::IsUintTextureFormat(format) &&
-	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	    raw_sint_storage || (Prospero::IsSampledTextureFormat(format) &&
+	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
+	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -568,8 +586,8 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
-	                                 bool shader_conversion, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
+                                     bool shader_conversion, bool storage, uint32_t view_levels,
+                                     uint32_t image_layers) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
@@ -684,10 +702,9 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage ||
-	    (Prospero::IsSampledTextureFormat(format) &&
-	     (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
-	         Prospero::IsUintTextureFormat(format));
+	    storage || (Prospero::IsSampledTextureFormat(format) &&
+	                (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
+	                    Prospero::IsUintTextureFormat(format));
 	if (!storage &&
 	    (resource.kind == ShaderRecompiler::IR::ResourceKind::Image ||
 	     resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) &&
@@ -752,7 +769,7 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto id = texture_cache.FindImage(desc, shader_conversion);
+	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -910,17 +927,18 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
 		resources.buffers.push_back(NativeStorageBuffer(m_context, buffer, descriptor,
-		                                                program.info.buffers[i], buffer_offset));
+		                                                program.info.buffers[i], prepared.stage, i,
+		                                                buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
 	resources.addresses.clear();
 	resources.addresses.reserve(program.info.addresses.size());
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		uint32_t address_offset = 0;
-		resources.addresses.push_back(NativeAddressBuffer(
-		    m_context, buffer, program.info.addresses[i], snapshot.addresses[i], address_offset));
-		pack_memory_offset(static_cast<uint32_t>(program.info.buffers.size()) + i,
-		                   address_offset);
+		resources.addresses.push_back(
+		    NativeAddressBuffer(m_context, buffer, program.info.addresses[i], snapshot.addresses[i],
+		                        prepared.stage, i, address_offset));
+		pack_memory_offset(static_cast<uint32_t>(program.info.buffers.size()) + i, address_offset);
 	}
 }
 

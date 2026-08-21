@@ -9851,6 +9851,19 @@ void TestNewShaderRecompilerExpPixelOutputs() {
         "compressed UINT16 MRT export was incorrectly decoded as FP16");
   CheckSpirvBinaryValidates(uint16_result.spirv);
 
+  ShaderPixelInputInfo unorm16_info;
+  unorm16_info.target_output_mode[0] = 5;
+  options.input_info.pixel = &unorm16_info;
+  ShaderRecompiler::CompileResult unorm16_result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, unorm16_result, &error),
+        error.c_str());
+  const auto unorm16_source = DisassembleSpirvBinary(unorm16_result.spirv);
+  Check(CountSourceOccurrences(unorm16_source, "UnpackUnorm2x16") == 2u,
+        "compressed UNORM16 MRT export did not unpack two normalized pairs");
+  Check(!SpirvContainsExtInst(unorm16_result.spirv, 62),
+        "compressed UNORM16 MRT export was incorrectly decoded as FP16");
+  CheckSpirvBinaryValidates(unorm16_result.spirv);
+
   const uint32_t partial_shader[] = {
       EncodeExp0(0x00, 0x7),
       EncodeExp1(0, 1, 2, 3),
@@ -9899,6 +9912,17 @@ void TestNewShaderRecompilerExpPixelOutputs() {
                                    "OpBitFieldUExtract") == 2u,
         "compressed UINT16 BA-only export did not read and unpack VSRC1");
   CheckSpirvBinaryValidates(compressed_ba_result.spirv);
+
+  unorm16_info.target_output_mode[0] = 5;
+  options.input_info.pixel = &unorm16_info;
+  ShaderRecompiler::CompileResult unorm16_ba_result;
+  Check(ShaderRecompiler::TryRecompile(compressed_ba_shader, options,
+                                       unorm16_ba_result, &error),
+        error.c_str());
+  const auto unorm16_ba_source = DisassembleSpirvBinary(unorm16_ba_result.spirv);
+  Check(CountSourceOccurrences(unorm16_ba_source, "UnpackUnorm2x16") == 1u,
+        "compressed UNORM16 BA-only export did not unpack VSRC1");
+  CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
 void TestRenderTargetReverseExportMapping() {

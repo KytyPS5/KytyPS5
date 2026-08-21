@@ -203,10 +203,12 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 	return bits;
 }
 
-bool MrtUsesUint(const EmitterState& state, const IR::ExportInfo& exp) {
-	return state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-	       exp.index < std::size(state.input_info.pixel->target_output_mode) &&
-	       state.input_info.pixel->target_output_mode[exp.index] == 7u;
+uint32_t MrtOutputMode(const EmitterState& state, const IR::ExportInfo& exp) {
+	if (state.stage != ShaderType::Pixel || exp.kind != IR::ExportTargetKind::Mrt ||
+	    exp.index >= std::size(state.input_info.pixel->target_output_mode)) {
+		return 0;
+	}
+	return state.input_info.pixel->target_output_mode[exp.index];
 }
 
 uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t component) {
@@ -220,6 +222,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
+		const auto unpack = MrtOutputMode(state, exp) == 5u ? GlslUnpackUnorm2x16
+		                                                    : GlslUnpackHalf2x16;
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {
@@ -229,8 +233,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 			const auto packed   = state.builder.AllocateId();
 			const auto unpacked = state.builder.AllocateId();
 			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), packed, data, pair});
-			state.builder.AddFunction({OpExtInst, TypeF32Vector(state, 2), unpacked,
-			                           GlslStd450(state), GlslUnpackHalf2x16, packed});
+			state.builder.AddFunction(
+			    {OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), unpack, packed});
 			for (uint32_t lane = 0; lane < 2u; lane++) {
 				const auto component = pair * 2u + lane;
 				if (((exp.en >> component) & 1u) != 0u) {
@@ -332,7 +336,7 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtUsesUint(state, exp);
+		const bool uint_output = MrtOutputMode(state, exp) == 7u;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&

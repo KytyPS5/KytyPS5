@@ -271,6 +271,7 @@ enum : uint32_t {
 	GlslPackSnorm2x16  = 56,
 	GlslPackUnorm2x16  = 57,
 	GlslPackHalf2x16   = 58,
+	GlslUnpackUnorm2x16 = 61,
 	GlslUnpackHalf2x16 = 62,
 	GlslFindILsb       = 73,
 	GlslFindUMsb       = 75,

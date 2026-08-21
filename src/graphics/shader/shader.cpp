@@ -112,16 +112,14 @@ static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_
 static std::mutex                                                      g_shader_map_mutex;
 
 struct ShaderStageProgramKey {
-	ShaderType                     stage          = ShaderType::Unknown;
-	ShaderLaneMaskMode             lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-	uint64_t                       shader_hash    = 0;
+	ShaderType                     stage       = ShaderType::Unknown;
+	uint64_t                       shader_hash = 0;
 	ShaderId                       program_id;
 	Config::ShaderOptimizationType optimization_type = Config::ShaderOptimizationType::None;
 
 	bool operator==(const ShaderStageProgramKey& other) const {
-		return stage == other.stage && lane_mask_mode == other.lane_mask_mode &&
-		       shader_hash == other.shader_hash && program_id == other.program_id &&
-		       optimization_type == other.optimization_type;
+		return stage == other.stage && shader_hash == other.shader_hash &&
+		       program_id == other.program_id && optimization_type == other.optimization_type;
 	}
 };
 
@@ -133,7 +131,6 @@ struct ShaderStageProgramKeyHash {
 		};
 
 		mix(static_cast<uint32_t>(key.stage));
-		mix(static_cast<uint32_t>(key.lane_mask_mode));
 		mix(Common::hash64(key.shader_hash));
 		mix(key.program_id.hash0);
 		mix(key.program_id.crc32);
@@ -920,11 +917,9 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 }
 
 static ShaderStageProgramKey MakeShaderStageProgramKey(ShaderType stage, uint64_t shader_hash,
-                                                       const ShaderId&    program_id,
-                                                       ShaderLaneMaskMode lane_mask_mode) {
+                                                       const ShaderId& program_id) {
 	ShaderStageProgramKey key {};
 	key.stage             = stage;
-	key.lane_mask_mode    = lane_mask_mode;
 	key.shader_hash       = shader_hash;
 	key.program_id        = program_id;
 	key.optimization_type = Config::GetShaderOptimizationType();
@@ -1055,7 +1050,6 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&               ids,
                                              const ShaderRecompiler::IR::Program& program) {
 	EXIT_IF(!program.binding_layout_complete);
-	ids.push_back(static_cast<uint32_t>(program.lane_mask_mode));
 	ids.push_back(program.bindings.descriptor_set);
 	ids.push_back(program.bindings.push_constant_offset);
 	ids.push_back(program.bindings.push_constant_size);
@@ -1136,8 +1130,7 @@ static std::span<const uint32_t> AddShaderProgramPermutation(const char* stage,
 }
 
 bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& info,
-                         std::span<const uint32_t>& spirv) {
+                         ShaderVertexInputInfo& info, std::span<const uint32_t>& spirv) {
 	spirv = {};
 
 	if (!ShaderGetStaticInputInfoVS(regs, sh, info)) {
@@ -1145,8 +1138,7 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 	}
 	const auto shader_hash = regs.gs_regs.chksum;
 	const auto program_id  = ShaderGetIdVS(regs, info, false);
-	const auto key =
-	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
+	const auto key         = MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id);
 
 	{
 		std::scoped_lock lock(g_shader_program_cache_mutex);
@@ -1163,7 +1155,7 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 	}
 
 	std::vector<uint32_t> compiled_spirv;
-	if (!ShaderCompileSpirvVS(regs, sh, lane_mask_mode, info, compiled_spirv)) {
+	if (!ShaderCompileSpirvVS(regs, sh, info, compiled_spirv)) {
 		return false;
 	}
 
@@ -1175,7 +1167,7 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 }
 
 bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, const ShaderVertexInputInfo& vs_info,
+                         const ShaderVertexInputInfo&                        vs_info,
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                          ShaderPixelInputInfo& ps_info, std::span<const uint32_t>& spirv) {
 	spirv = {};
@@ -1184,8 +1176,7 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 	const auto shader_hash =
 	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
 	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
-	const auto key =
-	    MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id, lane_mask_mode);
+	const auto key        = MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id);
 
 	{
 		std::scoped_lock lock(g_shader_program_cache_mutex);
@@ -1202,7 +1193,7 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 	}
 
 	std::vector<uint32_t> compiled_spirv;
-	if (!ShaderCompileSpirvPS(regs, sh, lane_mask_mode, ps_info, compiled_spirv)) {
+	if (!ShaderCompileSpirvPS(regs, sh, ps_info, compiled_spirv)) {
 		return false;
 	}
 
@@ -1220,8 +1211,7 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 	ShaderGetStaticInputInfoCS(regs, sh, info);
 	const auto shader_hash = regs.cs_regs.data_addr;
 	const auto program_id  = ShaderGetIdCS(regs, info, false);
-	const auto key         = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id,
-	                                                   ShaderLaneMaskMode::NativeWave);
+	const auto key = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id);
 
 	{
 		std::scoped_lock lock(g_shader_program_cache_mutex);
@@ -1449,8 +1439,7 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 }
 
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
-                          std::vector<uint32_t>& spirv) {
+                          ShaderVertexInputInfo& input_info, std::vector<uint32_t>& spirv) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::Amber300);
 
 	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0 || regs.gs_regs.chksum == 0);
@@ -1460,7 +1449,6 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 
 	ShaderRecompiler::CompileOptions options;
 	options.stage                      = ShaderType::Vertex;
-	options.lane_mask_mode             = lane_mask_mode;
 	options.shader_hash                = regs.gs_regs.chksum;
 	options.shader_base                = shader_addr;
 	options.user_data_base             = 8;
@@ -1506,8 +1494,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 }
 
 bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo& input_info,
-                          std::vector<uint32_t>& spirv) {
+                          ShaderPixelInputInfo& input_info, std::vector<uint32_t>& spirv) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::Blue300);
 
 	const uint64_t shader_addr = regs.ps_regs.data_addr;
@@ -1516,7 +1503,6 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 
 	ShaderRecompiler::CompileOptions options;
 	options.stage                      = ShaderType::Pixel;
-	options.lane_mask_mode             = lane_mask_mode;
 	options.shader_hash                = shader_hash;
 	options.shader_base                = shader_addr;
 	options.user_data_count            = regs.ps_regs.rsrc2.user_sgpr;

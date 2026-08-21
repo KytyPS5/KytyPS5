@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
-#include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -988,8 +987,7 @@ void TestSpirvRequirementsAnalysis() {
                                                             &analysis_error),
         "initial SPIR-V requirements analysis failed");
   const auto requirements = *program.spirv_requirements;
-  Check(requirements.requires_exact_subgroup && requirements.subgroup_ballot &&
-            requirements.subgroup_shuffle &&
+  Check(requirements.subgroup_ballot && requirements.subgroup_shuffle &&
             requirements.subgroup_local_invocation_id &&
             requirements.compute_derivatives &&
             requirements.image_gather_extended && requirements.function_lds &&
@@ -1044,8 +1042,7 @@ void TestSpirvRequirementsAnalysis() {
                                                             &analysis_error),
         "ADD_TID SPIR-V requirements analysis failed");
   const auto add_tid_requirements = *add_tid.spirv_requirements;
-  Check(add_tid_requirements.requires_exact_subgroup &&
-            add_tid_requirements.subgroup_local_invocation_id &&
+  Check(add_tid_requirements.subgroup_local_invocation_id &&
             !add_tid_requirements.subgroup_ballot &&
             !add_tid_requirements.subgroup_shuffle,
         "buffer ADD_TID requested the wrong subgroup contract");
@@ -1071,8 +1068,7 @@ void TestSpirvRequirementsAnalysis() {
                                                             &analysis_error),
         "empty SPIR-V requirements analysis failed");
   const auto empty_requirements = *empty.spirv_requirements;
-  Check(!empty_requirements.requires_exact_subgroup &&
-            !empty_requirements.subgroup_ballot &&
+  Check(!empty_requirements.subgroup_ballot &&
             !empty_requirements.subgroup_shuffle &&
             !empty_requirements.subgroup_local_invocation_id &&
             !empty_requirements.compute_derivatives &&
@@ -1080,129 +1076,6 @@ void TestSpirvRequirementsAnalysis() {
             !empty_requirements.function_lds &&
             !empty_requirements.pixel_valid_mask,
         "empty IR unexpectedly requested SPIR-V features");
-}
-
-void TestNativeSubgroupPolicy() {
-  const auto SetTypedValues = [](ShaderRecompiler::IR::Program &program,
-                                 ShaderRecompiler::IR::ValueOpcode opcode =
-                                     ShaderRecompiler::IR::ValueOpcode::Void) {
-    using namespace ShaderRecompiler::IR;
-    program.values = std::make_shared<ValueProgram>();
-    program.values->block_storage.push_back(std::make_unique<Block>());
-    auto *block = program.values->block_storage.back().get();
-    program.values->blocks.push_back(block);
-    if (opcode == ValueOpcode::ReadLane) {
-      block->AppendNewInst(opcode, {Value(0u), Value(0u)});
-    } else if (opcode == ValueOpcode::Ballot) {
-      block->AppendNewInst(opcode, {Value(true)});
-    } else if (opcode == ValueOpcode::DataAppend) {
-      program.values->memory_info.push_back({.kind = ResourceKind::Lds});
-      auto &append = block->AppendNewInst(
-          opcode, {Value(0u), Value(true), Value(1u), Value(0u)});
-      append.SetFlags(MemoryFlags{.index = 0});
-    }
-    std::string error;
-    Check(ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program, &error),
-          "native subgroup requirements analysis failed");
-  };
-
-  GraphicContext context;
-  context.subgroup_size = 32;
-  context.min_subgroup_size = 32;
-  context.max_subgroup_size = 32;
-  context.subgroup_size_control_enabled = true;
-  context.required_subgroup_size_stages = vk::ShaderStageFlagBits::eAll;
-  ShaderRecompiler::IR::Program safe;
-  safe.wave_size = 32;
-  safe.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-  SetTypedValues(safe);
-  Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                vk::ShaderStageFlagBits::eVertex, safe)
-                .mode == ShaderSubgroupMode::Natural,
-        "native wave32 policy changed");
-  safe.wave_size = 64;
-  Check(SelectGraphicsLaneMaskMode(safe.wave_size) ==
-                ShaderLaneMaskMode::PerInvocation &&
-            ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                    vk::ShaderStageFlagBits::eVertex, safe)
-                    .mode == ShaderSubgroupMode::Unsupported,
-        "wave64 graphics mismatch accepted native-wave mask lowering");
-  safe.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
-  Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                vk::ShaderStageFlagBits::eVertex, safe)
-                .mode == ShaderSubgroupMode::PerInvocationGraphics,
-        "wave64 graphics mismatch did not select per-invocation masks");
-
-  ShaderRecompiler::IR::Program cross_lane = safe;
-  SetTypedValues(cross_lane, ShaderRecompiler::IR::ValueOpcode::ReadLane);
-  Check(cross_lane.spirv_requirements->requires_exact_subgroup &&
-            ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                    vk::ShaderStageFlagBits::eVertex,
-                                    cross_lane)
-                    .mode == ShaderSubgroupMode::PerInvocationGraphics,
-        "graphics mismatch did not select per-invocation masks");
-  auto cross_lane_compute = cross_lane;
-  cross_lane_compute.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-  Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                vk::ShaderStageFlagBits::eCompute,
-                                cross_lane_compute)
-                .mode == ShaderSubgroupMode::FlattenedMasks,
-        "split wave64 compute did not use native subgroup operations");
-
-  ShaderRecompiler::IR::Program zero_exec = safe;
-  zero_exec.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-  SetTypedValues(zero_exec);
-  Check(!zero_exec.spirv_requirements->requires_exact_subgroup &&
-            ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                    vk::ShaderStageFlagBits::eCompute,
-                                    zero_exec)
-                    .mode == ShaderSubgroupMode::FlattenedMasks,
-        "compile-time uniform-zero EXEC write did not stay on the mask-free "
-        "path");
-
-  ShaderRecompiler::IR::Program selective_exec = safe;
-  SetTypedValues(selective_exec, ShaderRecompiler::IR::ValueOpcode::Ballot);
-  Check(selective_exec.spirv_requirements->requires_exact_subgroup,
-        "selective EXEC write was classified mask-free");
-
-  ShaderRecompiler::IR::Program carry = safe;
-  SetTypedValues(carry, ShaderRecompiler::IR::ValueOpcode::Ballot);
-  Check(carry.spirv_requirements->requires_exact_subgroup,
-        "lane-varying VCC carry producer was classified mask-free");
-
-  ShaderRecompiler::IR::Program vcc_branch = safe;
-  SetTypedValues(vcc_branch, ShaderRecompiler::IR::ValueOpcode::Ballot);
-  Check(vcc_branch.spirv_requirements->requires_exact_subgroup,
-        "whole-wave VCC branch was classified mask-free");
-
-  ShaderRecompiler::IR::Program ds_partial = safe;
-  ds_partial.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-  SetTypedValues(ds_partial, ShaderRecompiler::IR::ValueOpcode::DataAppend);
-  Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                vk::ShaderStageFlagBits::eCompute, ds_partial)
-                .mode == ShaderSubgroupMode::FlattenedMasks,
-        "split wave64 DS append did not use native subgroup operations");
-  context.max_subgroup_size = 64;
-  const auto controlled = ConfigureShaderSubgroup(
-      ShaderSubgroupCapabilities{context}, vk::ShaderStageFlagBits::eCompute,
-      cross_lane_compute);
-  Check(controlled.mode == ShaderSubgroupMode::Controlled &&
-            controlled.required_size == 64,
-        "supported controlled wave64 was not preferred over splitting");
-  context.subgroup_size = 64;
-  context.subgroup_size_control_enabled = false;
-  cross_lane.wave_size = 32;
-  cross_lane.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
-  Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                vk::ShaderStageFlagBits::eFragment, cross_lane)
-                .mode == ShaderSubgroupMode::Unsupported,
-        "inverse graphics mismatch was accepted as one guest wave");
-  cross_lane_compute.wave_size = 32;
-  Check(ConfigureShaderSubgroup(ShaderSubgroupCapabilities{context},
-                                vk::ShaderStageFlagBits::eCompute,
-                                cross_lane_compute)
-                .mode == ShaderSubgroupMode::FlattenedMasks,
-        "inverse compute mismatch did not use the native subgroup");
 }
 
 std::array<uint32_t, 64>
@@ -5567,8 +5440,7 @@ void TestGraphicsCreateInterpolantMapping() {
         "flat/custom interpolant mapping bits were unexpected");
   Check(regs[3].value == 0x01580304u,
         "f16 interpolant mapping bits were unexpected");
-  Check(regs[6].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 6u &&
-            regs[6].value == 6u,
+  Check(regs[6].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 6u && regs[6].value == 6u,
         "interpolant identity tail was not filled");
 
   Check(Gen5::AgcCreateInterpolantMapping2(native_regs, &gs, &ps) == 0,
@@ -7502,7 +7374,8 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
         "multiple-latch fixture lacks two native backedges");
   Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
   Check(graph.blocks.size() == original_block_count + 2u,
-        "multiple native latches did not create one synthetic continue and one empty header");
+        "multiple native latches did not create one synthetic continue and one "
+        "empty header");
   Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
         "multiple native latches were not coalesced to one SPIR-V backedge");
   const auto &loop = graph.natural_loops.front();
@@ -7700,23 +7573,22 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
     }
   }
 
-  for (const auto lane_mode :
-       {ShaderLaneMaskMode::NativeWave, ShaderLaneMaskMode::PerInvocation}) {
-    auto options = MakeCompileOptions(ShaderType::Compute);
-    options.lane_mask_mode = lane_mode;
-    options.dump_ir = true;
-    ShaderRecompiler::CompileResult result;
-    Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
-          error.c_str());
-    Check(!result.program.dispatcher_fallback &&
-              Common::ContainsStr(result.ir_dump, "mode=structured"),
-          "EXEC/SCC shared-arm epilogue did not stay structured");
-    Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 3u,
-          "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
-    Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
-          "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
-    CheckSpirvBinaryValidates(result.spirv);
-  }
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured"),
+        "EXEC/SCC shared-arm epilogue did not stay structured");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 3u,
+        "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
+  Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
+                             "OpGroupNonUniformBallot"),
+        "per-invocation EXEC/SCC branch reconstructed a native subgroup mask");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
@@ -7755,13 +7627,16 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "nested-tail routing changed semantic instruction coverage");
-  Check(std::ranges::count_if(graph.blocks, [](const auto &block) {
-          return block.terminator.condition ==
-                 ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-        }) == 1u &&
-            std::ranges::count_if(graph.blocks, [](const auto &block) {
-              return block.terminator.goto_value >= 0;
-            }) == 3u,
+  Check(std::ranges::count_if(
+            graph.blocks,
+            [](const auto &block) {
+              return block.terminator.condition ==
+                     ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+            }) == 1u &&
+            std::ranges::count_if(graph.blocks,
+                                  [](const auto &block) {
+                                    return block.terminator.goto_value >= 0;
+                                  }) == 3u,
         "nested-tail early exit did not use typed route state");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
@@ -8000,9 +7875,10 @@ void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
-  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-            original_coverage,
-        "shared-terminal structurization changed semantic instruction coverage");
+  Check(
+      CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+          original_coverage,
+      "shared-terminal structurization changed semantic instruction coverage");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
@@ -8171,7 +8047,6 @@ void TestNewShaderRecompilerU64PairLowering() {
   ir.Emit(IR::ValueOpcode::ULessThan64, {shifted, base});
   ir.Emit(IR::ValueOpcode::SLessThan64, {shifted, base});
   ir.Emit(IR::ValueOpcode::BitCount64, {shifted});
-  ir.Emit(IR::ValueOpcode::WqmU64, {shifted});
   for (const uint32_t count : {1u, 31u, 32u, 33u, 63u}) {
     ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {base, IR::Value(count)});
     ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {base, IR::Value(count)});
@@ -8710,10 +8585,9 @@ void TestDemandDrivenSpirvDeclarations() {
 void TestTypedEntryStateIsMinimal() {
   using namespace ShaderRecompiler;
 
-  const auto translate = [](ShaderLaneMaskMode lane_mode, uint32_t wave_size) {
+  const auto check = [](uint32_t wave_size) {
     IR::Program source;
     source.stage = ShaderType::Compute;
-    source.lane_mask_mode = lane_mode;
     source.wave_size = wave_size;
     source.user_data_count = 0;
     source.blocks.emplace_back();
@@ -8726,11 +8600,7 @@ void TestTypedEntryStateIsMinimal() {
     Check(Frontend::TranslateProgram(source, values, nullptr, nullptr, &compute,
                                      &error),
           error.c_str());
-    return values;
-  };
 
-  const auto check = [&](ShaderLaneMaskMode lane_mode, uint32_t wave_size) {
-    auto values = translate(lane_mode, wave_size);
     uint32_t set_exec = 0;
     uint32_t set_exec_lo = 0;
     uint32_t set_exec_hi = 0;
@@ -8738,13 +8608,11 @@ void TestTypedEntryStateIsMinimal() {
     IR::Value exec;
     IR::Value exec_lo;
     IR::Value exec_hi;
-    const IR::Inst *ballot = nullptr;
     for (const auto *block : values.blocks) {
       for (const auto &inst : *block) {
         switch (inst.GetOpcode()) {
         case IR::ValueOpcode::Ballot:
           ballots++;
-          ballot = &inst;
           break;
         case IR::ValueOpcode::SetExec:
           set_exec++;
@@ -8760,6 +8628,7 @@ void TestTypedEntryStateIsMinimal() {
           break;
         case IR::ValueOpcode::SetScalarRegister:
         case IR::ValueOpcode::SetThreadBitScalarRegister:
+        case IR::ValueOpcode::SetScalarMaskTag:
         case IR::ValueOpcode::SetVectorRegister:
         case IR::ValueOpcode::SetScc:
         case IR::ValueOpcode::SetVcc:
@@ -8774,44 +8643,19 @@ void TestTypedEntryStateIsMinimal() {
       }
     }
     Check(set_exec == 1u && set_exec_lo == 1u && set_exec_hi == 1u &&
-              exec.IsImmediate() && exec.U1(),
-          "typed entry does not define EXEC exactly once");
-    if (lane_mode == ShaderLaneMaskMode::PerInvocation) {
-      Check(ballots == 0u && exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
-                exec_hi.IsImmediate() && exec_hi.U32() == 0u,
-            "per-invocation entry EXEC is not the local {1,0} mask");
-    } else {
-      Check(ballots == 1u && !exec_lo.IsImmediate(),
-            "native compute entry EXEC does not use the active subgroup mask");
-      const auto *lo = exec_lo.ResolveInstruction();
-      Check(lo != nullptr &&
-                lo->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
-                lo->Arg(0).ResolveInstruction() == ballot &&
-                lo->Arg(1).Resolve().U32() == 0u,
-            "native compute EXEC_LO does not use ballot word zero");
-      if (wave_size == 32u) {
-        Check(exec_hi.IsImmediate() && exec_hi.U32() == 0u,
-              "native wave32 entry defined EXEC_HI");
-      } else {
-        const auto *hi = exec_hi.ResolveInstruction();
-        Check(hi != nullptr &&
-                  hi->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
-                  hi->Arg(0).ResolveInstruction() == ballot &&
-                  hi->Arg(1).Resolve().U32() == 1u,
-              "native wave64 EXEC_HI does not use ballot word one");
-      }
-    }
+              ballots == 0u && exec.IsImmediate() && exec.U1() &&
+              exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
+              exec_hi.IsImmediate() && exec_hi.U32() == 0u,
+          "typed entry is not the local {1,0} invocation mask");
 
     IR::RewriteToSsa(values.blocks);
     IR::RemoveIdentities(values.blocks);
     IR::EliminateDeadCode(values.blocks);
-    std::string error;
     Check(IR::ValidateValueProgram(values, true, &error), error.c_str());
   };
 
-  check(ShaderLaneMaskMode::NativeWave, 32u);
-  check(ShaderLaneMaskMode::NativeWave, 64u);
-  check(ShaderLaneMaskMode::PerInvocation, 64u);
+  check(32u);
+  check(64u);
 }
 
 void TestFinalSsaRejectsRegisterStatePseudos() {
@@ -9145,35 +8989,8 @@ void TestValuePhiValidation() {
   }
 }
 
-void TestWqmConstantPropagation() {
+void TestWqmMaskSignatureAndU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
-
-  ValueProgram program;
-  program.block_storage.push_back(std::make_unique<Block>());
-  program.blocks.push_back(program.block_storage.back().get());
-  program.block_info.emplace_back();
-  IREmitter ir(program.blocks.front());
-
-  constexpr std::array cases = {
-      std::pair{uint64_t{0}, uint64_t{0}},
-      std::pair{uint64_t{1}, uint64_t{0xfull}},
-      std::pair{uint64_t{1} << 31u, uint64_t{0xf} << 28u},
-      std::pair{uint64_t{1} << 32u, uint64_t{0xf} << 32u},
-      std::pair{uint64_t{0x8000001180000001ull},
-                uint64_t{0xf00000fff000000full}},
-  };
-  std::array<Value, cases.size()> results;
-  for (size_t index = 0; index < cases.size(); index++) {
-    results[index] = ir.Emit(ValueOpcode::WqmU64, {Value(cases[index].first)});
-  }
-
-  ConstantPropagationPass(program.blocks);
-  for (size_t index = 0; index < cases.size(); index++) {
-    const auto value = results[index].Resolve();
-    Check(value.IsImmediate() && value.GetType() == Type::U64 &&
-              value.U64() == cases[index].second,
-          "WqmU64 constant propagation crossed a quad or dword boundary");
-  }
 
   const auto check_invalid_signature = [](ValueOpcode opcode, Value valid,
                                           Value invalid) {
@@ -9189,7 +9006,6 @@ void TestWqmConstantPropagation() {
               Common::ContainsStr(error, "argument 0 has type"),
           "value IR accepted a WQM operand that violates opcode metadata");
   };
-  check_invalid_signature(ValueOpcode::WqmU64, Value(uint64_t{1}), Value(true));
   check_invalid_signature(ValueOpcode::WqmMask, Value(true),
                           Value(uint64_t{1}));
 
@@ -9624,7 +9440,7 @@ void TestNewShaderRecompilerVertexSystemInputsWithoutMirrors() {
         "vertex system values were routed through guest VGPR mirrors");
 }
 
-void TestNewShaderRecompilerVertexExportUsesLaneExecMask() {
+void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
   const uint32_t shader[] = {
       EncodeSop1(0x04, 126, 129), // s_mov_b64 exec, 1
       EncodeExp0(0x0c, 0xf),
@@ -9640,27 +9456,11 @@ void TestNewShaderRecompilerVertexExportUsesLaneExecMask() {
   Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
         error.c_str());
   CheckSpirvBinaryValidates(result.spirv);
-
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "gl_SubgroupInvocationID"),
-        "vertex export EXEC guard did not test the current lane");
+  Check(!Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "vertex EXEC guard depends on the native subgroup lane");
   Check(Common::ContainsStr(source, "OpBranchConditional"),
-        "vertex export EXEC guard did not branch on the lane-active mask");
-
-  options.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
-  ShaderRecompiler::CompileResult local_result;
-  Check(ShaderRecompiler::TryRecompile(shader, options, local_result, &error),
-        error.c_str());
-  Check(local_result.program.lane_mask_mode ==
-            ShaderLaneMaskMode::PerInvocation,
-        "per-invocation mask mode was not preserved in the immutable program");
-  CheckSpirvBinaryValidates(local_result.spirv);
-  const auto local_source = DisassembleSpirvBinary(local_result.spirv);
-  Check(!Common::ContainsStr(local_source,
-                             "OpLoad %uint %gl_SubgroupInvocationID"),
-        "per-invocation EXEC still depends on the native subgroup lane");
-  Check(Common::ContainsStr(local_source, "OpBranchConditional"),
-        "per-invocation vertex export lost its EXEC guard");
+        "vertex export lost its per-invocation EXEC guard");
 }
 
 void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
@@ -9677,7 +9477,6 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   };
 
   auto options = MakeCompileOptions(ShaderType::Vertex);
-  options.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -9720,45 +9519,6 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
         "wave32 WQM retained the unused high ballot-word expansion");
 
-  const uint32_t native_wqm_shader[] = {
-      EncodeSop1(0x0a, 2, 0), // s_wqm_b64 s[2:3], s[0:1]
-      EncodeVop1(0x01, 0, 2), // v_mov_b32 v0, s2
-      EncodeExp0(0x0c, 0x1),  EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
-  };
-  auto native_options = options;
-  native_options.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
-  Check(ShaderRecompiler::TryRecompile(native_wqm_shader, native_options,
-                                       result, &error),
-        error.c_str());
-  CheckSpirvBinaryValidates(result.spirv);
-  Check(Common::ContainsStr(result.ir_dump, "WqmU64") &&
-            !Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
-                                 "OpGroupNonUniformBallot"),
-        "native scalar WQM retained frontend expansion or subgroup machinery");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u &&
-            SpirvInstructionOpcodeCount(result.spirv, 194u) == 2u,
-        "native scalar WQM emitter was folded away or did not use the compact "
-        "path");
-
-  const uint32_t native_special_wqm_shader[] = {
-      EncodeSop1(0x04, 126, 0),   // s_mov_b64 exec, s[0:1]
-      EncodeSop1(0x0a, 126, 126), // s_wqm_b64 exec, exec
-      EncodeSop1(0x04, 106, 0),   // s_mov_b64 vcc, s[0:1]
-      EncodeSop1(0x0a, 106, 106), // s_wqm_b64 vcc, vcc
-      EncodeVop1(0x01, 0, 126),   // v_mov_b32 v0, exec_lo
-      EncodeVop1(0x01, 1, 106),   // v_mov_b32 v1, vcc_lo
-      EncodeExp0(0x0c, 0x3),      EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01),
-  };
-  Check(ShaderRecompiler::TryRecompile(native_special_wqm_shader,
-                                       native_options, result, &error),
-        error.c_str());
-  CheckSpirvBinaryValidates(result.spirv);
-  const auto native_special_source = DisassembleSpirvBinary(result.spirv);
-  Check(CountSourceOccurrences(result.ir_dump, "WqmU64") == 2u &&
-            !Common::ContainsStr(native_special_source,
-                                 "OpGroupNonUniformBallot"),
-        "native EXEC/VCC WQM retained destination-dependent ballot lowering");
-
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
       EncodeVop1(0x01, 0, 250),
@@ -9789,7 +9549,6 @@ void TestNewShaderRecompilerPerInvocationU64Complement() {
   };
 
   auto options = MakeCompileOptions(ShaderType::Vertex);
-  options.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
   options.dump_ir = true;
 
   ShaderRecompiler::CompileResult result;
@@ -9919,7 +9678,8 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   Check(ShaderRecompiler::TryRecompile(compressed_ba_shader, options,
                                        unorm16_ba_result, &error),
         error.c_str());
-  const auto unorm16_ba_source = DisassembleSpirvBinary(unorm16_ba_result.spirv);
+  const auto unorm16_ba_source =
+      DisassembleSpirvBinary(unorm16_ba_result.spirv);
   Check(CountSourceOccurrences(unorm16_ba_source, "UnpackUnorm2x16") == 1u,
         "compressed UNORM16 BA-only export did not unpack VSRC1");
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
@@ -10114,14 +9874,14 @@ void TestRenderTargetReverseExportMapping() {
   mappings[0] = gr32.export_mapping;
   ShaderPixelInputInfo compiled_info{};
   std::span<const uint32_t> compiled_spirv;
-  Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave, vs_info,
-                            mappings, compiled_info, compiled_spirv) &&
+  Check(ShaderCompileInfoPS(regs, sh, vs_info, mappings, compiled_info,
+                            compiled_spirv) &&
             compiled_info.target_export_mapping[0].IsIdentity(),
         "inactive reverse MRT mapping was not normalized out of the shader "
         "cache key");
   sh.target_output_mode[0] = 4;
-  Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave, vs_info,
-                            mappings, compiled_info, compiled_spirv) &&
+  Check(ShaderCompileInfoPS(regs, sh, vs_info, mappings, compiled_info,
+                            compiled_spirv) &&
             compiled_info.target_export_mapping[0] == gr32.export_mapping,
         "active reverse MRT mapping was lost before shader specialization");
 }
@@ -11098,8 +10858,7 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   HW::ShaderRegisters sh{};
   ShaderPixelInputInfo input_info{};
   std::vector<uint32_t> spirv;
-  Check(ShaderCompileSpirvPS(regs, sh, ShaderLaneMaskMode::NativeWave,
-                             input_info, spirv),
+  Check(ShaderCompileSpirvPS(regs, sh, input_info, spirv),
         "new pixel shader recompiler wrapper did not produce SPIR-V");
   Check(!spirv.empty(),
         "new pixel shader recompiler wrapper returned empty SPIR-V");
@@ -11132,8 +10891,7 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
 
   ShaderPixelInputInfo vcc_input{};
   std::vector<uint32_t> vcc_spirv;
-  Check(ShaderCompileSpirvPS(vcc_regs, sh, ShaderLaneMaskMode::NativeWave,
-                             vcc_input, vcc_spirv),
+  Check(ShaderCompileSpirvPS(vcc_regs, sh, vcc_input, vcc_spirv),
         "VCC raw-load pointer was lost");
   CheckSpirvBinaryValidates(vcc_spirv);
 }
@@ -11226,7 +10984,6 @@ void TestComputeLdsAllocationIdentity() {
 void TestPixelProgramCacheDescriptorSetIdentity() {
   const uint32_t shader_01[] = {0xbf810000u};
   const uint32_t shader_10[] = {0xbf810000u};
-  const uint32_t shader_mask[] = {0xbf810000u};
   HW::ShaderRegisters sh{};
 
   auto check_transition = [&](const uint32_t *shader, uint64_t checksum,
@@ -11249,8 +11006,8 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
       const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
       ShaderPixelInputInfo ps_info{};
       std::span<const uint32_t> spirv;
-      Check(ShaderCompileInfoPS(regs, sh, ShaderLaneMaskMode::NativeWave,
-                                vs_info, identity_mappings, ps_info, spirv),
+      Check(ShaderCompileInfoPS(regs, sh, vs_info, identity_mappings, ps_info,
+                                spirv),
             "pixel program-cache transition failed to compile");
       const auto expected_set = has_vs_descriptors ? 1u : 0u;
       Check(ps_info.descriptor_set == expected_set &&
@@ -11266,28 +11023,6 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 
   check_transition(shader_01, 0x91a27e6300000001ull, false, true);
   check_transition(shader_10, 0x91a27e6300000002ull, true, false);
-
-  HW::PixelShaderInfo mask_regs{};
-  mask_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader_mask);
-  mask_regs.ps_regs.chksum = 0x91a27e6300000003ull;
-  ShaderMappedData mapped{};
-  mapped.code_size_bytes = sizeof(shader_mask);
-  ShaderMapUserData(mask_regs.ps_regs.data_addr, mapped);
-  auto compile_mask_mode = [&](ShaderLaneMaskMode mode) {
-    ShaderVertexInputInfo vs_info{};
-    vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
-    const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
-    ShaderPixelInputInfo ps_info{};
-    std::span<const uint32_t> spirv;
-    Check(ShaderCompileInfoPS(mask_regs, sh, mode, vs_info, identity_mappings,
-                              ps_info, spirv),
-          "pixel lane-mask cache transition failed to compile");
-    Check(ps_info.stage.program != nullptr &&
-              ps_info.stage.program->lane_mask_mode == mode,
-          "pixel program cache reused a different lane-mask lowering");
-  };
-  compile_mask_mode(ShaderLaneMaskMode::NativeWave);
-  compile_mask_mode(ShaderLaneMaskMode::PerInvocation);
 }
 
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
@@ -11379,23 +11114,21 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
 }
 
 void TestNewShaderRecompilerSpirvSizeBaselines() {
-  const auto compile =
-      [](const char *name, std::span<const uint32_t> shader,
-         const SpirvMetrics &budget, ShaderType stage = ShaderType::Compute,
-         ShaderLaneMaskMode lane_mask_mode = ShaderLaneMaskMode::NativeWave) {
-        auto options = MakeCompileOptions(stage);
-        options.dump_ir = true;
-        options.lane_mask_mode = lane_mask_mode;
+  const auto compile = [](const char *name, std::span<const uint32_t> shader,
+                          const SpirvMetrics &budget,
+                          ShaderType stage = ShaderType::Compute) {
+    auto options = MakeCompileOptions(stage);
+    options.dump_ir = true;
 
-        ShaderRecompiler::CompileResult result;
-        std::string error;
-        const bool compiled =
-            ShaderRecompiler::TryRecompile(shader, options, result, &error);
-        Check(compiled, error.c_str());
-        CheckSpirvBinaryValidates(result.spirv);
-        CheckSpirvBudget(name, result.spirv, budget);
-        return result;
-      };
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    const bool compiled =
+        ShaderRecompiler::TryRecompile(shader, options, result, &error);
+    Check(compiled, error.c_str());
+    CheckSpirvBinaryValidates(result.spirv);
+    CheckSpirvBudget(name, result.spirv, budget);
+    return result;
+  };
 
   const uint32_t empty[] = {EncodeSopp(0x01)};
   const auto empty_result =
@@ -11595,19 +11328,18 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeExp1(0, 0, 0, 0), // POS0.x
       EncodeSopp(0x01),
   };
-  const auto wqm_result =
-      compile("wqm", wqm,
-              {.words = 407,
-               .instructions = 98,
-               .variables = 4,
-               .loads = 3,
-               .stores = 1,
-               .labels = 6,
-               .selection_merges = 1,
-               .branches = 4,
-               .conditional_branches = 1,
-               .ballots = 1},
-              ShaderType::Vertex, ShaderLaneMaskMode::PerInvocation);
+  const auto wqm_result = compile("wqm", wqm,
+                                  {.words = 407,
+                                   .instructions = 98,
+                                   .variables = 4,
+                                   .loads = 3,
+                                   .stores = 1,
+                                   .labels = 6,
+                                   .selection_merges = 1,
+                                   .branches = 4,
+                                   .conditional_branches = 1,
+                                   .ballots = 1},
+                                  ShaderType::Vertex);
   Check(Common::ContainsStr(wqm_result.ir_dump, "WqmMask"),
         "WQM size fixture no longer reaches per-invocation WqmMask IR");
 
@@ -11653,7 +11385,6 @@ int main() {
   TestSpirvRequirementsAnalysis();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
-  TestNativeSubgroupPolicy();
   TestNewShaderRecompilerSMovB32();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();
@@ -11720,13 +11451,13 @@ int main() {
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
   TestTypedEntryStateIsMinimal();
-  TestWqmConstantPropagation();
+  TestWqmMaskSignatureAndU64ShiftConstantPropagation();
   TestFinalSsaRejectsRegisterStatePseudos();
   TestValuePhiValidation();
   TestNativeWideValueValidation();
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
-  TestNewShaderRecompilerVertexExportUsesLaneExecMask();
+  TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();

@@ -574,15 +574,14 @@ constexpr u32 EncodeMimg0(u32 opcode, u32 dmask, u32 nsa_dwords = 0,
   return (0x3cu << 26u) | ((opcode >> 7u) & 0x1u) |
          ((nsa_dwords & 0x3u) << 1u) | ((dim & 0x7u) << 3u) |
          ((dmask & 0xfu) << 8u) | (glc ? (1u << 13u) : 0u) |
-         (r128 ? (1u << 15u) : 0u) |
-         ((opcode & 0x7fu) << 18u);
+         (r128 ? (1u << 15u) : 0u) | ((opcode & 0x7fu) << 18u);
 }
 
 constexpr u32 EncodeMimg1(u32 vdata, u32 vaddr, u32 srsrc = 0, u32 ssamp = 0,
                           bool a16 = false, bool d16 = false) {
   return ((ssamp & 0x1fu) << 21u) | ((srsrc & 0x1fu) << 16u) |
-         ((vdata & 0xffu) << 8u) | (vaddr & 0xffu) |
-         (a16 ? (1u << 30u) : 0u) | (d16 ? (1u << 31u) : 0u);
+         ((vdata & 0xffu) << 8u) | (vaddr & 0xffu) | (a16 ? (1u << 30u) : 0u) |
+         (d16 ? (1u << 31u) : 0u);
 }
 
 constexpr u32 EncodeVintrp(u32 opcode, u32 dst, u32 attr, u32 chan, u32 src) {
@@ -1178,7 +1177,8 @@ CompiledShader CompileCase(const TestCase &test) {
         result.resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  const auto buffer_count = static_cast<u32>(result.program.info.buffers.size());
+  const auto buffer_count =
+      static_cast<u32>(result.program.info.buffers.size());
   for (u32 i = 0; i < buffer_count; i++) {
     u32 offset = 0;
     if (i < test.storage_buffer_offsets.size()) {
@@ -1197,8 +1197,8 @@ CompiledShader CompileCase(const TestCase &test) {
     Require(test.name, "shader data", offset < 256,
             "address-memory offset is not representable");
     const auto index = buffer_count + i;
-    packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
-        offset << ((index % 4u) * 8u);
+    packed_user_data[result.program.bindings.memory_offset_dword +
+                     index / 4u] |= offset << ((index % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(result.resources.flattened_srt),
@@ -3562,8 +3562,7 @@ public:
       narrow_target.info.tile_mode = Prospero::TileMode::kRenderTarget;
       narrow_target.info.mip_layout[0] = {0, 0x10000, 128, 1};
       narrow_target.view_info.format = narrow_target.info.pixel_format;
-      narrow_target.view_info.usage =
-          vk::ImageUsageFlagBits::eColorAttachment;
+      narrow_target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       const auto narrow_target_id = texture_cache.FindImage(narrow_target);
       const auto narrow_target_view =
           texture_cache.FindRenderTarget(narrow_target_id, narrow_target);
@@ -3868,14 +3867,13 @@ public:
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),
                   sizeof(raw_d16_values));
       auto raw_d16 = MakeLinearDesc(
-          base + raw_d16_offset, sizeof(raw_d16_values),
-          vk::Format::eD16Unorm, Prospero::BufferFormat::k16UNorm,
-          Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(uint16_t), 1);
+          base + raw_d16_offset, sizeof(raw_d16_values), vk::Format::eD16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D,
+          {2, 1, 1}, 1, sizeof(uint16_t), 1);
       raw_d16.type = BindingType::DepthTarget;
       raw_d16.view_info.format = vk::Format::eD16Unorm;
       raw_d16.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
-      raw_d16.view_info.usage =
-          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      raw_d16.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
       const auto raw_d16_image = texture_cache.FindImage(raw_d16);
       (void)texture_cache.FindDepthTarget(raw_d16_image, raw_d16);
 
@@ -3887,13 +3885,13 @@ public:
       raw_d16_uint.view_info.aspect = vk::ImageAspectFlagBits::eColor;
       raw_d16_uint.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto raw_d16_uint_image = texture_cache.FindImage(raw_d16_uint);
-      Require(name, "raw D16 uint texture backing",
-              raw_d16_uint_image && raw_d16_uint_image != raw_d16_image &&
-                  !TextureCacheTestAccess::Contains(texture_cache,
-                                                    raw_d16_image) &&
-                  texture_cache.GetImage(raw_d16_uint_image)
-                          .backing.format == vk::Format::eR16Uint,
-              "D16 uint sampling did not recreate a true integer color backing");
+      Require(
+          name, "raw D16 uint texture backing",
+          raw_d16_uint_image && raw_d16_uint_image != raw_d16_image &&
+              !TextureCacheTestAccess::Contains(texture_cache, raw_d16_image) &&
+              texture_cache.GetImage(raw_d16_uint_image).backing.format ==
+                  vk::Format::eR16Uint,
+          "D16 uint sampling did not recreate a true integer color backing");
       Require(name, "raw D16 uint texture view",
               texture_cache.FindTexture(raw_d16_uint_image, raw_d16_uint) !=
                   nullptr,
@@ -3916,9 +3914,9 @@ public:
                                       layered_d16_color);
       auto &layered_d16_color_native =
           texture_cache.GetImage(layered_d16_color_image);
-      layered_d16_color_native.Transit(
-          vk::ImageLayout::eTransferDstOptimal,
-          vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+      layered_d16_color_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                       vk::AccessFlagBits2::eTransferWrite, {},
+                                       scheduler.Current().Handle());
       vk::ClearColorValue layered_raw_d16_clear_value{};
       layered_raw_d16_clear_value.float32[0] = 1.0f;
       const vk::ImageSubresourceRange layered_raw_d16_clear_range{
@@ -3931,8 +3929,7 @@ public:
 
       auto layered_raw_d16_depth = layered_d16_color;
       layered_raw_d16_depth.type = BindingType::DepthTarget;
-      layered_raw_d16_depth.info.data.size =
-          sizeof(uint16_t) * 2 * 5;
+      layered_raw_d16_depth.info.data.size = sizeof(uint16_t) * 2 * 5;
       layered_raw_d16_depth.info.pixel_format = vk::Format::eD16Unorm;
       layered_raw_d16_depth.info.guest_format =
           Prospero::BufferFormat::k16UNorm;
@@ -3940,8 +3937,7 @@ public:
       layered_raw_d16_depth.info.mip_layout[0].size =
           layered_raw_d16_depth.info.data.size;
       layered_raw_d16_depth.view_info.format = vk::Format::eD16Unorm;
-      layered_raw_d16_depth.view_info.aspect =
-          vk::ImageAspectFlagBits::eDepth;
+      layered_raw_d16_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       layered_raw_d16_depth.view_info.layer_count = 5;
       layered_raw_d16_depth.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -3949,28 +3945,25 @@ public:
           texture_cache.FindImage(layered_raw_d16_depth);
       const auto &layered_depth_owner =
           texture_cache.GetImage(layered_raw_d16_depth_image);
-      Require(
-          name, "layered raw D16 owner layout",
-          layered_raw_d16_depth_image != layered_d16_color_image &&
-              !TextureCacheTestAccess::Contains(
-                  texture_cache, layered_d16_color_image) &&
-              layered_depth_owner.info.resources.layers == 6 &&
-              layered_depth_owner.info.data.size ==
-                  sizeof(layered_raw_d16_values) &&
-              layered_depth_owner.info.mip_layout[0].size ==
-                  sizeof(layered_raw_d16_values),
-          "a partial depth view detached the retained six-layer owner from "
-          "its full guest range");
+      Require(name, "layered raw D16 owner layout",
+              layered_raw_d16_depth_image != layered_d16_color_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    layered_d16_color_image) &&
+                  layered_depth_owner.info.resources.layers == 6 &&
+                  layered_depth_owner.info.data.size ==
+                      sizeof(layered_raw_d16_values) &&
+                  layered_depth_owner.info.mip_layout[0].size ==
+                      sizeof(layered_raw_d16_values),
+              "a partial depth view detached the retained six-layer owner from "
+              "its full guest range");
       (void)texture_cache.FindDepthTarget(layered_raw_d16_depth_image,
                                           layered_raw_d16_depth);
 
       auto reacquired_layered_raw_d16_uint = layered_d16_color;
-      reacquired_layered_raw_d16_uint.info.pixel_format =
-          vk::Format::eR16Uint;
+      reacquired_layered_raw_d16_uint.info.pixel_format = vk::Format::eR16Uint;
       reacquired_layered_raw_d16_uint.info.guest_format =
           Prospero::BufferFormat::k16UInt;
-      reacquired_layered_raw_d16_uint.view_info.format =
-          vk::Format::eR16Uint;
+      reacquired_layered_raw_d16_uint.view_info.format = vk::Format::eR16Uint;
       const auto reacquired_layered_raw_d16_uint_image =
           texture_cache.FindImage(reacquired_layered_raw_d16_uint);
       const auto reacquired_layered_raw_d16_uint_view =
@@ -3986,13 +3979,13 @@ public:
           vk::AccessFlagBits2::eTransferRead, {}, scheduler.Current().Handle());
       vk::BufferImageCopy layered_raw_d16_copy{};
       layered_raw_d16_copy.bufferRowLength = 2;
-      layered_raw_d16_copy.imageSubresource = {
-          vk::ImageAspectFlagBits::eColor, 0, 0, 6};
+      layered_raw_d16_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor,
+                                               0, 0, 6};
       layered_raw_d16_copy.imageExtent = {2, 1, 1};
       scheduler.Current().Handle().copyImageToBuffer(
           reacquired_layered_raw_d16_native.backing.image,
-          vk::ImageLayout::eTransferSrcOptimal,
-          layered_raw_d16_readback.buffer, 1, &layered_raw_d16_copy);
+          vk::ImageLayout::eTransferSrcOptimal, layered_raw_d16_readback.buffer,
+          1, &layered_raw_d16_copy);
       HostReadBarrier(layered_raw_d16_readback.buffer,
                       layered_raw_d16_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
@@ -4010,8 +4003,8 @@ public:
           reacquired_layered_raw_d16_uint_image &&
               reacquired_layered_raw_d16_uint_image !=
                   layered_raw_d16_depth_image &&
-              !TextureCacheTestAccess::Contains(
-                  texture_cache, layered_raw_d16_depth_image) &&
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                layered_raw_d16_depth_image) &&
               reacquired_layered_raw_d16_native.backing.format ==
                   vk::Format::eR16Uint &&
               reacquired_layered_raw_d16_uint_view != nullptr &&
@@ -7717,14 +7710,13 @@ public:
       RenderDepthInfo read_only_clear_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, 1, scheduler.Current(), read_only_clear_depth);
-      Require(
-          name, "read-only stencil clear suppression",
-          read_only_clear_depth.image_id == phased_depth.image_id &&
-              !read_only_clear_depth.stencil_clear_enable &&
-              !read_only_clear_depth.AttachmentWriteAspects() &&
-              depth_attachment_layout(read_only_clear_depth) ==
-                  vk::ImageLayout::eDepthStencilReadOnlyOptimal,
-          "a PS5 target-level stencil write disable retained a host clear");
+      Require(name, "read-only stencil clear suppression",
+              read_only_clear_depth.image_id == phased_depth.image_id &&
+                  !read_only_clear_depth.stencil_clear_enable &&
+                  !read_only_clear_depth.AttachmentWriteAspects() &&
+                  depth_attachment_layout(read_only_clear_depth) ==
+                      vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+              "a PS5 target-level stencil write disable retained a host clear");
 
       registers.SetDepthRenderTarget(phased_depth_target);
       registers.SetDepthControl(phased_depth_control);
@@ -9972,21 +9964,21 @@ public:
       const auto surface_format = TextureGetSurfaceFormatInfo(format);
       constexpr u32 tail_xy[7][2] = {{64, 0}, {0, 64}, {32, 0}, {0, 32},
                                      {16, 0}, {8, 16}, {0, 24}};
-      bool valid =
-          built && Prospero::NumBytesPerElement(format) == 4 &&
-          Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
-          Prospero::IsSampledTextureFormat(format) &&
-          Prospero::IsUintTextureFormat(format) &&
-          Prospero::RemapTextureFormat(format) ==
-              Prospero::BufferFormat::k32UInt &&
-          surface_format.vk_format == vk::Format::eR32Uint &&
-          surface_format.conversion_format == format &&
-          VulkanFormat(format) == vk::Format::eUndefined &&
-          surface.texture.block.block_width == 128 &&
-          surface.texture.block.block_height == 128 &&
-          surface.texture.block.block_depth == 1 &&
-          surface.first_tail_level == 1 && surface.mips[0].offset == 0x10000 &&
-          total.size == 0x20000 && total.align == 0x10000;
+      bool valid = built && Prospero::NumBytesPerElement(format) == 4 &&
+                   Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
+                   Prospero::IsSampledTextureFormat(format) &&
+                   Prospero::IsUintTextureFormat(format) &&
+                   Prospero::RemapTextureFormat(format) ==
+                       Prospero::BufferFormat::k32UInt &&
+                   surface_format.vk_format == vk::Format::eR32Uint &&
+                   surface_format.conversion_format == format &&
+                   VulkanFormat(format) == vk::Format::eUndefined &&
+                   surface.texture.block.block_width == 128 &&
+                   surface.texture.block.block_height == 128 &&
+                   surface.texture.block.block_depth == 1 &&
+                   surface.first_tail_level == 1 &&
+                   surface.mips[0].offset == 0x10000 && total.size == 0x20000 &&
+                   total.align == 0x10000;
       for (u32 level = 1; level < levels && valid; level++) {
         valid &= surface.mips[level].offset == 0 &&
                  surface.mips[level].tail_x == tail_xy[level - 1][0] &&
@@ -9999,16 +9991,15 @@ public:
       const auto storage_only_format = Prospero::BufferFormat::k32SInt;
       const auto storage_only_surface =
           TextureGetSurfaceFormatInfo(storage_only_format);
-      Require(
-          name, "storage-only surface mapping",
-          !Prospero::IsSampledTextureFormat(storage_only_format) &&
-              !Prospero::IsUintTextureFormat(storage_only_format) &&
-              Prospero::RemapTextureFormat(storage_only_format) ==
-                  storage_only_format &&
-              storage_only_surface.vk_format == vk::Format::eR32Sint &&
-              storage_only_surface.conversion_format ==
-                  Prospero::BufferFormat::kInvalid,
-          "storage-only native backing was conflated with sampled support");
+      Require(name, "storage-only surface mapping",
+              !Prospero::IsSampledTextureFormat(storage_only_format) &&
+                  !Prospero::IsUintTextureFormat(storage_only_format) &&
+                  Prospero::RemapTextureFormat(storage_only_format) ==
+                      storage_only_format &&
+                  storage_only_surface.vk_format == vk::Format::eR32Sint &&
+                  storage_only_surface.conversion_format ==
+                      Prospero::BufferFormat::kInvalid,
+              "storage-only native backing was conflated with sampled support");
     }
 
     {
@@ -11997,18 +11988,26 @@ TestCase ScalarNotB64UpdatesScc() {
   code.push_back(EncodeSop1(0x08, 8, 6));
   capture_scc(10);
 
+  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeSop1(0x04, 12, 106));
+  code.push_back(EncodeSop1(0x08, 14, 12));
+  capture_scc(16);
+
   AppendStoreSgpr(&code, 4, 0);
   AppendStoreSgpr(&code, 10, 1);
   AppendStoreSgprPair(&code, 2, 2);
   AppendStoreSgprPair(&code, 8, 4);
+  AppendStoreSgpr(&code, 16, 6);
+  AppendStoreSgprPair(&code, 14, 7);
   AppendEnd(&code);
 
   return {"ScalarNotB64UpdatesScc",
           code,
           {},
-          {0, 1, 0, 0, 1, 0},
+          {0, 1, 0, 0, 1, 0, 0, 0xfffffffeu, 0xffffffffu},
           {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_NOT_B64, O::S_CSELECT_B32,
-           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+           O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarQuadmaskB64() {
@@ -12109,9 +12108,8 @@ TestCase ScalarSaveExecOps() {
   return {"ScalarSaveExecOps",
           code,
           {},
-          {0x00000001u, 0x00000000u, 0x00000001u, 0x00000000u, 0xffffffffu,
-           0xffffffffu, 0xffffffffu, 0x00000003u, 0xffffffffu, 0x00000003u,
-           0x00000002u, 0xffffffffu, 1},
+          // EXEC and saved EXEC values are invocation-local Booleans.
+          {1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0},
           {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
            O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
            O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
@@ -12138,7 +12136,7 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
   return {"ScalarOrn2SaveexecUsesSourceOrNotExec",
           code,
           {},
-          {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
+          {1, 0, 1, 0, 1},
           {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -12380,15 +12378,13 @@ TestCase Scalar64BitOps() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase ScalarAndn2B64SccBranch() {
+TestCase ScalarAndn2B64SccUsesMaskShadow() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
-      EncodeSMovB32(0, InlineU32(3)),
-      EncodeSMovB32(1, InlineU32(0)),
-      EncodeSMovB32(2, InlineU32(1)),
-      EncodeSMovB32(3, InlineU32(0)),
-      EncodeSop2(0x15, 4, 0, 2),
+      EncodeVopc(0xc2, InlineU32(0), 0),
+      EncodeSop1(0x04, 0, 106),
+      EncodeSop2(0x15, 4, 0, InlineU32(0)),
       EncodeVop1(0x01, 0, InlineU32(1)),
       EncodeSopp(0x04, 1),
       EncodeVop1(0x01, 0, InlineU32(7)),
@@ -12396,12 +12392,139 @@ TestCase ScalarAndn2B64SccBranch() {
   AppendStoreVgpr(&code, 0, 0);
   AppendEnd(&code);
 
-  return {"ScalarAndn2B64SccBranch",
+  return {"ScalarAndn2B64SccUsesMaskShadow",
           code,
           {},
           {7},
-          {O::S_MOV_B32, O::S_ANDN2_B64, O::V_MOV_B32, O::S_CBRANCH_SCC0,
+          {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_ANDN2_B64, O::V_MOV_B32,
+           O::S_CBRANCH_SCC0, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase ScalarMaskHighWriteInvalidatesProvenance() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeVopc(0xc2, Vgpr(0), 0),      EncodeSop1(0x04, 0, 106),
+      EncodeSMovB32(1, InlineU32(1)),    EncodeSop1(0x08, 2, 0),
+      EncodeVop1(0x01, 0, InlineU32(1)), EncodeSopp(0x04, 1),
+      EncodeVop1(0x01, 0, InlineU32(7)),
+  };
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  return {"ScalarMaskHighWriteInvalidatesProvenance",
+          code,
+          {},
+          {7},
+          {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_MOV_B32, O::S_NOT_B64,
+           O::V_MOV_B32, O::S_CBRANCH_SCC0, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
+TestCase ScalarSelectB64PreservesMaskProvenance() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  const auto set_scc = [&] {
+    code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
+  };
+  const auto capture_scc = [&](u32 dst) {
+    code.push_back(EncodeSop2(0x0a, dst, InlineU32(1), InlineU32(0)));
+  };
+
+  AppendSMovLiteral(&code, 0, 0xfffffffeu);
+  AppendSMovLiteral(&code, 1, 0xffffffffu);
+  code.push_back(EncodeSMovB32(2, InlineU32(0)));
+  code.push_back(EncodeSMovB32(3, InlineU32(0)));
+  set_scc();
+  code.push_back(EncodeSop2(0x0b, 4, 0, 2));
+  code.push_back(EncodeSop1(0x08, 6, 4));
+  capture_scc(8);
+
+  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeSop1(0x04, 10, 106));
+  set_scc();
+  code.push_back(EncodeSop2(0x0b, 12, 10, 2));
+  code.push_back(EncodeSop1(0x08, 14, 12));
+  capture_scc(16);
+
+  AppendStoreSgpr(&code, 8, 0);
+  AppendStoreSgpr(&code, 16, 1);
+  AppendEnd(&code);
+
+  return {"ScalarSelectB64PreservesMaskProvenance",
+          code,
+          {},
+          {1, 0},
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B64, O::S_NOT_B64,
+           O::S_CSELECT_B32, O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase ScalarWqmB64SelectsSccDomain() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  const auto capture_scc = [&](u32 dst) {
+    code.push_back(EncodeSop2(0x0a, dst, InlineU32(1), InlineU32(0)));
+  };
+
+  code.push_back(EncodeSMovB32(0, InlineU32(0)));
+  code.push_back(EncodeSMovB32(1, InlineU32(1)));
+  code.push_back(EncodeSop1(0x0a, 2, 0));
+  capture_scc(4);
+
+  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeSop1(0x04, 6, 106));
+  code.push_back(EncodeSop1(0x08, 8, 6));
+  code.push_back(EncodeSop1(0x0a, 10, 8));
+  capture_scc(12);
+
+  AppendStoreSgpr(&code, 4, 0);
+  AppendStoreSgpr(&code, 12, 1);
+  AppendEnd(&code);
+
+  return {"ScalarWqmB64SelectsSccDomain",
+          code,
+          {},
+          {1, 0},
+          {O::S_MOV_B32, O::S_WQM_B64, O::S_CSELECT_B32, O::V_CMP_EQ_U32,
+           O::S_MOV_B64, O::S_NOT_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
+TestCase ScalarMaskProvenanceOverlapAndMixedBinary() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  const auto capture_scc = [&](u32 dst) {
+    code.push_back(EncodeSop2(0x0a, dst, InlineU32(1), InlineU32(0)));
+  };
+
+  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeSop1(0x04, 0, 106));
+  code.push_back(EncodeSop1(0x04, 1, 0));
+  code.push_back(EncodeSop1(0x08, 3, 1));
+  capture_scc(5);
+
+  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeSop1(0x04, 8, 106));
+  code.push_back(EncodeSMovB32(10, InlineU32(1)));
+  code.push_back(EncodeSMovB32(11, InlineU32(0)));
+  code.push_back(EncodeSop2(0x19, 12, 8, 10));
+  capture_scc(14);
+
+  AppendStoreSgpr(&code, 5, 0);
+  AppendStoreSgpr(&code, 14, 1);
+  AppendEnd(&code);
+
+  return {"ScalarMaskProvenanceOverlapAndMixedBinary",
+          code,
+          {},
+          {0, 1},
+          {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_NOT_B64, O::S_CSELECT_B32,
+           O::S_MOV_B32, O::S_NAND_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase ScalarLiteral() {
@@ -13003,7 +13126,9 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   TestCase test;
   test.name = "VectorAddcWritesPerLaneCarryOut";
   test.code = code;
-  test.expected = std::vector<u32>(8, 0x0fu);
+  // VCC is represented as the current invocation's carry bit, not a shared
+  // four-lane ballot word.
+  test.expected = std::vector<u32>(8, 1u);
   test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32, O::V_ADD_NC_U32,
                   O::V_CMP_F_U32, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -13121,7 +13246,8 @@ TestCase VectorVop3BCarryOutWritesSgprMask() {
   TestCase test;
   test.name = "VectorVop3BCarryOutWritesSgprMask";
   test.code = code;
-  test.expected = std::vector<u32>(12, 0x0fu);
+  // Scalar mask destinations keep the current invocation's bit.
+  test.expected = std::vector<u32>(12, 1u);
   test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
                   O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -13153,7 +13279,7 @@ TestCase VectorVop3BCarryOutUsesEncodedSdst() {
   TestCase test;
   test.name = "VectorVop3BCarryOutUsesEncodedSdst";
   test.code = code;
-  test.expected = std::vector<u32>(12, 0x0fu);
+  test.expected = std::vector<u32>(12, 1u);
   test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
                   O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -13192,7 +13318,7 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
   TestCase test;
   test.name = "VectorVop3BSubCoU32UsesRdna2Opcode310";
   test.code = code;
-  test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 9, 9, 9, 9};
+  test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 1, 0, 0, 1};
   test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32,       O::V_CNDMASK_B32,
                   O::V_SUB_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -13631,9 +13757,12 @@ TestCase VectorPermlane16FetchInactiveZero() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
-      EncodeVop1(0x01, 1, 0),           EncodeVop2(0x25, 1, InlineU32(10), 1),
-      EncodeSMovB32(126, InlineU32(1)), EncodeSMovB32(127, InlineU32(0)),
-      EncodeSMovB32(0, InlineU32(1)),   EncodeSMovB32(1, InlineU32(0)),
+      EncodeVop1(0x01, 1, 0),
+      EncodeVop2(0x25, 1, InlineU32(10), 1),
+      EncodeVopc(0xc2, InlineU32(0), 0),
+      EncodeSop1(0x04, 126, 106),
+      EncodeSMovB32(0, InlineU32(1)),
+      EncodeSMovB32(1, InlineU32(0)),
   };
   AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1);
   AppendStoreVgpr(&code, 2, 0);
@@ -13643,8 +13772,9 @@ TestCase VectorPermlane16FetchInactiveZero() {
   test.name = "VectorPermlane16FetchInactiveZero";
   test.code = code;
   test.expected = {0};
-  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,       O::S_MOV_B32,
-                  O::V_PERMLANE16_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13657,9 +13787,9 @@ TestCase VectorPermlane16FetchInactiveFi() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
-      EncodeVop1(0x01, 1, Vgpr(0)),     EncodeVop2(0x25, 1, InlineU32(10), 1),
-      EncodeSMovB32(126, InlineU32(1)), EncodeSMovB32(127, InlineU32(0)),
-      EncodeSMovB32(0, InlineU32(1)),   EncodeSMovB32(1, InlineU32(0)),
+      EncodeVop1(0x01, 1, Vgpr(0)),      EncodeVop2(0x25, 1, InlineU32(10), 1),
+      EncodeVopc(0xc2, InlineU32(0), 0), EncodeSop1(0x04, 126, 106),
+      EncodeSMovB32(0, InlineU32(1)),    EncodeSMovB32(1, InlineU32(0)),
   };
   AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1, 0, 1);
   AppendStoreVgpr(&code, 2, 0);
@@ -13669,8 +13799,9 @@ TestCase VectorPermlane16FetchInactiveFi() {
   test.name = "VectorPermlane16FetchInactiveFi";
   test.code = code;
   test.expected = {11};
-  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,       O::S_MOV_B32,
-                  O::V_PERMLANE16_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -13803,11 +13934,10 @@ TestCase Vop1MoveRelDestination() {
   AppendVMovLiteral(&code, 6, 0xbbbbbbbbu);
   AppendVMovLiteral(&code, 7, 0xccccccccu);
   code.push_back(EncodeSMovB32(124, InlineU32(2)));
-  code.push_back(EncodeSMovB32(126, InlineU32(1)));
-  code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
+  code.push_back(EncodeSop1(0x04, 126, 106));
   code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
-  code.push_back(EncodeSMovB32(126, InlineU32(0xf)));
-  code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  code.push_back(EncodeSop1(0x04, 126, 193u));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 7, 4);
   AppendEnd(&code);
@@ -13816,8 +13946,9 @@ TestCase Vop1MoveRelDestination() {
   test.name = "Vop1MoveRelDestination";
   test.code = code;
   test.expected = {0x12345678u, 0xccccccccu, 0xccccccccu, 0xccccccccu};
-  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,          O::V_MOVRELD_B32,
-                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32,          O::S_MOV_B32,     O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,          O::V_MOVRELD_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -14542,7 +14673,6 @@ TestCase VectorVop3CompareGtU64OnGpu() {
                 {1, 1, 0},
                 {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_GT_U64, O::V_CNDMASK_B32,
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.required_spirv = {"OpUGreaterThan"};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -14731,13 +14861,10 @@ TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
-      EncodeVop1(0x01, 1, 0),
-      EncodeVop2(0x1a, 1, InlineU32(2), 1),
-      EncodeVop2(0x25, 1, Vgpr(0), 1),
-      EncodeVopc(0xc0, Vgpr(0), 0),
+      EncodeVop1(0x01, 1, 0),          EncodeVop2(0x1a, 1, InlineU32(2), 1),
+      EncodeVop2(0x25, 1, Vgpr(0), 1), EncodeVopc(0xc2, InlineU32(0), 0),
+      EncodeSop1(0x04, 4, 106),
   };
-  AppendSMovLiteral(&code, 4, 1);
-  AppendSMovLiteral(&code, 5, 0);
   AppendVop3(&code, 0x101, 2, InlineU32(10), InlineU32(20), 4);
   code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 1));
   AppendBufferStoreDword(&code, 2, 3);
@@ -14748,7 +14875,7 @@ TestCase Vop3CndmaskUsesSgprMaskLaneBits() {
   test.code = code;
   test.expected = {20, 10, 10, 10, 20, 10, 10, 10};
   test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32, O::V_ADD_NC_U32,
-                  O::V_CMP_F_U32,        O::S_MOV_B32,     O::V_CNDMASK_B32,
+                  O::V_CMP_EQ_U32,       O::S_MOV_B64,     O::V_CNDMASK_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -14962,7 +15089,7 @@ TestCase SimpleLoop() {
            O::S_BRANCH, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase BranchVccnzUsesWholeMask() {
+TestCase BranchVccnzUsesInvocationMask() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
@@ -14980,9 +15107,9 @@ TestCase BranchVccnzUsesWholeMask() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BranchVccnzUsesWholeMask";
+  test.name = "BranchVccnzUsesInvocationMask";
   test.code = code;
-  test.expected = std::vector<u32>(8, 42);
+  test.expected = {42, 11, 11, 11, 42, 11, 11, 11};
   test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,   O::V_ADD_NC_U32,
                   O::V_CMP_EQ_U32,       O::S_CBRANCH_VCCNZ, O::S_BRANCH,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -16647,7 +16774,7 @@ TestCase FlatSubdwordLoadsApplyByteOffset() {
   return test;
 }
 
-TestCase BranchVccnzUsesCarryProducedWholeMask() {
+TestCase BranchVccnzUsesCarryProducedInvocationMask() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
@@ -16665,9 +16792,9 @@ TestCase BranchVccnzUsesCarryProducedWholeMask() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BranchVccnzUsesCarryProducedWholeMask";
+  test.name = "BranchVccnzUsesCarryProducedInvocationMask";
   test.code = code;
-  test.expected = std::vector<u32>(8, 42);
+  test.expected = {11, 42, 42, 42, 42, 42, 42, 42};
   test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32,      O::V_ADD_NC_U32,
                   O::V_CMP_F_U32, O::V_ADDC_U32,         O::S_CBRANCH_VCCNZ,
                   O::S_BRANCH,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -18165,7 +18292,8 @@ TestCase ImageD16GatherPacksHalfPairs() {
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.native_ir_counts = {{"dmask=0x1 data_dwords=2 data_bits=16 component=0/4", 1}};
+  test.native_ir_counts = {
+      {"dmask=0x1 data_dwords=2 data_bits=16 component=0/4", 1}};
   test.required_spirv = {"OpImageGather", "PackHalf2x16"};
   return test;
 }
@@ -18376,8 +18504,8 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   AppendEnd(&code);
 
   auto expected_image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&expected_image, 4, 1, 2, 0x3e800000u, 0x3f000000u,
-               0x3f400000u, 0x3f800000u);
+  SetRgbaPixel(&expected_image, 4, 1, 2, 0x3e800000u, 0x3f000000u, 0x3f400000u,
+               0x3f800000u);
 
   TestCase test;
   test.name = "ImageD16StoreUnpacksHalfPairs";
@@ -18386,7 +18514,8 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.expected_storage_image_rgba = expected_image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.native_ir_counts = {{"dmask=0xf data_dwords=2 data_bits=16 component=0/4", 1}};
+  test.native_ir_counts = {
+      {"dmask=0xf data_dwords=2 data_bits=16 component=0/4", 1}};
   test.required_spirv = {"UnpackHalf2x16", "OpImageWrite"};
   return test;
 }
@@ -19286,7 +19415,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
-  AddCase(ScalarAndn2B64SccBranch);
+  AddCase(ScalarAndn2B64SccUsesMaskShadow);
+  AddCase(ScalarMaskHighWriteInvalidatesProvenance);
+  AddCase(ScalarSelectB64PreservesMaskProvenance);
+  AddCase(ScalarWqmB64SelectsSccDomain);
+  AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
@@ -19365,8 +19498,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
-  AddCase(BranchVccnzUsesWholeMask);
-  AddCase(BranchVccnzUsesCarryProducedWholeMask);
+  AddCase(BranchVccnzUsesInvocationMask);
+  AddCase(BranchVccnzUsesCarryProducedInvocationMask);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
@@ -21053,8 +21186,8 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA02604 BGRA 2D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), bgra, 0x870000);
 
-  const ShaderTextureResource r128{{0x0202e500u, 0xc8200000u, 0x010dc1dfu,
-                                    0x91b00facu, 0, 0, 0, 0}};
+  const ShaderTextureResource r128{
+      {0x0202e500u, 0xc8200000u, 0x010dc1dfu, 0x91b00facu, 0, 0, 0, 0}};
   auto r128_resource = BasicBgraStorageTextureResource();
   r128_resource.r128 = true;
   Require("BasicStorageTexture", "PPSA01736 R128 descriptor",
@@ -22542,7 +22675,8 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
           processor.Process(execution, packet.data(), packet.size()) ==
                   Pm4ProcessResult::Complete &&
               processor.GetShCtx().GetVs().es_regs.data_addr == shader_address,
-          "direct SET_SH_REG did not route its ES base pair through the register handlers");
+          "direct SET_SH_REG did not route its ES base pair through the "
+          "register handlers");
   std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
 }
 
@@ -22577,7 +22711,8 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
       std::bit_cast<uint32_t>(10.0f),
   };
   Pm4Execution range_execution;
-  const auto range_result = processor.Process(range_execution, range.data(), range.size());
+  const auto range_result =
+      processor.Process(range_execution, range.data(), range.size());
   const auto &range_viewport = processor.GetCtx().GetScreenViewport();
   Require("Pm4GuardBandRegisterRanges", "full range",
           range_result == Pm4ProcessResult::Complete &&
@@ -22644,12 +22779,13 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
       std::bit_cast<uint32_t>(14.0f),
   };
   Pm4Execution full_execution;
-  const auto full_result = processor.Process(full_execution, full.data(), full.size());
+  const auto full_result =
+      processor.Process(full_execution, full.data(), full.size());
   const auto &full_color = processor.GetCtx().GetBlendColor();
   Require("Pm4BlendColorRegisterRanges", "full range",
-          full_result == Pm4ProcessResult::Complete && full_color.red == 11.0f &&
-              full_color.green == 12.0f && full_color.blue == 13.0f &&
-              full_color.alpha == 14.0f,
+          full_result == Pm4ProcessResult::Complete &&
+              full_color.red == 11.0f && full_color.green == 12.0f &&
+              full_color.blue == 13.0f && full_color.alpha == 14.0f,
           "full blend-color range did not preserve native PS5 register order");
   std::printf("[host]    %-32s ok\n", "Pm4BlendColorRegisterRanges");
 }
@@ -22727,28 +22863,27 @@ void CheckAgcWaitPackets(RenderContext &renderer) {
                                nullptr,
                                0};
   const auto address32 = reinterpret_cast<uint64_t>(&label32);
-  auto *emitted32 = Gen5::AgcDcbWaitRegMem(
-      reinterpret_cast<Gen5::CommandBuffer *>(&dcb32), 0, 3, 0, 0,
-      &label32, label32, UINT32_MAX, 400);
-  Require(
-      "AgcWaitPackets", "native 32-bit packet",
-      Gen5::AgcDcbWaitOnAddressGetSize(0) == 56 &&
-          emitted32 == packet32.data() &&
-          dcb32.cursor_up == packet32.data() + 14 &&
-          packet32[0] == 0xc0027904u && packet32[1] == 0x342u &&
-          packet32[2] ==
-              (0xc8010000u |
-               (static_cast<uint32_t>(address32 >> 32u) & 0xffffu)) &&
-          packet32[3] == static_cast<uint32_t>(address32) &&
-          packet32[4] == 0xc0053c00u && packet32[5] == 0x13u &&
-          packet32[6] == (static_cast<uint32_t>(address32) & ~0x3u) &&
-          packet32[7] ==
-              (static_cast<uint32_t>(address32 >> 32u) & 0x3ffffu) &&
-          packet32[8] == label32 && packet32[9] == UINT32_MAX &&
-          packet32[10] == 25u && packet32[11] == 0xc0017904u &&
-          packet32[12] == 0x342u && packet32[13] == 0xc8000000u &&
-          execute(packet32.data(), 14),
-      "32-bit waitOnAddress stream differs from native AGC");
+  auto *emitted32 =
+      Gen5::AgcDcbWaitRegMem(reinterpret_cast<Gen5::CommandBuffer *>(&dcb32), 0,
+                             3, 0, 0, &label32, label32, UINT32_MAX, 400);
+  Require("AgcWaitPackets", "native 32-bit packet",
+          Gen5::AgcDcbWaitOnAddressGetSize(0) == 56 &&
+              emitted32 == packet32.data() &&
+              dcb32.cursor_up == packet32.data() + 14 &&
+              packet32[0] == 0xc0027904u && packet32[1] == 0x342u &&
+              packet32[2] ==
+                  (0xc8010000u |
+                   (static_cast<uint32_t>(address32 >> 32u) & 0xffffu)) &&
+              packet32[3] == static_cast<uint32_t>(address32) &&
+              packet32[4] == 0xc0053c00u && packet32[5] == 0x13u &&
+              packet32[6] == (static_cast<uint32_t>(address32) & ~0x3u) &&
+              packet32[7] ==
+                  (static_cast<uint32_t>(address32 >> 32u) & 0x3ffffu) &&
+              packet32[8] == label32 && packet32[9] == UINT32_MAX &&
+              packet32[10] == 25u && packet32[11] == 0xc0017904u &&
+              packet32[12] == 0x342u && packet32[13] == 0xc8000000u &&
+              execute(packet32.data(), 14),
+          "32-bit waitOnAddress stream differs from native AGC");
 
   alignas(8) uint32_t patched_label32 = 0xaabbccddu;
   const auto patched_address32 = reinterpret_cast<uint64_t>(&patched_label32);
@@ -22757,7 +22892,8 @@ void CheckAgcWaitPackets(RenderContext &renderer) {
   Require(
       "AgcWaitPackets", "native 32-bit patch",
       Gen5::AgcWaitRegMemPatchAddress(packet32.data(), &patched_label32) == 0 &&
-          Gen5::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) == 0 &&
+          Gen5::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) ==
+              0 &&
           packet32[2] ==
               (0xc8010000u |
                (static_cast<uint32_t>(patched_address32 >> 32u) & 0xffffu)) &&
@@ -22780,31 +22916,30 @@ void CheckAgcWaitPackets(RenderContext &renderer) {
                                nullptr,
                                0};
   const auto address64 = reinterpret_cast<uint64_t>(&label64);
-  auto *emitted64 = Gen5::AgcDcbWaitRegMem(
-      reinterpret_cast<Gen5::CommandBuffer *>(&dcb64), 1, 3, 0, 0,
-      &label64, label64, UINT64_MAX, 400);
-  Require(
-      "AgcWaitPackets", "native 64-bit packet",
-      Gen5::AgcDcbWaitOnAddressGetSize(1) == 64 &&
-          Gen5::AgcDcbWaitOnAddressGetSize(2) == 0 &&
-          emitted64 == packet64.data() &&
-          dcb64.cursor_up == packet64.data() + packet64.size() &&
-          packet64[0] == 0xc0027904u && packet64[1] == 0x342u &&
-          packet64[2] ==
-              (0xc8020000u |
-               (static_cast<uint32_t>(address64 >> 32u) & 0xffffu)) &&
-          packet64[3] == static_cast<uint32_t>(address64) &&
-          packet64[4] == 0xc0079300u && packet64[5] == 0x13u &&
-          packet64[6] == (static_cast<uint32_t>(address64) & ~0x7u) &&
-          packet64[7] ==
-              (static_cast<uint32_t>(address64 >> 32u) & 0x3ffffu) &&
-          packet64[8] == static_cast<uint32_t>(label64) &&
-          packet64[9] == static_cast<uint32_t>(label64 >> 32u) &&
-          packet64[10] == UINT32_MAX && packet64[11] == UINT32_MAX &&
-          packet64[12] == 25u && packet64[13] == 0xc0017904u &&
-          packet64[14] == 0x342u && packet64[15] == 0xc8000000u &&
-          execute(packet64.data(), packet64.size()),
-      "64-bit waitOnAddress stream differs from native AGC");
+  auto *emitted64 =
+      Gen5::AgcDcbWaitRegMem(reinterpret_cast<Gen5::CommandBuffer *>(&dcb64), 1,
+                             3, 0, 0, &label64, label64, UINT64_MAX, 400);
+  Require("AgcWaitPackets", "native 64-bit packet",
+          Gen5::AgcDcbWaitOnAddressGetSize(1) == 64 &&
+              Gen5::AgcDcbWaitOnAddressGetSize(2) == 0 &&
+              emitted64 == packet64.data() &&
+              dcb64.cursor_up == packet64.data() + packet64.size() &&
+              packet64[0] == 0xc0027904u && packet64[1] == 0x342u &&
+              packet64[2] ==
+                  (0xc8020000u |
+                   (static_cast<uint32_t>(address64 >> 32u) & 0xffffu)) &&
+              packet64[3] == static_cast<uint32_t>(address64) &&
+              packet64[4] == 0xc0079300u && packet64[5] == 0x13u &&
+              packet64[6] == (static_cast<uint32_t>(address64) & ~0x7u) &&
+              packet64[7] ==
+                  (static_cast<uint32_t>(address64 >> 32u) & 0x3ffffu) &&
+              packet64[8] == static_cast<uint32_t>(label64) &&
+              packet64[9] == static_cast<uint32_t>(label64 >> 32u) &&
+              packet64[10] == UINT32_MAX && packet64[11] == UINT32_MAX &&
+              packet64[12] == 25u && packet64[13] == 0xc0017904u &&
+              packet64[14] == 0x342u && packet64[15] == 0xc8000000u &&
+              execute(packet64.data(), packet64.size()),
+          "64-bit waitOnAddress stream differs from native AGC");
 
   alignas(8) uint64_t patched_label64 = 0x11223344aabbccddull;
   const auto patched_address64 = reinterpret_cast<uint64_t>(&patched_label64);
@@ -22826,18 +22961,20 @@ void CheckAgcWaitPackets(RenderContext &renderer) {
                0x5a580000u) &&
           packet64[8] == 0xaabbccddu && packet64[9] == 0x11223344u &&
           execute(packet64.data(), packet64.size()),
-      "64-bit native wait patch did not preserve the native high reference DWORD");
+      "64-bit native wait patch did not preserve the native high reference "
+      "DWORD");
 
   std::array<uint32_t, 16> invalid{};
   const uint32_t short_payload = 0x342u;
-  Require("AgcWaitPackets", "invalid packet",
-          Gen5::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
-                  packet_mismatch &&
-              Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
-                  packet_mismatch &&
-              !Gen5::AgcIsInternalDataPacket(
-                  KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
-          "native wait patch accepted a packet without the AGC metadata prefix");
+  Require(
+      "AgcWaitPackets", "invalid packet",
+      Gen5::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
+              packet_mismatch &&
+          Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
+              packet_mismatch &&
+          !Gen5::AgcIsInternalDataPacket(
+              KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
+      "native wait patch accepted a packet without the AGC metadata prefix");
   std::printf("[host]    %-32s ok\n", "AgcWaitPackets");
 }
 
@@ -22873,17 +23010,17 @@ void CheckAgcDrawIndirectMultiPacket(RenderContext &renderer) {
       0x55667788u, count_address, 0xaabbccddu, modifier);
 
   const uint32_t invalid_payload[]{0x342u, 0xc6000010u};
-  Require(
-      "AgcDrawIndirectMulti", "native packet",
-      emitted == packet.data() && dcb.cursor_up == packet.data() + packet.size() &&
-          packet == expected && execute(packet.data(), 3u) &&
-          execute(packet.data() + 13u, 3u) &&
-          Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
-              packet_mismatch &&
-          Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
-              packet_mismatch &&
-          !Gen5::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
-      "drawIndirectMulti stream differs from native AGC");
+  Require("AgcDrawIndirectMulti", "native packet",
+          emitted == packet.data() &&
+              dcb.cursor_up == packet.data() + packet.size() &&
+              packet == expected && execute(packet.data(), 3u) &&
+              execute(packet.data() + 13u, 3u) &&
+              Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
+                  packet_mismatch &&
+              Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
+                  packet_mismatch &&
+              !Gen5::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
+          "drawIndirectMulti stream differs from native AGC");
   std::printf("[host]    %-32s ok\n", "AgcDrawIndirectMulti");
 }
 

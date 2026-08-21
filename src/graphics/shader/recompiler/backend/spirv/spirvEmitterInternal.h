@@ -251,30 +251,30 @@ enum : uint32_t {
 };
 
 enum : uint32_t {
-	GlslRoundEven      = 2,
-	GlslTrunc          = 3,
-	GlslFAbs           = 4,
-	GlslFloor          = 8,
-	GlslCeil           = 9,
-	GlslFract          = 10,
-	GlslSin            = 13,
-	GlslCos            = 14,
-	GlslExp2           = 29,
-	GlslLog2           = 30,
-	GlslSqrt           = 31,
-	GlslInverseSqrt    = 32,
-	GlslFMin           = 37,
-	GlslFMax           = 40,
-	GlslFClamp         = 43,
-	GlslLdexp          = 53,
-	GlslFma            = 50,
-	GlslPackSnorm2x16  = 56,
-	GlslPackUnorm2x16  = 57,
-	GlslPackHalf2x16   = 58,
+	GlslRoundEven       = 2,
+	GlslTrunc           = 3,
+	GlslFAbs            = 4,
+	GlslFloor           = 8,
+	GlslCeil            = 9,
+	GlslFract           = 10,
+	GlslSin             = 13,
+	GlslCos             = 14,
+	GlslExp2            = 29,
+	GlslLog2            = 30,
+	GlslSqrt            = 31,
+	GlslInverseSqrt     = 32,
+	GlslFMin            = 37,
+	GlslFMax            = 40,
+	GlslFClamp          = 43,
+	GlslLdexp           = 53,
+	GlslFma             = 50,
+	GlslPackSnorm2x16   = 56,
+	GlslPackUnorm2x16   = 57,
+	GlslPackHalf2x16    = 58,
 	GlslUnpackUnorm2x16 = 61,
-	GlslUnpackHalf2x16 = 62,
-	GlslFindILsb       = 73,
-	GlslFindUMsb       = 75,
+	GlslUnpackHalf2x16  = 62,
+	GlslFindILsb        = 73,
+	GlslFindUMsb        = 75,
 };
 
 struct InputBinding {
@@ -325,41 +325,40 @@ struct EmitterState {
 	    : program(program_), resources(resources_), input_info(input_info_),
 	      requirements(*program_.spirv_requirements) {}
 
-	Builder                                          builder;
-	const IR::Program&                               program;
-	const IR::ResourceSnapshot&                      resources;
-	ShaderStageInputInfo                             input_info;
-	const IR::SpirvRequirements&                     requirements;
-	ShaderType                                       stage                   = ShaderType::Unknown;
-	uint32_t                                         wave_size               = 64;
-	bool                                             per_invocation_masks    = false;
-	uint32_t                                         storage_buffer_variable = 0;
+	Builder                      builder;
+	const IR::Program&           program;
+	const IR::ResourceSnapshot&  resources;
+	ShaderStageInputInfo         input_info;
+	const IR::SpirvRequirements& requirements;
+	ShaderType                   stage                   = ShaderType::Unknown;
+	uint32_t                     wave_size               = 64;
+	uint32_t                     storage_buffer_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers + IR::ShaderInfo::MaxAddresses>
-	                                                 memory_byte_offsets {};
-	uint32_t                                         address_memory_variable = 0;
-	uint32_t                                         gds_variable            = 0;
-	uint32_t                                         gds_length              = 0;
-	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         vsharp_storage_variable = 0;
-	uint32_t                                         flattened_srt_variable  = 0;
-	uint32_t                                         lds_variable            = 0;
-	uint32_t                                         scratch_variable        = 0;
+	                                                     memory_byte_offsets {};
+	uint32_t                                             address_memory_variable = 0;
+	uint32_t                                             gds_variable            = 0;
+	uint32_t                                             gds_length              = 0;
+	uint32_t                                             push_constant_variable  = 0;
+	uint32_t                                             vsharp_storage_variable = 0;
+	uint32_t                                             flattened_srt_variable  = 0;
+	uint32_t                                             lds_variable            = 0;
+	uint32_t                                             scratch_variable        = 0;
 	std::array<uint32_t, 2u * SampledImageViewKindCount> sampled_image_variables {};
 	std::array<uint32_t,
 	           static_cast<uint32_t>(StorageImageClass::Count) * StorageImageViewKindCount>
-	                                                 storage_image_variables {};
-	uint32_t                                         sampler_variable                      = 0;
-	uint32_t                                         main_func                             = 0;
-	uint32_t                                         entry_label                           = 0;
-	uint32_t                                         current_label                         = 0;
-	uint32_t                                         pixel_valid_mask_variable             = 0;
-	uint32_t                                         subgroup_local_invocation_id_variable = 0;
-	uint32_t                                         per_vertex_variable                   = 0;
-	uint32_t                                         depth_variable                        = 0;
-	uint32_t                                         sample_mask_variable                  = 0;
-	std::vector<InputBinding>                        inputs;
-	std::vector<OutputBinding>                       outputs;
-	std::vector<uint32_t>                            interface_variables;
+	                           storage_image_variables {};
+	uint32_t                   sampler_variable                      = 0;
+	uint32_t                   main_func                             = 0;
+	uint32_t                   entry_label                           = 0;
+	uint32_t                   current_label                         = 0;
+	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   per_vertex_variable                   = 0;
+	uint32_t                   depth_variable                        = 0;
+	uint32_t                   sample_mask_variable                  = 0;
+	std::vector<InputBinding>  inputs;
+	std::vector<OutputBinding> outputs;
+	std::vector<uint32_t>      interface_variables;
 };
 
 uint32_t TypeVoid(EmitterState& state);

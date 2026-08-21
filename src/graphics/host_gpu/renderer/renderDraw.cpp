@@ -18,7 +18,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
-#include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1061,12 +1060,10 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		target_export_mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
 	}
-	const auto lane_mask_mode = SelectGraphicsLaneMaskMode(64u);
-
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoVS");
 	}
-	if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
+	if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, state.vs_input_info,
 	                         state.vs_shader)) {
 		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
 	}
@@ -1077,7 +1074,7 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
-	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
+	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, state.vs_input_info,
 	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}

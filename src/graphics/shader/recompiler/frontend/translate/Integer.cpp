@@ -126,62 +126,26 @@ bool Translator::TranslatePackedInteger16(const IR::Instruction& inst) {
 	}
 }
 
-bool Translator::TranslatePerInvocationU64Mask(const IR::Instruction& inst) {
-	if (!current_per_invocation_masks) {
-		return false;
-	}
-
+IR::U1 Translator::EvaluateU64Mask(const IR::Instruction& inst) {
 	const auto lhs = [&] { return ReadMask(inst.src[0]); };
 	const auto rhs = [&] { return ReadMask(inst.src[1]); };
-	IR::U1     result;
 	switch (inst.op) {
-		case IR::Opcode::BitwiseAndU64: result = ir.LogicalAnd(lhs(), rhs()); break;
-		case IR::Opcode::BitwiseOrU64: result = ir.LogicalOr(lhs(), rhs()); break;
+		case IR::Opcode::BitwiseAndU64: return ir.LogicalAnd(lhs(), rhs());
+		case IR::Opcode::BitwiseOrU64: return ir.LogicalOr(lhs(), rhs());
 		case IR::Opcode::BitwiseXorU64:
-			result = IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {lhs(), rhs()}));
-			break;
-		case IR::Opcode::BitwiseAndNotU64:
-			result = ir.LogicalAnd(lhs(), ir.LogicalNot(rhs()));
-			break;
-		case IR::Opcode::BitwiseOrNotU64: result = ir.LogicalOr(lhs(), ir.LogicalNot(rhs())); break;
-		case IR::Opcode::BitwiseNandU64: result = ir.LogicalNot(ir.LogicalAnd(lhs(), rhs())); break;
-		case IR::Opcode::BitwiseNorU64: result = ir.LogicalNot(ir.LogicalOr(lhs(), rhs())); break;
+			return IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {lhs(), rhs()}));
+		case IR::Opcode::BitwiseAndNotU64: return ir.LogicalAnd(lhs(), ir.LogicalNot(rhs()));
+		case IR::Opcode::BitwiseOrNotU64: return ir.LogicalOr(lhs(), ir.LogicalNot(rhs()));
+		case IR::Opcode::BitwiseNandU64: return ir.LogicalNot(ir.LogicalAnd(lhs(), rhs()));
+		case IR::Opcode::BitwiseNorU64: return ir.LogicalNot(ir.LogicalOr(lhs(), rhs()));
 		case IR::Opcode::BitwiseXnorU64:
-			result = ir.LogicalNot(IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {lhs(), rhs()})));
-			break;
-		case IR::Opcode::BitwiseNotU64: result = ir.LogicalNot(lhs()); break;
-		default: return false;
+			return ir.LogicalNot(IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {lhs(), rhs()})));
+		case IR::Opcode::BitwiseNotU64: return ir.LogicalNot(lhs());
+		default: EXIT("invalid 64-bit mask opcode");
 	}
-	WriteMask64(inst.dst, result);
-	return true;
 }
 
 bool Translator::TranslateSimpleInteger(const IR::Instruction& inst) {
-	if (inst.op == IR::Opcode::BitwiseAndU64 || inst.op == IR::Opcode::BitwiseOrU64 ||
-	    inst.op == IR::Opcode::BitwiseXorU64 || inst.op == IR::Opcode::BitwiseNotU64) {
-		const auto             lhs = ReadU32Pair(inst.src[0]);
-		std::array<IR::U32, 2> result;
-		if (inst.op == IR::Opcode::BitwiseNotU64) {
-			result = {ir.BitwiseNot(lhs[0]), ir.BitwiseNot(lhs[1])};
-		} else {
-			const auto rhs = ReadU32Pair(inst.src[1]);
-			for (uint32_t component = 0; component < 2; component++) {
-				switch (inst.op) {
-					case IR::Opcode::BitwiseAndU64:
-						result[component] = ir.BitwiseAnd(lhs[component], rhs[component]);
-						break;
-					case IR::Opcode::BitwiseOrU64:
-						result[component] = ir.BitwiseOr(lhs[component], rhs[component]);
-						break;
-					default:
-						result[component] = ir.BitwiseXor(lhs[component], rhs[component]);
-						break;
-				}
-			}
-		}
-		WriteU32Pair(inst.dst, result);
-		return true;
-	}
 	IR::ValueOpcode opcode {};
 	IR::Type        type = IR::Type::U32;
 	switch (inst.op) {
@@ -250,37 +214,6 @@ bool Translator::TranslateSimpleInteger(const IR::Instruction& inst) {
 }
 
 bool Translator::TranslateComposedInteger(const IR::Instruction& inst) {
-	if (inst.op == IR::Opcode::BitwiseAndNotU64 || inst.op == IR::Opcode::BitwiseOrNotU64 ||
-	    inst.op == IR::Opcode::BitwiseNandU64 || inst.op == IR::Opcode::BitwiseNorU64 ||
-	    inst.op == IR::Opcode::BitwiseXnorU64) {
-		const auto             lhs = ReadU32Pair(inst.src[0]);
-		const auto             rhs = ReadU32Pair(inst.src[1]);
-		std::array<IR::U32, 2> result;
-		for (uint32_t component = 0; component < 2; component++) {
-			switch (inst.op) {
-				case IR::Opcode::BitwiseAndNotU64:
-					result[component] =
-					    ir.BitwiseAnd(lhs[component], ir.BitwiseNot(rhs[component]));
-					break;
-				case IR::Opcode::BitwiseOrNotU64:
-					result[component] = ir.BitwiseOr(lhs[component], ir.BitwiseNot(rhs[component]));
-					break;
-				case IR::Opcode::BitwiseNandU64:
-					result[component] =
-					    ir.BitwiseNot(ir.BitwiseAnd(lhs[component], rhs[component]));
-					break;
-				case IR::Opcode::BitwiseNorU64:
-					result[component] = ir.BitwiseNot(ir.BitwiseOr(lhs[component], rhs[component]));
-					break;
-				default:
-					result[component] =
-					    ir.BitwiseNot(ir.BitwiseXor(lhs[component], rhs[component]));
-					break;
-			}
-		}
-		WriteU32Pair(inst.dst, result);
-		return true;
-	}
 	const auto binary_u32 = [&](auto operation) {
 		const auto lhs = ReadU32(inst.src[0]);
 		const auto rhs = ReadU32(inst.src[1]);
@@ -612,10 +545,28 @@ bool Translator::TranslateExtendedInteger(const IR::Instruction& inst) {
 		}
 		case IR::Opcode::SelectU64: {
 			const auto condition = ReadCondition(inst.src[0]);
-			const auto lhs       = ReadU32Pair(inst.src[1]);
-			const auto rhs       = ReadU32Pair(inst.src[2]);
+			const auto selected_mask =
+			    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
+			                   {condition, ReadMask(inst.src[1]), ReadMask(inst.src[2])}));
+			const auto selected_mask_valid =
+			    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMaskValid(inst.src[1]),
+			                                               ReadMaskValid(inst.src[2])}));
+			if (inst.dst.kind == IR::OperandKind::Register &&
+			    (inst.dst.reg.file == IR::RegisterFile::Exec ||
+			     inst.dst.reg.file == IR::RegisterFile::Vcc)) {
+				WriteMask64(inst.dst, selected_mask);
+				return true;
+			}
+			const auto lhs = ReadU32Pair(inst.src[1]);
+			const auto rhs = ReadU32Pair(inst.src[2]);
 			WriteU32Pair(inst.dst, {ir.Select(condition, lhs[0], rhs[0]),
 			                        ir.Select(condition, lhs[1], rhs[1])});
+			if (inst.dst.kind == IR::OperandKind::Register &&
+			    inst.dst.reg.file == IR::RegisterFile::Scalar) {
+				const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg.index);
+				ir.SetThreadBitScalarReg(dst, selected_mask);
+				ir.SetScalarMaskTag(dst, selected_mask_valid);
+			}
 			return true;
 		}
 		case IR::Opcode::PackLowLowU16:

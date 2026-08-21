@@ -683,7 +683,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, output, error)) {
 			return false;
 		}
-		output.lane_mask_mode  = options.lane_mask_mode;
 		output.shader_hash     = options.shader_hash;
 		output.user_data_base  = options.user_data_base;
 		output.user_data_count = options.user_data_count;

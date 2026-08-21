@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
-#include "graphics/host_gpu/renderer/pipeline/shaderSubgroup.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -415,48 +414,6 @@ static void CreateLayout(DescriptorCache&                   descriptor_cache,
 	}
 }
 
-static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStageFlagBits vk_stage,
-                                  const ShaderRecompiler::IR::Program&                   program,
-                                  vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo& required,
-                                  vk::PipelineShaderStageCreateInfo&                     stage) {
-	const auto config =
-	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program);
-	switch (config.mode) {
-		case ShaderSubgroupMode::Natural: return;
-		case ShaderSubgroupMode::PerInvocationGraphics: {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("Vulkan running %u-lane graphics shader stage 0x%08x with per-invocation "
-				     "EXEC/VCC on the host-native subgroup\n",
-				     program.wave_size, static_cast<uint32_t>(vk_stage));
-			}
-			return;
-		}
-		case ShaderSubgroupMode::FlattenedMasks: {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("Vulkan running %u-lane shader stage 0x%08x with flattened per-invocation "
-				     "EXEC/VCC\n",
-				     program.wave_size, static_cast<uint32_t>(vk_stage));
-			}
-			return;
-		}
-		case ShaderSubgroupMode::Controlled: break;
-		case ShaderSubgroupMode::Unsupported:
-		default:
-			EXIT("Vulkan cannot run %u-lane shader stage 0x%08x: default=%u min=%u max=%u "
-			     "controlled_stages=0x%08x\n",
-			     program.wave_size, static_cast<uint32_t>(vk_stage), graphics.subgroup_size,
-			     graphics.min_subgroup_size, graphics.max_subgroup_size,
-			     static_cast<vk::ShaderStageFlags::MaskType>(
-			         graphics.required_subgroup_size_stages));
-	}
-
-	required.sType = vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo;
-	required.requiredSubgroupSize = config.required_size;
-	stage.pNext                   = &required;
-}
-
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(
     GraphicContext& graphics, DescriptorCache& descriptor_cache,
@@ -528,8 +485,7 @@ void CreatePipelineInternal(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 	EXIT_NOT_IMPLEMENTED(ps_active && frag_shader_module == nullptr);
 
-	vk::PipelineShaderStageCreateInfo                     vert_shader_stage_info {};
-	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo vert_subgroup_size {};
+	vk::PipelineShaderStageCreateInfo vert_shader_stage_info {};
 
 	vert_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 	vert_shader_stage_info.pNext               = nullptr;
@@ -538,12 +494,8 @@ void CreatePipelineInternal(
 	vert_shader_stage_info.module              = vert_shader_module;
 	vert_shader_stage_info.pName               = "main";
 	vert_shader_stage_info.pSpecializationInfo = nullptr;
-	EXIT_IF(!vs_input_info.stage);
-	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eVertex, *vs_input_info.stage.program,
-	                      vert_subgroup_size, vert_shader_stage_info);
 
-	vk::PipelineShaderStageCreateInfo                     frag_shader_stage_info {};
-	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo frag_subgroup_size {};
+	vk::PipelineShaderStageCreateInfo frag_shader_stage_info {};
 	frag_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 	frag_shader_stage_info.pNext               = nullptr;
 	frag_shader_stage_info.flags               = {};
@@ -551,12 +503,6 @@ void CreatePipelineInternal(
 	frag_shader_stage_info.module              = frag_shader_module;
 	frag_shader_stage_info.pName               = "main";
 	frag_shader_stage_info.pSpecializationInfo = nullptr;
-	if (ps_active) {
-		EXIT_IF(!ps_input_info->stage);
-		ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eFragment,
-		                      *ps_input_info->stage.program, frag_subgroup_size,
-		                      frag_shader_stage_info);
-	}
 
 	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
 	tess_control_shader_stage_info.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
@@ -1074,8 +1020,15 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	comp_shader_stage_info.pName               = "main";
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
-	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute, *input_info.stage.program,
-	                      comp_subgroup_size, comp_shader_stage_info);
+	const auto wave_size = input_info.stage.program->wave_size;
+	if (graphics.subgroup_size_control_enabled &&
+	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
+	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+		comp_subgroup_size.sType =
+		    vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo;
+		comp_subgroup_size.requiredSubgroupSize = wave_size;
+		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	}
 
 	vk::DescriptorSetLayout set_layouts[1]  = {};
 	uint32_t                set_layouts_num = 0;
@@ -1083,7 +1036,6 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	vk::PushConstantRange push_constant_info[1];
 	uint32_t              push_constant_info_num = 0;
 
-	EXIT_IF(!input_info.stage);
 	CreateLayout(descriptor_cache, set_layouts, set_layouts_num, push_constant_info,
 	             push_constant_info_num, *input_info.stage.program,
 	             vk::ShaderStageFlagBits::eCompute, DescriptorCache::Stage::Compute);

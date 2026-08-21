@@ -29,6 +29,8 @@ public:
 	void SetScalarReg(ScalarReg reg, U32 value);
 	U1   GetThreadBitScalarReg(ScalarReg reg);
 	void SetThreadBitScalarReg(ScalarReg reg, U1 value);
+	U1   GetScalarMaskTag(ScalarReg reg);
+	void SetScalarMaskTag(ScalarReg reg, U1 value);
 	U32  GetVectorReg(VectorReg reg);
 	void SetVectorReg(VectorReg reg, U32 value);
 	U1   GetGotoVariable(uint32_t id);

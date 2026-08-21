@@ -35,8 +35,6 @@ struct ShaderRegisters;
 
 enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute };
 
-enum class ShaderLaneMaskMode { NativeWave, PerInvocation };
-
 namespace ShaderRecompiler::IR {
 struct Program;
 struct ResourceSnapshot;
@@ -261,20 +259,17 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
                        bool include_bind_specialization);
 // Returned SPIR-V spans are read-only views backed by the shader program cache.
 bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
-                         std::span<const uint32_t>& spirv);
+                         ShaderVertexInputInfo& input_info, std::span<const uint32_t>& spirv);
 bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderLaneMaskMode lane_mask_mode, const ShaderVertexInputInfo& vs_info,
+                         const ShaderVertexInputInfo&                        vs_info,
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                          ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv);
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                          ShaderComputeInputInfo& input_info, std::span<const uint32_t>& spirv);
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
-                          std::vector<uint32_t>& spirv);
+                          ShaderVertexInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo& input_info,
-                          std::vector<uint32_t>& spirv);
+                          ShaderPixelInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);

@@ -17,6 +17,8 @@ bool IsRegisterStatePseudo(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::GetThreadBitScalarRegister:
 		case ValueOpcode::SetThreadBitScalarRegister:
+		case ValueOpcode::GetScalarMaskTag:
+		case ValueOpcode::SetScalarMaskTag:
 		case ValueOpcode::GetScalarRegister:
 		case ValueOpcode::SetScalarRegister:
 		case ValueOpcode::GetVectorRegister:

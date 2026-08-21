@@ -10,9 +10,9 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
 class Translator {
 public:
 	Translator(IR::ValueProgram& program, IR::Block* block, uint32_t vector_limit,
-	           uint32_t wave_size, bool per_invocation_masks)
+	           uint32_t wave_size)
 	    : value_program(program), ir(block), current_vector_limit(vector_limit),
-	      current_wave_size(wave_size), current_per_invocation_masks(per_invocation_masks) {}
+	      current_wave_size(wave_size) {}
 
 	bool TranslateBlock(const IR::BasicBlock& source, std::string* error);
 	bool AddBranchCondition(const IR::BasicBlock& source, IR::ValueBlockInfo& info,
@@ -28,7 +28,7 @@ private:
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const IR::Operand& operand, IR::U32 value);
 	IR::Value              ReadOperand(const IR::Operand& operand, IR::Type type);
-	IR::U1                 ThreadBit(IR::U32 low, IR::U32 high);
+	IR::U1                 ThreadBit(IR::U32 low);
 	void                   WriteRawU32(const IR::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const IR::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const IR::Operand& operand, IR::Value value);
@@ -38,11 +38,10 @@ private:
 	IR::U32                ReadU32(const IR::Operand& operand);
 	std::array<IR::U32, 2> ReadU32Pair(const IR::Operand& operand);
 	IR::U64                ReadU64(const IR::Operand& operand);
-	IR::F32                ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane,
-	                                       bool packed = false);
-	IR::F32                ReadF16AsF32(const IR::Operand& operand);
-	IR::F32                ReadMixF32(const IR::Operand& operand);
-	IR::U32                ReadU16LaneRaw(const IR::Operand& operand, bool high_lane);
+	IR::F32 ReadF16LaneAsF32(const IR::Operand& operand, bool high_lane, bool packed = false);
+	IR::F32 ReadF16AsF32(const IR::Operand& operand);
+	IR::F32 ReadMixF32(const IR::Operand& operand);
+	IR::U32 ReadU16LaneRaw(const IR::Operand& operand, bool high_lane);
 	IR::U32 ReadU16LaneAsU32(const IR::Operand& operand, bool high_lane, bool sign_extend);
 	IR::U32 ReadU16AsU32(const IR::Operand& operand, bool sign_extend);
 	IR::U32 ReadF16LaneBits(const IR::Operand& operand, bool high_lane);
@@ -51,6 +50,7 @@ private:
 	IR::U1  ReadCondition(const IR::Operand& operand);
 	IR::U32 ConditionBit(const IR::Operand& operand);
 	IR::U1  ReadMask(const IR::Operand& operand);
+	IR::U1  ReadMaskValid(const IR::Operand& operand);
 	void    WriteMask(const IR::Operand& operand, IR::U1 value);
 	void    WriteMask64(const IR::Operand& operand, IR::U1 value);
 	void    WriteCompareResult(const IR::Operand& operand, IR::U1 value);
@@ -76,8 +76,8 @@ private:
 	IR::Value       GetSamplerResource(const IR::MemoryInfo& memory);
 	IR::Value       MakeImageAddress(const IR::Instruction& inst, const IR::Operand& base);
 	IR::Value       ConstructU32x4(const IR::Operand& base, uint32_t count);
-	void            WriteImageComponents(const IR::Operand& dst, IR::Value value,
-	                                     const IR::MemoryInfo& memory, uint32_t component_limit);
+	void WriteImageComponents(const IR::Operand& dst, IR::Value value, const IR::MemoryInfo& memory,
+	                          uint32_t component_limit);
 	IR::ValueOpcode ImageAtomicOpcode(IR::Opcode opcode);
 	BufferAddress   ReadBufferAddress(const IR::Instruction& inst, uint32_t source_offset);
 	IR::U32         WidenSubdword(IR::Value value, uint32_t bits, bool sign);
@@ -101,35 +101,34 @@ private:
 	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
 
-	bool TranslateInstruction(const IR::Instruction& inst);
-	bool TranslateStateOperation(const IR::Instruction& inst);
-	bool TranslateControlOperation(const IR::Instruction& inst);
-	bool TranslateMove(const IR::Instruction& inst);
-	bool TranslateLaneOperation(const IR::Instruction& inst);
-	bool TranslateAttributeOperation(const IR::Instruction& inst);
-	bool TranslateMemoryOperation(const IR::Instruction& inst);
-	bool TranslateIntegerCompare(const IR::Instruction& inst);
-	bool TranslateInteger16Compare(const IR::Instruction& inst);
-	bool TranslateFloatCompare(const IR::Instruction& inst);
-	bool TranslateConversion(const IR::Instruction& inst);
-	bool TranslateInteger16Operation(const IR::Instruction& inst);
-	bool TranslatePackedInteger16(const IR::Instruction& inst);
-	bool TranslatePackedFloat16(const IR::Instruction& inst);
-	bool TranslateFloat16Operation(const IR::Instruction& inst);
-	bool TranslateFloatOperation(const IR::Instruction& inst);
-	bool TranslatePerInvocationU64Mask(const IR::Instruction& inst);
-	bool TranslateU64MaskOperation(const IR::Instruction& inst);
-	bool TranslateSimpleInteger(const IR::Instruction& inst);
-	bool TranslateComposedInteger(const IR::Instruction& inst);
-	bool TranslateExtendedInteger(const IR::Instruction& inst);
+	bool   TranslateInstruction(const IR::Instruction& inst);
+	bool   TranslateStateOperation(const IR::Instruction& inst);
+	bool   TranslateControlOperation(const IR::Instruction& inst);
+	bool   TranslateMove(const IR::Instruction& inst);
+	bool   TranslateLaneOperation(const IR::Instruction& inst);
+	bool   TranslateAttributeOperation(const IR::Instruction& inst);
+	bool   TranslateMemoryOperation(const IR::Instruction& inst);
+	bool   TranslateIntegerCompare(const IR::Instruction& inst);
+	bool   TranslateInteger16Compare(const IR::Instruction& inst);
+	bool   TranslateFloatCompare(const IR::Instruction& inst);
+	bool   TranslateConversion(const IR::Instruction& inst);
+	bool   TranslateInteger16Operation(const IR::Instruction& inst);
+	bool   TranslatePackedInteger16(const IR::Instruction& inst);
+	bool   TranslatePackedFloat16(const IR::Instruction& inst);
+	bool   TranslateFloat16Operation(const IR::Instruction& inst);
+	bool   TranslateFloatOperation(const IR::Instruction& inst);
+	IR::U1 EvaluateU64Mask(const IR::Instruction& inst);
+	bool   TranslateU64MaskOperation(const IR::Instruction& inst);
+	bool   TranslateSimpleInteger(const IR::Instruction& inst);
+	bool   TranslateComposedInteger(const IR::Instruction& inst);
+	bool   TranslateExtendedInteger(const IR::Instruction& inst);
 
 	IR::ValueProgram& value_program;
 	IR::IREmitter     ir;
-	IR::Opcode        current_opcode               = IR::Opcode::ControlNop;
-	uint32_t          current_pc                   = 0;
-	uint32_t          current_vector_limit         = 1;
-	uint32_t          current_wave_size            = 64;
-	bool              current_per_invocation_masks = false;
+	IR::Opcode        current_opcode       = IR::Opcode::ControlNop;
+	uint32_t          current_pc           = 0;
+	uint32_t          current_vector_limit = 1;
+	uint32_t          current_wave_size    = 64;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail

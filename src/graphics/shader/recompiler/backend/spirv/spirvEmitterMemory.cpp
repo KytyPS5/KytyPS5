@@ -672,11 +672,9 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
-	const auto count_low  = state.per_invocation_masks ? low : ctx.Arg(inst, 2);
-	const auto count_high = state.per_invocation_masks ? high : ctx.Arg(inst, 3);
 	const auto count =
-	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), count_low),
-	           Unary(state, OpBitCount, TypeU32(state), count_high));
+	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), low),
+	           Unary(state, OpBitCount, TypeU32(state), high));
 	const auto first = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), first,
 	                           ConstantU32(state, ScopeSubgroup), ballot});

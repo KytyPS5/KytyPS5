@@ -192,10 +192,8 @@ std::string ExportTargetKindToString(ExportTargetKind kind) {
 
 std::string ProgramToString(const Program& program) {
 	std::string text;
-	text += fmt::format("mode={} masks={} fallback={} reason={}\n",
+	text += fmt::format("mode={} fallback={} reason={}\n",
 	                    program.dispatcher_fallback ? "dispatcher" : "structured",
-	                    program.lane_mask_mode == ShaderLaneMaskMode::NativeWave ? "native-wave"
-	                                                                             : "per-invocation",
 	                    CFG::FailureKindToString(program.cfg_failure_kind).c_str(),
 	                    program.fallback_reason.c_str());
 	for (const auto& block: program.blocks) {

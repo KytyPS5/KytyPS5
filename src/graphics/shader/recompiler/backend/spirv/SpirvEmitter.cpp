@@ -198,10 +198,7 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 		program.spirv_requirements.emplace(requirements);
 		return true;
 	}
-	const auto MarkExactSubgroup = [&] {
-		requirements.requires_exact_subgroup = true;
-		requirements.subgroup_ballot         = true;
-	};
+	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
 			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None) {
@@ -230,7 +227,6 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 						if (program.stage != ShaderType::Compute) {
 							return Fail(error, "buffer ADD_TID is only valid for compute shaders");
 						}
-						requirements.requires_exact_subgroup      = true;
 						requirements.subgroup_local_invocation_id = true;
 					}
 				}
@@ -250,17 +246,17 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
-					MarkExactSubgroup();
+					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 				}
 			}
 			switch (inst.GetOpcode()) {
-				case IR::ValueOpcode::Ballot: MarkExactSubgroup(); break;
+				case IR::ValueOpcode::Ballot: MarkBallot(); break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
-					MarkExactSubgroup();
+					MarkBallot();
 					requirements.subgroup_shuffle = true;
 					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
 						requirements.subgroup_local_invocation_id = true;
@@ -270,18 +266,18 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 				case IR::ValueOpcode::DppUpdateU32:
 				case IR::ValueOpcode::WqmMask:
 				case IR::ValueOpcode::WriteLane: {
-					MarkExactSubgroup();
+					MarkBallot();
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
 				case IR::ValueOpcode::Permlane16U32: {
-					MarkExactSubgroup();
+					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
 				case IR::ValueOpcode::SwizzleU32: {
-					MarkExactSubgroup();
+					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 					break;
@@ -346,9 +342,8 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 		return false;
 	}
 	EmitterState state(program, resources, input_info);
-	state.stage                = program.stage;
-	state.wave_size            = program.wave_size;
-	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
+	state.stage     = program.stage;
+	state.wave_size = program.wave_size;
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());

@@ -58,13 +58,6 @@ uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	return result;
 }
 
-uint32_t BoolAsU32(ValueEmitContext& ctx, uint32_t value) {
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction({OpSelect, TypeU32(ctx.state), result, value,
-	                               ConstantU32(ctx.state, 1), ConstantU32(ctx.state, 0)});
-	return result;
-}
-
 uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t component) {
 	auto& state = ctx.state;
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
@@ -222,8 +215,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		const auto unpack = MrtOutputMode(state, exp) == 5u ? GlslUnpackUnorm2x16
-		                                                    : GlslUnpackHalf2x16;
+		const auto unpack =
+		    MrtOutputMode(state, exp) == 5u ? GlslUnpackUnorm2x16 : GlslUnpackHalf2x16;
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {
@@ -441,16 +434,8 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
-			if (state.per_invocation_masks) {
-				const auto result = state.builder.AllocateId();
-				state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(state, 4), result,
-				                           BoolAsU32(ctx, ctx.Arg(inst, 0)), ConstantU32(state, 0),
-				                           ConstantU32(state, 0), ConstantU32(state, 0)});
-				ctx.Define(inst, result);
-			} else {
-				ctx.Emit(inst, OpGroupNonUniformBallot, IR::Type::U32x4,
-				         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0)});
-			}
+			ctx.Emit(inst, OpGroupNonUniformBallot, IR::Type::U32x4,
+			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0)});
 			return true;
 		case IR::ValueOpcode::ReadFirstLane: {
 			const auto ballot = state.builder.AllocateId();

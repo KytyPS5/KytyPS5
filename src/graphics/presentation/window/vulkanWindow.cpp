@@ -514,10 +514,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features12.pNext                    = &depth_clip_control;
 	features12.samplerMirrorClampToEdge = VK_TRUE;
 
-	vk::PhysicalDeviceSubgroupSizeControlFeatures subgroup_size_control {};
-	subgroup_size_control.sType = vk::StructureType::ePhysicalDeviceSubgroupSizeControlFeatures;
-	subgroup_size_control.pNext = &features12;
-
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
 
@@ -578,28 +574,23 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		device_features.shaderInt64 = supported_features2.features.shaderInt64;
 	}
 
-	if (graphics.subgroup_size_control_enabled &&
-	    supported_features13.subgroupSizeControl == VK_TRUE) {
-		subgroup_size_control.subgroupSizeControl = VK_TRUE;
-	}
-
-	const auto* base_feature_chain = (subgroup_size_control.subgroupSizeControl == VK_TRUE
-	                                      ? static_cast<const void*>(&subgroup_size_control)
-	                                      : static_cast<const void*>(&features12));
-
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
-	robustness2.pNext = const_cast<void*>(base_feature_chain);
+	robustness2.pNext = &features12;
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	auto features13 = required_features13;
-	features13.pNext =
-	    robustness2_ext_enabled ? &robustness2 : const_cast<void*>(base_feature_chain);
+	const bool subgroup_size_control_enabled =
+	    graphics.subgroup_size_control_enabled && supported_features13.subgroupSizeControl == VK_TRUE;
+
+	auto features13              = required_features13;
+	features13.pNext             = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                                          : static_cast<void*>(&features12);
 	features13.robustImageAccess = supported_features13.robustImageAccess;
+	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",

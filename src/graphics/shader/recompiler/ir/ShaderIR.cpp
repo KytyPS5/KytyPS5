@@ -44,6 +44,23 @@ bool AppendScalarResultSccNonZero(const Decoder::Instruction& decoded, BasicBloc
 	if (!ScalarResultWritesSccNonZero(decoded.opcode)) {
 		return true;
 	}
+	switch (decoded.opcode) {
+		case Decoder::Opcode::S_AND_B64:
+		case Decoder::Opcode::S_ANDN2_B64:
+		case Decoder::Opcode::S_NOT_B64:
+		case Decoder::Opcode::S_OR_B64:
+		case Decoder::Opcode::S_ORN2_B64:
+		case Decoder::Opcode::S_XOR_B64:
+		case Decoder::Opcode::S_NAND_B64:
+		case Decoder::Opcode::S_NOR_B64:
+		case Decoder::Opcode::S_XNOR_B64:
+		case Decoder::Opcode::S_WQM_B64:
+			// These instructions maintain an invocation-local mask shadow and update SCC
+			// while lowering the operation. A raw dword comparison would disagree after
+			// complementing a mask temporary.
+			return true;
+		default: break;
+	}
 	if (block.instructions.empty()) {
 		SetError(error, "internal IR error: missing scalar result for SCC update");
 		return false;
@@ -206,14 +223,14 @@ uint32_t ResourceIndexFromOperand(const Decoder::Operand& operand) {
 
 MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKind kind) {
 	MemoryInfo mem;
-	mem.kind                     = kind;
-	mem.offset                   = decoded.offset;
-	mem.secondary_offset         = decoded.secondary_offset;
-	mem.dmask                    = decoded.dmask;
-	mem.data_dwords              = decoded.data_dwords;
-	mem.data_bits                = decoded.data_bits;
-	mem.component_count          = decoded.data_components != 0u ? decoded.data_components
-	                                                            : decoded.data_dwords;
+	mem.kind             = kind;
+	mem.offset           = decoded.offset;
+	mem.secondary_offset = decoded.secondary_offset;
+	mem.dmask            = decoded.dmask;
+	mem.data_dwords      = decoded.data_dwords;
+	mem.data_bits        = decoded.data_bits;
+	mem.component_count =
+	    decoded.data_components != 0u ? decoded.data_components : decoded.data_dwords;
 	mem.data_format              = decoded.data_format;
 	mem.number_format            = decoded.number_format;
 	mem.image_sample_flags       = decoded.image_sample_flags;
@@ -224,9 +241,9 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 		mem.image_nsa_addr[i] = decoded.image_nsa_addr[i];
 	}
 	mem.memory_segment = decoded.memory_segment;
-	mem.address_is_full = kind == ResourceKind::Flat ||
-	                      (kind == ResourceKind::Global &&
-	                       decoded.src1.kind == Decoder::OperandKind::Vgpr);
+	mem.address_is_full =
+	    kind == ResourceKind::Flat ||
+	    (kind == ResourceKind::Global && decoded.src1.kind == Decoder::OperandKind::Vgpr);
 	mem.data_signed   = decoded.data_signed;
 	mem.typed         = decoded.typed;
 	mem.formatted     = decoded.formatted;

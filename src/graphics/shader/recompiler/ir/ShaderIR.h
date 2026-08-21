@@ -456,7 +456,6 @@ struct ShaderInfo {
 };
 
 struct SpirvRequirements {
-	bool requires_exact_subgroup      = false;
 	bool subgroup_ballot              = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
@@ -469,7 +468,6 @@ struct SpirvRequirements {
 
 struct Program {
 	ShaderType                    stage               = ShaderType::Unknown;
-	ShaderLaneMaskMode            lane_mask_mode      = ShaderLaneMaskMode::NativeWave;
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      wave_size           = 64;
 	uint32_t                      user_data_base      = 0;

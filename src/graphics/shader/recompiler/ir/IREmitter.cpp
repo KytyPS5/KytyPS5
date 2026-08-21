@@ -36,6 +36,14 @@ void IREmitter::SetThreadBitScalarReg(ScalarReg reg, U1 value) {
 	Emit(ValueOpcode::SetThreadBitScalarRegister, {Value(reg), value});
 }
 
+U1 IREmitter::GetScalarMaskTag(ScalarReg reg) {
+	return U1(Emit(ValueOpcode::GetScalarMaskTag, {Value(reg)}));
+}
+
+void IREmitter::SetScalarMaskTag(ScalarReg reg, U1 value) {
+	Emit(ValueOpcode::SetScalarMaskTag, {Value(reg), value});
+}
+
 U32 IREmitter::GetVectorReg(VectorReg reg) {
 	return U32(Emit(ValueOpcode::GetVectorRegister, {Value(reg)}));
 }

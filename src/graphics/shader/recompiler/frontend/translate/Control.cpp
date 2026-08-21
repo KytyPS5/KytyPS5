@@ -7,37 +7,26 @@ bool Translator::TranslateStateOperation(const IR::Instruction& inst) {
 	switch (inst.op) {
 		case IR::Opcode::SaveexecB32:
 		case IR::Opcode::SaveexecB64: {
-			const auto old_low  = ir.GetExecLo();
-			const auto old_high = ir.GetExecHi();
-			const auto src_low  = ReadRawU32(inst.src[0]);
-			const auto src_high = inst.op == IR::Opcode::SaveexecB64
-			                          ? ReadRawU32(OffsetOperand(inst.src[0], 1))
-			                          : IR::U32(IR::Value(0u));
-			const auto apply    = [&](IR::U32 old_value, IR::U32 src_value) {
-				switch (inst.saveexec_mode) {
-					case IR::SaveexecMode::And: return ir.BitwiseAnd(old_value, src_value);
-					case IR::SaveexecMode::Andn1:
-						return ir.BitwiseAnd(old_value, ir.BitwiseNot(src_value));
-					case IR::SaveexecMode::Orn2:
-						return ir.BitwiseOr(ir.BitwiseNot(old_value), src_value);
-				}
-				return old_value;
-			};
-			const auto result_low = apply(old_low, src_low);
-			const auto result_high =
-			    inst.op == IR::Opcode::SaveexecB64 ? apply(old_high, src_high) : old_high;
-			if (inst.op == IR::Opcode::SaveexecB64) {
-				WriteU32Pair(inst.dst, {old_low, old_high});
-			} else {
-				WriteOperand(inst.dst, old_low);
+			const auto old = ir.GetExec();
+			const auto src = ReadMask(inst.src[0]);
+			IR::U1     result;
+			switch (inst.saveexec_mode) {
+				case IR::SaveexecMode::And: result = ir.LogicalAnd(old, src); break;
+				case IR::SaveexecMode::Andn1:
+					result = ir.LogicalAnd(old, ir.LogicalNot(src));
+					break;
+				case IR::SaveexecMode::Orn2: result = ir.LogicalOr(ir.LogicalNot(old), src); break;
 			}
-			ir.SetExecLo(result_low);
-			ir.SetExecHi(result_high);
-			ir.SetExec(ThreadBit(result_low, result_high));
-			const auto nonzero = inst.op == IR::Opcode::SaveexecB64
-			                         ? ir.BitwiseOr(result_low, result_high)
-			                         : result_low;
-			ir.SetScc(ir.INotEqual(nonzero, zero));
+			if (inst.op == IR::Opcode::SaveexecB64) {
+				WriteMask64(inst.dst, old);
+			} else {
+				WriteMask(inst.dst, old);
+			}
+			const auto mask = BallotMask(result);
+			ir.SetExec(result);
+			ir.SetExecLo(mask[0]);
+			ir.SetExecHi(mask[1]);
+			ir.SetScc(result);
 			return true;
 		}
 		case IR::Opcode::ScalarAddCarryU32:
@@ -157,24 +146,61 @@ bool Translator::TranslateMove(const IR::Instruction& inst) {
 			WriteOperand(inst.dst, ReadOperand(inst.src[0], IR::Type::F32));
 			return true;
 		case IR::Opcode::MoveU64: {
+			const auto is_exec_or_vcc = [](const IR::Operand& operand) {
+				return operand.kind == IR::OperandKind::Register &&
+				       (operand.reg.file == IR::RegisterFile::Exec ||
+				        operand.reg.file == IR::RegisterFile::Vcc);
+			};
+			if (is_exec_or_vcc(inst.dst) || is_exec_or_vcc(inst.src[0])) {
+				WriteMask64(inst.dst, ReadMask(inst.src[0]));
+				return true;
+			}
+			const bool scalar_copy = inst.dst.kind == IR::OperandKind::Register &&
+			                         inst.src[0].kind == IR::OperandKind::Register &&
+			                         inst.dst.reg.file == IR::RegisterFile::Scalar &&
+			                         inst.src[0].reg.file == IR::RegisterFile::Scalar;
+			IR::U1     source_mask;
+			IR::U1     source_mask_valid;
+			if (scalar_copy) {
+				const auto src    = static_cast<IR::ScalarReg>(inst.src[0].reg.index);
+				source_mask       = ir.GetThreadBitScalarReg(src);
+				source_mask_valid = ir.GetScalarMaskTag(src);
+			}
 			WriteU32Pair(inst.dst, ReadU32Pair(inst.src[0]));
-			if (inst.dst.kind == IR::OperandKind::Register &&
-			    inst.src[0].kind == IR::OperandKind::Register &&
-			    inst.dst.reg.file == IR::RegisterFile::Scalar &&
-			    inst.src[0].reg.file == IR::RegisterFile::Scalar) {
-				ir.SetThreadBitScalarReg(
-				    static_cast<IR::ScalarReg>(inst.dst.reg.index),
-				    ir.GetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.src[0].reg.index)));
+			if (scalar_copy) {
+				ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.dst.reg.index),
+				                         source_mask);
+				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(inst.dst.reg.index),
+				                    source_mask_valid);
 			}
 			return true;
 		}
 		case IR::Opcode::WqmB64: {
-			if (!current_per_invocation_masks) {
+			const auto is_exec_or_vcc = [](const IR::Operand& operand) {
+				return operand.kind == IR::OperandKind::Register &&
+				       (operand.reg.file == IR::RegisterFile::Exec ||
+				        operand.reg.file == IR::RegisterFile::Vcc);
+			};
+			if (!is_exec_or_vcc(inst.dst) && !is_exec_or_vcc(inst.src[0])) {
+				const auto mask_valid = ReadMaskValid(inst.src[0]);
+				const auto invocation_result =
+				    IR::U1(ir.Emit(IR::ValueOpcode::WqmMask, {ReadMask(inst.src[0])}));
 				const auto result = IR::U64(
 				    ir.Emit(IR::ValueOpcode::WqmU64, {ReadOperand(inst.src[0], IR::Type::U64)}));
 				WriteOperand(inst.dst, result);
-				ir.SetScc(IR::U1(
-				    ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
+				if (inst.dst.kind == IR::OperandKind::Register &&
+				    inst.dst.reg.file == IR::RegisterFile::Scalar) {
+					const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg.index);
+					ir.SetThreadBitScalarReg(dst, invocation_result);
+					ir.SetScalarMaskTag(dst, mask_valid);
+					const auto raw_nonzero = IR::U1(
+					    ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})}));
+					ir.SetScc(IR::U1(ir.Emit(
+					    IR::ValueOpcode::SelectU1, {mask_valid, invocation_result, raw_nonzero})));
+				} else {
+					ir.SetScc(IR::U1(
+					    ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
+				}
 				return true;
 			}
 			const auto result = IR::U1(ir.Emit(IR::ValueOpcode::WqmMask, {ReadMask(inst.src[0])}));

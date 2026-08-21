@@ -616,7 +616,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
-		const auto old_image = cache.ResolveOwner(target.image_id);
+		const auto old_image = cache.m_slot_images.try_get(target.image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
@@ -668,7 +668,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.is_clear = target.color_clear_enable || metadata_clear;
 	}
 	if (depth.image_id) {
-		const auto owner = cache.ResolveOwner(depth.image_id);
+		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
@@ -786,11 +786,10 @@ struct DrawIndexBufferSource {
 };
 
 struct PreparedIndexBuffer {
-	std::shared_ptr<void> owner;
-	vk::Buffer            buffer = nullptr;
-	uint64_t              size   = 0;
-	vk::DeviceSize        offset = 0;
-	vk::IndexType         type   = vk::IndexType::eUint16;
+	vk::Buffer     buffer = nullptr;
+	uint64_t       size   = 0;
+	vk::DeviceSize offset = 0;
+	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer) {
@@ -802,7 +801,7 @@ struct VertexBufferRange {
 	uint64_t      base_address  = 0;
 	uint64_t      requested_end = 0;
 	uint64_t      acquired_end  = 0;
-	BufferBinding binding;
+	std::pair<Buffer*, uint64_t> binding;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
@@ -810,11 +809,9 @@ struct VertexBufferRange {
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	std::array<vk::Buffer, MaxBuffers>            buffers {};
-	std::array<vk::DeviceSize, MaxBuffers>        offsets {};
-	std::array<std::shared_ptr<void>, MaxBuffers> owners {};
-	uint32_t                                      count       = 0;
-	uint32_t                                      owner_count = 0;
+	std::array<vk::Buffer, MaxBuffers>     buffers {};
+	std::array<vk::DeviceSize, MaxBuffers> offsets {};
+	uint32_t                               count = 0;
 };
 
 static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         buffer,
@@ -864,8 +861,9 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(buffer, range.base_address, size);
-		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, range.binding.buffer,
+		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device,
+		                     range.binding.first->Handle(),
 		                     "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]",
 		                     range.base_address, size);
 	}
@@ -873,15 +871,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
 	PreparedVertexBuffers prepared;
 	prepared.count = static_cast<uint32_t>(vs_input_info.buffers_num);
-	std::shared_ptr<Buffer> null_owner;
-	vk::Buffer              null_buffer = nullptr;
+	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
 		const auto  size   = VertexBufferDescriptorSize(vertex);
 		if (size == 0) {
-			if (null_owner == nullptr) {
-				null_owner  = cache.ObtainNullBuffer();
-				null_buffer = null_owner->Handle();
+			if (null_buffer == nullptr) {
+				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
 			}
 			prepared.buffers[i] = null_buffer;
 			prepared.offsets[i] = 0;
@@ -898,23 +894,14 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 			     vertex.addr);
 		}
 
-		prepared.buffers[i] = range->binding.buffer;
-		prepared.offsets[i] = range->binding.offset + vertex.addr - range->base_address;
+		prepared.buffers[i] = range->binding.first->Handle();
+		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
 		SetVulkanObjectNameF(
 		    buffer.GetContext().GetGraphics().device, prepared.buffers[i],
 		    "Kyty.VertexBuffer[slot={} guest=0x{:016x} size=0x{:x} stride={} records={}]", i,
 		    vertex.addr, size, vertex.stride, vertex.num_records);
 	}
 
-	if (null_owner != nullptr) {
-		prepared.owners[prepared.owner_count++] = std::move(null_owner);
-	}
-	for (uint32_t i = 0; i < merged_count; i++) {
-		if (merged_ranges[i].binding.owner != nullptr) {
-			EXIT_IF(prepared.owner_count >= PreparedVertexBuffers::MaxBuffers);
-			prepared.owners[prepared.owner_count++] = std::move(merged_ranges[i].binding.owner);
-		}
-	}
 	return prepared;
 }
 
@@ -1100,17 +1087,14 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 	prepared.size = source.size;
 	prepared.type = source.type;
 	if (source.host_data != nullptr) {
-		auto binding =
-		    buffer.GetContext().GetBufferCache().UploadTransient(source.host_data, source.size, 16);
-		prepared.owner  = std::move(binding.owner);
-		prepared.buffer = binding.buffer;
-		prepared.offset = binding.offset;
+		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		prepared.offset = stream.Copy(source.host_data, source.size, 16);
+		prepared.buffer = stream.Handle();
 	} else {
-		auto binding =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(buffer, source.address, source.size);
-		prepared.owner  = std::move(binding.owner);
-		prepared.buffer = binding.buffer;
-		prepared.offset = binding.offset;
+		auto [buffer_ptr, offset] = buffer.GetContext().GetBufferCache().ObtainBuffer(
+		    source.address, source.size, false);
+		prepared.buffer = buffer_ptr->Handle();
+		prepared.offset = offset;
 	}
 	if (source.host_data != nullptr) {
 		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
@@ -1124,13 +1108,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(RenderCommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                                PreparedVertexBuffers& prepared) {
-	for (uint32_t i = 0; i < prepared.owner_count; i++) {
-		if (prepared.owners[i] != nullptr) {
-			buffer.RetainResourceUntilFence(std::move(prepared.owners[i]));
-		}
-	}
+static void CommitVertexBuffers(vk::CommandBuffer vk_buffer, const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
@@ -1140,13 +1118,9 @@ static void CommitVertexBuffers(RenderCommandBuffer& buffer, vk::CommandBuffer v
 	}
 }
 
-static void CommitIndexBuffer(RenderCommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                              PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.size == 0) {
 		return;
-	}
-	if (prepared.owner != nullptr) {
-		buffer.RetainResourceUntilFence(std::move(prepared.owner));
 	}
 	EXIT_IF(prepared.buffer == nullptr);
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
@@ -1230,8 +1204,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
-	auto bindings        = PrepareGraphicsBindings(buffer, state.vs_input_info.stage,
-	                                               state.ps_input_info.stage, state.ps_active);
+	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
+	                                        state.ps_active);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
 	state.rendering =
@@ -1255,7 +1229,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x200u);
 	}
-	CommitVertexBuffers(buffer, vk_buffer, vertex_bindings);
+	CommitVertexBuffers(vk_buffer, vertex_bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout,
 	               bindings.vertex);
 	if (bindings.pixel.has_value()) {
@@ -1265,7 +1239,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout,
 		               *bindings.pixel);
 	}
-	CommitIndexBuffer(buffer, vk_buffer, index_binding);
+	CommitIndexBuffer(vk_buffer, index_binding);
 
 	const auto dynamic_params =
 	    BuildGraphicsDynamicParams(buffer, state.color_info, state.color_count, state.depth_info);
@@ -1310,6 +1284,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
+	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1441,6 +1416,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
+	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 

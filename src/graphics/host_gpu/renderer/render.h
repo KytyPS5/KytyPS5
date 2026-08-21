@@ -9,7 +9,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
-#include <memory>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -24,7 +23,6 @@ struct GraphicContext;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
 struct CommandSlot;
-struct VulkanBuffer;
 struct VulkanDescriptorSet;
 struct RenderDepthInfo;
 struct RenderColorInfo;
@@ -47,20 +45,6 @@ enum class CommandBufferDebugOp : uint32_t {
 	EopWriteBackFlip,
 	EopOnlyFlip,
 	Unknown,
-};
-
-class FenceResourceRetainer {
-public:
-	FenceResourceRetainer() = default;
-	~FenceResourceRetainer();
-	KYTY_CLASS_NO_COPY(FenceResourceRetainer);
-
-	void               Retain(std::shared_ptr<void> resource);
-	void               ReleaseAfterFence() noexcept;
-	[[nodiscard]] bool Empty() const noexcept { return m_resources.empty(); }
-
-private:
-	std::vector<std::shared_ptr<void>> m_resources;
 };
 
 struct SubmitInfo {
@@ -108,8 +92,6 @@ public:
 	void WaitForFenceOnly();
 	void WaitForFence();
 	void WaitForFenceAndReset();
-	void RetireBufferAfterFence(std::unique_ptr<VulkanBuffer> buffer);
-	void RetainResourceUntilFence(std::shared_ptr<void> resource);
 	void RecycleDescriptorAfterFence(VulkanDescriptorSet& set);
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -120,8 +102,6 @@ public:
 private:
 	void Release();
 	void FinalizeFence(bool reset_recording);
-	void ReleaseResourcesAfterFence();
-	void DeleteBuffersAfterFence();
 	void RecycleDescriptorsAfterFence();
 
 	RenderContext&                             m_context;
@@ -138,8 +118,6 @@ private:
 	uint32_t                                   m_debug_arg2      = 0;
 	uint32_t                                   m_debug_arg3      = 0;
 	uint64_t                                   m_debug_arg4      = 0;
-	std::vector<std::unique_ptr<VulkanBuffer>> m_retired_buffers;
-	FenceResourceRetainer                      m_fence_resources;
 	std::vector<VulkanDescriptorSet*>          m_descriptor_sets_after_fence;
 	mutable RenderState                        m_render_state;
 	mutable bool                               m_rendering = false;
@@ -182,10 +160,11 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
 	[[nodiscard]] DescriptorCache::PreparedBindings
-	     PrepareBindings(CommandBuffer& buffer, const ShaderStageRuntime& runtime,
-	                     vk::ShaderStageFlags shader_stage, DescriptorCache::Stage stage);
-	void RebindBuffers(CommandBuffer& buffer, DescriptorCache::PreparedBindings& bindings);
-	void RebindImages(CommandBuffer& buffer, DescriptorCache::PreparedBindings& bindings);
+	     PrepareBindings(const ShaderStageRuntime& runtime, vk::ShaderStageFlags shader_stage,
+	                     DescriptorCache::Stage stage);
+	void FindBuffers(DescriptorCache::PreparedBindings& bindings);
+	void RebindBuffers(DescriptorCache::PreparedBindings& bindings);
+	void RebindImages(DescriptorCache::PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    vk::PipelineLayout layout, DescriptorCache::PreparedBindings& bindings);
 
@@ -198,8 +177,7 @@ private:
 	[[nodiscard]] DescriptorCache::TextureBinding
 	ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	               const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(CommandBuffer&            buffer,
-	                                                       const ShaderStageRuntime& vertex,
+	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
 	void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
@@ -229,8 +207,8 @@ private:
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const RenderCommandBuffer&    buffer);
 
-	RenderContext&                      m_context;
-	std::vector<std::shared_ptr<Image>> m_bound_images;
+	RenderContext&        m_context;
+	std::vector<ImageId> m_bound_images;
 
 	friend struct RenderExecutorTestAccess;
 };

@@ -24,7 +24,6 @@ struct GraphicContext: public VulkanInstance {
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	void                   CreateBuffer(uint64_t size, VulkanBuffer& buffer);
-	void                   DeleteBuffer(VulkanBuffer& buffer);
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 	void                   MapMemory(VulkanMemory& memory, void*& data);

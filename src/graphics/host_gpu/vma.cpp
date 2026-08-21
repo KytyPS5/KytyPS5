@@ -199,20 +199,6 @@ void GraphicContext::CreateBuffer(uint64_t size, VulkanBuffer& buffer) {
 	VulkanTrackAllocation(buffer.memory);
 }
 
-void GraphicContext::DeleteBuffer(VulkanBuffer& buffer) {
-	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(allocator == nullptr || buffer.buffer == nullptr ||
-	        buffer.memory.allocation == nullptr);
-
-	VulkanUntrackAllocation(buffer.memory);
-	vmaDestroyBuffer(allocator, buffer.buffer, buffer.memory.allocation);
-	buffer.buffer                 = nullptr;
-	buffer.memory.memory          = nullptr;
-	buffer.memory.allocation      = nullptr;
-	buffer.memory.allocation_info = {};
-	buffer.memory.offset          = 0;
-}
-
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.memory.allocation != nullptr);

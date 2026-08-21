@@ -56,9 +56,7 @@ static const char* ShaderStageResourceName(DescriptorCache::Stage stage) {
 }
 
 static void BindNullStorageBuffer(RenderContext& context, BufferView& dst) {
-	auto owner = context.GetBufferCache().ObtainNullBuffer();
-	dst.buffer = owner->Handle();
-	dst.owner  = std::move(owner);
+	dst.buffer = context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle();
 	dst.offset = 0;
 	dst.range  = 16;
 }
@@ -89,11 +87,11 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
-static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& command_buffer,
-                                      const ShaderBufferResource&                 descriptor,
-                                      const ShaderRecompiler::IR::BufferResource& resource,
-                                      DescriptorCache::Stage stage, uint32_t slot,
-                                      uint32_t& buffer_offset) {
+static BufferView
+NativeStorageBuffer(RenderContext& context, const ShaderBufferResource& descriptor,
+                    const ShaderRecompiler::IR::BufferResource& resource,
+                    DescriptorCache::Stage stage, uint32_t slot, uint32_t& buffer_offset,
+                    BufferId id) {
 	BufferView result;
 	buffer_offset = 0;
 
@@ -115,19 +113,21 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range or device alignment is unsupported\n");
 	}
-	auto binding = context.GetBufferCache().ObtainBuffer(
-	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
-	const auto aligned_offset = binding.offset - binding.offset % alignment;
-	const auto adjustment     = binding.offset - aligned_offset;
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
+	    address, size, resource.written, resource.formatted, id);
+	const auto aligned_offset = offset - offset % alignment;
+	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	result.owner  = std::move(binding.owner);
-	result.buffer = binding.buffer;
+	result.buffer = buffer->Handle();
 	result.offset = aligned_offset;
 	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	if (resource.formatted && resource.written) {
+		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	}
 	SetVulkanObjectNameF(
 	    graphics.device, result.buffer,
 	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
@@ -136,11 +136,10 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	return result;
 }
 
-static BufferView
-NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
-                    const ShaderRecompiler::IR::AddressResource&           resource,
-                    const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
-                    DescriptorCache::Stage stage, uint32_t slot, uint32_t& address_offset) {
+static BufferView NativeAddressBuffer(
+    RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
+    const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
+    DescriptorCache::Stage stage, uint32_t slot, uint32_t& address_offset, BufferId id) {
 	BufferView result;
 	address_offset = 0;
 	if (address.binding_base == 0) {
@@ -163,15 +162,14 @@ NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	auto        binding =
-	    context.GetBufferCache().ObtainBuffer(command_buffer, address.binding_base, size);
-	const auto aligned_offset = binding.offset - binding.offset % alignment;
-	const auto adjustment     = binding.offset - aligned_offset;
+	auto [buffer, offset] =
+	    context.GetBufferCache().ObtainBuffer(address.binding_base, size, false, false, id);
+	const auto aligned_offset = offset - offset % alignment;
+	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const auto visible_size   = std::min(size, static_cast<uint64_t>(max_range - adjustment));
 	address_offset            = static_cast<uint32_t>(adjustment);
-	result.owner              = std::move(binding.owner);
-	result.buffer             = binding.buffer;
+	result.buffer             = buffer->Handle();
 	result.offset             = aligned_offset;
 	result.range              = static_cast<vk::DeviceSize>(visible_size + adjustment);
 	SetVulkanObjectNameF(graphics.device, result.buffer,
@@ -811,22 +809,19 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	return context.GetSamplerCache().GetSampler(descriptor);
 }
 
-static BufferView NativeUpload(RenderContext& context, CommandBuffer& command_buffer,
-                               std::span<const uint32_t> data) {
+static BufferView NativeUpload(RenderContext& context, std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
+	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid() || command_buffer.IsExecute());
-	auto binding = context.GetBufferCache().UploadTransient(data.data(), data.size_bytes(), 256);
-	return {.owner  = std::move(binding.owner),
-	        .buffer = binding.buffer,
-	        .offset = binding.offset,
-	        .range  = data.size_bytes()};
+	auto& buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
+	return {.buffer = buffer.Handle(), .offset = offset, .range = data.size_bytes()};
 }
 
 void RenderExecutor::TrackImageBinding(ImageId id) {
-	auto image = m_context.GetTextureCache().ResolveOwner(id);
-	EXIT_IF(image == nullptr);
-	if (std::ranges::find(m_bound_images, image) == m_bound_images.end()) {
-		m_bound_images.push_back(std::move(image));
+	EXIT_IF(m_context.GetTextureCache().m_slot_images.try_get(id) == nullptr);
+	if (std::ranges::find(m_bound_images, id) == m_bound_images.end()) {
+		m_bound_images.push_back(id);
 	}
 }
 
@@ -850,16 +845,17 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
-	for (const auto& image: m_bound_images) {
-		image->binding = {};
+	for (const auto id: m_bound_images) {
+		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
+			image->binding = {};
+		}
 	}
 	m_bound_images.clear();
 }
 
-DescriptorCache::PreparedBindings RenderExecutor::PrepareBindings(CommandBuffer&            buffer,
-                                                                  const ShaderStageRuntime& runtime,
-                                                                  vk::ShaderStageFlags shader_stage,
-                                                                  DescriptorCache::Stage stage) {
+DescriptorCache::PreparedBindings
+RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
+                                vk::ShaderStageFlags shader_stage, DescriptorCache::Stage stage) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -899,19 +895,68 @@ DescriptorCache::PreparedBindings RenderExecutor::PrepareBindings(CommandBuffer&
 	prepared.user_data.resize(program.bindings.ShaderDataDwords());
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
-		descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer().Handle();
+		descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
 	return prepared;
 }
 
-void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
-                                   DescriptorCache::PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(DescriptorCache::PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
+	const auto& program  = *prepared.program;
+	const auto& snapshot = *prepared.snapshot;
+	auto&       cache    = m_context.GetBufferCache();
+
+	prepared.buffer_ids.clear();
+	prepared.buffer_ids.reserve(program.info.buffers.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		ShaderBufferResource descriptor;
+		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
+		const auto address = descriptor.Base48();
+		const auto stride  = descriptor.Stride();
+		const auto records = descriptor.NumRecords();
+		EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
+		const auto requested_size =
+		    stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		if (address == 0 || requested_size == 0) {
+			prepared.buffer_ids.emplace_back();
+			continue;
+		}
+		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		prepared.buffer_ids.push_back(cache.FindBuffer(address, size));
+	}
+
+	prepared.address_ids.clear();
+	prepared.address_ids.reserve(program.info.addresses.size());
+	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
+		const auto& resource = program.info.addresses[i];
+		const auto& address  = snapshot.addresses[i];
+		if (address.binding_base == 0) {
+			prepared.address_ids.emplace_back();
+			continue;
+		}
+		EXIT_IF(resource.written);
+		const auto limit =
+		    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
+		        ? ShaderRecompiler::IR::FlatAddressWindowSize
+		        : static_cast<uint64_t>(m_context.GetGraphics()
+		                                    .GetPhysicalDeviceProperties()
+		                                    .limits.maxStorageBufferRange);
+		uint64_t size = 0;
+		EXIT_IF(!HostMemoryQueryRange(address.binding_base, limit, HostMemoryAccess::Mapped, size));
+		prepared.address_ids.push_back(cache.FindBuffer(address.binding_base, size));
+	}
+}
+
+void RenderExecutor::RebindBuffers(DescriptorCache::PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program   = *prepared.program;
 	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
+	EXIT_IF(prepared.buffer_ids.size() != program.info.buffers.size() ||
+	        prepared.address_ids.size() != program.info.addresses.size());
 
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
@@ -926,9 +971,9 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 		ShaderBufferResource descriptor;
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
-		resources.buffers.push_back(NativeStorageBuffer(m_context, buffer, descriptor,
+		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
 		                                                program.info.buffers[i], prepared.stage, i,
-		                                                buffer_offset));
+		                                                buffer_offset, prepared.buffer_ids[i]));
 		pack_memory_offset(i, buffer_offset);
 	}
 	resources.addresses.clear();
@@ -936,14 +981,20 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		uint32_t address_offset = 0;
 		resources.addresses.push_back(
-		    NativeAddressBuffer(m_context, buffer, program.info.addresses[i], snapshot.addresses[i],
-		                        prepared.stage, i, address_offset));
+		    NativeAddressBuffer(m_context, program.info.addresses[i], snapshot.addresses[i],
+		                        prepared.stage, i, address_offset, prepared.address_ids[i]));
 		pack_memory_offset(static_cast<uint32_t>(program.info.buffers.size()) + i, address_offset);
+	}
+	if (!prepared.flattened_srt.empty()) {
+		resources.flattened_srt = NativeUpload(m_context, prepared.flattened_srt);
+	}
+	if (ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UserData) != nullptr) {
+		resources.user_data = NativeUpload(m_context, prepared.user_data);
 	}
 }
 
-void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
-                                  DescriptorCache::PreparedBindings& prepared) {
+void RenderExecutor::RebindImages(DescriptorCache::PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
@@ -952,7 +1003,7 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.ResolveOwner(images[i].image_id);
+		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
@@ -962,6 +1013,8 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
@@ -991,40 +1044,29 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 }
 
 RenderExecutor::GraphicsBindings
-RenderExecutor::PrepareGraphicsBindings(CommandBuffer& buffer, const ShaderStageRuntime& vertex,
+RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
 	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(buffer, vertex, vk::ShaderStageFlagBits::eVertex,
+	    .vertex = PrepareBindings(vertex, vk::ShaderStageFlagBits::eVertex,
 	                              DescriptorCache::Stage::Vertex),
 	};
-	RebindBuffers(buffer, bindings.vertex);
-	RebindImages(buffer, bindings.vertex);
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(buffer, pixel, vk::ShaderStageFlagBits::eFragment,
+		bindings.pixel.emplace(PrepareBindings(pixel, vk::ShaderStageFlagBits::eFragment,
 		                                       DescriptorCache::Stage::Pixel));
-		RebindBuffers(buffer, *bindings.pixel);
-		RebindImages(buffer, *bindings.pixel);
+	}
+	FindBuffers(bindings.vertex);
+	if (bindings.pixel) {
+		FindBuffers(*bindings.pixel);
+	}
+	RebindBuffers(bindings.vertex);
+	if (bindings.pixel) {
+		RebindBuffers(*bindings.pixel);
+	}
+	RebindImages(bindings.vertex);
+	if (bindings.pixel) {
+		RebindImages(*bindings.pixel);
 	}
 	return bindings;
-}
-
-static void RetainBindings(CommandBuffer& buffer, DescriptorCache::NativeDescriptors& resources) {
-	if (resources.flattened_srt.owner != nullptr) {
-		buffer.RetainResourceUntilFence(std::move(resources.flattened_srt.owner));
-	}
-	if (resources.user_data.owner != nullptr) {
-		buffer.RetainResourceUntilFence(std::move(resources.user_data.owner));
-	}
-	for (auto& view: resources.buffers) {
-		if (view.owner != nullptr) {
-			buffer.RetainResourceUntilFence(std::move(view.owner));
-		}
-	}
-	for (auto& view: resources.addresses) {
-		if (view.owner != nullptr) {
-			buffer.RetainResourceUntilFence(std::move(view.owner));
-		}
-	}
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
@@ -1036,15 +1078,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	        prepared.committed);
 	const auto& program     = *prepared.program;
 	auto&       descriptors = prepared.resources;
-	if (!prepared.flattened_srt.empty()) {
-		descriptors.flattened_srt = NativeUpload(m_context, buffer, prepared.flattened_srt);
-	}
-	if (ShaderRecompiler::IR::FindBinding(
-	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UserData) != nullptr) {
-		descriptors.user_data = NativeUpload(m_context, buffer, prepared.user_data);
-	}
-	RetainBindings(buffer, descriptors);
-
 	auto       vk_buffer     = buffer.Handle();
 	const auto shader_stages = ShaderPipelineStages(prepared.shader_stage);
 	if (descriptors.gds.buffer != nullptr) {

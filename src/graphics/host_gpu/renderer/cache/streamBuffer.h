@@ -65,6 +65,10 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
+	// BufferCache state lives directly on the resource.
+	bool     is_deleted         = false;
+	uint64_t tick_accessed_last = 0;
+
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }

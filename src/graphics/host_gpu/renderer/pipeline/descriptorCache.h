@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shaderBindings.h"
@@ -36,10 +37,9 @@ struct VulkanDescriptorSet {
 };
 
 struct BufferView {
-	std::shared_ptr<void> owner;
-	vk::Buffer            buffer = nullptr;
-	vk::DeviceSize        offset = 0;
-	vk::DeviceSize        range  = VK_WHOLE_SIZE;
+	vk::Buffer     buffer = nullptr;
+	vk::DeviceSize offset = 0;
+	vk::DeviceSize range  = VK_WHOLE_SIZE;
 };
 
 class DescriptorCache {
@@ -68,6 +68,8 @@ public:
 		std::shared_ptr<const ShaderRecompiler::IR::Program>          program;
 		std::shared_ptr<const ShaderRecompiler::IR::ResourceSnapshot> snapshot;
 		NativeDescriptors                                             resources;
+		std::vector<BufferId>                                         buffer_ids;
+		std::vector<BufferId>                                         address_ids;
 		std::vector<uint32_t>                                         flattened_srt;
 		std::vector<uint32_t>                                         user_data;
 		vk::ShaderStageFlags                                          shader_stage;

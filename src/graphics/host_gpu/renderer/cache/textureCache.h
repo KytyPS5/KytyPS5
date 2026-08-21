@@ -4,17 +4,17 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
+#include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/tiler.h"
 
-#include <compare>
 #include <map>
-#include <memory>
-#include <set>
-#include <utility>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -25,8 +25,6 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
-class StreamBuffer;
-class TileManager;
 struct TextureCacheTestAccess;
 
 class TextureCache {
@@ -57,15 +55,17 @@ public:
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] Image&        GetImage(ImageId id);
-	[[nodiscard]] const Image&  GetImage(ImageId id) const;
-	void                        MarkGpuWritten(ImageId id);
+	[[nodiscard]] Image&        GetImage(ImageId id) {
+		auto& image = m_slot_images[id];
+		TouchImage(image);
+		return image;
+	}
+	void MarkGpuWritten(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
-	                                           bool formatted_buffer_write = false);
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -86,16 +86,11 @@ private:
 	struct ColorTransferPlan;
 	struct DownloadPlan;
 
-	struct Slot {
-		std::shared_ptr<Image> image;
-		uint32_t               generation = 1;
-	};
-
 	struct MetaDataInfo {
 		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
 		// PendingDcc retains that exact fill until FindRenderTarget classifies the address,
 		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
-		// Keep all surface metadata in this one shadPS4-style entry so CMask/FMask can be
+		// Keep all surface metadata in one entry so CMask/FMask can be
 		// registered beside HTile and DCC without introducing parallel tracking paths.
 		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
 
@@ -114,26 +109,21 @@ private:
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
 
-	[[nodiscard]] Image&                 ResolveImage(ImageId id);
-	[[nodiscard]] const Image&           ResolveImage(ImageId id) const;
-	[[nodiscard]] std::shared_ptr<Image> ResolveOwner(ImageId id) const;
-	[[nodiscard]] ImageId                InsertImage(const ImageInfo& info);
-	[[nodiscard]] ImageId                GetNullImage(const ImageDesc& desc);
-	void                                 RegisterImage(ImageId id);
-	void                                 UnregisterImage(ImageId id);
-	void                                 DeleteImage(ImageId id);
-	void                                 FreeImage(ImageId id);
-	void                                 RetainImage(CommandBuffer& command, ImageId id);
-	void                                 TouchImage(Image& image);
-	void                                 TrackImage(ImageId id);
-	void                                 TrackImageHead(ImageId id);
-	void                                 TrackImageTail(ImageId id);
-	void                                 UntrackImage(ImageId id);
-	void                                 UntrackImageHead(ImageId id);
-	void                                 UntrackImageTail(ImageId id);
-	void                                 MarkAsMaybeDirty(ImageId id, Image& image);
-	void                                 TrackImageDownload(ImageId id);
-	void                                 TrackImageDownloadLocked(ImageId id, Image& image);
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
+	void                      RegisterImage(ImageId id);
+	void                      UnregisterImage(ImageId id);
+	void                      DeleteImage(ImageId id);
+	void                      FreeImage(ImageId id);
+	void                      TouchImage(Image& image);
+	void                      TrackImage(ImageId id);
+	void                      TrackImageHead(ImageId id);
+	void                      TrackImageTail(ImageId id);
+	void                      UntrackImage(ImageId id);
+	void                      UntrackImageHead(ImageId id);
+	void                      UntrackImageTail(ImageId id);
+	void                      MarkAsMaybeDirty(ImageId id, Image& image);
+	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -162,31 +152,24 @@ private:
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	void               AssociateStencil(ImageId depth, GuestRange stencil);
-	void               AssociateStencilLocked(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	void InvalidateCpuAliases(uint64_t address, uint64_t size);
-	void ClearGpuModified(ImageId id);
-
-	void                                        DownloadImage(ImageId id);
-	[[nodiscard]] bool                          TryDownloadImage(ImageId id);
-	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapDownload(uint64_t size, uint64_t alignment);
-	void QueueDownload(GuestRange range, StreamBuffer& download, uint8_t* mapped, uint64_t offset);
+	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	[[nodiscard]] bool TryDownloadImage(ImageId id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
-	std::unique_ptr<TileManager>                      m_tiler;
+	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
-	std::vector<Slot>                                 m_slots;
-	std::vector<uint32_t>                             m_free_slots;
+	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::map<vk::Format, ImageId>                     m_null_images;
+	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
-	std::set<ImageId>                                 m_download_images;
+	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

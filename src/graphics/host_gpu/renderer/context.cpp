@@ -19,7 +19,6 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
-#include <memory>
 namespace Libs::Graphics {
 
 namespace {
@@ -39,27 +38,6 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint6
 }
 
 } // namespace
-
-FenceResourceRetainer::~FenceResourceRetainer() {
-	if (!m_resources.empty()) {
-		EXIT("fence resource retainer destroyed before release\n");
-	}
-}
-
-void FenceResourceRetainer::Retain(std::shared_ptr<void> resource) {
-	if (resource == nullptr) {
-		EXIT("cannot retain a null fence resource\n");
-	}
-	if (std::ranges::none_of(m_resources, [&resource](const auto& retained) {
-		    return retained.get() == resource.get();
-	    })) {
-		m_resources.push_back(std::move(resource));
-	}
-}
-
-void FenceResourceRetainer::ReleaseAfterFence() noexcept {
-	m_resources.clear();
-}
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_scheduler(scheduler), m_graphics(scheduler.Graphics()),
@@ -90,24 +68,10 @@ void CommandBuffer::Release() {
 
 	m_slot->busy = false;
 	m_slot->Reset();
-	ReleaseResourcesAfterFence();
+	RecycleDescriptorsAfterFence();
 	m_slot = nullptr;
 
 	EXIT_NOT_IMPLEMENTED(!IsInvalid());
-}
-
-void CommandBuffer::RetireBufferAfterFence(std::unique_ptr<VulkanBuffer> buffer) {
-	if (IsInvalid() || m_execute || buffer == nullptr || buffer->buffer == nullptr) {
-		EXIT("cannot retire a buffer on an invalid or submitted command buffer\n");
-	}
-	m_retired_buffers.push_back(std::move(buffer));
-}
-
-void CommandBuffer::RetainResourceUntilFence(std::shared_ptr<void> resource) {
-	if (IsInvalid() || m_execute) {
-		EXIT("cannot retain a resource on an invalid or submitted command buffer\n");
-	}
-	m_fence_resources.Retain(std::move(resource));
 }
 
 void CommandBuffer::RecycleDescriptorAfterFence(VulkanDescriptorSet& set) {
@@ -255,21 +219,8 @@ void CommandBuffer::FinalizeFence(bool reset_recording) {
 		}
 	}
 	if (was_executed) {
-		ReleaseResourcesAfterFence();
+		RecycleDescriptorsAfterFence();
 	}
-	DeleteBuffersAfterFence();
-}
-
-void CommandBuffer::ReleaseResourcesAfterFence() {
-	RecycleDescriptorsAfterFence();
-	m_fence_resources.ReleaseAfterFence();
-}
-
-void CommandBuffer::DeleteBuffersAfterFence() {
-	for (const auto& buffer: m_retired_buffers) {
-		m_graphics.DeleteBuffer(*buffer);
-	}
-	m_retired_buffers.clear();
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

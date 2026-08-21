@@ -390,7 +390,7 @@ int DeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
 	return result;
 }
 
-void ReadGds(Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size) {
+void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size) {
 	const auto offset = uint64_t {dw_offset} * sizeof(uint32_t);
 	const auto size   = uint64_t {dw_size} * sizeof(uint32_t);
 	EXIT_IF(dst == nullptr || offset > gds.Size() || size > gds.Size() - offset ||

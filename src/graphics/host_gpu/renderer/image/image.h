@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
 #include "common/assert.h"
+#include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
@@ -19,15 +20,7 @@ class Buffer;
 class CommandScheduler;
 struct ImageTestAccess;
 
-struct ImageId {
-	uint32_t index      = std::numeric_limits<uint32_t>::max();
-	uint32_t generation = 0;
-
-	[[nodiscard]] explicit operator bool() const noexcept {
-		return index != std::numeric_limits<uint32_t>::max();
-	}
-	auto operator<=>(const ImageId&) const = default;
-};
+using ImageId = Common::SlotId;
 
 struct CachedImageView {
 	ImageViewInfo info;

@@ -226,12 +226,17 @@ void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	if (tick >= CurrentTick()) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
-		// Current(). Recycle the same command object so that reference remains valid.
-		FinishCurrent();
+		// Current(). Recycle the same command object so that reference remains valid. Deferred
+		// resources are released only at the next GPU operation boundary.
+		SubmitInfo submit;
+		auto&      submitted = SubmitCurrent(submit);
+		submitted.WaitForFenceAndReset();
+		m_master.Refresh();
+		submitted.Begin();
+		m_recording = true;
 		return;
 	}
 	m_master.Wait(tick);
-	PopPendingOperations();
 }
 
 void CommandScheduler::PopPendingOperations() {
@@ -243,17 +248,18 @@ void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
 		m_master.Refresh();
 	}
 	for (;;) {
-		Common::UniqueFunction<void> callback;
+		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
 			if (m_pending_operations.empty() ||
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
-			callback = std::move(m_pending_operations.front().callback);
+			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		RunOperation(std::move(callback));
+		WaitPriorityOperations(operation.tick);
+		RunOperation(std::move(operation.callback));
 	}
 }
 
@@ -423,10 +429,8 @@ void CommandScheduler::BeginNext() {
 	EXIT_IF(m_recording);
 
 	auto candidate = FindReusableBuffer(m_master.KnownGpuTick());
-	bool refreshed = false;
 	if (candidate < 0) {
 		m_master.Refresh();
-		refreshed = true;
 		candidate = FindReusableBuffer(m_master.KnownGpuTick());
 	}
 	if (candidate < 0) {
@@ -435,7 +439,6 @@ void CommandScheduler::BeginNext() {
 
 	m_current = candidate;
 	Current().WaitForFenceAndReset();
-	PopPendingOperations(!refreshed);
 	BindCurrent();
 	Current().Begin();
 	m_recording = true;

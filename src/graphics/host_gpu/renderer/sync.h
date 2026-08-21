@@ -62,7 +62,7 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 int  AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
                 void* udata);
 int  DeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id);
-void ReadGds(Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
+void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
 
 } // namespace Sync
 } // namespace Libs::Graphics

@@ -353,10 +353,8 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
-	const uint32_t dst_sel      = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
-	const uint32_t cache_policy = (write_control >> 25u) & 0x3u;
-	const uint32_t increment    = (write_control >> 16u) & 0x1u;
-	const uint32_t write_confirm = (write_control >> 20u) & 0x1u;
+	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
+	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
 	switch (dst_sel) {
 		case 0:
@@ -366,16 +364,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		case 6: break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
-	EXIT_NOT_IMPLEMENTED(increment != 0);
-
-	if (cache_policy > 3 || write_confirm > 1) {
-		LOGF("\t warning: unexpected write_data control 0x%08" PRIx32 "\n", write_control);
-	}
 	if (dw_num == 0) {
 		return;
 	}
 
-	memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+	if (write_one_address) {
+		for (uint32_t i = 0; i < dw_num; i++) {
+			dst[0] = src[i];
+		}
+	} else {
+		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+	}
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {

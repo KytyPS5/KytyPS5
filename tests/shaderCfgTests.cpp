@@ -4231,7 +4231,7 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
                 raw.program.bindings,
                 ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
                 nullptr &&
-            raw.program.bindings.buffer_offset_count == 0u,
+            raw.program.bindings.memory_offset_count == 1u,
         "raw scalar load did not use only the address-memory domain");
   Check(count_live_memory_ops(
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
@@ -4284,7 +4284,7 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
                 buffer.program.bindings,
                 ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
                 nullptr &&
-            buffer.program.bindings.buffer_offset_count == 1u,
+            buffer.program.bindings.memory_offset_count == 1u,
         "descriptor scalar load did not use only the buffer domain");
   Check(count_live_memory_ops(
             buffer.program, ShaderRecompiler::IR::ValueOpcode::ReadConstBuffer,
@@ -11442,8 +11442,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 797,
-                                    .instructions = 209,
+                                   {.words = 807,
+                                    .instructions = 211,
                                     .runtime_arrays = 1,
                                     .variables = 2,
                                     .loads = 9,

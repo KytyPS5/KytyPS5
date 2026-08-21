@@ -52,14 +52,14 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
-void EmitStorageBufferOffsets(EmitterState& state) {
-	for (uint32_t i = 0; i < state.program.bindings.buffer_offset_count; i++) {
+void EmitMemoryOffsets(EmitterState& state) {
+	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		const auto word =
-		    EmitShaderDataDwordLoad(state, state.program.bindings.buffer_offset_dword + i / 4u);
-		const auto shift                = ConstantU32(state, (i % 4u) * 8u + 2u);
-		state.storage_buffer_offsets[i] = EmitBinaryU32(
+		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
+		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
+		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
-		    ConstantU32(state, 0x3fu));
+		    ConstantU32(state, 0xffu));
 	}
 }
 
@@ -135,7 +135,9 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
 			                           access.object_pointer, state.storage_buffer_variable,
 			                           ConstantU32(state, binding.array_index)});
-			access.index_offset     = state.storage_buffer_offsets[binding.array_index];
+			access.index_offset     = EmitBinaryU32(state, OpShiftRightLogical,
+			                                        state.memory_byte_offsets[binding.array_index],
+			                                        ConstantU32(state, 2u));
 			access.add_index_offset = true;
 			break;
 		}

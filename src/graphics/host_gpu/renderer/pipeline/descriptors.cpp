@@ -123,8 +123,10 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 static BufferView
 NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
                     const ShaderRecompiler::IR::AddressResource&           resource,
-                    const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
+                    const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
+                    uint32_t&                                              address_offset) {
 	BufferView result;
+	address_offset = 0;
 	if (address.binding_base == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
@@ -145,17 +147,17 @@ NativeAddressBuffer(RenderContext& context, CommandBuffer& command_buffer,
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
-	    BufferCache::GetBufferOffset(address.binding_base) % alignment != 0) {
-		EXIT("address resource range or alignment is unsupported\n");
-	}
 	auto binding =
 	    context.GetBufferCache().ObtainBuffer(command_buffer, address.binding_base, size);
+	const auto aligned_offset = binding.offset - binding.offset % alignment;
+	const auto adjustment     = binding.offset - aligned_offset;
+	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+	const auto visible_size = std::min(size, static_cast<uint64_t>(max_range - adjustment));
+	address_offset = static_cast<uint32_t>(adjustment);
 	result.owner  = std::move(binding.owner);
 	result.buffer = binding.buffer;
-	result.offset = binding.offset;
-	result.range  = static_cast<vk::DeviceSize>(size);
+	result.offset = aligned_offset;
+	result.range  = static_cast<vk::DeviceSize>(visible_size + adjustment);
 	return result;
 }
 
@@ -897,22 +899,28 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
 	EXIT_IF(prepared.user_data.size() != layout.ShaderDataDwords());
-	std::fill(prepared.user_data.begin() + layout.buffer_offset_dword, prepared.user_data.end(), 0);
+	std::fill(prepared.user_data.begin() + layout.memory_offset_dword, prepared.user_data.end(), 0);
+	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
+		const auto dword = layout.memory_offset_dword + index / 4u;
+		const auto shift = (index % 4u) * 8u;
+		prepared.user_data[dword] |= offset << shift;
+	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		ShaderBufferResource descriptor;
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
 		resources.buffers.push_back(NativeStorageBuffer(m_context, buffer, descriptor,
 		                                                program.info.buffers[i], buffer_offset));
-		const auto dword = layout.buffer_offset_dword + i / 4u;
-		const auto shift = (i % 4u) * 8u;
-		prepared.user_data[dword] |= buffer_offset << shift;
+		pack_memory_offset(i, buffer_offset);
 	}
 	resources.addresses.clear();
 	resources.addresses.reserve(program.info.addresses.size());
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
+		uint32_t address_offset = 0;
 		resources.addresses.push_back(NativeAddressBuffer(
-		    m_context, buffer, program.info.addresses[i], snapshot.addresses[i]));
+		    m_context, buffer, program.info.addresses[i], snapshot.addresses[i], address_offset));
+		pack_memory_offset(static_cast<uint32_t>(program.info.buffers.size()) + i,
+		                   address_offset);
 	}
 }
 

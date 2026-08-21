@@ -863,6 +863,7 @@ struct TestCase {
   bool compile_only = false;
   size_t storage_buffer_range_dwords = 0;
   std::vector<u32> storage_buffer_offsets;
+  std::vector<u32> address_memory_offsets;
   bool force_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   std::optional<uint64_t> flat_memory_base;
@@ -1177,14 +1178,27 @@ CompiledShader CompileCase(const TestCase &test) {
         result.resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  for (u32 i = 0; i < result.program.bindings.buffer_offset_count; i++) {
-    const auto offset = i < test.storage_buffer_offsets.size()
-                            ? test.storage_buffer_offsets[i]
-                            : 0u;
+  const auto buffer_count = static_cast<u32>(result.program.info.buffers.size());
+  for (u32 i = 0; i < buffer_count; i++) {
+    u32 offset = 0;
+    if (i < test.storage_buffer_offsets.size()) {
+      offset = test.storage_buffer_offsets[i];
+    }
     Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
             "storage buffer offset is not representable");
-    packed_user_data[result.program.bindings.buffer_offset_dword + i / 4u] |=
+    packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
+  }
+  for (u32 i = 0; i < result.program.info.addresses.size(); i++) {
+    u32 offset = 0;
+    if (i < test.address_memory_offsets.size()) {
+      offset = test.address_memory_offsets[i];
+    }
+    Require(test.name, "shader data", offset < 256,
+            "address-memory offset is not representable");
+    const auto index = buffer_count + i;
+    packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
+        offset << ((index % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(result.resources.flattened_srt),
@@ -16575,10 +16589,18 @@ TestCase FlatLoadVariants() {
   }
   AppendEnd(&code);
 
+  const std::vector<u32> guest_memory{0x80ff7f01u, 0x00008001u, 0x11223344u,
+                                      0x55667788u, 0x99aabbccu, 0xddeeff00u};
+  constexpr size_t byte_offset = 8;
+  std::vector<u32> host_memory(
+      (byte_offset + guest_memory.size() * sizeof(u32) + sizeof(u32) - 1u) /
+      sizeof(u32));
+  std::memcpy(reinterpret_cast<uint8_t *>(host_memory.data()) + byte_offset,
+              guest_memory.data(), guest_memory.size() * sizeof(u32));
+
   TestCase test{"FlatLoadVariants",
                 code,
-                {0x80ff7f01u, 0x00008001u, 0x11223344u, 0x55667788u,
-                 0x99aabbccu, 0xddeeff00u},
+                std::move(host_memory),
                 {0x01u, 0xffffffffu, 0x7f01u, 0xffff80ffu, 0x11223344u,
                  0x55667788u, 0x11223344u, 0x55667788u, 0x99aabbccu,
                  0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u,
@@ -16588,6 +16610,40 @@ TestCase FlatLoadVariants() {
                  O::FLAT_LOAD_DWORDX2, O::FLAT_LOAD_DWORDX3,
                  O::FLAT_LOAD_DWORDX4, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.flat_memory_base = 0;
+  test.address_memory_offsets = {static_cast<u32>(byte_offset)};
+  return test;
+}
+
+TestCase FlatSubdwordLoadsApplyByteOffset() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeFlat0(0x08, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  code.push_back(EncodeFlat0(0x0a, 0, 1));
+  code.push_back(EncodeFlat1(1, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  constexpr size_t byte_offset = 3;
+  constexpr u32 guest_word = 0x80ff7f01u;
+  std::vector<u32> host_memory(
+      (byte_offset + sizeof(guest_word) + sizeof(u32) - 1u) / sizeof(u32));
+  std::memcpy(reinterpret_cast<uint8_t *>(host_memory.data()) + byte_offset,
+              &guest_word, sizeof(guest_word));
+
+  TestCase test;
+  test.name = "FlatSubdwordLoadsApplyByteOffset";
+  test.code = std::move(code);
+  test.initial = std::move(host_memory);
+  test.expected = {0x01u, 0x0000ff7fu};
+  test.flat_memory_base = 0;
+  test.address_memory_offsets = {static_cast<u32>(byte_offset)};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_UBYTE, O::FLAT_LOAD_USHORT,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -16667,9 +16723,10 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   TestCase test;
   test.name = "FlatVirtualAddressRebasesGuestAllocation";
   test.code = std::move(code);
-  test.initial = {0, 0x12345678u};
+  test.initial = {0xfeedfaceu, 0xcafebabeu, 0, 0x12345678u};
   test.expected = {0x12345678u, 0x12345678u, 0};
   test.flat_memory_base = GuestBase;
+  test.address_memory_offsets = {8, 8, 8};
   test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -16688,12 +16745,16 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   AppendStoreVgpr(&code, 0, 0);
   AppendEnd(&code);
 
-  return {"GlobalSignedImmediateRebasesBeforeSaddr",
-          code,
-          {0x11111111u, 0x22222222u, 0x12345678u},
-          {0x12345678u},
-          {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test;
+  test.name = "GlobalSignedImmediateRebasesBeforeSaddr";
+  test.code = std::move(code);
+  test.initial = {0xfeedfaceu, 0xcafebabeu, 0x11111111u, 0x22222222u,
+                  0x12345678u};
+  test.expected = {0x12345678u};
+  test.address_memory_offsets = {8};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
@@ -19373,6 +19434,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(TBufferLoadFormatXy88IntegerComponents);
   AddCase(TBufferStoreVariants);
   AddCase(FlatLoadVariants);
+  AddCase(FlatSubdwordLoadsApplyByteOffset);
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);

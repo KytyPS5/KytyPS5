@@ -130,8 +130,9 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 		}
 		return false;
 	}
-	next.buffer_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.buffer_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
+	next.memory_offset_count =
+	    static_cast<uint32_t>(program.info.buffers.size() + program.info.addresses.size());
 
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources(program.info.buffers.size());

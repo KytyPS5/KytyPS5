@@ -333,7 +333,8 @@ struct EmitterState {
 	uint32_t                                         wave_size               = 64;
 	bool                                             per_invocation_masks    = false;
 	uint32_t                                         storage_buffer_variable = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> storage_buffer_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers + IR::ShaderInfo::MaxAddresses>
+	                                                 memory_byte_offsets {};
 	uint32_t                                         address_memory_variable = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
@@ -713,7 +714,7 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
-void EmitStorageBufferOffsets(EmitterState& state);
+void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 

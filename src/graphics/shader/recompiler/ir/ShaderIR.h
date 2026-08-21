@@ -423,13 +423,13 @@ struct BindingLayout {
 	uint32_t                       descriptor_set       = 0;
 	uint32_t                       push_constant_offset = 0;
 	uint32_t                       push_constant_size   = 0;
-	uint32_t                       buffer_offset_dword  = 0;
-	uint32_t                       buffer_offset_count  = 0;
+	uint32_t                       memory_offset_dword  = 0;
+	uint32_t                       memory_offset_count  = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return buffer_offset_dword + (buffer_offset_count + 3u) / 4u;
+		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
 
 	bool operator==(const BindingLayout& other) const = default;

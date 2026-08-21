@@ -620,7 +620,7 @@ bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std:
 		state.builder.AddFunction(
 		    {OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
 	}
-	EmitStorageBufferOffsets(state);
+	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

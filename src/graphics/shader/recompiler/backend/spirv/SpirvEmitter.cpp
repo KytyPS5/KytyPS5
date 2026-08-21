@@ -109,8 +109,9 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		}
 	}
 	const auto has_user_storage = present[static_cast<size_t>(Kind::UserData)];
-	if (program.bindings.buffer_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.buffer_offset_count != program.info.buffers.size() ||
+	if (program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
+	    program.bindings.memory_offset_count !=
+	        program.info.buffers.size() + program.info.addresses.size() ||
 	    (!has_user_storage &&
 	     program.bindings.push_constant_size != program.bindings.ShaderDataDwords() * 4u) ||
 	    (has_user_storage && program.bindings.push_constant_size != 0) ||

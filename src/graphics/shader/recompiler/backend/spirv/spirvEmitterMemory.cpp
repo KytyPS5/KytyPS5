@@ -135,6 +135,22 @@ uint32_t AddressByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const I
 	return Select(state, TypeU32(state), valid, relative, ConstantU32(state, UINT32_MAX));
 }
 
+uint32_t AddAddressMemoryOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                uint32_t address) {
+	auto&      state = ctx.state;
+	const auto binding =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
+	const auto offset =
+	    state.memory_byte_offsets[state.program.info.buffers.size() + binding.array_index];
+	const auto corrected = Binary(state, OpIAdd, TypeU32(state), address, offset);
+	const auto not_invalid =
+	    Binary(state, OpINotEqual, TypeBool(state), address, ConstantU32(state, UINT32_MAX));
+	const auto no_overflow =
+	    Binary(state, OpUGreaterThanEqual, TypeBool(state), corrected, address);
+	return Select(state, TypeU32(state), AndCondition(state, not_invalid, no_overflow), corrected,
+	              ConstantU32(state, UINT32_MAX));
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		return BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
@@ -147,7 +163,11 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		return Binary(ctx.state, OpIAdd, TypeU32(ctx.state), ctx.Arg(inst, 0),
 		              ConstantU32(ctx.state, mem.offset));
 	}
-	return AddressByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2));
+	const auto address = AddressByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2));
+	if (mem.kind == IR::ResourceKind::Scratch) {
+		return address;
+	}
+	return AddAddressMemoryOffset(ctx, mem, address);
 }
 
 uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {

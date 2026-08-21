@@ -901,8 +901,15 @@ bool TranslateProgram(const IR::Program& source, IR::ValueProgram& result,
 				                       first_bit));
 			}
 		} else if (source.stage == ShaderType::Pixel) {
-			const auto* ps  = pixel_input_info;
-			uint32_t    reg = ps->ps_system_input_base;
+			const auto* ps = pixel_input_info;
+			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr),
+				                      builtin(IR::StageInputKind::BaryCoordSmooth, 0));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr + 1u),
+				    builtin(IR::StageInputKind::BaryCoordSmooth, 1));
+			}
+			uint32_t reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::FragCoord, 0));

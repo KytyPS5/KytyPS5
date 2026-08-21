@@ -441,6 +441,8 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
+		case IR::StageInputKind::BaryCoordSmooth: return BuiltInBaryCoordKHR;
+		case IR::StageInputKind::BaryCoordNoPerspective: return BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return BuiltInWorkgroupId;
 		case IR::StageInputKind::LocalInvocationId: return BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return BuiltInLocalInvocationIndex;
@@ -464,11 +466,14 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
-			if (flat) {
+			if (input.per_vertex) {
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationPerVertexKHR});
+			} else if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 			}
 			if (state.stage == ShaderType::Pixel && state.input_info.pixel->ps_no_perspective &&
-			    !flat) {
+			    !flat && !input.per_vertex) {
 				state.builder.AddAnnotation(
 				    {OpDecorate, input.variable_id, DecorationNoPerspective});
 			}
@@ -625,6 +630,16 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityComputeDerivativeGroupQuadsKHR);
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
 	}
+	const bool fragment_barycentric =
+	    state.stage == ShaderType::Pixel &&
+	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
+		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+	    });
+	if (fragment_barycentric) {
+		state.builder.RequireCapability(CapabilityFragmentBarycentricKHR);
+		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
+	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
 	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
@@ -689,6 +704,10 @@ void DefineModule(EmitterState& state) {
 			case IR::StageInputKind::FragCoord:
 				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 4));
 				break;
+			case IR::StageInputKind::BaryCoordSmooth:
+			case IR::StageInputKind::BaryCoordNoPerspective:
+				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 3));
+				break;
 			case IR::StageInputKind::FrontFacing:
 				ptr_type = TypePointer(state, StorageClassInput, TypeBool(state));
 				break;
@@ -697,6 +716,10 @@ void DefineModule(EmitterState& state) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
 					const auto components = VertexParameterComponentCount(state, input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);
+				} else if (input.per_vertex) {
+					const auto array_type = state.builder.Type(
+					    OpTypeArray, {TypeF32Vector(state, 4), ConstantU32(state, 3)});
+					ptr_type = TypePointer(state, StorageClassInput, array_type);
 				} else {
 					ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 4));
 				}

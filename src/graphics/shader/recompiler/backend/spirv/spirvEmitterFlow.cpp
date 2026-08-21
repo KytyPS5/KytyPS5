@@ -93,6 +93,18 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
 		return bits;
 	}
+	if (kind == IR::StageInputKind::BaryCoordSmooth ||
+	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		const auto bits    = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain,
+		                           TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
+		                           variable, ConstantU32(state, component + 1u)});
+		state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
+		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
+		return bits;
+	}
 	return EmitInputComponentU32(state, kind, component);
 }
 
@@ -187,12 +199,78 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 	if (state.stage == ShaderType::Vertex) {
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
 	}
+	const auto load_per_vertex = [&](uint32_t vertex) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpAccessChain, TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
+		     input->variable_id, ConstantU32(state, vertex), ConstantU32(state, chan & 3u)});
+		state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
+		return value;
+	};
+	if (input->per_vertex) {
+		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
+		                                  ? IR::StageInputKind::BaryCoordNoPerspective
+		                                  : IR::StageInputKind::BaryCoordSmooth;
+		const auto barycentric      = InputVariableForKind(state, barycentric_kind);
+		uint32_t   sum              = 0;
+		for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+			const auto pointer = state.builder.AllocateId();
+			const auto weight  = state.builder.AllocateId();
+			const auto product = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain,
+			                           TypePointer(state, StorageClassInput, TypeF32(state)),
+			                           pointer, barycentric, ConstantU32(state, vertex)});
+			state.builder.AddFunction({OpLoad, TypeF32(state), weight, pointer});
+			state.builder.AddFunction(
+			    {OpFMul, TypeF32(state), product, load_per_vertex(vertex), weight});
+			if (vertex == 0u) {
+				sum = product;
+			} else {
+				const auto next = state.builder.AllocateId();
+				state.builder.AddFunction({OpFAdd, TypeF32(state), next, sum, product});
+				sum = next;
+			}
+		}
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, sum});
+		return bits;
+	}
 	const auto vector    = state.builder.AllocateId();
 	const auto component = state.builder.AllocateId();
 	const auto bits      = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeF32Vector(state, 4), vector, input->variable_id});
 	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), component, vector, chan & 3u});
 	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, component});
+	return bits;
+}
+
+uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32_t chan,
+                                    uint32_t mode) {
+	auto&       state = ctx.state;
+	const auto* input = InputBindingForParameter(state, attr);
+	if (!input->per_vertex) {
+		return EmitAttribute(ctx, attr, chan);
+	}
+	const auto load_vertex = [&](uint32_t vertex) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpAccessChain, TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
+		     input->variable_id, ConstantU32(state, vertex), ConstantU32(state, chan & 3u)});
+		state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
+		return value;
+	};
+
+	const auto selected_vertex = (mode + 1u) % 3u;
+	uint32_t   value           = load_vertex(selected_vertex);
+	if (!PixelParameterIsCustom(state, attr) && mode < 2u) {
+		const auto delta = state.builder.AllocateId();
+		state.builder.AddFunction({OpFSub, TypeF32(state), delta, value, load_vertex(0)});
+		value = delta;
+	}
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
 	return bits;
 }
 
@@ -514,6 +592,10 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		case IR::ValueOpcode::GetAttribute:
 			ctx.Define(inst, EmitAttribute(ctx, inst.Arg(0).U32(), inst.Arg(1).U32()));
+			return true;
+		case IR::ValueOpcode::GetInterpolationParameter:
+			ctx.Define(inst, EmitInterpolationParameter(ctx, inst.Arg(0).U32(), inst.Arg(1).U32(),
+			                                            inst.Arg(2).U32()));
 			return true;
 		case IR::ValueOpcode::SetAttribute: EmitExport(ctx, inst); return true;
 		case IR::ValueOpcode::GetShaderBase:

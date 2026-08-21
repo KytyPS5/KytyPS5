@@ -199,7 +199,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		vk::PhysicalDeviceVulkan12Features features12 {};
 		features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
+#if defined(__APPLE__)
 		features12.pNext = &depth_clip_control;
+#else
+		vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
+		fragment_barycentric.sType =
+		    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+		fragment_barycentric.pNext = &depth_clip_control;
+		features12.pNext           = &fragment_barycentric;
+#endif
 		features13.pNext = &features12;
 
 		device_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
@@ -231,6 +239,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			skip_device = true;
 #endif
 		}
+#if !defined(__APPLE__)
+		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
+			LOGF("fragmentShaderBarycentric is not supported\n");
+			skip_device = true;
+		}
+#endif
 
 		if (features12.samplerMirrorClampToEdge != VK_TRUE) {
 			LOGF("samplerMirrorClampToEdge is not supported\n");
@@ -522,6 +536,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_features12.pNext = nullptr;
 	supported_features13.pNext = &supported_features12;
 
+#if !defined(__APPLE__)
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_fragment_barycentric {};
+	supported_fragment_barycentric.sType =
+	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+	supported_fragment_barycentric.pNext = nullptr;
+	supported_features12.pNext           = &supported_fragment_barycentric;
+#endif
+
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
@@ -529,7 +551,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 	supported_robustness2.pNext = nullptr;
 	if (robustness2_ext_enabled) {
+#if defined(__APPLE__)
 		supported_features12.pNext = &supported_robustness2;
+#else
+		supported_fragment_barycentric.pNext = &supported_robustness2;
+#endif
 	}
 
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
@@ -544,6 +570,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features13.synchronization2 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
+#if !defined(__APPLE__)
+	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
+#endif
 	features12.timelineSemaphore = VK_TRUE;
 
 	if (Config::GpuAssistedValidationEnabled()) {
@@ -576,7 +605,16 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
+#if defined(__APPLE__)
 	robustness2.pNext = &features12;
+#else
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
+	fragment_barycentric.sType =
+	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+	fragment_barycentric.pNext                     = &features12;
+	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
+	robustness2.pNext                              = &fragment_barycentric;
+#endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -586,9 +624,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	const bool subgroup_size_control_enabled = graphics.subgroup_size_control_enabled &&
 	                                           supported_features13.subgroupSizeControl == VK_TRUE;
 
-	auto features13                = required_features13;
-	features13.pNext               = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                                         : static_cast<void*>(&features12);
+	auto features13 = required_features13;
+#if defined(__APPLE__)
+	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                           : static_cast<void*>(&features12);
+#else
+	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                           : static_cast<void*>(&fragment_barycentric);
+#endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
@@ -922,6 +965,7 @@ void WindowContext::CreateVulkan() {
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF

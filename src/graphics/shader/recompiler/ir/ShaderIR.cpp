@@ -866,9 +866,9 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock& block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
-	if (decoded.opcode == Decoder::Opcode::V_INTERP_MOV_F32 && decoded.src0.value != 2u) {
+	if (decoded.opcode == Decoder::Opcode::V_INTERP_MOV_F32 && decoded.src0.value >= 3u) {
 		if (error != nullptr) {
-			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
+			*error = fmt::format("v_interp_mov_f32 mode {} is reserved at pc 0x{:08x}",
 			                     decoded.src0.value, decoded.pc);
 		}
 		return false;
@@ -879,6 +879,9 @@ bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
 	inst.op              = Opcode::LoadInputF32;
 	inst.input_info.attr = decoded.src1.value;
 	inst.input_info.chan = decoded.src2.value;
+	if (decoded.opcode == Decoder::Opcode::V_INTERP_MOV_F32) {
+		inst.input_info.interpolation_mode = decoded.src0.value;
+	}
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
 		return false;
 	}

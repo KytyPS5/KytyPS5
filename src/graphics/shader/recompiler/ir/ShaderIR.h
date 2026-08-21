@@ -144,9 +144,10 @@ struct ExportInfo {
 };
 
 struct InputInfo {
-	uint32_t attr            = 0;
-	uint32_t chan            = 0;
-	uint32_t component_count = 1;
+	uint32_t attr               = 0;
+	uint32_t chan               = 0;
+	uint32_t component_count    = 1;
+	uint32_t interpolation_mode = 3;
 
 	bool operator==(const InputInfo& other) const = default;
 };
@@ -272,6 +273,8 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
+	BaryCoordSmooth,
+	BaryCoordNoPerspective,
 	WorkgroupId,
 	LocalInvocationId,
 	LocalInvocationIndex,
@@ -286,6 +289,7 @@ struct StageInput {
 	uint32_t       location        = 0;
 	uint32_t       component_count = 1;
 	std::string    debug_name;
+	bool           per_vertex = false;
 
 	bool operator==(const StageInput& other) const = default;
 };

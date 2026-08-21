@@ -274,6 +274,7 @@ VALUE_OPCODE(ImageAtomicAnd32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicOr32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicXor32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(GetAttribute, U32, U32, U32)
+VALUE_OPCODE(GetInterpolationParameter, U32, U32, U32, U32)
 VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 
 VALUE_OPCODE(ControlNop, Void)

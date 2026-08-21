@@ -32,6 +32,11 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsFlat(*state.input_info.pixel, attr);
 }
 
+bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
+	return state.stage == ShaderType::Pixel &&
+	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
+}
+
 void SetError(std::string* error, const char* message) {
 	if (error != nullptr) {
 		*error = message;
@@ -47,8 +52,8 @@ bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind ki
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program) {
 	for (const auto& input: program.info.inputs) {
-		state.inputs.push_back(
-		    {input.kind, input.location, input.component_count, 0, input.debug_name});
+		state.inputs.push_back({input.kind, input.location, input.component_count, 0,
+		                        input.debug_name, input.per_vertex});
 	}
 	for (const auto& output: program.info.outputs) {
 		if (HasOutput(state.outputs, output.kind, output.index)) {

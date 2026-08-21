@@ -9,14 +9,15 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
-              std::string name) {
+              std::string name, bool per_vertex = false) {
 	const auto input = std::find_if(info.inputs.begin(), info.inputs.end(), [=](const auto& value) {
 		return value.kind == kind && value.location == location;
 	});
 	if (input == info.inputs.end()) {
-		info.inputs.push_back({kind, location, components, std::move(name)});
+		info.inputs.push_back({kind, location, components, std::move(name), per_vertex});
 	} else {
 		input->component_count = std::max(input->component_count, components);
+		input->per_vertex      = input->per_vertex || per_vertex;
 	}
 }
 
@@ -79,6 +80,24 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					         static_cast<uint32_t>(options.vertex->resources_num))) {
 						return Fail("vertex input reference is out of range");
 					}
+					if (program.stage == ShaderType::Pixel &&
+					    (inst.Arg(1).U32() >= 4u ||
+					     inst.Arg(0).U32() >= options.pixel->input_num)) {
+						return Fail("pixel input reference is out of range");
+					}
+					break;
+				}
+				case ValueOpcode::GetInterpolationParameter: {
+					if (program.stage != ShaderType::Pixel || !inst.Arg(0).IsImmediate() ||
+					    inst.Arg(0).GetType() != Type::U32 || !inst.Arg(1).IsImmediate() ||
+					    inst.Arg(1).GetType() != Type::U32 || !inst.Arg(2).IsImmediate() ||
+					    inst.Arg(2).GetType() != Type::U32) {
+						return Fail("interpolation parameter reference is invalid");
+					}
+					if (inst.Arg(0).U32() >= options.pixel->input_num || inst.Arg(1).U32() >= 4u ||
+					    inst.Arg(2).U32() >= 3u) {
+						return Fail("interpolation parameter reference is out of range");
+					}
 					break;
 				}
 				case ValueOpcode::GetBuiltin: {
@@ -100,6 +119,12 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 						case StageInputKind::FragCoord:
 							if (component >= 4u) {
 								return Fail("typed fragment-coordinate component is out of range");
+							}
+							break;
+						case StageInputKind::BaryCoordSmooth:
+						case StageInputKind::BaryCoordNoPerspective:
+							if (component >= 2u) {
+								return Fail("typed barycentric component is out of range");
 							}
 							break;
 						case StageInputKind::WorkgroupId:
@@ -150,15 +175,40 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 	}
 }
 
-void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
+void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixel,
+                        ShaderInfo& info) {
 	if (pixel->HasPositionInput()) {
 		AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
 	}
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
+	std::array<bool, 32> per_vertex {};
+	std::array<bool, 32> interpolated {};
+	for (const auto* block: program.values->blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
+				interpolated[inst.Arg(0).U32()] = true;
+			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
+				const auto input = inst.Arg(0).U32();
+				const auto mode  = inst.Arg(2).U32();
+				per_vertex[input] =
+				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
+			}
+		}
+	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input));
+		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
+		         per_vertex[input]);
+	}
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		if (interpolated[input] && per_vertex[input]) {
+			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
+			                                           : StageInputKind::BaryCoordSmooth;
+			AddInput(info, kind, 0, 3,
+			         pixel->ps_no_perspective ? "gl_BaryCoordNoPerspKHR" : "gl_BaryCoordKHR");
+			break;
+		}
 	}
 }
 
@@ -194,6 +244,12 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::FragCoord: AddInput(info, kind, 0, 4, "gl_FragCoord"); break;
 				case StageInputKind::FrontFacing:
 					AddInput(info, kind, 0, 1, "gl_FrontFacing");
+					break;
+				case StageInputKind::BaryCoordSmooth:
+					AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
+					break;
+				case StageInputKind::BaryCoordNoPerspective:
+					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
 					break;
 				case StageInputKind::WorkgroupId:
 					AddInput(info, kind, 0, 3, "gl_WorkGroupID");
@@ -287,7 +343,7 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
-		case ShaderType::Pixel: CollectPixelInputs(options.pixel, next); break;
+		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
 		default: return false;
 	}

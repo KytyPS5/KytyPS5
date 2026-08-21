@@ -85,7 +85,12 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
 }
 
 bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input) {
-	return input < info.input_num && (info.interpolator_settings[input] & PsInputFlatShade) != 0;
+	return input < info.input_num && (info.interpolator_settings[input] & PsInputFlatShade) != 0 &&
+	       !ShaderPixelParameterIsCustom(info, input);
+}
+
+bool ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input) {
+	return input < 32u && (info.custom_interpolation_mask & (1u << input)) != 0;
 }
 
 struct ShaderBinaryInfo {
@@ -854,9 +859,18 @@ static void ShaderGetStaticInputInfoPS(
 
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
 	// flags in the hardware state and extract only the input count here.
-	ps_info.input_num                    = sh.ps_in_control & 0x3fu;
-	ps_info.ps_system_input_base         = ShaderCalcPsSystemInputBase(sh);
-	const uint32_t active_inputs         = sh.ps_input_ena & sh.ps_input_addr;
+	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
+	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
+	if ((active_inputs & 0x00000002u) != 0) {
+		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
+	}
+	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
+		const auto& semantic = data.input_semantics[i];
+		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
+			ps_info.custom_interpolation_mask |= 1u << i;
+		}
+	}
 	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
 	ps_info.ps_pos_y                     = (active_inputs & 0x00000200u) != 0;
 	ps_info.ps_pos_xy                    = ps_info.ps_pos_x && ps_info.ps_pos_y;
@@ -1297,6 +1311,8 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 
 	LOGF("\t input_num            = %u\n"
 	     "\t ps_system_input_base = %u\n"
+	     "\t custom_interpolation_mask = 0x%08" PRIx32 "\n"
+	     "\t ps_perspective_center_vgpr = %" PRIu32 "\n"
 	     "\t ps_pos_x             = %s\n"
 	     "\t ps_pos_y             = %s\n"
 	     "\t ps_pos_z             = %s\n"
@@ -1307,7 +1323,8 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_pixel_kill_enable = %s\n"
 	     "\t ps_early_z           = %s\n"
 	     "\t ps_execute_on_noop   = %s\n",
-	     info.input_num, info.ps_system_input_base, info.ps_pos_x ? "true" : "false",
+	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
+	     info.ps_perspective_center_vgpr, info.ps_pos_x ? "true" : "false",
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
 	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
@@ -1657,6 +1674,8 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 	ret.ids.push_back(input_info.scratch_size_dwords);
 	ret.ids.push_back(input_info.input_num);
 	ret.ids.push_back(input_info.ps_system_input_base);
+	ret.ids.push_back(input_info.custom_interpolation_mask);
+	ret.ids.push_back(input_info.ps_perspective_center_vgpr);
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_x));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_y));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_z));

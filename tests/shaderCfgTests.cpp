@@ -5377,6 +5377,133 @@ void TestNewShaderRecompilerVintrpLowering() {
   CheckSpirvBinaryValidates(no_perspective_result.spirv);
 }
 
+void TestCustomVintrpMovLowering() {
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1),      EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12),        0xbf810000u,
+  };
+  ShaderPixelInputInfo custom_ps_info{};
+  custom_ps_info.input_num = 1;
+  custom_ps_info.ps_system_input_base = 2;
+  custom_ps_info.custom_interpolation_mask = 1;
+  custom_ps_info.ps_perspective_center_vgpr = 0;
+  SetIdentityInterpolatorSettings(&custom_ps_info);
+  custom_ps_info.interpolator_settings[0] = 0x00000420u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &custom_ps_info;
+  options.dump_ir = true;
+
+  ShaderRecompiler::CompileResult custom_result;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, custom_result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(
+            custom_result.ir_dump,
+            "GetInterpolationParameter 0x00000000, 0x00000003, 0x00000000"),
+        "custom VINTRP did not preserve P10 mode");
+  Check(Common::ContainsStr(
+            custom_result.ir_dump,
+            "GetInterpolationParameter 0x00000000, 0x00000003, 0x00000001"),
+        "custom VINTRP did not preserve P20 mode");
+  Check(Common::ContainsStr(
+            custom_result.ir_dump,
+            "GetInterpolationParameter 0x00000000, 0x00000003, 0x00000002"),
+        "custom VINTRP did not preserve P0 mode");
+  Check(SpirvContainsCapability(custom_result.spirv, 5284u),
+        "custom VINTRP did not enable FragmentBarycentricKHR");
+  Check(SpirvHasDecorationValueWithDecoration(custom_result.spirv, 30u, 0u,
+                                              5285u),
+        "custom VINTRP input did not emit PerVertexKHR");
+  Check(
+      !SpirvHasDecorationValueWithDecoration(custom_result.spirv, 30u, 0u, 14u),
+      "custom VINTRP input was misclassified as flat");
+  Check(SpirvHasDecorationValue(custom_result.spirv, 11u, 5286u),
+        "perspective-center VGPRs did not use BaryCoordKHR");
+  const auto source = DisassembleSpirvBinary(custom_result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                       "in_param_0 %uint_0 %uint_3"),
+        "custom VINTRP P0 did not select vertex 0");
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                       "in_param_0 %uint_1 %uint_3"),
+        "custom VINTRP P10 did not select vertex 1");
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                       "in_param_0 %uint_2 %uint_3"),
+        "custom VINTRP P20 did not select vertex 2");
+  Check(!Common::ContainsStr(source, "OpFSub"),
+        "custom VINTRP incorrectly applied hardware delta subtraction");
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                       "gl_BaryCoordKHR %uint_1") &&
+            SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                           "gl_BaryCoordKHR %uint_2") &&
+            !SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                            "gl_BaryCoordKHR %uint_0"),
+        "guest perspective-center I/J did not map to BaryCoordKHR Y/Z");
+  CheckSpirvBinaryValidates(custom_result.spirv);
+
+  custom_ps_info.custom_interpolation_mask = 0;
+  custom_ps_info.interpolator_settings[0] = 0;
+  ShaderRecompiler::CompileResult standard_result;
+  Check(
+      ShaderRecompiler::TryRecompile(shader, options, standard_result, &error),
+      error.c_str());
+  Check(SpirvInstructionOpcodeCount(standard_result.spirv, 131u) == 2u,
+        "standard VINTRP P10/P20 did not subtract P0 exactly once each");
+  CheckSpirvBinaryValidates(standard_result.spirv);
+
+  const uint32_t flat_shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(12, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo flat_ps_info{};
+  flat_ps_info.input_num = 1;
+  flat_ps_info.interpolator_settings[0] = 0x00000400u;
+  options.input_info.pixel = &flat_ps_info;
+  ShaderRecompiler::CompileResult flat_result;
+  Check(
+      ShaderRecompiler::TryRecompile(flat_shader, options, flat_result, &error),
+      error.c_str());
+  Check(!SpirvContainsCapability(flat_result.spirv, 5284u),
+        "flat P0 unexpectedly required fragment barycentric support");
+  Check(SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
+        "flat P0 did not retain ordinary flat interpolation");
+  CheckSpirvBinaryValidates(flat_result.spirv);
+
+  const uint32_t mixed_shader[] = {
+      EncodeVintrp(0, 12, 0, 3, 0),
+      EncodeVintrp(1, 12, 0, 3, 0),
+      EncodeVintrp(2, 13, 0, 3, 2),
+      EncodeVop2(0x03, 14, 12 + 256, 13),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(14, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo mixed_ps_info{};
+  mixed_ps_info.input_num = 1;
+  options.input_info.pixel = &mixed_ps_info;
+  ShaderRecompiler::CompileResult mixed_result;
+  Check(ShaderRecompiler::TryRecompile(mixed_shader, options, mixed_result,
+                                       &error),
+        error.c_str());
+  Check(SpirvHasDecorationValue(mixed_result.spirv, 11u, 5286u) &&
+            SpirvInstructionOpcodeCount(mixed_result.spirv, 133u) == 3u,
+        "mixed ordinary/P0 input was not interpolated from per-vertex values");
+  CheckSpirvBinaryValidates(mixed_result.spirv);
+
+  mixed_ps_info.ps_no_perspective = true;
+  ShaderRecompiler::CompileResult mixed_linear_result;
+  Check(ShaderRecompiler::TryRecompile(mixed_shader, options,
+                                       mixed_linear_result, &error),
+        error.c_str());
+  Check(SpirvHasDecorationValue(mixed_linear_result.spirv, 11u, 5287u),
+        "mixed linear input did not use BaryCoordNoPerspKHR");
+  CheckSpirvBinaryValidates(mixed_linear_result.spirv);
+}
+
 void TestPsInputCountRegisterDecode() {
   HW::Context context;
   // NUM_INTERP is 3 while bit 14 is an independent control flag that must be
@@ -11623,6 +11750,7 @@ int main() {
   TestLowerProgramResetsAnalysisState();
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
+  TestCustomVintrpMovLowering();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

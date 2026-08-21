@@ -14,10 +14,14 @@ IR::ExportFlags Translator::AddExportInfo(const IR::Instruction& inst) {
 bool Translator::TranslateAttributeOperation(const IR::Instruction& inst) {
 	if (inst.op == IR::Opcode::LoadInputF32) {
 		for (uint32_t component = 0; component < inst.input_info.component_count; component++) {
-			WriteOperand(OffsetOperand(inst.dst, component),
-			             ir.Emit(IR::ValueOpcode::GetAttribute,
-			                     {IR::Value(inst.input_info.attr),
-			                      IR::Value(inst.input_info.chan + component)}));
+			const auto chan  = inst.input_info.chan + component;
+			const auto value = inst.input_info.interpolation_mode < 3u
+			                       ? ir.Emit(IR::ValueOpcode::GetInterpolationParameter,
+			                                 {IR::Value(inst.input_info.attr), IR::Value(chan),
+			                                  IR::Value(inst.input_info.interpolation_mode)})
+			                       : ir.Emit(IR::ValueOpcode::GetAttribute,
+			                                 {IR::Value(inst.input_info.attr), IR::Value(chan)});
+			WriteOperand(OffsetOperand(inst.dst, component), value);
 		}
 		return true;
 	}

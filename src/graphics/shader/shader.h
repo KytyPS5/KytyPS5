@@ -117,6 +117,8 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       ps_system_input_base         = 0;
+	uint32_t                                       custom_interpolation_mask    = 0;
+	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       mrt_output_mask              = 0;
@@ -150,6 +152,7 @@ uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, ui
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
+bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;

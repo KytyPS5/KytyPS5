@@ -171,6 +171,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndirectGetSize();
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
+                                                uint32_t             data_offset_in_bytes,
+                                                uint32_t             count_indirect,
+                                                uint32_t             max_count_or_count,
+                                                const volatile void* count_addr,
+                                                uint32_t stride_in_bytes, uint64_t modifier);
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier);
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
@@ -273,7 +279,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          const volatile void* address, uint64_t reference,
                                          uint64_t mask, uint32_t poll_cycles);
 uint64_t KYTY_SYSV_ABI  AgcDcbWaitOnAddressGetSize(uint32_t size);
-bool                    AgcIsWaitUserDataPacket(uint32_t cmd_id, const uint32_t* payload);
+bool                    AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);

@@ -2619,6 +2619,21 @@ static uint32_t decode_draw_index_initiator(uint64_t modifier) {
 	return (static_cast<uint32_t>(modifier) >> 3u) & 0x20u;
 }
 
+static constexpr uint32_t AGC_INTERNAL_DATA_REGISTER            = 0x342u;
+static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG     = 0xc6000008u;
+static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG       = 0xc8020000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG            = 0xc8000000u;
+static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW           = 4u;
+static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
+
+static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
+	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[2] = tag;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
                                         const volatile void* index_addr, uint64_t modifier) {
 	PRINT_NAME();
@@ -2871,6 +2886,69 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
 	cmd[4] = decode_indirect_draw_initiator(modifier);
+
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
+                                                uint32_t             data_offset_in_bytes,
+                                                uint32_t             count_indirect,
+                                                uint32_t             max_count_or_count,
+                                                const volatile void* count_addr,
+                                                uint32_t stride_in_bytes, uint64_t modifier) {
+	PRINT_NAME();
+
+	LOGF("\t data_offset        = 0x%" PRIx32 "\n"
+	     "\t count_indirect     = 0x%" PRIx32 "\n"
+	     "\t max_count_or_count = 0x%" PRIx32 "\n"
+	     "\t count_addr         = 0x%016" PRIx64 "\n"
+	     "\t stride_in_bytes    = 0x%" PRIx32 "\n"
+	     "\t modifier           = 0x%016" PRIx64 "\n",
+	     data_offset_in_bytes, count_indirect, max_count_or_count,
+	     reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
+
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	buf->DbgDump();
+
+	constexpr uint32_t draw_packet_size_dw = 10u;
+	constexpr uint32_t total_size_dw =
+	    AGC_INTERNAL_DATA_PACKET_SIZE_DW + draw_packet_size_dw +
+	    AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	auto* cmd = buf->AllocateDW(total_size_dw);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	write_agc_internal_data_packet(cmd, AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG);
+	auto* draw = cmd + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	auto* end  = draw + draw_packet_size_dw;
+	write_agc_internal_data_packet(end, AGC_DRAW_INDIRECT_MULTI_END_TAG);
+
+	const auto low           = static_cast<uint32_t>(modifier);
+	const auto sgpr_base     = indirect_modifier_sgpr_base(low);
+	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, false);
+	const auto count_vaddr   = reinterpret_cast<uint64_t>(count_addr);
+
+	uint32_t draw_index_location = 0x280u;
+	if ((low & 0x8u) != 0) {
+		draw_index_location = sgpr_base + extract_modifier_bits(low, 24u, 5u);
+	}
+	const auto draw_control = draw_index_location | ((low & 0x10u) << 23u) |
+	                          ((count_indirect & 0x1u) << 30u) | ((low & 0x8u) << 28u);
+
+	draw[0] = KYTY_PM4(draw_packet_size_dw, Pm4::IT_DRAW_INDIRECT_MULTI, 0u);
+	draw[1] = data_offset_in_bytes;
+	draw[2] = static_cast<uint32_t>(patch_offsets);
+	draw[3] = static_cast<uint32_t>(patch_offsets >> 32u);
+	draw[4] = draw_control;
+	draw[5] = max_count_or_count;
+	draw[6] = static_cast<uint32_t>(count_vaddr) & ~0x3u;
+	draw[7] = static_cast<uint32_t>(count_vaddr >> 32u);
+	draw[8] = stride_in_bytes;
+	draw[9] = decode_indirect_draw_initiator(modifier);
 
 	return cmd;
 }
@@ -3793,16 +3871,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_poli
 	return cmd;
 }
 
-static constexpr uint32_t AGC_WAIT_USER_DATA_REGISTER     = 0x342u;
-static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG = 0xc8010000u;
-static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG = 0xc8020000u;
-static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG      = 0xc8000000u;
-static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW     = 4u;
-static constexpr uint32_t AGC_WAIT_USER_DATA_END_DW       = 3u;
-
 static uint32_t* get_agc_wait_packet(uint32_t* cmd) {
 	if (cmd == nullptr || KYTY_PM4_LEN(cmd[0]) != AGC_WAIT_USER_DATA_BEGIN_DW ||
-	    !AgcIsWaitUserDataPacket(cmd[0], cmd + 1)) {
+	    !AgcIsInternalDataPacket(cmd[0], cmd + 1)) {
 		return nullptr;
 	}
 
@@ -3946,20 +4017,22 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 	       ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 }
 
-bool AgcIsWaitUserDataPacket(uint32_t cmd_id, const uint32_t* payload) {
+bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_WAIT_USER_DATA_REGISTER) {
+	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_INTERNAL_DATA_REGISTER) {
 		return false;
 	}
 
 	const auto size_dw = KYTY_PM4_LEN(cmd_id);
-	if (size_dw != AGC_WAIT_USER_DATA_BEGIN_DW && size_dw != AGC_WAIT_USER_DATA_END_DW) {
-		return false;
+	if (size_dw == AGC_WAIT_USER_DATA_BEGIN_DW) {
+		const auto tag = payload[1] & 0xffff0000u;
+		return tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG;
 	}
-	const auto tag     = payload[1] & 0xffff0000u;
-	return (size_dw == AGC_WAIT_USER_DATA_BEGIN_DW &&
-	        (tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG)) ||
-	       (size_dw == AGC_WAIT_USER_DATA_END_DW && payload[1] == AGC_WAIT_USER_DATA_END_TAG);
+
+	return size_dw == AGC_INTERNAL_DATA_PACKET_SIZE_DW &&
+	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG ||
+	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
+	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
@@ -3998,7 +4071,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	bool wait32        = (size == 0);
 	auto poll          = wait_reg_mem_poll_cycles_to_packet(poll_cycles);
 	const auto wait_dw  = wait32 ? 7u : 9u;
-	const auto total_dw = AGC_WAIT_USER_DATA_BEGIN_DW + wait_dw + AGC_WAIT_USER_DATA_END_DW;
+	const auto total_dw =
+	    AGC_WAIT_USER_DATA_BEGIN_DW + wait_dw + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
 
 	auto* cmd = buf->AllocateDW(total_dw);
 
@@ -4007,16 +4081,14 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	}
 
 	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = AGC_WAIT_USER_DATA_REGISTER;
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = (wait32 ? AGC_WAIT_USER_DATA_BEGIN_32_TAG : AGC_WAIT_USER_DATA_BEGIN_64_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
 	cmd[3] = static_cast<uint32_t>(address_value);
 
 	auto* wait = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
 	auto* end  = wait + wait_dw;
-	end[0]     = KYTY_PM4(AGC_WAIT_USER_DATA_END_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	end[1]     = AGC_WAIT_USER_DATA_REGISTER;
-	end[2]     = AGC_WAIT_USER_DATA_END_TAG;
+	write_agc_internal_data_packet(end, AGC_WAIT_USER_DATA_END_TAG);
 
 	if (wait32) {
 		wait[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0u);

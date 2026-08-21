@@ -2837,7 +2837,7 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	if (Gen5::AgcIsWaitUserDataPacket(cmd_id, buffer)) {
+	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 

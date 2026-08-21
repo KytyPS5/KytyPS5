@@ -111,6 +111,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("RmaJwLtc8rY", Gen5::AgcDcbSetBaseIndirectArgs);
 	LIB_FUNC("1q1titRBL6o", Gen5::AgcDcbDrawIndirect);
 	LIB_FUNC("cxPZ4Wgvdj8", Gen5::AgcDcbDrawIndirectGetSize);
+	LIB_FUNC("kUlvghKs-mA", Gen5::AgcDcbDrawIndirectMulti);
 	LIB_FUNC("t1vNu082-jM", Gen5::AgcDcbDrawIndexIndirect);
 	LIB_FUNC("ypVBz4uPKcQ", Gen5::AgcDcbDrawIndexIndirectMulti);
 	LIB_FUNC("CtB+A9-VxO0", Gen5::AgcDcbDispatchIndirect);

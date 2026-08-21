@@ -22835,10 +22835,56 @@ void CheckAgcWaitPackets(RenderContext &renderer) {
                   packet_mismatch &&
               Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
                   packet_mismatch &&
-              !Gen5::AgcIsWaitUserDataPacket(
+              !Gen5::AgcIsInternalDataPacket(
                   KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
           "native wait patch accepted a packet without the AGC metadata prefix");
   std::printf("[host]    %-32s ok\n", "AgcWaitPackets");
+}
+
+void CheckAgcDrawIndirectMultiPacket(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
+    Pm4Execution execution;
+    return processor.Process(execution, packet, size_dw) ==
+           Pm4ProcessResult::Complete;
+  };
+
+  constexpr uint64_t modifier = 0x0000000069380b1dull;
+  constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
+  const auto *count_address = reinterpret_cast<const volatile void *>(
+      static_cast<uintptr_t>(0x123456789abcdef3ull));
+  constexpr std::array<uint32_t, 16> expected{
+      0xc0017904u, 0x00000342u, 0xc6000008u, 0xc0082c00u,
+      0x11223344u, 0x00000111u, 0x00000113u, 0xc8000115u,
+      0x55667788u, 0x9abcdef0u, 0x12345678u, 0xaabbccddu,
+      0x00000022u, 0xc0017904u, 0x00000342u, 0xc6000000u};
+
+  std::array<uint32_t, 16> packet{};
+  AgcCommandBufferLayout dcb{packet.data(),
+                             packet.data() + packet.size(),
+                             packet.data(),
+                             packet.data() + packet.size(),
+                             nullptr,
+                             nullptr,
+                             0};
+  auto *emitted = Gen5::AgcDcbDrawIndirectMulti(
+      reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0x11223344u, 1u,
+      0x55667788u, count_address, 0xaabbccddu, modifier);
+
+  const uint32_t invalid_payload[]{0x342u, 0xc6000010u};
+  Require(
+      "AgcDrawIndirectMulti", "native packet",
+      emitted == packet.data() && dcb.cursor_up == packet.data() + packet.size() &&
+          packet == expected && execute(packet.data(), 3u) &&
+          execute(packet.data() + 13u, 3u) &&
+          Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
+              packet_mismatch &&
+          Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
+              packet_mismatch &&
+          !Gen5::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
+      "drawIndirectMulti stream differs from native AGC");
+  std::printf("[host]    %-32s ok\n", "AgcDrawIndirectMulti");
 }
 
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
@@ -23228,6 +23274,11 @@ int main(int argc, char **argv) {
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--agc-draw-multi-only") == 0) {
+    VulkanHarness vulkan;
+    CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -23393,6 +23444,7 @@ int main(int argc, char **argv) {
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
+  CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());

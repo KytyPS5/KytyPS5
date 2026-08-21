@@ -4,11 +4,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <optional>
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -23,7 +26,6 @@ struct GraphicContext;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
 struct CommandSlot;
-struct VulkanDescriptorSet;
 struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
@@ -92,7 +94,6 @@ public:
 	void WaitForFenceOnly();
 	void WaitForFence();
 	void WaitForFenceAndReset();
-	void RecycleDescriptorAfterFence(VulkanDescriptorSet& set);
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -102,25 +103,23 @@ public:
 private:
 	void Release();
 	void FinalizeFence(bool reset_recording);
-	void RecycleDescriptorsAfterFence();
 
-	RenderContext&                             m_context;
-	CommandScheduler&                          m_scheduler;
-	GraphicContext&                            m_graphics;
-	CommandSlot*                               m_slot            = nullptr;
-	bool                                       m_execute         = false;
-	bool                                       m_fence_waited    = false;
-	uint64_t                                   m_submit_seq      = 0;
-	uint32_t                                   m_debug_op        = 0;
-	uint64_t                                   m_debug_submit_id = 0;
-	uint32_t                                   m_debug_arg0      = 0;
-	uint32_t                                   m_debug_arg1      = 0;
-	uint32_t                                   m_debug_arg2      = 0;
-	uint32_t                                   m_debug_arg3      = 0;
-	uint64_t                                   m_debug_arg4      = 0;
-	std::vector<VulkanDescriptorSet*>          m_descriptor_sets_after_fence;
-	mutable RenderState                        m_render_state;
-	mutable bool                               m_rendering = false;
+	RenderContext&      m_context;
+	CommandScheduler&   m_scheduler;
+	GraphicContext&     m_graphics;
+	CommandSlot*        m_slot            = nullptr;
+	bool                m_execute         = false;
+	bool                m_fence_waited    = false;
+	uint64_t            m_submit_seq      = 0;
+	uint32_t            m_debug_op        = 0;
+	uint64_t            m_debug_submit_id = 0;
+	uint32_t            m_debug_arg0      = 0;
+	uint32_t            m_debug_arg1      = 0;
+	uint32_t            m_debug_arg2      = 0;
+	uint32_t            m_debug_arg3      = 0;
+	uint64_t            m_debug_arg4      = 0;
+	mutable RenderState m_render_state;
+	mutable bool        m_rendering = false;
 };
 
 class RenderCommandBuffer final: public CommandBuffer {
@@ -159,24 +158,22 @@ public:
 	void DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
-	[[nodiscard]] DescriptorCache::PreparedBindings
-	     PrepareBindings(const ShaderStageRuntime& runtime, vk::ShaderStageFlags shader_stage,
-	                     DescriptorCache::Stage stage);
-	void FindBuffers(DescriptorCache::PreparedBindings& bindings);
-	void RebindBuffers(DescriptorCache::PreparedBindings& bindings);
-	void RebindImages(DescriptorCache::PreparedBindings& bindings);
+	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	void                           FindBuffers(PreparedBindings& bindings);
+	void                           RebindBuffers(PreparedBindings& bindings);
+	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
-	                    vk::PipelineLayout layout, DescriptorCache::PreparedBindings& bindings);
+	                    const PipelineCache::Pipeline&     pipeline,
+	                    std::span<PreparedBindings* const> bindings);
 
 private:
 	struct GraphicsBindings {
-		DescriptorCache::PreparedBindings                vertex;
-		std::optional<DescriptorCache::PreparedBindings> pixel;
+		PreparedBindings                vertex;
+		std::optional<PreparedBindings> pixel;
 	};
 
-	[[nodiscard]] DescriptorCache::TextureBinding
-	ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	               const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
@@ -207,8 +204,14 @@ private:
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const RenderCommandBuffer&    buffer);
 
-	RenderContext&        m_context;
-	std::vector<ImageId> m_bound_images;
+	RenderContext&                        m_context;
+	std::vector<ImageId>                  m_bound_images;
+	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
+	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
+	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::vector<uint32_t>                 m_image_occurrences;
+	std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>
+	    m_push_constants {};
 
 	friend struct RenderExecutorTestAccess;
 };

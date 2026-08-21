@@ -338,6 +338,13 @@ enum class DescriptorBindingKind {
 	Count,
 };
 
+constexpr uint32_t NativePushConstantSize = 128;
+
+[[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
+	return static_cast<uint32_t>(kind) +
+	       (stage == ShaderType::Pixel ? static_cast<uint32_t>(DescriptorBindingKind::Count) : 0u);
+}
+
 [[nodiscard]] inline std::optional<DescriptorBindingKind>
 DescriptorBindingForImage(const ImageResource& image) {
 	using Dimension = Decoder::ImageDimension;
@@ -412,19 +419,17 @@ DescriptorBindingForImage(const ImageResource& image) {
 }
 
 struct DescriptorBinding {
-	DescriptorBindingKind kind    = DescriptorBindingKind::Buffers;
-	uint32_t              binding = 0;
+	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
 	std::vector<uint32_t> resources;
 
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
 struct BindingLayout {
-	uint32_t                       descriptor_set       = 0;
 	uint32_t                       push_constant_offset = 0;
-	uint32_t                       push_constant_size   = 0;
-	uint32_t                       memory_offset_dword  = 0;
-	uint32_t                       memory_offset_count  = 0;
+	uint32_t                       push_constant_size  = 0;
+	uint32_t                       memory_offset_dword = 0;
+	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 

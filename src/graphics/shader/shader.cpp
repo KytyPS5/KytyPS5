@@ -846,6 +846,11 @@ static void ShaderGetStaticInputInfoPS(
 		     regs.ps_regs.data_addr);
 	}
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
+	ps_info.push_constant_offset =
+	    vs_info.stage.program != nullptr
+	        ? vs_info.stage.program->bindings.push_constant_offset +
+	              vs_info.stage.program->bindings.push_constant_size
+	        : 0;
 
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
 	// flags in the hardware state and extract only the input count here.
@@ -872,15 +877,6 @@ static void ShaderGetStaticInputInfoPS(
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
 	}
-
-	ps_info.descriptor_set =
-	    vs_info.stage.program != nullptr && !vs_info.stage.program->bindings.descriptors.empty()
-	        ? 1
-	        : 0;
-	ps_info.push_constant_offset = vs_info.stage.program != nullptr
-	                                   ? vs_info.stage.program->bindings.push_constant_offset +
-	                                         vs_info.stage.program->bindings.push_constant_size
-	                                   : 0;
 
 	for (int i = 0; i < 8; i++) {
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
@@ -1020,11 +1016,10 @@ static void LogShaderProgramCacheHit(const char* stage, uint64_t shader_hash, ui
 
 static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Program& program) {
 	std::string ret = fmt::format(
-	    "set={} push={} groups={} user={} buffers={} images={} samplers={} addresses={} srt={}",
-	    program.bindings.descriptor_set, program.bindings.push_constant_size,
-	    program.bindings.descriptors.size(), program.bindings.user_data_registers.size(),
-	    program.info.buffers.size(), program.info.images.size(), program.info.samplers.size(),
-	    program.info.addresses.size(),
+	    "push={} groups={} user={} buffers={} images={} samplers={} addresses={} srt={}",
+	    program.bindings.push_constant_size, program.bindings.descriptors.size(),
+	    program.bindings.user_data_registers.size(), program.info.buffers.size(),
+	    program.info.images.size(), program.info.samplers.size(), program.info.addresses.size(),
 	    program.values != nullptr ? program.values->srt_reads.size() : 0u);
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& buffer = program.info.buffers[i];
@@ -1050,8 +1045,6 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&               ids,
                                              const ShaderRecompiler::IR::Program& program) {
 	EXIT_IF(!program.binding_layout_complete);
-	ids.push_back(program.bindings.descriptor_set);
-	ids.push_back(program.bindings.push_constant_offset);
 	ids.push_back(program.bindings.push_constant_size);
 	ids.push_back(program.bindings.memory_offset_dword);
 	ids.push_back(program.bindings.memory_offset_count);
@@ -1061,7 +1054,6 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 	ids.push_back(static_cast<uint32_t>(program.bindings.descriptors.size()));
 	for (const auto& binding: program.bindings.descriptors) {
 		ids.push_back(static_cast<uint32_t>(binding.kind));
-		ids.push_back(binding.binding);
 		ids.push_back(static_cast<uint32_t>(binding.resources.size()));
 		ids.insert(ids.end(), binding.resources.begin(), binding.resources.end());
 	}
@@ -1456,8 +1448,6 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.scratch_dwords             = input_info.scratch_size_dwords;
 	options.user_data                  = regs.gs_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
-	options.descriptor_set             = 0;
-	options.push_constant_offset       = 0;
 	options.input_info.vertex          = &input_info;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
@@ -1507,10 +1497,9 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.shader_base                = shader_addr;
 	options.user_data_count            = regs.ps_regs.rsrc2.user_sgpr;
 	options.scratch_dwords             = input_info.scratch_size_dwords;
+	options.push_constant_offset       = input_info.push_constant_offset;
 	options.user_data                  = regs.ps_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
-	options.descriptor_set             = input_info.descriptor_set;
-	options.push_constant_offset       = input_info.push_constant_offset;
 	options.input_info.pixel           = &input_info;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
@@ -1560,8 +1549,6 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.scratch_dwords             = input_info.scratch_size_dwords;
 	options.user_data                  = regs.cs_user_sgpr.value;
 	options.read_specialization_memory = ReadShaderGuestMemory;
-	options.descriptor_set             = 0;
-	options.push_constant_offset       = 0;
 	options.input_info.compute         = &input_info;
 	options.wave_size                  = input_info.wave_size;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
@@ -1666,7 +1653,6 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 	ret.hash0 = (regs.ps_regs.chksum >> 32u) & 0xffffffffu;
 	ret.crc32 = regs.ps_regs.chksum & 0xffffffffu;
 
-	ret.ids.push_back(input_info.descriptor_set);
 	ret.ids.push_back(input_info.push_constant_offset);
 	ret.ids.push_back(input_info.scratch_size_dwords);
 	ret.ids.push_back(input_info.input_num);
@@ -1678,6 +1664,7 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_front_face));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_no_perspective));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pixel_kill_enable));
+	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_depth_export_enable));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_sample_mask_export_enable));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_early_z));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_execute_on_noop));
@@ -1738,10 +1725,7 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 		ret.ids.push_back(input_info.threads_num[i]);
 		ret.ids.push_back(static_cast<uint32_t>(input_info.group_id[i]));
 	}
-	ret.ids.push_back(static_cast<uint32_t>(input_info.dispatch_thread_dimensions));
-	for (uint32_t dim: input_info.dispatch_threads_num) {
-		ret.ids.push_back(dim);
-	}
+	ret.ids.push_back(static_cast<uint32_t>(input_info.tg_size_en));
 
 	if (include_bind_specialization) {
 		EXIT_IF(!input_info.stage);

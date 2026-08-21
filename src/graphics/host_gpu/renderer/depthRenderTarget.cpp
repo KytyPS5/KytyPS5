@@ -13,7 +13,6 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -290,8 +289,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
-	r.stencil_clear_value  = hw.GetStencilClearValue();
-	r.stencil_test_enable  = has_stencil && dc.stencil_enable;
+	r.stencil_clear_value = hw.GetStencilClearValue();
+	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
 		const bool stencil_ops_disabled =
 		    rc.stencil_clear_enable || z.depth_view.stencil_write_disable;

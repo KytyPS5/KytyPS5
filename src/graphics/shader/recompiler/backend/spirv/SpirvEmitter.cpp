@@ -89,17 +89,11 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	}
 
 	std::array<bool, KindCount> seen {};
-	for (uint32_t i = 0; i < program.bindings.descriptors.size(); i++) {
-		const auto& binding = program.bindings.descriptors[i];
-		const auto  kind    = static_cast<size_t>(binding.kind);
+	for (const auto& binding: program.bindings.descriptors) {
+		const auto kind = static_cast<size_t>(binding.kind);
 		if (kind >= KindCount || seen[kind] || !present[kind] ||
 		    binding.resources != expected[kind]) {
 			return Fail(error, "native descriptor groups do not match shader topology");
-		}
-		for (uint32_t j = 0; j < i; j++) {
-			if (program.bindings.descriptors[j].binding == binding.binding) {
-				return Fail(error, "native descriptor binding numbers are not unique");
-			}
 		}
 		seen[kind] = true;
 	}
@@ -109,7 +103,10 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		}
 	}
 	const auto has_user_storage = present[static_cast<size_t>(Kind::UserData)];
-	if (program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
+	if (program.bindings.push_constant_offset % sizeof(uint32_t) != 0 ||
+	    program.bindings.push_constant_offset + program.bindings.push_constant_size >
+	        IR::NativePushConstantSize ||
+	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count !=
 	        program.info.buffers.size() + program.info.addresses.size() ||
 	    (!has_user_storage &&

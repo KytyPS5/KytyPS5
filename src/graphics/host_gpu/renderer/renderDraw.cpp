@@ -15,7 +15,6 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -798,9 +797,9 @@ static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer
 }
 
 struct VertexBufferRange {
-	uint64_t      base_address  = 0;
-	uint64_t      requested_end = 0;
-	uint64_t      acquired_end  = 0;
+	uint64_t                     base_address  = 0;
+	uint64_t                     requested_end = 0;
+	uint64_t                     acquired_end  = 0;
 	std::pair<Buffer*, uint64_t> binding;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
@@ -862,15 +861,14 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
-		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device,
-		                     range.binding.first->Handle(),
-		                     "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]",
-		                     range.base_address, size);
+		SetVulkanObjectNameF(
+		    buffer.GetContext().GetGraphics().device, range.binding.first->Handle(),
+		    "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]", range.base_address, size);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
 	PreparedVertexBuffers prepared;
-	prepared.count = static_cast<uint32_t>(vs_input_info.buffers_num);
+	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
@@ -1062,7 +1060,8 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
 	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, state.vs_input_info,
-	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
+	                         target_export_mapping,
+	                         state.ps_input_info, state.ps_shader)) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}
 }
@@ -1091,8 +1090,8 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
 		prepared.buffer = stream.Handle();
 	} else {
-		auto [buffer_ptr, offset] = buffer.GetContext().GetBufferCache().ObtainBuffer(
-		    source.address, source.size, false);
+		auto [buffer_ptr, offset] =
+		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 	}
@@ -1108,7 +1107,8 @@ static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer vk_buffer, const PreparedVertexBuffers& prepared) {
+static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+                                const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
@@ -1230,15 +1230,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x200u);
 	}
 	CommitVertexBuffers(vk_buffer, vertex_bindings);
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout,
-	               bindings.vertex);
 	if (bindings.pixel.has_value()) {
 		if (set_auto_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 		}
-		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout,
-		               *bindings.pixel);
 	}
+	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
+	const size_t                     descriptor_stage_count = bindings.pixel.has_value() ? 2u : 1u;
+	if (bindings.pixel) {
+		descriptor_stages[1] = &*bindings.pixel;
+	}
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
+	               std::span {descriptor_stages.data(), descriptor_stage_count});
 	CommitIndexBuffer(vk_buffer, index_binding);
 
 	const auto dynamic_params =

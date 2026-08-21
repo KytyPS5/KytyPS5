@@ -55,13 +55,14 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
-	[[nodiscard]] bool            Active() const noexcept { return m_current >= 0; }
-	void                          CheckActive() const;
-	RenderCommandBuffer&          Current() const;
-	[[nodiscard]] uint64_t        CurrentTick() const noexcept { return m_master.CurrentTick(); }
-	[[nodiscard]] bool            IsFree(uint64_t tick);
-	[[nodiscard]] RenderContext&  Context() const noexcept { return m_context; }
-	[[nodiscard]] GraphicContext& Graphics() const noexcept { return m_graphics; }
+	[[nodiscard]] bool             Active() const noexcept { return m_current >= 0; }
+	void                           CheckActive() const;
+	RenderCommandBuffer&           Current() const;
+	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] bool             IsFree(uint64_t tick);
+	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
+	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
 	static constexpr size_t CommandBufferGrowStep = 4;

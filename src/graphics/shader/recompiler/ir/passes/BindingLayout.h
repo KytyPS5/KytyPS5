@@ -5,13 +5,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-struct BindingLayoutOptions {
-	uint32_t descriptor_set       = 0;
-	uint32_t push_constant_offset = 0;
-	uint32_t max_push_dwords      = 32;
-};
-
-bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std::string* error);
+bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::string* error);
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 

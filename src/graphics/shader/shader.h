@@ -120,7 +120,6 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       mrt_output_mask              = 0;
-	uint32_t                                       descriptor_set               = 0;
 	uint32_t                                       push_constant_offset         = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;

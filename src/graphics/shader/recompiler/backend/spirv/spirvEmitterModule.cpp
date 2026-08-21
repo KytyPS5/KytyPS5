@@ -510,23 +510,20 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 	}
 }
 
-void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name, uint32_t set,
-                        uint32_t binding) {
+void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name,
+                        IR::DescriptorBindingKind kind) {
 	if (variable == 0) {
 		return;
 	}
 	state.builder.AddName(variable, name);
-	state.builder.AddAnnotation({OpDecorate, variable, DecorationDescriptorSet, set});
-	state.builder.AddAnnotation({OpDecorate, variable, DecorationBinding, binding});
+	state.builder.AddAnnotation({OpDecorate, variable, DecorationDescriptorSet, 0});
+	state.builder.AddAnnotation(
+	    {OpDecorate, variable, DecorationBinding, IR::NativeBinding(state.program.stage, kind)});
 }
 
 void AddDescriptorAnnotationsAndNames(EmitterState& state) {
-	const auto set      = state.program.bindings.descriptor_set;
-	auto       Decorate = [&](uint32_t variable, const char* name, IR::DescriptorBindingKind kind) {
-		const auto* binding = DescriptorBinding(state, kind);
-		if (binding != nullptr) {
-			DecorateDescriptor(state, variable, name, set, binding->binding);
-		}
+	auto Decorate = [&](uint32_t variable, const char* name, IR::DescriptorBindingKind kind) {
+		DecorateDescriptor(state, variable, name, kind);
 	};
 	if (state.storage_buffer_variable != 0) {
 		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
@@ -570,7 +567,7 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "storage_atomic_2d_array",
 	                                        "storage_atomic_3d"};
 	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		const auto view        = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
 		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
 		Decorate(state.storage_image_variables[i], StorageNames[i],
 		         StorageBindingKind(image_class, view));
@@ -588,17 +585,13 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 }
 
 void AddVsharpAnnotationsAndNames(EmitterState& state) {
-	const auto& bind = state.program.bindings;
 	if (state.push_constant_variable != 0) {
 		state.builder.AddName(PushConstantBlockType(state), "BufferResource");
 		state.builder.AddName(state.push_constant_variable, "vsharp");
 	}
 	if (state.vsharp_storage_variable != 0) {
-		const auto* storage = DescriptorBinding(state, IR::DescriptorBindingKind::UserData);
-		if (storage != nullptr) {
-			DecorateDescriptor(state, state.vsharp_storage_variable, "user_data",
-			                   bind.descriptor_set, storage->binding);
-		}
+		DecorateDescriptor(state, state.vsharp_storage_variable, "user_data",
+		                   IR::DescriptorBindingKind::UserData);
 	}
 }
 

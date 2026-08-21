@@ -583,13 +583,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	const bool subgroup_size_control_enabled =
-	    graphics.subgroup_size_control_enabled && supported_features13.subgroupSizeControl == VK_TRUE;
+	const bool subgroup_size_control_enabled = graphics.subgroup_size_control_enabled &&
+	                                           supported_features13.subgroupSizeControl == VK_TRUE;
 
-	auto features13              = required_features13;
-	features13.pNext             = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                                          : static_cast<void*>(&features12);
-	features13.robustImageAccess = supported_features13.robustImageAccess;
+	auto features13                = required_features13;
+	features13.pNext               = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                                         : static_cast<void*>(&features12);
+	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
@@ -834,7 +834,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3] = {};
+	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
 	uint32_t                       enabled_features_count = 0;
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
@@ -939,7 +939,15 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not find suitable device");
 	}
 
-	graphic_ctx.physical_device.getProperties(&graphic_ctx.physical_device_properties);
+	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
+	vk::PhysicalDeviceProperties2              physical_device_properties {};
+	push_descriptor_properties.sType = vk::StructureType::ePhysicalDevicePushDescriptorProperties;
+	push_descriptor_properties.pNext = nullptr;
+	physical_device_properties.sType = vk::StructureType::ePhysicalDeviceProperties2;
+	physical_device_properties.pNext = &push_descriptor_properties;
+	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
+	graphic_ctx.physical_device_properties = physical_device_properties.properties;
+	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 

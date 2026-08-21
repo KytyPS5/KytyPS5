@@ -342,7 +342,7 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
-  static DescriptorCache::TextureBinding
+  static TextureBinding
   ResolveTexture(RenderExecutor &executor,
                  const ShaderRecompiler::IR::ImageResource &resource,
                  const ShaderRecompiler::IR::DescriptorValue &value) {
@@ -356,10 +356,93 @@ struct RenderExecutorTestAccess {
     return executor.PrepareGraphicsBindings(vertex, pixel, pixel_active);
   }
 
-  static void CommitBindings(RenderExecutor &executor, CommandBuffer &buffer,
-                             DescriptorCache::PreparedBindings &bindings) {
-    executor.CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, nullptr,
-                            bindings);
+  static PipelineCache::Pipeline
+  CreateDescriptorPipeline(RenderExecutor &executor,
+                           std::span<PreparedBindings *const> stages) {
+    std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+    bool compute = false;
+    for (const auto *prepared : stages) {
+      const auto &program = *prepared->program;
+      compute |= program.stage == ShaderType::Compute;
+      const auto shader_stage = program.stage == ShaderType::Vertex
+                                    ? vk::ShaderStageFlagBits::eVertex
+                                : program.stage == ShaderType::Pixel
+                                    ? vk::ShaderStageFlagBits::eFragment
+                                    : vk::ShaderStageFlagBits::eCompute;
+      for (const auto &binding : program.bindings.descriptors) {
+        layout_bindings.push_back(
+            {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
+             NativeDescriptorType(binding.kind), NativeDescriptorCount(binding),
+             shader_stage});
+      }
+    }
+    vk::DescriptorSetLayoutCreateInfo descriptor_info{};
+    descriptor_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+    descriptor_info.flags =
+        vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    descriptor_info.bindingCount =
+        static_cast<uint32_t>(layout_bindings.size());
+    descriptor_info.pBindings = layout_bindings.data();
+    PipelineCache::Pipeline pipeline{};
+    auto &device = executor.m_context.GetGraphics().device;
+    EXIT_IF(device.createDescriptorSetLayout(&descriptor_info, nullptr,
+                                             &pipeline.descriptor_set_layout) !=
+            vk::Result::eSuccess);
+
+    vk::PipelineLayoutCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    pipeline_info.setLayoutCount = 1;
+    pipeline_info.pSetLayouts = &pipeline.descriptor_set_layout;
+    const vk::PushConstantRange push_range {
+        compute ? vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute}
+                : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eVertex |
+                                       vk::ShaderStageFlagBits::eFragment},
+        0, ShaderRecompiler::IR::NativePushConstantSize};
+    pipeline_info.pushConstantRangeCount = 1;
+    pipeline_info.pPushConstantRanges = &push_range;
+    EXIT_IF(device.createPipelineLayout(&pipeline_info, nullptr,
+                                        &pipeline.pipeline_layout) !=
+            vk::Result::eSuccess);
+    pipeline.uses_push_descriptors = true;
+    return pipeline;
+  }
+
+  static PipelineCache::Pipeline CommitBindings(RenderExecutor &executor,
+                                                CommandBuffer &buffer,
+                                                PreparedBindings &bindings) {
+    std::array<PreparedBindings *, 1> stages{&bindings};
+    auto pipeline = CreateDescriptorPipeline(executor, stages);
+    const auto bind_point = bindings.program->stage == ShaderType::Compute
+                                ? vk::PipelineBindPoint::eCompute
+                                : vk::PipelineBindPoint::eGraphics;
+    executor.CommitBindings(buffer, bind_point, pipeline, stages);
+    return pipeline;
+  }
+
+  static PipelineCache::Pipeline CommitBindings(RenderExecutor &executor,
+                                                CommandBuffer &buffer,
+                                                PreparedBindings &vertex,
+                                                PreparedBindings &pixel) {
+    std::array<PreparedBindings *, 2> stages{&vertex, &pixel};
+    auto pipeline = CreateDescriptorPipeline(executor, stages);
+    executor.CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
+                            stages);
+    return pipeline;
+  }
+
+  static void DestroyDescriptorPipelines(
+      RenderExecutor &executor,
+      std::span<const PipelineCache::Pipeline> pipelines) {
+    auto &device = executor.m_context.GetGraphics().device;
+    for (const auto &pipeline : pipelines) {
+      device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+      device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout,
+                                        nullptr);
+    }
+  }
+
+  static const auto &PushConstants(const RenderExecutor &executor) {
+    return executor.m_push_constants;
   }
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
@@ -392,19 +475,11 @@ struct RenderExecutorTestAccess {
     executor.ResetBindings();
   }
 
-  static bool BoundImagesInOrder(const RenderExecutor &executor,
-                                 ImageId first, ImageId second) {
+  static bool BoundImagesInOrder(const RenderExecutor &executor, ImageId first,
+                                 ImageId second) {
     return executor.m_bound_images.size() == 2 &&
            executor.m_bound_images[0] == first &&
            executor.m_bound_images[1] == second;
-  }
-};
-
-struct DescriptorCacheTestAccess {
-  static vk::DescriptorImageInfo
-  MakeImageInfo(const DescriptorCache::TextureBinding &binding,
-                uint32_t element = 0) {
-    return DescriptorCache::MakeImageInfo(binding, element);
   }
 };
 
@@ -873,7 +948,7 @@ struct TestCase {
   size_t storage_buffer_range_dwords = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<u32> address_memory_offsets;
-  bool force_shader_data_storage = false;
+  bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   std::optional<uint64_t> flat_memory_base;
   std::vector<u32> gds_initial;
@@ -987,7 +1062,7 @@ void CheckRectListShaders() {
           shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
               shaders.evaluation.size() > 1 &&
               shaders.evaluation[1] == 0x00010500u,
-	      "vector selection requires SPIR-V 1.5");
+          "vector selection requires SPIR-V 1.5");
   ValidateSpirv(name, shaders.control);
   ValidateSpirv(name, shaders.evaluation);
 
@@ -1154,21 +1229,29 @@ CompiledShader CompileCase(const TestCase &test) {
                     test.expected_storage_mip_descriptors,
             "dynamic storage image did not receive one descriptor per mip");
   }
-  if (test.force_shader_data_storage) {
+  if (test.expand_shader_data_storage) {
+    auto &block = *result.program.values->blocks.front();
+    for (u32 reg = 0; reg < 33; reg++) {
+      auto &user_data = block.AppendNewInst(
+          ShaderRecompiler::IR::ValueOpcode::GetUserData,
+          {ShaderRecompiler::IR::Value(
+              static_cast<ShaderRecompiler::IR::ScalarReg>(reg))});
+      block.AppendNewInst(ShaderRecompiler::IR::ValueOpcode::ReferenceU32,
+                          {ShaderRecompiler::IR::Value(&user_data)});
+    }
     result.program.bindings = {};
     result.program.binding_layout_complete = false;
-    if (!ShaderRecompiler::IR::AllocateBindings(
-            result.program, {.max_push_dwords = 0}, &error)) {
+    if (!ShaderRecompiler::IR::AllocateBindings(result.program, 0, &error)) {
       Fail(test.name, "binding layout", error.c_str());
     }
     const auto *shader_data = ShaderRecompiler::IR::FindBinding(
         result.program.bindings,
         ShaderRecompiler::IR::DescriptorBindingKind::UserData);
     Require(test.name, "binding layout",
-            result.program.bindings.user_data_registers.empty() &&
+            result.program.bindings.user_data_registers.size() == 33 &&
                 result.program.bindings.push_constant_size == 0 &&
                 shader_data != nullptr,
-            "offset-only shader data did not use its storage fallback");
+            "oversized shader data did not use its storage fallback");
     std::vector<u32> storage_spirv;
     if (!ShaderRecompiler::Spirv::EmitProgram(result.program, result.resources,
                                               options.input_info, storage_spirv,
@@ -1448,6 +1531,114 @@ public:
     std::printf("[host]    %-32s ok\n", "CommandPoolGrowth");
   }
 
+  void CheckDescriptorHeapLargeSet() {
+    EnsureRuntimeContext();
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+    constexpr std::array stages{
+        vk::ShaderStageFlagBits::eVertex,
+        vk::ShaderStageFlagBits::eFragment,
+        vk::ShaderStageFlagBits::eCompute,
+    };
+    for (uint32_t i = 0; i < bindings.size(); i++) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType = vk::DescriptorType::eSampler;
+      bindings[i].descriptorCount = 16;
+      bindings[i].stageFlags = stages[i];
+    }
+    vk::DescriptorSetLayoutCreateInfo create{};
+    create.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+    create.bindingCount = static_cast<uint32_t>(bindings.size());
+    create.pBindings = bindings.data();
+    vk::DescriptorSetLayout layout = nullptr;
+    RequireVk("DescriptorHeapLargeSet", "layout",
+              m_device.createDescriptorSetLayout(&create, nullptr, &layout),
+              "vkCreateDescriptorSetLayout");
+
+    vk::PipelineLayoutCreateInfo pipeline_create{};
+    pipeline_create.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    pipeline_create.setLayoutCount = 1;
+    pipeline_create.pSetLayouts = &layout;
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk("DescriptorHeapLargeSet", "pipeline layout",
+              m_device.createPipelineLayout(&pipeline_create, nullptr,
+                                            &pipeline_layout),
+              "vkCreatePipelineLayout");
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+
+      const auto commit = [&] {
+        const auto set = context.GetDescriptorHeap().Commit(layout);
+        Require("DescriptorHeapLargeSet", "allocation", set != nullptr,
+                "ordinary descriptor heap could not allocate an oversized sampler set");
+        scheduler.Current().Handle().bindDescriptorSets(
+            vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0,
+            nullptr);
+      };
+
+      for (uint32_t i = 0; i < 22; i++) {
+        commit();
+      }
+      scheduler.FinishCurrent();
+      for (uint32_t i = 0; i < 21; i++) {
+        commit();
+      }
+    }
+
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(layout, nullptr);
+    std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
+  }
+
+  void CheckGraphicsPushConstantBank() {
+    constexpr const char *name = "GraphicsPushConstantBank";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    ShaderRecompiler::IR::Program vertex_program{};
+    vertex_program.stage = ShaderType::Vertex;
+    vertex_program.bindings.push_constant_size = 2 * sizeof(uint32_t);
+    ShaderRecompiler::IR::Program pixel_program{};
+    pixel_program.stage = ShaderType::Pixel;
+    pixel_program.bindings.push_constant_offset = 2 * sizeof(uint32_t);
+    pixel_program.bindings.push_constant_size = 2 * sizeof(uint32_t);
+    ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+    PreparedBindings vertex{};
+    vertex.program = &vertex_program;
+    vertex.snapshot = &snapshot;
+    vertex.user_data = {0x11111111u, 0x22222222u};
+    PreparedBindings pixel{};
+    pixel.program = &pixel_program;
+    pixel.snapshot = &snapshot;
+    pixel.user_data = {0x33333333u, 0x44444444u};
+
+    const auto pipeline = RenderExecutorTestAccess::CommitBindings(
+        context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
+    const auto &bank =
+        RenderExecutorTestAccess::PushConstants(context.GetRenderExecutor());
+    Require(name, "packing",
+            bank[0] == 0x11111111u && bank[1] == 0x22222222u &&
+                bank[2] == 0x33333333u && bank[3] == 0x44444444u &&
+                std::ranges::all_of(bank.begin() + 4, bank.end(),
+                                    [](uint32_t value) { return value == 0; }) &&
+                vertex.committed && pixel.committed,
+            "graphics stages were not packed into one zero-filled push bank");
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(
+        context.GetRenderExecutor(), std::span {&pipeline, 1u});
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -1706,12 +1897,12 @@ public:
     auto &upload_stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
     const auto stream_offset =
         upload_stream.Copy(overflow_data.data(), overflow_data.size(), 16);
-    Require(
-        "StreamBufferRing", "cache-owned stream upload",
-        upload_stream.Handle() != nullptr && stream_offset < upload_stream.Size() &&
-            std::memcmp(upload_stream.Mapped().data() + stream_offset, overflow_data.data(),
-                        overflow_data.size()) == 0,
-        "cache-owned stream upload lost bytes");
+    Require("StreamBufferRing", "cache-owned stream upload",
+            upload_stream.Handle() != nullptr &&
+                stream_offset < upload_stream.Size() &&
+                std::memcmp(upload_stream.Mapped().data() + stream_offset,
+                            overflow_data.data(), overflow_data.size()) == 0,
+            "cache-owned stream upload lost bytes");
 
     const auto atom =
         m_runtime_context.physical_device_properties.limits.nonCoherentAtomSize;
@@ -2253,10 +2444,10 @@ public:
               "DMA prefetch modified ownership or did not establish a dirty "
               "cached page");
 
-	  buffer_cache.FillBuffer(clean_cached_fill, sizeof(source_words),
-	                          clean_fill_value, false);
-	  buffer_cache.CopyBuffer(clean_cached_copy, clean_cached_source,
-	                          sizeof(clean_copy_words), false, false);
+      buffer_cache.FillBuffer(clean_cached_fill, sizeof(source_words),
+                              clean_fill_value, false);
+      buffer_cache.CopyBuffer(clean_cached_copy, clean_cached_source,
+                              sizeof(clean_copy_words), false, false);
       Require("GpuCommandLane", "clean cached DMA ownership",
               !buffer_cache.HasGpuDirtyBytes(clean_cached_fill,
                                              sizeof(source_words)) &&
@@ -2364,8 +2555,8 @@ public:
       Require("GpuCommandLane", "dirty tracked fault setup",
               dirty.first != nullptr,
               "dirty write-fault test could not create a cached Buffer");
-	  buffer_cache.FillBuffer(dirty_fault_address, sizeof(dirty_fault_value),
-	                          dirty_fault_value, false);
+      buffer_cache.FillBuffer(dirty_fault_address, sizeof(dirty_fault_value),
+                              dirty_fault_value, false);
     });
     Require("GpuCommandLane", "dirty tracked fault ownership",
             buffer_cache.HasGpuDirtyBytes(dirty_fault_address,
@@ -2426,14 +2617,15 @@ public:
     constexpr uint64_t empty_copy_fault_address = fault_base + 0xe000;
     constexpr uint32_t empty_copy_fault_value = 0x6b28d1efu;
     gpu.SendCommandSync([&] {
-      auto dirty = buffer_cache.ObtainBuffer(
-          empty_copy_fault_address, sizeof(empty_copy_fault_value), true, false);
+      auto dirty = buffer_cache.ObtainBuffer(empty_copy_fault_address,
+                                             sizeof(empty_copy_fault_value),
+                                             true, false);
       Require("GpuCommandLane", "empty-copy write setup",
               dirty.first != nullptr,
               "empty-copy write test could not create a cached Buffer");
-	  buffer_cache.FillBuffer(empty_copy_fault_address,
-	                          sizeof(empty_copy_fault_value),
-	                          empty_copy_fault_value, false);
+      buffer_cache.FillBuffer(empty_copy_fault_address,
+                              sizeof(empty_copy_fault_value),
+                              empty_copy_fault_value, false);
       buffer_cache.ReadMemory(empty_copy_fault_address,
                               sizeof(empty_copy_fault_value));
       const bool gpu_owned = buffer_cache.IsRegionGpuModified(
@@ -2776,8 +2968,7 @@ public:
           cache.FindBuffer(index_begin + 0x100, sizeof(uint32_t));
       const auto index_right = cache.FindBuffer(
           index_begin + 2 * index_page + 0x100, sizeof(uint32_t));
-      Require(name, "registered-range owners",
-              index_left && index_right,
+      Require(name, "registered-range owners", index_left && index_right,
               "failed to create disjoint Buffer index owners");
       Require(
           name, "registered-range boundaries",
@@ -2793,16 +2984,15 @@ public:
           "overlap");
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
-      Require(
-          name, "registered-range merge",
-          index_bridge &&
-              cache.IsRegionRegistered(index_begin + index_page, index_page),
-          "bridging acquisition did not publish its merged Buffer range");
+      Require(name, "registered-range merge",
+              index_bridge && cache.IsRegionRegistered(index_begin + index_page,
+                                                       index_page),
+              "bridging acquisition did not publish its merged Buffer range");
       const auto [resolved_left, resolved_left_offset] = cache.ObtainBuffer(
           index_begin + 0x100, sizeof(uint32_t), true, false, index_left);
-      const auto [resolved_right, resolved_right_offset] = cache.ObtainBuffer(
-          index_begin + 2 * index_page + 0x100, sizeof(uint32_t), true, false,
-          index_right);
+      const auto [resolved_right, resolved_right_offset] =
+          cache.ObtainBuffer(index_begin + 2 * index_page + 0x100,
+                             sizeof(uint32_t), true, false, index_right);
       Require(name, "two-pass stale id resolution",
               resolved_left == &cache.GetBuffer(index_bridge) &&
                   resolved_right == resolved_left &&
@@ -2815,9 +3005,10 @@ public:
 
       MarkGpuWrite(base + first_offset, sizeof(first_value));
       MarkGpuWrite(base + second_offset, sizeof(second_value));
-	  cache.FillBuffer(base + first_offset, sizeof(first_value), first_value, false);
-	  cache.FillBuffer(base + second_offset, sizeof(second_value),
-	                   second_value, false);
+      cache.FillBuffer(base + first_offset, sizeof(first_value), first_value,
+                       false);
+      cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
+                       false);
       auto &download = BufferCacheTestAccess::DownloadBuffer(cache);
       auto *fixed_download = &download;
       const auto fixed_download_handle = download.Handle();
@@ -2831,11 +3022,12 @@ public:
                    sizeof(ring_fault_first_value));
       MarkGpuWrite(base + ring_fault_second_offset,
                    sizeof(ring_fault_second_value));
-	  cache.FillBuffer(base + ring_fault_first_offset,
-	                   sizeof(ring_fault_first_value), ring_fault_first_value, false);
-	  cache.FillBuffer(base + ring_fault_second_offset,
-	                   sizeof(ring_fault_second_value),
-	                   ring_fault_second_value, false);
+      cache.FillBuffer(base + ring_fault_first_offset,
+                       sizeof(ring_fault_first_value), ring_fault_first_value,
+                       false);
+      cache.FillBuffer(base + ring_fault_second_offset,
+                       sizeof(ring_fault_second_value), ring_fault_second_value,
+                       false);
       Require(name, "fault-ring wrapped batch",
               resources.HandleFault(PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
@@ -2937,7 +3129,8 @@ public:
       Require(name, "direct-unmap allocation",
               unmap_allocation.first != nullptr,
               "direct-unmap buffer allocation failed");
-	  cache.FillBuffer(base + unmap_offset, sizeof(unmap_value), unmap_value, false);
+      cache.FillBuffer(base + unmap_offset, sizeof(unmap_value), unmap_value,
+                       false);
       cache.UnmapMemory(base + 0x4000, 0x4000);
       uint32_t unmap_backing = 0;
       std::memcpy(&unmap_backing, memory + unmap_offset, sizeof(unmap_backing));
@@ -2947,20 +3140,20 @@ public:
               "direct dirty unmap cleared tracking before "
               "publishing bytes");
 
-      auto partial_unmap_allocation = cache.ObtainBuffer(
-          base + 0x8000, 0x8000, true, false);
+      auto partial_unmap_allocation =
+          cache.ObtainBuffer(base + 0x8000, 0x8000, true, false);
       Require(name, "partial-unmap allocation",
               partial_unmap_allocation.first != nullptr,
               "cross-page cached buffer allocation failed");
-	  cache.FillBuffer(base + partial_unmap_offset, sizeof(partial_unmap_value),
-	                   partial_unmap_value, false);
-	  cache.FillBuffer(base + partial_unmap_survivor_offset,
-	                   sizeof(partial_unmap_survivor_value),
-	                   partial_unmap_survivor_value, false);
+      cache.FillBuffer(base + partial_unmap_offset, sizeof(partial_unmap_value),
+                       partial_unmap_value, false);
+      cache.FillBuffer(base + partial_unmap_survivor_offset,
+                       sizeof(partial_unmap_survivor_value),
+                       partial_unmap_survivor_value, false);
       cache.UnmapMemory(base + 0x8000, 0x4000);
-      auto survivor = cache.ObtainBuffer(
-          base + partial_unmap_survivor_offset,
-          sizeof(partial_unmap_survivor_value), false);
+      auto survivor =
+          cache.ObtainBuffer(base + partial_unmap_survivor_offset,
+                             sizeof(partial_unmap_survivor_value), false);
       Require(name, "partial-unmap survivor", survivor.first != nullptr,
               "still-mapped cached-buffer remainder could not be recreated");
       auto partial_unmap_readback =
@@ -2968,8 +3161,9 @@ public:
                            vk::BufferUsageFlagBits::eTransferDst, {0});
       const vk::BufferCopy survivor_copy{survivor.second, 0,
                                          sizeof(partial_unmap_survivor_value)};
-      scheduler.Current().Handle().copyBuffer(
-          survivor.first->Handle(), partial_unmap_readback.buffer, 1, &survivor_copy);
+      scheduler.Current().Handle().copyBuffer(survivor.first->Handle(),
+                                              partial_unmap_readback.buffer, 1,
+                                              &survivor_copy);
       vk::BufferMemoryBarrier survivor_barrier{};
       survivor_barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       survivor_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -2997,12 +3191,12 @@ public:
       std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
       std::memcpy(memory + large_offset + large_size - sizeof(large_stale),
                   &large_stale, sizeof(large_stale));
-      auto large_allocation = cache.ObtainBuffer(
-          base + large_offset, large_size, true, false);
+      auto large_allocation =
+          cache.ObtainBuffer(base + large_offset, large_size, true, false);
       Require(name, "near-capacity dirty allocation",
               large_allocation.first != nullptr,
               "failed to allocate the near-capacity dirty native buffer");
-	  cache.FillBuffer(base + large_offset, large_size, large_value, false);
+      cache.FillBuffer(base + large_offset, large_size, large_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -3049,18 +3243,19 @@ public:
           base + grouped_first_offset, &grouped_stale, sizeof(grouped_stale));
       Libs::LibKernel::Memory::WriteBacking(
           base + grouped_second_offset, &grouped_stale, sizeof(grouped_stale));
-      auto grouped_first = cache.ObtainBuffer(
-          base + grouped_first_offset, grouped_owner_size, true, false);
-      auto grouped_second = cache.ObtainBuffer(
-          base + grouped_second_offset, grouped_owner_size, true, false);
+      auto grouped_first = cache.ObtainBuffer(base + grouped_first_offset,
+                                              grouped_owner_size, true, false);
+      auto grouped_second = cache.ObtainBuffer(base + grouped_second_offset,
+                                               grouped_owner_size, true, false);
       Require(name, "per-owner GC allocation",
-              grouped_first.first != nullptr && grouped_second.first != nullptr &&
+              grouped_first.first != nullptr &&
+                  grouped_second.first != nullptr &&
                   grouped_first.first != grouped_second.first,
               "disjoint GC candidates merged into one Buffer owner");
-	  cache.FillBuffer(base + grouped_first_offset, grouped_owner_size,
-	                   grouped_first_value, false);
-	  cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
-	                   grouped_second_value, false);
+      cache.FillBuffer(base + grouped_first_offset, grouped_owner_size,
+                       grouped_first_value, false);
+      cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
+                       grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -3102,8 +3297,8 @@ public:
               "failed to create the clean cross-page retirement owner");
       (void)cache.ObtainBuffer(base + disjoint_dirty_offset,
                                sizeof(disjoint_value), true, false);
-	  cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
-	                   disjoint_value, false);
+      cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
+                       disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -3130,9 +3325,9 @@ public:
                   !cache.HasGpuDirtyBytes(base + disjoint_dirty_offset,
                                           sizeof(disjoint_value)),
               "disjoint unmap lost the completed whole-owner publication");
-      auto disjoint_new_owner = cache.ObtainBuffer(
-          base + disjoint_new_owner_offset,
-          sizeof(disjoint_value), true, false);
+      auto disjoint_new_owner =
+          cache.ObtainBuffer(base + disjoint_new_owner_offset,
+                             sizeof(disjoint_value), true, false);
       Require(name, "disjoint post-publication reacquire",
               disjoint_new_owner.first != nullptr,
               "disjoint acquisition failed after whole-owner publication");
@@ -3164,8 +3359,8 @@ public:
               "failed to create a fresh cross-page retirement owner");
       (void)cache.ObtainBuffer(base + reacquire_dirty_offset,
                                sizeof(reacquire_value), true, false);
-	  cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
-	                   reacquire_value, false);
+      cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
+                       reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -3181,9 +3376,9 @@ public:
               reacquire_before == reacquire_stale,
               "fresh whole-owner publication completed before reacquisition");
       scheduler.FinishCurrent();
-      auto reacquired = cache.ObtainBuffer(
-          base + reacquire_disjoint_offset,
-          sizeof(reacquire_value), true, false);
+      auto reacquired =
+          cache.ObtainBuffer(base + reacquire_disjoint_offset,
+                             sizeof(reacquire_value), true, false);
       Require(name, "independent disjoint post-publication reacquire",
               reacquired.first != nullptr,
               "clean disjoint-half acquisition failed after publication");
@@ -3631,7 +3826,7 @@ public:
       };
 
       // A formatted Buffer read must use the private
-	  // Exercise the cache-native image-copy path. Use a request larger
+      // Exercise the cache-native image-copy path. Use a request larger
       // than the stream shortcut and poison guest backing
       // after upload so stale CPU staging cannot accidentally
       // satisfy the content check.
@@ -3700,7 +3895,7 @@ public:
               "prefix, or transferred ownership");
 
       auto &buffer_cache = resources.GetBufferCache();
-	  std::pair<Libs::Graphics::Buffer *, uint64_t> mip_formatted;
+      std::pair<Libs::Graphics::Buffer *, uint64_t> mip_formatted;
       bool formatted_owner_was_absent = false;
       gpu.SendCommandSync([&] {
         formatted_owner_was_absent = !buffer_cache.IsRegionRegistered(
@@ -4108,8 +4303,8 @@ public:
       Require(name, "MS stencil buffer allocation",
               ms_stencil_owner.first != nullptr,
               "failed to create an unequal-sample stencil source");
-	  resources.GetBufferCache().FillBuffer(base + ms_stencil_offset,
-	                                        ms_stencil_size, 0x41414141u, false);
+      resources.GetBufferCache().FillBuffer(
+          base + ms_stencil_offset, ms_stencil_size, 0x41414141u, false);
       auto ms_depth_desc = color_desc;
       ms_depth_desc.type = BindingType::DepthTarget;
       ms_depth_desc.info.stencil = {base + ms_stencil_offset, ms_stencil_size};
@@ -4456,12 +4651,12 @@ public:
       Require(name, "partial-page buffer allocation",
               partial_write.first != nullptr,
               "partial-page GPU write did not create a native buffer");
-	  resources.GetBufferCache().FillBuffer(base + partial_image_offset,
-	                                        sizeof(partial_image_value),
-	                                        partial_image_value, false);
-	  resources.GetBufferCache().FillBuffer(base + partial_buffer_offset,
-	                                        sizeof(partial_buffer_value),
-	                                        partial_buffer_value, false);
+      resources.GetBufferCache().FillBuffer(base + partial_image_offset,
+                                            sizeof(partial_image_value),
+                                            partial_image_value, false);
+      resources.GetBufferCache().FillBuffer(base + partial_buffer_offset,
+                                            sizeof(partial_buffer_value),
+                                            partial_buffer_value, false);
       auto partial_desc = MakeLinearDesc(
           base + partial_image_offset, sizeof(partial_image_value),
           vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
@@ -4471,7 +4666,8 @@ public:
               !texture_cache.GetImage(partial_image).IsGpuModified(),
               "image upload incorrectly consumed buffer dirty ownership");
       auto partial_image_mirror = resources.GetBufferCache().ObtainBuffer(
-          base + partial_image_offset, sizeof(partial_image_value), false, true);
+          base + partial_image_offset, sizeof(partial_image_value), false,
+          true);
       Require(name, "partial-page image mirror",
               partial_image_mirror.first != nullptr &&
                   !texture_cache.GetImage(partial_image).IsGpuModified(),
@@ -4624,9 +4820,9 @@ public:
       const auto publish_image = texture_cache.FindImage(publish_image_desc);
       (void)texture_cache.FindTexture(publish_image, publish_image_desc);
       texture_cache.MarkGpuWritten(publish_image);
-	  resources.GetBufferCache().FillBuffer(base + publish_buffer_offset,
-	                                        sizeof(publish_buffer_value),
-	                                        publish_buffer_value, false);
+      resources.GetBufferCache().FillBuffer(base + publish_buffer_offset,
+                                            sizeof(publish_buffer_value),
+                                            publish_buffer_value, false);
       auto publish_replacement_desc = publish_image_desc;
       publish_replacement_desc.info.pixel_format = vk::Format::eR32Sfloat;
       publish_replacement_desc.info.guest_format =
@@ -4753,8 +4949,8 @@ public:
               texture_cache.TouchMeta(base + metadata_b, 0, false) &&
               !texture_cache.IsMetaCleared(base + metadata_b, 0),
           "per-slice metadata update incorrectly required prior GPU ownership");
-	  resources.GetBufferCache().FillBuffer(base + metadata_b, sizeof(uint32_t),
-	                                        0, false);
+      resources.GetBufferCache().FillBuffer(base + metadata_b, sizeof(uint32_t),
+                                            0, false);
       Require(
           name, "metadata buffer fill state",
           texture_cache.IsMetaCleared(base + metadata_b, 0),
@@ -4975,9 +5171,9 @@ public:
               "mixed image source could not dirty its first page");
       std::memcpy(memory + mixed_source_offset, &mixed_cpu_value,
                   sizeof(mixed_cpu_value));
-	  resources.GetBufferCache().FillBuffer(base + mixed_source_offset + 0x1000,
-	                                        sizeof(mixed_gpu_value),
-	                                        mixed_gpu_value, false);
+      resources.GetBufferCache().FillBuffer(base + mixed_source_offset + 0x1000,
+                                            sizeof(mixed_gpu_value),
+                                            mixed_gpu_value, false);
       auto mixed_source_desc = MakeLinearDesc(
           base + mixed_source_offset, mixed_source_size, vk::Format::eR32Uint,
           Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
@@ -5029,8 +5225,8 @@ public:
       Require(name, "bridged CPU owner allocation",
               bridged_cpu_owner.first != nullptr,
               "bridged image source did not create its CPU-side cache owner");
-	  resources.GetBufferCache().FillBuffer(base + bridged_cpu_offset,
-	                                        bridged_texel_size, 0, false);
+      resources.GetBufferCache().FillBuffer(base + bridged_cpu_offset,
+                                            bridged_texel_size, 0, false);
       Require(
           name, "bridged CPU write fault",
           resources.HandleFault(PageFaultAccess::Write,
@@ -5051,8 +5247,9 @@ public:
               bridged_gpu_owner.first != nullptr &&
                   bridged_gpu_owner.first != bridged_cpu_owner.first,
               "bridged image source did not retain two disjoint cache owners");
-	  resources.GetBufferCache().FillBuffer(
-	      base + bridged_gpu_offset, bridged_texel_size, bridged_gpu_value, false);
+      resources.GetBufferCache().FillBuffer(base + bridged_gpu_offset,
+                                            bridged_texel_size,
+                                            bridged_gpu_value, false);
       Require(name, "bridged ownership split",
               resources.GetBufferCache().HasGpuDirtyBytes(
                   base + bridged_gpu_offset, bridged_texel_size) &&
@@ -5458,9 +5655,9 @@ public:
       Require(name, "same-page dirty sibling allocation",
               dirty_sibling.first != nullptr,
               "failed to create the disjoint same-page Buffer owner");
-	  resources.GetBufferCache().FillBuffer(base + dirty_sibling_offset,
-	                                        sizeof(dirty_sibling_value),
-	                                        dirty_sibling_value, false);
+      resources.GetBufferCache().FillBuffer(base + dirty_sibling_offset,
+                                            sizeof(dirty_sibling_value),
+                                            dirty_sibling_value, false);
       auto exact_image_desc =
           MakeLinearDesc(base + exact_image_offset, sizeof(uint32_t),
                          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
@@ -5495,7 +5692,8 @@ public:
       auto gc_image_desc_b = gc_image_desc_a;
       gc_image_desc_b.info.data.address = base + gc_image_offsets[1];
       auto clean_buffer_alias = resources.GetBufferCache().ObtainBuffer(
-          gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size, true);
+          gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size,
+          true);
       Require(name, "clean pre-image buffer alias",
               clean_buffer_alias.first != nullptr,
               "failed to create the clean cached Buffer alias");
@@ -5590,7 +5788,8 @@ public:
       const vk::BufferCopy alias_copy{refreshed_buffer_alias.second, 0,
                                       sizeof(uint32_t)};
       scheduler.Current().Handle().copyBuffer(
-          refreshed_buffer_alias.first->Handle(), alias_readback.buffer, 1, &alias_copy);
+          refreshed_buffer_alias.first->Handle(), alias_readback.buffer, 1,
+          &alias_copy);
       HostReadBarrier(alias_readback.buffer, alias_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
@@ -6369,10 +6568,9 @@ public:
       Require(name, "guest readback queue",
               TextureCacheTestAccess::TryDownload(cache, id),
               "tiled BGRA16 guest readback was rejected");
-      auto mirror = resources.GetBufferCache().ObtainBuffer(
-          base, total.size, false, true);
-      Require(name, "mirror owner",
-              mirror.first != nullptr,
+      auto mirror = resources.GetBufferCache().ObtainBuffer(base, total.size,
+                                                            false, true);
+      Require(name, "mirror owner", mirror.first != nullptr,
               "tiled BGRA16 mirror has no BufferCache owner");
       auto mirror_readback = CreateHostBuffer(
           name, 8, vk::BufferUsageFlagBits::eTransferDst, {0, 0});
@@ -6571,14 +6769,13 @@ public:
           "the 3D render target could not be queued for guest-layout readback");
       auto mirror = resources.GetBufferCache().ObtainBuffer(
           base, allocation_size, false, true);
-      Require(name, "volume mirror",
-              mirror.first != nullptr,
+      Require(name, "volume mirror", mirror.first != nullptr,
               "the 3D render-target readback has no BufferCache owner");
       auto slice_probe =
           CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0});
       const vk::BufferCopy copy{mirror.second + 31 * slice_size, 0, 4};
-      scheduler.Current().Handle().copyBuffer(mirror.first->Handle(), slice_probe.buffer,
-                                              1, &copy);
+      scheduler.Current().Handle().copyBuffer(mirror.first->Handle(),
+                                              slice_probe.buffer, 1, &copy);
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -6883,6 +7080,15 @@ public:
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
+      std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+      const auto allocate_bindings =
+          [&](ShaderRecompiler::IR::Program &program) {
+            program.shader_info_complete = true;
+            std::string error;
+            Require(name, "binding layout",
+                    ShaderRecompiler::IR::AllocateBindings(program, 0, &error),
+                    error.c_str());
+          };
 
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
       constexpr auto linear = Prospero::TileMode::kLinear;
@@ -6922,14 +7128,13 @@ public:
               ShaderRecompiler::IR::SpecializeResources(
                   null_program, null_snapshot, &null_error),
               null_error.c_str());
+      allocate_bindings(null_program);
       ShaderStageRuntime null_runtime{
           std::make_shared<const ShaderRecompiler::IR::Program>(
               std::move(null_program)),
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(null_snapshot))};
-      auto null_bindings = executor.PrepareBindings(
-          null_runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto null_bindings = executor.PrepareBindings(null_runtime);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
               null_bindings.resources.images.size() == 3,
@@ -6951,18 +7156,18 @@ public:
                                                            null_image_id),
               "the shared null image did not preserve texture/storage "
               "acquisition without guest readback or RenderExecutor ownership");
-      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
-                                               null_bindings);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), null_bindings));
       Require(name, "null descriptor general layouts",
-              std::ranges::all_of(
-                  null_bindings.resources.images,
-                  [](const auto &binding) {
-                    const auto info =
-                        DescriptorCacheTestAccess::MakeImageInfo(binding);
-                    return binding.layout == vk::ImageLayout::eGeneral &&
-                           info.imageView == binding.image_view &&
-                           info.imageLayout == binding.layout;
-                  }) &&
+              std::ranges::all_of(null_bindings.resources.images,
+                                  [](const auto &binding) {
+                                    const auto info = MakeImageInfo(binding);
+                                    return binding.layout ==
+                                               vk::ImageLayout::eGeneral &&
+                                           info.imageView ==
+                                               binding.image_view &&
+                                           info.imageLayout == binding.layout;
+                                  }) &&
                   null_image.backing.state.layout == vk::ImageLayout::eGeneral,
               "shared sampled/storage null descriptors did not retain "
               "the general layout through descriptor generation");
@@ -7018,6 +7223,7 @@ public:
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       storage_resource.written = true;
       storage_program.info.images.push_back(storage_resource);
+      allocate_bindings(storage_program);
       ShaderRecompiler::IR::DescriptorValue storage_descriptor{};
       std::copy(std::begin(storage.fields), std::end(storage.fields),
                 storage_descriptor.dwords.begin());
@@ -7070,7 +7276,7 @@ public:
       auto sampled_overwide_resolved = RenderExecutorTestAccess::ResolveTexture(
           executor, sampled_overwide_resource,
           overwide_mipped_storage_descriptor);
-      DescriptorCache::PreparedBindings mipped_prepared{};
+      PreparedBindings mipped_prepared{};
       auto mipped_program = std::make_shared<ShaderRecompiler::IR::Program>();
       mipped_program->info.images.push_back(storage_resource);
       mipped_program->info.images.push_back(mipped_storage_resource);
@@ -7082,8 +7288,8 @@ public:
                                  mipped_storage_descriptor,
                                  overwide_mipped_storage_descriptor,
                                  overwide_mipped_storage_descriptor};
-      mipped_prepared.program = std::move(mipped_program);
-      mipped_prepared.snapshot = std::move(mipped_snapshot);
+      mipped_prepared.program = mipped_program.get();
+      mipped_prepared.snapshot = mipped_snapshot.get();
       mipped_prepared.resources.images.push_back(
           std::move(plain_mipped_storage_binding));
       mipped_prepared.resources.images.push_back(
@@ -7119,12 +7325,12 @@ public:
                   mipped_binding.mip_views[2] != nullptr &&
                   mipped_binding.mip_views[0] != mipped_binding.mip_views[1] &&
                   mipped_binding.mip_views[1] != mipped_binding.mip_views[2] &&
-                  DescriptorCacheTestAccess::MakeImageInfo(mipped_binding, 0)
-                          .imageView == mipped_binding.mip_views[0] &&
-                  DescriptorCacheTestAccess::MakeImageInfo(mipped_binding, 1)
-                          .imageView == mipped_binding.mip_views[1] &&
-                  DescriptorCacheTestAccess::MakeImageInfo(mipped_binding, 2)
-                          .imageView == mipped_binding.mip_views[2],
+                  MakeImageInfo(mipped_binding, 0).imageView ==
+                      mipped_binding.mip_views[0] &&
+                  MakeImageInfo(mipped_binding, 1).imageView ==
+                      mipped_binding.mip_views[1] &&
+                  MakeImageInfo(mipped_binding, 2).imageView ==
+                      mipped_binding.mip_views[2],
               "base-1 through last-3 storage view did not create three "
               "ordered one-level descriptors");
       Require(name, "over-wide fixed storage mip view",
@@ -7275,9 +7481,7 @@ public:
               std::move(storage_program)),
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(storage_snapshot))};
-      auto storage_discovery = executor.PrepareBindings(
-          storage_runtime, vk::ShaderStageFlagBits::eVertex,
-          DescriptorCache::Stage::Vertex);
+      auto storage_discovery = executor.PrepareBindings(storage_runtime);
       const auto storage_id = storage_discovery.resources.images[0].image_id;
       Require(name, "storage prefetch purity",
               storage_discovery.resources.images[0].image_view == nullptr &&
@@ -7299,6 +7503,7 @@ public:
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_resource.read = true;
       sampled_program.info.images.push_back(sampled_resource);
+      allocate_bindings(sampled_program);
       ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
       sampled_snapshot.images.push_back(storage_descriptor);
       ShaderStageRuntime sampled_runtime{
@@ -7333,14 +7538,14 @@ public:
           executor, storage_runtime, ordered_sampled_runtime, true);
       const auto ordered_sampled_id =
           ordered_bindings.pixel->resources.images[0].image_id;
-      Require(name, "VS-before-PS retained-owner order",
-              ordered_bindings.vertex.resources.images[0].image_id ==
-                      storage_id &&
-                  ordered_sampled_id != storage_id &&
-                  RenderExecutorTestAccess::BoundImagesInOrder(
-                      executor, storage_id, ordered_sampled_id),
-              "production graphics binding did not retain vertex resources "
-              "before pixel resources");
+      Require(
+          name, "VS-before-PS retained-owner order",
+          ordered_bindings.vertex.resources.images[0].image_id == storage_id &&
+              ordered_sampled_id != storage_id &&
+              RenderExecutorTestAccess::BoundImagesInOrder(executor, storage_id,
+                                                           ordered_sampled_id),
+          "production graphics binding did not retain vertex resources "
+          "before pixel resources");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto graphics_bindings =
@@ -7368,10 +7573,9 @@ public:
                   texture_cache.GetImage(storage_id).usage.texture,
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
-      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
-                                               graphics_bindings.vertex);
-      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
-                                               *graphics_bindings.pixel);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), graphics_bindings.vertex,
+          *graphics_bindings.pixel));
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
                   (vk::AccessFlagBits2::eShaderRead |
@@ -7400,21 +7604,18 @@ public:
               texture_cache.GetImage(storage_id).binding.force_general,
               "an already sampled image was not promoted when a later "
               "storage alias bound the same backing");
-      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
-                                               writable_alias_bindings.vertex);
-      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
-                                               *writable_alias_bindings.pixel);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), writable_alias_bindings.vertex,
+          *writable_alias_bindings.pixel));
       Require(
           name, "forced-general descriptor capture",
           writable_alias_bindings.vertex.resources.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
               writable_alias_bindings.pixel->resources.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              DescriptorCacheTestAccess::MakeImageInfo(
-                  writable_alias_bindings.vertex.resources.images[0])
+              MakeImageInfo(writable_alias_bindings.vertex.resources.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
-              DescriptorCacheTestAccess::MakeImageInfo(
-                  writable_alias_bindings.pixel->resources.images[0])
+              MakeImageInfo(writable_alias_bindings.pixel->resources.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
               texture_cache.GetImage(storage_id).backing.state.layout ==
                   vk::ImageLayout::eGeneral &&
@@ -7469,40 +7670,38 @@ public:
           std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       split_program->resource_tracking_complete = true;
       split_program->info.images = {storage_resource, sampled_resource};
-      DescriptorCache::PreparedBindings split_bindings{};
-      split_bindings.program = split_program;
-      split_bindings.snapshot =
+      allocate_bindings(*split_program);
+      PreparedBindings split_bindings{};
+      auto split_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
-      split_bindings.shader_stage = vk::ShaderStageFlagBits::eVertex;
-      split_bindings.stage = DescriptorCache::Stage::Vertex;
+      split_bindings.program = split_program.get();
+      split_bindings.snapshot = split_snapshot.get();
       split_bindings.resources.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
            split_storage_desc});
       split_bindings.resources.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_sampled_desc),
            split_sampled_desc});
-      RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(),
-                                               split_bindings);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), split_bindings));
       const auto &split_image = texture_cache.GetImage(split_id);
-      Require(name, "per-binding subresource layouts",
-              split_bindings.resources.images[0].layout ==
-                      vk::ImageLayout::eGeneral &&
-                  split_bindings.resources.images[1].layout ==
-                      vk::ImageLayout::eShaderReadOnlyOptimal &&
-                  DescriptorCacheTestAccess::MakeImageInfo(
-                      split_bindings.resources.images[0])
-                          .imageLayout == vk::ImageLayout::eGeneral &&
-                  DescriptorCacheTestAccess::MakeImageInfo(
-                      split_bindings.resources.images[1])
-                          .imageLayout ==
-                      vk::ImageLayout::eShaderReadOnlyOptimal &&
-                  split_image.backing.subresource_states.size() == 2 &&
-                  split_image.backing.subresource_states[0].layout ==
-                      vk::ImageLayout::eGeneral &&
-                  split_image.backing.subresource_states[1].layout ==
-                      vk::ImageLayout::eShaderReadOnlyOptimal,
-              "descriptor layouts were queried after a later mip transition "
-              "instead of being captured at each binding");
+      Require(
+          name, "per-binding subresource layouts",
+          split_bindings.resources.images[0].layout ==
+                  vk::ImageLayout::eGeneral &&
+              split_bindings.resources.images[1].layout ==
+                  vk::ImageLayout::eShaderReadOnlyOptimal &&
+              MakeImageInfo(split_bindings.resources.images[0]).imageLayout ==
+                  vk::ImageLayout::eGeneral &&
+              MakeImageInfo(split_bindings.resources.images[1]).imageLayout ==
+                  vk::ImageLayout::eShaderReadOnlyOptimal &&
+              split_image.backing.subresource_states.size() == 2 &&
+              split_image.backing.subresource_states[0].layout ==
+                  vk::ImageLayout::eGeneral &&
+              split_image.backing.subresource_states[1].layout ==
+                  vk::ImageLayout::eShaderReadOnlyOptimal,
+          "descriptor layouts were queried after a later mip transition "
+          "instead of being captured at each binding");
 
       Libs::LibKernel::Memory::WriteBacking(
           storage_address, &storage_stale_value, sizeof(storage_stale_value));
@@ -7865,9 +8064,7 @@ public:
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(array_snapshot))};
 
-      auto array_binding = executor.PrepareBindings(
-          array_runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto array_binding = executor.PrepareBindings(array_runtime);
       executor.RebindImages(array_binding);
       const auto expanded_array_id = array_binding.resources.images[0].image_id;
       const auto &expanded_array = texture_cache.GetImage(expanded_array_id);
@@ -7940,9 +8137,8 @@ public:
       ShaderStageRuntime colliding_msaa_runtime{
           std::move(colliding_msaa_program),
           std::move(colliding_msaa_snapshot)};
-      auto colliding_msaa_binding = executor.PrepareBindings(
-          colliding_msaa_runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto colliding_msaa_binding =
+          executor.PrepareBindings(colliding_msaa_runtime);
       executor.RebindImages(colliding_msaa_binding);
       const auto &resolved_colliding_msaa =
           colliding_msaa_binding.resources.images[0];
@@ -8000,9 +8196,7 @@ public:
       msaa_snapshot->images.push_back(msaa_descriptor);
       ShaderStageRuntime msaa_runtime{std::move(msaa_program),
                                       std::move(msaa_snapshot)};
-      auto msaa_binding = executor.PrepareBindings(
-          msaa_runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto msaa_binding = executor.PrepareBindings(msaa_runtime);
       executor.RebindImages(msaa_binding);
       const auto &resolved_msaa = msaa_binding.resources.images[0];
       Require(
@@ -8041,9 +8235,7 @@ public:
       msaa_array_snapshot->images.push_back(msaa_array_descriptor);
       ShaderStageRuntime msaa_array_runtime{std::move(msaa_array_program),
                                             std::move(msaa_array_snapshot)};
-      auto msaa_array_binding = executor.PrepareBindings(
-          msaa_array_runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
       executor.RebindImages(msaa_array_binding);
       const auto &resolved_msaa_array = msaa_array_binding.resources.images[0];
       Require(name, "MSAA array backing expansion",
@@ -8163,11 +8355,10 @@ public:
       rebound_depth.samples = 1;
       rebound_depth.image_id = depth_id;
       scheduler.FinishCurrent();
-      Require(
-          name, "deferred target slot erasure",
-          TextureCacheTestAccess::Owner(texture_cache, target_subresource_id) ==
-              nullptr,
-          "the displaced target slot was not erased after GPU completion");
+      Require(name, "deferred target slot erasure",
+              TextureCacheTestAccess::Owner(texture_cache,
+                                            target_subresource_id) == nullptr,
+              "the displaced target slot was not erased after GPU completion");
       auto rebound_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &rebound_color, 1, rebound_depth);
       const auto stencil_proxy_id = texture_cache.FindImageFromRange(
@@ -8281,9 +8472,7 @@ public:
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(snapshot))};
 
-      auto prepared = context.GetRenderExecutor().PrepareBindings(
-          runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
       const auto sampled_stencil_id = prepared.resources.images[0].image_id;
       Require(name, "first stencil discovery",
               prepared.resources.images.size() == 1 &&
@@ -8316,9 +8505,7 @@ public:
               "at the stencil guest address");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      auto redirected = context.GetRenderExecutor().PrepareBindings(
-          runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto redirected = context.GetRenderExecutor().PrepareBindings(runtime);
       Require(name, "redirected owner discovery",
               redirected.resources.images.size() == 1 &&
                   redirected.resources.images[0].image_id == depth_id &&
@@ -8354,9 +8541,8 @@ public:
           std::move(stencil_storage_program),
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(stencil_storage_snapshot))};
-      auto storage_redirected = executor.PrepareBindings(
-          stencil_storage_runtime, vk::ShaderStageFlagBits::eCompute,
-          DescriptorCache::Stage::Compute);
+      auto storage_redirected =
+          executor.PrepareBindings(stencil_storage_runtime);
       executor.RebindImages(storage_redirected);
       Require(
           name, "storage stencil acquisition",
@@ -8367,6 +8553,8 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      RenderExecutorTestAccess::DestroyDescriptorPipelines(
+          executor, descriptor_pipelines);
     }
 
     Require(name, "unmap direct backing",
@@ -8681,6 +8869,9 @@ public:
     auto Binding = [&](Kind kind) {
       return ShaderRecompiler::IR::FindBinding(layout, kind);
     };
+    auto Native = [](Kind kind) {
+      return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
+    };
     auto Count = [&](Kind kind) {
       const auto *binding = Binding(kind);
       if (binding == nullptr) {
@@ -8733,50 +8924,10 @@ public:
           layout_bindings.push_back(item);
         };
     for (const auto &binding : layout.descriptors) {
-      vk::DescriptorType type = vk::DescriptorType::eStorageBuffer;
-      u32 count = static_cast<u32>(binding.resources.size());
-      switch (binding.kind) {
-      case Kind::Sampled1D:
-      case Kind::Sampled1DArray:
-      case Kind::Sampled2D:
-      case Kind::Sampled2DArray:
-      case Kind::Sampled3D:
-      case Kind::SampledUint1D:
-      case Kind::SampledUint1DArray:
-      case Kind::SampledUint2D:
-      case Kind::SampledUint2DArray:
-      case Kind::SampledUint3D:
-        type = vk::DescriptorType::eSampledImage;
-        break;
-      case Kind::Storage1D:
-      case Kind::Storage1DArray:
-      case Kind::Storage2D:
-      case Kind::Storage2DArray:
-      case Kind::Storage3D:
-      case Kind::StorageUint1D:
-      case Kind::StorageUint1DArray:
-      case Kind::StorageUint2D:
-      case Kind::StorageUint2DArray:
-      case Kind::StorageUint3D:
-      case Kind::StorageAtomic1D:
-      case Kind::StorageAtomic1DArray:
-      case Kind::StorageAtomic2D:
-      case Kind::StorageAtomic2DArray:
-      case Kind::StorageAtomic3D:
-        type = vk::DescriptorType::eStorageImage;
-        break;
-      case Kind::Samplers:
-        type = vk::DescriptorType::eSampler;
-        break;
-      case Kind::Gds:
-      case Kind::FlattenedSrt:
-      case Kind::UserData:
-        count = 1;
-        break;
-      default:
-        break;
-      }
-      add_layout_binding(binding.binding, type, count);
+      add_layout_binding(ShaderRecompiler::IR::NativeBinding(
+                             ShaderType::Compute, binding.kind),
+                         NativeDescriptorType(binding.kind),
+                         NativeDescriptorCount(binding));
     }
 
     vk::DescriptorSetLayoutCreateInfo layout_info{};
@@ -8797,7 +8948,7 @@ public:
     vk::PushConstantRange push_range{};
     if (layout.push_constant_size != 0) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
-      push_range.offset = layout.push_constant_offset;
+      push_range.offset = 0;
       push_range.size = layout.push_constant_size;
       pipeline_layout_info.pushConstantRangeCount = 1;
       pipeline_layout_info.pPushConstantRanges = &push_range;
@@ -8916,7 +9067,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = buffers->binding;
+      write.dstBinding = Native(Kind::Buffers);
       write.descriptorCount = static_cast<u32>(buffer_infos.size());
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = buffer_infos.data();
@@ -8931,7 +9082,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = address->binding;
+      write.dstBinding = Native(Kind::AddressMemory);
       write.descriptorCount = static_cast<u32>(address_memory_infos.size());
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = address_memory_infos.data();
@@ -8945,7 +9096,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = flattened->binding;
+      write.dstBinding = Native(Kind::FlattenedSrt);
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &flattened_info;
@@ -8959,7 +9110,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = user->binding;
+      write.dstBinding = Native(Kind::UserData);
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &user_data_info;
@@ -8972,7 +9123,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = gds->binding;
+      write.dstBinding = Native(Kind::Gds);
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &gds_info;
@@ -9003,7 +9154,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = sampled->binding;
+      write.dstBinding = Native(sampled->kind);
       write.descriptorCount = static_cast<u32>(sampled_infos.size());
       write.descriptorType = vk::DescriptorType::eSampledImage;
       write.pImageInfo = sampled_infos.data();
@@ -9030,7 +9181,7 @@ public:
           vk::WriteDescriptorSet write{};
           write.sType = vk::StructureType::eWriteDescriptorSet;
           write.dstSet = descriptor_set;
-          write.dstBinding = binding->binding;
+          write.dstBinding = Native(binding->kind);
           write.descriptorCount = static_cast<u32>(infos->size());
           write.descriptorType = vk::DescriptorType::eStorageImage;
           write.pImageInfo = infos->data();
@@ -9050,7 +9201,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = samplers->binding;
+      write.dstBinding = Native(Kind::Samplers);
       write.descriptorCount = static_cast<u32>(sampler_infos.size());
       write.descriptorType = vk::DescriptorType::eSampler;
       write.pImageInfo = sampler_infos.data();
@@ -9070,8 +9221,8 @@ public:
               compiled.packed_user_data.size() * sizeof(u32) ==
                   layout.push_constant_size,
               "native user-data size does not match push-constant range");
-      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-                        layout.push_constant_offset, layout.push_constant_size,
+      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                        layout.push_constant_size,
                         compiled.packed_user_data.data());
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
@@ -9165,7 +9316,7 @@ public:
                   fragment_bind.push_constant_size,
               "fragment push constant data size does not match reflection");
       push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
-      push_constant_range.offset = fragment_bind.push_constant_offset;
+      push_constant_range.offset = 0;
       push_constant_range.size = fragment_bind.push_constant_size;
     }
 
@@ -9292,8 +9443,7 @@ public:
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
     if (push_constant_range.size != 0) {
-      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment,
-                        fragment_bind.push_constant_offset,
+      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
                         fragment_bind.push_constant_size,
                         test.push_constants.data());
     }
@@ -15285,7 +15435,7 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   test.expected = {0x12345678u, 0, 0, 0xabcdef01u};
   test.storage_buffer_range_dwords = 1;
   test.storage_buffer_offsets = {0, 12};
-  test.force_shader_data_storage = true;
+  test.expand_shader_data_storage = true;
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -18509,7 +18659,7 @@ void CheckIndirectImageKeySwitch() {
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
   std::string error;
-  Require(name, "binding layout", AllocateBindings(program, {}, &error),
+  Require(name, "binding layout", AllocateBindings(program, 0, &error),
           error.c_str());
   ResourceSnapshot snapshot{};
   DescriptorValue descriptor{};
@@ -22431,8 +22581,8 @@ void CheckSlotVectorLifetime() {
   const auto second = slots.insert(&destroyed);
   Require("SlotVectorLifetime", "generation",
           first_destroyed && !destroyed && first.index == second.index &&
-              first != second &&
-              !slots.is_allocated(first) && slots.is_allocated(second),
+              first != second && !slots.is_allocated(first) &&
+              slots.is_allocated(second),
           "reused slot accepted a stale cache resource id");
   std::printf("[host]    %-32s ok\n", "SlotVectorLifetime");
 }
@@ -23259,6 +23409,21 @@ int main(int argc, char **argv) {
     vulkan.CheckSchedulerTimeline();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--descriptor-heap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDescriptorHeapLargeSet();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--push-constant-bank-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGraphicsPushConstantBank();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuMappedRangeLifecycle();
@@ -23503,6 +23668,8 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckDescriptorHeapLargeSet();
+  vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckCommandPoolGrowth();

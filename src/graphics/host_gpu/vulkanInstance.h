@@ -30,6 +30,7 @@ struct VulkanInstance {
 	uint32_t                           subgroup_size                     = 0;
 	uint32_t                           min_subgroup_size                 = 0;
 	uint32_t                           max_subgroup_size                 = 0;
+	uint32_t                           max_push_descriptors              = 0;
 	vk::ShaderStageFlags               required_subgroup_size_stages     = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);

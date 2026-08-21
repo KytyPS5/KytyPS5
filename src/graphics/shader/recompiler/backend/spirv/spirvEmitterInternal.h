@@ -667,8 +667,8 @@ void AddInputAnnotationsAndNames(EmitterState& state);
 
 void AddOutputAnnotationsAndNames(EmitterState& state);
 
-void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name, uint32_t set,
-                        uint32_t binding);
+void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name,
+                        IR::DescriptorBindingKind kind);
 
 void AddDescriptorAnnotationsAndNames(EmitterState& state);
 

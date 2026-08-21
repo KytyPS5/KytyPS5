@@ -798,10 +798,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::CollectShaderInfo(ir, info_options, error)) {
 		return false;
 	}
-	IR::BindingLayoutOptions layout_options;
-	layout_options.descriptor_set       = options.descriptor_set;
-	layout_options.push_constant_offset = options.push_constant_offset;
-	if (!IR::AllocateBindings(ir, layout_options, error)) {
+	if (!IR::AllocateBindings(ir, options.push_constant_offset, error)) {
 		return false;
 	}
 	if (!Spirv::AnalyzeProgramRequirements(ir, error)) {

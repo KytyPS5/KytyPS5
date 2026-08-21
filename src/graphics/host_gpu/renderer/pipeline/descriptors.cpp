@@ -17,7 +17,6 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -45,14 +44,95 @@
 
 namespace Libs::Graphics {
 
-static const char* ShaderStageResourceName(DescriptorCache::Stage stage) {
-	switch (stage) {
-		case DescriptorCache::Stage::Vertex: return "Vertex";
-		case DescriptorCache::Stage::Pixel: return "Pixel";
-		case DescriptorCache::Stage::Compute: return "Compute";
-		case DescriptorCache::Stage::Unknown: return "Unknown";
+namespace {
+
+using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+bool IsSampledImage(BindingKind kind) {
+	switch (kind) {
+		case BindingKind::Sampled1D:
+		case BindingKind::Sampled1DArray:
+		case BindingKind::Sampled2D:
+		case BindingKind::Sampled2DArray:
+		case BindingKind::Sampled2DMsaa:
+		case BindingKind::Sampled2DMsaaArray:
+		case BindingKind::Sampled3D:
+		case BindingKind::SampledUint1D:
+		case BindingKind::SampledUint1DArray:
+		case BindingKind::SampledUint2D:
+		case BindingKind::SampledUint2DArray:
+		case BindingKind::SampledUint2DMsaa:
+		case BindingKind::SampledUint2DMsaaArray:
+		case BindingKind::SampledUint3D: return true;
+		default: return false;
 	}
-	return "Unknown";
+}
+
+bool IsStorageImage(BindingKind kind) {
+	switch (kind) {
+		case BindingKind::Storage1D:
+		case BindingKind::Storage1DArray:
+		case BindingKind::Storage2D:
+		case BindingKind::Storage2DArray:
+		case BindingKind::Storage3D:
+		case BindingKind::StorageUint1D:
+		case BindingKind::StorageUint1DArray:
+		case BindingKind::StorageUint2D:
+		case BindingKind::StorageUint2DArray:
+		case BindingKind::StorageUint3D:
+		case BindingKind::StorageAtomic1D:
+		case BindingKind::StorageAtomic1DArray:
+		case BindingKind::StorageAtomic2D:
+		case BindingKind::StorageAtomic2DArray:
+		case BindingKind::StorageAtomic3D: return true;
+		default: return false;
+	}
+}
+
+} // namespace
+
+vk::DescriptorType NativeDescriptorType(BindingKind kind) {
+	if (kind == BindingKind::Samplers) {
+		return vk::DescriptorType::eSampler;
+	}
+	if (IsSampledImage(kind)) {
+		return vk::DescriptorType::eSampledImage;
+	}
+	if (IsStorageImage(kind)) {
+		return vk::DescriptorType::eStorageImage;
+	}
+	return vk::DescriptorType::eStorageBuffer;
+}
+
+uint32_t NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding) {
+	return binding.resources.empty() ? 1u : static_cast<uint32_t>(binding.resources.size());
+}
+
+vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t element) {
+	const auto view =
+	    texture.mip_views.empty()
+	        ? (element == 0u ? texture.image_view : vk::ImageView {})
+	        : (element < texture.mip_views.size() ? texture.mip_views[element] : vk::ImageView {});
+	EXIT_IF(!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
+	return {nullptr, view, texture.layout};
+}
+
+static const char* ShaderStageResourceName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex: return "Vertex";
+		case ShaderType::Pixel: return "Pixel";
+		case ShaderType::Compute: return "Compute";
+		default: return "Unknown";
+	}
+}
+
+static vk::ShaderStageFlags NativeShaderStage(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
+		case ShaderType::Pixel: return vk::ShaderStageFlagBits::eFragment;
+		case ShaderType::Compute: return vk::ShaderStageFlagBits::eCompute;
+		default: EXIT("unknown native shader stage\n");
+	}
 }
 
 static void BindNullStorageBuffer(RenderContext& context, BufferView& dst) {
@@ -87,11 +167,11 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
-static BufferView
-NativeStorageBuffer(RenderContext& context, const ShaderBufferResource& descriptor,
-                    const ShaderRecompiler::IR::BufferResource& resource,
-                    DescriptorCache::Stage stage, uint32_t slot, uint32_t& buffer_offset,
-                    BufferId id) {
+static BufferView NativeStorageBuffer(RenderContext&                              context,
+                                      const ShaderBufferResource&                 descriptor,
+                                      const ShaderRecompiler::IR::BufferResource& resource,
+                                      ShaderType stage, uint32_t slot, uint32_t& buffer_offset,
+                                      BufferId id) {
 	BufferView result;
 	buffer_offset = 0;
 
@@ -113,8 +193,8 @@ NativeStorageBuffer(RenderContext& context, const ShaderBufferResource& descript
 	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range or device alignment is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written, resource.formatted, id);
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                              resource.formatted, id);
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -136,10 +216,10 @@ NativeStorageBuffer(RenderContext& context, const ShaderBufferResource& descript
 	return result;
 }
 
-static BufferView NativeAddressBuffer(
-    RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
-    const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
-    DescriptorCache::Stage stage, uint32_t slot, uint32_t& address_offset, BufferId id) {
+static BufferView
+NativeAddressBuffer(RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
+                    const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
+                    ShaderType stage, uint32_t slot, uint32_t& address_offset, BufferId id) {
 	BufferView result;
 	address_offset = 0;
 	if (address.binding_base == 0) {
@@ -640,9 +720,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-DescriptorCache::TextureBinding
-RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                               const ShaderRecompiler::IR::DescriptorValue& value) {
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
 	ShaderTextureResource descriptor;
 	CopyNativeDescriptor(value, descriptor.fields);
 	const bool storage = resource.written;
@@ -813,7 +892,7 @@ static BufferView NativeUpload(RenderContext& context, std::span<const uint32_t>
 	EXIT_IF(data.empty());
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid() || command_buffer.IsExecute());
-	auto& buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {.buffer = buffer.Handle(), .offset = offset, .range = data.size_bytes()};
 }
@@ -853,9 +932,7 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
-DescriptorCache::PreparedBindings
-RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                vk::ShaderStageFlags shader_stage, DescriptorCache::Stage stage) {
+PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -865,12 +942,10 @@ RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
 	}
 
-	DescriptorCache::PreparedBindings prepared;
-	prepared.program      = runtime.program;
-	prepared.snapshot     = runtime.resources;
-	prepared.shader_stage = shader_stage;
-	prepared.stage        = stage;
-	auto& descriptors     = prepared.resources;
+	PreparedBindings prepared;
+	prepared.program  = runtime.program.get();
+	prepared.snapshot = runtime.resources.get();
+	auto& descriptors = prepared.resources;
 	descriptors.buffers.reserve(program.info.buffers.size());
 	descriptors.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -900,7 +975,7 @@ RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	return prepared;
 }
 
-void RenderExecutor::FindBuffers(DescriptorCache::PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
@@ -916,8 +991,7 @@ void RenderExecutor::FindBuffers(DescriptorCache::PreparedBindings& prepared) {
 		const auto stride  = descriptor.Stride();
 		const auto records = descriptor.NumRecords();
 		EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
-		const auto requested_size =
-		    stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_ids.emplace_back();
 			continue;
@@ -936,19 +1010,18 @@ void RenderExecutor::FindBuffers(DescriptorCache::PreparedBindings& prepared) {
 			continue;
 		}
 		EXIT_IF(resource.written);
-		const auto limit =
-		    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
-		        ? ShaderRecompiler::IR::FlatAddressWindowSize
-		        : static_cast<uint64_t>(m_context.GetGraphics()
-		                                    .GetPhysicalDeviceProperties()
-		                                    .limits.maxStorageBufferRange);
-		uint64_t size = 0;
+		const auto limit = resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
+		                       ? ShaderRecompiler::IR::FlatAddressWindowSize
+		                       : static_cast<uint64_t>(m_context.GetGraphics()
+		                                                   .GetPhysicalDeviceProperties()
+		                                                   .limits.maxStorageBufferRange);
+		uint64_t   size  = 0;
 		EXIT_IF(!HostMemoryQueryRange(address.binding_base, limit, HostMemoryAccess::Mapped, size));
 		prepared.address_ids.push_back(cache.FindBuffer(address.binding_base, size));
 	}
 }
 
-void RenderExecutor::RebindBuffers(DescriptorCache::PreparedBindings& prepared) {
+void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program   = *prepared.program;
@@ -972,7 +1045,7 @@ void RenderExecutor::RebindBuffers(DescriptorCache::PreparedBindings& prepared) 
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
 		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
-		                                                program.info.buffers[i], prepared.stage, i,
+		                                                program.info.buffers[i], program.stage, i,
 		                                                buffer_offset, prepared.buffer_ids[i]));
 		pack_memory_offset(i, buffer_offset);
 	}
@@ -980,9 +1053,9 @@ void RenderExecutor::RebindBuffers(DescriptorCache::PreparedBindings& prepared) 
 	resources.addresses.reserve(program.info.addresses.size());
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		uint32_t address_offset = 0;
-		resources.addresses.push_back(
-		    NativeAddressBuffer(m_context, program.info.addresses[i], snapshot.addresses[i],
-		                        prepared.stage, i, address_offset, prepared.address_ids[i]));
+		resources.addresses.push_back(NativeAddressBuffer(m_context, program.info.addresses[i],
+		                                                  snapshot.addresses[i], program.stage, i,
+		                                                  address_offset, prepared.address_ids[i]));
 		pack_memory_offset(static_cast<uint32_t>(program.info.buffers.size()) + i, address_offset);
 	}
 	if (!prepared.flattened_srt.empty()) {
@@ -994,7 +1067,7 @@ void RenderExecutor::RebindBuffers(DescriptorCache::PreparedBindings& prepared) 
 	}
 }
 
-void RenderExecutor::RebindImages(DescriptorCache::PreparedBindings& prepared) {
+void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
@@ -1047,12 +1120,10 @@ RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
 	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex, vk::ShaderStageFlagBits::eVertex,
-	                              DescriptorCache::Stage::Vertex),
+	    .vertex = PrepareBindings(vertex),
 	};
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel, vk::ShaderStageFlagBits::eFragment,
-		                                       DescriptorCache::Stage::Pixel));
+		bindings.pixel.emplace(PrepareBindings(pixel));
 	}
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {
@@ -1071,74 +1142,190 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
-                                    vk::PipelineLayout                 layout,
-                                    DescriptorCache::PreparedBindings& prepared) {
+                                    const PipelineCache::Pipeline&     pipeline,
+                                    std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.program == nullptr || prepared.stage == DescriptorCache::Stage::Unknown ||
-	        prepared.committed);
-	const auto& program     = *prepared.program;
-	auto&       descriptors = prepared.resources;
-	auto       vk_buffer     = buffer.Handle();
-	const auto shader_stages = ShaderPipelineStages(prepared.shader_stage);
-	if (descriptors.gds.buffer != nullptr) {
-		buffer.EndRendering();
-		const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-		vk_buffer.pipelineBarrier(
-		    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
-		        vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
-		    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
-	}
-
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto&       image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
-		auto&       binding = descriptors.images[i];
-		const auto& view    = binding.desc.view_info;
-		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
-		                                   view.layer_count};
-		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		if (image.info.data.Empty()) {
-			image.Transit(vk::ImageLayout::eGeneral,
-			              storage
-			                  ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
-			                  : vk::AccessFlagBits2::eShaderRead,
-			              range, vk_buffer);
-		} else if ((image.binding.force_general || image.binding.is_target) &&
-		           !image.info.IsDepth()) {
-			const vk::AccessFlags2 storage_access = image.binding.shader_write
-			                                            ? vk::AccessFlagBits2::eShaderWrite
-			                                            : vk::AccessFlags2 {};
-			image.Transit(vk::ImageLayout::eGeneral,
-			              vk::AccessFlagBits2::eShaderRead | storage_access |
-			                  vk::AccessFlagBits2::eColorAttachmentRead |
-			                  vk::AccessFlagBits2::eColorAttachmentWrite,
-			              {}, vk_buffer);
-		} else if (storage) {
-			image.Transit(vk::ImageLayout::eGeneral,
-			              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-			              range, vk_buffer);
-		} else {
-			image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-			                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
-			              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+	auto   vk_buffer        = buffer.Handle();
+	size_t descriptor_count = 0;
+	size_t write_count      = 0;
+	constexpr auto GraphicsStages =
+	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	const auto push_constant_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
+	                                      ? vk::ShaderStageFlags {GraphicsStages}
+	                                      : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
+	for (const auto* prepared: prepared_bindings) {
+		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
+		        prepared->snapshot == nullptr || prepared->committed);
+		write_count += prepared->program->bindings.descriptors.size();
+		for (const auto& binding: prepared->program->bindings.descriptors) {
+			descriptor_count += NativeDescriptorCount(binding);
 		}
-		binding.layout = image.backing.state.layout;
+		const auto shader_stage = NativeShaderStage(prepared->program->stage);
+		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
+		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
+		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	m_descriptor_buffers.clear();
+	m_descriptor_images.clear();
+	m_descriptor_writes.clear();
+	m_push_constants.fill(0);
+	m_descriptor_buffers.reserve(descriptor_count);
+	m_descriptor_images.reserve(descriptor_count);
+	m_descriptor_writes.reserve(write_count);
 
-	if (!program.bindings.descriptors.empty()) {
-		auto& set =
-		    m_context.GetDescriptorCache().GetDescriptor(prepared.stage, program, descriptors);
-		vk_buffer.bindDescriptorSets(pipeline_bind_point, layout, program.bindings.descriptor_set,
-		                             1, &set.set, 0, nullptr);
-		buffer.RecycleDescriptorAfterFence(set);
+	for (auto* prepared: prepared_bindings) {
+		const auto& program       = *prepared->program;
+		auto&       descriptors   = prepared->resources;
+		const auto  shader_stage  = NativeShaderStage(program.stage);
+		const auto  shader_stages = ShaderPipelineStages(shader_stage);
+		if (descriptors.gds.buffer != nullptr) {
+			buffer.EndRendering();
+			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
+			vk_buffer.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
+			        vk::PipelineStageFlagBits::eAllGraphics |
+			        vk::PipelineStageFlagBits::eComputeShader,
+			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
+		}
+
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
+			auto& binding = descriptors.images[i];
+			const auto&                 view = binding.desc.view_info;
+			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+			                                   view.layer_count};
+			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			if (image.info.data.Empty()) {
+				image.Transit(vk::ImageLayout::eGeneral,
+				              storage ? vk::AccessFlagBits2::eShaderRead |
+				                            vk::AccessFlagBits2::eShaderWrite
+				                      : vk::AccessFlagBits2::eShaderRead,
+				              range, vk_buffer);
+			} else if ((image.binding.force_general || image.binding.is_target) &&
+			           !image.info.IsDepth()) {
+				const vk::AccessFlags2 storage_access = image.binding.shader_write
+				                                            ? vk::AccessFlagBits2::eShaderWrite
+				                                            : vk::AccessFlags2 {};
+				image.Transit(vk::ImageLayout::eGeneral,
+				              vk::AccessFlagBits2::eShaderRead | storage_access |
+				                  vk::AccessFlagBits2::eColorAttachmentRead |
+				                  vk::AccessFlagBits2::eColorAttachmentWrite,
+				              {}, vk_buffer);
+			} else if (storage) {
+				image.Transit(vk::ImageLayout::eGeneral,
+				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+				              range, vk_buffer);
+			} else {
+				image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
+				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+			}
+			binding.layout = image.backing.state.layout;
+		}
+
+		m_image_occurrences.assign(descriptors.images.size(), 0);
+		for (const auto& binding: program.bindings.descriptors) {
+			vk::WriteDescriptorSet write {};
+			write.sType          = vk::StructureType::eWriteDescriptorSet;
+			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
+			write.descriptorType = NativeDescriptorType(binding.kind);
+			write.descriptorCount   = NativeDescriptorCount(binding);
+			const auto buffer_start = m_descriptor_buffers.size();
+			const auto image_start  = m_descriptor_images.size();
+			switch (binding.kind) {
+				case BindingKind::Buffers:
+					for (const auto resource: binding.resources) {
+						const auto& view = descriptors.buffers.at(resource);
+						EXIT_IF(view.buffer == nullptr);
+						m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
+					}
+					break;
+				case BindingKind::AddressMemory:
+					for (const auto resource: binding.resources) {
+						const auto& view = descriptors.addresses.at(resource);
+						EXIT_IF(view.buffer == nullptr);
+						m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
+					}
+					break;
+				case BindingKind::FlattenedSrt:
+				case BindingKind::UserData:
+				case BindingKind::Gds: {
+					const auto& view =
+					    binding.kind == BindingKind::FlattenedSrt ? descriptors.flattened_srt
+					    : binding.kind == BindingKind::UserData   ? descriptors.user_data
+					                                              : descriptors.gds;
+					EXIT_IF(view.buffer == nullptr);
+					m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
+					break;
+				}
+				case BindingKind::Samplers:
+					for (const auto resource: binding.resources) {
+						const auto sampler = descriptors.samplers.at(resource);
+						EXIT_IF(sampler == nullptr);
+						m_descriptor_images.emplace_back(sampler, nullptr,
+						                                 vk::ImageLayout::eUndefined);
+					}
+					break;
+				default:
+					for (const auto resource: binding.resources) {
+						m_descriptor_images.push_back(MakeImageInfo(
+						    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
+					}
+					break;
+			}
+			if (m_descriptor_buffers.size() != buffer_start) {
+				write.pBufferInfo = m_descriptor_buffers.data() + buffer_start;
+			}
+			if (m_descriptor_images.size() != image_start) {
+				write.pImageInfo = m_descriptor_images.data() + image_start;
+			}
+			m_descriptor_writes.push_back(write);
+		}
+		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
+			const auto expected =
+			    descriptors.images[i].mip_views.empty()
+			        ? 1u
+			        : static_cast<uint32_t>(descriptors.images[i].mip_views.size());
+			EXIT_IF(m_image_occurrences[i] != expected);
+		}
+
+		if (program.bindings.push_constant_size != 0) {
+			const auto offset = program.bindings.push_constant_offset;
+			EXIT_IF(offset % sizeof(uint32_t) != 0 ||
+			        program.bindings.push_constant_size !=
+			            prepared->user_data.size() * sizeof(uint32_t) ||
+			        offset + program.bindings.push_constant_size >
+			            ShaderRecompiler::IR::NativePushConstantSize);
+			std::copy(prepared->user_data.begin(), prepared->user_data.end(),
+			          m_push_constants.begin() + offset / sizeof(uint32_t));
+		}
 	}
-	if (program.bindings.push_constant_size != 0) {
-		EXIT_IF(program.bindings.push_constant_size !=
-		        prepared.user_data.size() * sizeof(uint32_t));
-		vk_buffer.pushConstants(layout, prepared.shader_stage,
-		                        program.bindings.push_constant_offset,
-		                        program.bindings.push_constant_size, prepared.user_data.data());
+	vk_buffer.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
+	                        ShaderRecompiler::IR::NativePushConstantSize,
+	                        m_push_constants.data());
+
+	if (!m_descriptor_writes.empty()) {
+		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
+		if (pipeline.uses_push_descriptors) {
+			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+			                               static_cast<uint32_t>(m_descriptor_writes.size()),
+			                               m_descriptor_writes.data());
+		} else {
+			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			for (auto& write: m_descriptor_writes) {
+				write.dstSet = set;
+			}
+			m_context.GetGraphics().device.updateDescriptorSets(
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
+			    nullptr);
+			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
+			                             0, nullptr);
+		}
 	}
-	prepared.committed = true;
+	for (auto* prepared: prepared_bindings) {
+		prepared->committed = true;
+	}
 }
 
 } // namespace Libs::Graphics

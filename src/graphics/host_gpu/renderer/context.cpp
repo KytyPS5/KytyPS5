@@ -9,7 +9,6 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
@@ -30,8 +29,8 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint6
 	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq, debug_op,
 	     debug_submit, arg0, arg1, arg2, arg3, arg4);
-	std::printf("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
-	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	std::printf("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64
+	            " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	            what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq,
 	            debug_op, debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
@@ -68,21 +67,9 @@ void CommandBuffer::Release() {
 
 	m_slot->busy = false;
 	m_slot->Reset();
-	RecycleDescriptorsAfterFence();
 	m_slot = nullptr;
 
 	EXIT_NOT_IMPLEMENTED(!IsInvalid());
-}
-
-void CommandBuffer::RecycleDescriptorAfterFence(VulkanDescriptorSet& set) {
-	m_descriptor_sets_after_fence.push_back(&set);
-}
-
-void CommandBuffer::RecycleDescriptorsAfterFence() {
-	for (auto* set: m_descriptor_sets_after_fence) {
-		m_context.GetDescriptorCache().Recycle(*set);
-	}
-	m_descriptor_sets_after_fence.clear();
 }
 
 void CommandBuffer::Begin() const {
@@ -217,9 +204,6 @@ void CommandBuffer::FinalizeFence(bool reset_recording) {
 			Common::LockGuard lock(*m_slot->pool_mutex);
 			m_slot->Reset();
 		}
-	}
-	if (was_executed) {
-		RecycleDescriptorsAfterFence();
 	}
 }
 

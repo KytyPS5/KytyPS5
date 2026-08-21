@@ -690,6 +690,24 @@ bool SpirvHasDecorationValue(const std::vector<uint32_t> &binary,
   return SpirvDecorationValueCount(binary, decoration, value) != 0;
 }
 
+bool SpirvHasMemberDecorationValue(std::span<const uint32_t> binary,
+                                   uint32_t decoration, uint32_t value) {
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word = binary[i];
+    const uint32_t opcode = word & 0xffffu;
+    const uint32_t word_count = word >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return false;
+    }
+    if (opcode == 72u && word_count >= 5u && binary[i + 3] == decoration &&
+        binary[i + 4] == value) {
+      return true;
+    }
+    i += word_count;
+  }
+  return false;
+}
+
 std::vector<uint32_t>
 SpirvDecorationValueTargets(const std::vector<uint32_t> &binary,
                             uint32_t decoration, uint32_t value) {
@@ -9868,22 +9886,23 @@ void TestRenderTargetReverseExportMapping() {
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
   HW::ShaderRegisters sh{};
-  ShaderVertexInputInfo vs_info{};
-  vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
   std::array<Prospero::ColorComponentMapping, 8> mappings{};
   mappings[0] = gr32.export_mapping;
   ShaderPixelInputInfo compiled_info{};
+  ShaderVertexInputInfo vertex_info{};
   std::span<const uint32_t> compiled_spirv;
-  Check(ShaderCompileInfoPS(regs, sh, vs_info, mappings, compiled_info,
-                            compiled_spirv) &&
-            compiled_info.target_export_mapping[0].IsIdentity(),
-        "inactive reverse MRT mapping was not normalized out of the shader "
-        "cache key");
+  Check(
+      ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
+                          compiled_spirv) &&
+          compiled_info.target_export_mapping[0].IsIdentity(),
+      "inactive reverse MRT mapping was not normalized out of the shader "
+      "cache key");
   sh.target_output_mode[0] = 4;
-  Check(ShaderCompileInfoPS(regs, sh, vs_info, mappings, compiled_info,
-                            compiled_spirv) &&
-            compiled_info.target_export_mapping[0] == gr32.export_mapping,
-        "active reverse MRT mapping was lost before shader specialization");
+  Check(
+      ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
+                          compiled_spirv) &&
+          compiled_info.target_export_mapping[0] == gr32.export_mapping,
+      "active reverse MRT mapping was lost before shader specialization");
 }
 
 void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
@@ -9988,15 +10007,21 @@ void TestNewShaderRecompilerNativeBindingPlan() {
         "native binding plan did not allocate the sampler");
   Check(SpirvContainsOpcode(result.spirv, 86),
         "SPIR-V binary does not combine separate image/sampler descriptors");
-  Check(SpirvHasDecorationValue(result.spirv, 33u, buffers->binding),
+  Check(SpirvHasDecorationValue(result.spirv, 33u,
+                                ShaderRecompiler::IR::NativeBinding(
+                                    result.program.stage, buffers->kind)),
         "SPIR-V lacks storage-buffer Binding decoration");
-  Check(SpirvHasDecorationValue(result.spirv, 33u, sampled->binding),
+  Check(SpirvHasDecorationValue(result.spirv, 33u,
+                                ShaderRecompiler::IR::NativeBinding(
+                                    result.program.stage, sampled->kind)),
         "SPIR-V lacks sampled-image Binding decoration");
-  Check(SpirvHasDecorationValue(result.spirv, 33u, samplers->binding),
+  Check(SpirvHasDecorationValue(result.spirv, 33u,
+                                ShaderRecompiler::IR::NativeBinding(
+                                    result.program.stage, samplers->kind)),
         "SPIR-V lacks sampler Binding decoration");
-  Check(SpirvHasDecorationValue(result.spirv, 34u,
-                                result.program.bindings.descriptor_set),
-        "SPIR-V lacks DescriptorSet decoration");
+  Check(SpirvDecorationValueCount(result.spirv, 34u, 0u) ==
+            result.program.bindings.descriptors.size(),
+        "SPIR-V resources do not all use descriptor set zero");
   CheckSpirvBinaryValidates(result.spirv);
 
   auto malformed = result.program;
@@ -10945,6 +10970,31 @@ void TestComputeLdsAllocationIdentity() {
             ShaderGetIdCS(regs, lds_896, true),
         "compute pipeline identity omitted the LDS allocation");
 
+  auto tg_size_disabled = lds_896;
+  auto tg_size_enabled = lds_896;
+  tg_size_enabled.tg_size_en = true;
+  Check(ShaderGetIdCS(regs, tg_size_disabled, false) !=
+            ShaderGetIdCS(regs, tg_size_enabled, false),
+        "compute shader identity omitted TG_SIZE semantics");
+
+  auto dispatch_disabled = lds_896;
+  dispatch_disabled.dispatch_threads_num[0] = 64;
+  dispatch_disabled.dispatch_threads_num[1] = 32;
+  dispatch_disabled.dispatch_threads_num[2] = 1;
+  auto dispatch_enabled = dispatch_disabled;
+  dispatch_enabled.dispatch_thread_dimensions = true;
+  Check(ShaderGetIdCS(regs, dispatch_disabled, false) ==
+            ShaderGetIdCS(regs, dispatch_enabled, false),
+        "runtime dispatch enable created a compute shader variant");
+
+  auto second_extent = dispatch_enabled;
+  second_extent.dispatch_threads_num[0] = 1920;
+  second_extent.dispatch_threads_num[1] = 1080;
+  second_extent.dispatch_threads_num[2] = 4;
+  Check(ShaderGetIdCS(regs, dispatch_enabled, false) ==
+            ShaderGetIdCS(regs, second_extent, false),
+        "runtime dispatch extent created a compute shader variant");
+
   mapped.scratch_size_dwords = 7;
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
   regs.cs_regs.lds_size = decode_lds_field(lds_896_rsrc2);
@@ -10981,14 +11031,25 @@ void TestComputeLdsAllocationIdentity() {
   CheckSpirvBinaryValidates(append_result.spirv);
 }
 
-void TestPixelProgramCacheDescriptorSetIdentity() {
+void TestPixelProgramCacheBindingIdentity() {
   const uint32_t shader_01[] = {0xbf810000u};
   const uint32_t shader_10[] = {0xbf810000u};
   HW::ShaderRegisters sh{};
 
-  auto check_transition = [&](const uint32_t *shader, uint64_t checksum,
-                              bool first_has_vs_descriptors,
-                              bool second_has_vs_descriptors) {
+  HW::PixelShaderInfo identity_regs{};
+  ShaderPixelInputInfo no_depth_export{};
+  auto depth_export = no_depth_export;
+  depth_export.ps_depth_export_enable = true;
+  Check(ShaderGetIdPS(identity_regs, no_depth_export, false) !=
+            ShaderGetIdPS(identity_regs, depth_export, false),
+        "pixel shader identity omitted depth-export semantics");
+  auto shifted_push = no_depth_export;
+  shifted_push.push_constant_offset = 36;
+  Check(ShaderGetIdPS(identity_regs, no_depth_export, false) !=
+            ShaderGetIdPS(identity_regs, shifted_push, false),
+        "pixel shader identity omitted graphics push-bank placement");
+
+  auto check_cache_identity = [&](const uint32_t *shader, uint64_t checksum) {
     HW::PixelShaderInfo regs{};
     regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
     regs.ps_regs.chksum = checksum;
@@ -10996,33 +11057,120 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
     mapped.code_size_bytes = sizeof(uint32_t);
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
 
-    auto compile = [&](bool has_vs_descriptors) {
-      auto vs_program = std::make_shared<ShaderRecompiler::IR::Program>();
-      if (has_vs_descriptors) {
-        vs_program->bindings.descriptors.emplace_back();
-      }
-      ShaderVertexInputInfo vs_info{};
-      vs_info.stage.program = std::move(vs_program);
-      const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
-      ShaderPixelInputInfo ps_info{};
-      std::span<const uint32_t> spirv;
-      Check(ShaderCompileInfoPS(regs, sh, vs_info, identity_mappings, ps_info,
-                                spirv),
-            "pixel program-cache transition failed to compile");
-      const auto expected_set = has_vs_descriptors ? 1u : 0u;
-      Check(ps_info.descriptor_set == expected_set &&
-                ps_info.stage.program != nullptr &&
-                ps_info.stage.program->bindings.descriptor_set == expected_set,
-            "pixel program cache reused SPIR-V with the paired VS descriptor "
-            "set");
-    };
+    const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
+    ShaderVertexInputInfo vertex_info{};
+    ShaderPixelInputInfo first_info{};
+    std::span<const uint32_t> first_spirv;
+    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings, first_info,
+                              first_spirv),
+          "pixel program-cache fixture failed to compile");
 
-    compile(first_has_vs_descriptors);
-    compile(second_has_vs_descriptors);
+    ShaderPixelInputInfo second_info{};
+    std::span<const uint32_t> second_spirv;
+    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings, second_info,
+                              second_spirv),
+          "pixel program-cache lookup failed");
+    Check(
+        first_info.stage.program != nullptr &&
+            second_info.stage.program == first_info.stage.program &&
+            second_spirv.data() == first_spirv.data() &&
+            second_spirv.size() == first_spirv.size(),
+        "pixel program cache did not reuse an identical graphics placement");
   };
 
-  check_transition(shader_01, 0x91a27e6300000001ull, false, true);
-  check_transition(shader_10, 0x91a27e6300000002ull, true, false);
+  check_cache_identity(shader_01, 0x91a27e6300000001ull);
+  check_cache_identity(shader_10, 0x91a27e6300000002ull);
+
+  const uint32_t push_shader[] = {
+      EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+  };
+  HW::PixelShaderInfo push_regs{};
+  push_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(push_shader);
+  push_regs.ps_regs.chksum = 0x91a27e6300000003ull;
+  push_regs.ps_regs.rsrc2.user_sgpr = 4;
+  ShaderMappedData push_mapped{};
+  push_mapped.code_size_bytes = sizeof(push_shader);
+  ShaderMapUserData(push_regs.ps_regs.data_addr, push_mapped);
+  HW::ShaderRegisters push_sh{};
+  push_sh.target_output_mode[0] = 4;
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  const auto MakeVertex = [](uint32_t push_size) {
+    ShaderVertexInputInfo info{};
+    auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+    program->stage = ShaderType::Vertex;
+    program->bindings.push_constant_size = push_size;
+    info.stage.program = std::move(program);
+    return info;
+  };
+  const auto vertex_at_zero = MakeVertex(0);
+  const auto vertex_at_36 = MakeVertex(36);
+  ShaderPixelInputInfo at_zero{};
+  ShaderPixelInputInfo at_36{};
+  ShaderPixelInputInfo at_zero_again{};
+  std::span<const uint32_t> spirv_at_zero;
+  std::span<const uint32_t> spirv_at_36;
+  std::span<const uint32_t> spirv_at_zero_again;
+  Check(ShaderCompileInfoPS(push_regs, push_sh, vertex_at_zero, mappings,
+                            at_zero, spirv_at_zero) &&
+            ShaderCompileInfoPS(push_regs, push_sh, vertex_at_36, mappings,
+                                at_36, spirv_at_36) &&
+            ShaderCompileInfoPS(push_regs, push_sh, vertex_at_zero, mappings,
+                                at_zero_again, spirv_at_zero_again),
+        "pixel program-cache placement fixture failed to compile");
+  Check(at_zero.push_constant_offset == 0 &&
+            at_36.push_constant_offset == 36 &&
+            at_zero.stage.program != at_36.stage.program &&
+            spirv_at_zero.data() != spirv_at_36.data() &&
+            at_zero_again.stage.program == at_zero.stage.program &&
+            spirv_at_zero_again.data() == spirv_at_zero.data() &&
+            SpirvHasMemberDecorationValue(spirv_at_36, 35u, 36u),
+        "pixel program cache did not partition and reuse graphics push placement");
+}
+
+void TestGraphicsPushConstantPlacement() {
+  using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+  constexpr uint32_t OffsetDecoration = 35;
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+  };
+  const std::array<uint32_t, 4> user_data = {
+      0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+  ShaderPixelInputInfo pixel_info{};
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel_info;
+  options.user_data = user_data.data();
+  options.user_data_count = static_cast<uint32_t>(user_data.size());
+  options.push_constant_offset = 36;
+
+  ShaderRecompiler::CompileResult placed;
+  std::string error;
+  Check(ShaderRecompiler::TryRecompile(shader, options, placed, &error),
+        error.c_str());
+  Check(placed.program.bindings.push_constant_offset == 36 &&
+            placed.program.bindings.push_constant_size == sizeof(user_data) &&
+            ShaderRecompiler::IR::FindBinding(placed.program.bindings,
+                                              BindingKind::UserData) == nullptr,
+        "pixel push constants did not follow the vertex payload");
+  Check(SpirvHasMemberDecorationValue(placed.spirv, OffsetDecoration, 36),
+        "SPIR-V push block omitted the graphics-bank member offset");
+  CheckSpirvBinaryValidates(placed.spirv);
+
+  options.push_constant_offset = 124;
+  ShaderRecompiler::CompileResult spilled;
+  error.clear();
+  Check(ShaderRecompiler::TryRecompile(shader, options, spilled, &error),
+        error.c_str());
+  Check(spilled.program.bindings.push_constant_offset == 124 &&
+            spilled.program.bindings.push_constant_size == 0 &&
+            ShaderRecompiler::IR::FindBinding(spilled.program.bindings,
+                                              BindingKind::UserData) != nullptr,
+        "pixel data that crossed the graphics push bank did not spill");
+  CheckSpirvBinaryValidates(spilled.spirv);
 }
 
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
@@ -11478,7 +11626,8 @@ int main() {
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
-  TestPixelProgramCacheDescriptorSetIdentity();
+  TestPixelProgramCacheBindingIdentity();
+  TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   return 0;

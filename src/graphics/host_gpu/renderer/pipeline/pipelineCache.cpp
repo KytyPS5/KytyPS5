@@ -42,6 +42,7 @@ PipelineCache::~PipelineCache() {
 			(void)key;
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}
 	};
 	destroy(m_graphics_pipelines);
@@ -210,9 +211,9 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	auto cached = std::make_unique<GraphicsPipeline>(p);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
-	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, rendering, vs_input_info,
-	                       vs_spirv, ps_input_info, ps_spirv, static_params, vs_id.hash0,
-	                       vs_id.crc32, ps_id.hash0, ps_id.crc32, ps_active);
+	CreatePipelineInternal(m_graphics, *cached, rendering, vs_input_info, vs_spirv, ps_input_info,
+	                       ps_spirv, static_params, vs_id.hash0, vs_id.crc32, ps_id.hash0,
+	                       ps_id.crc32, ps_active);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
 	                 ps_id.crc32);
 
@@ -252,7 +253,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
-	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, input_info, cs_spirv);
+	CreatePipelineInternal(m_graphics, *cached, input_info, cs_spirv);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

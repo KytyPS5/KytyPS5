@@ -636,24 +636,22 @@ void TestImagesSamplersAndAliases() {
 void TestSampleAdjustSamplerScratch() {
   Fixture fixture(ShaderType::Pixel);
   const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
-  const auto lane = fixture.Emit(ValueOpcode::SelectU32,
-                                 {active, Value(1u), Value(0u)});
-  const auto low = fixture.Emit(ValueOpcode::BitwiseAnd32,
-                                {lane, Value(0xffu)});
-  const auto high = fixture.Emit(ValueOpcode::BitwiseAnd32,
-                                 {lane, Value(0xffu)});
+  const auto lane =
+      fixture.Emit(ValueOpcode::SelectU32, {active, Value(1u), Value(0u)});
+  const auto low =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(0xffu)});
+  const auto high =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(0xffu)});
   const auto quads = fixture.Emit(
       ValueOpcode::BitwiseOr32,
-      {low, fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                         {high, Value(8u)})});
-  const auto scratch = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
-                                    {quads, Value(12u)});
-  const auto word3 = fixture.Emit(ValueOpcode::BitwiseOr32,
-                                  {fixture.UserData(3), scratch});
-  const auto image = fixture.Image(
-      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-       Value(0u), Value(0u)},
-      0x1ec);
+      {low, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {high, Value(8u)})});
+  const auto scratch =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {quads, Value(12u)});
+  const auto word3 =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {fixture.UserData(3), scratch});
+  const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)},
+                                   0x1ec);
   const auto sampler = fixture.Sampler(
       {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), word3},
       0x1ec);
@@ -685,22 +683,21 @@ void TestSampleAdjustSamplerScratch() {
   const auto CheckRejected = [](uint32_t flags, uint32_t shift,
                                 const char *message) {
     Fixture rejected(ShaderType::Pixel);
-    const auto condition =
-        rejected.Emit(ValueOpcode::WqmMask, {Value(true)});
+    const auto condition = rejected.Emit(ValueOpcode::WqmMask, {Value(true)});
     const auto bit = rejected.Emit(ValueOpcode::SelectU32,
                                    {condition, Value(1u), Value(0u)});
-    const auto dynamic = rejected.Emit(ValueOpcode::ShiftLeftLogical32,
-                                       {bit, Value(shift)});
-    const auto dynamic_word3 = rejected.Emit(
-        ValueOpcode::BitwiseOr32, {rejected.UserData(3), dynamic});
-    const auto rejected_image = rejected.Image(
-        {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-         Value(0u), Value(0u)},
-        0x200);
-    const auto rejected_sampler = rejected.Sampler(
-        {rejected.UserData(0), rejected.UserData(1), rejected.UserData(2),
-         dynamic_word3},
-        0x200);
+    const auto dynamic =
+        rejected.Emit(ValueOpcode::ShiftLeftLogical32, {bit, Value(shift)});
+    const auto dynamic_word3 = rejected.Emit(ValueOpcode::BitwiseOr32,
+                                             {rejected.UserData(3), dynamic});
+    const auto rejected_image =
+        rejected.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                        Value(0u), Value(0u), Value(0u)},
+                       0x200);
+    const auto rejected_sampler =
+        rejected.Sampler({rejected.UserData(0), rejected.UserData(1),
+                          rejected.UserData(2), dynamic_word3},
+                         0x200);
     MemoryInfo rejected_memory;
     rejected_memory.kind = ResourceKind::Image;
     rejected_memory.image_dimension = Decoder::ImageDimension::Dim2D;
@@ -789,7 +786,7 @@ void TestDynamicStorageMipTracking() {
         "base-1 through last-3 dynamic storage range was not specialized");
   ShaderComputeInputInfo compute{};
   Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
-            AllocateBindings(fixture.program, {}, &error),
+            AllocateBindings(fixture.program, 0, &error),
         "dynamic storage mip bindings were not allocated");
   const auto *storage_binding =
       FindBinding(fixture.program.bindings, DescriptorBindingKind::Storage2D);
@@ -888,7 +885,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
 
   ShaderComputeInputInfo compute{};
   Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
-            AllocateBindings(fixture.program, {}, &error) &&
+            AllocateBindings(fixture.program, 0, &error) &&
             FindBinding(fixture.program.bindings,
                         DescriptorBindingKind::FlattenedSrt) != nullptr,
         "flattened typed SRT reads did not receive a binding");
@@ -933,7 +930,7 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   ShaderComputeInputInfo compute{};
   Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
-            AllocateBindings(fixture.program, {}, &error) &&
+            AllocateBindings(fixture.program, 0, &error) &&
             FindBinding(fixture.program.bindings,
                         DescriptorBindingKind::FlattenedSrt) == nullptr &&
             FindBinding(fixture.program.bindings,
@@ -1198,22 +1195,85 @@ void TestShaderInfoAndBindingLayout() {
                 StageInputKind::GlobalInvocationId,
         "typed shader values were not reflected in shader info");
 
-  BindingLayoutOptions options;
-  options.descriptor_set = 2;
-  options.max_push_dwords = 1;
-  Check(AllocateBindings(fixture.program, options, &error),
+  Check(AllocateBindings(fixture.program, 0, &error),
         "typed binding allocation failed");
-  Check(fixture.program.bindings.descriptor_set == 2 &&
-            FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::Buffers) != nullptr &&
+  Check(FindBinding(fixture.program.bindings, DescriptorBindingKind::Buffers) !=
+                nullptr &&
             FindBinding(fixture.program.bindings, DescriptorBindingKind::Gds) !=
                 nullptr &&
             FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::UserData) != nullptr,
+                        DescriptorBindingKind::UserData) == nullptr &&
+            fixture.program.bindings.push_constant_size ==
+                fixture.program.bindings.ShaderDataDwords() * sizeof(uint32_t),
         "typed resources were not assigned native bindings");
+  Check(NativeBinding(ShaderType::Compute, DescriptorBindingKind::Buffers) ==
+                static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
+            NativeBinding(ShaderType::Vertex, DescriptorBindingKind::Buffers) ==
+                static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
+            NativeBinding(ShaderType::Pixel, DescriptorBindingKind::Buffers) ==
+                static_cast<uint32_t>(DescriptorBindingKind::Count) +
+                    static_cast<uint32_t>(DescriptorBindingKind::Buffers),
+        "fixed stage binding ranges are inconsistent");
   Check(fixture.program.bindings.user_data_registers ==
             std::vector<uint32_t>({3u, 4u}),
         "binding layout did not collect live typed user-data values");
+}
+
+void TestGraphicsPushConstantLayout() {
+  const auto AddUserData = [](Fixture &fixture, uint32_t count) {
+    for (uint32_t index = 0; index < count; index++) {
+      fixture.Emit(ValueOpcode::ReferenceU32, {fixture.UserData(index)});
+    }
+    fixture.program.shader_info_complete = true;
+  };
+
+  std::string error;
+  Fixture vertex(ShaderType::Vertex);
+  AddUserData(vertex, 9);
+  Check(AllocateBindings(vertex.program, 0, &error) &&
+            vertex.program.bindings.push_constant_offset == 0 &&
+            vertex.program.bindings.push_constant_size == 9 * sizeof(uint32_t),
+        "vertex shader was not placed at the start of the graphics push bank");
+
+  const auto pixel_offset = vertex.program.bindings.push_constant_size;
+  Fixture pixel(ShaderType::Pixel);
+  AddUserData(pixel, 4);
+  Check(AllocateBindings(pixel.program, pixel_offset, &error) &&
+            pixel.program.bindings.push_constant_offset == pixel_offset &&
+            pixel.program.bindings.push_constant_size == 4 * sizeof(uint32_t) &&
+            FindBinding(pixel.program.bindings, DescriptorBindingKind::UserData) ==
+                nullptr,
+        "pixel shader did not follow the vertex data in the graphics push bank");
+
+  Fixture edge(ShaderType::Pixel);
+  AddUserData(edge, 1);
+  Check(AllocateBindings(edge.program, NativePushConstantSize - sizeof(uint32_t),
+                         &error) &&
+            edge.program.bindings.push_constant_size == sizeof(uint32_t),
+        "last aligned push-constant dword did not fit in the graphics bank");
+
+  Fixture spill(ShaderType::Pixel);
+  AddUserData(spill, 32);
+  Check(AllocateBindings(spill.program, pixel_offset, &error) &&
+            spill.program.bindings.push_constant_size == 0 &&
+            FindBinding(spill.program.bindings, DescriptorBindingKind::UserData) !=
+                nullptr,
+        "pixel shader overlapping the vertex push data did not spill to storage");
+
+  Fixture full(ShaderType::Pixel);
+  AddUserData(full, 1);
+  Check(AllocateBindings(full.program, NativePushConstantSize, &error) &&
+            full.program.bindings.push_constant_size == 0 &&
+            FindBinding(full.program.bindings, DescriptorBindingKind::UserData) !=
+                nullptr,
+        "full graphics push bank did not spill pixel user data to storage");
+
+  Fixture invalid(ShaderType::Pixel);
+  AddUserData(invalid, 1);
+  Check(!AllocateBindings(invalid.program,
+                          NativePushConstantSize + sizeof(uint32_t), &error) &&
+            !invalid.program.binding_layout_complete,
+        "push-constant placement beyond the graphics bank was accepted");
 }
 
 void TestResourceLimitIsTransactional() {
@@ -1339,6 +1399,7 @@ int main() {
     Run("exec-masked FLAT address", TestExecMaskedFlatAddressProvenance);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
+    Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {

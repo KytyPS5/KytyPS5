@@ -14720,6 +14720,34 @@ TestCase VectorVop3CompareNeU64OnGpu() {
            O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorVopcCmpxNeU64CapturedExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 7, 0);
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovU32(&code, 31, 0);
+  code.push_back(0x7dea0e80u); // v_cmpx_ne_u64 exec, 0, v[7:8]
+  AppendBufferStoreDword(&code, 8, 31);
+
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  AppendVMovU32(&code, 8, 1);
+  AppendVMovU32(&code, 31, 4);
+  code.push_back(0x7dea0e80u); // v_cmpx_ne_u64 exec, 0, v[7:8]
+  AppendBufferStoreDword(&code, 8, 31);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCmpxNeU64CapturedExecMask",
+                code,
+                {0x11223344u, 0x55667788u},
+                {0x11223344u, 1u},
+                {O::V_MOV_B32, O::V_CMPX_NE_U64, O::BUFFER_STORE_DWORD,
+                 O::S_MOV_B32, O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMPX_NE_U64 exec_lo, 0, v7", 2}};
+  test.native_ir_counts = {{"CompareNeU64 exec_lo, 0x00000000, v7", 2}};
+  return test;
+}
+
 TestCase VectorVop3CompareGtU64OnGpu() {
   using O = ShaderOpcode;
 
@@ -19564,6 +19592,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
+  AddCase(VectorVopcCmpxNeU64CapturedExecMask);
   AddCase(VectorCompareClassF32);
   AddCase(VectorCompareF16Ops);
   AddCase(Vop2SdwaCndmaskSourceModifier);

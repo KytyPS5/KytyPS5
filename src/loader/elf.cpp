@@ -491,8 +491,9 @@ bool Elf64::IsValid() const {
 		return false;
 	}
 
-	if (m_ehdr->e_ident[EI_OSABI] != ELFOSABI_FREEBSD) {
-		LOGF("ehdr->e_ident[EI_OSABI] (0x%x) != ELFOSABI_FREEBSD\n", m_ehdr->e_ident[EI_OSABI]);
+	const auto osabi = m_ehdr->e_ident[EI_OSABI];
+	if (osabi != ELFOSABI_FREEBSD && osabi != 0) {
+		LOGF("ehdr->e_ident[EI_OSABI] (0x%x) is neither ELFOSABI_FREEBSD nor ELFOSABI_NONE\n", osabi);
 		return false;
 	}
 
@@ -501,8 +502,8 @@ bool Elf64::IsValid() const {
 		return false;
 	}
 
-	if (m_ehdr->e_type != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC) {
-		LOGF("ehdr->e_type (%04x) != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC\n", m_ehdr->e_type);
+	if (m_ehdr->e_type != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC && m_ehdr->e_type != ET_DYN) {
+		LOGF("ehdr->e_type (%04x) is not a supported executable/shared-object type\n", m_ehdr->e_type);
 		return false;
 	}
 

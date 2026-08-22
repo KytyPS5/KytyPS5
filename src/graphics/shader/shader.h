@@ -249,6 +249,9 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
+// Writes every recompiled shader in the in-memory cache to disk. Called on the
+// way out; see WindowFlushCaches() for why that is not a destructor.
+void ShaderSaveDiskCache();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

@@ -65,6 +65,18 @@ std::filesystem::path GetShaderLogFolder() {
 	return g_config->shader_log_folder;
 }
 
+std::filesystem::path GetPipelineCacheFile() {
+	return g_config->pipeline_cache_file;
+}
+
+std::filesystem::path GetShaderCacheFile() {
+	return g_config->shader_cache_file;
+}
+
+uint64_t GetLogRepeatLimit() {
+	return g_config->log_repeat_limit;
+}
+
 bool CommandBufferDumpEnabled() {
 	return g_config->command_buffer_dump_enabled;
 }

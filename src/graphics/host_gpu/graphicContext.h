@@ -19,6 +19,19 @@ struct VulkanMemory;
 struct GraphicContext: public VulkanInstance {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
+
+	// Load (and validate) the on-disk pipeline cache, then create the
+	// vk::PipelineCache. Never fails the caller: a backend without a cache
+	// renders identically, just slower on first use of each pipeline.
+	void CreatePipelineCache();
+	// Serialise the cache to disk, leaving it usable. Split out from
+	// DestroyPipelineCache() because the emulator's normal exit is
+	// std::quick_exit(), which runs no destructors - so the only chance to
+	// write the cache is before that, with the device still alive.
+	void SavePipelineCache();
+	// Serialise the cache back to disk and destroy it. Safe to call when
+	// CreatePipelineCache() was never called or failed.
+	void DestroyPipelineCache();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;

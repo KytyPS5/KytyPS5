@@ -15,6 +15,9 @@ class File;
 
 namespace Loader {
 
+// Defined in loader/bootFailure.h, which includes this header for Elf64_Ehdr.
+enum class BootFailure;
+
 using Elf64_Addr   = uint64_t; // Unsigned program address
 using Elf64_Off    = uint64_t; // Unsigned file offset
 using Elf64_Half   = uint16_t; // Unsigned medium integer
@@ -261,6 +264,8 @@ public:
 
 	[[nodiscard]] bool IsSelf() const;
 	[[nodiscard]] bool IsValid() const;
+	// Why the header was rejected, when it was. None once the file has loaded.
+	[[nodiscard]] BootFailure GetBootFailure() const { return m_boot_failure; }
 	[[nodiscard]] bool IsShared() const;
 	[[nodiscard]] bool IsNextGen() const;
 
@@ -301,6 +306,8 @@ private:
 	std::unique_ptr<uint8_t[]>     m_dynamic_data;
 	std::unique_ptr<char[]>        m_str_table;
 	uint32_t                       m_str_table_size = 0;
+	// Zero is BootFailure::None; the enum is only forward-declared here.
+	BootFailure                    m_boot_failure {};
 	// uint64_t    m_base_vaddr   = 0;
 };
 

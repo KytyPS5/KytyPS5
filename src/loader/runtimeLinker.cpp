@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/bootFailure.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -1338,7 +1339,9 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		ParseProgramDynamicInfo(program);
 		CreateSymbolDatabase(program);
 	} else {
-		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+		const auto failure = program->elf->GetBootFailure();
+		EXIT("cannot boot %s\n\t%s: %s\n", Common::PathToString(elf_name).c_str(),
+		     BootFailureToString(failure).data(), BootFailureExplain(failure).data());
 	}
 
 	m_programs.push_back(program_owner.release());

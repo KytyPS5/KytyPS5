@@ -371,6 +371,9 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(shader_disk_cache_tests "${KYTY_TESTS_DIR}/ShaderDiskCacheTests.cpp")
+add_kyty_full_emulator_test(pm4_fuzz_tests "${KYTY_TESTS_DIR}/Pm4FuzzTests.cpp")
+add_kyty_full_emulator_test(diagnostics_tests "${KYTY_TESTS_DIR}/DiagnosticsTests.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -387,6 +390,19 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_executable(log_rate_limit_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LogRateLimitTests.cpp"
+)
+target_link_libraries(log_rate_limit_tests common)
+target_include_directories(log_rate_limit_tests PRIVATE ${inc_headers})
+
+add_executable(boot_failure_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BootFailureTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/bootFailure.cpp"
+)
+target_link_libraries(boot_failure_tests common)
+target_include_directories(boot_failure_tests PRIVATE ${inc_headers})
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
@@ -509,10 +525,15 @@ endif()
 if(BUILD_TESTING)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_disk_cache COMMAND $<TARGET_FILE:shader_disk_cache_tests>)
+	add_test(NAME pm4_fuzz COMMAND $<TARGET_FILE:pm4_fuzz_tests>)
+	add_test(NAME diagnostics COMMAND $<TARGET_FILE:diagnostics_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME boot_failure COMMAND $<TARGET_FILE:boot_failure_tests>)
+	add_test(NAME log_rate_limit COMMAND $<TARGET_FILE:log_rate_limit_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)

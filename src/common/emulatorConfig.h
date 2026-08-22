@@ -42,6 +42,16 @@ struct ConfigOptions {
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
+	// Driver pipeline cache, persisted between runs so the second launch of a
+	// title does not recompile every pipeline again. Empty disables it.
+	std::filesystem::path  pipeline_cache_file         = "_PipelineCache.bin";
+	// Recompiled-shader cache, persisted between runs so the GCN -> SPIR-V
+	// translation is not redone every launch. Empty disables it.
+	std::filesystem::path  shader_cache_file           = "_ShaderCache.bin";
+	// How many messages one LOGF call site may write before it is sampled
+	// instead. Zero means no limit. Logs reaching several GB in two minutes
+	// (issue #200) are almost entirely a few sites in per-draw loops.
+	uint64_t               log_repeat_limit            = 256;
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
@@ -71,6 +81,9 @@ bool     VulkanValidationEnabled();
 bool                   ShaderValidationEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 ShaderLogDirection     GetShaderLogDirection();
+std::filesystem::path  GetPipelineCacheFile();
+std::filesystem::path  GetShaderCacheFile();
+uint64_t               GetLogRepeatLimit();
 std::filesystem::path  GetShaderLogFolder();
 
 bool                  CommandBufferDumpEnabled();

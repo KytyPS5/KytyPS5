@@ -868,6 +868,12 @@ void WindowRun() {
 	g_window->Run();
 }
 
+void WindowFlushCaches() {
+	if (g_window != nullptr && g_window->graphic_ctx.device != nullptr) {
+		g_window->graphic_ctx.SavePipelineCache();
+	}
+}
+
 void WindowShutdown() {
 	if (g_window != nullptr) {
 		g_window.reset();

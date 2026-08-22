@@ -21,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -279,8 +280,43 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 	return resolved;
 }
 #else
-static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
-	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
+// Map guest path segments that are illegal on NTFS to stable host names.
+static std::string EncodeHostPathSegment(std::string_view input) {
+	std::string out;
+	out.reserve(input.size());
+	for (unsigned char ch: input) {
+		switch (ch) {
+			case '%': out += "%25"; break;
+			case ':': out += "%3A"; break;
+			case '*': out += "%2A"; break;
+			case '?': out += "%3F"; break;
+			case '"': out += "%22"; break;
+			case '<': out += "%3C"; break;
+			case '>': out += "%3E"; break;
+			case '|': out += "%7C"; break;
+			default: out += static_cast<char>(ch); break;
+		}
+	}
+	return out;
+}
+
+static std::string EncodeHostRelativePath(const std::string& relative_path) {
+	std::string out;
+	std::string segment;
+	out.reserve(relative_path.size());
+	segment.reserve(relative_path.size());
+
+	for (char ch: relative_path) {
+		if (ch == '/') {
+			out += EncodeHostPathSegment(segment);
+			out += '/';
+			segment.clear();
+			continue;
+		}
+		segment += ch;
+	}
+	out += EncodeHostPathSegment(segment);
+	return out;
 }
 #endif
 
@@ -301,11 +337,7 @@ std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_fi
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
-			         mounted_file_name.c_str());
-		}
-		return p.dir / rel_path;
+		return p.dir / EncodeHostRelativePath(rel_path);
 #else
 		return ResolvePathIgnoringCase(p.dir / rel_path);
 #endif
@@ -330,7 +362,7 @@ std::filesystem::path MountPoints::GetRealDirectory(const std::string& mounted_d
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return p.dir / rel_path;
+		return p.dir / EncodeHostRelativePath(rel_path);
 #else
 		return ResolvePathIgnoringCase(p.dir / rel_path);
 #endif

@@ -1212,10 +1212,12 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& info, std::span<const uint32_t>& spirv) {
+                         bool needs_lds_barriers, ShaderComputeInputInfo& info,
+                         std::span<const uint32_t>& spirv) {
 	spirv = {};
 
 	ShaderGetStaticInputInfoCS(regs, sh, info);
+	info.needs_lds_barriers = needs_lds_barriers;
 	const auto shader_hash = regs.cs_regs.data_addr;
 	const auto program_id  = ShaderGetIdCS(regs, info, false);
 	const auto key = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id);
@@ -1344,9 +1346,11 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
 	     "\t lds_size_dwords    = %u\n"
+	     "\t needs_lds_barriers = %s\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
 	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
+	     info.needs_lds_barriers ? "true" : "false",
 	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
@@ -1742,6 +1746,7 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 	ret.ids.push_back(input_info.thread_ids_num);
 	ret.ids.push_back(input_info.lds_size_dwords);
 	ret.ids.push_back(input_info.scratch_size_dwords);
+	ret.ids.push_back(static_cast<uint32_t>(input_info.needs_lds_barriers));
 
 	for (int i = 0; i < 3; i++) {
 		ret.ids.push_back(input_info.threads_num[i]);

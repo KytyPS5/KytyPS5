@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
@@ -11409,7 +11410,7 @@ void TestComputeLdsAllocationIdentity() {
     regs.cs_regs.lds_size = encoded_lds_size;
     ShaderComputeInputInfo input_info{};
     std::span<const uint32_t> spirv;
-    Check(ShaderCompileInfoCS(regs, sh, input_info, spirv),
+    Check(ShaderCompileInfoCS(regs, sh, false, input_info, spirv),
           "compute LDS allocation shader did not compile");
     Check(input_info.lds_size_dwords == expected_dwords,
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
@@ -11436,6 +11437,12 @@ void TestComputeLdsAllocationIdentity() {
   Check(ShaderGetIdCS(regs, lds_1152, true) !=
             ShaderGetIdCS(regs, lds_896, true),
         "compute pipeline identity omitted the LDS allocation");
+
+  auto split_wave = lds_896;
+  split_wave.needs_lds_barriers = true;
+  Check(ShaderGetIdCS(regs, lds_896, true) !=
+            ShaderGetIdCS(regs, split_wave, true),
+        "compute shader identity omitted split-wave LDS synchronization");
 
   auto tg_size_disabled = lds_896;
   auto tg_size_enabled = lds_896;
@@ -11467,7 +11474,7 @@ void TestComputeLdsAllocationIdentity() {
   regs.cs_regs.lds_size = decode_lds_field(lds_896_rsrc2);
   ShaderComputeInputInfo scratch_info{};
   std::span<const uint32_t> scratch_spirv;
-  Check(ShaderCompileInfoCS(regs, sh, scratch_info, scratch_spirv),
+  Check(ShaderCompileInfoCS(regs, sh, false, scratch_info, scratch_spirv),
         "compute scratch metadata shader did not compile");
   Check(scratch_info.scratch_size_dwords == 7,
         "AGC per-thread scratch size was not propagated");
@@ -11496,6 +11503,138 @@ void TestComputeLdsAllocationIdentity() {
   Check(SpirvUnsignedLessThanBoundCount(append_result.spirv, 1152u) == 1u,
         "typed LDS append omitted the declared allocation bound");
   CheckSpirvBinaryValidates(append_result.spirv);
+}
+
+void TestWave64LdsSynchronization() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x0d), // ds_write_b32 v0, v1
+      EncodeDs1(0, 1, 0),
+      EncodeSopp(0x01),
+  };
+
+  const auto compile = [&](bool needs_lds_barriers, uint32_t wave_size,
+                           uint32_t threads) {
+    ShaderComputeInputInfo input_info{};
+    input_info.lds_size_dwords = 128;
+    input_info.needs_lds_barriers = needs_lds_barriers;
+    input_info.threads_num[0] = threads;
+    input_info.threads_num[1] = 1;
+    input_info.threads_num[2] = 1;
+
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = wave_size;
+    options.input_info.compute = &input_info;
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+          error.c_str());
+    CheckSpirvBinaryValidates(result.spirv);
+    return result;
+  };
+
+  const auto native_wave64 = compile(false, 64, 64);
+  Check(!SpirvContainsOpcode(native_wave64.spirv, 224),
+        "native wave64 shader gained a synthetic workgroup barrier");
+
+  const auto split_wave64 = compile(true, 64, 64);
+  Check(SpirvContainsOpcode(split_wave64.spirv, 224),
+        "split wave64 LDS shader omitted workgroup synchronization");
+
+  const auto split_wave32 = compile(true, 32, 64);
+  Check(!SpirvContainsOpcode(split_wave32.spirv, 224),
+        "wave32 shader gained wave64 synchronization");
+
+  const auto larger_workgroup = compile(true, 64, 128);
+  Check(!SpirvContainsOpcode(larger_workgroup.spirv, 224),
+        "multi-wave workgroup gained unsupported synthetic synchronization");
+}
+
+void TestSharedMemoryBarrierSafety() {
+  using namespace ShaderRecompiler::IR;
+
+  const auto make_program = [](size_t block_count) {
+    ValueProgram program;
+    program.memory_info.push_back({.kind = ResourceKind::Lds});
+    for (size_t index = 0; index < block_count; index++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.emplace_back();
+      program.block_info.back().id = static_cast<uint32_t>(index);
+    }
+    return program;
+  };
+  const auto append_write = [](Block& block) {
+    auto& inst = block.AppendNewInst(
+        ValueOpcode::WriteSharedU32,
+        {Value(0u), Value(1u), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = 0});
+  };
+  const auto append_read = [](Block& block) {
+    auto& inst = block.AppendNewInst(ValueOpcode::LoadSharedU32,
+                                     {Value(0u), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = 0});
+  };
+  const auto count_barriers = [](const Block& block) {
+    return std::ranges::count_if(block, [](const Inst& inst) {
+      return inst.GetOpcode() == ValueOpcode::Barrier;
+    });
+  };
+  const auto divergent_condition = [](ValueProgram& program, size_t block) {
+    IREmitter ir(program.blocks[block]);
+    const auto local_id = U32(ir.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)}));
+    return ir.INotEqual(local_id, U32(Value(0u)));
+  };
+
+  ShaderComputeInputInfo compute_info{};
+  compute_info.needs_lds_barriers = true;
+  compute_info.lds_size_dwords = 128;
+  compute_info.threads_num[0] = 64;
+  compute_info.threads_num[1] = 1;
+  compute_info.threads_num[2] = 1;
+
+  auto phases = make_program(1);
+  append_write(*phases.blocks[0]);
+  append_read(*phases.blocks[0]);
+  const auto phase_stats = InsertSharedMemoryBarriers(phases, 64u, compute_info);
+  std::vector<ValueOpcode> phase_opcodes;
+  for (const auto& inst : *phases.blocks[0]) {
+    phase_opcodes.push_back(inst.GetOpcode());
+  }
+  Check(phase_stats.inserted_barriers == 2 && phase_opcodes.size() == 4 &&
+            phase_opcodes[0] == ValueOpcode::WriteSharedU32 &&
+            phase_opcodes[1] == ValueOpcode::Barrier &&
+            phase_opcodes[2] == ValueOpcode::LoadSharedU32 &&
+            phase_opcodes[3] == ValueOpcode::Barrier,
+        "LDS write/read phases were not separated by a barrier");
+
+  auto selection = make_program(3);
+  selection.block_info[0].terminator.kind =
+      ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  selection.block_info[0].terminator.merge_block = 2;
+  selection.block_info[0].condition = divergent_condition(selection, 0);
+  append_write(*selection.blocks[1]);
+  append_read(*selection.blocks[2]);
+  const auto selection_stats =
+      InsertSharedMemoryBarriers(selection, 64u, compute_info);
+  Check(selection_stats.inserted_barriers == 2 &&
+            count_barriers(*selection.blocks[1]) == 0 &&
+            selection.blocks[2]->begin()->GetOpcode() ==
+                ValueOpcode::Barrier,
+        "workgroup barrier was placed inside divergent selection flow");
+
+  auto loop = make_program(1);
+  loop.block_info[0].terminator.kind =
+      ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  loop.block_info[0].condition = divergent_condition(loop, 0);
+  append_write(*loop.blocks[0]);
+  append_read(*loop.blocks[0]);
+  const auto loop_stats = InsertSharedMemoryBarriers(loop, 64u, compute_info);
+  Check(loop_stats.inserted_barriers == 0 &&
+            count_barriers(*loop.blocks[0]) == 0,
+        "workgroup barrier was inserted into divergent loop control");
 }
 
 void TestPixelProgramCacheBindingIdentity() {
@@ -12096,6 +12235,8 @@ int main() {
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
+  TestWave64LdsSynchronization();
+  TestSharedMemoryBarrierSafety();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();

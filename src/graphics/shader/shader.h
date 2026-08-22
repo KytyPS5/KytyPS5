@@ -107,6 +107,7 @@ struct ShaderComputeInputInfo {
 	uint32_t           scratch_size_dwords        = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	bool               needs_lds_barriers          = false;
 	uint32_t           wave_size                  = 64;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
@@ -268,7 +269,8 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                          ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv);
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& input_info, std::span<const uint32_t>& spirv);
+                         bool needs_lds_barriers, ShaderComputeInputInfo& input_info,
+                         std::span<const uint32_t>& spirv);
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderVertexInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,

@@ -1019,8 +1019,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.subgroup_size_control_enabled &&
-	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
+	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.sType =
 		    vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo;

@@ -493,14 +493,19 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
 	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
-	graphics.subgroup_size_control_enabled = features13.subgroupSizeControl == VK_TRUE &&
-	                                         subgroup_size_control.minSubgroupSize <= 64 &&
-	                                         subgroup_size_control.maxSubgroupSize >= 64;
+	graphics.compute_subgroup_size_control_enabled =
+	    features13.subgroupSizeControl == VK_TRUE &&
+	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
+	    subgroup_size_control.minSubgroupSize <= 64 &&
+	    subgroup_size_control.maxSubgroupSize >= 64;
+	graphics.compute_wave64_supported =
+	    graphics.subgroup_size == 64u || graphics.compute_subgroup_size_control_enabled;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
-	     graphics.subgroup_size_control_enabled ? "true" : "false");
+	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
+	     graphics.compute_wave64_supported ? "true" : "false");
 }
 
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
@@ -645,8 +650,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	const bool subgroup_size_control_enabled = graphics.subgroup_size_control_enabled &&
-	                                           supported_features13.subgroupSizeControl == VK_TRUE;
+	const bool subgroup_size_control_enabled =
+	    graphics.compute_subgroup_size_control_enabled &&
+	    supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
 #if defined(__APPLE__)

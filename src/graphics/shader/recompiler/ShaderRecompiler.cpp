@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
@@ -740,6 +741,14 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		IR::ResolveControlFlowIdentities(*ir.values);
 		IR::RemoveIdentities(ir.values->blocks);
 		IR::EliminateDeadCode(ir.values->blocks);
+	}
+	if (options.stage == ShaderType::Compute) {
+		const auto lds_barriers =
+		    IR::InsertSharedMemoryBarriers(*ir.values, ir.wave_size, *compute);
+		if (lds_barriers.inserted_barriers != 0) {
+			LOGF("%s wave64 LDS synchronization: barriers=%" PRIu32 "\n", GetDumpLabel(options),
+			     lds_barriers.inserted_barriers);
+		}
 	}
 	std::string srt_error;
 	if (!IR::BuildSrtPlan(ir, &srt_error)) {

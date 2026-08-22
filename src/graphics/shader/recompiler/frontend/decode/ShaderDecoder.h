@@ -389,6 +389,7 @@ enum class Opcode {
 	V_CMP_EQ_I64,
 	V_CMP_GT_U64,
 	V_CMP_NE_U64,
+	V_CMPX_NE_I64,
 	V_CMPX_NE_U64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,

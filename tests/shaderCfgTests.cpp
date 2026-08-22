@@ -4044,8 +4044,9 @@ void TestNewShaderDecoderArchitecture() {
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
-  const uint32_t opcodes[] = {0xa2u, 0xe4u, 0xe5u,
-                              0xf5u}; // eq_i64, gt_u64, ne_u64, cmpx_ne_u64
+  const uint32_t opcodes[] = {
+      0xa2u, 0xb5u, 0xe4u, 0xe5u,
+      0xf5u}; // eq_i64, cmpx_ne_i64, gt_u64, ne_u64, cmpx_ne_u64
   for (const auto opcode : opcodes) {
     const uint32_t shader[] = {
         EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
@@ -8366,6 +8367,40 @@ void TestNewShaderRecompilerU64PairLowering() {
   options.dump_ir = true;
   CompileResult result;
   std::string error;
+
+  const uint32_t cmpx_i64_shader[] = {
+      0xd4b5007eu, 0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_cmpx_i64;
+  Check(Decoder::DecodeInstruction(cmpx_i64_shader, 0u, decoded_cmpx_i64,
+                                   &error),
+        error.c_str());
+  Check(decoded_cmpx_i64.opcode == Decoder::Opcode::V_CMPX_NE_I64 &&
+            decoded_cmpx_i64.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded_cmpx_i64.src0.value == 0u &&
+            decoded_cmpx_i64.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded_cmpx_i64.src1.reg == 7u,
+        "decoder rejected captured VOP3 V_CMPX_NE_I64 fields");
+  Check(TryRecompile(cmpx_i64_shader, options, result, &error), error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_NE_I64 exec_lo, 0, v7"),
+        "captured VOP3 V_CMPX_NE_I64 was not present in the decoded dump");
+  Decoder::Program decoded_i64_program;
+  CFG::Graph graph_i64;
+  IR::Program native_i64;
+  Check(Decoder::DecodeProgram(cmpx_i64_shader, decoded_i64_program, &error),
+        error.c_str());
+  Check(CFG::BuildGraph(decoded_i64_program, graph_i64, &error) &&
+            CFG::Structurize(graph_i64, &error),
+        error.c_str());
+  Check(IR::LowerProgram(decoded_i64_program, graph_i64, ShaderType::Compute,
+                         64u, native_i64, &error),
+        error.c_str());
+  Check(Common::ContainsStr(IR::ProgramToString(native_i64),
+                            "CompareNeU64 exec_lo, 0x00000000, v7"),
+        "V_CMPX_NE_I64 did not lower to masked 64-bit inequality");
+  CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t cmpx_shader[] = {
       0x7dea0e80u, // v_cmpx_ne_u64 exec, 0, v[7:8]

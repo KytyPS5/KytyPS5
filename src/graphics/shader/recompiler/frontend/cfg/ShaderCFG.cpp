@@ -1875,7 +1875,8 @@ bool RouteSharedSelectionArm(Graph& graph, uint32_t route_variable) {
 		return false;
 	}
 	const auto block_count = static_cast<uint32_t>(graph.blocks.size());
-	for (uint32_t block_id = 0; block_id < block_count; block_id++) {
+	// Route later/deeper candidates first so earlier shared arms remain structured.
+	for (uint32_t block_id = block_count; block_id-- > 0;) {
 		GotoRouteBlocks route;
 		if (RouteOneSharedArm(graph, block_count, block_id, route_variable, route)) {
 			PlaceGotoRouteBlocks(graph, block_count, route);

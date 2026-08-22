@@ -7926,6 +7926,68 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // outer forward-skip condition
+      EncodeSopp(0x04, 4),    // outer -> shared or nested condition
+      EncodeSopc(0x06, 1, 1), // nested forward-skip condition
+      EncodeSopp(0x04, 2),    // nested -> shared or work
+      EncodeSMovB32(2, 129),  // forward-skip work
+      EncodeSopp(0x02, 0),    // work -> shared
+      EncodeSMovB32(3, 129),  // shared work
+      EncodeSopc(0x06, 4, 4), // outer terminal condition
+      EncodeSopp(0x04, 3),    // outer -> shared terminal or inner
+      EncodeSopc(0x06, 5, 5), // inner terminal condition
+      EncodeSopp(0x04, 1),    // inner -> shared terminal or other terminal
+      0xbf810000u,            // other terminal
+      0xbf810000u,            // shared terminal
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  std::string error;
+  Check(ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded,
+                                                 &error),
+        error.c_str());
+  ShaderRecompiler::CFG::Graph graph;
+  Check(ShaderRecompiler::CFG::BuildGraph(decoded, graph, &error),
+        error.c_str());
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph, &error), error.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "shared-exit route ordering changed semantic instruction coverage");
+  const auto route_selects =
+      std::ranges::count_if(graph.blocks, [](const auto &block) {
+        return block.terminator.condition ==
+               ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+      });
+  const auto route_sets =
+      std::ranges::count_if(graph.blocks, [](const auto &block) {
+        return block.terminator.goto_value >= 0;
+      });
+  const bool has_early_route =
+      std::ranges::any_of(graph.blocks, [](const auto &block) {
+        return block.start_pc < 0x30u &&
+               (block.terminator.condition ==
+                    ShaderRecompiler::CFG::BranchCondition::GotoVariable ||
+                block.terminator.goto_value >= 0);
+      });
+  Check(route_selects == 1u && route_sets == 3u && !has_early_route,
+        "shared exits were routed before the innermost blocking construct");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  ShaderRecompiler::CompileResult result;
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "inner-first shared-exit routing did not stay structured");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgLoopSharedRegion() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0),      // loop condition
@@ -11954,6 +12016,7 @@ int main() {
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
+  TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();

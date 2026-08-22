@@ -729,10 +729,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	ir.blocks.clear();
 	IR::RewriteToSsa(ir.values->blocks);
 	IR::ConstantPropagationPass(ir.values->blocks);
-	for (auto& info: ir.values->block_info) {
-		info.condition       = info.condition.Resolve();
-		info.indirect_target = info.indirect_target.Resolve();
-	}
+	IR::ResolveControlFlowIdentities(*ir.values);
 	IR::RemoveIdentities(ir.values->blocks);
 	IR::EliminateDeadCode(ir.values->blocks);
 	const auto read_lane_stats = IR::EliminateReadLane(*ir.values, ir.wave_size);
@@ -740,6 +737,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
 		IR::ConstantPropagationPass(ir.values->blocks);
+		IR::ResolveControlFlowIdentities(*ir.values);
 		IR::RemoveIdentities(ir.values->blocks);
 		IR::EliminateDeadCode(ir.values->blocks);
 	}

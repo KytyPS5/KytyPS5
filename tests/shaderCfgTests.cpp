@@ -10498,16 +10498,14 @@ bool LowerTypedPlanning(const uint32_t *code, uint32_t words,
   ir.blocks.clear();
   ShaderRecompiler::IR::RewriteToSsa(ir.values->blocks);
   ShaderRecompiler::IR::ConstantPropagationPass(ir.values->blocks);
-  for (auto &info : ir.values->block_info) {
-    info.condition = info.condition.Resolve();
-    info.indirect_target = info.indirect_target.Resolve();
-  }
+  ShaderRecompiler::IR::ResolveControlFlowIdentities(*ir.values);
   ShaderRecompiler::IR::RemoveIdentities(ir.values->blocks);
   ShaderRecompiler::IR::EliminateDeadCode(ir.values->blocks);
   const auto read_lane =
       ShaderRecompiler::IR::EliminateReadLane(*ir.values, ir.wave_size);
   if (read_lane.rewritten_reads != 0) {
     ShaderRecompiler::IR::ConstantPropagationPass(ir.values->blocks);
+    ShaderRecompiler::IR::ResolveControlFlowIdentities(*ir.values);
     ShaderRecompiler::IR::RemoveIdentities(ir.values->blocks);
     ShaderRecompiler::IR::EliminateDeadCode(ir.values->blocks);
   }

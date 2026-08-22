@@ -402,6 +402,47 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+void TestControlFlowValueSurvivesReadLaneFolding() {
+  Fixture fixture(3);
+  auto *entry = fixture.program.values->blocks[0];
+  auto *taken = fixture.program.values->blocks[1];
+  auto *other = fixture.program.values->blocks[2];
+  entry->AddBranch(taken);
+  entry->AddBranch(other);
+
+  auto &entry_info = fixture.program.values->block_info[0];
+  entry_info.terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  entry_info.terminator.true_block = 1;
+  entry_info.terminator.false_block = 2;
+  fixture.program.values->block_info[1].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  fixture.program.values->block_info[2].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+
+  const auto undef = fixture.Emit(ValueOpcode::UndefU32);
+  const auto write = fixture.Emit(
+      ValueOpcode::WriteLane, {undef, Value(42u), Value(5u)});
+  const auto read =
+      fixture.Emit(ValueOpcode::ReadLane, {write, Value(5u)});
+  entry_info.condition =
+      fixture.Emit(ValueOpcode::IEqual32, {read, Value(42u)});
+  fixture.Emit(ValueOpcode::Reference, {entry_info.condition});
+
+  Check(EliminateReadLane(*fixture.program.values, 64).rewritten_reads == 1,
+        "control-flow fixture did not eliminate its fixed-lane read");
+  ConstantPropagationPass(fixture.program.values->blocks);
+  ResolveControlFlowIdentities(*fixture.program.values);
+  RemoveIdentities(fixture.program.values->blocks);
+  EliminateDeadCode(fixture.program.values->blocks);
+
+  std::string error;
+  Check(entry_info.condition == Value(true) &&
+            ValidateValueProgram(*fixture.program.values, true, &error),
+        error.empty() ? "folded branch condition did not survive identity removal"
+                      : error.c_str());
+}
+
 void TestUndefinedRuntimeValueFails() {
   Fixture fixture;
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
@@ -443,6 +484,7 @@ int main() {
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();
+    TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;

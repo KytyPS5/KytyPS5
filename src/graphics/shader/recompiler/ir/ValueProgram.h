@@ -68,6 +68,7 @@ struct ValueProgram {
 };
 
 bool        ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::string* error);
+void        ResolveControlFlowIdentities(ValueProgram& program);
 bool        EquivalentValue(const ValueProgram& program, Value left, Value right);
 Value       ResolveInvariantPhi(const ValueProgram& program, Value value);
 std::string ValueProgramToString(const ValueProgram& program);

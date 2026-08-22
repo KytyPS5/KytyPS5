@@ -591,6 +591,13 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 	return true;
 }
 
+void ResolveControlFlowIdentities(ValueProgram& program) {
+	for (auto& info: program.block_info) {
+		info.condition       = info.condition.Resolve();
+		info.indirect_target = info.indirect_target.Resolve();
+	}
+}
+
 std::string ValueProgramToString(const ValueProgram& program) {
 	std::map<const Inst*, size_t> ids;
 	size_t                        next_id = 1;

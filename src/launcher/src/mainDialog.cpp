@@ -8,6 +8,7 @@
 
 #include <QApplication>
 #include <QByteArray>
+#include <QDateTime>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -194,6 +195,33 @@ static QString BoolArg(bool value) {
 	return value ? QStringLiteral("true") : QStringLiteral("false");
 }
 
+static QString CreateTestLogFile(const Configuration& info) {
+	QFileInfo configured_file(info.printf_output_file);
+	auto      game_id = info.title_id.trimmed();
+
+	if (game_id.isEmpty()) {
+		game_id = QDir(info.basedir).dirName();
+	}
+	if (game_id.isEmpty()) {
+		game_id = QStringLiteral("game");
+	}
+	game_id.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]+")), QStringLiteral("_"));
+
+	auto base_name = configured_file.completeBaseName();
+	if (base_name.isEmpty()) {
+		base_name = QStringLiteral("_kyty");
+	}
+
+	const auto timestamp =
+	    QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+	auto file_name = QStringLiteral("%1_%2_%3").arg(base_name, game_id, timestamp);
+	if (!configured_file.suffix().isEmpty()) {
+		file_name += QStringLiteral(".") + configured_file.suffix();
+	}
+
+	return configured_file.dir().filePath(file_name);
+}
+
 static QStringList CreateEmulatorArgs(const Configuration& info) {
 	QStringList args;
 	auto        r = EnumToText(info.screen_resolution).split('x');
@@ -216,8 +244,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--shader-log-folder" << info.shader_log_folder;
 	args << "--command-buffer-dump" << BoolArg(info.command_buffer_dump_enabled);
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
-	args << "--printf-direction" << EnumToText(info.printf_direction);
-	args << "--printf-output-file" << info.printf_output_file;
+	args << "--printf-direction"
+	     << (info.printf_direction == Configuration::LogDirection::FilePerTest
+	             ? EnumToText(Configuration::LogDirection::File)
+	             : EnumToText(info.printf_direction));
+	args << "--printf-output-file"
+	     << (info.printf_direction == Configuration::LogDirection::FilePerTest
+	             ? CreateTestLogFile(info)
+	             : info.printf_output_file);
 	args << "--profiler-direction" << EnumToText(info.profiler_direction);
 	args << "--spirv-debug-printf" << "false";
 #if defined(_WIN32)

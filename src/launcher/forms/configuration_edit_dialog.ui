@@ -224,7 +224,7 @@
       <item row="8" column="1">
        <widget class="QComboBox" name="comboBox_printf_direction">
         <property name="toolTip">
-         <string>Print logs to file or console window. If enabled may decrease emulator performance</string>
+         <string>Print logs to the console or a file. File per test creates a new file for every test</string>
         </property>
        </widget>
       </item>

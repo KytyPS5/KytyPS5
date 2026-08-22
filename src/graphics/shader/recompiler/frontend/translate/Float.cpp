@@ -89,6 +89,16 @@ bool Translator::TranslateFloat16Operation(const IR::Instruction& inst) {
 		case 3: result = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})); break;
 		default: EXIT("invalid half-float source count: %u", inst.src_count);
 	}
+	if (inst.op == IR::Opcode::SqrtF16 || inst.op == IR::Opcode::InverseSqrtF16 ||
+	    inst.op == IR::Opcode::Log2F16) {
+		const auto negative = IR::U1(
+		    ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {args[0], IR::Value::F32(0.0f)}));
+		result = ApplyF32ResultModifiers(inst.dst, result);
+		const auto bits = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
+		const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
+		WriteU16(inst.dst, ir.Select(negative, invalid, bits));
+		return true;
+	}
 	WriteF16(inst.dst, result);
 	return true;
 }

@@ -13705,7 +13705,8 @@ TestCase VectorSpecialF16Ops() {
   code.push_back(EncodeVop1(0x57, 13, Vgpr(2)));
   code.push_back(EncodeVop1(0x57, 14, Vgpr(3)));
   code.push_back(EncodeVop1(0x58, 15, Vgpr(4)));
-  for (u32 i = 0; i < 6; i++) {
+  AppendVop3(&code, 0x1d7, 16, Vgpr(3), 0, 0, 0, 0, true);
+  for (u32 i = 0; i < 7; i++) {
     AppendStoreVgpr(&code, 10 + i, i);
   }
   AppendEnd(&code);
@@ -13714,7 +13715,7 @@ TestCase VectorSpecialF16Ops() {
           code,
           {},
           {0x00008000u, 0xb8005678u, 0x00003800u, 0x00000000u, 0x0000fe00u,
-           0x00000000u},
+           0x00000000u, 0x00000000u},
           {O::V_MOV_B32, O::V_RCP_F16, O::V_RSQ_F16, O::V_LOG_F16, O::V_EXP_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -14314,8 +14315,8 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
   return {"VectorMinMaxF32NanAndSignedZeroEdges",
           code,
           {},
-          {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u, 0x7fe00001u,
-           0x7fe00001u, 0x40000000u, 0x40000000u},
+          {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u, 0x40000000u,
+           0x40000000u, 0x40000000u, 0x40000000u},
           {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32,
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -14341,7 +14342,7 @@ TestCase VectorMed3F32NanUsesMin3Path() {
   return {"VectorMed3F32NanUsesMin3Path",
           code,
           {},
-          {0x7fe00001u, 0x40000000u, 0x40400000u},
+          {0x40000000u, 0x40000000u, 0x40000000u},
           {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 

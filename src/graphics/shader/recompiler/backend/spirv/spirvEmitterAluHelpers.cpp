@@ -223,12 +223,8 @@ F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
 	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
 	const auto exponent_max  = EmitCompareU32Constant(state, OpIEqual, exponent_bits, 0x7f800000u);
 	const auto mantissa_nonzero = EmitCompareU32Constant(state, OpINotEqual, mantissa_bits, 0);
-	const auto quiet_bit_clear =
-	    EmitCompareU32Constant(state, OpIEqual, EmitAndConstant(state, cls.bits, 0x00400000u), 0);
-	cls.nan        = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
-	cls.snan       = EmitLogicalAndBool(state, cls.nan, quiet_bit_clear);
-	cls.zero       = EmitCompareU32Constant(state, OpIEqual, abs_bits, 0);
-	cls.quiet_bits = EmitOrU32(state, cls.bits, ConstantU32(state, 0x00400000u));
+	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
+	cls.zero = EmitCompareU32Constant(state, OpIEqual, abs_bits, 0);
 	return cls;
 }
 
@@ -308,12 +304,7 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 
 	const auto rhs_nan_bits =
 	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
-	const auto non_snan_bits =
-	    EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
-	const auto rhs_snan_bits =
-	    EmitSelectValueU32(state, rhs_class.snan, rhs_class.quiet_bits, non_snan_bits);
-	const auto result_bits =
-	    EmitSelectValueU32(state, lhs_class.snan, lhs_class.quiet_bits, rhs_snan_bits);
+	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
 	return EmitBitcastU32ToF32(state, result_bits);
 }
 

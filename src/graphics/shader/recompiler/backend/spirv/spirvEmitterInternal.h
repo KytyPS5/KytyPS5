@@ -569,11 +569,9 @@ constexpr uint32_t ImageSpirvMultisampled(ImageViewKind view) {
 }
 
 struct F32Class {
-	uint32_t bits       = 0;
-	uint32_t nan        = 0;
-	uint32_t snan       = 0;
-	uint32_t zero       = 0;
-	uint32_t quiet_bits = 0;
+	uint32_t bits = 0;
+	uint32_t nan  = 0;
+	uint32_t zero = 0;
 };
 
 uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr);

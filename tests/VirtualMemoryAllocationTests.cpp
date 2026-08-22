@@ -472,6 +472,19 @@ void TestGuestAddressSpaceHasNoFixedFallback() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestWindowsGuestBackingUsesLazyCommit() {
+	const char* test = "WindowsGuestBackingUsesLazyCommit";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto committed = Libs::LibKernel::Memory::TestGuestBackingCommittedSize();
+	Check(test, committed != UINT64_MAX, "failed to query direct-memory backing state");
+	Check(test, committed < Libs::LibKernel::Memory::TestGuestBackingSize(),
+	      "the complete 13.5 GiB backing store was committed at boot");
+	std::printf("[host]    %-48s ok (%" PRIu64 " KiB committed)\n", test, committed / 1024);
+#else
+	std::printf("[host]    %-48s skipped\n", test);
+#endif
+}
+
 void TestGuestFreeRangeSearchDoesNotUnderflow() {
 	const char* test = "GuestFreeRangeSearchDoesNotUnderflow";
 
@@ -2520,6 +2533,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestPrtBackingReadPreservesSparseResidency);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
+	RunTest(TestWindowsGuestBackingUsesLazyCommit);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
 	RunTest(TestFlexibleMemoryUsesSharedBacking);

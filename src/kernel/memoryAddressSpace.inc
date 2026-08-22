@@ -34,6 +34,7 @@ public:
 	enum class FailureReason {
 		None,
 		BackingUnavailable,
+		BackingCommitFailed,
 		PhysicalRangeOutOfBounds,
 		FixedMapViewFailed,
 		PlaceholderMapFailed,
@@ -44,7 +45,13 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE,
+		// A pagefile-backed mapping defaults to SEC_COMMIT, which charges commit for the
+		// entire section up front. The PS5 direct-memory aperture is 13.5 GiB, so that can
+		// fail on otherwise capable hosts whose page-file commit limit is smaller than the
+		// emulated physical-memory size. Reserve the section instead and commit backing
+		// pages lazily as guest mappings actually use them.
+		m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr,
+		                              PAGE_EXECUTE_READWRITE | SEC_RESERVE,
 		                              static_cast<DWORD>(m_size >> 32u),
 		                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
@@ -132,6 +139,7 @@ public:
 		switch (reason) {
 			case FailureReason::None: return "n/a";
 			case FailureReason::BackingUnavailable: return "backing-unavailable";
+			case FailureReason::BackingCommitFailed: return "backing-commit-failed";
 			case FailureReason::PhysicalRangeOutOfBounds: return "physical-range-out-of-bounds";
 			case FailureReason::FixedMapViewFailed: return "fixed-map-view-failed";
 			case FailureReason::PlaceholderMapFailed: return "placeholder-map-failed";
@@ -162,6 +170,11 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!CommitRange(backing_offset, size)) {
+			return false;
+		}
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -235,6 +248,10 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!CommitRange(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingCommitFailed);
+			return false;
+		}
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -550,6 +567,23 @@ private:
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool CommitRange(uint64_t backing_offset, uint64_t size) {
+		if (!RangeOk(backing_offset, size)) {
+			return false;
+		}
+
+		void* committed = VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT,
+		                               PAGE_READWRITE);
+		if (committed == nullptr) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t direct-memory backing: commit failed at 0x%016" PRIx64
+			           " (size 0x%016" PRIx64 "): 0x%08" PRIx32 "\n",
+			           backing_offset, size, static_cast<uint32_t>(GetLastError()));
+			return false;
+		}
+		return true;
+	}
+
 	static DWORD GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PAGE_READONLY;

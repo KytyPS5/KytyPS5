@@ -130,6 +130,10 @@ uint32_t SampleMaskArrayType(EmitterState& state) {
 	return state.builder.Type(OpTypeArray, {TypeI32(state), ConstantU32(state, 1)});
 }
 
+uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
+	return state.builder.Type(OpTypeArray, {TypeF32(state), ConstantU32(state, count)});
+}
+
 void DefineDescriptorVariables(EmitterState& state) {
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::Buffers) != nullptr) {
 		const auto count =
@@ -420,6 +424,23 @@ void AllocateOutputVariables(EmitterState& state) {
 				binding.variable_id =
 				    AllocateSharedOutputVariable(state, state.per_vertex_variable);
 				break;
+			case IR::StageOutputKind::PointSize:
+				binding.variable_id =
+				    AllocateSharedOutputVariable(state, state.point_size_variable);
+				break;
+			case IR::StageOutputKind::ClipDistance:
+				binding.variable_id =
+				    AllocateSharedOutputVariable(state, state.clip_distance_variable);
+				state.clip_distance_count = std::max(state.clip_distance_count, binding.index + 1);
+				break;
+			case IR::StageOutputKind::CullDistance:
+				binding.variable_id =
+				    AllocateSharedOutputVariable(state, state.cull_distance_variable);
+				state.cull_distance_count = std::max(state.cull_distance_count, binding.index + 1);
+				break;
+			case IR::StageOutputKind::Layer:
+				binding.variable_id = AllocateSharedOutputVariable(state, state.layer_variable);
+				break;
 			case IR::StageOutputKind::Depth:
 				binding.variable_id = AllocateSharedOutputVariable(state, state.depth_variable);
 				break;
@@ -495,6 +516,16 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 		state.builder.AddName(PerVertexType(state), "gl_PerVertex");
 		state.builder.AddName(state.per_vertex_variable, "outPerVertex");
 	}
+	auto AddBuiltIn = [&](uint32_t variable, const char* name, uint32_t builtin) {
+		if (variable != 0) {
+			state.builder.AddName(variable, name);
+			state.builder.AddAnnotation({OpDecorate, variable, DecorationBuiltIn, builtin});
+		}
+	};
+	AddBuiltIn(state.point_size_variable, "gl_PointSize", BuiltInPointSize);
+	AddBuiltIn(state.clip_distance_variable, "gl_ClipDistance", BuiltInClipDistance);
+	AddBuiltIn(state.cull_distance_variable, "gl_CullDistance", BuiltInCullDistance);
+	AddBuiltIn(state.layer_variable, "gl_Layer", BuiltInLayer);
 	if (state.depth_variable != 0) {
 		state.builder.AddName(state.depth_variable, "gl_FragDepth");
 		state.builder.AddAnnotation(
@@ -613,6 +644,16 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(CapabilityShader);
 	state.builder.RequireCapability(CapabilitySignedZeroInfNanPreserve);
+	if (state.clip_distance_variable != 0) {
+		state.builder.RequireCapability(CapabilityClipDistance);
+	}
+	if (state.cull_distance_variable != 0) {
+		state.builder.RequireCapability(CapabilityCullDistance);
+	}
+	if (state.layer_variable != 0) {
+		state.builder.RequireCapability(CapabilityShaderViewportIndexLayerEXT);
+		state.builder.RequireExtension("SPV_EXT_shader_viewport_index_layer");
+	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
@@ -731,6 +772,30 @@ void DefineModule(EmitterState& state) {
 	if (state.per_vertex_variable != 0) {
 		state.builder.DefineGlobalVariable(
 		    state.per_vertex_variable, TypePointer(state, StorageClassOutput, PerVertexType(state)),
+		    StorageClassOutput);
+	}
+	if (state.point_size_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.point_size_variable, TypePointer(state, StorageClassOutput, TypeF32(state)),
+		    StorageClassOutput);
+	}
+	if (state.clip_distance_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.clip_distance_variable,
+		    TypePointer(state, StorageClassOutput,
+		                F32ArrayType(state, state.clip_distance_count)),
+		    StorageClassOutput);
+	}
+	if (state.cull_distance_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.cull_distance_variable,
+		    TypePointer(state, StorageClassOutput,
+		                F32ArrayType(state, state.cull_distance_count)),
+		    StorageClassOutput);
+	}
+	if (state.layer_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.layer_variable, TypePointer(state, StorageClassOutput, TypeU32(state)),
 		    StorageClassOutput);
 	}
 	for (const auto& binding: state.outputs) {

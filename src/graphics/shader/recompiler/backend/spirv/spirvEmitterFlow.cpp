@@ -367,6 +367,49 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 	return vector;
 }
 
+void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp) {
+	auto& state = ctx.state;
+	for (uint32_t component = 0; component < 4; component++) {
+		if ((exp.en & (1u << component)) == 0) {
+			continue;
+		}
+		const auto output = IR::DecodePositionExportComponent(
+		    state.input_info.vertex->pa_cl_vs_out_cntl, exp.index, component);
+		if (output.layer) {
+			const auto raw   = ExportRawComponent(ctx, data, component);
+			const auto layer = state.builder.AllocateId();
+			state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), layer, raw,
+			                           ConstantU32(state, 0x7ffu)});
+			state.builder.AddFunction({OpStore, state.layer_variable, layer});
+			continue;
+		}
+		if (!output.point_size && output.clip_distance == UINT32_MAX &&
+		    output.cull_distance == UINT32_MAX) {
+			continue;
+		}
+
+		const auto raw = ExportRawComponent(ctx, data, component);
+		const auto f32 = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitcast, TypeF32(state), f32, raw});
+		if (output.point_size) {
+			state.builder.AddFunction({OpStore, state.point_size_variable, f32});
+			continue;
+		}
+		auto StoreDistance = [&](uint32_t variable, uint32_t index) {
+			if (index == UINT32_MAX) {
+				return;
+			}
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpAccessChain, TypePointer(state, StorageClassOutput, TypeF32(state)), pointer,
+			     variable, ConstantU32(state, index)});
+			state.builder.AddFunction({OpStore, pointer, f32});
+		};
+		StoreDistance(state.clip_distance_variable, output.clip_distance);
+		StoreDistance(state.cull_distance_variable, output.cull_distance);
+	}
+}
+
 void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -384,6 +427,10 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	EmitIfCondition(state, exec, [&]() {
 		const auto data = ctx.Arg(inst, 0);
+		if (exp.kind == IR::ExportTargetKind::Position && exp.index != 0) {
+			EmitAuxPositionExport(ctx, data, exp);
+			return;
+		}
 		if (exp.kind == IR::ExportTargetKind::MrtZ) {
 			if ((exp.en & 1u) != 0u && state.depth_variable != 0) {
 				const auto raw = ExportRawComponent(ctx, data, 0);

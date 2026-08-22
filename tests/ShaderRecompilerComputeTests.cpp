@@ -10624,6 +10624,15 @@ private:
         if ((queues[i].queueFlags &
              (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) ==
             (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) {
+          vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
+          barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+          vk::PhysicalDeviceFeatures2 features{};
+          features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
+          features.pNext = &barycentric;
+          physical.getFeatures2(&features);
+          if (barycentric.fragmentShaderBarycentric != true) {
+            continue;
+          }
           m_physical_device = physical;
           m_queue_family = i;
           break;
@@ -10634,7 +10643,7 @@ private:
       }
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
-            "no Vulkan graphics+compute queue family");
+            "no Vulkan graphics+compute device with fragment barycentrics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};
@@ -10681,10 +10690,14 @@ private:
     device_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
     device_features12.timelineSemaphore = true;
+    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
+    barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+    barycentric.pNext = &device_features12;
+    barycentric.fragmentShaderBarycentric = true;
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
-    device_features13.pNext = &device_features12;
+    device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
     device_info.pNext = &device_features13;
@@ -10693,7 +10706,8 @@ private:
     device_features.sampleRateShading = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
-        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME};
     device_info.enabledExtensionCount = std::size(device_extensions);
     device_info.ppEnabledExtensionNames = device_extensions;
     RequireVk("VulkanHarness", "dispatch",

@@ -783,7 +783,8 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 	info = {};
 
-	info.export_count = static_cast<int>(sh.GetExportCount());
+	info.export_count      = static_cast<int>(sh.GetExportCount());
+	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
 	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0 || regs.gs_regs.chksum == 0);
 
@@ -1452,6 +1453,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	KYTY_PROFILER_FUNCTION(profiler::colors::Amber300);
 
 	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0 || regs.gs_regs.chksum == 0);
+	input_info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
 	const uint64_t shader_addr = regs.es_regs.data_addr;
 	const auto code = ShaderGetMappedCode(shader_addr, "ShaderRecompiler VS", regs.gs_regs.chksum);
@@ -1619,6 +1621,7 @@ ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInput
 	ret.ids.push_back(input_info.resources_num);
 	ret.ids.push_back(input_info.export_count);
 	ret.ids.push_back(input_info.scratch_size_dwords);
+	ret.ids.push_back(input_info.pa_cl_vs_out_cntl);
 
 	for (int i = 0; i < input_info.resources_num; i++) {
 		const auto& r  = input_info.resources[i];

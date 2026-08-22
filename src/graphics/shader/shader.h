@@ -95,6 +95,7 @@ struct ShaderVertexInputInfo {
 	int                     export_count        = 0;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                param_export_mask   = 0;
+	uint32_t                pa_cl_vs_out_cntl    = 0;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };

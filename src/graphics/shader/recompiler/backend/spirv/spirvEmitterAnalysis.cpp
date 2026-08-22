@@ -64,7 +64,7 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 }
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
-	if (exp.kind == IR::ExportTargetKind::Position) {
+	if (exp.kind == IR::ExportTargetKind::Position && exp.index == 0) {
 		return state.per_vertex_variable;
 	}
 	if (exp.kind == IR::ExportTargetKind::MrtZ) {

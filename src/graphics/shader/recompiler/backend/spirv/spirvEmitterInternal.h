@@ -39,6 +39,8 @@ enum : uint32_t {
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
 	CapabilityImageGatherExtended            = 25,
+	CapabilityClipDistance                   = 32,
+	CapabilityCullDistance                   = 33,
 	CapabilitySampled1D                      = 43,
 	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
@@ -47,6 +49,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
+	CapabilityShaderViewportIndexLayerEXT    = 5254,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
 	StorageClassUniformConstant              = 0,
@@ -77,6 +80,10 @@ enum : uint32_t {
 
 enum : uint32_t {
 	BuiltInPosition                  = 0,
+	BuiltInPointSize                 = 1,
+	BuiltInClipDistance              = 3,
+	BuiltInCullDistance              = 4,
+	BuiltInLayer                     = 9,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
 	BuiltInSampleMask                = 20,
@@ -359,6 +366,12 @@ struct EmitterState {
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
+	uint32_t                   point_size_variable                   = 0;
+	uint32_t                   clip_distance_variable                = 0;
+	uint32_t                   cull_distance_variable                = 0;
+	uint32_t                   layer_variable                        = 0;
+	uint32_t                   clip_distance_count                   = 0;
+	uint32_t                   cull_distance_count                   = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;

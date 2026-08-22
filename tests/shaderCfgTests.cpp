@@ -728,6 +728,136 @@ SpirvDecorationValueTargets(const std::vector<uint32_t> &binary,
   return targets;
 }
 
+std::vector<uint32_t>
+SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
+                           uint32_t builtin) {
+  struct Access {
+    uint32_t base = 0;
+    std::vector<uint32_t> indices;
+  };
+  std::unordered_map<uint32_t, uint32_t> direct_builtins;
+  std::unordered_map<uint64_t, uint32_t> member_builtins;
+  std::unordered_map<uint32_t, uint32_t> pointer_pointees;
+  std::unordered_map<uint32_t, uint32_t> variable_types;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  std::unordered_map<uint32_t, Access> accesses;
+  std::vector<uint32_t> stores;
+
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t opcode = binary[i] & 0xffffu;
+    const uint32_t count = binary[i] >> 16u;
+    if (count == 0 || i + count > binary.size()) {
+      return {};
+    }
+    if (opcode == 71u && count >= 4u && binary[i + 2] == 11u) {
+      direct_builtins[binary[i + 1]] = binary[i + 3];
+    } else if (opcode == 72u && count >= 5u && binary[i + 3] == 11u) {
+      const uint64_t key = (static_cast<uint64_t>(binary[i + 1]) << 32u) |
+                           binary[i + 2];
+      member_builtins[key] = binary[i + 4];
+    } else if (opcode == 32u && count == 4u) {
+      pointer_pointees[binary[i + 1]] = binary[i + 3];
+    } else if (opcode == 43u && count >= 4u) {
+      constants[binary[i + 2]] = binary[i + 3];
+    } else if (opcode == 59u && count >= 4u) {
+      variable_types[binary[i + 2]] = binary[i + 1];
+    } else if (opcode == 65u && count >= 5u) {
+      accesses[binary[i + 2]] =
+          {binary[i + 3], std::vector<uint32_t>(binary.begin() + i + 4,
+                                                binary.begin() + i + count)};
+    } else if (opcode == 62u && count >= 3u) {
+      stores.push_back(binary[i + 1]);
+    }
+    i += count;
+  }
+
+  std::vector<uint32_t> elements;
+  for (const auto pointer : stores) {
+    if (const auto decorated = direct_builtins.find(pointer);
+        decorated != direct_builtins.end()) {
+      if (decorated->second == builtin) {
+        elements.push_back(UINT32_MAX);
+      }
+      continue;
+    }
+    const auto access = accesses.find(pointer);
+    if (access == accesses.end()) {
+      continue;
+    }
+    if (const auto decorated = direct_builtins.find(access->second.base);
+        decorated != direct_builtins.end()) {
+      if (decorated->second == builtin && !access->second.indices.empty()) {
+        const auto index = constants.find(access->second.indices.back());
+        if (index != constants.end()) {
+          elements.push_back(index->second);
+        }
+      }
+      continue;
+    }
+    const auto variable = variable_types.find(access->second.base);
+    if (variable == variable_types.end() || access->second.indices.empty()) {
+      continue;
+    }
+    const auto pointee = pointer_pointees.find(variable->second);
+    const auto member = constants.find(access->second.indices.front());
+    if (pointee == pointer_pointees.end() || member == constants.end()) {
+      continue;
+    }
+    const uint64_t key = (static_cast<uint64_t>(pointee->second) << 32u) |
+                         member->second;
+    if (const auto decorated = member_builtins.find(key);
+        decorated != member_builtins.end() && decorated->second == builtin) {
+      elements.push_back(UINT32_MAX);
+    }
+  }
+  std::sort(elements.begin(), elements.end());
+  return elements;
+}
+
+bool SpirvBuiltInStoreUsesAndConstant(const std::vector<uint32_t> &binary,
+                                      uint32_t builtin,
+                                      uint32_t constant) {
+  std::unordered_set<uint32_t> variables;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  std::unordered_map<uint32_t, std::array<uint32_t, 2>> bitwise_ands;
+  std::unordered_map<uint32_t, uint32_t> stores;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t opcode = binary[i] & 0xffffu;
+    const uint32_t count = binary[i] >> 16u;
+    if (count == 0 || i + count > binary.size()) {
+      return false;
+    }
+    if (opcode == 71u && count >= 4u && binary[i + 2] == 11u &&
+        binary[i + 3] == builtin) {
+      variables.insert(binary[i + 1]);
+    } else if (opcode == 43u && count >= 4u) {
+      constants[binary[i + 2]] = binary[i + 3];
+    } else if (opcode == 199u && count == 5u) {
+      bitwise_ands[binary[i + 2]] = {binary[i + 3], binary[i + 4]};
+    } else if (opcode == 62u && count >= 3u) {
+      stores[binary[i + 1]] = binary[i + 2];
+    }
+    i += count;
+  }
+  for (const auto variable : variables) {
+    const auto store = stores.find(variable);
+    if (store == stores.end()) {
+      continue;
+    }
+    const auto value = bitwise_ands.find(store->second);
+    if (value == bitwise_ands.end()) {
+      continue;
+    }
+    for (const auto operand : value->second) {
+      const auto literal = constants.find(operand);
+      if (literal != constants.end() && literal->second == constant) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool SpirvTargetHasDecoration(const std::vector<uint32_t> &binary,
                               uint32_t target, uint32_t decoration) {
   for (size_t i = 5; i < binary.size();) {
@@ -8605,6 +8735,123 @@ void TestNewShaderRecompilerExpVertexOutputs() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerAuxPositionExports() {
+  const auto compile = [](std::span<const uint32_t> shader, uint32_t control) {
+    ShaderVertexInputInfo vertex{};
+    vertex.pa_cl_vs_out_cntl = control;
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+          error.c_str());
+    return result;
+  };
+
+  const uint32_t all_outputs[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x5, false), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0e, 0xb, false), EncodeExp1(8, 9, 10, 11),
+      EncodeExp0(0x0f, 0x6), EncodeExp1(12, 13, 14, 15),
+      0xbf810000u,
+  };
+  const auto all = compile(all_outputs, 0x00e5aa55u);
+  CheckSpirvBinaryValidates(all.spirv);
+  Check(SpirvStoredBuiltInElements(all.spirv, 0u) ==
+            std::vector<uint32_t>({UINT32_MAX}),
+        "POS1-POS3 overwrote gl_Position");
+  Check(SpirvStoredBuiltInElements(all.spirv, 1u) ==
+            std::vector<uint32_t>({UINT32_MAX}) &&
+            SpirvStoredBuiltInElements(all.spirv, 9u) ==
+                std::vector<uint32_t>({UINT32_MAX}),
+        "MISC point-size/layer stores are missing");
+  Check(SpirvStoredBuiltInElements(all.spirv, 3u) ==
+            std::vector<uint32_t>({0u, 3u}) &&
+            SpirvStoredBuiltInElements(all.spirv, 4u) ==
+                std::vector<uint32_t>({0u, 1u, 2u}),
+        "partial clip/cull exports used the wrong dense elements");
+  Check(SpirvHasDecorationValue(all.spirv, 11u, 1u) &&
+            SpirvHasDecorationValue(all.spirv, 11u, 3u) &&
+            SpirvHasDecorationValue(all.spirv, 11u, 4u) &&
+            SpirvHasDecorationValue(all.spirv, 11u, 9u) &&
+            SpirvContainsCapability(all.spirv, 32u) &&
+            SpirvContainsCapability(all.spirv, 33u) &&
+            SpirvContainsCapability(all.spirv, 5254u),
+        "auxiliary vertex BuiltIns or capabilities are missing");
+  const auto all_source = DisassembleSpirvBinary(all.spirv);
+  Check(Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
+            SpirvBuiltInStoreUsesAndConstant(all.spirv, 9u, 0x7ffu),
+        "layer export extension or GFX10 layer mask is missing");
+  const auto positions = std::count_if(
+      all.program.info.outputs.begin(), all.program.info.outputs.end(),
+      [](const auto &output) {
+        return output.kind == ShaderRecompiler::IR::StageOutputKind::Position;
+      });
+  Check(positions == 1 &&
+            std::ranges::find_if(all.program.info.outputs, [](const auto &output) {
+              return output.kind == ShaderRecompiler::IR::StageOutputKind::Position;
+            })->index == 0,
+        "shader info did not reserve Position exclusively for POS0");
+
+  const uint32_t cc1_only[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x6), EncodeExp1(4, 5, 6, 7),
+      0xbf810000u,
+  };
+  const auto dense = compile(cc1_only, 0x0080a050u);
+  CheckSpirvBinaryValidates(dense.spirv);
+  Check(SpirvStoredBuiltInElements(dense.spirv, 0u).size() == 1u &&
+            SpirvStoredBuiltInElements(dense.spirv, 3u) ==
+                std::vector<uint32_t>({1u}) &&
+            SpirvStoredBuiltInElements(dense.spirv, 4u) ==
+                std::vector<uint32_t>({0u}),
+        "CCDIST1 was not densely packed into POS1");
+
+  const uint32_t middle_hole[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x1, false), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0e, 0x3), EncodeExp1(8, 9, 10, 11),
+      0xbf810000u,
+  };
+  const auto shifted = compile(middle_hole, 0x00a12010u);
+  CheckSpirvBinaryValidates(shifted.spirv);
+  Check(SpirvStoredBuiltInElements(shifted.spirv, 1u).size() == 1u &&
+            SpirvStoredBuiltInElements(shifted.spirv, 3u) ==
+                std::vector<uint32_t>({0u}) &&
+            SpirvStoredBuiltInElements(shifted.spirv, 4u) ==
+                std::vector<uint32_t>({0u}),
+        "CCDIST1 did not shift across a disabled CCDIST0 vector");
+
+  const auto rejects = [](uint32_t control, uint32_t en, const char *message) {
+    const uint32_t shader[] = {
+        EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(0x0d, en), EncodeExp1(4, 5, 6, 7),
+        0xbf810000u,
+    };
+    ShaderVertexInputInfo vertex{};
+    vertex.pa_cl_vs_out_cntl = control;
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    Check(!ShaderRecompiler::TryRecompile(shader, options, result, &error) &&
+              Common::ContainsStr(error, message),
+          "unsupported auxiliary position export did not fail explicitly");
+  };
+  rejects(0x00280000u, 0x4u, "viewport-index");
+  rejects(0u, 0x1u, "auxiliary/stereo");
+
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = 1;
+  regs.gs_regs.chksum = 1;
+  ShaderVertexInputInfo key0{};
+  ShaderVertexInputInfo key1{};
+  key1.pa_cl_vs_out_cntl = 1;
+  Check(ShaderGetIdVS(regs, key0, false) != ShaderGetIdVS(regs, key1, false),
+        "PA_CL_VS_OUT_CNTL is absent from the vertex shader cache key");
+}
+
 void TestDemandDrivenSpirvDeclarations() {
   using ShaderRecompiler::Spirv::Builder;
 
@@ -11661,6 +11908,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneLowering();

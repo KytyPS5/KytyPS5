@@ -269,7 +269,14 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 	}
 }
 
-void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
+bool CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
+	                const ShaderPixelInputInfo* pixel, ShaderInfo& info, std::string* error) {
+	auto Fail = [&](std::string message) {
+		if (error != nullptr) {
+			*error = std::move(message);
+		}
+		return false;
+	};
 	for (const auto* block: program.values->blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
@@ -292,8 +299,41 @@ void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, S
 			}
 			switch (export_info.kind) {
 				case ExportTargetKind::Position:
-					AddOutput(info, StageOutputKind::Position, export_info.index, 0,
-					          "out_position");
+					if (export_info.index == 0) {
+						AddOutput(info, StageOutputKind::Position, 0, 0, "out_position");
+						break;
+					}
+					if (export_info.compr) {
+						return Fail("compressed auxiliary position export is unsupported");
+					}
+					for (uint32_t component = 0; component < 4; component++) {
+						if ((export_info.en & (1u << component)) == 0) {
+							continue;
+						}
+						const auto output = DecodePositionExportComponent(
+						    vertex->pa_cl_vs_out_cntl, export_info.index, component);
+						if (!output.valid) {
+							return Fail(fmt::format("unsupported POS{} auxiliary/stereo export",
+							                        export_info.index));
+						}
+						if (output.viewport) {
+							return Fail("vertex viewport-index export is unsupported");
+						}
+						if (output.point_size) {
+							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");
+						}
+						if (output.layer) {
+							AddOutput(info, StageOutputKind::Layer, 0, 0, "gl_Layer");
+						}
+						if (output.clip_distance != UINT32_MAX) {
+							AddOutput(info, StageOutputKind::ClipDistance, output.clip_distance, 0,
+							          "gl_ClipDistance");
+						}
+						if (output.cull_distance != UINT32_MAX) {
+							AddOutput(info, StageOutputKind::CullDistance, output.cull_distance, 0,
+							          "gl_CullDistance");
+						}
+					}
 					break;
 				case ExportTargetKind::Parameter:
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
@@ -307,6 +347,7 @@ void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, S
 			}
 		}
 	}
+	return true;
 }
 
 } // namespace
@@ -348,7 +389,9 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 		default: return false;
 	}
 	CollectBuiltinInputs(program, next);
-	CollectOutputs(program, options.pixel, next);
+	if (!CollectOutputs(program, options.vertex, options.pixel, next, error)) {
+		return false;
+	}
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;
 	return true;

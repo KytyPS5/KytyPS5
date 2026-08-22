@@ -11,6 +11,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <bit>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -282,7 +283,70 @@ enum class StageInputKind {
 	Parameter,
 };
 
-enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask };
+enum class StageOutputKind {
+	Position,
+	Parameter,
+	Mrt,
+	Depth,
+	SampleMask,
+	PointSize,
+	ClipDistance,
+	CullDistance,
+	Layer
+};
+
+struct PositionExportComponent {
+	uint32_t clip_distance = UINT32_MAX;
+	uint32_t cull_distance = UINT32_MAX;
+	bool     valid          = false;
+	bool     point_size     = false;
+	bool     layer          = false;
+	bool     viewport       = false;
+};
+
+inline PositionExportComponent DecodePositionExportComponent(uint32_t control,
+	                                                           uint32_t pos_index,
+	                                                           uint32_t component) {
+	PositionExportComponent result;
+	if (pos_index == 0 || component >= 4) {
+		return result;
+	}
+
+	uint32_t slot   = pos_index - 1;
+	uint32_t vector = 3;
+	for (uint32_t i = 0; i < 3; i++) {
+		if ((control & (1u << (21u + i))) != 0) {
+			if (slot == 0) {
+				vector = i;
+				break;
+			}
+			slot--;
+		}
+	}
+	if (vector == 3) {
+		return result;
+	}
+
+	result.valid = true;
+	if (vector == 0) {
+		result.point_size = component == 0 && (control & (1u << 16u)) != 0;
+		result.layer      = component == 2 && (control & (1u << 18u)) != 0;
+		result.viewport   = component == 2 && (control & (1u << 19u)) != 0;
+		return result;
+	}
+
+	const auto scalar = (vector - 1) * 4 + component;
+	const auto lower  = (1u << scalar) - 1u;
+	const auto clip   = control & 0xffu;
+	const auto cull   = (control >> 8u) & 0xffu;
+	if ((clip & (1u << scalar)) != 0) {
+		result.clip_distance = std::popcount(clip & lower);
+	}
+	if ((cull & (1u << scalar)) != 0) {
+		result.cull_distance = std::popcount(cull & lower);
+	}
+	return result;
+}
 
 struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;

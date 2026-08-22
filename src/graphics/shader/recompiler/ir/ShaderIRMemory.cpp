@@ -624,6 +624,7 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 		case Decoder::Opcode::DS_READ_U8:
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
+		case Decoder::Opcode::DS_READ_U16_D16:
 		case Decoder::Opcode::DS_READ_B32:
 		case Decoder::Opcode::DS_READ_B64:
 		case Decoder::Opcode::DS_READ_B96:
@@ -763,6 +764,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::DS_READ_U8:
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
+		case Decoder::Opcode::DS_READ_U16_D16:
 		case Decoder::Opcode::DS_READ2_B32:
 		case Decoder::Opcode::DS_READ2ST64_B32:
 		case Decoder::Opcode::DS_READ_B32:

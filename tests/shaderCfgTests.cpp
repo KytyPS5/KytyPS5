@@ -6560,6 +6560,7 @@ void TestNewShaderRecompilerDsSubDwordLowering() {
       EncodeDs0(0x3a, 4), EncodeDs1(43, 0, 1), // ds_read_u8 v43, v1
       EncodeDs0(0x3b, 6), EncodeDs1(44, 0, 1), // ds_read_i16 v44, v1
       EncodeDs0(0x3c, 8), EncodeDs1(45, 0, 1), // ds_read_u16 v45, v1
+      0xda980000u, 0x07000007u, // ds_read_u16_d16 v7, v7
       0xbf810000u,
   };
 
@@ -6582,6 +6583,8 @@ void TestNewShaderRecompilerDsSubDwordLowering() {
         "new decoder did not decode DS signed short read");
   Check(Common::ContainsStr(result.decoded_dump, "ds_read_u16"),
         "new decoder did not decode DS unsigned short read");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_READ_U16_D16 v7.sdwa(sel=4"),
+        "new decoder did not decode captured DS masked short read");
   Check(Common::ContainsStr(result.decoded_dump, "dwords=1 bits=8"),
         "DS byte decode did not preserve byte-width metadata");
   Check(Common::ContainsStr(result.decoded_dump, "dwords=1 bits=16"),
@@ -6598,6 +6601,8 @@ void TestNewShaderRecompilerDsSubDwordLowering() {
         "DS signed short read did not lower to explicit IR");
   Check(Common::ContainsStr(result.ir_dump, "DsReadUshort v45"),
         "DS unsigned short read did not lower to explicit IR");
+  Check(Common::ContainsStr(result.ir_dump, "DsReadUshort v7.sdwa(sel=4"),
+        "DS masked short read did not preserve its partial destination");
   Check(SpirvContainsOpcode(result.spirv, 61),
         "SPIR-V binary does not contain OpLoad");
   Check(SpirvContainsOpcode(result.spirv, 62),
@@ -8368,6 +8373,45 @@ void TestNewShaderRecompilerU64PairLowering() {
   CompileResult result;
   std::string error;
 
+  const uint32_t lshrrev_b64_shader[] = {
+      0xd7000001u, 0x0000d50cu, // v_lshrrev_b64 v[1:2], v12, vcc
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_lshrrev_b64;
+  Check(Decoder::DecodeInstruction(lshrrev_b64_shader, 0u,
+                                   decoded_lshrrev_b64, &error),
+        error.c_str());
+  Check(decoded_lshrrev_b64.opcode == Decoder::Opcode::V_LSHRREV_B64 &&
+            decoded_lshrrev_b64.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_lshrrev_b64.dst.reg == 1u &&
+            decoded_lshrrev_b64.src_count == 2u &&
+            decoded_lshrrev_b64.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded_lshrrev_b64.src0.reg == 12u &&
+            decoded_lshrrev_b64.src1.kind == Decoder::OperandKind::VccLo,
+        "decoder rejected captured VOP3 V_LSHRREV_B64 fields");
+  Check(TryRecompile(lshrrev_b64_shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_LSHRREV_B64 v1, v12, vcc_lo"),
+        "captured VOP3 V_LSHRREV_B64 was not present in the decoded dump");
+  Decoder::Program decoded_lshrrev_b64_program;
+  CFG::Graph graph_lshrrev_b64;
+  IR::Program native_lshrrev_b64;
+  Check(Decoder::DecodeProgram(lshrrev_b64_shader,
+                               decoded_lshrrev_b64_program, &error),
+        error.c_str());
+  Check(CFG::BuildGraph(decoded_lshrrev_b64_program, graph_lshrrev_b64,
+                        &error) &&
+            CFG::Structurize(graph_lshrrev_b64, &error),
+        error.c_str());
+  Check(IR::LowerProgram(decoded_lshrrev_b64_program, graph_lshrrev_b64,
+                         ShaderType::Compute, 64u, native_lshrrev_b64, &error),
+        error.c_str());
+  Check(Common::ContainsStr(IR::ProgramToString(native_lshrrev_b64),
+                            "ShiftRightLogicalU64 v1, vcc_lo, v12"),
+        "V_LSHRREV_B64 did not reverse its encoded operands for pair-U64 IR");
+  CheckSpirvBinaryValidates(result.spirv);
+
   const uint32_t cmpx_i64_shader[] = {
       0xd4b5007eu, 0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
       EncodeSopp(0x01),
@@ -8430,6 +8474,26 @@ void TestNewShaderRecompilerU64PairLowering() {
   Check(Common::ContainsStr(IR::ProgramToString(native),
                             "CompareNeU64 exec_lo, 0x00000000, v7"),
         "V_CMPX_NE_U64 did not lower to masked 64-bit inequality");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t cmpx_v2_shader[] = {
+      0x7dea0480u, // v_cmpx_ne_u64 exec, 0, v[2:3]
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_cmpx_v2;
+  Check(Decoder::DecodeInstruction(cmpx_v2_shader, 0u, decoded_cmpx_v2,
+                                   &error),
+        error.c_str());
+  Check(decoded_cmpx_v2.opcode == Decoder::Opcode::V_CMPX_NE_U64 &&
+            decoded_cmpx_v2.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded_cmpx_v2.src0.value == 0u &&
+            decoded_cmpx_v2.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded_cmpx_v2.src1.reg == 2u,
+        "decoder rejected reported VOPC V_CMPX_NE_U64 fields");
+  Check(TryRecompile(cmpx_v2_shader, options, result, &error), error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_NE_U64 exec_lo, 0, v2"),
+        "reported VOPC V_CMPX_NE_U64 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t empty_shader[] = {EncodeSopp(0x01)};

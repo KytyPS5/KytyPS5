@@ -11393,6 +11393,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_READ_U8:
   case Opcode::DS_READ_I16:
   case Opcode::DS_READ_U16:
+  case Opcode::DS_READ_U16_D16:
   case Opcode::DS_READ2_B32:
   case Opcode::DS_READ_B32:
   case Opcode::DS_READ_B64:
@@ -12929,6 +12930,30 @@ TestCase VectorShiftCountsMaskLowBits() {
           {O::V_MOV_B32, O::V_LSHL_B32, O::V_LSHLREV_B32, O::V_LSHR_B32,
            O::V_LSHRREV_B32, O::V_ASHR_I32, O::V_ASHRREV_I32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorVop3LshrrevB64Captured() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 106, 0x89abcdefu);
+  AppendSMovLiteral(&code, 107, 0x01234567u);
+  AppendVMovU32(&code, 12, 68);
+  code.push_back(0xd7000001u);
+  code.push_back(0x0000d50cu); // v_lshrrev_b64 v[1:2], v12, vcc
+  AppendStoreVgpr(&code, 1, 0);
+  AppendStoreVgpr(&code, 2, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorVop3LshrrevB64Captured";
+  test.code = std::move(code);
+  test.expected = {0x789abcdeu, 0x00123456u};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHRREV_B64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftRightLogical", "OpSelect"};
+  test.forbidden_spirv = {"OpTypeInt 64"};
+  return test;
 }
 
 TestCase VectorVop3IntegerOps() {
@@ -14735,16 +14760,30 @@ TestCase VectorVopcCmpxNeU64CapturedExecMask() {
   AppendVMovU32(&code, 31, 4);
   code.push_back(0x7dea0e80u); // v_cmpx_ne_u64 exec, 0, v[7:8]
   AppendBufferStoreDword(&code, 8, 31);
+
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 3, 0);
+  AppendVMovU32(&code, 31, 8);
+  code.push_back(0x7dea0480u); // v_cmpx_ne_u64 exec, 0, v[2:3]
+  AppendBufferStoreDword(&code, 3, 31);
+
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  AppendVMovU32(&code, 3, 1);
+  AppendVMovU32(&code, 31, 12);
+  code.push_back(0x7dea0480u); // v_cmpx_ne_u64 exec, 0, v[2:3]
+  AppendBufferStoreDword(&code, 3, 31);
   AppendEnd(&code);
 
   TestCase test{"VectorVopcCmpxNeU64CapturedExecMask",
                 code,
-                {0x11223344u, 0x55667788u},
-                {0x11223344u, 1u},
+                {0x11223344u, 0x55667788u, 0xaabbccddu, 0xeeff0011u},
+                {0x11223344u, 1u, 0xaabbccddu, 1u},
                 {O::V_MOV_B32, O::V_CMPX_NE_U64, O::BUFFER_STORE_DWORD,
                  O::S_MOV_B32, O::S_ENDPGM}};
-  test.decoded_counts = {{"V_CMPX_NE_U64 exec_lo, 0, v7", 2}};
-  test.native_ir_counts = {{"CompareNeU64 exec_lo, 0x00000000, v7", 2}};
+  test.decoded_counts = {{"V_CMPX_NE_U64 exec_lo, 0, v7", 2},
+                         {"V_CMPX_NE_U64 exec_lo, 0, v2", 2}};
+  test.native_ir_counts = {{"CompareNeU64 exec_lo, 0x00000000, v7", 2},
+                           {"CompareNeU64 exec_lo, 0x00000000, v2", 2}};
   return test;
 }
 
@@ -17197,6 +17236,38 @@ TestCase DsReadWriteVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase DsReadU16D16CapturedPreservesHighHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x89abcdefu);
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 2, 1)); // ds_write_b32 v2, v1
+
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  code.push_back(EncodeDs0(0xa6));
+  code.push_back(EncodeDs1(3, 0, 1)); // ds_read_u16_d16 v3, v1
+
+  AppendVMovU32(&code, 7, 0);
+  code.push_back(0xda980000u);
+  code.push_back(0x07000007u); // captured ds_read_u16_d16 v7, v7
+
+  AppendStoreVgpr(&code, 3, 0);
+  AppendStoreVgpr(&code, 7, 1);
+  AppendEnd(&code);
+
+  TestCase test{"DsReadU16D16CapturedPreservesHighHalf",
+                code,
+                std::vector<u32>(2, 0),
+                {0x1234cdefu, 0x0000cdefu},
+                {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_U16_D16,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_READ_U16_D16", 2}};
+  test.native_ir_counts = {{"DsReadUshort", 2}};
+  return test;
+}
+
 TestCase DsReadWrite2Variants() {
   using O = ShaderOpcode;
 
@@ -19569,6 +19640,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
+  AddCase(VectorVop3LshrrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorAlignByteUsesFiveBitByteOffset);
@@ -19713,6 +19785,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScratchIsPrivatePerInvocation);
   AddCase(FlatStoreVariants);
   AddCase(DsReadWriteVariants);
+  AddCase(DsReadU16D16CapturedPreservesHighHalf);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);

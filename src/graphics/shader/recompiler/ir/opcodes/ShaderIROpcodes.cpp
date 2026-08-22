@@ -250,6 +250,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::V_LSHLREV_B16, Opcode::ShiftLeftLogicalU16},
     {Decoder::Opcode::V_LSHR_B32, Opcode::ShiftRightLogicalU32},
     {Decoder::Opcode::V_LSHRREV_B32, Opcode::ShiftRightLogicalU32},
+    {Decoder::Opcode::V_LSHRREV_B64, Opcode::ShiftRightLogicalU64},
     {Decoder::Opcode::V_LSHRREV_B16, Opcode::ShiftRightLogicalU16},
     {Decoder::Opcode::V_ASHR_I32, Opcode::ShiftRightArithmeticI32},
     {Decoder::Opcode::V_ASHRREV_I32, Opcode::ShiftRightArithmeticI32},
@@ -395,6 +396,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::DS_READ_U8, Opcode::DsReadUbyte},
     {Decoder::Opcode::DS_READ_I16, Opcode::DsReadSshort},
     {Decoder::Opcode::DS_READ_U16, Opcode::DsReadUshort},
+    {Decoder::Opcode::DS_READ_U16_D16, Opcode::DsReadUshort},
     {Decoder::Opcode::DS_READ2_B32, Opcode::DsRead2B32},
     {Decoder::Opcode::DS_READ2ST64_B32, Opcode::DsRead2B32},
     {Decoder::Opcode::DS_READ_B32, Opcode::DsReadB32},
@@ -466,6 +468,7 @@ bool IsReversedBinary(Decoder::Opcode opcode) {
 		case Decoder::Opcode::V_LSHLREV_B32:
 		case Decoder::Opcode::V_LSHRREV_B32:
 		case Decoder::Opcode::V_ASHRREV_I32:
+		case Decoder::Opcode::V_LSHRREV_B64:
 		case Decoder::Opcode::V_LSHLREV_B16:
 		case Decoder::Opcode::V_LSHRREV_B16:
 		case Decoder::Opcode::V_ASHRREV_I16:

@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -74,6 +75,7 @@ private:
 	}
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
@@ -87,23 +89,24 @@ private:
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 
-	GraphicContext&              m_graphics;
-	CommandScheduler&            m_scheduler;
-	Buffer                       m_gds_buffer;
-	Common::SlotVector<Buffer>   m_slot_buffers;
-	std::map<uint64_t, BufferId> m_buffers;
-	PageTable                    m_page_table;
-	RangeSet                     m_gpu_modified_ranges;
-	MemoryTracker                m_memory_tracker;
-	StreamBuffer                 m_staging_buffer;
-	StreamBuffer                 m_stream_buffer;
-	StreamBuffer                 m_download_buffer;
-	StreamBuffer                 m_device_buffer;
-	TextureCache&                m_texture_cache;
-	uint64_t                     m_total_used_memory  = 0;
-	uint64_t                     m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
-	uint64_t                     m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
-	uint64_t                     m_gc_tick            = 0;
+	GraphicContext&                                   m_graphics;
+	CommandScheduler&                                 m_scheduler;
+	Buffer                                            m_gds_buffer;
+	Common::SlotVector<Buffer>                        m_slot_buffers;
+	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
+	std::map<uint64_t, BufferId>                      m_buffers;
+	PageTable                                         m_page_table;
+	RangeSet                                          m_gpu_modified_ranges;
+	MemoryTracker                                     m_memory_tracker;
+	StreamBuffer                                      m_staging_buffer;
+	StreamBuffer                                      m_stream_buffer;
+	StreamBuffer                                      m_download_buffer;
+	StreamBuffer                                      m_device_buffer;
+	TextureCache&                                     m_texture_cache;
+	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	uint64_t m_gc_tick            = 0;
 };
 
 } // namespace Libs::Graphics

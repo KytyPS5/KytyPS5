@@ -66,8 +66,8 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool     is_deleted         = false;
-	uint64_t tick_accessed_last = 0;
+	bool   is_deleted = false;
+	size_t lru_id     = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

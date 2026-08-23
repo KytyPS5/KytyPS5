@@ -51,7 +51,7 @@ struct BufferCache::DownloadCopy {
 };
 
 void BufferCache::Register(BufferId id) {
-	const auto& buffer = m_slot_buffers[id];
+	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
@@ -60,6 +60,7 @@ void BufferCache::Register(BufferId id) {
 	const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 	(void)it;
 	EXIT_IF(!inserted);
+	buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += buffer.Size();
 }
 
@@ -83,7 +84,14 @@ void BufferCache::Unregister(BufferId id) {
 		EXIT("BufferCache: allocation accounting underflow\n");
 	}
 	m_total_used_memory -= buffer.Size();
+	m_lru_cache.Free(buffer.lru_id);
 	buffer.is_deleted = true;
+}
+
+void BufferCache::TouchBuffer(const Buffer& buffer) {
+	if (!buffer.is_deleted) {
+		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	}
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
@@ -364,7 +372,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
-			buffer.tick_accessed_last = m_gc_tick;
+			TouchBuffer(buffer);
 			return *owner;
 		}
 	}
@@ -393,8 +401,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 	const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
 	                                      AllFlags, end - begin);
-	auto&      buffer         = m_slot_buffers[id];
-	buffer.tick_accessed_last = m_gc_tick;
+	auto&      buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
 	for (auto overlap = first; overlap != last;) {
@@ -509,6 +516,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		id     = FindBuffer(vaddr, size);
 		buffer = &m_slot_buffers[id];
 	}
+	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
@@ -545,7 +553,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 			owner = &m_slot_buffers[FindBuffer(vaddr, size)];
 		}
 		if (owner != nullptr && !cpu_modified && (!gpu_modified || has_dirty_buffer_source)) {
-			owner->tick_accessed_last = m_gc_tick;
+			TouchBuffer(*owner);
 			return {owner, owner->Offset(vaddr)};
 		}
 		if (has_dirty_buffer_source && owner == nullptr) {
@@ -570,7 +578,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return {&m_staging_buffer, stage_offset};
 	}
 
-	owner->tick_accessed_last = m_gc_tick;
+	TouchBuffer(*owner);
 	std::vector<std::pair<uint64_t, uint64_t>> uploads;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, false,
@@ -603,7 +611,7 @@ void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data)
 			continue;
 		}
 		WriteDataBuffer(buffer, begin, data.data() + begin - vaddr, range_end - begin);
-		buffer.tick_accessed_last = m_gc_tick;
+		TouchBuffer(buffer);
 	}
 }
 
@@ -743,30 +751,17 @@ void BufferCache::RunGarbageCollector() {
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
-	std::vector<uint64_t> candidates;
-	for (const auto& [address, id]: m_buffers) {
-		const auto& buffer = m_slot_buffers[id];
-		if (tick - std::min(tick, buffer.tick_accessed_last) >= age) {
-			candidates.push_back(address);
-		}
-	}
-	std::ranges::sort(candidates, [&](uint64_t left, uint64_t right) {
-		return m_slot_buffers[m_buffers.at(left)].tick_accessed_last <
-		       m_slot_buffers[m_buffers.at(right)].tick_accessed_last;
-	});
 	std::vector<BufferId> dirty_buffers;
 	std::vector<DownloadCopy> copies;
 	size_t                    retire_count = 0;
-	for (const auto address: candidates) {
-		auto found = m_buffers.find(address);
-		EXIT_IF(found == m_buffers.end());
-		const auto id     = found->second;
-		auto&      buffer = m_slot_buffers[id];
+	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+		auto& buffer = m_slot_buffers[id];
+		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
-			continue;
+			return false;
 		}
 		if (dirty) {
 			m_memory_tracker.ForEachDownloadRange<false>(
@@ -787,10 +782,8 @@ void BufferCache::RunGarbageCollector() {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 		}
-		if (++retire_count == limit) {
-			break;
-		}
-	}
+		return ++retire_count == limit;
+	});
 	if (dirty_buffers.empty()) {
 		return;
 	}

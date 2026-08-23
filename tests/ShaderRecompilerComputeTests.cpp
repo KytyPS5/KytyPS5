@@ -2922,6 +2922,7 @@ public:
     constexpr uint32_t second_stale = 0xdeadbeefu;
     constexpr uint32_t clean_value = 0xaabbccddu;
     constexpr uint32_t unmap_value = 0x91a2b3c4u;
+    constexpr uint32_t remap_value = 0xd5e6f708u;
     constexpr uint32_t partial_unmap_value = 0x62738495u;
     constexpr uint32_t partial_unmap_survivor_value = 0xa6b7c8d9u;
     constexpr uint32_t ring_fault_first_value = 0x0a1b2c3du;
@@ -2965,6 +2966,31 @@ public:
         auto allocation = cache.ObtainBuffer(address, size, true, false);
         Require(name, "dirty allocation", allocation.first != nullptr,
                 "dirty-GC buffer allocation failed");
+      };
+      const auto ReadNativeValue =
+          [&](const Libs::Graphics::Buffer &buffer, uint64_t offset) {
+        auto readback =
+            CreateHostBuffer(name, sizeof(uint32_t),
+                             vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{offset, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer,
+                                                1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+            nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return value;
       };
 
       constexpr uint64_t index_offset = 0x180000;
@@ -3033,18 +3059,26 @@ public:
                   resolved_right == resolved_left &&
                   resolved_left_offset != resolved_right_offset,
               "saved descriptor IDs did not resolve through the merged owner");
-      cache.UnmapMemory(index_begin, index_span);
-      cache.UnmapMemory(base + recycled_offset, index_page);
-      Require(name, "registered-range removal",
-              !cache.IsRegionRegistered(index_begin, index_span) &&
-                  !BufferCacheTestAccess::PageOwner(cache, index_begin) &&
-                  !BufferCacheTestAccess::PageOwner(
-                      cache, index_begin + index_page) &&
-                  !BufferCacheTestAccess::PageOwner(
-                      cache, index_begin + 2 * index_page) &&
-                  !BufferCacheTestAccess::PageOwner(cache,
-                                                    base + recycled_offset),
-              "unmapped Buffer owner remained in the registered-range index");
+      resources.UnmapMemory(index_begin, index_span);
+      resources.UnmapMemory(base + recycled_offset, index_page);
+      Require(name, "invalidation retains owners",
+              !resources.IsMapped(index_begin, index_span) &&
+                  !resources.IsMapped(base + recycled_offset, index_page) &&
+                  cache.IsRegionRegistered(index_begin, index_span) &&
+                  BufferCacheTestAccess::PageOwner(cache, index_begin) ==
+                      index_bridge &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + index_page) == index_bridge &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + 2 * index_page) == index_bridge &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, base + recycled_offset) == recycled &&
+                  cache.IsRegionCpuModified(index_begin, index_span) &&
+                  cache.IsRegionCpuModified(base + recycled_offset,
+                                            index_page),
+              "CPU invalidation retired a reusable Buffer owner");
+      resources.MapMemory(index_begin, index_span);
+      resources.MapMemory(base + recycled_offset, index_page);
 
       MarkGpuWrite(base + first_offset, sizeof(first_value));
       MarkGpuWrite(base + second_offset, sizeof(second_value));
@@ -3245,23 +3279,36 @@ public:
 
       auto unmap_allocation = cache.ObtainBuffer(
           base + unmap_offset, sizeof(unmap_value), true, false);
-      Require(name, "direct-unmap allocation",
+      Require(name, "direct-invalidation allocation",
               unmap_allocation.first != nullptr,
-              "direct-unmap buffer allocation failed");
+              "direct-invalidation buffer allocation failed");
       cache.FillBuffer(base + unmap_offset, sizeof(unmap_value), unmap_value,
                        false);
-      cache.UnmapMemory(base + 0x4000, 0x4000);
+      resources.UnmapMemory(base + 0x4000, 0x4000);
       uint32_t unmap_backing = 0;
       std::memcpy(&unmap_backing, memory + unmap_offset, sizeof(unmap_backing));
-      Require(name, "direct-unmap contents",
+      Require(name, "direct-invalidation contents",
               unmap_backing == unmap_value &&
-                  !cache.IsRegionRegistered(base + 0x4000, 0x4000),
-              "direct dirty unmap cleared tracking before "
-              "publishing bytes");
+                  !resources.IsMapped(base + 0x4000, 0x4000) &&
+                  cache.IsRegionRegistered(base + 0x4000, 0x4000) &&
+                  cache.IsRegionCpuModified(base + 0x4000, 0x4000) &&
+                  !cache.IsRegionGpuModified(base + 0x4000, 0x4000) &&
+                  !cache.HasGpuDirtyBytes(base + 0x4000, 0x4000),
+              "dirty invalidation did not publish bytes and retain its owner");
+      std::memcpy(memory + unmap_offset, &remap_value, sizeof(remap_value));
+      resources.MapMemory(base + 0x4000, 0x4000);
+      const auto remapped =
+          cache.ObtainBuffer(base + unmap_offset, sizeof(remap_value), true);
+      Require(name, "same-address remap allocation",
+              remapped.first == unmap_allocation.first,
+              "same-address remap did not synchronize the retained Buffer");
+      Require(name, "same-address remap contents",
+              ReadNativeValue(*remapped.first, remapped.second) == remap_value,
+              "same-address remap reused stale native Buffer bytes");
 
       auto partial_unmap_allocation =
           cache.ObtainBuffer(base + 0x8000, 0x8000, true, false);
-      Require(name, "partial-unmap allocation",
+      Require(name, "partial-invalidation allocation",
               partial_unmap_allocation.first != nullptr,
               "cross-page cached buffer allocation failed");
       cache.FillBuffer(base + partial_unmap_offset, sizeof(partial_unmap_value),
@@ -3269,39 +3316,27 @@ public:
       cache.FillBuffer(base + partial_unmap_survivor_offset,
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
-      cache.UnmapMemory(base + 0x8000, 0x4000);
+      resources.UnmapMemory(base + 0x8000, 0x4000);
+      Require(name, "partial-invalidation ownership",
+              !resources.IsMapped(base + 0x8000, 0x4000) &&
+                  cache.IsRegionRegistered(base + 0x8000, 0x8000) &&
+                  cache.IsRegionCpuModified(base + 0x8000, 0x4000) &&
+                  !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
+                                          sizeof(partial_unmap_value)) &&
+                  cache.HasGpuDirtyBytes(
+                      base + partial_unmap_survivor_offset,
+                      sizeof(partial_unmap_survivor_value)),
+              "partial invalidation retired its owner or cleared disjoint GPU bytes");
+      resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,
                              sizeof(partial_unmap_survivor_value), false);
-      Require(name, "partial-unmap survivor", survivor.first != nullptr,
-              "still-mapped cached-buffer remainder could not be recreated");
-      auto partial_unmap_readback =
-          CreateHostBuffer(name, sizeof(partial_unmap_survivor_value),
-                           vk::BufferUsageFlagBits::eTransferDst, {0});
-      const vk::BufferCopy survivor_copy{survivor.second, 0,
-                                         sizeof(partial_unmap_survivor_value)};
-      scheduler.Current().Handle().copyBuffer(survivor.first->Handle(),
-                                              partial_unmap_readback.buffer, 1,
-                                              &survivor_copy);
-      vk::BufferMemoryBarrier survivor_barrier{};
-      survivor_barrier.sType = vk::StructureType::eBufferMemoryBarrier;
-      survivor_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-      survivor_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-      survivor_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      survivor_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      survivor_barrier.buffer = partial_unmap_readback.buffer;
-      survivor_barrier.size = partial_unmap_readback.size;
-      scheduler.Current().Handle().pipelineBarrier(
-          vk::PipelineStageFlagBits::eTransfer,
-          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
-          &survivor_barrier, 0, nullptr);
-      scheduler.Finish();
-      Require(name, "partial-unmap survivor contents",
-              ReadBuffer(name, partial_unmap_readback, 1) ==
-                  std::vector<u32>{partial_unmap_survivor_value},
-              "partial unmap recreated its still-mapped remainder from "
-              "uninitialized native bytes");
-      DestroyBuffer(&partial_unmap_readback);
+      Require(name, "partial-invalidation survivor", survivor.first != nullptr,
+              "cached-buffer remainder was not retained");
+      Require(name, "partial-invalidation survivor contents",
+              ReadNativeValue(*survivor.first, survivor.second) ==
+                  partial_unmap_survivor_value,
+              "partial invalidation lost disjoint native bytes");
 
       constexpr uint64_t large_offset = 0x10000;
       constexpr uint64_t large_size = 33ull * 1024 * 1024;
@@ -3431,16 +3466,17 @@ public:
           name, "disjoint retirement publication",
           disjoint_before_unmap == disjoint_value,
           "whole-owner Buffer retired before publishing its dirty bytes");
-      cache.UnmapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
+      resources.UnmapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
       uint32_t disjoint_after_unmap = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + disjoint_dirty_offset,
                                               &disjoint_after_unmap,
                                               sizeof(disjoint_after_unmap));
-      Require(name, "disjoint synchronized unmap",
+      Require(name, "disjoint synchronized invalidation",
               disjoint_after_unmap == disjoint_value &&
                   !cache.HasGpuDirtyBytes(base + disjoint_dirty_offset,
                                           sizeof(disjoint_value)),
-              "disjoint unmap lost the completed whole-owner publication");
+              "disjoint invalidation lost the completed whole-owner publication");
+      resources.MapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
       auto disjoint_new_owner =
           cache.ObtainBuffer(base + disjoint_new_owner_offset,
                              sizeof(disjoint_value), true, false);

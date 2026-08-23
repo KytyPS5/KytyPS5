@@ -63,7 +63,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_scheduler.FinishCurrent();
 			m_scheduler.WaitPriorityOperations(tick);
 		}
-		m_buffer_cache.UnmapMemory(vaddr, size);
+		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_page_manager.OnGpuUnmap(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

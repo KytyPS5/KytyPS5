@@ -1871,9 +1871,6 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		metadata = m_surface_metas.erase(metadata);
 	}
 	auto images = FindImagesInRegion(address, size, false);
-	if (!images.empty()) {
-		m_scheduler.Finish();
-	}
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {

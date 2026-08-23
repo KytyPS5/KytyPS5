@@ -2993,6 +2993,25 @@ public:
         return value;
       };
 
+      constexpr uint64_t large_copy_source_offset = 0x40000;
+      constexpr uint64_t large_copy_destination_offset = 0x80000;
+      constexpr uint64_t large_copy_size = 96 * 1024;
+      std::vector<uint8_t> large_copy_source(large_copy_size);
+      for (uint64_t index = 0; index < large_copy_size; ++index) {
+        large_copy_source[index] =
+            static_cast<uint8_t>((index * 37 + index / 251) & 0xffu);
+      }
+      std::memcpy(memory + large_copy_source_offset, large_copy_source.data(),
+                  large_copy_size);
+      std::memset(memory + large_copy_destination_offset, 0, large_copy_size);
+      cache.CopyBuffer(base + large_copy_destination_offset,
+                       base + large_copy_source_offset, large_copy_size, false,
+                       false);
+      Require(name, "large host copy",
+              std::memcmp(memory + large_copy_destination_offset,
+                          large_copy_source.data(), large_copy_size) == 0,
+              "chunked host copy lost bytes across its scratch boundary");
+
       constexpr uint64_t index_offset = 0x180000;
       constexpr uint64_t index_page = BufferCache::CACHING_PAGE_SIZE;
       constexpr uint64_t index_span = 3 * index_page;

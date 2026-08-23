@@ -341,10 +341,6 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		auto downloads = RecordDownloads(copies);
 		m_scheduler.FinishCurrent();
 		PublishDownloads(downloads);
-	} else if (!retired_buffers.empty()) {
-		// Image uploads can reference a clean cached buffer without owning it. Submit the active
-		// command stream before removing such backing.
-		m_scheduler.FinishCurrent();
 	}
 	for (const auto& [begin, bytes]: modified_buffers) {
 		m_gpu_modified_ranges.Subtract(begin, bytes);

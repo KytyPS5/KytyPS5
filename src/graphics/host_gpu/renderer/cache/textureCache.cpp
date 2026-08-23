@@ -1209,7 +1209,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
+		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
 			continue;
 		}
 		matches.push_back(id);
@@ -1580,7 +1580,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		if (owner->depth_id) {
 			owner = m_texture_cache.m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner != nullptr && owner->SafeToDownload()) {
+		if (owner != nullptr && m_texture_cache.SafeToDownload(*owner)) {
 			matches.push_back(id);
 		}
 	}

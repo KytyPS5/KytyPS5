@@ -5673,6 +5673,25 @@ public:
                   texture_cache.GetImage(exact_image).IsGpuModified(),
               "image ownership discarded or conflicted with disjoint dirty "
               "Buffer bytes on the same tracker page");
+      auto exact_buffer = resources.GetBufferCache().ObtainBuffer(
+          base + exact_image_offset, sizeof(uint32_t), true);
+      Require(name, "overlapping buffer ownership allocation",
+              exact_buffer.first != nullptr,
+              "failed to create the overlapping dirty Buffer owner");
+      exact_buffer.first->Fill(exact_buffer.second, sizeof(uint32_t),
+                               dirty_sibling_value);
+      Libs::Graphics::Buffer exact_download(
+          m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+          base + exact_image_offset, AllFlags, sizeof(uint32_t));
+      Require(name, "overlapping buffer ownership rejection",
+              !texture_cache.FindImageFromRange(base + exact_image_offset,
+                                                sizeof(uint32_t)) &&
+                  !BufferCacheTestAccess::SynchronizeBufferFromImage(
+                      resources.GetBufferCache(), exact_download,
+                      base + exact_image_offset, sizeof(uint32_t)),
+              "dirty Buffer bytes did not block the stale image source");
+      resources.GetBufferCache().ReadMemory(base + exact_image_offset,
+                                            sizeof(uint32_t));
       resources.GetBufferCache().ReadMemory(base + dirty_sibling_offset,
                                             sizeof(dirty_sibling_value));
 

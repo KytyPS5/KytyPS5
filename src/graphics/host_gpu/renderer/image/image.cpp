@@ -736,15 +736,10 @@ Image::~Image() {
 	if (m_graphics == nullptr) {
 		return;
 	}
-	{
-		std::lock_guard lock(views.mutex);
-		for (auto& cached: views.views) {
-			if (cached.view != nullptr) {
-				m_graphics->device.destroyImageView(cached.view, nullptr);
-				cached.view = nullptr;
-			}
+	for (const auto& cached: views) {
+		if (cached.view != nullptr) {
+			m_graphics->device.destroyImageView(cached.view, nullptr);
 		}
-		views.views.clear();
 	}
 	if (backing.image != nullptr) {
 		m_graphics->DeleteImage(backing);

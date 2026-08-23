@@ -8,7 +8,6 @@
 
 #include <compare>
 #include <limits>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -25,14 +24,6 @@ using ImageId = Common::SlotId;
 struct CachedImageView {
 	ImageViewInfo info;
 	vk::ImageView view = nullptr;
-};
-
-struct ImageViewCache {
-	ImageViewCache() = default;
-	KYTY_CLASS_NO_COPY(ImageViewCache);
-
-	std::mutex                   mutex;
-	std::vector<CachedImageView> views;
 };
 
 struct ImageUsage {
@@ -150,7 +141,7 @@ public:
 
 	ImageInfo        info;
 	VulkanImage      backing;
-	ImageViewCache   views;
+	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;

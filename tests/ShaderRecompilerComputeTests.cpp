@@ -2772,7 +2772,7 @@ public:
                 array != first && reinterpreted != nullptr &&
                 reinterpreted != first && storage != nullptr &&
                 storage != first && attachment == first &&
-                color.views.views.size() == 7,
+                color.views.size() == 7,
             "dynamic view identity omitted mapping, format, mip, layer, type, "
             "or storage usage");
 
@@ -2820,7 +2820,7 @@ public:
                 depth_alias == depth_first && depth_array != nullptr &&
                 depth_array != depth_first && depth_attachment != nullptr &&
                 depth_attachment != depth_array &&
-                depth.views.views.size() == 3,
+                depth.views.size() == 3,
             "unified depth view cache lost sampled/attachment identity");
 
     auto depth_stencil_info = depth_info;
@@ -2841,10 +2841,10 @@ public:
     Require(name, "depth/stencil aspects",
             depth_only != nullptr && combined != nullptr &&
                 depth_only != combined &&
-                depth_stencil.views.views.size() == 2 &&
-                depth_stencil.views.views[0].info.aspect ==
+                depth_stencil.views.size() == 2 &&
+                depth_stencil.views[0].info.aspect ==
                     vk::ImageAspectFlagBits::eDepth &&
-                depth_stencil.views.views[1].info.aspect ==
+                depth_stencil.views[1].info.aspect ==
                     (vk::ImageAspectFlagBits::eDepth |
                      vk::ImageAspectFlagBits::eStencil),
             "explicit depth-only and combined aspects shared one image view");
@@ -3833,7 +3833,7 @@ public:
           name, "dynamic views",
           first_view != nullptr && repeated_view == first_view &&
               mapped_view != nullptr && mapped_view != first_view &&
-              image.views.views.size() == 2 && !image.usage.texture &&
+              image.views.size() == 2 && !image.usage.texture &&
               !image.IsGpuModified() && !image.IsCpuDirty() &&
               !TextureCacheTestAccess::PendingDownload(texture_cache, first),
           "TextureCache::FindTexture did not preserve sampled view "
@@ -8174,7 +8174,7 @@ public:
       const auto &sampled_depth_image =
           texture_cache.GetImage(sampled_depth_binding.image_id);
       const bool normalized_depth_view = std::ranges::any_of(
-          sampled_depth_image.views.views, [&](const auto &cached) {
+          sampled_depth_image.views, [&](const auto &cached) {
             return cached.view == sampled_depth_view &&
                    cached.info.format == vk::Format::eD32Sfloat &&
                    cached.info.aspect == vk::ImageAspectFlagBits::eDepth &&

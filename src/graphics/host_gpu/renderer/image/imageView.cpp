@@ -4,8 +4,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
-#include <mutex>
-
 namespace Libs::Graphics {
 
 namespace {
@@ -357,8 +355,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
-	std::lock_guard lock(views.mutex);
-	for (const auto& cached: views.views) {
+	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;
 		}
@@ -394,7 +391,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
-	views.views.push_back({normalized, view});
+	views.push_back({normalized, view});
 	return view;
 }
 

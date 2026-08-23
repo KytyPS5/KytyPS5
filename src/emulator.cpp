@@ -15,6 +15,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kytyGitVersion.h"
 #include "libs/agc.h"
 #include "libs/audio.h"
 #include "libs/controller.h"
@@ -26,13 +27,31 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <thread>
 
 namespace Emulator {
 
 static void PrintSystemInfo() {
-	Common::SystemInfo info = Common::GetSystemInfo();
+	const Common::SystemInfo info = Common::GetSystemInfo();
 
-	LOGF("ProcessorName = %s\n", info.ProcessorName.c_str());
+#if defined(__APPLE__)
+	static constexpr auto platform_name = "macOS";
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static constexpr auto platform_name = "Windows";
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	static constexpr auto platform_name = "Linux";
+#else
+	static constexpr auto platform_name = "Unknown";
+#endif
+
+	LOGF("Build\n"
+	     "  version: %s\n\n"
+	     "Host\n"
+	     "  os:      %s\n"
+	     "  cpu:     %s\n"
+	     "  threads: %u\n\n",
+	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
+	     std::thread::hardware_concurrency());
 }
 
 static void KytyClose() {

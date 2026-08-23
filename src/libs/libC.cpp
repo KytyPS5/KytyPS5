@@ -360,6 +360,36 @@ static KYTY_SYSV_ABI double libc_difftime(int64_t time1, int64_t time0) {
 	return std::difftime(static_cast<std::time_t>(time1), static_cast<std::time_t>(time0));
 }
 
+// The guest `struct tm` (Orbis) is the 9-field, 36-byte layout: tm_sec..tm_isdst with no
+// tm_gmtoff/tm_zone. glibc's std::tm adds tm_gmtoff and tm_zone (56 bytes total), and std::mktime
+// writes the full host struct back into the caller's buffer. Passing the guest pointer straight
+// through therefore overflows the guest allocation and clobbers the stack canary on Linux/macOS,
+// while the MSVC _mktime64 path used on Windows writes only the matching 36-byte layout. Copy
+// through a sanitized host struct tm, mirroring the in-place fields the guest libc updates.
+static void CopyGuestTmToHost(std::tm* dst, const std::tm* src) {
+	dst->tm_sec   = src->tm_sec;
+	dst->tm_min   = src->tm_min;
+	dst->tm_hour  = src->tm_hour;
+	dst->tm_mday  = src->tm_mday;
+	dst->tm_mon   = src->tm_mon;
+	dst->tm_year  = src->tm_year;
+	dst->tm_wday  = src->tm_wday;
+	dst->tm_yday  = src->tm_yday;
+	dst->tm_isdst = src->tm_isdst;
+}
+
+static void CopyHostTmToGuest(std::tm* dst, const std::tm* src) {
+	dst->tm_sec   = src->tm_sec;
+	dst->tm_min   = src->tm_min;
+	dst->tm_hour  = src->tm_hour;
+	dst->tm_mday  = src->tm_mday;
+	dst->tm_mon   = src->tm_mon;
+	dst->tm_year  = src->tm_year;
+	dst->tm_wday  = src->tm_wday;
+	dst->tm_yday  = src->tm_yday;
+	dst->tm_isdst = src->tm_isdst;
+}
+
 static KYTY_SYSV_ABI std::tm* libc_gmtime(const int64_t* timer) {
 	if (timer == nullptr) {
 		return nullptr;
@@ -410,7 +440,16 @@ static KYTY_SYSV_ABI int64_t libc_mktime(std::tm* timeptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return static_cast<int64_t>(_mktime64(timeptr));
 #else
-	return static_cast<int64_t>(std::mktime(timeptr));
+	std::tm sanitized {};
+	CopyGuestTmToHost(&sanitized, timeptr);
+	sanitized.tm_gmtoff = 0;
+	sanitized.tm_zone   = nullptr;
+
+	const auto result = static_cast<int64_t>(std::mktime(&sanitized));
+
+	CopyHostTmToGuest(timeptr, &sanitized);
+
+	return result;
 #endif
 }
 
@@ -421,9 +460,12 @@ static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* f
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	// Guest-created tm values do not initialize glibc's tm_zone pointer.
-	std::tm sanitized = *timeptr;
-	sanitized.tm_zone = nullptr;
+	// Guest-created tm values do not initialize glibc's tm_gmtoff/tm_zone fields, and the guest
+	// allocation may not even cover them.
+	std::tm sanitized {};
+	CopyGuestTmToHost(&sanitized, timeptr);
+	sanitized.tm_gmtoff = 0;
+	sanitized.tm_zone   = nullptr;
 
 	return std::strftime(str, count, format, &sanitized);
 #else

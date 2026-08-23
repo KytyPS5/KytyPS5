@@ -710,7 +710,8 @@ static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer) {
 	const auto& ctx              = buffer.GetRegisters();
 	const auto& sh_regs          = ctx.GetShaderRegisters();
 	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
-	return has_color_output || PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
+	return ShaderAddressValid(buffer.GetShaders().GetPs().ps_regs.data_addr) &&
+	       (has_color_output || PixelShaderHasDepthOrCoverageSideEffects(sh_regs));
 }
 
 enum class CbColorMode : uint8_t {

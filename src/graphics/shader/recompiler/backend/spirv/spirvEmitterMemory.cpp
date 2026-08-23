@@ -436,12 +436,12 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		                     Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
 		              value);
 	};
-	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-		AtomicUpdate(ctx.state, pointer, mem.kind, merge);
-	} else {
+	if (mem.kind == IR::ResourceKind::Scratch) {
 		const auto old = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
 		ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
+	} else {
+		AtomicUpdate(ctx.state, pointer, mem.kind, merge);
 	}
 }
 

@@ -16112,6 +16112,35 @@ TestCase BufferStoreFormatXResource16UintWritesHalfword() {
   return test;
 }
 
+TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 0));
+  code.push_back(EncodeMubuf0(0x04u, 0, true, false));
+  code.push_back(EncodeMubuf1(1, 0, 0));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXResource16UintPreservesAdjacentLanes";
+  test.code = code;
+  test.initial = std::vector<u32>(32, 0);
+  for (u32 index = 0; index < 32; index++) {
+    test.expected.push_back(((index * 2 + 2) << 16) | (index * 2 + 1));
+  }
+  test.opcodes = {O::V_ADD_NC_U32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.user_data = MakeStructuredStorageBufferData(2, 64, false, 11);
+  test.has_user_data = true;
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
+  return test;
+}
+
 TestCase BufferLoadFormatXyResource88UintExtractsBytes() {
   using O = ShaderOpcode;
 
@@ -19742,6 +19771,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress);
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
+  AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);

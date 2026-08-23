@@ -8412,6 +8412,47 @@ void TestNewShaderRecompilerU64PairLowering() {
         "V_LSHRREV_B64 did not reverse its encoded operands for pair-U64 IR");
   CheckSpirvBinaryValidates(result.spirv);
 
+  const uint32_t lshlrev_b64_shader[] = {
+      0xd6ff0021u, 0x00010303u, // v_lshlrev_b64 v[33:34], v3, 1
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_lshlrev_b64;
+  Check(Decoder::DecodeInstruction(lshlrev_b64_shader, 0u,
+                                   decoded_lshlrev_b64, &error),
+        error.c_str());
+  Check(decoded_lshlrev_b64.opcode == Decoder::Opcode::V_LSHLREV_B64 &&
+            decoded_lshlrev_b64.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_lshlrev_b64.dst.reg == 33u &&
+            decoded_lshlrev_b64.src_count == 2u &&
+            decoded_lshlrev_b64.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded_lshlrev_b64.src0.reg == 3u &&
+            decoded_lshlrev_b64.src1.kind ==
+                Decoder::OperandKind::IntegerInlineConstant &&
+            decoded_lshlrev_b64.src1.value == 1u,
+        "decoder rejected captured VOP3 V_LSHLREV_B64 fields");
+  Check(TryRecompile(lshlrev_b64_shader, options, result, &error),
+        error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_LSHLREV_B64 v33, v3, 1"),
+        "captured VOP3 V_LSHLREV_B64 was not present in the decoded dump");
+  Decoder::Program decoded_lshlrev_b64_program;
+  CFG::Graph graph_lshlrev_b64;
+  IR::Program native_lshlrev_b64;
+  Check(Decoder::DecodeProgram(lshlrev_b64_shader,
+                               decoded_lshlrev_b64_program, &error),
+        error.c_str());
+  Check(CFG::BuildGraph(decoded_lshlrev_b64_program, graph_lshlrev_b64,
+                        &error) &&
+            CFG::Structurize(graph_lshlrev_b64, &error),
+        error.c_str());
+  Check(IR::LowerProgram(decoded_lshlrev_b64_program, graph_lshlrev_b64,
+                         ShaderType::Compute, 64u, native_lshlrev_b64, &error),
+        error.c_str());
+  Check(Common::ContainsStr(IR::ProgramToString(native_lshlrev_b64),
+                            "ShiftLeftLogicalU64 v33, 0x00000001, v3"),
+        "V_LSHLREV_B64 did not reverse its encoded operands for pair-U64 IR");
+  CheckSpirvBinaryValidates(result.spirv);
+
   const uint32_t cmpx_i64_shader[] = {
       0xd4b5007eu, 0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
       EncodeSopp(0x01),

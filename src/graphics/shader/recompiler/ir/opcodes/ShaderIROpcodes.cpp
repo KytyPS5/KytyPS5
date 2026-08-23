@@ -250,6 +250,7 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::V_LSHLREV_B16, Opcode::ShiftLeftLogicalU16},
     {Decoder::Opcode::V_LSHR_B32, Opcode::ShiftRightLogicalU32},
     {Decoder::Opcode::V_LSHRREV_B32, Opcode::ShiftRightLogicalU32},
+    {Decoder::Opcode::V_LSHLREV_B64, Opcode::ShiftLeftLogicalU64},
     {Decoder::Opcode::V_LSHRREV_B64, Opcode::ShiftRightLogicalU64},
     {Decoder::Opcode::V_LSHRREV_B16, Opcode::ShiftRightLogicalU16},
     {Decoder::Opcode::V_ASHR_I32, Opcode::ShiftRightArithmeticI32},
@@ -468,6 +469,7 @@ bool IsReversedBinary(Decoder::Opcode opcode) {
 		case Decoder::Opcode::V_LSHLREV_B32:
 		case Decoder::Opcode::V_LSHRREV_B32:
 		case Decoder::Opcode::V_ASHRREV_I32:
+		case Decoder::Opcode::V_LSHLREV_B64:
 		case Decoder::Opcode::V_LSHRREV_B64:
 		case Decoder::Opcode::V_LSHLREV_B16:
 		case Decoder::Opcode::V_LSHRREV_B16:

@@ -12956,6 +12956,34 @@ TestCase VectorVop3LshrrevB64Captured() {
   return test;
 }
 
+TestCase VectorVop3LshlrevB64Captured() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 3, 30);
+  code.push_back(0xd6ff0021u);
+  code.push_back(0x00010303u); // v_lshlrev_b64 v[33:34], v3, 1
+  AppendStoreVgpr(&code, 33, 1);
+  AppendStoreVgpr(&code, 34, 2);
+  code.push_back(EncodeVop2(0x03, 3, InlineU32(31), 3));
+  code.push_back(0xd6ff0021u);
+  code.push_back(0x00010303u);
+  AppendStoreVgpr(&code, 33, 3);
+  AppendStoreVgpr(&code, 34, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorVop3LshlrevB64Captured";
+  test.code = std::move(code);
+  test.initial = {33u, 0u, 0u, 0u, 0u};
+  test.expected = {33u, 0u, 2u, 1u, 0u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftLeftLogical", "OpSelect"};
+  test.forbidden_spirv = {"OpTypeInt 64"};
+  return test;
+}
+
 TestCase VectorVop3IntegerOps() {
   using O = ShaderOpcode;
 
@@ -19670,6 +19698,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
   AddCase(VectorVop3LshrrevB64Captured);
+  AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorAlignByteUsesFiveBitByteOffset);

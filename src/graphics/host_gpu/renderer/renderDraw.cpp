@@ -309,16 +309,13 @@ static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderCol
 	}
 }
 
-static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandBuffer& buffer,
-                                                            const RenderColorInfo*     colors,
-                                                            uint32_t                   color_count,
-                                                            const RenderDepthInfo&     depth) {
+static void SetGraphicsDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+                                     const RenderColorInfo* colors, uint32_t color_count,
+                                     const RenderDepthInfo& depth) {
+	KYTY_PROFILER_FUNCTION();
+
 	EXIT_IF(colors == nullptr);
 	const auto& ctx = buffer.GetRegisters();
-
-	PipelineDynamicParameters ret {};
-	ret.color_write_count   = color_count;
-	ret.stencil_test_enable = depth.stencil_test_enable;
 
 	const auto&  vp = ctx.GetScreenViewport();
 	vk::Extent2D framebuffer_extent {};
@@ -333,68 +330,22 @@ static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandB
 
 	const auto final_scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent);
 
-	ret.viewport_scale[0]  = vp.viewports[0].xscale;
-	ret.viewport_scale[1]  = vp.viewports[0].yscale;
-	ret.viewport_scale[2]  = vp.viewports[0].zscale;
-	ret.viewport_offset[0] = vp.viewports[0].xoffset;
-	ret.viewport_offset[1] = vp.viewports[0].yoffset;
-	ret.viewport_offset[2] = vp.viewports[0].zoffset;
-	ret.scissor_ltrb[0]    = final_scissor.left;
-	ret.scissor_ltrb[1]    = final_scissor.top;
-	ret.scissor_ltrb[2]    = final_scissor.right;
-	ret.scissor_ltrb[3]    = final_scissor.bottom;
-	ret.line_width         = ctx.GetLineWidth();
-	ret.stencil_front      = depth.stencil_dynamic_front;
-	ret.stencil_back       = depth.stencil_dynamic_back;
-
-	const auto& mode        = ctx.GetModeControl();
-	const auto& poly_offset = ctx.GetPolyOffset();
-	const bool  use_front   = mode.poly_offset_front_enable && !mode.cull_front;
-	const bool  use_back    = mode.poly_offset_back_enable && !mode.cull_back;
-	ret.depth_bias_enable   = use_front || use_back;
-	if (ret.depth_bias_enable) {
-		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
-		const float guest_constant_factor =
-		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
-		ret.depth_bias_constant_factor =
-		    ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset, depth.format);
-		ret.depth_bias_clamp = poly_offset.clamp;
-		ret.depth_bias_slope_factor =
-		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-	}
-
-	// Color-control operation selects special color-buffer paths, not the normal component write
-	// mask. Attachment availability therefore follows the target write mask.
-	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
-		ret.color_write_enable[i] =
-		    (i < color_count &&
-		     render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0);
-	}
-
-	return ret;
-}
-
-static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                             const PipelineDynamicParameters& dynamic_params) {
-	KYTY_PROFILER_FUNCTION();
-
 	vk::Viewport viewport {};
-	viewport.x        = dynamic_params.viewport_offset[0] - dynamic_params.viewport_scale[0];
-	viewport.y        = dynamic_params.viewport_offset[1] - dynamic_params.viewport_scale[1];
-	viewport.width    = dynamic_params.viewport_scale[0] * 2.0f;
-	viewport.height   = dynamic_params.viewport_scale[1] * 2.0f;
-	viewport.minDepth = dynamic_params.viewport_offset[2];
-	viewport.maxDepth = dynamic_params.viewport_scale[2] + dynamic_params.viewport_offset[2];
+	viewport.x        = vp.viewports[0].xoffset - vp.viewports[0].xscale;
+	viewport.y        = vp.viewports[0].yoffset - vp.viewports[0].yscale;
+	viewport.width    = vp.viewports[0].xscale * 2.0f;
+	viewport.height   = vp.viewports[0].yscale * 2.0f;
+	viewport.minDepth = vp.viewports[0].zoffset;
+	viewport.maxDepth = vp.viewports[0].zscale + vp.viewports[0].zoffset;
 	vk_buffer.setViewport(0, 1, &viewport);
 
 	vk::Rect2D scissor {};
-	scissor.offset = {dynamic_params.scissor_ltrb[0], dynamic_params.scissor_ltrb[1]};
-	scissor.extent = {
-	    static_cast<uint32_t>(dynamic_params.scissor_ltrb[2] - dynamic_params.scissor_ltrb[0]),
-	    static_cast<uint32_t>(dynamic_params.scissor_ltrb[3] - dynamic_params.scissor_ltrb[1])};
+	scissor.offset = {final_scissor.left, final_scissor.top};
+	scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
+	                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
 	vk_buffer.setScissor(0, 1, &scissor);
 
-	float line_width = dynamic_params.line_width;
+	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
 		static bool logged = false;
 		if (!logged) {
@@ -407,26 +358,36 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 	}
 	vk_buffer.setLineWidth(line_width);
 
-	vk_buffer.setDepthBiasEnable(dynamic_params.depth_bias_enable ? VK_TRUE : VK_FALSE);
-	if (dynamic_params.depth_bias_enable) {
-		vk_buffer.setDepthBias(dynamic_params.depth_bias_constant_factor,
-		                       dynamic_params.depth_bias_clamp,
-		                       dynamic_params.depth_bias_slope_factor);
+	const auto& mode              = ctx.GetModeControl();
+	const auto& poly_offset       = ctx.GetPolyOffset();
+	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
+	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
+	const bool  depth_bias_enable = use_front || use_back;
+	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	if (depth_bias_enable) {
+		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
+		const float guest_constant_factor =
+		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
+		const float constant_factor =
+		    ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset, depth.format);
+		const float slope_factor =
+		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
+		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
-	if (dynamic_params.stencil_test_enable) {
+	if (depth.stencil_test_enable) {
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-		                                dynamic_params.stencil_front.compareMask);
+		                                depth.stencil_dynamic_front.compareMask);
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-		                                dynamic_params.stencil_back.compareMask);
+		                                depth.stencil_dynamic_back.compareMask);
 		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-		                              dynamic_params.stencil_front.writeMask);
+		                              depth.stencil_dynamic_front.writeMask);
 		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack,
-		                              dynamic_params.stencil_back.writeMask);
+		                              depth.stencil_dynamic_back.writeMask);
 		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront,
-		                              dynamic_params.stencil_front.reference);
+		                              depth.stencil_dynamic_front.reference);
 		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack,
-		                              dynamic_params.stencil_back.reference);
+		                              depth.stencil_dynamic_back.reference);
 	}
 
 #if defined(__APPLE__)
@@ -434,11 +395,15 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
 	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t i = 0; i < dynamic_params.color_write_count; i++) {
-		enable[i] = (dynamic_params.color_write_enable[i] ? VK_TRUE : VK_FALSE);
+	// Color-control operation selects special color-buffer paths, not the normal component write
+	// mask. Attachment availability therefore follows the target write mask.
+	for (uint32_t i = 0; i < color_count; i++) {
+		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		                ? VK_TRUE
+		                : VK_FALSE;
 	}
-	if (dynamic_params.color_write_count != 0) {
-		vk_buffer.setColorWriteEnableEXT(dynamic_params.color_write_count, enable);
+	if (color_count != 0) {
+		vk_buffer.setColorWriteEnableEXT(color_count, enable);
 	}
 #endif
 }
@@ -1060,8 +1025,7 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
 	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, state.vs_input_info,
-	                         target_export_mapping,
-	                         state.ps_input_info, state.ps_shader)) {
+	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}
 }
@@ -1244,9 +1208,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
 	CommitIndexBuffer(vk_buffer, index_binding);
 
-	const auto dynamic_params =
-	    BuildGraphicsDynamicParams(buffer, state.color_info, state.color_count, state.depth_info);
-	SetDynamicParams(buffer, vk_buffer, dynamic_params);
+	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
+	                         state.depth_info);
 
 	LogDrawPhase(draw.name, "BeginRendering");
 	if (set_auto_debug) {

@@ -3296,6 +3296,43 @@ public:
                       cache, starvation_retired),
               "critical GC did not immediately free the skipped dirty owners");
 
+      constexpr uint64_t lookup_only_offset = 0x218000;
+      constexpr uint64_t obtained_offset = 0x220000;
+      constexpr uint64_t residency_size =
+          2 * BufferCache::CACHING_PAGE_SIZE;
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+      const auto lookup_only = cache.FindBuffer(
+          base + lookup_only_offset, residency_size);
+      const auto obtained =
+          cache.FindBuffer(base + obtained_offset, residency_size);
+      for (uint32_t tick = 0; tick <= 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "lookup-only owner identity",
+              cache.FindBuffer(base + lookup_only_offset, residency_size) ==
+                  lookup_only,
+              "lookup-only discovery replaced its valid Buffer owner");
+      const auto [obtained_buffer, obtained_buffer_offset] = cache.ObtainBuffer(
+          base + obtained_offset, residency_size, false, false, obtained);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, 0, std::numeric_limits<uint64_t>::max());
+      cache.RunGarbageCollector();
+      Require(name, "lookup versus acquisition residency",
+              !cache.IsRegionRegistered(base + lookup_only_offset,
+                                        residency_size) &&
+                  !BufferCacheTestAccess::PageOwner(
+                      cache, base + lookup_only_offset) &&
+                  obtained_buffer == &cache.GetBuffer(obtained) &&
+                  obtained_buffer_offset == 0 &&
+                  cache.IsRegionRegistered(base + obtained_offset,
+                                           residency_size) &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, base + obtained_offset) == obtained,
+              "lookup refreshed residency or actual acquisition did not");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+
       auto unmap_allocation = cache.ObtainBuffer(
           base + unmap_offset, sizeof(unmap_value), true, false);
       Require(name, "direct-invalidation allocation",

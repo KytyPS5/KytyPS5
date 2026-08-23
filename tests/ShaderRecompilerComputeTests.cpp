@@ -155,6 +155,12 @@ struct BufferCacheTestAccess {
                                          uint64_t address, uint64_t size) {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
+
+  static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
+    const auto *owner = cache.m_page_table.Find(
+        address >> BufferCache::PageTable::kPageBits);
+    return owner == nullptr ? BufferId{} : *owner;
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -2962,13 +2968,23 @@ public:
       constexpr uint64_t index_span = 3 * index_page;
       const uint64_t index_begin = base + index_offset;
       Require(name, "registered-range empty lookup",
-              !cache.IsRegionRegistered(index_begin, index_span),
+              !cache.IsRegionRegistered(index_begin, index_span) &&
+                  !BufferCacheTestAccess::PageOwner(cache, index_begin),
               "empty Buffer cache reported a registered range");
       const auto index_left =
           cache.FindBuffer(index_begin + 0x100, sizeof(uint32_t));
       const auto index_right = cache.FindBuffer(
           index_begin + 2 * index_page + 0x100, sizeof(uint32_t));
-      Require(name, "registered-range owners", index_left && index_right,
+      Require(name, "registered-range owners",
+              index_left && index_right &&
+                  cache.FindBuffer(index_begin + 0x200, sizeof(uint32_t)) ==
+                      index_left &&
+                  BufferCacheTestAccess::PageOwner(cache, index_begin) ==
+                      index_left &&
+                  !BufferCacheTestAccess::PageOwner(cache,
+                                                    index_begin + index_page) &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + 2 * index_page) == index_right,
               "failed to create disjoint Buffer index owners");
       Require(
           name, "registered-range boundaries",
@@ -2986,8 +3002,23 @@ public:
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
       Require(name, "registered-range merge",
               index_bridge && cache.IsRegionRegistered(index_begin + index_page,
-                                                       index_page),
+                                                       index_page) &&
+                  BufferCacheTestAccess::PageOwner(cache, index_begin) ==
+                      index_bridge &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + index_page) == index_bridge &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + 2 * index_page) == index_bridge,
               "bridging acquisition did not publish its merged Buffer range");
+      scheduler.FinishCurrent();
+      constexpr uint64_t recycled_offset = index_offset + 4 * index_page;
+      const auto recycled = cache.FindBuffer(base + recycled_offset + 0x100,
+                                             sizeof(uint32_t));
+      Require(name, "slot generation reuse",
+              (recycled.index == index_left.index && recycled != index_left) ||
+                  (recycled.index == index_right.index &&
+                   recycled != index_right),
+              "retired Buffer slot was not reused with a new generation");
       const auto [resolved_left, resolved_left_offset] = cache.ObtainBuffer(
           index_begin + 0x100, sizeof(uint32_t), true, false, index_left);
       const auto [resolved_right, resolved_right_offset] =
@@ -2999,8 +3030,16 @@ public:
                   resolved_left_offset != resolved_right_offset,
               "saved descriptor IDs did not resolve through the merged owner");
       cache.UnmapMemory(index_begin, index_span);
+      cache.UnmapMemory(base + recycled_offset, index_page);
       Require(name, "registered-range removal",
-              !cache.IsRegionRegistered(index_begin, index_span),
+              !cache.IsRegionRegistered(index_begin, index_span) &&
+                  !BufferCacheTestAccess::PageOwner(cache, index_begin) &&
+                  !BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + index_page) &&
+                  !BufferCacheTestAccess::PageOwner(
+                      cache, index_begin + 2 * index_page) &&
+                  !BufferCacheTestAccess::PageOwner(cache,
+                                                    base + recycled_offset),
               "unmapped Buffer owner remained in the registered-range index");
 
       MarkGpuWrite(base + first_offset, sizeof(first_value));

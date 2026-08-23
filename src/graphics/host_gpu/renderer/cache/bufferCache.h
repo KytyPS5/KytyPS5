@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
@@ -66,12 +67,16 @@ private:
 
 	struct DownloadCopy;
 	struct DownloadRange;
+	using PageTable = MultiLevelPageTable<BufferId, 14, 40, 16>;
+	static_assert(CACHING_PAGE_SIZE == (uint64_t {1} << PageTable::kPageBits));
 	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
 	[[nodiscard]] static constexpr uint64_t AlignDownload(uint64_t size) noexcept {
 		return (size + DOWNLOAD_ALIGNMENT - 1) & ~(DOWNLOAD_ALIGNMENT - 1);
 	}
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
+	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
@@ -91,6 +96,7 @@ private:
 	Buffer                       m_gds_buffer;
 	Common::SlotVector<Buffer>   m_slot_buffers;
 	std::map<uint64_t, BufferId> m_buffers;
+	PageTable                    m_page_table;
 	RangeSet                     m_gpu_modified_ranges;
 	MemoryTracker                m_memory_tracker;
 	StreamBuffer                 m_staging_buffer;

@@ -56,10 +56,31 @@ struct BufferCache::DownloadRange {
 	uint64_t offset  = 0;
 };
 
+void BufferCache::Register(BufferId id) {
+	const auto& buffer = m_slot_buffers[id];
+	PageTable::PageRange pages {};
+	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		m_page_table[page] = id;
+	}
+	const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
+	(void)it;
+	EXIT_IF(!inserted);
+	m_total_used_memory += buffer.Size();
+}
+
 void BufferCache::Unregister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
 	if (buffer.is_deleted) {
 		return;
+	}
+	PageTable::PageRange pages {};
+	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+		auto* owner = m_page_table.Find(page);
+		if (owner != nullptr && *owner == id) {
+			*owner = {};
+		}
 	}
 	const auto found = m_buffers.find(buffer.CpuAddress());
 	EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -252,15 +273,15 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "memory invalidation");
 	    },
-	    [&](uint64_t address, uint64_t bytes) noexcept {
+		[&](uint64_t address, uint64_t bytes) noexcept {
 		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
 			    for (uint64_t copied = 0; copied < range.size;) {
 				    const auto copy_address = range.address + copied;
-				    auto       owner        = m_buffers.upper_bound(copy_address);
-				    if (owner == m_buffers.begin()) {
+				    const auto* owner = m_page_table.Find(copy_address >> PageTable::kPageBits);
+				    if (owner == nullptr || !*owner) {
 					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
 				    }
-				    auto& buffer = m_slot_buffers[std::prev(owner)->second];
+				    auto& buffer = m_slot_buffers[*owner];
 				    if (!buffer.IsInBounds(copy_address, 1)) {
 					    EXIT("BufferCache: invalidation readback is outside its buffer owner\n");
 				    }
@@ -369,45 +390,35 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner) {
+		auto& buffer = m_slot_buffers[*owner];
+		if (buffer.IsInBounds(vaddr, size)) {
+			buffer.tick_accessed_last = m_gc_tick;
+			return *owner;
+		}
+	}
+	return CreateBuffer(vaddr, size);
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	auto& command = m_scheduler.Current();
 	EXIT_IF(command.IsInvalid() || command.IsExecute());
 	auto       begin = vaddr & ~(CACHING_PAGE_SIZE - 1);
 	auto       end   = (vaddr + size + CACHING_PAGE_SIZE - 1) & ~(CACHING_PAGE_SIZE - 1);
-	const auto next  = m_buffers.upper_bound(vaddr);
-	if (next != m_buffers.begin()) {
-		const auto owner  = std::prev(next);
-		auto&      buffer = m_slot_buffers[owner->second];
-		if (buffer.IsInBounds(vaddr, size)) {
-			buffer.tick_accessed_last = m_gc_tick;
-			return owner->second;
-		}
-	}
-
-	auto merge = [&](const Buffer& buffer) {
-		const auto buffer_begin = buffer.CpuAddress();
-		const auto buffer_end   = buffer_begin + buffer.Size();
-		if (begin >= buffer_end || buffer_begin >= end) {
-			return false;
-		}
-		begin = std::min(begin, buffer_begin);
-		end   = std::max(end, buffer_end);
-		return true;
-	};
-	std::vector<BufferId> overlaps;
-	auto                  first = m_buffers.lower_bound(begin);
+	auto       first = m_buffers.lower_bound(begin);
 	if (first != m_buffers.begin()) {
 		const auto previous = std::prev(first);
-		if (merge(m_slot_buffers[previous->second])) {
+		if (const auto& buffer = m_slot_buffers[previous->second];
+		    buffer.CpuAddress() + buffer.Size() > begin) {
 			first = previous;
 		}
 	}
-	for (auto candidate = first; candidate != m_buffers.end(); ++candidate) {
-		if (candidate->first >= end) {
-			break;
-		}
-		if (merge(m_slot_buffers[candidate->second])) {
-			overlaps.push_back(candidate->second);
-		}
+	auto last = first;
+	for (; last != m_buffers.end() && last->first < end; ++last) {
+		const auto& buffer = m_slot_buffers[last->second];
+		begin              = std::min(begin, buffer.CpuAddress());
+		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
 	}
 
 	const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
@@ -416,17 +427,14 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	buffer.tick_accessed_last = m_gc_tick;
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
-	for (const auto overlap: overlaps) {
-		const auto& old = m_slot_buffers[overlap];
+	for (auto overlap = first; overlap != last;) {
+		const auto current = overlap++;
+		const auto old_id  = current->second;
+		const auto& old    = m_slot_buffers[old_id];
 		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
+		DeleteBuffer(old_id);
 	}
-	for (const auto overlap: overlaps) {
-		DeleteBuffer(overlap);
-	}
-	m_total_used_memory += buffer.Size();
-	const auto [it, inserted] = m_buffers.emplace(begin, id);
-	(void)it;
-	EXIT_IF(!inserted);
+	Register(id);
 	return id;
 }
 
@@ -544,13 +552,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		EXIT("BufferCache: invalid image source\n");
 	}
 	auto find_owner = [&]() -> Buffer* {
-		auto owner = m_buffers.upper_bound(vaddr);
-		if (owner == m_buffers.begin()) {
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
 			return nullptr;
 		}
-		--owner;
-		auto* buffer = m_slot_buffers.try_get(owner->second);
-		return buffer != nullptr && buffer->IsInBounds(vaddr, size) ? buffer : nullptr;
+		auto& buffer = m_slot_buffers[*owner];
+		return buffer.IsInBounds(vaddr, size) ? &buffer : nullptr;
 	};
 
 	{
@@ -565,14 +572,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 			if (!IsRegionRegistered(vaddr, size)) {
 				EXIT("BufferCache: GPU-dirty image source has no native buffer\n");
 			}
-			const auto id       = FindBuffer(vaddr, size);
-			auto&      buffer   = m_slot_buffers[id];
-			owner               = &buffer;
-			const auto resolved = m_buffers.find(buffer.CpuAddress());
-			if (resolved == m_buffers.end() || resolved->second != id ||
-			    !buffer.IsInBounds(vaddr, size)) {
-				EXIT("BufferCache: merged image source does not contain the requested range\n");
-			}
+			owner = &m_slot_buffers[FindBuffer(vaddr, size)];
 		}
 		if (owner != nullptr && !cpu_modified && (!gpu_modified || has_dirty_buffer_source)) {
 			owner->tick_accessed_last = m_gc_tick;

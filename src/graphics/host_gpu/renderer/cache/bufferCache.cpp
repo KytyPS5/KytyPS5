@@ -167,7 +167,7 @@ void BufferCache::QueueGarbageDownload(std::span<const DownloadCopy> copies, Buf
 		// query therefore cannot orphan a dirty sibling on an edge page.
 		m_memory_tracker.UnmarkRegionAsGpuModified(address, size);
 		if (m_memory_tracker.IsRegionGpuModified(address, size) ||
-		    !m_gpu_modified_ranges.Intersections(address, size).empty()) {
+		    m_gpu_modified_ranges.Intersects(address, size)) {
 			EXIT("BufferCache: asynchronous garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(address, size);
@@ -314,8 +314,7 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		    !m_memory_tracker.IsRegionGpuModified(begin, buffer.Size())) {
 			continue;
 		}
-		const auto dirty = m_gpu_modified_ranges.Intersections(begin, buffer.Size());
-		if (dirty.empty()) {
+		if (!m_gpu_modified_ranges.Intersects(begin, buffer.Size())) {
 			EXIT("BufferCache: GPU-modified buffer has no dirty ranges\n");
 		}
 		modified_buffers.emplace_back(begin, buffer.Size());
@@ -350,7 +349,7 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	for (const auto& [begin, bytes]: retired_buffers) {
 		m_memory_tracker.MarkRegionAsCpuModified(begin, bytes);
 	}
-	if (!m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
 		EXIT("BufferCache: unmap retained dirty byte ranges\n");
 	}
 	m_memory_tracker.UntrackMemory(vaddr, size);
@@ -557,8 +556,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	{
 		const bool cpu_modified            = m_memory_tracker.IsRegionCpuModified(vaddr, size);
 		const bool gpu_modified            = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-		const auto dirty                   = m_gpu_modified_ranges.Intersections(vaddr, size);
-		const bool has_dirty_buffer_source = !dirty.empty();
+		const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
 		                                           "image source");
 
@@ -592,8 +590,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 	m_staging_buffer.Commit();
 
-	const auto dirty                   = m_gpu_modified_ranges.Intersections(vaddr, size);
-	const bool has_dirty_buffer_source = !dirty.empty();
+	const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
 	auto*      owner                   = find_owner();
 	if (has_dirty_buffer_source && owner == nullptr) {
 		EXIT("BufferCache: GPU-dirty image source lost its native owner\n");
@@ -756,7 +753,7 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return !m_gpu_modified_ranges.Intersections(vaddr, size).empty();
+	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

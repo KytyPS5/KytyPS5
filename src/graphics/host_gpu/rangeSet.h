@@ -59,6 +59,15 @@ public:
 		return result;
 	}
 
+	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.lower_bound(address);
+		if (it != m_ranges.begin() && std::prev(it)->second > address) {
+			return true;
+		}
+		return it != m_ranges.end() && it->first < end;
+	}
+
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);

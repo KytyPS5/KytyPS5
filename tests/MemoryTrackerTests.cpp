@@ -191,6 +191,10 @@ void TestRangeSet() {
   ranges.Add(0x1200, 0x40);
   Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
         "range set containment did not require full coverage");
+  Check(ranges.Intersects(0x0fff, 2) && ranges.Intersects(0x11ff, 2) &&
+            !ranges.Intersects(0x1100, 0x100) &&
+            !ranges.Intersects(0x1240, 1),
+        "range set intersection did not preserve half-open boundaries");
   auto intersections = ranges.Intersections(0x1070, 0x1b0);
   Check(intersections.size() == 2 && intersections[0].address == 0x1070 &&
             intersections[0].size == 0x90 &&

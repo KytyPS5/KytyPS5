@@ -50,12 +50,6 @@ struct BufferCache::DownloadCopy {
 	uint64_t size          = 0;
 };
 
-struct BufferCache::DownloadRange {
-	uint64_t address = 0;
-	uint64_t size    = 0;
-	uint64_t offset  = 0;
-};
-
 void BufferCache::Register(BufferId id) {
 	const auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
@@ -122,79 +116,62 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 	return {begin, end - begin};
 }
 
-std::vector<BufferCache::DownloadRange>
-BufferCache::RecordDownloads(std::span<const DownloadCopy> copies) {
-	uint64_t reservation_size = 0;
+void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	std::vector<DownloadCopy> batch;
+	batch.reserve(copies.size());
+	uint64_t                  packed_size = 0;
+	auto&                     download    = m_download_buffer;
+	const auto flush = [&] {
+		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
+		EXIT_IF(mapped == nullptr);
+		uint64_t cursor = 0;
+		for (const auto& copy: batch) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
+			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			                  vk::AccessFlagBits::eHostRead);
+			cursor += AlignDownload(envelope_size);
+		}
+		download.Commit();
+		const auto completion_tick = m_scheduler.CurrentTick();
+		m_scheduler.FinishCurrent();
+		m_scheduler.WaitPriorityOperations(completion_tick);
+		cursor = 0;
+		for (const auto& copy: batch) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			const auto offset = cursor + copy.source_offset - source_begin;
+			download.Invalidate(base_offset + offset, copy.size);
+			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
+			cursor += AlignDownload(envelope_size);
+		}
+		batch.clear();
+		packed_size = 0;
+	};
+	for (auto copy: copies) {
+		while (copy.size != 0) {
+			const auto available = download.Size() - packed_size;
+			const auto prefix    = copy.source_offset & 3u;
+			const auto bytes     = std::min(copy.size, available - prefix);
+			DownloadCopy part {copy.buffer, copy.source_offset, copy.address, bytes};
+			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
+			(void)source_begin;
+			packed_size += AlignDownload(envelope_size);
+			batch.push_back(part);
+			copy.source_offset += bytes;
+			copy.address += bytes;
+			copy.size -= bytes;
+			if (packed_size == download.Size()) {
+				flush();
+			}
+		}
+	}
+	if (!batch.empty()) {
+		flush();
+	}
 	for (const auto& copy: copies) {
-		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-		(void)source_begin;
-		if (envelope_size > UINT64_MAX - (DOWNLOAD_ALIGNMENT - 1)) {
-			EXIT("BufferCache: download batch alignment overflow\n");
-		}
-		const auto aligned_size = AlignDownload(envelope_size);
-		if (aligned_size > UINT64_MAX - reservation_size) {
-			EXIT("BufferCache: download batch overflow\n");
-		}
-		reservation_size += aligned_size;
+		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
 	}
-	if (reservation_size == 0) {
-		return {};
-	}
-
-	auto& download                   = m_download_buffer;
-	const auto [mapped, base_offset] = download.Map(reservation_size, DOWNLOAD_ALIGNMENT);
-	if (mapped == nullptr) {
-		EXIT("BufferCache: download batch could not reserve the shared stream\n");
-	}
-
-	std::vector<DownloadRange> downloads;
-	downloads.reserve(copies.size());
-	uint64_t cursor = 0;
-	for (const auto& copy: copies) {
-		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-		const auto prefix                        = copy.source_offset - source_begin;
-		download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-		                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
-		                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-		                  vk::AccessFlagBits::eHostRead);
-		downloads.push_back({copy.address, copy.size, base_offset + cursor + prefix});
-		cursor += AlignDownload(envelope_size);
-	}
-	download.Commit();
-	return downloads;
-}
-
-void BufferCache::PublishDownloads(std::span<const DownloadRange> downloads) {
-	for (const auto& range: downloads) {
-		m_download_buffer.Invalidate(range.offset, range.size);
-		Libs::LibKernel::Memory::WriteBacking(
-		    range.address, m_download_buffer.Mapped().data() + range.offset, range.size);
-	}
-}
-
-void BufferCache::QueueGarbageDownload(std::span<const DownloadCopy> copies, BufferId id,
-                                       uint64_t address, uint64_t size) {
-	EXIT_IF(copies.empty());
-	auto downloads = RecordDownloads(copies);
-	auto retired   = downloads;
-	m_scheduler.DeferPriorityOperation(
-	    [this, downloads = std::move(downloads)]() mutable { PublishDownloads(downloads); });
-	m_scheduler.DeferOperation([this, retired = std::move(retired), id, address, size]() mutable {
-		for (const auto& range: retired) {
-			m_gpu_modified_ranges.Subtract(range.address, range.size);
-		}
-		// ForEachDownloadRange reports full tracker pages, and every exact GPU-owned
-		// interval on those pages was downloaded and removed. Clearing the original
-		// query therefore cannot orphan a dirty sibling on an edge page.
-		m_memory_tracker.UnmarkRegionAsGpuModified(address, size);
-		if (m_memory_tracker.IsRegionGpuModified(address, size) ||
-		    m_gpu_modified_ranges.Intersects(address, size)) {
-			EXIT("BufferCache: asynchronous garbage collection retained GPU ownership\n");
-		}
-		m_memory_tracker.UntrackMemory(address, size);
-		EXIT_IF(!m_slot_buffers[id].is_deleted);
-		m_slot_buffers.erase(id);
-	});
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -303,12 +280,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		return;
 	}
-	auto downloads = RecordDownloads(copies);
-	m_scheduler.FinishCurrent();
-	PublishDownloads(downloads);
-	for (const auto& range: downloads) {
-		m_gpu_modified_ranges.Subtract(range.address, range.size);
-	}
+	DownloadBufferMemory(copies);
 	// The enumeration above covered whole dirty pages and every exact interval on them.
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	if (is_write) {
@@ -359,9 +331,7 @@ void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		    });
 	}
 	if (!copies.empty()) {
-		auto downloads = RecordDownloads(copies);
-		m_scheduler.FinishCurrent();
-		PublishDownloads(downloads);
+		DownloadBufferMemory(copies);
 	}
 	for (const auto& [begin, bytes]: modified_buffers) {
 		m_gpu_modified_ranges.Subtract(begin, bytes);
@@ -784,10 +754,9 @@ void BufferCache::RunGarbageCollector() {
 		return m_slot_buffers[m_buffers.at(left)].tick_accessed_last <
 		       m_slot_buffers[m_buffers.at(right)].tick_accessed_last;
 	});
-	if (candidates.size() > limit) {
-		candidates.resize(limit);
-	}
-
+	std::vector<BufferId> dirty_buffers;
+	std::vector<DownloadCopy> copies;
+	size_t                    retire_count = 0;
 	for (const auto address: candidates) {
 		auto found = m_buffers.find(address);
 		EXIT_IF(found == m_buffers.end());
@@ -796,7 +765,9 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		std::vector<DownloadCopy> copies;
+		if (dirty && !aggressive) {
+			continue;
+		}
 		if (dirty) {
 			m_memory_tracker.ForEachDownloadRange<false>(
 			    buffer.CpuAddress(), buffer.Size(),
@@ -805,24 +776,37 @@ void BufferCache::RunGarbageCollector() {
 				                                           dirty_size, "garbage collection");
 			    },
 			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-				    for (const auto range:
-				         m_gpu_modified_ranges.Intersections(dirty_address, dirty_size)) {
+				    m_gpu_modified_ranges.ForEachIntersection(
+				        dirty_address, dirty_size, [&](RangeSet::Range range) {
 					    copies.push_back({&buffer, range.address - buffer.CpuAddress(),
 					                      range.address, range.size});
-				    }
-			    });
-		}
-
-		const auto retire_address = buffer.CpuAddress();
-		const auto retire_size    = buffer.Size();
-		if (dirty) {
-			EXIT_IF(copies.empty());
-			Unregister(id);
-			QueueGarbageDownload(copies, id, retire_address, retire_size);
+				        });
+				});
+			dirty_buffers.push_back(id);
 		} else {
-			m_memory_tracker.UntrackMemory(retire_address, retire_size);
+			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 		}
+		if (++retire_count == limit) {
+			break;
+		}
+	}
+	if (dirty_buffers.empty()) {
+		return;
+	}
+
+	EXIT_IF(copies.empty());
+	DownloadBufferMemory(copies);
+	for (const auto id: dirty_buffers) {
+		auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
+		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			EXIT("BufferCache: garbage collection retained GPU ownership\n");
+		}
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		Unregister(id);
+		m_slot_buffers.erase(id);
 	}
 }
 

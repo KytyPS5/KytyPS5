@@ -66,7 +66,6 @@ private:
 	friend struct BufferCacheTestAccess;
 
 	struct DownloadCopy;
-	struct DownloadRange;
 	using PageTable = MultiLevelPageTable<BufferId, 14, 40, 16>;
 	static_assert(CACHING_PAGE_SIZE == (uint64_t {1} << PageTable::kPageBits));
 	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
@@ -84,10 +83,7 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	[[nodiscard]] std::vector<DownloadRange> RecordDownloads(std::span<const DownloadCopy> copies);
-	void PublishDownloads(std::span<const DownloadRange> downloads);
-	void QueueGarbageDownload(std::span<const DownloadCopy> copies, BufferId id, uint64_t address,
-	                          uint64_t size);
+	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 

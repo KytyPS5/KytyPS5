@@ -161,6 +161,10 @@ struct BufferCacheTestAccess {
         address >> BufferCache::PageTable::kPageBits);
     return owner == nullptr ? BufferId{} : *owner;
   }
+
+  static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
+    return cache.m_slot_buffers.is_allocated(id);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -3113,11 +3117,6 @@ public:
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
       cache.RunGarbageCollector();
-      Require(name, "dirty retirement",
-              !cache.IsRegionRegistered(base, allocation_size),
-              "aged GPU-dirty buffer survived pressured "
-              "collection");
-
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -3126,9 +3125,10 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + second_offset,
                                               &second_before_completion,
                                               sizeof(second_before_completion));
-      Require(name, "deferred dirty retirement",
+      Require(name, "normal dirty retention",
               first_before_completion == first_stale &&
                   second_before_completion == second_stale &&
+                  cache.IsRegionRegistered(base, allocation_size) &&
                   cache.IsRegionGpuModified(base + first_offset,
                                             sizeof(first_value)) &&
                   cache.IsRegionGpuModified(base + second_offset,
@@ -3138,9 +3138,32 @@ public:
                   cache.HasGpuDirtyBytes(base + second_offset,
                                          sizeof(second_value)) &&
                   scheduler.CurrentTick() == gc_submission_tick,
-              "buffer GC published bytes or cleared dirty "
-              "ownership before GPU completion");
-      scheduler.FinishCurrent();
+              "normal GC retired or synchronized a dirty Buffer");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+      const auto older_publication_tick = scheduler.CurrentTick();
+      std::binary_semaphore older_publication_entered{0};
+      std::binary_semaphore release_older_publication{0};
+      std::atomic<bool> gc_returned{false};
+      scheduler.DeferPriorityOperation([&] {
+        older_publication_entered.release();
+        release_older_publication.acquire();
+        Libs::LibKernel::Memory::WriteBacking(
+            base + first_offset, &first_stale, sizeof(first_stale));
+      });
+      std::jthread release_publication([&] {
+        older_publication_entered.acquire();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(100);
+        while (!gc_returned.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        release_older_publication.release();
+      });
+      cache.RunGarbageCollector();
+      gc_returned = true;
+      release_publication.join();
+      scheduler.WaitPriorityOperations(older_publication_tick);
 
       uint32_t first_backing = 0;
       uint32_t second_backing = 0;
@@ -3152,6 +3175,7 @@ public:
       Require(name, "downloaded contents",
               first_backing == first_value && second_backing == second_value &&
                   clean_backing == clean_value &&
+                  !cache.IsRegionRegistered(base, allocation_size) &&
                   !cache.IsRegionGpuModified(base + first_offset,
                                              sizeof(first_value)) &&
                   !cache.IsRegionGpuModified(base + second_offset,
@@ -3159,9 +3183,65 @@ public:
                   !cache.HasGpuDirtyBytes(base + first_offset,
                                           sizeof(first_value)) &&
                   !cache.HasGpuDirtyBytes(base + second_offset,
-                                          sizeof(second_value)),
-              "dirty GC did not publish exact ranges before "
-              "clearing broad page ownership");
+                                          sizeof(second_value)) &&
+                  scheduler.CurrentTick() > gc_submission_tick,
+              "critical GC did not publish exact ranges before clearing "
+              "Buffer ownership");
+
+      constexpr uint64_t starvation_offset = 0x100000;
+      constexpr uint64_t starvation_stride = 2 * BufferCache::CACHING_PAGE_SIZE;
+      constexpr uint32_t starvation_count = 33;
+      constexpr uint32_t starvation_value = 0x31415926u;
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+      for (uint32_t index = 0; index < starvation_count; index++) {
+        const auto address = base + starvation_offset + index * starvation_stride;
+        (void)cache.ObtainBuffer(address, sizeof(starvation_value), true);
+        cache.FillBuffer(address, sizeof(starvation_value), starvation_value,
+                         false);
+      }
+      for (uint32_t tick = 0; tick < 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      constexpr uint64_t starvation_clean_offset =
+          starvation_offset + starvation_count * starvation_stride;
+      const auto starvation_clean = cache.FindBuffer(
+          base + starvation_clean_offset, sizeof(starvation_value));
+      Require(name, "normal-GC clean candidate",
+              static_cast<bool>(starvation_clean),
+              "failed to create the clean starvation candidate");
+      for (uint32_t tick = 0; tick <= 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, 0, std::numeric_limits<uint64_t>::max());
+      cache.RunGarbageCollector();
+      Require(
+          name, "normal-GC dirty bypass",
+          cache.IsRegionRegistered(base + starvation_offset,
+                                   sizeof(starvation_value)) &&
+              cache.IsRegionRegistered(
+                  base + starvation_offset +
+                      (starvation_count - 1) * starvation_stride,
+                  sizeof(starvation_value)) &&
+              !cache.IsRegionRegistered(base + starvation_clean_offset,
+                                        sizeof(starvation_value)),
+          "old dirty owners hid an eligible clean Buffer from normal GC");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+      const auto starvation_retired =
+          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
+      cache.RunGarbageCollector();
+      Require(name, "critical-GC starvation cleanup",
+              !cache.IsRegionRegistered(base + starvation_offset,
+                                        sizeof(starvation_value)) &&
+                  !cache.IsRegionRegistered(
+                      base + starvation_offset +
+                          (starvation_count - 1) * starvation_stride,
+                      sizeof(starvation_value)) &&
+                  !BufferCacheTestAccess::IsBufferAllocated(
+                      cache, starvation_retired),
+              "critical GC did not immediately free the skipped dirty owners");
 
       auto unmap_allocation = cache.ObtainBuffer(
           base + unmap_offset, sizeof(unmap_value), true, false);
@@ -3224,7 +3304,7 @@ public:
       DestroyBuffer(&partial_unmap_readback);
 
       constexpr uint64_t large_offset = 0x10000;
-      constexpr uint64_t large_size = 31ull * 1024 * 1024;
+      constexpr uint64_t large_size = 33ull * 1024 * 1024;
       constexpr uint32_t large_value = 0x5aa55aa5u;
       constexpr uint32_t large_stale = 0x12345678u;
       std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
@@ -3239,17 +3319,16 @@ public:
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
-      Require(name, "near-capacity deferred retirement",
+      Require(name, "near-capacity synchronized retirement",
               !cache.IsRegionRegistered(base + large_offset, large_size),
               "near-capacity dirty Buffer survived pressured collection");
       uint32_t large_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + large_offset,
                                               &large_before_completion,
                                               sizeof(large_before_completion));
-      Require(name, "near-capacity backing remained deferred",
-              large_before_completion == large_stale,
-              "near-capacity Buffer GC published before its scheduler tick");
-      scheduler.FinishCurrent();
+      Require(name, "near-capacity backing publication",
+              large_before_completion == large_value,
+              "near-capacity Buffer GC retired ownership before publication");
       const auto large_image_source =
           cache.ObtainBufferForImage(base + large_offset, sizeof(large_value));
       Require(name, "fixed download after Buffer retirement",
@@ -3307,7 +3386,6 @@ public:
                       fixed_download &&
                   fixed_download->Handle() == fixed_download_handle,
               "GC aggregated disjoint retirees or replaced the download ring");
-      scheduler.FinishCurrent();
       uint32_t grouped_first_backing = 0;
       uint32_t grouped_second_backing = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + grouped_first_offset,
@@ -3341,7 +3419,7 @@ public:
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
-      Require(name, "disjoint deferred retirement",
+      Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
                                         disjoint_owner_size),
               "cross-page owner survived pressured collection");
@@ -3350,10 +3428,9 @@ public:
                                               &disjoint_before_unmap,
                                               sizeof(disjoint_before_unmap));
       Require(
-          name, "disjoint retirement remained deferred",
-          disjoint_before_unmap == disjoint_stale,
-          "whole-owner Buffer publication completed before synchronization");
-      scheduler.FinishCurrent();
+          name, "disjoint retirement publication",
+          disjoint_before_unmap == disjoint_value,
+          "whole-owner Buffer retired before publishing its dirty bytes");
       cache.UnmapMemory(base + disjoint_owner_offset + 0x4000, 0x4000);
       uint32_t disjoint_after_unmap = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + disjoint_dirty_offset,
@@ -3403,7 +3480,7 @@ public:
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
-      Require(name, "reacquire deferred retirement",
+      Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,
                                         reacquire_owner_size),
               "fresh cross-page owner survived pressured collection");
@@ -3411,10 +3488,9 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + reacquire_dirty_offset,
                                               &reacquire_before,
                                               sizeof(reacquire_before));
-      Require(name, "reacquire publication remained deferred",
-              reacquire_before == reacquire_stale,
-              "fresh whole-owner publication completed before reacquisition");
-      scheduler.FinishCurrent();
+      Require(name, "reacquire publication completed",
+              reacquire_before == reacquire_value,
+              "fresh whole-owner ownership retired before publication");
       auto reacquired =
           cache.ObtainBuffer(base + reacquire_disjoint_offset,
                              sizeof(reacquire_value), true, false);

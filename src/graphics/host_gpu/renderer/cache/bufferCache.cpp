@@ -16,6 +16,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -432,19 +433,77 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	std::vector<std::pair<uint64_t, uint64_t>> uploads;
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	vk::Buffer                  source;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
-	    [&]() noexcept {
-		    for (const auto& [address, bytes]: uploads) {
-			    WriteDataBuffer(buffer, address, reinterpret_cast<const void*>(address), bytes);
-		    }
-	    });
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+		    total_size += bytes;
+	    },
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (source) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		vk::BufferMemoryBarrier before {};
+		before.sType         = vk::StructureType::eBufferMemoryBarrier;
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                       vk::AccessFlagBits::eTransferRead |
+		                       vk::AccessFlagBits::eTransferWrite;
+		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data());
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
+}
+
+vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+                                     uint64_t total_size) {
+	if (copies.empty()) {
+		return nullptr;
+	}
+
+	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	if (mapped != nullptr) {
+		for (auto& copy: copies) {
+			const auto address = buffer.CpuAddress() + copy.dstOffset;
+			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			copy.srcOffset += base_offset;
+		}
+		m_staging_buffer.Commit();
+		return m_staging_buffer.Handle();
+	}
+
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	for (const auto& copy: copies) {
+		const auto address = buffer.CpuAddress() + copy.dstOffset;
+		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
+		            reinterpret_cast<const void*>(address), copy.size);
+	}
+	temporary->Flush(0, total_size);
+	const auto handle = temporary->Handle();
+	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return handle;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,

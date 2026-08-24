@@ -1251,7 +1251,10 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	program->dbg_print_reloc = true;
 
-	rt->RelocateProgram(program);
+	// Loading a module can satisfy imports in programs that were already relocated. This is
+	// especially important after StopUnloadModule: unloading replaces those bindings with
+	// stubs, so relocating only the new module leaves its callers permanently stubbed.
+	rt->RelocateAll();
 
 	int result = rt->StartModule(program, args, argp, nullptr);
 

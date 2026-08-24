@@ -3681,6 +3681,16 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
+// Guards the guest address-space registry (ProtectTransient iterates it). The GPU protection
+// sweeps hold this mutex before any region-tracking lock so the mprotect inside a sweep never
+// takes it while a region lock is held, avoiding a lock-order inversion with a guest thread that
+// faults on its own stack (swept read-only by the GPU) while executing a syscall that holds this
+// same mutex. The mutex is recursive because a sweep both acquires it and runs an mprotect that
+// re-acquires it on the same thread.
+std::recursive_mutex& GetGuestAddressSpaceMutex() {
+	return g_guest_address_space->GetMutex();
+}
+
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 

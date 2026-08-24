@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -36,8 +37,16 @@ public:
 		CheckNotInUploadCallback();
 		ValidateRange(vaddr, size);
 
+		// The protection update below runs an mprotect (ProtectGuestHostMemory) that iterates the
+		// guest-address-space registry. Hold its mutex before taking the region-tracking lock so
+		// the mprotect never acquires it while a region lock is held; otherwise a guest thread
+		// that faults on its own stack (swept read-only by the GPU) while holding that mutex in a
+		// syscall deadlocks against the thread performing the sweep. The guard is scoped to the
+		// region-lock section: on_flush hands work to the GPU thread (SendCommandSync) and must
+		// run with no tracking locks held.
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
+				std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
@@ -68,6 +77,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
+		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 		std::vector<RegionManager*> managers;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
 			managers.push_back(manager);
@@ -108,6 +118,9 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
+		// See InvalidateRegion: the sweep mprotects inside the region locks, so the guest
+		// address-space mutex must be held first to keep the lock order consistent.
+		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {

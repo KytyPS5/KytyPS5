@@ -269,6 +269,7 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
+		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
 		return;
 	}
@@ -294,6 +295,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	}
 	const auto size  = image.track_addr - image_begin;
 	image.track_addr = image_begin;
+	std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
 }
 
@@ -312,6 +314,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	const auto address   = image.track_addr_end;
 	const auto size      = image_end - address;
 	image.track_addr_end = image_end;
+	std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 	m_page_manager.UpdatePageWatchers<true>(address, size);
 }
 
@@ -325,6 +328,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
 	if (size != 0) {
+		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
 }
@@ -342,6 +346,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 		MarkAsMaybeDirty(id, image);
 	}
 	if (size != 0) {
+		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 		m_page_manager.UpdatePageWatchers<false>(begin, size);
 	}
 }
@@ -359,6 +364,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 		MarkAsMaybeDirty(id, image);
 	}
 	if (size != 0) {
+		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
 		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
 }

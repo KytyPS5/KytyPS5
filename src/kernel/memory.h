@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <mutex>
+
 namespace Libs::Graphics {
 class GpuResourceManager;
 enum class PageFaultAccess;
@@ -182,6 +184,9 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// Recursive mutex guarding the guest address-space mapping registry. GPU protection sweeps must
+// hold it before acquiring region-tracking locks; see the implementation for the rationale.
+std::recursive_mutex& GetGuestAddressSpaceMutex();
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

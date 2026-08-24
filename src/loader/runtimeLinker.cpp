@@ -1163,7 +1163,6 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				prefix_count++;
 			}
 
-			const size_t inst_size = prefix_count + Jit::Call9::GetSize();
 			if (inst_ptr + Jit::Call9::GetSize() > start_ptr + size) {
 				break;
 			}
@@ -1172,20 +1171,19 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
 			    inst_ptr[4] == tls_pattern[4] &&
 			    *reinterpret_cast<const uint32_t*>(inst_ptr + 5) == 0) {
-				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(ptr));
+				LOGF("Patch tls at addr: [%016" PRIx64 "]\n",
+				     reinterpret_cast<uint64_t>(inst_ptr));
 
 				const auto reg = (modrm >> 3u) & 7u;
 				EXIT_NOT_IMPLEMENTED(reg == 4u);
 
-				auto* code = new (ptr) Jit::Call9;
+				// Preserve leading 0x66 bytes: a raw scan can encounter one in the preceding
+				// instruction before reaching the actual fs load.
+				auto* code = new (inst_ptr) Jit::Call9;
 				code->SetFunc(reg == 0
 				                  ? program->tls.handler_vaddr
 				                  : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg));
-				if (inst_size > Jit::Call9::GetSize()) {
-					std::memset(ptr + Jit::Call9::GetSize(), 0x90,
-					            inst_size - Jit::Call9::GetSize());
-				}
-				ptr += inst_size - 1;
+				ptr += prefix_count + Jit::Call9::GetSize() - 1;
 			}
 		}
 	}

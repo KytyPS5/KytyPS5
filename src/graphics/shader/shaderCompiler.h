@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -14,9 +15,12 @@ struct ShaderParams {
 	std::span<const uint32_t> code;
 	std::span<const uint32_t> user_data;
 	uint64_t                  hash = 0;
+	// Set when `code` is assembled on the host rather than viewed in guest memory, so the
+	// program is still identified by the guest address the shader was launched from.
+	uint64_t                  base_override = 0;
 
 	[[nodiscard]] uint64_t Base() const {
-		return reinterpret_cast<uint64_t>(code.data());
+		return base_override != 0 ? base_override : reinterpret_cast<uint64_t>(code.data());
 	}
 };
 
@@ -47,6 +51,19 @@ vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
                                 ShaderPixelInputInfo& input_info);
 vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
                                 ShaderComputeInputInfo& input_info);
+
+// A merged NGG ES+GS pair compiles to a mesh stage. Preparing the params is enough to look the
+// program up; the two halves are only assembled on a cache miss, and `code` must then outlive
+// the `params` that view it. Every step is fallible: an unsupported pair leaves the draw to the
+// ordinary vertex path instead of terminating the emulator.
+bool PrepareMeshProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                        const MeshDispatch& dispatch, MeshInputTopology topology, bool indexed,
+                        ShaderVertexInputInfo& input_info, ShaderParams& params,
+                        std::string* error);
+bool AssembleMeshProgram(const HW::VertexShaderInfo& regs, std::vector<uint32_t>& code,
+                         ShaderParams& params, std::string* error);
+vk::ShaderModule CompileMeshProgram(vk::Device device, const ShaderParams& params,
+                                    ShaderVertexInputInfo& input_info, std::string* error);
 
 } // namespace Libs::Graphics
 

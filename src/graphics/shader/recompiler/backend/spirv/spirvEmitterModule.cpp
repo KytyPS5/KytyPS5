@@ -187,6 +187,10 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.flattened_srt_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::MeshIndices) != nullptr) {
+		state.mesh_index_variable = state.builder.DefineGlobalVariable(
+		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
+	}
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
 		const auto view    = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
 		const bool integer = i >= SampledImageViewKindCount;
@@ -424,6 +428,11 @@ void AllocateInputVariables(EmitterState& state) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
+	if (state.logical_wave64 &&
+	    InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex) == 0) {
+		state.local_invocation_index_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.local_invocation_index_variable);
+	}
 }
 
 static uint32_t AllocateInterfaceVariable(EmitterState& state) {
@@ -461,6 +470,9 @@ void AllocateOutputVariables(EmitterState& state) {
 				state.cull_distance_count = std::max(state.cull_distance_count, binding.index + 1);
 				break;
 			case IR::StageOutputKind::Layer:
+				if (state.stage == ShaderType::Mesh) {
+					break;
+				}
 				binding.variable_id = AllocateSharedOutputVariable(state, state.layer_variable);
 				break;
 			case IR::StageOutputKind::Depth:
@@ -476,6 +488,20 @@ void AllocateOutputVariables(EmitterState& state) {
 				break;
 		}
 	}
+	if (state.stage == ShaderType::Mesh) {
+		state.mesh_prim_indices_variable = AllocateInterfaceVariable(state);
+		state.mesh_layer_variable = AllocateInterfaceVariable(state);
+		state.mesh_cull_variable  = AllocateInterfaceVariable(state);
+		AllocateSharedOutputVariable(state, state.per_vertex_variable);
+	}
+}
+
+uint32_t MeshOutputVertices(const EmitterState& state) {
+	return std::max(state.input_info.vertex->mesh_output_vertices, 1u);
+}
+
+uint32_t MeshOutputPrimitives(const EmitterState& state) {
+	return std::max(state.input_info.vertex->mesh_output_primitives, 1u);
 }
 
 uint32_t BuiltInForInput(IR::StageInputKind kind) {
@@ -534,6 +560,21 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 }
 
 void AddOutputAnnotationsAndNames(EmitterState& state) {
+	if (state.mesh_prim_indices_variable != 0) {
+		state.builder.AddName(state.mesh_prim_indices_variable, "gl_PrimitiveTriangleIndicesEXT");
+		state.builder.AddAnnotation({OpDecorate, state.mesh_prim_indices_variable,
+		                             DecorationBuiltIn, BuiltInPrimitiveTriangleIndicesEXT});
+		state.builder.AddName(state.mesh_layer_variable, "gl_Layer");
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.mesh_layer_variable, DecorationBuiltIn, BuiltInLayer});
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.mesh_layer_variable, DecorationPerPrimitiveEXT});
+		state.builder.AddName(state.mesh_cull_variable, "gl_CullPrimitiveEXT");
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.mesh_cull_variable, DecorationBuiltIn, BuiltInCullPrimitiveEXT});
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.mesh_cull_variable, DecorationPerPrimitiveEXT});
+	}
 	if (state.per_vertex_variable != 0) {
 		state.builder.AddName(PerVertexType(state), "gl_PerVertex");
 		state.builder.AddName(state.per_vertex_variable, "outPerVertex");
@@ -640,6 +681,10 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	if (state.gds_variable != 0) {
 		Decorate(state.gds_variable, "gds", IR::DescriptorBindingKind::Gds);
 	}
+	if (state.mesh_index_variable != 0) {
+		Decorate(state.mesh_index_variable, "mesh_indices",
+		         IR::DescriptorBindingKind::MeshIndices);
+	}
 	if (state.flattened_srt_variable != 0) {
 		Decorate(state.flattened_srt_variable, "flattened_srt",
 		         IR::DescriptorBindingKind::FlattenedSrt);
@@ -712,6 +757,12 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
+	if (state.stage == ShaderType::Mesh) {
+		state.builder.RequireVersion(SpirvVersion15);
+		state.builder.RequireCapability(CapabilityMeshShadingEXT);
+		state.builder.RequireCapability(CapabilityShaderLayer);
+		state.builder.RequireExtension("SPV_EXT_mesh_shader");
+	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
 	state.builder.AddMemoryModel(
 	    {state.program.info.uses_dma ? AddressingModelPhysicalStorageBuffer64
@@ -732,6 +783,15 @@ void DefineModule(EmitterState& state) {
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		state.builder.AddExecutionMode(
 		    {state.main_func, ExecutionModeLocalSize, local_x, local_y, local_z});
+	}
+	if (state.stage == ShaderType::Mesh) {
+		state.builder.AddExecutionMode(
+		    {state.main_func, ExecutionModeLocalSize, state.wave_size, 1u, 1u});
+		state.builder.AddExecutionMode(
+		    {state.main_func, ExecutionModeOutputVertices, MeshOutputVertices(state)});
+		state.builder.AddExecutionMode(
+		    {state.main_func, ExecutionModeOutputPrimitivesEXT, MeshOutputPrimitives(state)});
+		state.builder.AddExecutionMode({state.main_func, ExecutionModeOutputTrianglesEXT});
 	}
 	if (state.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode({state.main_func, ExecutionModeOriginUpperLeft});
@@ -804,9 +864,29 @@ void DefineModule(EmitterState& state) {
 		state.builder.DefineGlobalVariable(input.variable_id, ptr_type, StorageClassInput);
 	}
 	if (state.per_vertex_variable != 0) {
-		state.builder.DefineGlobalVariable(
-		    state.per_vertex_variable, TypePointer(state, StorageClassOutput, PerVertexType(state)),
-		    StorageClassOutput);
+		const auto per_vertex =
+		    state.stage == ShaderType::Mesh
+		        ? state.builder.Type(OpTypeArray, {PerVertexType(state),
+		                                           ConstantU32(state, MeshOutputVertices(state))})
+		        : PerVertexType(state);
+		state.builder.DefineGlobalVariable(state.per_vertex_variable,
+		                                   TypePointer(state, StorageClassOutput, per_vertex),
+		                                   StorageClassOutput);
+	}
+	if (state.mesh_prim_indices_variable != 0) {
+		const auto count   = ConstantU32(state, MeshOutputPrimitives(state));
+		const auto indices = state.builder.Type(OpTypeArray, {TypeU32Vector(state, 3), count});
+		state.builder.DefineGlobalVariable(state.mesh_prim_indices_variable,
+		                                   TypePointer(state, StorageClassOutput, indices),
+		                                   StorageClassOutput);
+		const auto layers = state.builder.Type(OpTypeArray, {TypeI32(state), count});
+		state.builder.DefineGlobalVariable(state.mesh_layer_variable,
+		                                   TypePointer(state, StorageClassOutput, layers),
+		                                   StorageClassOutput);
+		const auto culls = state.builder.Type(OpTypeArray, {TypeBool(state), count});
+		state.builder.DefineGlobalVariable(state.mesh_cull_variable,
+		                                   TypePointer(state, StorageClassOutput, culls),
+		                                   StorageClassOutput);
 	}
 	if (state.point_size_variable != 0) {
 		state.builder.DefineGlobalVariable(
@@ -835,12 +915,18 @@ void DefineModule(EmitterState& state) {
 	for (const auto& binding: state.outputs) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
 		    binding.kind == IR::StageOutputKind::Mrt) {
-			const auto pointer_type =
+			auto value_type =
 			    binding.kind == IR::StageOutputKind::Mrt && MrtUsesUintOutput(state, binding.index)
-			        ? TypePointer(state, StorageClassOutput, TypeU32Vector(state, 4))
-			        : TypePointer(state, StorageClassOutput, TypeF32Vector(state, 4));
-			state.builder.DefineGlobalVariable(binding.variable_id, pointer_type,
-			                                   StorageClassOutput);
+			        ? TypeU32Vector(state, 4)
+			        : TypeF32Vector(state, 4);
+			if (state.stage == ShaderType::Mesh &&
+			    binding.kind == IR::StageOutputKind::Parameter) {
+				value_type = state.builder.Type(
+				    OpTypeArray, {value_type, ConstantU32(state, MeshOutputVertices(state))});
+			}
+			state.builder.DefineGlobalVariable(
+			    binding.variable_id, TypePointer(state, StorageClassOutput, value_type),
+			    StorageClassOutput);
 		}
 	}
 	if (state.depth_variable != 0) {

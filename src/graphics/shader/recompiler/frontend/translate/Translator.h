@@ -9,9 +9,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
-	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size)
+	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size,
+	           bool logical_wave64 = false)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      current_wave_size(wave_size) {}
+	      current_wave_size(wave_size), current_logical_wave64(logical_wave64) {}
 
 	bool TranslateInstruction(const Decoder::Instruction& inst, std::string* error);
 	bool TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -29,7 +30,7 @@ private:
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
 	IR::Value              ReadOperand(const Decoder::Operand& operand, IR::Type type);
-	IR::U1                 ThreadBit(IR::U32 low);
+	IR::U1                 ThreadBit(IR::U32 low, IR::U32 high);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
@@ -250,10 +251,11 @@ private:
 
 	IR::Program&    program;
 	IR::IREmitter   ir;
-	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
-	uint32_t        current_pc           = 0;
-	uint32_t        current_vector_limit = 1;
-	uint32_t        current_wave_size    = 64;
+	Decoder::Opcode current_opcode         = Decoder::Opcode::UNKNOWN;
+	uint32_t        current_pc             = 0;
+	uint32_t        current_vector_limit   = 1;
+	uint32_t        current_wave_size      = 64;
+	bool            current_logical_wave64 = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

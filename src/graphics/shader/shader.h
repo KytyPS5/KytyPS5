@@ -33,7 +33,10 @@ struct ComputeShaderInfo;
 struct ShaderRegisters;
 } // namespace HW
 
-enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute };
+enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute, Mesh };
+
+struct MeshDispatch;
+enum class MeshInputTopology;
 
 namespace ShaderRecompiler::IR {
 struct Program;
@@ -86,6 +89,20 @@ struct ShaderVertexInputInfo {
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// Guest wave size for this stage, decoded from VGT_SHADER_STAGES_EN. Part of the shader id,
+	// so a wave32 and a wave64 build of one program never share a pipeline.
+	uint32_t                wave_size           = 64;
+
+	uint32_t                mesh_vertices_per_workgroup   = 0;
+	uint32_t                mesh_primitives_per_workgroup = 0;
+	uint32_t                mesh_last_group_index         = 0;
+	uint32_t                mesh_last_vertices            = 0;
+	uint32_t                mesh_last_primitives          = 0;
+	uint32_t                mesh_output_vertices          = 0;
+	uint32_t                mesh_output_primitives        = 0;
+	uint32_t                mesh_topology                 = 0;
+	bool                    mesh_indexed                  = false;
+	uint32_t                mesh_lds_size_dwords          = 0;
 };
 
 struct ShaderComputeInputInfo {

@@ -57,6 +57,7 @@ enum class Opcode {
 	S_ANDN1_SAVEEXEC_B64,
 	S_NOT_B32,
 	S_NOT_B64,
+	S_WQM_B32,
 	S_WQM_B64,
 	S_ADD_U32,
 	S_ADDC_U32,
@@ -698,6 +699,10 @@ Family GetInstructionFamily(uint32_t word);
 bool DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
                        std::string* error);
 bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error);
+
+bool InstructionWritesDestination(const Instruction& inst);
+uint32_t InstructionSourceRegisterCount(const Instruction& inst, uint32_t index);
+bool InstructionReadsDestination(const Instruction& inst);
 
 bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
 bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::string* error);

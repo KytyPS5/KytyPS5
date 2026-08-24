@@ -9024,12 +9024,21 @@ public:
       auto storage_redirected =
           executor.PrepareBindings(stencil_storage_runtime);
       executor.RebindImages(storage_redirected);
-      Require(
-          name, "storage stencil acquisition",
-          storage_redirected.resources.images[0].image_id == depth_id &&
-              storage_redirected.resources.images[0].image_view != nullptr &&
-              texture_cache.GetImage(depth_id).usage.storage,
-          "storage stencil binding did not acquire the associated depth owner");
+      // A storage binding is the one case that must NOT redirect to the depth owner: a depth
+      // image is never created with VK_IMAGE_USAGE_STORAGE_BIT, so the shader writes the plane's
+      // own colour image and the result is copied into the depth image's stencil aspect
+      // afterwards.
+      const auto storage_stencil_id =
+          storage_redirected.resources.images[0].image_id;
+      Require(name, "storage stencil acquisition",
+              storage_stencil_id != depth_id &&
+                  storage_redirected.resources.images[0].image_view !=
+                      nullptr &&
+                  texture_cache.GetImage(storage_stencil_id).depth_id ==
+                      depth_id &&
+                  texture_cache.GetImage(storage_stencil_id).usage.storage &&
+                  !texture_cache.GetImage(depth_id).usage.storage,
+              "storage stencil binding did not stay on the plane's own image");
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -19325,7 +19334,7 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+  test.required_spirv = {"OpImageSampleExplicitLod", "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
 }
@@ -19369,7 +19378,7 @@ TestCase ImageGatherCompareOpcodes() {
       O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
       O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
       O::S_ENDPGM};
-  test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
+  test.required_spirv = {"OpImageGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
 }

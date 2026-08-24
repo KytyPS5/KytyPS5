@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderMergedGeometry.h"
 
 #include <algorithm>
 #include <array>
@@ -111,8 +112,12 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
-	return {ir.Select(value, IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))),
-	        IR::U32(IR::Value(0u))};
+	if (!current_logical_wave64) {
+		return {ir.Select(value, IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))),
+		        IR::U32(IR::Value(0u))};
+	}
+	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {value});
+	return {IR::U32(ir.CompositeExtract(ballot, 0)), IR::U32(ir.CompositeExtract(ballot, 1))};
 }
 
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
@@ -286,7 +291,7 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
 			ir.SetScalarReg(reg, value);
-			ir.SetThreadBitScalarReg(reg, ThreadBit(value));
+			ir.SetThreadBitScalarReg(reg, ir.INotEqual(value, IR::U32(IR::Value(0u))));
 			ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 			if (IR::RegIndex(reg) > 0u) {
 				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(IR::RegIndex(reg) - 1u),
@@ -315,20 +320,20 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		}
 		case Decoder::OperandKind::VccLo:
 			ir.SetVccLo(IR::U32(value));
-			ir.SetVcc(ThreadBit(IR::U32(value)));
+			ir.SetVcc(ThreadBit(IR::U32(value), ir.GetVccHi()));
 			break;
 		case Decoder::OperandKind::VccHi:
 			ir.SetVccHi(IR::U32(value));
-			ir.SetVcc(ThreadBit(ir.GetVccLo()));
+			ir.SetVcc(ThreadBit(ir.GetVccLo(), IR::U32(value)));
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
 		case Decoder::OperandKind::ExecLo:
 			ir.SetExecLo(IR::U32(value));
-			ir.SetExec(ThreadBit(IR::U32(value)));
+			ir.SetExec(ThreadBit(IR::U32(value), ir.GetExecHi()));
 			break;
 		case Decoder::OperandKind::ExecHi:
 			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit(ir.GetExecLo()));
+			ir.SetExec(ThreadBit(ir.GetExecLo(), IR::U32(value)));
 			break;
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
@@ -583,7 +588,7 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	if (operand.kind == Decoder::OperandKind::Null) {
 		return;
 	}
-	const auto thread_bit = ThreadBit(value[0]);
+	const auto thread_bit = ThreadBit(value[0], value[1]);
 	switch (operand.kind) {
 		case Decoder::OperandKind::ExecLo:
 			ir.SetExec(thread_bit);
@@ -602,8 +607,21 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	WriteRawU32(OffsetOperand(operand, 1), value[1]);
 }
 
-IR::U1 Translator::ThreadBit(IR::U32 low) {
-	return ir.INotEqual(low, IR::U32(IR::Value(0u)));
+IR::U1 Translator::ThreadBit(IR::U32 low, IR::U32 high) {
+	if (!current_logical_wave64) {
+		return ir.INotEqual(low, IR::U32(IR::Value(0u)));
+	}
+	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	auto       word = low;
+	if (current_wave_size == 64u) {
+		const auto high_lane =
+		    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {lane, IR::Value(32u)}));
+		word = ir.Select(high_lane, high, low);
+	}
+	const auto bit =
+	    ir.BitwiseAnd(ir.ShiftRightLogical(word, ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)))),
+	                  IR::U32(IR::Value(1u)));
+	return ir.INotEqual(bit, IR::U32(IR::Value(0u)));
 }
 
 IR::U1 Translator::ReadCondition(const Decoder::Operand& operand) {
@@ -628,6 +646,15 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
+			if (current_logical_wave64) {
+				// The logical mask spans two scalar registers, so read the pair rather than the
+				// per-invocation bit the host subgroup would carry.
+				const auto high =
+				    current_wave_size == 64u && IR::RegIndex(reg) + 1u < IR::NumScalarRegs
+				        ? ir.GetScalarReg(static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u))
+				        : IR::U32(IR::Value(0u));
+				return ThreadBit(ir.GetScalarReg(reg), high);
+			}
 			return ir.GetThreadBitScalarReg(reg);
 		}
 		case Decoder::OperandKind::ExecLo:
@@ -771,15 +798,26 @@ bool Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	}
 	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
 	// invocations leave the region without reconstructing a host-subgroup mask.
-	IR::U1 condition;
+	IR::U1     condition;
+	const auto mask_non_zero = [&](IR::U1 value) -> IR::U1 {
+		if (!current_logical_wave64) {
+			return value;
+		}
+		const auto mask = BallotMask(value);
+		return ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u)));
+	};
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero:
+			condition = ir.LogicalNot(mask_non_zero(ir.GetVcc()));
+			break;
+		case CFG::BranchCondition::VccNonZero: condition = mask_non_zero(ir.GetVcc()); break;
+		case CFG::BranchCondition::ExecZero:
+			condition = ir.LogicalNot(mask_non_zero(ir.GetExec()));
+			break;
+		case CFG::BranchCondition::ExecNonZero: condition = mask_non_zero(ir.GetExec()); break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				return Fail(error,
@@ -968,6 +1006,11 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 		result.info.vertex_offset_sgpr = options.embedded_fetch->vertex_offset_sgpr;
 	}
 
+	// A merged geometry wave is 64 lanes wide whatever the host subgroup is, so its masks have to
+	// be carried in the raw EXEC/VCC halves rather than in a per-invocation bit.
+	const bool logical_wave64 =
+	    options.stage == ShaderType::Mesh && options.wave_size == 64u;
+
 	uint32_t vector_limit = 1u;
 	for (const auto& cfg_block: cfg.blocks) {
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
@@ -1041,8 +1084,83 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 			entry_ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 		}
 		entry_ir.SetExec(IR::U1(IR::Value(true)));
-		entry_ir.SetExecLo(IR::U32(IR::Value(1u)));
-		entry_ir.SetExecHi(IR::U32(IR::Value(0u)));
+		entry_ir.SetExecLo(IR::U32(IR::Value(logical_wave64 ? 0xffffffffu : 1u)));
+		entry_ir.SetExecHi(
+		    IR::U32(IR::Value(logical_wave64 && options.wave_size > 32u ? 0xffffffffu : 0u)));
+		if (options.stage == ShaderType::Mesh) {
+			// s3 is the merged wave info: [7:0] ES vertex count, [15:8] GS primitive count,
+			// [27:24] wave id, [31:28] waves in the workgroup.
+			const auto* vs = options.vertex;
+			if (vs == nullptr || vs->mesh_vertices_per_workgroup == 0 ||
+			    vs->mesh_primitives_per_workgroup == 0) {
+				return Fail(error, "mesh stage reached without a dispatch split: the draw must "
+				                   "supply per-workgroup vertex and primitive counts");
+			}
+			if (vs->mesh_vertices_per_workgroup % vs->mesh_primitives_per_workgroup != 0) {
+				return Fail(
+				    error, "a mesh workgroup's vertices must divide evenly among its primitives");
+			}
+			const auto group   = builtin(IR::StageInputKind::WorkgroupId, 0);
+			const auto is_last = entry_ir.IEqual(group, IR::U32(IR::Value(vs->mesh_last_group_index)));
+			const auto vertex_count =
+			    entry_ir.Select(is_last, IR::U32(IR::Value(vs->mesh_last_vertices)),
+			                    IR::U32(IR::Value(vs->mesh_vertices_per_workgroup)));
+			const auto primitive_count =
+			    entry_ir.Select(is_last, IR::U32(IR::Value(vs->mesh_last_primitives)),
+			                    IR::U32(IR::Value(vs->mesh_primitives_per_workgroup)));
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(3),
+			    entry_ir.BitwiseOr(
+			        entry_ir.BitwiseOr(
+			            vertex_count,
+			            entry_ir.ShiftLeftLogical(primitive_count, IR::U32(IR::Value(8u)))),
+			        IR::U32(IR::Value(1u << 28u))));
+
+			const auto lane = builtin(IR::StageInputKind::LocalInvocationIndex);
+			const auto slot = entry_ir.IAdd(
+			    entry_ir.IMul(group, IR::U32(IR::Value(vs->mesh_vertices_per_workgroup))), lane);
+
+			const auto verts_per_prim =
+			    vs->mesh_vertices_per_workgroup / vs->mesh_primitives_per_workgroup;
+			IR::U32 index_position = slot;
+			if (static_cast<MeshInputTopology>(vs->mesh_topology) ==
+			    MeshInputTopology::TriangleStrip) {
+				const auto prim = entry_ir.UDiv(slot, IR::U32(IR::Value(verts_per_prim)));
+				const auto corner =
+				    entry_ir.ISub(slot, entry_ir.IMul(prim, IR::U32(IR::Value(verts_per_prim))));
+				const auto swap    = entry_ir.BitwiseAnd(prim, IR::U32(IR::Value(1u)));
+				const auto swapped = entry_ir.Select(entry_ir.IEqual(corner, IR::U32(IR::Value(2u))),
+				                                     corner, entry_ir.BitwiseXor(corner, swap));
+				index_position     = entry_ir.IAdd(prim, swapped);
+			}
+			const auto vertex_index =
+			    vs->mesh_indexed
+			        ? IR::U32(entry_ir.Emit(IR::ValueOpcode::ReadMeshIndex, {index_position}))
+			        : index_position;
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), vertex_index);
+
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+			                      builtin(IR::StageInputKind::WorkgroupId, 1));
+
+			// v0/v1 name the input vertices lane `p` assembles: a vertex sits at bit 2 of each
+			// 16-bit half, the hardware's ES vertex offset in dwords.
+			const auto first_slot = entry_ir.IMul(lane, IR::U32(IR::Value(verts_per_prim)));
+			// Two vertices to a register, low half then high half, as gs_vtx_offset0/1/2.
+			for (uint32_t reg = 0; reg * 2u < verts_per_prim; reg++) {
+				IR::U32 packed {IR::Value(0u)};
+				for (uint32_t half = 0; half < 2u; half++) {
+					const auto vertex = reg * 2u + half;
+					if (vertex >= verts_per_prim) {
+						break;
+					}
+					const auto vertex_slot = entry_ir.IAdd(first_slot, IR::U32(IR::Value(vertex)));
+					const auto field =
+					    entry_ir.ShiftLeftLogical(vertex_slot, IR::U32(IR::Value(half * 16u + 2u)));
+					packed = half == 0 ? field : entry_ir.BitwiseOr(packed, field);
+				}
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg), packed);
+			}
+		}
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.compute;
 			const auto  thread_ids =
@@ -1116,7 +1234,8 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto         typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size);
+		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size,
+		                      logical_wave64);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

@@ -131,6 +131,7 @@ static vk::ShaderStageFlags NativeShaderStage(ShaderType stage) {
 		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
 		case ShaderType::Pixel: return vk::ShaderStageFlagBits::eFragment;
 		case ShaderType::Compute: return vk::ShaderStageFlagBits::eCompute;
+		case ShaderType::Mesh: return vk::ShaderStageFlagBits::eMeshEXT;
 		default: EXIT("unknown native shader stage\n");
 	}
 }
@@ -807,7 +808,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
+	if (stencil_association && !storage) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
@@ -831,15 +832,7 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	ShaderSamplerResource descriptor;
 	CopyNativeDescriptor(value, descriptor.fields);
-	const bool depth_compare = std::any_of(program.info.sampled_pairs.begin(),
-	                                       program.info.sampled_pairs.end(), [&](const auto& pair) {
-		                                       return pair.sampler == index &&
-		                                              pair.image < program.info.images.size() &&
-		                                              program.info.images[pair.image].depth_compare;
-	                                       });
-	if (!depth_compare) {
-		descriptor.fields[0] &= ~(0x7u << 12u);
-	}
+	descriptor.fields[0] &= ~(0x7u << 12u);
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
@@ -853,6 +846,31 @@ static BufferView NativeUpload(RenderContext& context, std::span<const uint32_t>
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {.buffer = buffer.Handle(), .offset = offset, .range = data.size_bytes()};
+}
+
+void RenderExecutor::SetMeshIndices(const void* index_addr, uint32_t index_type_and_size,
+                                    uint32_t index_count) {
+	EXIT_IF(index_addr == nullptr || index_count == 0);
+	m_mesh_index_scratch.resize(index_count);
+	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
+		case Prospero::IndexType::kIndex8: {
+			const auto* indices = static_cast<const uint8_t*>(index_addr);
+			std::copy_n(indices, index_count, m_mesh_index_scratch.begin());
+			break;
+		}
+		case Prospero::IndexType::kIndex16: {
+			const auto* indices = static_cast<const uint16_t*>(index_addr);
+			std::copy_n(indices, index_count, m_mesh_index_scratch.begin());
+			break;
+		}
+		case Prospero::IndexType::kIndex32: {
+			const auto* indices = static_cast<const uint32_t*>(index_addr);
+			std::copy_n(indices, index_count, m_mesh_index_scratch.begin());
+			break;
+		}
+		default: EXIT("unsupported mesh index type: %u\n", index_type_and_size);
+	}
+	m_mesh_index_view = NativeUpload(m_context, m_mesh_index_scratch);
 }
 
 void RenderExecutor::TrackImageBinding(ImageId id) {
@@ -884,10 +902,14 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 void RenderExecutor::ResetBindings() {
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
+			if (image->binding.stencil_write) {
+				m_context.GetTextureCache().FlushStencilWrite(id);
+			}
 			image->binding = {};
 		}
 	}
 	m_bound_images.clear();
+	m_mesh_index_view = {};
 }
 
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
@@ -1081,10 +1103,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
-	constexpr auto GraphicsStages =
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	constexpr auto GraphicsStages = vk::ShaderStageFlagBits::eVertex |
+	                                vk::ShaderStageFlagBits::eFragment |
+	                                vk::ShaderStageFlagBits::eMeshEXT;
+	vk::ShaderStageFlags graphics_stages {};
+	for (const auto* prepared: prepared_bindings) {
+		if (prepared != nullptr && prepared->program != nullptr) {
+			graphics_stages |= NativeShaderStage(prepared->program->stage);
+		}
+	}
 	const auto push_constant_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-	                                      ? vk::ShaderStageFlags {GraphicsStages}
+	                                      ? graphics_stages
 	                                      : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
@@ -1129,21 +1158,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			if (storage && image.depth_id) {
+				image.binding.stencil_write = true;
+			}
 			if (image.info.data.Empty()) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              storage ? vk::AccessFlagBits2::eShaderRead |
 				                            vk::AccessFlagBits2::eShaderWrite
 				                      : vk::AccessFlagBits2::eShaderRead,
 				              range, vk_buffer);
-			} else if ((image.binding.force_general || image.binding.is_target) &&
-			           !image.info.IsDepth()) {
+			} else if (image.binding.force_general || image.binding.is_target) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
+				const auto attachment_access =
+				    image.info.IsDepth() ? vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+				                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+				                         : vk::AccessFlagBits2::eColorAttachmentRead |
+				                               vk::AccessFlagBits2::eColorAttachmentWrite;
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | storage_access |
-				                  vk::AccessFlagBits2::eColorAttachmentRead |
-				                  vk::AccessFlagBits2::eColorAttachmentWrite,
+				                  attachment_access,
 				              {}, vk_buffer);
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
@@ -1181,6 +1216,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					                             ? cache.GetBdaPageTableBuffer()
 					                             : cache.GetFaultBuffer();
 					m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0, bda_buffer->Size());
+					break;
+				}
+				case BindingKind::MeshIndices: {
+					if (m_mesh_index_view.buffer == nullptr) {
+						EXIT("a mesh program declares an index buffer the draw never supplied\n");
+					}
+					m_descriptor_buffers.emplace_back(m_mesh_index_view.buffer,
+					                                  m_mesh_index_view.offset,
+					                                  m_mesh_index_view.range);
 					break;
 				}
 				case BindingKind::FlattenedSrt:

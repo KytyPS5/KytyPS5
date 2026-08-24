@@ -80,6 +80,7 @@ VALUE_OPCODE(BitFieldUExtract, U32, U32, U32, U32)
 VALUE_OPCODE(BitFieldSExtract, U32, U32, U32, U32)
 VALUE_OPCODE(DppMoveU32, U32, U32, U1)
 VALUE_OPCODE(DppUpdateU32, U32, U32, U32, U1)
+VALUE_OPCODE(WqmU32, U32, U32)
 VALUE_OPCODE(WqmU64, U64, U64)
 VALUE_OPCODE(WqmMask, U1, U1)
 
@@ -200,6 +201,11 @@ VALUE_OPCODE(GetSamplerResource, SamplerResource, U32, U32, U32, U32)
 VALUE_OPCODE(MakeImageAddress, ImageAddress, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32,
              U32, U32)
 
+// One entry of the draw's index buffer, widened to a dword. Only a mesh program's synthesized
+// prologue emits this: the geometry engine would have read the index buffer to decide which guest
+// vertex each ES lane fetches, and a mesh dispatch has to do that read itself.
+VALUE_OPCODE(ReadMeshIndex, U32, U32)
+
 VALUE_OPCODE(ReadConst, U32, SrtResource, U32)
 VALUE_OPCODE(ReadConstBuffer, U32, BufferResource, U32)
 VALUE_OPCODE(LoadAddressU8, U8, AddressResource, U32, U32, U1)
@@ -280,7 +286,7 @@ VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 VALUE_OPCODE(ControlNop, Void)
 VALUE_OPCODE(Waitcnt, Void)
 VALUE_OPCODE(Barrier, Void)
-VALUE_OPCODE(Sendmsg, Void)
+VALUE_OPCODE(Sendmsg, Void, U32)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)

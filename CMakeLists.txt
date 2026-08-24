@@ -431,6 +431,25 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
+add_executable(shader_stages_en_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderStagesEnTests.cpp"
+)
+target_link_libraries(shader_stages_en_tests fmt::fmt)
+target_include_directories(shader_stages_en_tests PRIVATE ${inc_headers})
+
+add_executable(merged_geometry_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MergedGeometryTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderMergedGeometry.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ExportOps.cpp"
+)
+target_link_libraries(merged_geometry_tests fmt::fmt common)
+target_include_directories(merged_geometry_tests PRIVATE ${inc_headers})
+
 add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStageRuntimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -532,6 +551,8 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
+	add_test(NAME shader_stages_en COMMAND $<TARGET_FILE:shader_stages_en_tests>)
+	add_test(NAME merged_geometry COMMAND $<TARGET_FILE:merged_geometry_tests>)
 	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
@@ -586,6 +607,8 @@ if(BUILD_TESTING)
 		page_manager_tests
 		bit_array_tests
 		shader_vertex_metadata_tests
+		shader_stages_en_tests
+		merged_geometry_tests
 		shader_stage_runtime_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests

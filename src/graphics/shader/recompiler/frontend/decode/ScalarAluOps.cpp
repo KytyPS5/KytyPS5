@@ -39,6 +39,7 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x04u, Opcode::S_MOV_B64},
     {0x07u, Opcode::S_NOT_B32},
     {0x08u, Opcode::S_NOT_B64},
+    {0x09u, Opcode::S_WQM_B32},
     {0x0au, Opcode::S_WQM_B64},
     {0x0bu, Opcode::S_BREV_B32},
     {0x0fu, Opcode::S_BCNT1_I32_B32},
@@ -199,9 +200,14 @@ bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.family          = Family::SOPK;
 	inst.opcode_id       = opcode;
 	inst.opcode          = Detail::LookupOpcode(SOPK_OPS, opcode);
+	// The unsigned SOPK compares zero-extend SIMM16; only the signed forms sign-extend it.
+	const bool zero_extended =
+	    inst.opcode == Opcode::S_CMP_EQ_U32 || inst.opcode == Opcode::S_CMP_LG_U32 ||
+	    inst.opcode == Opcode::S_CMP_GT_U32 || inst.opcode == Opcode::S_CMP_GE_U32 ||
+	    inst.opcode == Opcode::S_CMP_LT_U32 || inst.opcode == Opcode::S_CMP_LE_U32;
 	inst.src0.kind       = OperandKind::IntegerInlineConstant;
-	inst.src0.signed_val = imm;
-	inst.src0.value      = static_cast<uint32_t>(imm);
+	inst.src0.signed_val = zero_extended ? static_cast<int32_t>(word & 0xffffu) : imm;
+	inst.src0.value      = zero_extended ? (word & 0xffffu) : static_cast<uint32_t>(imm);
 	inst.src_count       = 1;
 	SetRawWords(inst, code, word_index, 1);
 

@@ -19,6 +19,9 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eCompute) {
 		result |= vk::PipelineStageFlagBits::eComputeShader;
 	}
+	if (stages & vk::ShaderStageFlagBits::eMeshEXT) {
+		result |= vk::PipelineStageFlagBits::eMeshShaderEXT;
+	}
 	EXIT_IF(!result);
 	return result;
 }

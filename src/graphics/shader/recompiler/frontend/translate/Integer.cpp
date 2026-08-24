@@ -150,8 +150,15 @@ bool Translator::SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode
 		const auto arg_type = IR::ArgTypeOf(opcode, index);
 		const auto operand  = SourceAt(inst, reverse && index < 2u ? 1u - index : index);
 		args[index]         = ReadOperand(operand, arg_type == IR::Type::Void ? type : arg_type);
+		// The hardware takes the shift count modulo the operand width; SPIR-V leaves a shift of
+		// the width or more undefined.
 		if (mask_shift_count && index == 1u) {
 			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(31u)));
+		}
+		if (index == 1u && (opcode == IR::ValueOpcode::ShiftLeftLogical64 ||
+		                    opcode == IR::ValueOpcode::ShiftRightLogical64 ||
+		                    opcode == IR::ValueOpcode::ShiftRightArithmetic64)) {
+			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(63u)));
 		}
 	}
 	IR::Value result;

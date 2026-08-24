@@ -661,6 +661,51 @@ struct ShaderRegisters {
 	}
 };
 
+// VGT_SHADER_STAGES_EN. Only bits established by measurement are named; the low stage-enable field
+// is kept opaque and compared against observed values rather than split into sub-fields. The W32
+// bits are execution width, never pipeline shape, so they must not take part in a shape test.
+struct ShaderStagesEn {
+	static constexpr uint32_t PRIMGEN_EN      = 1u << 13u;
+	static constexpr uint32_t HS_W32_EN       = 1u << 21u;
+	static constexpr uint32_t GS_W32_EN       = 1u << 22u;
+	static constexpr uint32_t VS_W32_EN       = 1u << 23u;
+	static constexpr uint32_t NGG_PASSTHROUGH = 1u << 25u;
+
+	static constexpr uint32_t STAGE_ENABLES_MASK  = 0x00001FFFu;
+	static constexpr uint32_t STAGE_ENABLES_NONE  = 0x00000000u;
+	static constexpr uint32_t STAGE_ENABLES_ES_GS = 0x00000030u;
+
+	uint32_t raw             = 0;
+	uint32_t stage_enables   = 0;
+	bool     primgen_en      = false;
+	bool     ngg_passthrough = false;
+	bool     hs_w32_en       = false;
+	bool     gs_w32_en       = false;
+	bool     vs_w32_en       = false;
+
+	[[nodiscard]] bool IsNggVertexOnly() const {
+		return primgen_en && ngg_passthrough && stage_enables == STAGE_ENABLES_NONE;
+	}
+
+	[[nodiscard]] bool IsNggMergedEsGs() const {
+		return primgen_en && !ngg_passthrough && stage_enables == STAGE_ENABLES_ES_GS;
+	}
+
+	[[nodiscard]] uint32_t VertexWaveSize() const { return gs_w32_en ? 32u : 64u; }
+};
+
+[[nodiscard]] inline ShaderStagesEn DecodeShaderStages(uint32_t raw) {
+	ShaderStagesEn s;
+	s.raw             = raw;
+	s.stage_enables   = raw & ShaderStagesEn::STAGE_ENABLES_MASK;
+	s.primgen_en      = (raw & ShaderStagesEn::PRIMGEN_EN) != 0u;
+	s.ngg_passthrough = (raw & ShaderStagesEn::NGG_PASSTHROUGH) != 0u;
+	s.hs_w32_en       = (raw & ShaderStagesEn::HS_W32_EN) != 0u;
+	s.gs_w32_en       = (raw & ShaderStagesEn::GS_W32_EN) != 0u;
+	s.vs_w32_en       = (raw & ShaderStagesEn::VS_W32_EN) != 0u;
+	return s;
+}
+
 enum class UserSgprType { Unknown, Region, Vsharp };
 
 struct UserSgprInfo {
@@ -770,6 +815,9 @@ public:
 
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
 	[[nodiscard]] uint32_t GetShaderStages() const { return m_shader_stages; }
+	[[nodiscard]] ShaderStagesEn GetShaderStagesEn() const {
+		return DecodeShaderStages(m_shader_stages);
+	}
 
 	void SetDepthRenderTarget(const DepthRenderTarget& target) { m_depth_render_target = target; }
 	[[nodiscard]] const DepthRenderTarget& GetDepthRenderTarget() const {

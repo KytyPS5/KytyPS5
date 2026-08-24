@@ -1087,6 +1087,18 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    ctx.Memory(inst).planning_only) {
 		return true;
 	}
+	if (op == IR::ValueOpcode::ReadMeshIndex) {
+		if (state.mesh_index_variable == 0) {
+			ctx.Fail(inst, "requires the mesh index descriptor");
+			return true;
+		}
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                           state.mesh_index_variable, ConstantU32(state, 0),
+		                           ctx.Arg(inst, 0)});
+		ctx.Emit(inst, OpLoad, IR::Type::U32, {pointer});
+		return true;
+	}
 	if (op == IR::ValueOpcode::ReadConst) {
 		if (state.flattened_srt_variable == 0) {
 			ctx.Fail(inst, "requires the flattened SRT descriptor");

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -100,8 +101,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, rt.view.last_array_slice_index, render_target_slice_offset);
+	auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index,
+	                                  rt.view.last_array_slice_index, render_target_slice_offset);
 	switch (view.type) {
 		case TargetViewType::Image2D:
 		case TargetViewType::Image2DArray: break;
@@ -315,10 +316,18 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 	const uint32_t     view_depth  = std::max(depth >> rt.view.current_mip_level, 1u);
-	if (volume &&
-	    (view.base_layer >= view_depth || view.layer_count > view_depth - view.base_layer)) {
-		EXIT("3D render-target view exceeds mip depth: base=%u count=%u depth=%u mip=%u\n",
+	if (volume && view.base_layer >= view_depth) {
+		EXIT("3D render-target view starts past mip depth: base=%u count=%u depth=%u mip=%u\n",
 		     view.base_layer, view.layer_count, view_depth, rt.view.current_mip_level);
+	}
+	if (volume && view.layer_count > view_depth - view.base_layer) {
+		static std::once_flag warn_once;
+		std::call_once(warn_once, [&] {
+			LOGF("RenderColorTarget: clamping a 3D view of %u slices from base %u to a mip depth "
+			     "of %u\n",
+			     view.layer_count, view.base_layer, view_depth);
+		});
+		view.layer_count = view_depth - view.base_layer;
 	}
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);

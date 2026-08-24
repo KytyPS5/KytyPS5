@@ -170,6 +170,10 @@ U32 IREmitter::IMul(U32 lhs, U32 rhs) {
 	return U32(Emit(ValueOpcode::IMul32, {lhs, rhs}));
 }
 
+U32 IREmitter::UDiv(U32 lhs, U32 rhs) {
+	return U32(Emit(ValueOpcode::UDiv32, {lhs, rhs}));
+}
+
 U32 IREmitter::ShiftLeftLogical(U32 value, U32 shift) {
 	return U32(Emit(ValueOpcode::ShiftLeftLogical32, {value, shift}));
 }

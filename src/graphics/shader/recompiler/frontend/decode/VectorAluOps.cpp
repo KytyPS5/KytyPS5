@@ -1267,6 +1267,8 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::V_LDEXP_F32:
 		case Opcode::V_BFM_B32:
 		case Opcode::V_BCNT_U32_B32:
+		case Opcode::V_MBCNT_LO_U32_B32:
+		case Opcode::V_MBCNT_HI_U32_B32:
 		case Opcode::V_CVT_PKNORM_I16_F32:
 		case Opcode::V_CVT_PKNORM_U16_F32:
 		case Opcode::V_CVT_PK_U16_U32:

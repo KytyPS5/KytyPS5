@@ -66,6 +66,17 @@ bool UsesGds(const Program& program, bool& uses_gds) {
 	return true;
 }
 
+bool UsesMeshIndices(const Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ReadMeshIndex) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::string* error) {
@@ -167,6 +178,9 @@ bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::stri
 	    });
 	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
+	}
+	if (UsesMeshIndices(program)) {
+		AddBinding(next, DescriptorBindingKind::MeshIndices);
 	}
 
 	const auto push_dwords = (NativePushConstantSize - push_constant_offset) / sizeof(uint32_t);

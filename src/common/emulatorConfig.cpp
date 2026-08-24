@@ -113,6 +113,18 @@ bool StrictUnresolvedImportsEnabled() {
 	return g_config->strict_unresolved_imports;
 }
 
+std::filesystem::path GetUnresolvedImportReport() {
+	return g_config->unresolved_import_report;
+}
+
+int32_t GetUserId() {
+	return g_config->user_id;
+}
+
+const std::string& GetUserName() {
+	return g_config->user_name;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

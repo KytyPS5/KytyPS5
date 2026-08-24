@@ -68,6 +68,9 @@ static void PrintUsage() {
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --strict-unresolved-imports         Stop when an unresolved import is called.\n");
+	::printf("  --unresolved-import-report <path>   Write unresolved imports as JSON.\n");
+	::printf("  --user-id <positive integer>        Local UserService ID. Default: 1000.\n");
+	::printf("  --user-name <name>                  Local UserService name. Default: Kyty.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -120,6 +123,16 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = language;
+	return true;
+}
+
+static bool ParseUserId(const std::string& value, int32_t& out) {
+	int32_t user_id   = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), user_id);
+	if (error != std::errc {} || end != value.data() + value.size() || user_id <= 0) {
+		return false;
+	}
+	out = user_id;
 	return true;
 }
 
@@ -277,6 +290,23 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--unresolved-import-report") {
+			if (value.empty()) {
+				::printf("unresolved import report path cannot be empty\n");
+				return false;
+			}
+			options.config.unresolved_import_report = Common::FixFilenameSlash(value);
+		} else if (arg == "--user-id") {
+			if (!ParseUserId(value, options.config.user_id)) {
+				::printf("invalid user ID: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--user-name") {
+			if (value.empty() || value.size() > Config::MAX_USER_NAME_LENGTH) {
+				::printf("user name must contain 1-%zu bytes\n", Config::MAX_USER_NAME_LENGTH);
+				return false;
+			}
+			options.config.user_name = value;
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

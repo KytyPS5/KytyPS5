@@ -29,7 +29,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <limits>
 #include <memory>
+#include <nlohmann/json.hpp>
+#include <tuple>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -126,6 +129,72 @@ struct StubbedImportRecord {
 	std::string program;
 };
 
+static bool SameImport(const UnresolvedImportReportEntry& left,
+                       const UnresolvedImportReportEntry& right) {
+	return std::tie(left.program, left.nid, left.symbol, left.type, left.bind) ==
+	       std::tie(right.program, right.nid, right.symbol, right.type, right.bind);
+}
+
+bool WriteUnresolvedImportReportFile(
+    const std::filesystem::path&                    path,
+    const std::vector<UnresolvedImportReportEntry>& unresolved_imports) {
+	if (path.empty()) {
+		return false;
+	}
+
+	auto sorted = unresolved_imports;
+	std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
+		return std::tie(left.program, left.nid, left.symbol, left.type, left.bind) <
+		       std::tie(right.program, right.nid, right.symbol, right.type, right.bind);
+	});
+
+	std::vector<UnresolvedImportReportEntry> grouped;
+	for (const auto& entry: sorted) {
+		if (!grouped.empty() && SameImport(grouped.back(), entry)) {
+			grouped.back().relocation_sites += entry.relocation_sites;
+		} else {
+			grouped.push_back(entry);
+		}
+	}
+
+	nlohmann::ordered_json imports          = nlohmann::ordered_json::array();
+	uint64_t               relocation_sites = 0;
+	for (const auto& entry: grouped) {
+		imports.push_back({{"program", entry.program},
+		                   {"nid", entry.nid},
+		                   {"symbol", entry.symbol},
+		                   {"type", entry.type},
+		                   {"bind", entry.bind},
+		                   {"relocation_sites", entry.relocation_sites}});
+		relocation_sites += entry.relocation_sites;
+	}
+
+	nlohmann::ordered_json root   = {{"schema_version", 1},
+	                                 {"unique_imports", grouped.size()},
+	                                 {"relocation_sites", relocation_sites},
+	                                 {"imports", std::move(imports)}};
+	const auto             output = root.dump(2) + "\n";
+	if (output.size() > std::numeric_limits<uint32_t>::max()) {
+		return false;
+	}
+
+	const auto parent = path.parent_path();
+	if (!parent.empty() && !Common::File::CreateDirectories(parent)) {
+		return false;
+	}
+
+	Common::File file;
+	if (!file.Create(path)) {
+		return false;
+	}
+
+	uint32_t written = 0;
+	file.Write(output.data(), static_cast<uint32_t>(output.size()), &written);
+	const bool flushed = file.Flush();
+	file.Close();
+	return written == output.size() && flushed;
+}
+
 // The structure will be passed via the stack
 // since the size of an object is larger than 16 bytes
 struct RelocateHandlerStack {
@@ -137,6 +206,34 @@ static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
+
+static std::string ImportNid(const std::string& qualified_symbol) {
+	const auto separator = qualified_symbol.find('[');
+	return separator == std::string::npos ? qualified_symbol
+	                                      : qualified_symbol.substr(0, separator);
+}
+
+static void WriteConfiguredUnresolvedImportReport() {
+	const auto report_path = Config::GetUnresolvedImportReport();
+	if (report_path.empty()) {
+		return;
+	}
+
+	std::vector<UnresolvedImportReportEntry> entries;
+	entries.reserve(g_stubbed_imports.size());
+	for (const auto& record: g_stubbed_imports) {
+		entries.push_back({record.program, ImportNid(record.name), record.name,
+		                   Common::EnumName(record.type), Common::EnumName(record.bind), 1});
+	}
+
+	if (WriteUnresolvedImportReportFile(report_path, entries)) {
+		LOGF("Unresolved import report: %s (%zu relocation sites)\n",
+		     Common::PathToString(report_path).c_str(), entries.size());
+	} else {
+		LOGF("Failed to write unresolved import report: %s\n",
+		     Common::PathToString(report_path).c_str());
+	}
+}
 
 static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
 
@@ -1323,6 +1420,7 @@ void RuntimeLinker::RelocateAll() {
 	}
 
 	m_relocated = true;
+	WriteConfiguredUnresolvedImportReport();
 }
 
 void RuntimeLinker::RelocateProgram(Program* program) {
@@ -1332,6 +1430,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	Relocate(program);
+	WriteConfiguredUnresolvedImportReport();
 }
 
 void RuntimeLinker::UnloadProgram(Program* program) {

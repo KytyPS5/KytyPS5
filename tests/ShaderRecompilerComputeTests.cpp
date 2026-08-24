@@ -46,6 +46,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 
@@ -72,10 +73,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
 #include <semaphore>
@@ -14455,6 +14459,36 @@ int KYTY_SYSV_ABI TestRudpEventHandler(int, int, const uint8_t *, size_t,
 
 void CheckSystemLibraryStateContracts() {
   EnsureConfigInitialized();
+
+  const auto report_path =
+      std::filesystem::temp_directory_path() /
+      "kyty_unresolved_import_report_test.json";
+  const std::vector<Loader::UnresolvedImportReportEntry> report_entries = {
+      {"/app0/eboot.bin", "BBBBBBBBBBB", "BBBBBBBBBBB[Lib][Module][Func]",
+       "Func", "Global", 1},
+      {"/app0/eboot.bin", "AAAAAAAAAAA", "AAAAAAAAAAA[Lib][Module][Func]",
+       "Func", "Weak", 1},
+      {"/app0/eboot.bin", "AAAAAAAAAAA", "AAAAAAAAAAA[Lib][Module][Func]",
+       "Func", "Weak", 1}};
+  const bool report_written =
+      Loader::WriteUnresolvedImportReportFile(report_path, report_entries);
+  std::ifstream report_file(report_path, std::ios::binary);
+  const auto report_json =
+      nlohmann::json::parse(report_file, nullptr, false);
+  report_file.close();
+  std::error_code remove_report_error;
+  std::filesystem::remove(report_path, remove_report_error);
+  Require("SystemLibraryState", "Unresolved import JSON report",
+          report_written && report_json.is_object() &&
+              report_json.value("schema_version", 0) == 1 &&
+              report_json.value("unique_imports", 0) == 2 &&
+              report_json.value("relocation_sites", 0) == 3 &&
+              report_json["imports"].is_array() &&
+              report_json["imports"].size() == 2 &&
+              report_json["imports"][0].value("nid", "") == "AAAAAAAAAAA" &&
+              report_json["imports"][0].value("relocation_sites", 0) == 2,
+          "unresolved imports were not grouped and serialized deterministically");
+
   Loader::SymbolDatabase symbols;
   ::Libs::InitAll(&symbols);
 
@@ -15611,6 +15645,15 @@ void CheckSystemLibraryStateContracts() {
               speech_status == 0 && tts_cancel() == OK,
           "TextToSpeech2 status ABI or cancel state failed");
 
+  using ShareCaptureFn = int(KYTY_SYSV_ABI *)(const void *, int32_t *);
+  const auto share_capture =
+      reinterpret_cast<ShareCaptureFn>(find("ErH6tKS7fzE"));
+  int32_t share_request_id = 17;
+  Require("SystemLibraryState", "Share capture unsupported state",
+          share_capture(nullptr, &share_request_id) != OK &&
+              share_request_id == -1,
+          "Share capture did not return an explicit unsupported result");
+
   struct PsmlDirectBlockAbi {
     uint64_t address;
     uint64_t size;
@@ -15673,12 +15716,29 @@ void CheckSystemLibraryStateContracts() {
       CesOpaqueStorageAbi *(KYTY_SYSV_ABI *)(CesOpaqueStorageAbi *);
   using CesContextInitFn =
       int(KYTY_SYSV_ABI *)(CesOpaqueStorageAbi *, const CesOpaqueStorageAbi *);
+  using CesProfileRefFn = const uint8_t *(KYTY_SYSV_ABI *)();
+  using CesUtf8ToSbcFn = int(KYTY_SYSV_ABI *)(
+      const uint8_t *, uint32_t, uint32_t *, const uint8_t *, uint8_t *);
+  using CesSbcToUtf8Fn = int(KYTY_SYSV_ABI *)(
+      const uint8_t *, uint8_t, uint8_t *, uint32_t, uint32_t *);
   const auto ces_profile_init =
       reinterpret_cast<CesProfileInitFn>(find("ZiDCxUUGbec"));
   const auto ces_context_init =
       reinterpret_cast<CesContextInitFn>(find("538bRGc6Zo8"));
+  const auto ces_cp1252_profile =
+      reinterpret_cast<CesProfileRefFn>(find("LPzYZ+FR0BI"));
+  const auto ces_utf8_to_sbc =
+      reinterpret_cast<CesUtf8ToSbcFn>(find("3Q1gOWWarcw"));
+  const auto ces_sbc_to_utf8 =
+      reinterpret_cast<CesSbcToUtf8Fn>(find("xTd54EEL1Ao"));
   CesOpaqueStorageAbi ces_profile{};
   CesOpaqueStorageAbi ces_context{};
+  const std::array<uint8_t, 3> euro_utf8{0xe2, 0x82, 0xac};
+  std::array<uint8_t, 4> euro_roundtrip{};
+  uint32_t euro_input_length = 0;
+  uint32_t euro_output_length = 0;
+  uint8_t euro_cp1252 = 0;
+  const auto *cp1252_profile = ces_cp1252_profile();
   Require("SystemLibraryState", "CES CP932 lifecycle",
           ces_profile_init(nullptr) == nullptr &&
               ces_profile_init(&ces_profile) == &ces_profile &&
@@ -15687,6 +15747,80 @@ void CheckSystemLibraryStateContracts() {
               ces_context.system_use[0] == &ces_profile &&
               ces_context_init(nullptr, &ces_profile) != OK,
           "CES CP932 profile or MBCS context initialization failed");
+
+  Require("SystemLibraryState", "CES CP1252 conversion",
+          cp1252_profile != nullptr &&
+              ces_utf8_to_sbc(euro_utf8.data(), euro_utf8.size(),
+                              &euro_input_length, cp1252_profile,
+                              &euro_cp1252) == OK &&
+              euro_input_length == euro_utf8.size() && euro_cp1252 == 0x80 &&
+              ces_sbc_to_utf8(cp1252_profile, euro_cp1252,
+                              euro_roundtrip.data(), euro_roundtrip.size(),
+                              &euro_output_length) == OK &&
+              euro_output_length == euro_utf8.size() &&
+              std::equal(euro_utf8.begin(), euro_utf8.end(),
+                         euro_roundtrip.begin()),
+          "CES CP1252 did not preserve the Euro sign through UTF-8 conversion");
+
+  struct UserLoginListAbi {
+    int user_id[4];
+  };
+  struct UserEventAbi {
+    int event_type;
+    int user_id;
+  };
+  using UserInitializeFn = int(KYTY_SYSV_ABI *)(const void *);
+  using UserIdFn = int(KYTY_SYSV_ABI *)(int *);
+  using UserListFn = int(KYTY_SYSV_ABI *)(UserLoginListAbi *);
+  using UserEventFn = int(KYTY_SYSV_ABI *)(UserEventAbi *);
+  using UserNameFn = int(KYTY_SYSV_ABI *)(int, char *, size_t);
+  using PrivacyFn = int(KYTY_SYSV_ABI *)(uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t, uint64_t);
+  const auto user_initialize =
+      reinterpret_cast<UserInitializeFn>(find("j3YMu1MVNNo"));
+  const auto user_initial = reinterpret_cast<UserIdFn>(find("CdWp0oHWGr0"));
+  const auto user_list = reinterpret_cast<UserListFn>(find("fPhymKNvK-A"));
+  const auto user_event = reinterpret_cast<UserEventFn>(find("yH17Q6NWtVg"));
+  const auto user_name = reinterpret_cast<UserNameFn>(find("1xxcMiGu2fo"));
+  const auto privacy = reinterpret_cast<PrivacyFn>(find("D-CzAxQL0XI"));
+  Config::ConfigOptions user_config;
+  user_config.printf_direction = Config::OutputDirection::Silent;
+  user_config.user_id = 4242;
+  user_config.user_name = "GodsWill";
+  Config::Load(user_config);
+  int initial_user = -1;
+  UserLoginListAbi login_list{};
+  UserEventAbi login_event{};
+  std::array<char, 16> configured_user_name{};
+  std::array<char, 4> short_user_name{};
+  Require(
+      "SystemLibraryState", "Configurable UserService",
+      user_initialize(nullptr) == OK &&
+          user_initial(nullptr) ==
+              Libs::UserService::USER_SERVICE_ERROR_INVALID_ARGUMENT &&
+          user_initial(&initial_user) == OK && initial_user == 4242 &&
+          user_list(&login_list) == OK && login_list.user_id[0] == 4242 &&
+          login_list.user_id[1] == -1 && user_event(&login_event) == OK &&
+          login_event.event_type == 0 && login_event.user_id == 4242 &&
+          user_event(&login_event) ==
+              Libs::UserService::USER_SERVICE_ERROR_NO_EVENT &&
+          user_name(4242, configured_user_name.data(),
+                    configured_user_name.size()) == OK &&
+          std::string_view(configured_user_name.data()) == "GodsWill" &&
+          user_name(4242, short_user_name.data(), short_user_name.size()) ==
+              Libs::UserService::USER_SERVICE_ERROR_BUFFER_TOO_SHORT &&
+          user_name(1000, configured_user_name.data(),
+                    configured_user_name.size()) ==
+              Libs::UserService::USER_SERVICE_ERROR_NOT_LOGGED_IN,
+      "UserService did not honor the configured local identity or error ABI");
+  Require("SystemLibraryState", "Privacy unsupported state",
+          privacy(0, 0, 0, 0, 0, 0) ==
+              Libs::UserService::USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED,
+          "Privacy returned false success instead of an explicit unsupported result");
+
+  Config::ConfigOptions default_config;
+  default_config.printf_direction = Config::OutputDirection::Silent;
+  Config::Load(default_config);
 
   std::printf("[host]    %-32s ok\n", "SystemLibraryState");
 }

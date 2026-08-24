@@ -1,12 +1,12 @@
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <cinttypes>
-#include <cstdio>
 #include <cstring>
 
 namespace Libs {
@@ -40,14 +40,18 @@ struct UserServiceGamePresets {
 
 static_assert(sizeof(UserServiceGamePresets) == 40);
 
+static bool g_login_event_sent = false;
+
 static KYTY_SYSV_ABI int UserServiceInitialize(const void* /*params*/) {
 	PRINT_NAME();
+	g_login_event_sent = false;
 
 	return OK;
 }
 
 static KYTY_SYSV_ABI int UserServiceInitialize2() {
 	PRINT_NAME();
+	g_login_event_sent = false;
 
 	return OK;
 }
@@ -55,9 +59,11 @@ static KYTY_SYSV_ABI int UserServiceInitialize2() {
 static KYTY_SYSV_ABI int UserServiceGetInitialUser(int* user_id) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(user_id == nullptr);
+	if (user_id == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
-	*user_id = 1000;
+	*user_id = Config::GetUserId();
 
 	return OK;
 }
@@ -65,14 +71,14 @@ static KYTY_SYSV_ABI int UserServiceGetInitialUser(int* user_id) {
 static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(event == nullptr);
+	if (event == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
-	static bool logged_in = false;
-
-	if (!logged_in) {
-		logged_in         = true;
-		event->event_type = UserServiceEventTypeLogin;
-		event->user_id    = 1000;
+	if (!g_login_event_sent) {
+		g_login_event_sent = true;
+		event->event_type  = UserServiceEventTypeLogin;
+		event->user_id     = Config::GetUserId();
 		return OK;
 	}
 
@@ -82,9 +88,11 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdList* user_id_list) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(user_id_list == nullptr);
+	if (user_id_list == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
-	user_id_list->user_id[0] = 1000;
+	user_id_list->user_id[0] = Config::GetUserId();
 	user_id_list->user_id[1] = -1;
 	user_id_list->user_id[2] = -1;
 	user_id_list->user_id[3] = -1;
@@ -93,12 +101,21 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 }
 
 static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t size) {
-	EXIT_NOT_IMPLEMENTED(user_id != 1000);
-	EXIT_NOT_IMPLEMENTED(size < 5);
+	PRINT_NAME();
 
-	int s = snprintf(name, size, "%s", "Kyty");
+	if (name == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
+	if (user_id != Config::GetUserId()) {
+		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
+	}
 
-	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);
+	const auto& configured_name = Config::GetUserName();
+	if (size <= configured_name.size()) {
+		return USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
+	}
+
+	std::memcpy(name, configured_name.c_str(), configured_name.size() + 1);
 
 	return OK;
 }
@@ -109,7 +126,7 @@ static KYTY_SYSV_ABI int UserServiceGetUserNumber(int user_id, int32_t* number) 
 	if (number == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -124,7 +141,7 @@ static KYTY_SYSV_ABI int UserServiceGetGamePresets(int user_id, UserServiceGameP
 	if (presets == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -145,7 +162,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityVibration(int user_id, int32
 	if (vibration == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -161,7 +178,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityTriggerEffect(int      user_
 	if (trigger_effect == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -176,7 +193,7 @@ static KYTY_SYSV_ABI int UserServiceGetAgeLevel(int user_id, uint32_t* age_level
 	if (age_level == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -192,7 +209,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityChatTranscription(int      u
 	if (chat_transcription == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -208,7 +225,7 @@ UserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hol
 	if (press_and_hold_delay == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -224,7 +241,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomEnabled(int      user_id
 	if (zoom_enabled == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -240,7 +257,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomFollowFocus(int      use
 	if (zoom_follow_focus == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != 1000) {
+	if (user_id != Config::GetUserId()) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -249,9 +266,9 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomFollowFocus(int      use
 	return OK;
 }
 
-static KYTY_SYSV_ABI int UserServicePlatformPrivacyWs1Stub(uint64_t, uint64_t, uint64_t, uint64_t,
-                                                           uint64_t, uint64_t) {
-	return OK;
+static KYTY_SYSV_ABI int UserServicePlatformPrivacyWs1Unsupported(uint64_t, uint64_t, uint64_t,
+                                                                  uint64_t, uint64_t, uint64_t) {
+	return USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED;
 }
 
 } // namespace UserService
@@ -273,7 +290,7 @@ LIB_DEFINE(InitUserService_1) {
 	LIB_FUNC("-3Y5GO+-i78", UserService::UserServiceGetAccessibilityTriggerEffect);
 	LIB_FUNC("hD-H81EN9Vg", UserService::UserServiceGetAccessibilityZoomEnabled);
 	LIB_FUNC("O6IW1-Dwm-w", UserService::UserServiceGetAccessibilityZoomFollowFocus);
-	LIB_FUNC("D-CzAxQL0XI", UserService::UserServicePlatformPrivacyWs1Stub);
+	LIB_FUNC("D-CzAxQL0XI", UserService::UserServicePlatformPrivacyWs1Unsupported);
 }
 
 } // namespace Libs

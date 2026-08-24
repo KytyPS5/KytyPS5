@@ -5,7 +5,7 @@ Base revisada: `6eed46b`
 
 ## Actualización 2026-08-24
 
-Estado actual sobre `75b1c11`, rama `gods-will/runtime-compatibility`:
+Estado actual de la rama `gods-will/runtime-compatibility`:
 
 - **Imports opcionales:** los 61 imports observados de NP, Commerce, Entitlements, Manager,
   Signaling, Trophy, WebApi y JSON tienen resolución local. Las rutas online conservan estado
@@ -18,7 +18,15 @@ Estado actual sobre `75b1c11`, rama `gods-will/runtime-compatibility`:
   sampler estándar y custom. AJM incluye LPCM (23) y HE-VAG (22) nativo.
 - **Servicios offline:** RUDP implementa contextos, bind, pairing local, mensajes, polling y
   opciones sin PSN; PSML mantiene objetos, dispatch, progreso y solicitud de captura;
-  TextToSpeech2 mantiene el ABI observado de estado/cancelación; CES mantiene sus dos contextos.
+  TextToSpeech2 mantiene el ABI observado de estado/cancelación; CES mantiene sus dos contextos
+  y la conversión UTF-8/CP1252. Privacy devuelve ahora `OPERATION_NOT_SUPPORTED` en vez de un
+  éxito ficticio.
+- **Loader:** `--unresolved-import-report <ruta.json>` genera automáticamente un inventario
+  determinista, ordenado y agrupado por programa, NID, símbolo, tipo y binding. Puede combinarse
+  con `--strict-unresolved-imports` para identificar el primer import realmente ejecutado.
+- **UserService:** `--user-id` y `--user-name` configuran la identidad local; las rutas de usuario
+  inicial, lista, evento, nombre y preferencias usan la misma identidad y devuelven errores ABI
+  en argumentos inválidos.
 - **Pruebas:** pasan `shader_recompiler_compute_tests.exe`, `shader_cfg_tests.exe` y
   `kernel_file_system_tests.exe`; `kyty_emulator.exe` compila y se instala.
 - **Castlevania Dominus Collection 01.003:** llega al título y entra a Dawn of Sorrow a 60 FPS
@@ -45,12 +53,14 @@ Implementado y verificado en la revisión posterior a la auditoría:
   modificadores de fuente; `DS_SWIZZLE_B32` implementa FFT bit-reverse; FLAT acepta
   GLC/SLC/DLC como políticas de caché.
 - **Loader:** `--strict-unresolved-imports` detiene la ejecución en el primer thunk llamado,
-  mostrando símbolo y programa.
+  mostrando símbolo y programa. `--unresolved-import-report` conserva además el inventario JSON
+  completo por programa/NID, incluyendo el número de sitios de relocalización.
 - **AudioIn:** captura real mediante SDL, escritura completa del buffer y silencio seguro cuando
   no existe dispositivo.
 - **Sistema:** Sysmodule mantiene referencias de carga; las entradas exportadas de RUDP validan
   inicialización/hilo/callback; Share conserva configuración y devuelve error explícito para
-  captura no disponible.
+  captura no disponible. UserService acepta una identidad local configurable y Privacy devuelve
+  explícitamente que la operación no está soportada.
 - **POSIX / red (SDK 10):** `rename`, `rmdir`, `fchmod`, `futimes`, `utimes`, `shutdown`,
   `getpeername`, `sendmsg` y `recvmsg` tienen implementación host. libSceNet enlaza además
   `connect`, send/recv, `getpeername`, `getsockopt` y el ciclo de vida/resolución Aton.
@@ -59,7 +69,9 @@ Implementado y verificado en la revisión posterior a la auditoría:
   En The Messenger, los 12 imports sin resolver del runtime IL2CPP ahora enlazan a funciones
   reales; el módulo opcional `libSceNpToolkit2.prx` conserva 61 imports de servicios online.
 - **Pruebas:** regresiones GPU y de estado Sysmodule/RUDP añadidas. El ejecutable del emulador y
-  las suites `kernel_file_system_tests` y `shader_recompiler_compute_tests` compilan y pasan.
+  las suites `kernel_file_system_tests` y `shader_recompiler_compute_tests` compilan y pasan. La
+  suite completa valida también el reporte JSON, UserService, Privacy, Share, PSML, CES, TTS,
+  Audio3D, NGS2 y AJM.
 
 Fuentes SDK 12 usadas para GPU:
 
@@ -70,8 +82,9 @@ Fuentes SDK 12 usadas para GPU:
 - `F:\Downloads\references\GPU Shader Core ISA Specification � SDK 12.000\71.pdf`, página 3
   (GLC/SLC/DLC).
 
-El índice local de SDK 12 no contiene contratos de Audio3D, NGS2, ACM, Sysmodule, RUDP, Share ni
-PSML. Esas rutas no deben completarse inventando ABI o efectos.
+El índice local de SDK 12 no contiene contratos de Audio3D, NGS2, ACM, Sysmodule, RUDP, Share,
+PSML, TextToSpeech2, Privacy ni write throttling. Esas rutas no deben completarse inventando ABI
+o efectos.
 
 Fuentes SDK 10 usadas para POSIX y red:
 
@@ -126,15 +139,16 @@ concreto es su fallback genérico para imports no resueltos.
    mantienen audio y 60 FPS; no reapareció el antiguo `0xc0000005` durante esta prueba.
 2. **Partidas completas:** ejecutar recorridos jugables prolongados en los diez títulos de
    `F:\APPs_IA\SharpEMU\Game`; llegar al título no equivale a completar una partida.
-3. **Audio avanzado:** validar Audio3D con un título real y ampliar módulos custom NGS2 solo al
+3. **GPU no reproducida:** ampliar PM4, ISA, exports, layouts, mipmaps, arrays y texturas 3D solo
+   cuando una traza válida revele un caso nuevo; la matriz actual no tiene opcodes pendientes.
+4. **Audio avanzado:** validar Audio3D con un título real y ampliar módulos custom NGS2 solo al
    aparecer controles no cubiertos en trazas. Convolution reverb y HE-VAG ya están implementados.
-4. **Codecs:** CELP8/CELP16 siguen pendientes: los perfiles MPE/RPE son propietarios y no existe
+5. **Codecs:** CELP8/CELP16 siguen pendientes: los perfiles MPE/RPE son propietarios y no existe
    un decodificador verificable en las dependencias actuales. No se añadirá audio ficticio.
-5. **Servicios locales:** Share/PSML no tienen todavía una fuente de framebuffer/codificador para
+6. **Servicios locales:** Share/PSML no tienen todavía una fuente de framebuffer/codificador para
    crear artefactos de captura; TextToSpeech2 no ha expuesto en trazas una ABI de síntesis, solo
-   estado/cancelación. RUDP local ya está implementado. Nunca se conectarán a la red oficial.
-6. **GPU no reproducida:** ampliar PM4/ISA cuando una traza válida revele un caso nuevo; la
-   matriz actual ya no tiene opcodes pendientes.
+   estado/cancelación. La semántica de write throttling tampoco está documentada en el corpus
+   local. RUDP local ya está implementado. Nunca se conectarán a la red oficial.
 
 No se considera completo un servicio que solo conserva estado si el juego necesita su efecto
 externo. Los fallbacks offline permiten ejecución segura y revelan el siguiente bloqueo.

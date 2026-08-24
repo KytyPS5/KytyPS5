@@ -138,6 +138,19 @@ struct Program {
 	uint32_t                        custom_call_plt_num         = 0;
 };
 
+struct UnresolvedImportReportEntry {
+	std::string program;
+	std::string nid;
+	std::string symbol;
+	std::string type;
+	std::string bind;
+	uint32_t    relocation_sites = 1;
+};
+
+bool WriteUnresolvedImportReportFile(
+    const std::filesystem::path&                    path,
+    const std::vector<UnresolvedImportReportEntry>& unresolved_imports);
+
 class RuntimeLinker {
 public:
 	RuntimeLinker();

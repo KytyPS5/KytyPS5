@@ -111,6 +111,16 @@ int KYTY_SYSV_ABI NetShutdown(int s, int how) {
 	return FinishSocketCall(Net::Shutdown(s, how));
 }
 
+int KYTY_SYSV_ABI NetSocketAbort(int s, int flags) {
+	PRINT_NAME();
+	LOGF("\t s     = %d\n\t flags = 0x%08x\n", s, flags);
+
+	// The host has no separate socket-abort primitive. A bidirectional shutdown
+	// wakes blocked send/receive calls while preserving the descriptor for the
+	// title to close, which is the observable behavior callers require here.
+	return NetShutdown(s, 2);
+}
+
 int KYTY_SYSV_ABI NetGetpeername(int s, void* addr, uint32_t* addrlen) {
 	return FinishSocketCall(Net::Getpeername(s, addr, addrlen));
 }
@@ -269,6 +279,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Inp1lfL+Jdw", LibNet::NetEpollDestroy);
 	LIB_FUNC("kOj1HiAGE54", LibNet::NetListen);
 	LIB_FUNC("TSM6whtekok", LibNet::NetShutdown);
+	LIB_FUNC("zJGf8xjFnQE", LibNet::NetSocketAbort);
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
@@ -1472,17 +1483,181 @@ LIB_DEFINE(InitNet_1_NetCtl) {
 
 } // namespace LibNetCtl
 
+namespace LibNpUtility {
+
+LIB_VERSION("NpUtility", 1, "NpUtility", 1, 1);
+
+constexpr int NP_BANDWIDTH_TEST_ERROR_INVALID_ARGUMENT = -2141905147; /* 0x80551F05 */
+constexpr int NP_BANDWIDTH_TEST_STATUS_FINISHED         = 2;
+
+struct NpBandwidthTestResult {
+	double upload_bps;
+	double download_bps;
+	int    result;
+	char   padding[4];
+};
+
+static std::mutex          g_np_bandwidth_mutex;
+static std::map<int, bool> g_np_bandwidth_contexts;
+static int                 g_np_bandwidth_next_context = 1;
+
+static int NpBandwidthTestStart(const void* param, uint32_t timeout_usec, bool upload) {
+	PRINT_NAME();
+	LOGF("\t param        = 0x%016" PRIx64 "\n"
+	     "\t timeout_usec = %" PRIu32 "\n"
+	     "\t direction    = %s\n",
+	     reinterpret_cast<uint64_t>(param), timeout_usec, upload ? "upload" : "download");
+
+	if (param == nullptr) {
+		return NP_BANDWIDTH_TEST_ERROR_INVALID_ARGUMENT;
+	}
+
+	std::scoped_lock lock(g_np_bandwidth_mutex);
+	const int        id = g_np_bandwidth_next_context++;
+	g_np_bandwidth_contexts.emplace(id, upload);
+	return id;
+}
+
+static int KYTY_SYSV_ABI NpBandwidthTestInitStartUpload(const void* param,
+	                                                    uint32_t timeout_usec) {
+	return NpBandwidthTestStart(param, timeout_usec, true);
+}
+
+static int KYTY_SYSV_ABI NpBandwidthTestInitStartDownload(const void* param,
+	                                                      uint32_t timeout_usec) {
+	return NpBandwidthTestStart(param, timeout_usec, false);
+}
+
+static int KYTY_SYSV_ABI NpBandwidthTestGetStatus(int context_id, int* status) {
+	PRINT_NAME();
+	if (status == nullptr) {
+		return NP_BANDWIDTH_TEST_ERROR_INVALID_ARGUMENT;
+	}
+
+	std::scoped_lock lock(g_np_bandwidth_mutex);
+	if (g_np_bandwidth_contexts.find(context_id) == g_np_bandwidth_contexts.end()) {
+		return NP_BANDWIDTH_TEST_ERROR_INVALID_ARGUMENT;
+	}
+	*status = NP_BANDWIDTH_TEST_STATUS_FINISHED;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpBandwidthTestShutdown(int context_id,
+	                                             NpBandwidthTestResult* result) {
+	PRINT_NAME();
+	std::scoped_lock lock(g_np_bandwidth_mutex);
+	const auto       context = g_np_bandwidth_contexts.find(context_id);
+	if (context == g_np_bandwidth_contexts.end() || result == nullptr) {
+		return NP_BANDWIDTH_TEST_ERROR_INVALID_ARGUMENT;
+	}
+
+	*result = {};
+	g_np_bandwidth_contexts.erase(context);
+	return 0;
+}
+
+LIB_DEFINE(InitNet_1_NpUtility) {
+	LIB_FUNC("mA0zsbqm+kA", LibNpUtility::NpBandwidthTestInitStartUpload);
+	LIB_FUNC("BYIZGKm6bO4", LibNpUtility::NpBandwidthTestGetStatus);
+	LIB_FUNC("hqzi1IHdQQQ", LibNpUtility::NpBandwidthTestInitStartDownload);
+	LIB_FUNC("pLr1fEQS1z8", LibNpUtility::NpBandwidthTestShutdown);
+}
+
+} // namespace LibNpUtility
+
 namespace LibNpCommerce {
 
 LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
+constexpr int COMMON_DIALOG_STATUS_NONE     = 0;
+constexpr int COMMON_DIALOG_STATUS_FINISHED = 3;
+constexpr int COMMON_DIALOG_ERROR_ARG_NULL  = -2135425011; /* 0x80B8000D */
+
+struct NpCommerceDialogResult {
+	int32_t result;
+	bool    authorized;
+	char    padding[3];
+	void*   user_data;
+	uint8_t reserved[32];
+};
+
+static bool  g_np_commerce_initialized = false;
+static int   g_np_commerce_status      = COMMON_DIALOG_STATUS_NONE;
+static void* g_np_commerce_user_data   = nullptr;
+
+static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+	PRINT_NAME();
+	g_np_commerce_initialized = true;
+	g_np_commerce_status      = COMMON_DIALOG_STATUS_NONE;
+	g_np_commerce_user_data   = nullptr;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogOpen(const void* param) {
+	PRINT_NAME();
+	if (param == nullptr) {
+		return COMMON_DIALOG_ERROR_ARG_NULL;
+	}
+	if (!g_np_commerce_initialized) {
+		NpCommerceDialogInitialize();
+	}
+
+	// Store access is intentionally offline. Complete the dialog as canceled so
+	// the caller can continue without contacting an official service.
+	g_np_commerce_status    = COMMON_DIALOG_STATUS_FINISHED;
+	g_np_commerce_user_data = nullptr;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogGetResult(NpCommerceDialogResult* result) {
+	PRINT_NAME();
+	if (result == nullptr) {
+		return COMMON_DIALOG_ERROR_ARG_NULL;
+	}
+	*result            = {};
+	result->user_data  = g_np_commerce_user_data;
+	result->authorized = false;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+	PRINT_NAME();
+	g_np_commerce_initialized = false;
+	g_np_commerce_status      = COMMON_DIALOG_STATUS_NONE;
+	g_np_commerce_user_data   = nullptr;
+	return 0;
+}
+
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
+	return g_np_commerce_status;
+}
 
-	return 0; // SCE_COMMON_DIALOG_STATUS_NONE
+static int KYTY_SYSV_ABI NpCommerceShowPsStoreIcon(int position) {
+	PRINT_NAME();
+	LOGF("\t position = %d\n", position);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpCommerceHidePsStoreIcon() {
+	PRINT_NAME();
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpCommerceSetPsStoreIconLayout(int layout) {
+	PRINT_NAME();
+	LOGF("\t layout = %d\n", layout);
+	return 0;
 }
 
 LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
+	LIB_FUNC("DfSCDRA3EjY", NpCommerceDialogOpen);
+	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
+	LIB_FUNC("r42bWcQbtZY", NpCommerceDialogGetResult);
+	LIB_FUNC("uKTDW8hk-ts", NpCommerceSetPsStoreIconLayout);
+	LIB_FUNC("DHmwsa6S8Tc", NpCommerceShowPsStoreIcon);
+	LIB_FUNC("dsqCVsNM0Zg", NpCommerceHidePsStoreIcon);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 
@@ -1493,6 +1668,22 @@ namespace LibNpManager {
 LIB_VERSION("NpManager", 1, "NpManager", 1, 1);
 
 namespace NpManager = Network::NpManager;
+
+static int KYTY_SYSV_ABI NpNotifyPremiumFeature(const void* param) {
+	PRINT_NAME();
+	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	return param != nullptr ? 0 : -2141912319; /* SCE_NP_ERROR_INVALID_ARGUMENT */
+}
+
+static int KYTY_SYSV_ABI NpUnregisterPremiumEventCallback() {
+	PRINT_NAME();
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpUnregisterNpReachabilityStateCallback() {
+	PRINT_NAME();
+	return 0;
+}
 
 LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("3Zl8BePTh9Y", NpManager::NpCheckCallback);
@@ -1505,6 +1696,9 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("GImICnh+boA", NpManager::NpRegisterPlusEventCallback);
 	LIB_FUNC("+yqjab2fUJA", NpManager::NpRegisterPremiumEventCallback);
 	LIB_FUNC("hw5KNqAAels", NpManager::NpRegisterNpReachabilityStateCallback);
+	LIB_FUNC("P6piso307SE", LibNpManager::NpNotifyPremiumFeature);
+	LIB_FUNC("-Rjp3-YViXc", LibNpManager::NpUnregisterPremiumEventCallback);
+	LIB_FUNC("cRILAEvn+9M", LibNpManager::NpUnregisterNpReachabilityStateCallback);
 	LIB_FUNC("p-o74CnoNzY", NpManager::NpGetNpId);
 	LIB_FUNC("XDncXQIJUSk", NpManager::NpGetOnlineId);
 	LIB_FUNC("rbknaUjpqWo", NpManager::NpGetAccountIdA);
@@ -1529,16 +1723,187 @@ namespace LibNpSessionSignaling {
 
 LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
 
+constexpr int NP_SESSION_SIGNALING_ERROR_NOT_INITIALIZED = -2141900031; /* 0x80553301 */
+constexpr int NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT = -2141900029; /* 0x80553303 */
+constexpr int NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND    = -2141900024; /* 0x80553308 */
+constexpr int NP_SESSION_SIGNALING_ERROR_CONN_NOT_FOUND   = -2141900020; /* 0x8055330C */
+constexpr int NP_ERROR_SIGNED_OUT                         = -2141913082; /* 0x80550006 */
+
+struct NpSessionSignalingNetInfo {
+	uint32_t local_addr;
+	uint32_t mapped_addr;
+	int      nat_status;
+	int      stun_status;
+};
+
+static std::mutex               g_np_session_signaling_mutex;
+static std::map<uint32_t, bool> g_np_session_signaling_contexts;
+static bool                     g_np_session_signaling_initialized = false;
+static uint32_t                 g_np_session_signaling_next_context = 1;
+static uint32_t                 g_np_session_signaling_next_request = 1;
+
 static int KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
 	PRINT_NAME();
 
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
+	g_np_session_signaling_initialized = true;
 	return 0;
+}
+
+static bool NpSessionSignalingHasContext(uint32_t context_id) {
+	return g_np_session_signaling_contexts.find(context_id) !=
+	       g_np_session_signaling_contexts.end();
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingTerminate() {
+	PRINT_NAME();
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	g_np_session_signaling_contexts.clear();
+	g_np_session_signaling_initialized = false;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingCreateContext2(const void* param,
+	                                                       uint32_t* context_id) {
+	PRINT_NAME();
+	if (param == nullptr || context_id == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!g_np_session_signaling_initialized) {
+		return NP_SESSION_SIGNALING_ERROR_NOT_INITIALIZED;
+	}
+	*context_id = g_np_session_signaling_next_context++;
+	g_np_session_signaling_contexts.emplace(*context_id, true);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingDestroyContext(uint32_t context_id) {
+	PRINT_NAME();
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!NpSessionSignalingHasContext(context_id)) {
+		return NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+	}
+	g_np_session_signaling_contexts.erase(context_id);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingRequestPrepare(uint32_t context_id,
+	                                                      uint32_t* request_id) {
+	PRINT_NAME();
+	if (request_id == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!NpSessionSignalingHasContext(context_id)) {
+		return NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+	}
+	*request_id = g_np_session_signaling_next_request++;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingActivateUser(uint32_t context_id,
+	                                                    const void* peer_address,
+	                                                    uint32_t* group_id) {
+	PRINT_NAME();
+	if (peer_address == nullptr || group_id == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!NpSessionSignalingHasContext(context_id)) {
+		return NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+	}
+	*group_id = 0;
+	return NP_ERROR_SIGNED_OUT;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingActivateSession(uint32_t context_id,
+	                                                       const char* session_id,
+	                                                       int session_type,
+	                                                       const void* options,
+	                                                       uint32_t* group_id) {
+	PRINT_NAME();
+	LOGF("\t session_type = %d\n\t options = 0x%016" PRIx64 "\n", session_type,
+	     reinterpret_cast<uint64_t>(options));
+	if (session_id == nullptr || group_id == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!NpSessionSignalingHasContext(context_id)) {
+		return NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+	}
+	*group_id = 0;
+	return NP_ERROR_SIGNED_OUT;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingDeactivate(uint32_t context_id, uint32_t group_id) {
+	PRINT_NAME();
+	LOGF("\t group_id = %" PRIu32 "\n", group_id);
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	return NpSessionSignalingHasContext(context_id) ? 0
+	                                                : NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingGetLocalNetInfo(
+	uint32_t context_id, NpSessionSignalingNetInfo* info) {
+	PRINT_NAME();
+	if (info == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!NpSessionSignalingHasContext(context_id)) {
+		return NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+	}
+	*info = {};
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingGetConnectionStatus(
+	uint32_t context_id, uint32_t connection_id, int* status, uint32_t* peer_address,
+	uint16_t* peer_port) {
+	PRINT_NAME();
+	if (status == nullptr || peer_address == nullptr || peer_port == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	if (!NpSessionSignalingHasContext(context_id)) {
+		return NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
+	}
+	*status       = 0;
+	*peer_address = 0;
+	*peer_port    = 0;
+	LOGF("\t connection_id = %" PRIu32 "\n", connection_id);
+	return NP_SESSION_SIGNALING_ERROR_CONN_NOT_FOUND;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingGetConnectionInfo(uint32_t context_id,
+	                                                          uint32_t connection_id,
+	                                                          int info_code, void* info) {
+	PRINT_NAME();
+	LOGF("\t connection_id = %" PRIu32 "\n\t info_code = %d\n", connection_id,
+	     info_code);
+	if (info == nullptr) {
+		return NP_SESSION_SIGNALING_ERROR_INVALID_ARGUMENT;
+	}
+	std::scoped_lock lock(g_np_session_signaling_mutex);
+	return NpSessionSignalingHasContext(context_id)
+	           ? NP_SESSION_SIGNALING_ERROR_CONN_NOT_FOUND
+	           : NP_SESSION_SIGNALING_ERROR_CTX_NOT_FOUND;
 }
 
 LIB_DEFINE(InitNet_1_NpSessionSignaling) {
 	LIB_FUNC("ysmw6J-P8Ak", NpSessionSignalingInitialize);
+	LIB_FUNC("r8mVMwlafF8", NpSessionSignalingRequestPrepare);
+	LIB_FUNC("9r7dM3puxMk", NpSessionSignalingActivateUser);
+	LIB_FUNC("cQkBH-pXhF0", NpSessionSignalingDeactivate);
+	LIB_FUNC("OTilStjd9L8", NpSessionSignalingGetLocalNetInfo);
+	LIB_FUNC("n1fn2KFeLDA", NpSessionSignalingGetConnectionStatus);
+	LIB_FUNC("aBuX0PX-T7I", NpSessionSignalingCreateContext2);
+	LIB_FUNC("yJw2m6UWDYU", NpSessionSignalingGetConnectionInfo);
+	LIB_FUNC("Z9Q9LzQDXf0", NpSessionSignalingDestroyContext);
+	LIB_FUNC("r4XacqHvkn4", NpSessionSignalingActivateSession);
+	LIB_FUNC("CqJuNXo5yiM", NpSessionSignalingTerminate);
 }
 
 } // namespace LibNpSessionSignaling
@@ -1570,6 +1935,55 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  download_status;
 };
 
+struct NpEntitlementAccessEntitlementKey {
+	char data[16];
+};
+
+struct NpEntitlementAccessTransactionId {
+	char transaction_id[65];
+	char padding[7];
+};
+
+struct NpEntitlementAccessUnifiedEntitlementInfo {
+	NpUnifiedEntitlementLabel entitlement_label;
+	uint64_t                  active_date;
+	uint64_t                  inactive_date;
+	int32_t                   entitlement_type;
+	int32_t                   use_count;
+	int32_t                   use_limit;
+	int32_t                   package_type;
+	bool                      active;
+	int8_t                    reserved[3];
+};
+
+struct NpServiceEntitlementLabel {
+	char data[7];
+};
+
+struct NpEntitlementAccessServiceEntitlementInfo {
+	NpServiceEntitlementLabel entitlement_label;
+	uint8_t                   padding;
+	uint64_t                  active_date;
+	uint64_t                  inactive_date;
+	int32_t                   entitlement_type;
+	int32_t                   use_count;
+	int32_t                   use_limit;
+	uint32_t                  reserved1;
+	bool                      active;
+	bool                      consumable;
+	int8_t                    reserved2[2];
+};
+
+static_assert(sizeof(NpEntitlementAccessEntitlementKey) == 16);
+static_assert(sizeof(NpEntitlementAccessTransactionId) == 72);
+static_assert(sizeof(NpEntitlementAccessUnifiedEntitlementInfo) == 64);
+static_assert(sizeof(NpEntitlementAccessServiceEntitlementInfo) == 48);
+
+static bool                    g_np_entitlement_access_initialized = false;
+static int64_t                 g_np_entitlement_access_next_request = 1;
+static std::map<int64_t, bool> g_np_entitlement_access_requests;
+static std::mutex              g_np_entitlement_access_mutex;
+
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
@@ -1585,6 +1999,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
 	}
 
 	memset(boot_param, 0, sizeof(*boot_param));
+	g_np_entitlement_access_initialized = true;
 
 	return 0;
 }
@@ -1656,12 +2071,232 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
+	uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+	NpEntitlementAccessEntitlementKey* key) {
+	PRINT_NAME();
+	LOGF("\t service_label = %" PRIu32 "\n", service_label);
+	if (entitlement_label == nullptr || key == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	*key = {};
+	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessGenerateTransactionId(
+	NpEntitlementAccessTransactionId* transaction_id) {
+	PRINT_NAME();
+	if (transaction_id == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	*transaction_id = {};
+	std::strncpy(transaction_id->transaction_id, "offline", sizeof(transaction_id->transaction_id) - 1);
+	return 0;
+}
+
+static int NpEntitlementAccessCreateRequest(const void* entitlement_label, int64_t* request_id) {
+	if (entitlement_label == nullptr || request_id == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	if (!g_np_entitlement_access_initialized) {
+		return -2122514431; /* SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_INITIALIZED */
+	}
+	*request_id = g_np_entitlement_access_next_request++;
+	g_np_entitlement_access_requests.emplace(*request_id, false);
+	return 0;
+}
+
+static bool NpEntitlementAccessHasRequest(int64_t request_id) {
+	return g_np_entitlement_access_requests.find(request_id) !=
+	       g_np_entitlement_access_requests.end();
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestConsumeUnifiedEntitlement(
+	int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+	const NpEntitlementAccessTransactionId* transaction_id, int32_t use_count,
+	int64_t* request_id) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n\t service_label = %" PRIu32 "\n\t use_count = %d\n",
+	     user_id, service_label, use_count);
+	(void)transaction_id;
+	return NpEntitlementAccessCreateRequest(entitlement_label, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestConsumeServiceEntitlement(
+	int user_id, uint32_t service_label, const NpServiceEntitlementLabel* entitlement_label,
+	const NpEntitlementAccessTransactionId* transaction_id, int32_t use_count,
+	int64_t* request_id) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n\t service_label = %" PRIu32 "\n\t use_count = %d\n",
+	     user_id, service_label, use_count);
+	(void)transaction_id;
+	return NpEntitlementAccessCreateRequest(entitlement_label, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollConsumeEntitlement(int64_t request_id,
+	                                                               int32_t* result,
+	                                                               int32_t* use_limit) {
+	PRINT_NAME();
+	if (result == nullptr || use_limit == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	if (!NpEntitlementAccessHasRequest(request_id)) {
+		return -2122514411; /* SCE_NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND */
+	}
+	*result    = NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+	*use_limit = 0;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfo(
+	int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+	int64_t* request_id) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n\t service_label = %" PRIu32 "\n", user_id, service_label);
+	return NpEntitlementAccessCreateRequest(entitlement_label, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestServiceEntitlementInfo(
+	int user_id, uint32_t service_label, const NpServiceEntitlementLabel* entitlement_label,
+	int64_t* request_id) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n\t service_label = %" PRIu32 "\n", user_id, service_label);
+	return NpEntitlementAccessCreateRequest(entitlement_label, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfo(
+	int64_t request_id, int32_t* result, NpEntitlementAccessUnifiedEntitlementInfo* info) {
+	PRINT_NAME();
+	if (result == nullptr || info == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	if (!NpEntitlementAccessHasRequest(request_id)) {
+		return -2122514411;
+	}
+	*result = NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+	*info   = {};
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollServiceEntitlementInfo(
+	int64_t request_id, int32_t* result, NpEntitlementAccessServiceEntitlementInfo* info) {
+	PRINT_NAME();
+	if (result == nullptr || info == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	if (!NpEntitlementAccessHasRequest(request_id)) {
+		return -2122514411;
+	}
+	*result = NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+	*info   = {};
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfoList(
+	int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* list,
+	uint32_t list_num, const void* param, int64_t* request_id) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n\t service_label = %" PRIu32 "\n\t list_num = %" PRIu32
+	     "\n\t param = 0x%016" PRIx64 "\n",
+	     user_id, service_label, list_num, reinterpret_cast<uint64_t>(param));
+	return NpEntitlementAccessCreateRequest(list, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestServiceEntitlementInfoList(
+	int user_id, uint32_t service_label, const NpServiceEntitlementLabel* list,
+	uint32_t list_num, const void* param, int64_t* request_id) {
+	PRINT_NAME();
+	LOGF("\t user_id = %d\n\t service_label = %" PRIu32 "\n\t list_num = %" PRIu32
+	     "\n\t param = 0x%016" PRIx64 "\n",
+	     user_id, service_label, list_num, reinterpret_cast<uint64_t>(param));
+	return NpEntitlementAccessCreateRequest(list, request_id);
+}
+
+template <typename Info>
+static int NpEntitlementAccessPollInfoList(int64_t request_id, int32_t* result, Info* list,
+	                                       uint32_t list_num, uint32_t* hit_num,
+	                                       int32_t* next_offset, int32_t* previous_offset) {
+	if (result == nullptr || hit_num == nullptr || next_offset == nullptr ||
+	    previous_offset == nullptr || (list == nullptr && list_num != 0)) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	if (!NpEntitlementAccessHasRequest(request_id)) {
+		return -2122514411;
+	}
+	if (list != nullptr && list_num != 0) {
+		std::memset(list, 0, sizeof(Info) * list_num);
+	}
+	*result          = NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+	*hit_num         = 0;
+	*next_offset     = -1;
+	*previous_offset = -1;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfoList(
+	int64_t request_id, int32_t* result, NpEntitlementAccessUnifiedEntitlementInfo* list,
+	uint32_t list_num, uint32_t* hit_num, int32_t* next_offset, int32_t* previous_offset) {
+	PRINT_NAME();
+	return NpEntitlementAccessPollInfoList(request_id, result, list, list_num, hit_num,
+	                                       next_offset, previous_offset);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollServiceEntitlementInfoList(
+	int64_t request_id, int32_t* result, NpEntitlementAccessServiceEntitlementInfo* list,
+	uint32_t list_num, uint32_t* hit_num, int32_t* next_offset, int32_t* previous_offset) {
+	PRINT_NAME();
+	return NpEntitlementAccessPollInfoList(request_id, result, list, list_num, hit_num,
+	                                       next_offset, previous_offset);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
+	PRINT_NAME();
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	const auto       request = g_np_entitlement_access_requests.find(request_id);
+	if (request == g_np_entitlement_access_requests.end()) {
+		return -2122514411;
+	}
+	g_np_entitlement_access_requests.erase(request);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessAbortRequest(int64_t request_id) {
+	PRINT_NAME();
+	std::scoped_lock lock(g_np_entitlement_access_mutex);
+	const auto       request = g_np_entitlement_access_requests.find(request_id);
+	if (request == g_np_entitlement_access_requests.end()) {
+		return -2122514411;
+	}
+	request->second = true;
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
 	LIB_FUNC("TFyU+KFBv54",
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
+	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
+	LIB_FUNC("IQtb-TaIjSM", LibNpEntitlementAccess::NpEntitlementAccessGenerateTransactionId);
+	LIB_FUNC("eOxGbG3sPb0", LibNpEntitlementAccess::NpEntitlementAccessRequestConsumeUnifiedEntitlement);
+	LIB_FUNC("Aqae0TjLvQU", LibNpEntitlementAccess::NpEntitlementAccessRequestConsumeServiceEntitlement);
+	LIB_FUNC("69u+XqsoNd0", LibNpEntitlementAccess::NpEntitlementAccessPollConsumeEntitlement);
+	LIB_FUNC("jautSRs4OdQ", LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfo);
+	LIB_FUNC("M8icY9OwkKs", LibNpEntitlementAccess::NpEntitlementAccessRequestServiceEntitlementInfo);
+	LIB_FUNC("M4XlLFnzQaQ", LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfo);
+	LIB_FUNC("ShGBFuoSSsQ", LibNpEntitlementAccess::NpEntitlementAccessPollServiceEntitlementInfo);
+	LIB_FUNC("uCZf2L27th8", LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfoList);
+	LIB_FUNC("brbRxzr7qyI", LibNpEntitlementAccess::NpEntitlementAccessRequestServiceEntitlementInfoList);
+	LIB_FUNC("nAEqawEZG5s", LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfoList);
+	LIB_FUNC("aFv8qms6XTM", LibNpEntitlementAccess::NpEntitlementAccessPollServiceEntitlementInfoList);
+	LIB_FUNC("Z0eQj8m7XA8", LibNpEntitlementAccess::NpEntitlementAccessDeleteRequest);
+	LIB_FUNC("HFcQl9TMcFQ", LibNpEntitlementAccess::NpEntitlementAccessAbortRequest);
 }
 
 } // namespace LibNpEntitlementAccess
@@ -2269,6 +2904,35 @@ static int KYTY_SYSV_ABI NpTrophy2RegisterUnlockCallback(void* callback, void* u
 	return 0;
 }
 
+static int KYTY_SYSV_ABI NpTrophy2UnregisterUnlockCallback() {
+	PRINT_NAME();
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpTrophy2GetRewardIcon(int context, int handle, int trophy_id,
+	                                            void* buffer, size_t* size) {
+	PRINT_NAME();
+	LOGF("\t context   = %d\n"
+	     "\t handle    = %d\n"
+	     "\t trophy_id = %d\n"
+	     "\t buffer    = 0x%016" PRIx64 "\n"
+	     "\t size      = 0x%016" PRIx64 "\n",
+	     context, handle, trophy_id, reinterpret_cast<uint64_t>(buffer),
+	     reinterpret_cast<uint64_t>(size));
+	if (size != nullptr) {
+		*size = 0;
+	}
+	return NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND;
+}
+
+static int KYTY_SYSV_ABI NpTrophy2ShowTrophyList(int context) {
+	PRINT_NAME();
+	LOGF("\t context = %d\n", context);
+	// The system UI is unavailable, but this path remains local and never
+	// attempts to contact PlayStation Network.
+	return 0;
+}
+
 static int KYTY_SYSV_ABI NpTrophy2AbortHandle(int handle) {
 	PRINT_NAME();
 
@@ -2306,6 +2970,9 @@ LIB_DEFINE(InitNet_1_NpTrophy2) {
 	LIB_FUNC("6IjXJUy6ZnA", LibNpTrophy2::NpTrophy2GetGroupIcon);
 	LIB_FUNC("-9LLVU0uvs8", LibNpTrophy2::NpTrophy2GetTrophyIcon);
 	LIB_FUNC("sUXGfNMalIo", LibNpTrophy2::NpTrophy2RegisterUnlockCallback);
+	LIB_FUNC("wVqxM58sIKs", LibNpTrophy2::NpTrophy2UnregisterUnlockCallback);
+	LIB_FUNC("BsE-m8JxIOg", LibNpTrophy2::NpTrophy2GetRewardIcon);
+	LIB_FUNC("EHQEDVXZ0TI", LibNpTrophy2::NpTrophy2ShowTrophyList);
 	LIB_FUNC("fYapWA9xVmA", LibNpTrophy2::NpTrophy2AbortHandle);
 	LIB_FUNC("d8P11CI40KE", LibNpTrophy2::NpTrophy2DestroyHandle);
 	LIB_FUNC("sysY2FHYff4", LibNpTrophy2::NpTrophy2DestroyContext);
@@ -3196,20 +3863,39 @@ static int KYTY_SYSV_ABI CesSbcToUtf8(const uint8_t* profile, uint8_t sbc, uint8
 	return utf8max >= len ? 0 : -1;
 }
 
-static int KYTY_SYSV_ABI CesStub(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
-	PRINT_NAME();
+struct CesOpaqueStorage {
+	void* system_use[32];
+};
 
-	(void)arg0;
-	(void)arg1;
-	(void)arg2;
-	(void)arg3;
+static CesOpaqueStorage* KYTY_SYSV_ABI CesUcsProfileInitSjis1997Cp932(
+	CesOpaqueStorage* sheet) {
+	PRINT_NAME();
+	if (sheet == nullptr) {
+		return nullptr;
+	}
+	*sheet = {};
+	// Keep a stable non-null tag in the SDK-defined opaque profile sheet.
+	static const uint32_t cp932_tag = 932;
+	sheet->system_use[0] = const_cast<uint32_t*>(&cp932_tag);
+	return sheet;
+}
+
+static int KYTY_SYSV_ABI CesMbcsUcsContextInit(CesOpaqueStorage* context,
+	                                           const CesOpaqueStorage* profile) {
+	PRINT_NAME();
+	if (context == nullptr || profile == nullptr) {
+		return -1;
+	}
+	*context = {};
+	context->system_use[0] = const_cast<CesOpaqueStorage*>(profile);
+	context->system_use[1] = profile->system_use[0];
 
 	return 0;
 }
 
 LIB_DEFINE(InitNet_1_Ces) {
-	LIB_FUNC("ZiDCxUUGbec", LibCes::CesStub);
-	LIB_FUNC("538bRGc6Zo8", LibCes::CesStub);
+	LIB_FUNC("ZiDCxUUGbec", LibCes::CesUcsProfileInitSjis1997Cp932);
+	LIB_FUNC("538bRGc6Zo8", LibCes::CesMbcsUcsContextInit);
 	LIB_FUNC("LPzYZ+FR0BI", LibCes::CesRefersUcsProfileCp1252);
 	LIB_FUNC("3Q1gOWWarcw", LibCes::CesUtf8ToSbc);
 	LIB_FUNC("xTd54EEL1Ao", LibCes::CesSbcToUtf8);
@@ -3317,6 +4003,10 @@ struct NpWebApi2ResponseInformationOption {
 	char*   error_object;
 	size_t  error_object_size;
 	size_t  response_data_size;
+};
+
+struct NpWebApi2PushContextId {
+	char uuid[37];
 };
 
 struct NpWebApi2Request {
@@ -3596,6 +4286,12 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateFilter(int lib_ctx_id, int hand
 	return filter_id++;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filter_id) {
+	PRINT_NAME();
+	LOGF("\t lib_ctx_id = %d\n\t filter_id = %d\n", lib_ctx_id, filter_id);
+	return 0;
+}
+
 static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id, int filter_id,
                                                             void* callback, void* user_arg) {
 	PRINT_NAME();
@@ -3608,6 +4304,39 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	static int callback_id = 1;
 
 	return callback_id++;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
+	                                                          int callback_id) {
+	PRINT_NAME();
+	LOGF("\t user_context_id = %d\n\t callback_id = %d\n", user_context_id,
+	     callback_id);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterPushContextCallback(
+	int user_context_id, int filter_id, void* callback, void* user_arg) {
+	return NpWebApi2PushEventRegisterCallback(user_context_id, filter_id, callback, user_arg);
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventCreatePushContext(
+	int user_context_id, NpWebApi2PushContextId* push_context_id) {
+	PRINT_NAME();
+	LOGF("\t user_context_id = %d\n", user_context_id);
+	if (push_context_id == nullptr) {
+		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
+	}
+	std::memset(push_context_id, 0, sizeof(*push_context_id));
+	std::strncpy(push_context_id->uuid, "00000000-0000-0000-0000-000000000000",
+	             sizeof(push_context_id->uuid) - 1);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventStartPushContextCallback(
+	int user_context_id, const NpWebApi2PushContextId* push_context_id) {
+	PRINT_NAME();
+	LOGF("\t user_context_id = %d\n", user_context_id);
+	return push_context_id != nullptr ? 0 : NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
 }
 
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
@@ -3641,11 +4370,86 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("QafxeZM3WK4", LibNpWebApi2::NpWebApi2PushEventDeletePushContext);
 	LIB_FUNC("MsaFhR+lPE4", LibNpWebApi2::NpWebApi2PushEventCreateFilter);
 	LIB_FUNC("fY3QqeNkF8k", LibNpWebApi2::NpWebApi2PushEventRegisterCallback);
+	LIB_FUNC("KJdPcOGmK58", LibNpWebApi2::NpWebApi2PushEventDeleteFilter);
+	LIB_FUNC("hOnIlcGrO6g", LibNpWebApi2::NpWebApi2PushEventUnregisterCallback);
+	LIB_FUNC("lxtHJMwBsaU", LibNpWebApi2::NpWebApi2PushEventRegisterPushContextCallback);
+	LIB_FUNC("NNVf18SlbT8", LibNpWebApi2::NpWebApi2PushEventCreatePushContext);
+	LIB_FUNC("AAj9X+4aGYA", LibNpWebApi2::NpWebApi2PushEventStartPushContextCallback);
 	LIB_FUNC("3Tt9zL3tkoc", LibNpWebApi2::NpWebApi2CheckTimeout);
 	LIB_FUNC("bEvXpcEk200", LibNpWebApi2::NpWebApi2Terminate);
 }
 
 } // namespace LibNpWebApi2
+
+namespace LibPlayerInvitationDialog {
+
+LIB_VERSION("PlayerInvitationDialog", 1, "PlayerInvitationDialog", 1, 1);
+
+constexpr int COMMON_DIALOG_STATUS_NONE     = 0;
+constexpr int COMMON_DIALOG_STATUS_FINISHED = 3;
+constexpr int COMMON_DIALOG_ERROR_ARG_NULL  = -2135425011; /* 0x80B8000D */
+
+struct PlayerInvitationDialogResult {
+	int32_t error_code;
+	int32_t result;
+	uint8_t reserved[32];
+};
+
+static bool g_player_invitation_initialized = false;
+static int  g_player_invitation_status      = COMMON_DIALOG_STATUS_NONE;
+
+static int KYTY_SYSV_ABI PlayerInvitationDialogInitialize() {
+	PRINT_NAME();
+	g_player_invitation_initialized = true;
+	g_player_invitation_status      = COMMON_DIALOG_STATUS_NONE;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI PlayerInvitationDialogOpen(const void* param) {
+	PRINT_NAME();
+	if (param == nullptr) {
+		return COMMON_DIALOG_ERROR_ARG_NULL;
+	}
+	if (!g_player_invitation_initialized) {
+		PlayerInvitationDialogInitialize();
+	}
+	// No official network is contacted. Complete locally as user-canceled.
+	g_player_invitation_status = COMMON_DIALOG_STATUS_FINISHED;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI PlayerInvitationDialogUpdateStatus() {
+	PRINT_NAME();
+	return g_player_invitation_status;
+}
+
+static int KYTY_SYSV_ABI PlayerInvitationDialogGetResult(
+	PlayerInvitationDialogResult* result) {
+	PRINT_NAME();
+	if (result == nullptr) {
+		return COMMON_DIALOG_ERROR_ARG_NULL;
+	}
+	*result         = {};
+	result->result  = 1; // SCE_COMMON_DIALOG_RESULT_USER_CANCELED
+	return 0;
+}
+
+static int KYTY_SYSV_ABI PlayerInvitationDialogTerminate() {
+	PRINT_NAME();
+	g_player_invitation_initialized = false;
+	g_player_invitation_status      = COMMON_DIALOG_STATUS_NONE;
+	return 0;
+}
+
+LIB_DEFINE(InitNet_1_PlayerInvitationDialog) {
+	LIB_FUNC("rKPTlHwGa4k", LibPlayerInvitationDialog::PlayerInvitationDialogOpen);
+	LIB_FUNC("gDm5a6GSE94", LibPlayerInvitationDialog::PlayerInvitationDialogTerminate);
+	LIB_FUNC("JDwx3Bl4bB4", LibPlayerInvitationDialog::PlayerInvitationDialogInitialize);
+	LIB_FUNC("kFhuwHrIUqs", LibPlayerInvitationDialog::PlayerInvitationDialogUpdateStatus);
+	LIB_FUNC("AhqlQ8cngrk", LibPlayerInvitationDialog::PlayerInvitationDialogGetResult);
+}
+
+} // namespace LibPlayerInvitationDialog
 
 namespace LibGameUpdate {
 
@@ -4019,6 +4823,7 @@ LIB_DEFINE(InitNet_1) {
 	LibHttp::InitNet_1_Http(s);
 	LibHttp2::InitNet_1_Http2(s);
 	LibNetCtl::InitNet_1_NetCtl(s);
+	LibNpUtility::InitNet_1_NpUtility(s);
 	LibNpCommerce::InitNet_1_NpCommerce(s);
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
@@ -4029,6 +4834,7 @@ LIB_DEFINE(InitNet_1) {
 	LibCes::InitNet_1_Ces(s);
 	LibNpGameIntent::InitNet_1_NpGameIntent(s);
 	LibNpWebApi2::InitNet_1_NpWebApi2(s);
+	LibPlayerInvitationDialog::InitNet_1_PlayerInvitationDialog(s);
 	LibGameUpdate::InitNet_1_GameUpdate(s);
 	LibShare::InitNet_1_Share(s);
 	LibJson2::InitNet_1_Json2(s);

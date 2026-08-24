@@ -533,6 +533,17 @@ void KYTY_SYSV_ABI cxa_finalize(void* d) {
 	}
 }
 
+// Guest exceptions are allocated and released by the guest C++ runtime. The host cannot
+// safely mutate the implementation-private reference counter, so keep these lifecycle
+// hooks conservative until exception objects are represented explicitly by the emulator.
+static KYTY_SYSV_ABI void cxa_increment_exception_refcount(void* exception) {
+	(void)exception;
+}
+
+static KYTY_SYSV_ABI void cxa_decrement_exception_refcount(void* exception) {
+	(void)exception;
+}
+
 } // namespace LibC
 
 namespace LibcInternalExt {
@@ -783,6 +794,8 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
 	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
+	LIB_FUNC("PsrRUg671K0", LibC::cxa_increment_exception_refcount);
+	LIB_FUNC("MQFPAqQPt1s", LibC::cxa_decrement_exception_refcount);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 
 	LIB_FUNC("al3JzFI9MQ0", LibcInternal::LibcHeapErrorReportForGame);
@@ -814,6 +827,8 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("XKRegsFpEpk", LibC::catchReturnFromMain);
 	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
+	LIB_FUNC("PsrRUg671K0", LibC::cxa_increment_exception_refcount);
+	LIB_FUNC("MQFPAqQPt1s", LibC::cxa_decrement_exception_refcount);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 }
 

@@ -787,6 +787,43 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static void LogUnhandledHostException(const Common::HostException::ExceptionInfo& info) {
+	auto report = fmt::format(
+	    "Unhandled host exception: type={} access={} native=0x{:08x} exception=0x{:016x} "
+	    "fault=0x{:016x}\n"
+	    "  rip=0x{:016x} rsp=0x{:016x} rbp=0x{:016x}\n"
+	    "  rax=0x{:016x} rbx=0x{:016x} rcx=0x{:016x} rdx=0x{:016x}\n"
+	    "  rsi=0x{:016x} rdi=0x{:016x} r8 =0x{:016x} r9 =0x{:016x}\n"
+	    "  r10=0x{:016x} r11=0x{:016x} r12=0x{:016x} r13=0x{:016x}\n"
+	    "  r14=0x{:016x} r15=0x{:016x}\n",
+	    Common::EnumName(info.type), Common::EnumName(info.access_violation_type), info.native_code,
+	    info.exception_address, info.access_violation_vaddr, info.exception_address, info.rsp,
+	    info.rbp, info.rax, info.rbx, info.rcx, info.rdx, info.rsi, info.rdi, info.r8, info.r9,
+	    info.r10, info.r11, info.r12, info.r13, info.r14, info.r15);
+
+	uint64_t stack_words[8] {};
+	if (IsReadableRange(info.rsp, sizeof(stack_words))) {
+		std::memcpy(stack_words, reinterpret_cast<const void*>(info.rsp), sizeof(stack_words));
+		report += "  stack:";
+		for (const auto word: stack_words) {
+			report += fmt::format(" 0x{:016x}", word);
+		}
+		report += "\n";
+	}
+
+	void* frames[16] {};
+	const int depth = WalkGuestStack(info.rbp, info.rsp, frames, static_cast<int>(std::size(frames)));
+	if (depth > 0) {
+		report += "  guest frames:";
+		for (int i = 0; i < depth; i++) {
+			report += fmt::format(" 0x{:016x}", reinterpret_cast<uintptr_t>(frames[i]));
+		}
+		report += "\n";
+	}
+
+	Log::WriteFatal(report);
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -803,12 +840,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Read: access = GpuAccess::Read; break;
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
-			case CoreAccess::Unknown: return false;
+			case CoreAccess::Unknown:
+				LogUnhandledHostException(*info);
+				return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
 	}
+	LogUnhandledHostException(*info);
 	return false;
 }
 

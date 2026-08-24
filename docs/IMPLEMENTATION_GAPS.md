@@ -1,7 +1,39 @@
 # Auditoría de rutas stub o sin implementar
 
-Fecha: 2026-08-23
+Fecha: 2026-08-24
 Base revisada: `6eed46b`
+
+## Actualización 2026-08-24
+
+Estado actual sobre `b9480fa`, rama `gods-will/runtime-compatibility`:
+
+- **Imports opcionales:** los 61 imports observados de NP, Commerce, Entitlements, Manager,
+  Signaling, Trophy, WebApi y JSON tienen resolución local. Las rutas online conservan estado
+  determinista y permanecen desconectadas de la red oficial.
+- **GPU:** la matriz cubre 509 opcodes; los 61 ALU pendientes ya tienen lowering y regresiones.
+  No quedan pendientes en ALU, float, memory, image o graphics de esa matriz. `S_SETPC_B64`
+  cubre destinos estáticos, dinámicos y tablas de salto; PM4 indirecto cubre CX, SH y UC.
+- **Audio:** ACM incluye FFT/IFFT fp32/fp16 y panner CPU; NGS2 incluye WAV PCM, bloques,
+  listener, paneo, distancia, cono y doppler; AJM incluye LPCM (23) con S16/S32/float.
+- **Servicios offline:** RUDP valida lifecycle/callback; PSML mantiene objetos, dispatch,
+  progreso y capture state; TextToSpeech2 mantiene estado/cancelación; CES mantiene sus dos
+  contextos observados. Ninguno intenta PSN.
+- **Pruebas:** pasan `shader_recompiler_compute_tests.exe`, `shader_cfg_tests.exe` y
+  `kernel_file_system_tests.exe`; `kyty_emulator.exe` compila y se instala.
+- **Castlevania Dominus Collection 01.003:** llega al título a ~60 FPS. Después de entrar y
+  seleccionar un juego, Windows confirma `0xc0000005` por ejecución de dirección nula. Dump:
+  `C:\Users\TechX\AppData\Local\CrashDumps\kyty_emulator.exe.35036.dmp`. La repetición
+  estricta genera `kyty_emulator.exe.50000.dmp` y `_TempData/castlevania-post-title.log`.
+  El último PLT observado de `dra03.prx`, `MQFPAqQPt1s#F#G`, corresponde a
+  `libc::__cxa_decrement_exception_refcount`; libc registra ahora ese NID y su par de incremento
+  como shims conservadores. El handler nativo registra registros, pila y frames legibles cuando
+  una excepción no es atendida.
+
+Audio y servicios se contrastaron explícitamente con SDK 10, porque el índice local disponible
+de SDK 12 no contiene esos contratos. Archivo consultado:
+`F:\Downloads\SDK MANAGER 10.00\SDK MANAGER 10.00\InstallFiles\49f9e27e27d6e2f894c60f5acd3fd3f6\SDK-10_00_00_40-00_00_00_0_1.zip`.
+Se revisaron `audio3d.h`, ACM FFT/panner/conv-reverb, NGS2, `ajm/lpcm_decoder.h`, `rudp.h`,
+Share, PSML, TextToSpeech2 y CES.
 
 ## Estado de remediación
 
@@ -22,8 +54,8 @@ Implementado y verificado en la revisión posterior a la auditoría:
 - **POSIX / red (SDK 10):** `rename`, `rmdir`, `fchmod`, `futimes`, `utimes`, `shutdown`,
   `getpeername`, `sendmsg` y `recvmsg` tienen implementación host. libSceNet enlaza además
   `connect`, send/recv, `getpeername`, `getsockopt` y el ciclo de vida/resolución Aton.
-- **Loader / títulos reales:** los siete títulos encontrados en
-  `F:\APPs\_IA\SharpEMU\Game` superaron el arranque con `--strict-unresolved-imports`.
+- **Loader / títulos reales (prueba histórica):** siete títulos encontrados en
+  `F:\APPs_IA\SharpEMU\Game` superaron el arranque con `--strict-unresolved-imports`.
   En The Messenger, los 12 imports sin resolver del runtime IL2CPP ahora enlazan a funciones
   reales; el módulo opcional `libSceNpToolkit2.prx` conserva 61 imports de servicios online.
 - **Pruebas:** regresiones GPU y de estado Sysmodule/RUDP añadidas. El ejecutable del emulador y
@@ -61,8 +93,8 @@ Como señal histórica de alcance, en la base auditada había 454 referencias a 
 El decodificador de shaders contiene además 48 referencias a `SetUnsupported` o
 `MarkMemoryUnsupported`.
 
-La regresión actual cubre 448 opcodes del decodificador; quedan 61 opcodes ALU marcados como
-pendientes y ninguno pendiente en las categorías float, memory, image o graphics de esa prueba.
+La regresión actual cubre 509 opcodes del decodificador; quedan 0 pendientes en las categorías
+ALU, float, memory, image o graphics de esa prueba.
 
 ## Evidencia confirmada
 
@@ -88,20 +120,22 @@ La salida básica `AudioOut` **no es un stub**: abre un dispositivo SDL, convier
 y encola audio (`audio.cpp:222-251`, `:327-391`). El loader tampoco está vacío; el problema
 concreto es su fallback genérico para imports no resueltos.
 
-## Pendientes priorizados
+## Pendientes priorizados actuales
 
-1. **P0 — títulos reales:** ampliar las pruebas más allá del arranque y convertir cada import
-   realmente llamado en un caso reproducible. Los 61 imports opcionales observados pertenecen
-   principalmente a NP Utility/Commerce/Entitlements/Manager/Signaling/Trophy/WebApi y JSON.
-2. **P0 — GPU:** implementar y probar los 61 opcodes ALU aún pendientes; además permanecen
-   selectores PM4, `S_SETPC_B64` dinámico y casos sin contrato/captura reproducible.
-3. **P0 — audio avanzado:** aportar contratos y cargas reales para implementar Audio3D, DSP de
-   ACM/NGS2, módulos custom y codecs adicionales.
-4. **P1 — servicios:** definir backend y ABI para RUDP de transporte, Share/PSML de captura,
-   TextToSpeech2, privacy, CES y write throttling.
-5. **P1 — configuración:** sustituir el usuario único de UserService por perfiles configurables.
-6. **P1 — pruebas de integración:** añadir un título o traza redistribuible que cubra loader,
-   AudioIn/Audio3D y servicios en runtime.
+1. **Castlevania:** repetir la selección con el nuevo diagnóstico, confirmar si el import de
+   excepciones C++ era causal y localizar la llamada nula si persiste. Los dumps anteriores no
+   incluyen el guest stack necesario; la prueba interactiva queda aplazada mientras el usuario
+   está AFK.
+2. **Partidas completas:** ejecutar recorridos jugables prolongados en los diez títulos de
+   `F:\APPs_IA\SharpEMU\Game`; llegar al título no equivale a completar una partida.
+3. **Audio avanzado:** kernel real de ACM convolution reverb, módulos custom NGS2 y render
+   audible de Audio3D; la cola de Audio3D todavía simula reproducción.
+4. **Codecs:** CELP/HEVAG y cualquier codec adicional observado en trazas reales. LPCM, MP3,
+   ATRAC9, AAC y Opus ya tienen rutas conocidas.
+5. **Servicios con backend local:** transporte RUDP, captura Share/PSML y síntesis TTS. Nunca
+   deben conectarse a la red oficial.
+6. **GPU no reproducida:** ampliar PM4/ISA cuando una traza válida revele un caso nuevo; la
+   matriz actual ya no tiene opcodes pendientes.
 
-Prioridad propuesta: primero obtener trazas de títulos reales y convertir cada bloqueo en un
-caso reproducible; después implementar por frecuencia e impacto, no por cantidad de macros.
+No se considera completo un servicio que solo conserva estado si el juego necesita su efecto
+externo. Los fallbacks offline permiten ejecución segura y revelan el siguiente bloqueo.

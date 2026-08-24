@@ -16,9 +16,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cmath>
+#include <complex>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Audio {
@@ -977,21 +983,179 @@ struct AcmBatchError {
 
 static std::atomic_uint32_t g_acm_next_context {1};
 static std::atomic_uint32_t g_acm_next_batch {1};
+static std::mutex           g_acm_mutex;
+static std::unordered_set<AcmContextId> g_acm_contexts;
+static std::unordered_map<AcmBatchId, AcmContextId> g_acm_batches;
 
-static void acm_advance_batch(AcmBatchInfo* info, size_t bytes) {
-	if (info == nullptr || info->buffer == nullptr || info->buffer_size == 0) {
+constexpr int ACM_ERROR_INVALID_CONTEXT   = static_cast<int>(0x81940002u);
+constexpr int ACM_ERROR_INVALID_BATCH     = static_cast<int>(0x81940003u);
+constexpr int ACM_ERROR_INVALID_PARAMETER = static_cast<int>(0x81940006u);
+constexpr int ACM_ERROR_BATCHBUFFER_FULL  = static_cast<int>(0x81940009u);
+constexpr int ACM_ERROR_ALIGNMENT         = static_cast<int>(0x8194000au);
+constexpr size_t ACM_COMMAND_SIZE          = 16;
+constexpr uint32_t ACM_FFT_ZERO_2ND_HALF   = 1;
+constexpr uint32_t ACM_FFT_SPLIT_INPUT     = 2;
+constexpr uint32_t ACM_FFT_SPLIT_OUTPUT    = 4;
+constexpr uint32_t ACM_IFFT_DROP_1ST_HALF  = 1;
+constexpr uint32_t ACM_PANNER_KEYON        = 1;
+constexpr uint32_t ACM_PANNER_SAMPLES      = 256;
+
+static int acm_reserve_batch(AcmBatchInfo* info, size_t bytes) {
+	if (info == nullptr || info->buffer == nullptr || info->offset > info->buffer_size) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	if (bytes > info->buffer_size - info->offset) {
+		return ACM_ERROR_BATCHBUFFER_FULL;
+	}
+	std::memset(static_cast<uint8_t*>(info->buffer) + info->offset, 0, bytes);
+	info->offset += bytes;
+	return OK;
+}
+
+static float acm_half_to_float(uint16_t value) {
+	const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16u;
+	uint32_t       exp  = (value >> 10u) & 0x1fu;
+	uint32_t       mant = value & 0x3ffu;
+	uint32_t       bits = 0;
+	if (exp == 0) {
+		if (mant == 0) {
+			bits = sign;
+		} else {
+			exp = 113;
+			while ((mant & 0x400u) == 0) {
+				mant <<= 1u;
+				exp--;
+			}
+			bits = sign | (exp << 23u) | ((mant & 0x3ffu) << 13u);
+		}
+	} else if (exp == 0x1fu) {
+		bits = sign | 0x7f800000u | (mant << 13u);
+	} else {
+		bits = sign | ((exp + 112u) << 23u) | (mant << 13u);
+	}
+	return std::bit_cast<float>(bits);
+}
+
+static uint16_t acm_float_to_half(float value) {
+	const uint32_t bits = std::bit_cast<uint32_t>(value);
+	const uint32_t sign = (bits >> 16u) & 0x8000u;
+	const uint32_t abs  = bits & 0x7fffffffu;
+	if (abs >= 0x7f800000u) {
+		return static_cast<uint16_t>(sign | (abs > 0x7f800000u ? 0x7e00u : 0x7c00u));
+	}
+	if (abs > 0x477fefffu) {
+		return static_cast<uint16_t>(sign | 0x7c00u);
+	}
+	if (abs < 0x33000001u) {
+		return static_cast<uint16_t>(sign);
+	}
+	if (abs < 0x38800000u) {
+		const uint32_t shift = 113u - (abs >> 23u);
+		const uint32_t mant  = (abs & 0x7fffffu) | 0x800000u;
+		return static_cast<uint16_t>(sign | ((mant + (1u << (shift + 12u))) >> (shift + 13u)));
+	}
+	return static_cast<uint16_t>(sign | (((abs + 0x1000u) >> 13u) - 0x1c000u));
+}
+
+static float acm_read_value(const void* data, size_t index, int format) {
+	return format == 0 ? static_cast<const float*>(data)[index]
+	                   : acm_half_to_float(static_cast<const uint16_t*>(data)[index]);
+}
+
+static void acm_write_value(void* data, size_t index, int format, float value) {
+	if (format == 0) {
+		static_cast<float*>(data)[index] = value;
+	} else {
+		static_cast<uint16_t*>(data)[index] = acm_float_to_half(value);
+	}
+}
+
+static bool acm_fft_size_valid(int size) { return size == 512 || size == 1024 || size == 2048; }
+
+static int acm_validate_fft(int size, int count, int input_format, const void* const input[],
+	                        int output_format, void* const output[], uint32_t flags) {
+	if (!acm_fft_size_valid(size) || count <= 0 || input == nullptr || output == nullptr ||
+	    (input_format != 0 && input_format != 1) ||
+	    (output_format != 0 && output_format != 1) || (flags & ~7u) != 0) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	const auto input_count  = static_cast<size_t>(count) * ((flags & ACM_FFT_SPLIT_INPUT) ? 2 : 1);
+	const auto output_count = static_cast<size_t>(count) * ((flags & ACM_FFT_SPLIT_OUTPUT) ? 2 : 1);
+	for (size_t i = 0; i < input_count; i++) {
+		if (input[i] == nullptr) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
+	for (size_t i = 0; i < output_count; i++) {
+		if (output[i] == nullptr) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
+	return OK;
+}
+
+static void acm_fft_write_output(void* const output[], int operation, bool split, int format,
+	                              const std::vector<float>& values) {
+	if (!split) {
+		for (size_t i = 0; i < values.size(); i++) {
+			acm_write_value(output[operation], i, format, values[i]);
+		}
 		return;
 	}
+	const auto half = values.size() / 2;
+	for (size_t i = 0; i < half; i++) {
+		acm_write_value(output[operation * 2], i, format, values[i]);
+		acm_write_value(output[operation * 2 + 1], i, format, values[half + i]);
+	}
+}
 
-	info->offset = std::min(info->buffer_size, info->offset + bytes);
+static void acm_fft_transform(std::vector<std::complex<double>>* values, bool inverse) {
+	auto& data = *values;
+	const auto n = data.size();
+	for (size_t i = 1, j = 0; i < n; i++) {
+		size_t bit = n >> 1u;
+		for (; (j & bit) != 0; bit >>= 1u) {
+			j ^= bit;
+		}
+		j ^= bit;
+		if (i < j) {
+			std::swap(data[i], data[j]);
+		}
+	}
+	const auto pi = std::acos(-1.0);
+	for (size_t length = 2; length <= n; length <<= 1u) {
+		const auto angle = (inverse ? 2.0 : -2.0) * pi / static_cast<double>(length);
+		const std::complex<double> step(std::cos(angle), std::sin(angle));
+		for (size_t base = 0; base < n; base += length) {
+			std::complex<double> factor(1.0, 0.0);
+			for (size_t i = 0; i < length / 2; i++) {
+				const auto even = data[base + i];
+				const auto odd  = data[base + i + length / 2] * factor;
+				data[base + i]              = even + odd;
+				data[base + i + length / 2] = even - odd;
+				factor *= step;
+			}
+		}
+	}
+	if (inverse) {
+		for (auto& value: data) {
+			value /= static_cast<double>(n);
+		}
+	}
 }
 
 int KYTY_SYSV_ABI AcmContextCreate(AcmContextId* context) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(context == nullptr);
+	if (context == nullptr) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
 
 	*context = g_acm_next_context.fetch_add(1, std::memory_order_relaxed);
+	{
+		std::scoped_lock lock(g_acm_mutex);
+		g_acm_contexts.insert(*context);
+	}
 
 	LOGF("\t context = %" PRIu32 "\n", *context);
 
@@ -1001,6 +1165,12 @@ int KYTY_SYSV_ABI AcmContextCreate(AcmContextId* context) {
 int KYTY_SYSV_ABI AcmContextDestroy(AcmContextId context) {
 	PRINT_NAME();
 	LOGF("\t context = %" PRIu32 "\n", context);
+	std::scoped_lock lock(g_acm_mutex);
+	if (g_acm_contexts.erase(context) == 0) {
+		return ACM_ERROR_INVALID_CONTEXT;
+	}
+	std::erase_if(g_acm_batches,
+	              [context](const auto& item) { return item.second == context; });
 	return OK;
 }
 
@@ -1009,13 +1179,20 @@ int KYTY_SYSV_ABI AcmBatchStartBuffer(AcmContextId context, const void* batch_co
                                       AcmBatchId* batch) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(batch == nullptr);
+	if (batch == nullptr || batch_commands == nullptr || batch_size == 0) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
 
 	if (batch_error != nullptr) {
 		std::memset(batch_error, 0, sizeof(AcmBatchError));
 	}
 
+	std::scoped_lock lock(g_acm_mutex);
+	if (!g_acm_contexts.contains(context)) {
+		return ACM_ERROR_INVALID_CONTEXT;
+	}
 	*batch = g_acm_next_batch.fetch_add(1, std::memory_order_relaxed);
+	g_acm_batches[*batch] = context;
 
 	return OK;
 }
@@ -1025,25 +1202,59 @@ int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info
                                        AcmBatchError* batch_error, AcmBatchId* batch) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(batch_info_count != 0 && batch_info == nullptr);
-	EXIT_NOT_IMPLEMENTED(batch == nullptr);
+	if (batch_info_count == 0 || batch_info == nullptr || batch == nullptr) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	for (uint32_t i = 0; i < batch_info_count; i++) {
+		if (batch_info[i] == nullptr || batch_info[i]->buffer == nullptr ||
+		    batch_info[i]->offset > batch_info[i]->buffer_size) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
 
 	if (batch_error != nullptr) {
 		std::memset(batch_error, 0, sizeof(AcmBatchError));
 	}
 
+	std::scoped_lock lock(g_acm_mutex);
+	if (!g_acm_contexts.contains(context)) {
+		return ACM_ERROR_INVALID_CONTEXT;
+	}
 	*batch = g_acm_next_batch.fetch_add(1, std::memory_order_relaxed);
+	g_acm_batches[*batch] = context;
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t timeout) {
+	PRINT_NAME();
+	(void)timeout;
+	std::scoped_lock lock(g_acm_mutex);
+	if (!g_acm_contexts.contains(context)) {
+		return ACM_ERROR_INVALID_CONTEXT;
+	}
+	const auto it = g_acm_batches.find(batch);
+	if (it == g_acm_batches.end() || it->second != context) {
+		return ACM_ERROR_INVALID_BATCH;
+	}
+	g_acm_batches.erase(it);
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
+int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info, uint8_t value,
+	                                      volatile void* notification) {
 	PRINT_NAME();
-	acm_advance_batch(batch_info, 2 * 16);
+	if (value == 0 || notification == nullptr) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	if ((reinterpret_cast<uintptr_t>(notification) & 127u) != 0) {
+		return ACM_ERROR_ALIGNMENT;
+	}
+	const auto result = acm_reserve_batch(batch_info, 2 * ACM_COMMAND_SIZE);
+	if (result != OK) {
+		return result;
+	}
+	*static_cast<volatile uint8_t*>(notification) = value;
 	return OK;
 }
 
@@ -1051,42 +1262,79 @@ int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t bl
                                            uint32_t count, const void* const ir[],
                                            const float* gain, void* const out[]) {
 	PRINT_NAME();
-	(void)block_count;
-	(void)in;
-	(void)count;
-	(void)ir;
-	(void)gain;
-	(void)out;
-	acm_advance_batch(batch_info, 1024);
-	return OK;
+	if (block_count != 1 || in == nullptr || count == 0 || ir == nullptr || out == nullptr) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (ir[i] == nullptr || out[i] == nullptr || (gain != nullptr && !std::isfinite(gain[i]))) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
+	// The command is preserved for batch ordering. Convolution data uses ACV-specific permuted
+	// spectra, so the host fallback deliberately does not reinterpret those buffers.
+	return acm_reserve_batch(batch_info, 1024);
 }
 
 int KYTY_SYSV_ABI AcmConvReverbSharedIr(AcmBatchInfo* batch_info, uint32_t block_count,
                                         const void* ir, uint32_t count, void* const in[],
                                         const float* gain, void* const out[]) {
 	PRINT_NAME();
-	(void)block_count;
-	(void)ir;
-	(void)count;
-	(void)in;
-	(void)gain;
-	(void)out;
-	acm_advance_batch(batch_info, 1024);
-	return OK;
+	if (block_count != 1 || ir == nullptr || count == 0 || in == nullptr || out == nullptr) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (in[i] == nullptr || out[i] == nullptr || (gain != nullptr && !std::isfinite(gain[i]))) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
+	return acm_reserve_batch(batch_info, 1024);
 }
 
 int KYTY_SYSV_ABI AcmFft(AcmBatchInfo* batch_info, int size, int count, int input_format,
                          const void* const input[], int output_format, void* const output[],
                          uint32_t flags) {
 	PRINT_NAME();
-	(void)size;
-	(void)count;
-	(void)input_format;
-	(void)input;
-	(void)output_format;
-	(void)output;
-	(void)flags;
-	acm_advance_batch(batch_info, 256);
+	const auto validation = acm_validate_fft(size, count, input_format, input, output_format,
+	                                         output, flags);
+	if (validation != OK) {
+		return validation;
+	}
+	const auto command_count = 2u + static_cast<uint32_t>(count) *
+	                                      (7u + ((flags & ACM_FFT_SPLIT_INPUT) ? 1u : 0u) +
+	                                       ((flags & ACM_FFT_SPLIT_OUTPUT) ? 1u : 0u));
+	const auto reserve_result = acm_reserve_batch(batch_info, command_count * ACM_COMMAND_SIZE);
+	if (reserve_result != OK) {
+		return reserve_result;
+	}
+
+	const bool zero_second_half = (flags & ACM_FFT_ZERO_2ND_HALF) != 0;
+	const bool split_input      = (flags & ACM_FFT_SPLIT_INPUT) != 0;
+	const bool split_output     = (flags & ACM_FFT_SPLIT_OUTPUT) != 0;
+	const auto n                = static_cast<size_t>(size);
+	for (int operation = 0; operation < count; operation++) {
+		std::vector<std::complex<double>> samples(n);
+		const auto provided = zero_second_half ? n / 2 : n;
+		for (size_t i = 0; i < provided; i++) {
+			const auto part  = split_input && i >= n / 2 ? 1 : 0;
+			const auto index = split_input ? i % (n / 2) : i;
+			samples[i] = acm_read_value(input[operation * (split_input ? 2 : 1) + part], index,
+			                            input_format);
+		}
+		acm_fft_transform(&samples, false);
+		std::vector<float> packed(n, 0.0f);
+		for (size_t k = 0; k <= n / 2; k++) {
+			const auto sum = samples[k];
+			if (k == 0) {
+				packed[0] = static_cast<float>(sum.real());
+			} else if (k == n / 2) {
+				packed[1] = static_cast<float>(sum.real());
+			} else {
+				packed[k * 2]     = static_cast<float>(sum.real());
+				packed[k * 2 + 1] = static_cast<float>(sum.imag());
+			}
+		}
+		acm_fft_write_output(output, operation, split_output, output_format, packed);
+	}
 	return OK;
 }
 
@@ -1094,14 +1342,51 @@ int KYTY_SYSV_ABI AcmIfft(AcmBatchInfo* batch_info, int size, int count, int inp
                           const void* const input[], int output_format, void* const output[],
                           uint32_t flags) {
 	PRINT_NAME();
-	(void)size;
-	(void)count;
-	(void)input_format;
-	(void)input;
-	(void)output_format;
-	(void)output;
-	(void)flags;
-	acm_advance_batch(batch_info, 256);
+	const auto validation = acm_validate_fft(size, count, input_format, input, output_format,
+	                                         output, flags & ~ACM_IFFT_DROP_1ST_HALF);
+	if (validation != OK || (flags & ~7u) != 0) {
+		return validation != OK ? validation : ACM_ERROR_INVALID_PARAMETER;
+	}
+	const auto command_count = 2u + static_cast<uint32_t>(count) *
+	                                      (7u + ((flags & ACM_FFT_SPLIT_INPUT) ? 1u : 0u) +
+	                                       ((flags & (ACM_IFFT_DROP_1ST_HALF |
+	                                                  ACM_FFT_SPLIT_OUTPUT)) != 0
+	                                            ? 1u
+	                                            : 0u));
+	const auto reserve_result = acm_reserve_batch(batch_info, command_count * ACM_COMMAND_SIZE);
+	if (reserve_result != OK) {
+		return reserve_result;
+	}
+
+	const bool split_input  = (flags & ACM_FFT_SPLIT_INPUT) != 0;
+	const bool split_output = (flags & ACM_FFT_SPLIT_OUTPUT) != 0;
+	const bool drop_first   = (flags & ACM_IFFT_DROP_1ST_HALF) != 0;
+	const auto n            = static_cast<size_t>(size);
+	for (int operation = 0; operation < count; operation++) {
+		std::vector<float> packed(n, 0.0f);
+		for (size_t i = 0; i < n; i++) {
+			const auto part  = split_input && i >= n / 2 ? 1 : 0;
+			const auto index = split_input ? i % (n / 2) : i;
+			packed[i] = acm_read_value(input[operation * (split_input ? 2 : 1) + part], index,
+			                           input_format);
+		}
+		std::vector<std::complex<double>> spectrum(n);
+		spectrum[0]     = {packed[0], 0.0};
+		spectrum[n / 2] = {packed[1], 0.0};
+		for (size_t k = 1; k < n / 2; k++) {
+			spectrum[k]     = {packed[k * 2], packed[k * 2 + 1]};
+			spectrum[n - k] = std::conj(spectrum[k]);
+		}
+		acm_fft_transform(&spectrum, true);
+		std::vector<float> samples(n, 0.0f);
+		for (size_t t = 0; t < n; t++) {
+			samples[t] = static_cast<float>(spectrum[t].real());
+		}
+		if (drop_first) {
+			samples.erase(samples.begin(), samples.begin() + static_cast<ptrdiff_t>(n / 2));
+		}
+		acm_fft_write_output(output, operation, split_output, output_format, samples);
+	}
 	return OK;
 }
 
@@ -1110,16 +1395,67 @@ int KYTY_SYSV_ABI AcmPanner(AcmBatchInfo* batch_info, uint32_t in_count, const f
                             const void* const parameter[], void* const state[],
                             const float* const out_init[], float* const out[]) {
 	PRINT_NAME();
-	(void)in_count;
-	(void)in;
-	(void)biquad_count;
-	(void)biquad_update_count;
-	(void)out_count;
-	(void)parameter;
-	(void)state;
-	(void)out_init;
-	(void)out;
-	acm_advance_batch(batch_info, 512);
+	if (in_count == 0 || in == nullptr || biquad_count > 2 || biquad_update_count > 1 ||
+	    out_count == 0 || out_count > 36 || parameter == nullptr || state == nullptr ||
+	    out == nullptr) {
+		return ACM_ERROR_INVALID_PARAMETER;
+	}
+	for (uint32_t voice = 0; voice < in_count; voice++) {
+		if (in[voice] == nullptr || parameter[voice] == nullptr || state[voice] == nullptr) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
+	for (uint32_t channel = 0; channel < out_count; channel++) {
+		if (out[channel] == nullptr) {
+			return ACM_ERROR_INVALID_PARAMETER;
+		}
+	}
+	const auto reserve_result = acm_reserve_batch(batch_info, 20 * ACM_COMMAND_SIZE);
+	if (reserve_result != OK) {
+		return reserve_result;
+	}
+
+	for (uint32_t channel = 0; channel < out_count; channel++) {
+		if (out_init != nullptr && out_init[channel] != nullptr) {
+			std::memcpy(out[channel], out_init[channel], ACM_PANNER_SAMPLES * sizeof(float));
+		} else {
+			std::memset(out[channel], 0, ACM_PANNER_SAMPLES * sizeof(float));
+		}
+	}
+	const auto coefficient_sets = 1u << biquad_update_count;
+	const auto coefficient_count = biquad_count * coefficient_sets * 5u;
+	for (uint32_t voice = 0; voice < in_count; voice++) {
+		const auto* bytes       = static_cast<const uint8_t*>(parameter[voice]);
+		const auto  voice_flags = *reinterpret_cast<const uint32_t*>(bytes);
+		const auto* coefficients = reinterpret_cast<const float*>(bytes + sizeof(uint32_t));
+		const auto* target_gain  = coefficients + coefficient_count;
+		auto*       voice_state  = static_cast<float*>(state[voice]);
+		auto*       filter_state = voice_state;
+		auto*       previous_gain = voice_state + biquad_count * 2u;
+		for (uint32_t sample = 0; sample < ACM_PANNER_SAMPLES; sample++) {
+			float value = in[voice][sample];
+			for (uint32_t biquad = 0; biquad < biquad_count; biquad++) {
+				const auto update = biquad_update_count == 0 ? 0u : sample / (ACM_PANNER_SAMPLES / 2u);
+				const auto* c = coefficients + (biquad * coefficient_sets + update) * 5u;
+				auto& z1 = filter_state[biquad * 2u];
+				auto& z2 = filter_state[biquad * 2u + 1u];
+				const auto filtered = c[0] * value + z1;
+				z1 = c[1] * value - c[3] * filtered + z2;
+				z2 = c[2] * value - c[4] * filtered;
+				value = filtered;
+			}
+			const auto blend = static_cast<float>(sample + 1u) /
+			                   static_cast<float>(ACM_PANNER_SAMPLES);
+			for (uint32_t channel = 0; channel < out_count; channel++) {
+				const auto gain = (voice_flags & ACM_PANNER_KEYON) != 0
+				                      ? target_gain[channel]
+				                      : previous_gain[channel] +
+				                            (target_gain[channel] - previous_gain[channel]) * blend;
+				out[channel][sample] += value * gain;
+			}
+		}
+		std::memcpy(previous_gain, target_gain, out_count * sizeof(float));
+	}
 	return OK;
 }
 
@@ -1130,6 +1466,10 @@ namespace Audio3d {
 LIB_NAME("Audio3d", "Audio3d");
 
 namespace Semaphore = LibKernel::Semaphore;
+
+constexpr int AUDIO3D_ERROR_INVALID_PARAMETER = static_cast<int>(0x80ea0004u);
+constexpr int AUDIO3D_ERROR_OUT_OF_RESOURCES  = static_cast<int>(0x80ea0006u);
+constexpr int AUDIO3D_ERROR_NOT_READY          = static_cast<int>(0x80ea0007u);
 
 struct Audio3dOpenParameters {
 	size_t   size        = 0x20;
@@ -1219,6 +1559,9 @@ void KYTY_SYSV_ABI Audio3dGetDefaultOpenParameters(Audio3dOpenParameters* p) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(sizeof(Audio3dOpenParameters) != 0x20);
+	if (p == nullptr) {
+		return;
+	}
 
 	*p = Audio3dOpenParameters();
 }
@@ -1227,9 +1570,10 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
                                   uint32_t* id) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(parameters == nullptr);
-	EXIT_NOT_IMPLEMENTED(id == nullptr);
-	EXIT_NOT_IMPLEMENTED(parameters->size != 0x20);
+	if (parameters == nullptr || id == nullptr || parameters->size != sizeof(Audio3dOpenParameters)) {
+		return AUDIO3D_ERROR_INVALID_PARAMETER;
+	}
+	*id = std::numeric_limits<uint32_t>::max();
 
 	LOGF("\t user_id     = %d\n"
 	     "\t granularity = %u\n"
@@ -1240,8 +1584,17 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 	     user_id, parameters->granularity, parameters->rate, parameters->max_objects,
 	     parameters->queue_depth, parameters->buffer_mode);
 
-	EXIT_NOT_IMPLEMENTED(parameters->buffer_mode != 2);
-	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 1);
+	const auto max_queue_depth = parameters->granularity == 256
+	                                 ? 64u
+	                                 : (parameters->granularity == 512
+	                                        ? 31u
+	                                        : (parameters->granularity == 768 ? 20u : 15u));
+	if (parameters->buffer_mode != 2 || (user_id != 255 && user_id != 1) ||
+	    parameters->rate != 0 || parameters->granularity == 0 ||
+	    (parameters->granularity % 256) != 0 || parameters->max_objects > 512 ||
+	    parameters->queue_depth == 0 || parameters->queue_depth > max_queue_depth) {
+		return AUDIO3D_ERROR_INVALID_PARAMETER;
+	}
 
 	uint32_t port = 0;
 	for (; port < MAX_PORTS; port++) {
@@ -1250,7 +1603,9 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 		}
 	}
 
-	EXIT_NOT_IMPLEMENTED(port >= MAX_PORTS);
+	if (port >= MAX_PORTS) {
+		return AUDIO3D_ERROR_OUT_OF_RESOURCES;
+	}
 
 	g_ports[port].user_id = user_id;
 	g_ports[port].params  = *parameters;
@@ -1391,7 +1746,9 @@ int KYTY_SYSV_ABI Audio3dPortPush(uint32_t port_id, uint32_t blocking) {
 
 	auto* port = &g_ports[port_id];
 
-	EXIT_NOT_IMPLEMENTED(blocking != 1);
+	if (blocking > 1) {
+		return AUDIO3D_ERROR_INVALID_PARAMETER;
+	}
 
 	LOGF("\t blocking = %u\n", blocking);
 
@@ -1424,6 +1781,9 @@ int KYTY_SYSV_ABI Audio3dPortPush(uint32_t port_id, uint32_t blocking) {
 				Common::Thread::SleepMicro(wait_time);
 			}
 		}
+	}
+	if (data_num == 0 && blocking == 0) {
+		return AUDIO3D_ERROR_NOT_READY;
 	}
 
 	return OK;
@@ -2169,11 +2529,46 @@ int KYTY_SYSV_ABI Ngs2SystemSetGrainSamples(uintptr_t system_handle, uint32_t nu
 }
 
 int KYTY_SYSV_ABI Ngs2SystemDestroy(uintptr_t system_handle, Ngs2ContextBufferInfo* buffer_info) {
+	constexpr int32_t ERROR_FAIL                  = static_cast<int32_t>(0x804a8001u);
+	constexpr int32_t ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
 	PRINT_NAME();
 	LOGF("\t system_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(system_handle));
 
 	if (buffer_info != nullptr) {
-		std::memset(buffer_info, 0, sizeof(Ngs2ContextBufferInfo));
+		*buffer_info = {};
+	}
+	if (system_handle == 0) {
+		return ERROR_INVALID_SYSTEM_HANDLE;
+	}
+
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+			if (rack->ngs == ngs) {
+				return ERROR_FAIL;
+			}
+		}
+	}
+
+	auto** link = &g_ngs_list;
+	while (*link != nullptr && *link != ngs) {
+		link = &(*link)->next;
+	}
+	if (*link == nullptr) {
+		return ERROR_INVALID_SYSTEM_HANDLE;
+	}
+	*link = ngs->next;
+
+	const auto context_buffer = ngs->buffer_info;
+	const auto allocator      = ngs->allocator;
+	ngs->~Ngs2Internal();
+	if (allocator.free_handler != nullptr) {
+		auto free_buffer = context_buffer;
+		return allocator.free_handler(&free_buffer);
+	}
+	if (buffer_info != nullptr) {
+		*buffer_info = context_buffer;
 	}
 
 	return OK;
@@ -2518,23 +2913,174 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	return OK;
 }
 
+constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS     = static_cast<int32_t>(0x804a8010u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_ADDRESS = static_cast<int32_t>(0x804a8055u);
+constexpr int32_t NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA = static_cast<int32_t>(0x804a8056u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_BLOCK_ADDRESS =
+	static_cast<int32_t>(0x804a8058u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA   = static_cast<int32_t>(0x804a8430u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT = static_cast<int32_t>(0x804a8431u);
+constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT = static_cast<int32_t>(0x804a8432u);
+constexpr int32_t NGS2_ERROR_INVALID_PAN_UNIT_ANGLE  = static_cast<int32_t>(0x804a8450u);
+constexpr int32_t NGS2_ERROR_INVALID_PAN_SPEAKER     = static_cast<int32_t>(0x804a8451u);
+constexpr int32_t NGS2_ERROR_INVALID_PAN_MATRIX_FORMAT = static_cast<int32_t>(0x804a8452u);
+constexpr int32_t NGS2_ERROR_INVALID_PAN_WORK        = static_cast<int32_t>(0x804a8453u);
+constexpr int32_t NGS2_ERROR_INVALID_PAN_PARAM       = static_cast<int32_t>(0x804a8454u);
+
+static uint16_t Ngs2ReadLe16(const uint8_t* data) {
+	return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8u);
+}
+
+static uint32_t Ngs2ReadLe32(const uint8_t* data) {
+	return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8u) |
+	       (static_cast<uint32_t>(data[2]) << 16u) | (static_cast<uint32_t>(data[3]) << 24u);
+}
+
+static bool Ngs2FourCcEquals(const uint8_t* data, const char (&value)[5]) {
+	return std::memcmp(data, value, 4) == 0;
+}
+
+static uint32_t Ngs2PcmWaveformType(uint16_t format, uint16_t bits) {
+	if (format == 1) {
+		switch (bits) {
+			case 8: return 0x11;
+			case 16: return 0x12;
+			case 24: return 0x14;
+			case 32: return 0x16;
+			default: return 0;
+		}
+	}
+	if (format == 3) {
+		return bits == 32 ? 0x18u : (bits == 64 ? 0x1au : 0u);
+	}
+	return 0;
+}
+
+static uint32_t Ngs2WaveformBytesPerSample(uint32_t waveform_type) {
+	switch (waveform_type) {
+		case 0x10:
+		case 0x11: return 1;
+		case 0x12:
+		case 0x13: return 2;
+		case 0x14:
+		case 0x15: return 3;
+		case 0x16:
+		case 0x17:
+		case 0x18:
+		case 0x19: return 4;
+		case 0x1a:
+		case 0x1b: return 8;
+		default: return 0;
+	}
+}
+
 int KYTY_SYSV_ABI Ngs2ParseWaveformData(const void* data, size_t data_size,
                                         Ngs2WaveformInfo* info) {
 	PRINT_NAME();
 	LOGF("\t data = 0x%016" PRIx64 ", data_size = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(data_size));
 
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
+	if (info == nullptr) {
+		return NGS2_ERROR_INVALID_OUT_ADDRESS;
+	}
+	*info = {};
+	if (data == nullptr) {
+		return NGS2_ERROR_INVALID_WAVEFORM_ADDRESS;
+	}
+	if (data_size < 12) {
+		return NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA;
+	}
 
-	std::memset(info, 0, sizeof(Ngs2WaveformInfo));
-	info->format.waveform_type = 0x80;
-	info->format.num_channels  = 1;
-	info->format.sample_rate   = 48000;
-	info->data_size =
-	    static_cast<uint32_t>(std::min<size_t>(data_size, std::numeric_limits<uint32_t>::max()));
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	if (!Ngs2FourCcEquals(bytes, "RIFF") || !Ngs2FourCcEquals(bytes + 8, "WAVE")) {
+		return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+	}
+
+	uint16_t format_tag     = 0;
+	uint16_t channels       = 0;
+	uint16_t bits_per_sample = 0;
+	uint16_t block_align    = 0;
+	uint32_t sample_rate    = 0;
+	uint32_t data_offset    = 0;
+	uint32_t pcm_data_size  = 0;
+	uint32_t loop_begin     = 0;
+	uint32_t loop_end       = 0;
+	bool     has_format     = false;
+	bool     has_data       = false;
+
+	for (size_t offset = 12; offset + 8 <= data_size;) {
+		const auto chunk_size = static_cast<size_t>(Ngs2ReadLe32(bytes + offset + 4));
+		const auto payload    = offset + 8;
+		if (chunk_size > data_size - payload) {
+			return NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA;
+		}
+		if (Ngs2FourCcEquals(bytes + offset, "fmt ")) {
+			if (chunk_size < 16) {
+				return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+			}
+			format_tag      = Ngs2ReadLe16(bytes + payload);
+			channels        = Ngs2ReadLe16(bytes + payload + 2);
+			sample_rate     = Ngs2ReadLe32(bytes + payload + 4);
+			block_align     = Ngs2ReadLe16(bytes + payload + 12);
+			bits_per_sample = Ngs2ReadLe16(bytes + payload + 14);
+			if (format_tag == 0xfffe && chunk_size >= 40) {
+				format_tag = Ngs2ReadLe16(bytes + payload + 24);
+			}
+			has_format = true;
+		} else if (Ngs2FourCcEquals(bytes + offset, "data")) {
+			if (payload > std::numeric_limits<uint32_t>::max() ||
+			    chunk_size > std::numeric_limits<uint32_t>::max()) {
+				return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+			}
+			data_offset   = static_cast<uint32_t>(payload);
+			pcm_data_size = static_cast<uint32_t>(chunk_size);
+			has_data      = true;
+		} else if (Ngs2FourCcEquals(bytes + offset, "smpl") && chunk_size >= 60 &&
+		           Ngs2ReadLe32(bytes + payload + 28) != 0) {
+			loop_begin = Ngs2ReadLe32(bytes + payload + 44);
+			const auto inclusive_end = Ngs2ReadLe32(bytes + payload + 48);
+			loop_end = inclusive_end == std::numeric_limits<uint32_t>::max()
+			               ? inclusive_end
+			               : inclusive_end + 1u;
+		}
+		const auto padded_size = chunk_size + (chunk_size & 1u);
+		if (padded_size > data_size - payload) {
+			break;
+		}
+		offset = payload + padded_size;
+	}
+
+	if (!has_format || !has_data) {
+		return NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA;
+	}
+	const auto waveform_type = Ngs2PcmWaveformType(format_tag, bits_per_sample);
+	if (waveform_type == 0) {
+		return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+	}
+	const auto bytes_per_sample = Ngs2WaveformBytesPerSample(waveform_type);
+	if (channels == 0 || sample_rate == 0 || sample_rate > 192000 || block_align == 0 ||
+	    block_align != channels * bytes_per_sample) {
+		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+	}
+
+	info->format.waveform_type = waveform_type;
+	info->format.num_channels  = channels;
+	info->format.sample_rate   = sample_rate;
+	info->data_offset          = data_offset;
+	info->data_size            = pcm_data_size;
+	info->num_samples          = pcm_data_size / block_align;
+	info->loop_begin_position  = std::min(loop_begin, info->num_samples);
+	info->loop_end_position    = std::min(loop_end, info->num_samples);
+	info->audio_unit_size          = block_align;
 	info->num_audio_unit_samples   = 1;
 	info->num_audio_unit_per_frame = 1;
+	info->audio_frame_size         = block_align;
 	info->num_audio_frame_samples  = 1;
+	info->num_delay_samples        = 0;
+	info->num_blocks               = 1;
+	info->blocks[0].data_offset    = data_offset;
+	info->blocks[0].data_size      = pcm_data_size;
+	info->blocks[0].num_samples    = info->num_samples;
 	return OK;
 }
 
@@ -2544,9 +3090,25 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	LOGF("\t format = 0x%016" PRIx64 ", sample_pos = %" PRIu32 ", num_samples = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(format), sample_pos, num_samples);
 
-	EXIT_NOT_IMPLEMENTED(block == nullptr);
-
-	std::memset(block, 0, sizeof(Ngs2WaveformBlock));
+	if (block == nullptr) {
+		return NGS2_ERROR_INVALID_WAVEFORM_BLOCK_ADDRESS;
+	}
+	*block = {};
+	if (format == nullptr) {
+		return NGS2_ERROR_INVALID_WAVEFORM_ADDRESS;
+	}
+	const auto bytes_per_sample = Ngs2WaveformBytesPerSample(format->waveform_type);
+	if (bytes_per_sample == 0 || format->num_channels == 0) {
+		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+	}
+	const auto frame_size = static_cast<uint64_t>(bytes_per_sample) * format->num_channels;
+	const auto offset     = static_cast<uint64_t>(sample_pos) * frame_size;
+	const auto size       = static_cast<uint64_t>(num_samples) * frame_size;
+	if (offset > std::numeric_limits<uintptr_t>::max() || size > std::numeric_limits<size_t>::max()) {
+		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+	}
+	block->data_offset = static_cast<uintptr_t>(offset);
+	block->data_size   = static_cast<size_t>(size);
 	block->num_samples = num_samples;
 	return OK;
 }
@@ -2557,17 +3119,36 @@ int KYTY_SYSV_ABI Ngs2PanInit(Ngs2PanWork* work, const float* speaker_angles, fl
 	LOGF("\t work = 0x%016" PRIx64 ", num_speakers = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(work), num_speakers);
 
-	EXIT_NOT_IMPLEMENTED(work == nullptr);
+	if (work == nullptr) {
+		return NGS2_ERROR_INVALID_PAN_WORK;
+	}
+	if (!std::isfinite(unit_angle) || unit_angle <= 0.0f) {
+		return NGS2_ERROR_INVALID_PAN_UNIT_ANGLE;
+	}
+	if (speaker_angles == nullptr || num_speakers == 0 || num_speakers > 8) {
+		return NGS2_ERROR_INVALID_PAN_SPEAKER;
+	}
 
 	std::memset(work, 0, sizeof(Ngs2PanWork));
 	work->unit_angle   = unit_angle;
-	work->num_speakers = std::min<uint32_t>(num_speakers, 8);
-	if (speaker_angles != nullptr) {
-		for (uint32_t i = 0; i < work->num_speakers; i++) {
-			work->speaker_angles[i] = speaker_angles[i];
+	work->num_speakers = num_speakers;
+	for (uint32_t i = 0; i < work->num_speakers; i++) {
+		if (!std::isfinite(speaker_angles[i])) {
+			return NGS2_ERROR_INVALID_PAN_SPEAKER;
 		}
+		work->speaker_angles[i] = speaker_angles[i];
 	}
 	return OK;
+}
+
+static float Ngs2WrapPanAngle(float value, float unit) {
+	value = std::fmod(value, unit);
+	return value < 0.0f ? value + unit : value;
+}
+
+static float Ngs2PanAngularDistance(float left, float right, float unit) {
+	const auto distance = std::abs(Ngs2WrapPanAngle(left, unit) - Ngs2WrapPanAngle(right, unit));
+	return std::min(distance, unit - distance);
 }
 
 int KYTY_SYSV_ABI Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* params,
@@ -2579,12 +3160,69 @@ int KYTY_SYSV_ABI Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* 
 	     reinterpret_cast<uint64_t>(work), reinterpret_cast<uint64_t>(params), num_params,
 	     matrix_format);
 
-	EXIT_NOT_IMPLEMENTED(out_volume_matrix == nullptr && num_params != 0);
+	if (work == nullptr || work->num_speakers == 0 || work->num_speakers > 8 ||
+	    !std::isfinite(work->unit_angle) || work->unit_angle <= 0.0f) {
+		return NGS2_ERROR_INVALID_PAN_WORK;
+	}
+	if (num_params != 0 && (params == nullptr || out_volume_matrix == nullptr)) {
+		return NGS2_ERROR_INVALID_PAN_PARAM;
+	}
+	if (matrix_format != 1 && matrix_format != 2 && matrix_format != 6 && matrix_format != 8) {
+		return NGS2_ERROR_INVALID_PAN_MATRIX_FORMAT;
+	}
 
-	const auto channels = (matrix_format == 0 ? 2u : std::min<uint32_t>(matrix_format, 8));
+	const auto channels = matrix_format;
+	const auto speaker_count = std::min(work->num_speakers, channels - (channels >= 6 ? 1u : 0u));
+	const auto speaker_channel = [channels](uint32_t speaker) {
+		return channels >= 6 && speaker >= 3 ? speaker + 1 : speaker;
+	};
 	for (uint32_t p = 0; p < num_params; p++) {
-		for (uint32_t c = 0; c < channels; c++) {
-			out_volume_matrix[p * channels + c] = (c == 0 ? 1.0f : 0.0f);
+		auto* matrix = out_volume_matrix + p * channels;
+		std::fill_n(matrix, channels, 0.0f);
+		if (!std::isfinite(params[p].angle) || !std::isfinite(params[p].distance) ||
+		    !std::isfinite(params[p].fbw_level) || !std::isfinite(params[p].lfe_level)) {
+			return NGS2_ERROR_INVALID_PAN_PARAM;
+		}
+		if (channels == 1 || speaker_count == 1) {
+			matrix[0] = 1.0f;
+		} else {
+			uint32_t nearest[2] = {0, 1};
+			float distances[2] = {
+			    Ngs2PanAngularDistance(params[p].angle, work->speaker_angles[0], work->unit_angle),
+			    Ngs2PanAngularDistance(params[p].angle, work->speaker_angles[1], work->unit_angle)};
+			if (distances[1] < distances[0]) {
+				std::swap(distances[0], distances[1]);
+				std::swap(nearest[0], nearest[1]);
+			}
+			for (uint32_t speaker = 2; speaker < speaker_count; speaker++) {
+				const auto distance = Ngs2PanAngularDistance(params[p].angle,
+				                                              work->speaker_angles[speaker],
+				                                              work->unit_angle);
+				if (distance < distances[0]) {
+					distances[1] = distances[0];
+					nearest[1]   = nearest[0];
+					distances[0] = distance;
+					nearest[0]   = speaker;
+				} else if (distance < distances[1]) {
+					distances[1] = distance;
+					nearest[1]   = speaker;
+				}
+			}
+			const auto total = distances[0] + distances[1];
+			const auto blend = total > 0.0f ? distances[0] / total : 0.0f;
+			matrix[speaker_channel(nearest[0])] =
+			    std::cos(blend * std::acos(-1.0f) * 0.5f);
+			matrix[speaker_channel(nearest[1])] =
+			    std::sin(blend * std::acos(-1.0f) * 0.5f);
+		}
+		if (channels >= 6) {
+			matrix[3] = std::clamp(params[p].lfe_level, 0.0f, 1.0f);
+		}
+		const auto distance_gain = params[p].distance > 1.0f ? 1.0f / params[p].distance : 1.0f;
+		for (uint32_t channel = 0; channel < channels; channel++) {
+			if (channel != 3 || channels < 6) {
+				matrix[channel] *= distance_gain;
+			}
 		}
 	}
 
@@ -2630,18 +3268,101 @@ int KYTY_SYSV_ABI Ngs2GeomResetSourceParam(Ngs2GeomSourceParam* out_source_param
 	return OK;
 }
 
+static float Ngs2GeomDot(const Ngs2GeomVector& left, const Ngs2GeomVector& right) {
+	return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+static Ngs2GeomVector Ngs2GeomCross(const Ngs2GeomVector& left, const Ngs2GeomVector& right) {
+	return {left.y * right.z - left.z * right.y, left.z * right.x - left.x * right.z,
+	        left.x * right.y - left.y * right.x};
+}
+
+static float Ngs2GeomLength(const Ngs2GeomVector& value) {
+	return std::sqrt(std::max(0.0f, Ngs2GeomDot(value, value)));
+}
+
+static Ngs2GeomVector Ngs2GeomNormalize(const Ngs2GeomVector& value,
+	                                    const Ngs2GeomVector& fallback) {
+	const auto length = Ngs2GeomLength(value);
+	return length > 1.0e-6f
+	           ? Ngs2GeomVector {value.x / length, value.y / length, value.z / length}
+	           : fallback;
+}
+
+static Ngs2GeomVector Ngs2GeomTransformPoint(const Ngs2GeomListenerWork& listener,
+	                                         const Ngs2GeomVector& point) {
+	return {
+	    listener.matrix[0][0] * point.x + listener.matrix[0][1] * point.y +
+	        listener.matrix[0][2] * point.z + listener.matrix[0][3],
+	    listener.matrix[1][0] * point.x + listener.matrix[1][1] * point.y +
+	        listener.matrix[1][2] * point.z + listener.matrix[1][3],
+	    listener.matrix[2][0] * point.x + listener.matrix[2][1] * point.y +
+	        listener.matrix[2][2] * point.z + listener.matrix[2][3]};
+}
+
+static Ngs2GeomVector Ngs2GeomTransformVector(const Ngs2GeomListenerWork& listener,
+	                                          const Ngs2GeomVector& value) {
+	return {listener.matrix[0][0] * value.x + listener.matrix[0][1] * value.y +
+	            listener.matrix[0][2] * value.z,
+	        listener.matrix[1][0] * value.x + listener.matrix[1][1] * value.y +
+	            listener.matrix[1][2] * value.z,
+	        listener.matrix[2][0] * value.x + listener.matrix[2][1] * value.y +
+	            listener.matrix[2][2] * value.z};
+}
+
+static float Ngs2GeomDistanceLevel(const Ngs2GeomRolloff& rolloff, float distance) {
+	const auto reference = std::max(rolloff.reference_distance, 1.0e-6f);
+	const auto maximum   = std::max(rolloff.max_distance, reference);
+	const auto factor    = std::max(rolloff.rolloff_factor, 0.0f);
+	const auto clamped   = std::clamp(distance, reference, maximum);
+	switch (rolloff.model) {
+		case 0: return reference / std::max(reference + factor * (distance - reference), reference);
+		case 1:
+			return maximum > reference
+			           ? 1.0f - factor * (distance - reference) / (maximum - reference)
+			           : 1.0f;
+		case 2: return std::pow(std::max(distance, reference) / reference, -factor);
+		case 3: return reference / std::max(reference + factor * (clamped - reference), reference);
+		case 4:
+			return maximum > reference
+			           ? 1.0f - factor * (clamped - reference) / (maximum - reference)
+			           : 1.0f;
+		case 5: return std::pow(clamped / reference, -factor);
+		default: return 1.0f;
+	}
+}
+
 int KYTY_SYSV_ABI Ngs2GeomCalcListener(const Ngs2GeomListenerParam* param,
                                        Ngs2GeomListenerWork* out_work, uint32_t flags) {
 	PRINT_NAME();
 	LOGF("\t flags = 0x%08" PRIx32 "\n", flags);
 
-	EXIT_NOT_IMPLEMENTED(param == nullptr);
-	EXIT_NOT_IMPLEMENTED(out_work == nullptr);
+	constexpr auto ERROR_INVALID_LISTENER = static_cast<int32_t>(0x804a8461u);
+	constexpr auto ERROR_INVALID_FLAG     = static_cast<int32_t>(0x804a8463u);
+	if (param == nullptr || out_work == nullptr) {
+		return ERROR_INVALID_LISTENER;
+	}
+	if ((flags & ~1u) != 0) {
+		return ERROR_INVALID_FLAG;
+	}
 
 	std::memset(out_work, 0, sizeof(Ngs2GeomListenerWork));
-	for (uint32_t i = 0; i < 4; i++) {
-		out_work->matrix[i][i] = 1.0f;
+	const auto front = Ngs2GeomNormalize(param->orient_front, {0.0f, 0.0f, 1.0f});
+	const auto up_hint = Ngs2GeomNormalize(param->orient_up, {0.0f, 1.0f, 0.0f});
+	const auto right = Ngs2GeomNormalize((flags & 1u) != 0 ? Ngs2GeomCross(up_hint, front)
+	                                                        : Ngs2GeomCross(front, up_hint),
+	                                    {1.0f, 0.0f, 0.0f});
+	const auto up = Ngs2GeomNormalize((flags & 1u) != 0 ? Ngs2GeomCross(front, right)
+	                                                     : Ngs2GeomCross(right, front),
+	                                 {0.0f, 1.0f, 0.0f});
+	const Ngs2GeomVector axes[3] = {right, up, front};
+	for (uint32_t row = 0; row < 3; row++) {
+		out_work->matrix[row][0] = axes[row].x;
+		out_work->matrix[row][1] = axes[row].y;
+		out_work->matrix[row][2] = axes[row].z;
+		out_work->matrix[row][3] = -Ngs2GeomDot(axes[row], param->position);
 	}
+	out_work->matrix[3][3] = 1.0f;
 	out_work->velocity    = param->velocity;
 	out_work->sound_speed = (param->sound_speed > 0.0f ? param->sound_speed : 343.0f);
 	out_work->coordinate  = flags & 0x1u;
@@ -2655,22 +3376,83 @@ int KYTY_SYSV_ABI Ngs2GeomApply(const Ngs2GeomListenerWork* listener,
 	PRINT_NAME();
 	LOGF("\t flags = 0x%08" PRIx32 "\n", flags);
 
-	EXIT_NOT_IMPLEMENTED(listener == nullptr);
-	EXIT_NOT_IMPLEMENTED(source == nullptr);
-	EXIT_NOT_IMPLEMENTED(out_attrib == nullptr);
-
-	std::memset(out_attrib, 0, sizeof(Ngs2GeomAttribute));
-	out_attrib->pitch_ratio         = 1.0f;
-	out_attrib->a3d_attrib.position = source->position;
-	out_attrib->a3d_attrib.volume   = std::max(source->min_level, source->max_level);
-
-	const auto channels =
-	    std::min<uint32_t>((source->matrix_format == 0 ? 2u : source->matrix_format), 8);
-	const auto level = (source->max_level > 0.0f ? source->max_level : 1.0f);
-	for (uint32_t ch = 0; ch < channels; ch++) {
-		out_attrib->level[ch * 8 + ch] = level;
+	constexpr auto ERROR_INVALID_SOURCE = static_cast<int32_t>(0x804a8462u);
+	constexpr auto ERROR_INVALID_FLAG   = static_cast<int32_t>(0x804a8463u);
+	constexpr auto ERROR_INVALID_CONE   = static_cast<int32_t>(0x804a8464u);
+	if (listener == nullptr || source == nullptr || out_attrib == nullptr) {
+		return ERROR_INVALID_SOURCE;
+	}
+	if ((flags & ~0x1fu) != 0) {
+		return ERROR_INVALID_FLAG;
+	}
+	if (source->cone.inner_angle < 0.0f || source->cone.outer_angle < source->cone.inner_angle ||
+	    source->cone.outer_angle > 360.0f) {
+		return ERROR_INVALID_CONE;
 	}
 
+	std::memset(out_attrib, 0, sizeof(Ngs2GeomAttribute));
+	const auto local_position = Ngs2GeomTransformPoint(*listener, source->position);
+	const auto distance       = Ngs2GeomLength(local_position);
+	const auto to_listener = Ngs2GeomNormalize(
+	    Ngs2GeomVector {-local_position.x, -local_position.y, -local_position.z},
+	    {0.0f, 0.0f, -1.0f});
+	const auto direction = Ngs2GeomNormalize(Ngs2GeomTransformVector(*listener, source->direction),
+	                                        {0.0f, 0.0f, 1.0f});
+	const auto cone_angle = std::acos(std::clamp(Ngs2GeomDot(direction, to_listener), -1.0f, 1.0f)) *
+	                        (180.0f / std::acos(-1.0f));
+	float cone_level = source->cone.inner_level;
+	const auto inner_half = source->cone.inner_angle * 0.5f;
+	const auto outer_half = source->cone.outer_angle * 0.5f;
+	if (cone_angle >= outer_half) {
+		cone_level = source->cone.outer_level;
+	} else if (cone_angle > inner_half && outer_half > inner_half) {
+		const auto blend = (cone_angle - inner_half) / (outer_half - inner_half);
+		cone_level = source->cone.inner_level +
+		             (source->cone.outer_level - source->cone.inner_level) * blend;
+	}
+	const auto distance_level = std::max(0.0f, Ngs2GeomDistanceLevel(source->rolloff, distance));
+	const auto level = std::clamp(distance_level * cone_level, source->min_level,
+	                              std::max(source->min_level, source->max_level));
+
+	out_attrib->pitch_ratio = 1.0f;
+	if ((flags & (1u << 1u)) != 0 && distance > 1.0e-6f) {
+		const Ngs2GeomVector radial {local_position.x / distance, local_position.y / distance,
+		                                 local_position.z / distance};
+		const auto listener_velocity = Ngs2GeomDot(listener->velocity, radial);
+		const auto source_velocity   = Ngs2GeomDot(source->velocity, radial);
+		const auto speed = std::max(listener->sound_speed, 1.0f);
+		const auto factor = std::max(source->doppler_factor, 0.0f);
+		const auto denominator = speed - factor * source_velocity;
+		if (std::abs(denominator) > 1.0e-6f) {
+			out_attrib->pitch_ratio =
+			    std::clamp((speed - factor * listener_velocity) / denominator, 0.125f, 8.0f);
+		}
+	}
+	if ((flags & (1u << 3u)) != 0) {
+		out_attrib->a3d_attrib.position = local_position;
+		out_attrib->a3d_attrib.volume   = level;
+	}
+
+	if ((flags & (1u << 2u)) != 0) {
+		const auto channels =
+		    std::min<uint32_t>((source->matrix_format == 0 ? 2u : source->matrix_format), 8);
+		const auto inputs = std::clamp(source->num_speakers, 1u, 8u);
+		const auto angle = std::atan2(local_position.x, local_position.z);
+		const auto right_gain = std::sin(angle * 0.5f + std::acos(-1.0f) * 0.25f);
+		const auto left_gain  = std::cos(angle * 0.5f + std::acos(-1.0f) * 0.25f);
+		for (uint32_t input = 0; input < inputs; input++) {
+			if (channels == 1) {
+				out_attrib->level[input * 8] = level;
+			} else {
+				out_attrib->level[input * 8]     = level * std::clamp(left_gain, 0.0f, 1.0f);
+				out_attrib->level[input * 8 + 1] = level * std::clamp(right_gain, 0.0f, 1.0f);
+				if (channels >= 6) {
+					out_attrib->level[input * 8 + 3] =
+					    level * std::clamp(source->lfe_level, 0.0f, 1.0f);
+				}
+			}
+		}
+	}
 	return OK;
 }
 

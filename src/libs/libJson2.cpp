@@ -60,6 +60,26 @@ struct JsonValue {
 	uint32_t type;
 };
 
+struct JsonObjectIterator {
+	void* impl;
+};
+
+struct JsonObjectPair {
+	JsonString first;
+	char       padding[4];
+	JsonValue  second;
+};
+
+struct JsonObjectIteratorState {
+	const JsonObject*                                      owner = nullptr;
+	std::map<std::string, JsonValue*>::const_iterator     iterator;
+	JsonObjectPair                                         pair {};
+	bool                                                   pair_initialized = false;
+};
+
+static_assert(sizeof(JsonObjectIterator) == 8);
+static_assert(sizeof(JsonObjectPair) == 48);
+
 struct JsonInitParameter2 {
 	void*    allocator;
 	void*    user_data;
@@ -759,6 +779,16 @@ static JsonString* KYTY_SYSV_ABI JsonStringCtor(JsonString* self) {
 	return self;
 }
 
+static JsonString* KYTY_SYSV_ABI JsonStringCopyCtor(JsonString* self,
+                                                    const JsonString* source) {
+	PRINT_NAME();
+
+	if (self != nullptr) {
+		self->impl = new std::string(*JsonStringImpl(source));
+	}
+	return self;
+}
+
 static JsonString* KYTY_SYSV_ABI JsonStringCStringCtor(JsonString* self, const char* str) {
 	PRINT_NAME();
 
@@ -888,6 +918,105 @@ static void KYTY_SYSV_ABI JsonObjectClear(JsonObject* self) {
 	}
 }
 
+static void JsonObjectIteratorClearPair(JsonObjectIteratorState* state) {
+	if (state == nullptr || !state->pair_initialized) {
+		return;
+	}
+
+	delete state->pair.first.impl;
+	state->pair.first.impl = nullptr;
+	JsonValueClear(&state->pair.second);
+	state->pair_initialized = false;
+}
+
+static JsonObjectIteratorState* JsonObjectIteratorImpl(JsonObjectIterator* self) {
+	return self != nullptr ? static_cast<JsonObjectIteratorState*>(self->impl) : nullptr;
+}
+
+static const JsonObjectIteratorState* JsonObjectIteratorImpl(const JsonObjectIterator* self) {
+	return self != nullptr ? static_cast<const JsonObjectIteratorState*>(self->impl) : nullptr;
+}
+
+static JsonObjectIterator JsonObjectMakeIterator(const JsonObject* self, bool at_end) {
+	JsonObjectIterator result {};
+	auto*              state = new JsonObjectIteratorState;
+	state->owner              = self;
+	const auto* object         = JsonObjectImpl(self);
+	state->iterator            = at_end ? object->end() : object->begin();
+	result.impl                = state;
+	return result;
+}
+
+static size_t KYTY_SYSV_ABI JsonObjectSize(const JsonObject* self) {
+	PRINT_NAME();
+	return JsonObjectImpl(self)->size();
+}
+
+static JsonObjectIterator KYTY_SYSV_ABI JsonObjectBegin(const JsonObject* self) {
+	PRINT_NAME();
+	return JsonObjectMakeIterator(self, false);
+}
+
+static JsonObjectIterator KYTY_SYSV_ABI JsonObjectEnd(const JsonObject* self) {
+	PRINT_NAME();
+	return JsonObjectMakeIterator(self, true);
+}
+
+static bool KYTY_SYSV_ABI JsonObjectIteratorNotEqual(const JsonObjectIterator* self,
+	                                                  const JsonObjectIterator* other) {
+	const auto* lhs = JsonObjectIteratorImpl(self);
+	const auto* rhs = JsonObjectIteratorImpl(other);
+	if (lhs == nullptr || rhs == nullptr) {
+		return lhs != rhs;
+	}
+	if (lhs->owner != rhs->owner) {
+		return true;
+	}
+	return lhs->iterator != rhs->iterator;
+}
+
+static JsonObjectIterator* KYTY_SYSV_ABI JsonObjectIteratorIncrement(JsonObjectIterator* self) {
+	auto* state = JsonObjectIteratorImpl(self);
+	if (state == nullptr) {
+		return self;
+	}
+
+	JsonObjectIteratorClearPair(state);
+	const auto* object = JsonObjectImpl(state->owner);
+	if (state->iterator != object->end()) {
+		++state->iterator;
+	}
+	return self;
+}
+
+static JsonObjectPair* KYTY_SYSV_ABI JsonObjectIteratorDereference(JsonObjectIterator* self) {
+	auto* state = JsonObjectIteratorImpl(self);
+	if (state == nullptr) {
+		return nullptr;
+	}
+
+	const auto* object = JsonObjectImpl(state->owner);
+	if (state->iterator == object->end()) {
+		return nullptr;
+	}
+
+	JsonObjectIteratorClearPair(state);
+	state->pair.first.impl = new std::string(state->iterator->first);
+	JsonValueInit(&state->pair.second);
+	JsonValueCopy(&state->pair.second, state->iterator->second);
+	state->pair_initialized = true;
+	return &state->pair;
+}
+
+static void KYTY_SYSV_ABI JsonObjectIteratorDtor(JsonObjectIterator* self) {
+	auto* state = JsonObjectIteratorImpl(self);
+	JsonObjectIteratorClearPair(state);
+	delete state;
+	if (self != nullptr) {
+		self->impl = nullptr;
+	}
+}
+
 static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, size_t size) {
 	PRINT_NAME();
 
@@ -996,6 +1125,14 @@ LIB_DEFINE(InitNet_1_Json2) {
 	LIB_FUNC("cG1VE2HMl6c", LibJson2::JsonStringDtor);
 	LIB_FUNC("IKQimvG9Wqs", LibJson2::JsonValueSetType);
 	LIB_FUNC("RBw+4NukeGQ", LibJson2::JsonValueCount);
+	LIB_FUNC("0CAesfH963Q", LibJson2::JsonStringCopyCtor);
+	LIB_FUNC("fSGHm9RjN5U", LibJson2::JsonObjectSize);
+	LIB_FUNC("xhAcaIwnrgk", LibJson2::JsonObjectBegin);
+	LIB_FUNC("ivMCitpSQNk", LibJson2::JsonObjectEnd);
+	LIB_FUNC("+isUKw4zud4", LibJson2::JsonObjectIteratorNotEqual);
+	LIB_FUNC("ZCd6IYoD3Bc", LibJson2::JsonObjectIteratorDereference);
+	LIB_FUNC("DlWmn2ZQuWY", LibJson2::JsonObjectIteratorIncrement);
+	LIB_FUNC("hoINmSMlYjI", LibJson2::JsonObjectIteratorDtor);
 	LIB_FUNC("+drDFyAS6u4", LibJson2::JsonInitializerSetGlobalNullAccessCallback);
 	LIB_FUNC("00oCq0RwSAY", LibJson2::JsonInitializerSetGlobalNullAccessCallback);
 }

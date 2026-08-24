@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 namespace Libs {
 
@@ -61,6 +63,15 @@ static bool                 g_initialized      = false;
 static uint32_t             g_supported_modes  = 0x3;
 static std::atomic<int32_t> g_shared_ref_count = 0;
 
+struct PsmlObjectState {
+	uint64_t dispatch_count    = 0;
+	float    progress          = 0.0f;
+	bool     capture_requested = false;
+};
+
+static std::mutex                                      g_object_mutex;
+static std::unordered_map<const void*, PsmlObjectState> g_object_states;
+
 static uint64_t BaseVaBytes(uint32_t type) {
 	// The native implementation indexes this table before adding one 6 MiB range.
 	switch (type) {
@@ -116,6 +127,10 @@ static int KYTY_SYSV_ABI PsmlInitialize() {
 	g_initialized      = true;
 	g_supported_modes  = 0x3;
 	g_shared_ref_count = 0;
+	{
+		std::scoped_lock lock(g_object_mutex);
+		g_object_states.clear();
+	}
 
 	return OK;
 }
@@ -160,6 +175,10 @@ PsmlSharedResourcesInitialize(void* resources, const SharedResourcesInitParamete
 
 	MarkSharedResources(resources, *params);
 	g_shared_ref_count.fetch_add(1, std::memory_order_relaxed);
+	{
+		std::scoped_lock lock(g_object_mutex);
+		g_object_states[resources] = {};
+	}
 
 	return OK;
 }
@@ -175,7 +194,15 @@ static int KYTY_SYSV_ABI PsmlSharedResourcesFinalize(void* resources) {
 		return PSML_ERROR_NULL_OBJECT;
 	}
 
+	if (*static_cast<const uint32_t*>(resources) != SHARED_RESOURCES_MAGIC) {
+		return PSML_ERROR_INVALID_OBJECT;
+	}
 	g_shared_ref_count.fetch_sub(1, std::memory_order_relaxed);
+	{
+		std::scoped_lock lock(g_object_mutex);
+		g_object_states.erase(resources);
+	}
+	*static_cast<uint32_t*>(resources) = 0;
 
 	return OK;
 }
@@ -216,10 +243,17 @@ static int KYTY_SYSV_ABI PsmlContextInitialize(void* context, const void* params
 	if (shared_resources == nullptr) {
 		return PSML_ERROR_INVALID_POINTER;
 	}
+	if (*static_cast<const uint32_t*>(shared_resources) != SHARED_RESOURCES_MAGIC) {
+		return PSML_ERROR_INVALID_OBJECT;
+	}
 
 	*reinterpret_cast<uint32_t*>(bytes)        = CONTEXT_MAGIC;
 	*reinterpret_cast<void**>(bytes + 0x360)   = shared_resources;
 	*reinterpret_cast<uint8_t*>(bytes + 0x368) = 0;
+	{
+		std::scoped_lock lock(g_object_mutex);
+		g_object_states[context] = {};
+	}
 
 	return OK;
 }
@@ -236,6 +270,10 @@ static int KYTY_SYSV_ABI PsmlContextFinalize(void* context) {
 	}
 
 	*static_cast<uint32_t*>(context) = 0;
+	{
+		std::scoped_lock lock(g_object_mutex);
+		g_object_states.erase(context);
+	}
 
 	return OK;
 }
@@ -272,6 +310,14 @@ static int KYTY_SYSV_ABI PsmlDispatch(void* context, uint64_t command, uint64_t 
 	if (command == 0 || params == 0) {
 		return PSML_ERROR_INVALID_POINTER;
 	}
+	{
+		std::scoped_lock lock(g_object_mutex);
+		auto& state = g_object_states[context];
+		state.progress = 0.0f;
+		state.dispatch_count++;
+		// Host execution is synchronous for the compatibility path.
+		state.progress = 1.0f;
+	}
 
 	return OK;
 }
@@ -291,7 +337,14 @@ static int KYTY_SYSV_ABI PsmlGetProgress(const void* object, float* out_progress
 		return PSML_ERROR_INVALID_POINTER;
 	}
 
-	*out_progress = 0.0f;
+	{
+		std::scoped_lock lock(g_object_mutex);
+		const auto it = g_object_states.find(object);
+		if (it == g_object_states.end()) {
+			return PSML_ERROR_INVALID_OBJECT;
+		}
+		*out_progress = it->second.progress;
+	}
 
 	return OK;
 }
@@ -305,6 +358,10 @@ static int KYTY_SYSV_ABI PsmlRequestCapture(const void* object) {
 	}
 	if (!HasKnownObjectMagic(object)) {
 		return PSML_ERROR_INVALID_OBJECT;
+	}
+	{
+		std::scoped_lock lock(g_object_mutex);
+		g_object_states[object].capture_requested = true;
 	}
 
 	return OK;

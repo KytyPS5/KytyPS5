@@ -118,6 +118,17 @@ struct AjmDecOpusInitializeParameters {
 	uint32_t mapping_family;
 };
 
+struct AjmDecLpcmInitializeParameters {
+	uint32_t input_encoding;
+	uint32_t channel_num;
+	uint32_t sample_rate;
+};
+
+struct AjmSidebandDecLpcmCodecInfo {
+	uint32_t input_encoding;
+	uint32_t reserved[2];
+};
+
 struct AjmSidebandDecOpusCodecInfo {
 	uint32_t frames_per_packet;
 };
@@ -127,6 +138,7 @@ enum class AjmCodec : uint32_t {
 	DecAt9           = 1,
 	DecM4aac         = 2,
 	DecUnknownNewABI = 14,
+	DecLpcm          = 23,
 	DecOpus          = 24,
 };
 
@@ -249,7 +261,7 @@ static const char* AjmCodecName(uint32_t codec) {
 		case 12: return "CELP16 decoder";
 		case 13: return "CELP16 encoder";
 		case 22: return "HE-VAG decoder";
-		case 23: return "LPCM decoder";
+		case static_cast<uint32_t>(AjmCodec::DecLpcm): return "LPCM decoder";
 		case static_cast<uint32_t>(AjmCodec::DecOpus): return "Opus decoder";
 		default: return "unknown";
 	}
@@ -482,6 +494,150 @@ private:
 	uint32_t m_frames_per_packet = 1;
 };
 
+class AjmLpcmDecoder final: public AjmDecoder {
+public:
+	AjmLpcmDecoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding)
+	    : AjmDecoder(channels, sample_rate, encoding) {}
+
+	AjmDecodeResult Initialize(const void* codec_parameters,
+	                           size_t      codec_parameters_size) override {
+		auto result = MakeResult();
+		if (codec_parameters == nullptr ||
+		    codec_parameters_size < sizeof(AjmDecLpcmInitializeParameters)) {
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
+		const auto* params = static_cast<const AjmDecLpcmInitializeParameters*>(codec_parameters);
+		if (params->input_encoding > static_cast<uint32_t>(AjmSampleEncoding::Float) ||
+		    params->channel_num == 0 || params->channel_num > 64 || params->sample_rate == 0 ||
+		    params->sample_rate > 384000) {
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
+		m_input_encoding = static_cast<AjmSampleEncoding>(params->input_encoding);
+		SetFormat(params->channel_num, params->sample_rate, m_sample_encoding);
+		m_total_decoded_samples = 0;
+		m_is_initialized        = true;
+		return MakeResult();
+	}
+
+	AjmDecodeResult Decode(const void* input, size_t input_size, void* output, size_t output_size,
+	                       bool multiple_frames, AjmGaplessState* gapless) override {
+		(void)multiple_frames;
+		auto result = MakeResult();
+		if (!m_is_initialized) {
+			result.result = AJM_RESULT_NOT_INITIALIZED;
+			return result;
+		}
+		if (input == nullptr || input_size == 0) {
+			result.result = AJM_RESULT_PARTIAL_INPUT;
+			return result;
+		}
+		const auto input_sample_size  = AjmBytesPerSample(m_input_encoding);
+		const auto output_sample_size = AjmBytesPerSample(m_sample_encoding);
+		const auto input_frame_size   = input_sample_size * m_channels;
+		const auto output_frame_size  = output_sample_size * m_channels;
+		auto available_frames        = input_size / input_frame_size;
+		if (available_frames == 0) {
+			result.result = AJM_RESULT_PARTIAL_INPUT;
+			return result;
+		}
+
+		size_t skip_frames = 0;
+		if (gapless != nullptr) {
+			skip_frames = std::min<size_t>(available_frames, gapless->current.skip_samples);
+		}
+		auto output_frames = available_frames - skip_frames;
+		if (gapless != nullptr && gapless->HasSampleLimit()) {
+			output_frames = std::min<size_t>(output_frames, gapless->current.total_samples);
+		}
+		const auto capacity_frames = output_frame_size == 0 ? 0 : output_size / output_frame_size;
+		if (output_frames > capacity_frames) {
+			output_frames = capacity_frames;
+			result.result = AJM_RESULT_NOT_ENOUGH_ROOM;
+		}
+		if (output_frames != 0 && output == nullptr) {
+			result.result = AJM_RESULT_NOT_ENOUGH_ROOM;
+			return result;
+		}
+
+		const auto* input_bytes = static_cast<const uint8_t*>(input) + skip_frames * input_frame_size;
+		auto*       output_bytes = static_cast<uint8_t*>(output);
+		const auto sample_count = output_frames * m_channels;
+		for (size_t sample = 0; sample < sample_count; sample++) {
+			float value = 0.0f;
+			switch (m_input_encoding) {
+				case AjmSampleEncoding::S16:
+					value = static_cast<float>(reinterpret_cast<const int16_t*>(input_bytes)[sample]) /
+					        32768.0f;
+					break;
+				case AjmSampleEncoding::S32:
+					value = static_cast<float>(reinterpret_cast<const int32_t*>(input_bytes)[sample]) /
+					        2147483648.0f;
+					break;
+				case AjmSampleEncoding::Float:
+					value = reinterpret_cast<const float*>(input_bytes)[sample];
+					break;
+			}
+			value = std::clamp(value, -1.0f, 1.0f);
+			switch (m_sample_encoding) {
+				case AjmSampleEncoding::S16:
+					reinterpret_cast<int16_t*>(output_bytes)[sample] = static_cast<int16_t>(
+					    std::clamp(value * 32768.0f, -32768.0f, 32767.0f));
+					break;
+				case AjmSampleEncoding::S32:
+					reinterpret_cast<int32_t*>(output_bytes)[sample] = static_cast<int32_t>(
+					    std::clamp(static_cast<double>(value) * 2147483648.0, -2147483648.0,
+					               2147483647.0));
+					break;
+				case AjmSampleEncoding::Float:
+					reinterpret_cast<float*>(output_bytes)[sample] = value;
+					break;
+			}
+		}
+
+		const auto consumed_frames = skip_frames + output_frames;
+		result.input_consumed       = consumed_frames * input_frame_size;
+		result.output_written       = output_frames * output_frame_size;
+		result.frames               = output_frames != 0 ? 1u : 0u;
+		m_total_decoded_samples += output_frames;
+		result.total_decoded_samples = m_total_decoded_samples;
+		result.format                = GetFormat();
+		if (gapless != nullptr) {
+			gapless->current.skip_samples = static_cast<uint16_t>(
+			    gapless->current.skip_samples - std::min<size_t>(skip_frames, UINT16_MAX));
+			gapless->current.skipped_samples = static_cast<uint16_t>(std::min<size_t>(
+			    UINT16_MAX, static_cast<size_t>(gapless->current.skipped_samples) + skip_frames));
+			if (gapless->HasSampleLimit()) {
+				gapless->current.total_samples = static_cast<uint32_t>(
+				    gapless->current.total_samples > output_frames
+				        ? gapless->current.total_samples - output_frames
+				        : 0);
+			}
+		}
+		return result;
+	}
+
+	void WriteCodecInfo(void* output, size_t output_size,
+	                    const AjmDecodeResult& result) const override {
+		(void)result;
+		if (output != nullptr && output_size >= sizeof(AjmSidebandDecLpcmCodecInfo)) {
+			auto* info           = static_cast<AjmSidebandDecLpcmCodecInfo*>(output);
+			info->input_encoding = static_cast<uint32_t>(m_input_encoding);
+			info->reserved[0]    = 0;
+			info->reserved[1]    = 0;
+		}
+	}
+
+	[[nodiscard]] size_t CodecInfoSize() const override {
+		return sizeof(AjmSidebandDecLpcmCodecInfo);
+	}
+
+private:
+	AjmSampleEncoding m_input_encoding = AjmSampleEncoding::S16;
+	bool              m_is_initialized = false;
+};
+
 struct AjmInstanceState {
 	uint32_t                    context = 0;
 	uint32_t                    codec   = 0;
@@ -497,6 +653,7 @@ static bool AjmCodecIsSupported(uint32_t codec) {
 	return codec == static_cast<uint32_t>(AjmCodec::DecMp3) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecAt9) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecM4aac) ||
+	       codec == static_cast<uint32_t>(AjmCodec::DecLpcm) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecOpus) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecUnknownNewABI);
 }
@@ -533,6 +690,8 @@ static std::unique_ptr<AjmDecoder> AjmCreateDecoder(uint32_t codec, uint64_t fla
 			return std::make_unique<AjmAt9Decoder>(channels, 48000, encoding, flags);
 		case static_cast<uint32_t>(AjmCodec::DecM4aac):
 			return std::make_unique<AjmAacDecoder>(channels, 48000, encoding, flags);
+		case static_cast<uint32_t>(AjmCodec::DecLpcm):
+			return std::make_unique<AjmLpcmDecoder>(channels, 48000, encoding);
 		case static_cast<uint32_t>(AjmCodec::DecOpus):
 			return std::make_unique<AjmOpusDecoder>(channels, 48000, encoding, flags);
 		default: break;
@@ -720,7 +879,7 @@ static bool AjmCodecIsValid(uint32_t codec) {
 		case 13:
 		case static_cast<uint32_t>(AjmCodec::DecUnknownNewABI):
 		case 22:
-		case 23:
+		case static_cast<uint32_t>(AjmCodec::DecLpcm):
 		case static_cast<uint32_t>(AjmCodec::DecOpus): return true;
 		default: return false;
 	}

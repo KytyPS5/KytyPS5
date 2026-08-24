@@ -445,6 +445,11 @@ void ApplyDefaultVop2F16Destination(Instruction& inst) {
 	if (IsVop2LowHalfF16Opcode(inst.opcode)) {
 		inst.dst.sdwa_sel = 4;
 	}
+	if (inst.opcode == Opcode::V_PK_FMAC_F16) {
+		inst.src0.op_sel_hi = true;
+		inst.src1.op_sel_hi = true;
+		inst.dst.op_sel_hi  = true;
+	}
 }
 
 bool IsVop1FloatResultOpcode(Opcode opcode);

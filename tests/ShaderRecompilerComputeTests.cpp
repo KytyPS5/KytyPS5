@@ -12015,6 +12015,41 @@ TestCase ScalarExtendedArithmetic() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarRemainingAluOps() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 0, 0x00000010u);
+  AppendSMovLiteral(&code, 1, 0x0f0f0f0fu);
+  AppendSMovLiteral(&code, 2, 0x00ff00ffu);
+  code.push_back(EncodeSop1(0x13, 20, 0));
+  code.push_back(EncodeSop1(0x07, 21, 0));
+  code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(1)));
+  code.push_back(EncodeSop2(0x05, 22, InlineU32(9), InlineU32(3)));
+  AppendSMovLiteral(&code, 23, 0x000000ffu);
+  code.push_back(EncodeSop1(0x1b, 23, InlineU32(2)));
+  code.push_back(EncodeSop2(0x14, 24, 1, 2));
+  code.push_back(EncodeSop2(0x16, 25, 1, 2));
+  code.push_back(EncodeSop2(0x18, 26, 1, 2));
+  code.push_back(EncodeSop2(0x1a, 27, 1, 2));
+  code.push_back(EncodeSop2(0x1c, 28, 1, 2));
+
+  for (u32 i = 0; i < 9u; i++) {
+    AppendStoreSgpr(&code, 20u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"ScalarRemainingAluOps",
+          code,
+          {},
+          {4u, 0xffffffefu, 6u, 0xfbu, 0x0f000f00u, 0xff0fff0fu,
+           0xfff0fff0u, 0xf000f000u, 0xf00ff00fu},
+          {O::S_MOV_B32, O::S_FF1_I32_B32, O::S_NOT_B32, O::S_CMP_EQ_U32,
+           O::S_SUBB_U32, O::S_BITSET0_B32, O::S_ANDN2_B32, O::S_ORN2_B32,
+           O::S_NAND_B32, O::S_NOR_B32, O::S_XNOR_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarArithmeticSccCarryBorrowOverflow() {
   using O = ShaderOpcode;
 
@@ -14027,6 +14062,108 @@ TestCase VectorSpecialF16Ops() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorRemainingPackedOps() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x00020001u);
+  AppendVMovLiteral(&code, 1, 0x00040003u);
+  AppendVMovLiteral(&code, 2, 0x00060005u);
+  AppendVMovLiteral(&code, 3, 0x00100008u);
+  AppendVMovLiteral(&code, 4, 0xfff8fffcu);
+
+  AppendVop3p(&code, 0x00, 10, Vgpr(0), Vgpr(1), Vgpr(2), 0x7);
+  AppendVop3p(&code, 0x01, 11, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x02, 12, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x03, 13, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x04, 14, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x05, 15, Vgpr(0), Vgpr(3), 0, 0x3);
+  AppendVop3p(&code, 0x06, 16, Vgpr(0), Vgpr(4), 0, 0x3);
+  AppendVop3p(&code, 0x07, 17, Vgpr(4), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x08, 18, Vgpr(4), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x09, 19, Vgpr(0), Vgpr(1), Vgpr(2), 0x7);
+  AppendVop3p(&code, 0x0a, 20, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x0b, 21, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x0c, 22, Vgpr(4), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x0d, 23, Vgpr(4), Vgpr(1), 0, 0x3);
+
+  AppendVMovLiteral(&code, 30, 0x40003c00u);
+  AppendVMovLiteral(&code, 31, 0x44004200u);
+  AppendVMovLiteral(&code, 32, 0x46004500u);
+  code.push_back(EncodeVop2(0x3c, 32, Vgpr(30), 31));
+
+  for (u32 i = 0; i < 14u; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendStoreVgpr(&code, 32, 14);
+  AppendEnd(&code);
+
+  return {"VectorRemainingPackedOps",
+          code,
+          {},
+          {0x000e0008u, 0x00080003u, 0x00060004u, 0xfffefffeu,
+           0x00100006u, 0x00040004u, 0xfffefffeu, 0x00040003u,
+           0xfff8fffcu, 0x000e0008u, 0x00060004u, 0xfffefffeu,
+           0xfff8fffcu, 0x00040003u, 0x4b004800u},
+          {O::V_MOV_B32, O::V_PK_MAD_I16, O::V_PK_MUL_LO_U16,
+           O::V_PK_ADD_I16, O::V_PK_SUB_I16, O::V_PK_LSHLREV_B16,
+           O::V_PK_LSHRREV_B16, O::V_PK_ASHRREV_I16, O::V_PK_MAX_I16,
+           O::V_PK_MIN_I16, O::V_PK_MAD_U16, O::V_PK_ADD_U16,
+           O::V_PK_SUB_U16, O::V_PK_MAX_U16, O::V_PK_MIN_U16,
+           O::V_PK_FMAC_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorRemainingF16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 0, 3);
+  AppendVMovLiteral(&code, 1, 0x0000fffeu);
+  AppendVMovLiteral(&code, 2, 0x00004080u); // 2.25h
+  AppendVMovLiteral(&code, 3, 0x00004000u); // 2.0h
+  AppendVMovLiteral(&code, 4, 0x00004200u); // 3.0h
+  AppendVMovLiteral(&code, 5, 0x00004000u); // 2.0h
+  AppendVMovLiteral(&code, 6, 0x00003c00u); // 1.0h
+
+  for (u32 dst = 20; dst <= 34; dst++) {
+    AppendVMovU32(&code, dst, 0);
+  }
+  code.push_back(EncodeVop1(0x50, 20, Vgpr(0)));
+  code.push_back(EncodeVop1(0x51, 21, Vgpr(1)));
+  code.push_back(EncodeVop1(0x53, 22, Vgpr(20)));
+  code.push_back(EncodeVop1(0x55, 23, Vgpr(2)));
+  code.push_back(EncodeVop1(0x5b, 24, Vgpr(2)));
+  code.push_back(EncodeVop1(0x5c, 25, Vgpr(2)));
+  code.push_back(EncodeVop1(0x5d, 26, Vgpr(2)));
+  code.push_back(EncodeVop1(0x5e, 27, Vgpr(2)));
+
+  AppendVMovLiteral(&code, 30, 0x00003c00u);
+  code.push_back(EncodeVop2(0x36, 30, Vgpr(3), 4));
+  code.push_back(EncodeVop2(0x37, 34, Vgpr(5), 6));
+  code.push_back(0x00004200u);
+  code.push_back(EncodeVop2(0x38, 32, Vgpr(5), 6));
+  code.push_back(0x00003c00u);
+  AppendVop3(&code, 0x311, 33, Vgpr(3), Vgpr(4));
+
+  const u32 results[] = {20, 21, 22, 23, 24, 25, 26, 27, 30, 34, 32, 33};
+  for (u32 i = 0; i < static_cast<u32>(std::size(results)); i++) {
+    AppendStoreVgpr(&code, results[i], i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorRemainingF16Ops",
+          code,
+          {},
+          {0x00004200u, 0x0000c000u, 3u, 0x00003e00u, 0x00004000u,
+           0x00004200u, 0x00004000u, 0x00004000u, 0x00004700u,
+           0x00004700u, 0x00004200u, 0x42004000u},
+          {O::V_MOV_B32, O::V_CVT_F16_U16, O::V_CVT_F16_I16,
+           O::V_CVT_I16_F16, O::V_SQRT_F16, O::V_FLOOR_F16, O::V_CEIL_F16,
+           O::V_TRUNC_F16, O::V_RNDNE_F16, O::V_FMAC_F16, O::V_FMAMK_F16,
+           O::V_FMAAK_F16, O::V_PACK_B32_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
 TestCase VectorWritelaneIgnoresExecMask() {
   using O = ShaderOpcode;
 
@@ -14311,7 +14448,10 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
-void KYTY_SYSV_ABI TestRudpEventHandler(int, int, int, void *) {}
+int KYTY_SYSV_ABI TestRudpEventHandler(int, int, const uint8_t *, size_t,
+                                      const void *, uint32_t, void *) {
+  return OK;
+}
 
 void CheckSystemLibraryStateContracts() {
   EnsureConfigInitialized();
@@ -14333,6 +14473,264 @@ void CheckSystemLibraryStateContracts() {
     (void)find(nid);
   }
 
+  constexpr const char *optional_psn_imports[] = {
+      "mA0zsbqm+kA", "BYIZGKm6bO4", "hqzi1IHdQQQ", "pLr1fEQS1z8",
+      "0aR2aWmQal4", "DfSCDRA3EjY", "m-I92Ab50W8", "r42bWcQbtZY",
+      "uKTDW8hk-ts", "DHmwsa6S8Tc", "dsqCVsNM0Zg", "5LiMEPuW0DQ",
+      "HFcQl9TMcFQ", "Z0eQj8m7XA8", "IQtb-TaIjSM", "69u+XqsoNd0",
+      "ShGBFuoSSsQ", "aFv8qms6XTM", "M4XlLFnzQaQ", "nAEqawEZG5s",
+      "jautSRs4OdQ", "uCZf2L27th8", "M8icY9OwkKs", "brbRxzr7qyI",
+      "eOxGbG3sPb0", "Aqae0TjLvQU", "P6piso307SE", "-Rjp3-YViXc",
+      "cRILAEvn+9M", "rKPTlHwGa4k", "gDm5a6GSE94", "JDwx3Bl4bB4",
+      "kFhuwHrIUqs", "AhqlQ8cngrk", "fSGHm9RjN5U", "xhAcaIwnrgk",
+      "ivMCitpSQNk", "+isUKw4zud4", "ZCd6IYoD3Bc", "0CAesfH963Q",
+      "DlWmn2ZQuWY", "hoINmSMlYjI", "r8mVMwlafF8", "9r7dM3puxMk",
+      "cQkBH-pXhF0", "OTilStjd9L8", "n1fn2KFeLDA", "yJw2m6UWDYU",
+      "aBuX0PX-T7I", "Z9Q9LzQDXf0", "r4XacqHvkn4", "CqJuNXo5yiM",
+      "zJGf8xjFnQE", "wVqxM58sIKs", "BsE-m8JxIOg", "EHQEDVXZ0TI",
+      "KJdPcOGmK58", "hOnIlcGrO6g", "lxtHJMwBsaU", "NNVf18SlbT8",
+      "AAj9X+4aGYA"};
+  for (const auto *nid : optional_psn_imports) {
+    (void)find(nid);
+  }
+
+  using CxaRefFn = void(KYTY_SYSV_ABI *)(void *);
+  const auto cxa_increment =
+      reinterpret_cast<CxaRefFn>(find("PsrRUg671K0"));
+  const auto cxa_decrement =
+      reinterpret_cast<CxaRefFn>(find("MQFPAqQPt1s"));
+  int exception_marker = 0;
+  cxa_increment(&exception_marker);
+  cxa_decrement(&exception_marker);
+
+  using BandwidthStartFn = int(KYTY_SYSV_ABI *)(const void *, uint32_t);
+  using BandwidthStatusFn = int(KYTY_SYSV_ABI *)(int, int *);
+  using BandwidthShutdownFn = int(KYTY_SYSV_ABI *)(int, void *);
+  alignas(8) std::array<uint8_t, 64> bandwidth_param{};
+  alignas(8) std::array<uint8_t, 24> bandwidth_result{};
+  const auto bandwidth_start =
+      reinterpret_cast<BandwidthStartFn>(find("mA0zsbqm+kA"));
+  const auto bandwidth_status =
+      reinterpret_cast<BandwidthStatusFn>(find("BYIZGKm6bO4"));
+  const auto bandwidth_shutdown =
+      reinterpret_cast<BandwidthShutdownFn>(find("pLr1fEQS1z8"));
+  const int bandwidth_context = bandwidth_start(bandwidth_param.data(), 0);
+  int bandwidth_state = 0;
+  Require("SystemLibraryState", "NP bandwidth offline",
+          bandwidth_context > 0 &&
+              bandwidth_status(bandwidth_context, &bandwidth_state) == OK &&
+              bandwidth_state == 2 &&
+              bandwidth_shutdown(bandwidth_context, bandwidth_result.data()) ==
+                  OK,
+          "offline bandwidth lifecycle failed");
+
+  using DialogVoidFn = int(KYTY_SYSV_ABI *)();
+  using DialogOpenFn = int(KYTY_SYSV_ABI *)(const void *);
+  using DialogResultFn = int(KYTY_SYSV_ABI *)(void *);
+  const auto commerce_init =
+      reinterpret_cast<DialogVoidFn>(find("0aR2aWmQal4"));
+  const auto commerce_open =
+      reinterpret_cast<DialogOpenFn>(find("DfSCDRA3EjY"));
+  const auto commerce_status =
+      reinterpret_cast<DialogVoidFn>(find("LR5cwFMMCVE"));
+  const auto commerce_result =
+      reinterpret_cast<DialogResultFn>(find("r42bWcQbtZY"));
+  const auto commerce_term =
+      reinterpret_cast<DialogVoidFn>(find("m-I92Ab50W8"));
+  alignas(8) std::array<uint8_t, 128> commerce_param{};
+  alignas(8) std::array<uint8_t, 48> commerce_output{};
+  Require("SystemLibraryState", "NP commerce offline",
+          commerce_init() == OK &&
+              commerce_open(commerce_param.data()) == OK &&
+              commerce_status() == 3 &&
+              commerce_result(commerce_output.data()) == OK &&
+              commerce_term() == OK,
+          "offline commerce dialog lifecycle failed");
+
+  using EntitlementInitFn = int(KYTY_SYSV_ABI *)(const void *, void *);
+  using EntitlementRequestFn =
+      int(KYTY_SYSV_ABI *)(int, uint32_t, const void *, int64_t *);
+  using EntitlementPollFn =
+      int(KYTY_SYSV_ABI *)(int64_t, int32_t *, void *);
+  using EntitlementIdFn = int(KYTY_SYSV_ABI *)(int64_t);
+  const auto entitlement_init =
+      reinterpret_cast<EntitlementInitFn>(find("jO8DM8oyego"));
+  const auto entitlement_request =
+      reinterpret_cast<EntitlementRequestFn>(find("jautSRs4OdQ"));
+  const auto entitlement_poll =
+      reinterpret_cast<EntitlementPollFn>(find("M4XlLFnzQaQ"));
+  const auto entitlement_delete =
+      reinterpret_cast<EntitlementIdFn>(find("Z0eQj8m7XA8"));
+  alignas(8) std::array<uint8_t, 32> entitlement_init_param{};
+  alignas(8) std::array<uint8_t, 32> entitlement_boot_param{};
+  alignas(8) std::array<uint8_t, 20> entitlement_label{};
+  alignas(8) std::array<uint8_t, 64> entitlement_info{};
+  int64_t entitlement_request_id = 0;
+  int32_t entitlement_result = 0;
+  Require("SystemLibraryState", "NP entitlement offline",
+          entitlement_init(entitlement_init_param.data(),
+                           entitlement_boot_param.data()) == OK &&
+              entitlement_request(1, 0, entitlement_label.data(),
+                                  &entitlement_request_id) == OK &&
+              entitlement_poll(entitlement_request_id, &entitlement_result,
+                               entitlement_info.data()) == OK &&
+              entitlement_result < 0 &&
+              entitlement_delete(entitlement_request_id) == OK,
+          "offline entitlement lifecycle failed");
+
+  using SessionInitFn = int(KYTY_SYSV_ABI *)(void *);
+  using SessionCreateFn = int(KYTY_SYSV_ABI *)(const void *, uint32_t *);
+  using SessionLocalInfoFn = int(KYTY_SYSV_ABI *)(uint32_t, void *);
+  using SessionActivateFn =
+      int(KYTY_SYSV_ABI *)(uint32_t, const void *, uint32_t *);
+  using SessionContextFn = int(KYTY_SYSV_ABI *)(uint32_t);
+  const auto session_init =
+      reinterpret_cast<SessionInitFn>(find("ysmw6J-P8Ak"));
+  const auto session_create =
+      reinterpret_cast<SessionCreateFn>(find("aBuX0PX-T7I"));
+  const auto session_local_info =
+      reinterpret_cast<SessionLocalInfoFn>(find("OTilStjd9L8"));
+  const auto session_activate =
+      reinterpret_cast<SessionActivateFn>(find("9r7dM3puxMk"));
+  const auto session_destroy =
+      reinterpret_cast<SessionContextFn>(find("Z9Q9LzQDXf0"));
+  const auto session_term =
+      reinterpret_cast<DialogVoidFn>(find("CqJuNXo5yiM"));
+  alignas(8) std::array<uint8_t, 40> session_init_param{};
+  alignas(8) std::array<uint8_t, 64> session_create_param{};
+  alignas(8) std::array<uint8_t, 16> session_local_info_output{};
+  alignas(8) std::array<uint8_t, 32> session_peer{};
+  uint32_t session_context = 0;
+  uint32_t session_group = 0;
+  Require("SystemLibraryState", "NP signaling offline",
+          session_init(session_init_param.data()) == OK &&
+              session_create(session_create_param.data(), &session_context) ==
+                  OK &&
+              session_local_info(session_context,
+                                 session_local_info_output.data()) == OK &&
+              session_activate(session_context, session_peer.data(),
+                               &session_group) < 0 &&
+              session_group == 0 && session_destroy(session_context) == OK &&
+              session_term() == OK,
+          "offline session-signaling lifecycle failed");
+
+  using PushContextFn = int(KYTY_SYSV_ABI *)(int, void *);
+  const auto push_context =
+      reinterpret_cast<PushContextFn>(find("NNVf18SlbT8"));
+  std::array<char, 37> push_context_id{};
+  Require("SystemLibraryState", "NP WebApi push context",
+          push_context(1, push_context_id.data()) == OK &&
+              std::string_view(push_context_id.data()) ==
+                  "00000000-0000-0000-0000-000000000000",
+          "offline WebApi push context was not deterministic");
+
+  struct JsonObjectAbi {
+    void *impl;
+  };
+  struct JsonStringAbi {
+    void *impl;
+  };
+  struct alignas(8) JsonValueAbi {
+    std::array<uint8_t, 32> bytes;
+  };
+  struct JsonIteratorAbi {
+    void *impl;
+  };
+  struct JsonPairAbi {
+    JsonStringAbi key;
+    std::array<uint8_t, 4> padding;
+    JsonValueAbi value;
+  };
+  static_assert(sizeof(JsonPairAbi) == 48);
+
+  using JsonObjectCtorFn =
+      JsonObjectAbi *(KYTY_SYSV_ABI *)(JsonObjectAbi *);
+  using JsonObjectDtorFn = void(KYTY_SYSV_ABI *)(JsonObjectAbi *);
+  using JsonStringCtorFn =
+      JsonStringAbi *(KYTY_SYSV_ABI *)(JsonStringAbi *, const char *);
+  using JsonStringCopyCtorFn =
+      JsonStringAbi *(KYTY_SYSV_ABI *)(JsonStringAbi *,
+                                      const JsonStringAbi *);
+  using JsonStringDtorFn = void(KYTY_SYSV_ABI *)(JsonStringAbi *);
+  using JsonStringCStrFn =
+      const char *(KYTY_SYSV_ABI *)(const JsonStringAbi *);
+  using JsonObjectIndexFn =
+      void *(KYTY_SYSV_ABI *)(JsonObjectAbi *, const JsonStringAbi *);
+  using JsonValueSetIntFn = void(KYTY_SYSV_ABI *)(void *, int64_t);
+  using JsonValueGetIntFn = const int64_t *(KYTY_SYSV_ABI *)(const void *);
+  using JsonObjectSizeFn = size_t(KYTY_SYSV_ABI *)(const JsonObjectAbi *);
+  using JsonObjectIteratorFn =
+      JsonIteratorAbi(KYTY_SYSV_ABI *)(const JsonObjectAbi *);
+  using JsonIteratorNotEqualFn =
+      bool(KYTY_SYSV_ABI *)(const JsonIteratorAbi *,
+                            const JsonIteratorAbi *);
+  using JsonIteratorDereferenceFn =
+      JsonPairAbi *(KYTY_SYSV_ABI *)(JsonIteratorAbi *);
+  using JsonIteratorIncrementFn =
+      JsonIteratorAbi *(KYTY_SYSV_ABI *)(JsonIteratorAbi *);
+  using JsonIteratorDtorFn = void(KYTY_SYSV_ABI *)(JsonIteratorAbi *);
+
+  const auto json_object_ctor =
+      reinterpret_cast<JsonObjectCtorFn>(find("OJPTonqdg0I"));
+  const auto json_object_dtor =
+      reinterpret_cast<JsonObjectDtorFn>(find("5JmzZt8twAo"));
+  const auto json_string_ctor =
+      reinterpret_cast<JsonStringCtorFn>(find("9KUZFjI1IxA"));
+  const auto json_string_copy_ctor =
+      reinterpret_cast<JsonStringCopyCtorFn>(find("0CAesfH963Q"));
+  const auto json_string_dtor =
+      reinterpret_cast<JsonStringDtorFn>(find("cG1VE2HMl6c"));
+  const auto json_string_c_str =
+      reinterpret_cast<JsonStringCStrFn>(find("L1KAkYWml-M"));
+  const auto json_object_index =
+      reinterpret_cast<JsonObjectIndexFn>(find("ERuf9y0DY84"));
+  const auto json_value_set_int =
+      reinterpret_cast<JsonValueSetIntFn>(find("QxVVYhP-mvg"));
+  const auto json_value_get_int =
+      reinterpret_cast<JsonValueGetIntFn>(find("DIxvoy7Ngvk"));
+  const auto json_object_size =
+      reinterpret_cast<JsonObjectSizeFn>(find("fSGHm9RjN5U"));
+  const auto json_object_begin =
+      reinterpret_cast<JsonObjectIteratorFn>(find("xhAcaIwnrgk"));
+  const auto json_object_end =
+      reinterpret_cast<JsonObjectIteratorFn>(find("ivMCitpSQNk"));
+  const auto json_iterator_not_equal =
+      reinterpret_cast<JsonIteratorNotEqualFn>(find("+isUKw4zud4"));
+  const auto json_iterator_dereference =
+      reinterpret_cast<JsonIteratorDereferenceFn>(find("ZCd6IYoD3Bc"));
+  const auto json_iterator_increment =
+      reinterpret_cast<JsonIteratorIncrementFn>(find("DlWmn2ZQuWY"));
+  const auto json_iterator_dtor =
+      reinterpret_cast<JsonIteratorDtorFn>(find("hoINmSMlYjI"));
+
+  JsonObjectAbi json_object{};
+  JsonStringAbi json_key{};
+  JsonStringAbi json_key_copy{};
+  json_object_ctor(&json_object);
+  json_string_ctor(&json_key, "answer");
+  json_string_copy_ctor(&json_key_copy, &json_key);
+  json_value_set_int(json_object_index(&json_object, &json_key), 42);
+  auto json_begin = json_object_begin(&json_object);
+  auto json_end = json_object_end(&json_object);
+  const bool json_has_item = json_iterator_not_equal(&json_begin, &json_end);
+  auto *json_pair = json_iterator_dereference(&json_begin);
+  const bool json_pair_valid =
+      json_pair != nullptr &&
+      std::string_view(json_string_c_str(&json_pair->key)) == "answer" &&
+      *json_value_get_int(&json_pair->value) == 42 &&
+      std::string_view(json_string_c_str(&json_key_copy)) == "answer";
+  const bool json_size_valid = json_object_size(&json_object) == 1;
+  json_iterator_increment(&json_begin);
+  const bool json_at_end = !json_iterator_not_equal(&json_begin, &json_end);
+  json_iterator_dtor(&json_begin);
+  json_iterator_dtor(&json_end);
+  json_string_dtor(&json_key_copy);
+  json_string_dtor(&json_key);
+  json_object_dtor(&json_object);
+  Require("SystemLibraryState", "Json object iterators",
+          json_size_valid && json_has_item && json_pair_valid && json_at_end,
+          "Json object iterator ABI did not preserve key/value data");
+
   using SysmoduleFn = int(KYTY_SYSV_ABI *)(uint16_t);
   const auto sys_load = reinterpret_cast<SysmoduleFn>(find("g8cM39EUZ6o"));
   const auto sys_unload = reinterpret_cast<SysmoduleFn>(find("eR2bZFAAU0Q"));
@@ -14349,7 +14747,8 @@ void CheckSystemLibraryStateContracts() {
 
   using RudpInitFn = int(KYTY_SYSV_ABI *)(void *, int);
   using RudpThreadFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t);
-  using RudpHandler = void(KYTY_SYSV_ABI *)(int, int, int, void *);
+  using RudpHandler = int(KYTY_SYSV_ABI *)(int, int, const uint8_t *, size_t,
+                                          const void *, uint32_t, void *);
   using RudpSetHandlerFn = int(KYTY_SYSV_ABI *)(RudpHandler, void *);
   const auto rudp_init = reinterpret_cast<RudpInitFn>(find("amuBfI-AQc4"));
   const auto rudp_thread = reinterpret_cast<RudpThreadFn>(find("6PBNpsgyaxw"));
@@ -14365,6 +14764,357 @@ void CheckSystemLibraryStateContracts() {
               rudp_set_handler(TestRudpEventHandler, nullptr) == OK &&
               rudp_thread(0, 0) == OK && rudp_thread(0, 0) != OK,
           "RUDP did not enforce initialization and I/O-thread state");
+
+  struct AcmBatchInfoAbi {
+    void *buffer;
+    size_t offset;
+    size_t buffer_size;
+  };
+  using AcmContextCreateFn = int(KYTY_SYSV_ABI *)(uint32_t *);
+  using AcmContextDestroyFn = int(KYTY_SYSV_ABI *)(uint32_t);
+  using AcmFftFn = int(KYTY_SYSV_ABI *)(
+      AcmBatchInfoAbi *, int, int, int, const void *const[], int,
+      void *const[], uint32_t);
+  using AcmPannerFn = int(KYTY_SYSV_ABI *)(
+      AcmBatchInfoAbi *, uint32_t, const float *const[], uint32_t, uint32_t,
+      uint32_t, const void *const[], void *const[], const float *const[],
+      float *const[]);
+  using AcmNotificationFn = int(KYTY_SYSV_ABI *)(AcmBatchInfoAbi *, uint8_t,
+                                                 volatile void *);
+  const auto acm_context_create =
+      reinterpret_cast<AcmContextCreateFn>(find("ZIXln2K3XMk"));
+  const auto acm_context_destroy =
+      reinterpret_cast<AcmContextDestroyFn>(find("jBgBjAj02R8"));
+  const auto acm_fft = reinterpret_cast<AcmFftFn>(find("KovqaFbmtsM"));
+  const auto acm_ifft = reinterpret_cast<AcmFftFn>(find("DR-ZCmvVR9Q"));
+  const auto acm_panner =
+      reinterpret_cast<AcmPannerFn>(find("LA4RCNKnFjg"));
+  const auto acm_notification =
+      reinterpret_cast<AcmNotificationFn>(find("r7z5YQFZo+U"));
+
+  alignas(128) std::array<uint8_t, 4096> acm_commands{};
+  AcmBatchInfoAbi acm_info{acm_commands.data(), 0, acm_commands.size()};
+  std::array<float, 512> acm_pcm{};
+  std::array<float, 512> acm_frequency{};
+  std::array<float, 512> acm_roundtrip{};
+  acm_pcm[0] = 1.0f;
+  const void *acm_fft_inputs[] = {acm_pcm.data()};
+  void *acm_fft_outputs[] = {acm_frequency.data()};
+  const void *acm_ifft_inputs[] = {acm_frequency.data()};
+  void *acm_ifft_outputs[] = {acm_roundtrip.data()};
+  uint32_t acm_context = 0;
+  const bool acm_transform_ok =
+      acm_context_create(&acm_context) == OK && acm_context != 0 &&
+      acm_fft(&acm_info, 512, 1, 0, acm_fft_inputs, 0, acm_fft_outputs, 0) ==
+          OK &&
+      acm_ifft(&acm_info, 512, 1, 0, acm_ifft_inputs, 0, acm_ifft_outputs,
+               0) == OK &&
+      std::abs(acm_roundtrip[0] - 1.0f) < 0.0001f &&
+      std::all_of(acm_roundtrip.begin() + 1, acm_roundtrip.end(),
+                  [](float value) { return std::abs(value) < 0.0001f; });
+
+  std::array<float, 256> acm_pan_input{};
+  std::array<float, 256> acm_pan_left{};
+  std::array<float, 256> acm_pan_right{};
+  acm_pan_input.fill(1.0f);
+  struct AcmPannerParameterAbi {
+    uint32_t flags;
+    float gain[2];
+  } acm_pan_parameter{1, {0.25f, 0.75f}};
+  alignas(128) std::array<float, 34> acm_pan_state{};
+  const float *acm_pan_inputs[] = {acm_pan_input.data()};
+  const void *acm_pan_parameters[] = {&acm_pan_parameter};
+  void *acm_pan_states[] = {acm_pan_state.data()};
+  float *acm_pan_outputs[] = {acm_pan_left.data(), acm_pan_right.data()};
+  alignas(128) std::array<uint8_t, 128> acm_notify{};
+  const bool acm_panner_ok =
+      acm_panner(&acm_info, 1, acm_pan_inputs, 0, 0, 2,
+                 acm_pan_parameters, acm_pan_states, nullptr,
+                 acm_pan_outputs) == OK &&
+      std::abs(acm_pan_left[128] - 0.25f) < 0.0001f &&
+      std::abs(acm_pan_right[128] - 0.75f) < 0.0001f &&
+      acm_notification(&acm_info, 0x5a, acm_notify.data()) == OK &&
+      acm_notify[0] == 0x5a && acm_context_destroy(acm_context) == OK &&
+      acm_context_destroy(acm_context) != OK;
+  Require("SystemLibraryState", "ACM CPU processing",
+          acm_transform_ok && acm_panner_ok,
+          "ACM FFT/IFFT, panner, notification, or context lifecycle failed");
+
+  struct Ngs2WaveformFormatAbi {
+    uint32_t waveform_type;
+    uint32_t num_channels;
+    uint32_t sample_rate;
+    uint32_t config_data;
+    uint32_t frame_margin;
+    uint32_t frame_offset;
+  };
+  struct Ngs2WaveformBlockAbi {
+    uintptr_t data_offset;
+    size_t data_size;
+    uint32_t num_repeats;
+    uint32_t num_skip_samples;
+    uint32_t num_samples;
+    uint32_t reserved;
+    uintptr_t user_data;
+  };
+  struct Ngs2WaveformInfoAbi {
+    Ngs2WaveformFormatAbi format;
+    uint32_t data_offset;
+    uint32_t data_size;
+    uint32_t loop_begin_position;
+    uint32_t loop_end_position;
+    uint32_t num_samples;
+    uint32_t audio_unit_size;
+    uint32_t num_audio_unit_samples;
+    uint32_t num_audio_unit_per_frame;
+    uint32_t audio_frame_size;
+    uint32_t num_audio_frame_samples;
+    uint32_t num_delay_samples;
+    uint32_t num_blocks;
+    Ngs2WaveformBlockAbi blocks[4];
+  };
+  struct Ngs2PanParamAbi {
+    float angle;
+    float distance;
+    float fbw_level;
+    float lfe_level;
+  };
+  struct Ngs2PanWorkAbi {
+    float speaker_angles[8];
+    float unit_angle;
+    uint32_t num_speakers;
+  };
+  using Ngs2ParseWaveformFn = int(KYTY_SYSV_ABI *)(
+      const void *, size_t, Ngs2WaveformInfoAbi *);
+  using Ngs2CalcBlockFn = int(KYTY_SYSV_ABI *)(
+      const Ngs2WaveformFormatAbi *, uint32_t, uint32_t,
+      Ngs2WaveformBlockAbi *);
+  using Ngs2PanInitFn = int(KYTY_SYSV_ABI *)(Ngs2PanWorkAbi *, const float *,
+                                            float, uint32_t);
+  using Ngs2PanMatrixFn = int(KYTY_SYSV_ABI *)(
+      Ngs2PanWorkAbi *, const Ngs2PanParamAbi *, uint32_t, uint32_t, float *);
+  const auto ngs2_parse =
+      reinterpret_cast<Ngs2ParseWaveformFn>(find("hyVLT2VlOYk"));
+  const auto ngs2_calc =
+      reinterpret_cast<Ngs2CalcBlockFn>(find("3pCNbVM11UA"));
+  const auto ngs2_pan_init =
+      reinterpret_cast<Ngs2PanInitFn>(find("xa8oL9dmXkM"));
+  const auto ngs2_pan_matrix =
+      reinterpret_cast<Ngs2PanMatrixFn>(find("gbMKV+8Enuo"));
+
+  std::array<uint8_t, 52> wave{};
+  const auto write_fourcc = [&wave](size_t offset, const char *text) {
+    std::memcpy(wave.data() + offset, text, 4);
+  };
+  const auto write_le16 = [&wave](size_t offset, uint16_t value) {
+    wave[offset] = static_cast<uint8_t>(value);
+    wave[offset + 1] = static_cast<uint8_t>(value >> 8u);
+  };
+  const auto write_le32 = [&wave](size_t offset, uint32_t value) {
+    for (uint32_t i = 0; i < 4; i++) {
+      wave[offset + i] = static_cast<uint8_t>(value >> (i * 8u));
+    }
+  };
+  write_fourcc(0, "RIFF");
+  write_le32(4, 44);
+  write_fourcc(8, "WAVE");
+  write_fourcc(12, "fmt ");
+  write_le32(16, 16);
+  write_le16(20, 1);
+  write_le16(22, 2);
+  write_le32(24, 48000);
+  write_le32(28, 192000);
+  write_le16(32, 4);
+  write_le16(34, 16);
+  write_fourcc(36, "data");
+  write_le32(40, 8);
+  write_le16(44, 0x1000);
+  write_le16(46, 0xf000);
+  write_le16(48, 0x2000);
+  write_le16(50, 0xe000);
+  Ngs2WaveformInfoAbi waveform_info{};
+  Ngs2WaveformBlockAbi waveform_block{};
+  const float speaker_angles[] = {270.0f, 90.0f};
+  Ngs2PanWorkAbi pan_work{};
+  const Ngs2PanParamAbi pan_param{0.0f, 1.0f, 0.0f, 0.0f};
+  std::array<float, 2> pan_matrix{};
+  Require("SystemLibraryState", "NGS2 waveform and pan",
+          ngs2_parse(wave.data(), wave.size(), &waveform_info) == OK &&
+              waveform_info.format.waveform_type == 0x12 &&
+              waveform_info.format.num_channels == 2 &&
+              waveform_info.format.sample_rate == 48000 &&
+              waveform_info.data_offset == 44 &&
+              waveform_info.num_samples == 2 && waveform_info.num_blocks == 1 &&
+              ngs2_calc(&waveform_info.format, 1, 1, &waveform_block) == OK &&
+              waveform_block.data_offset == 4 && waveform_block.data_size == 4 &&
+              ngs2_pan_init(&pan_work, speaker_angles, 360.0f, 2) == OK &&
+              ngs2_pan_matrix(&pan_work, &pan_param, 1, 2,
+                              pan_matrix.data()) == OK &&
+              std::abs(pan_matrix[0] - 0.7071067f) < 0.0001f &&
+              std::abs(pan_matrix[1] - 0.7071067f) < 0.0001f,
+          "NGS2 PCM WAV parsing, block calculation, or equal-power pan failed");
+
+  struct AjmBatchInfoAbi {
+    void *buffer;
+    size_t offset;
+    size_t size;
+    void *last_good_job;
+    const void *last_good_job_ra;
+  };
+  struct AjmLpcmParamsAbi {
+    uint32_t input_encoding;
+    uint32_t channels;
+    uint32_t sample_rate;
+  };
+  using AjmInitializeFn = int(KYTY_SYSV_ABI *)(int64_t, uint32_t *);
+  using AjmFinalizeFn = int(KYTY_SYSV_ABI *)(uint32_t);
+  using AjmModuleFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t, int64_t);
+  using AjmInstanceCreateFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t,
+                                                   uint64_t, uint32_t *);
+  using AjmInstanceDestroyFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t);
+  using AjmBatchInitializeFn = int(KYTY_SYSV_ABI *)(void *, size_t,
+                                                    AjmBatchInfoAbi *);
+  using AjmJobInitializeFn = int(KYTY_SYSV_ABI *)(
+      AjmBatchInfoAbi *, uint32_t, const void *, size_t, void *);
+  using AjmJobDecodeFn = int(KYTY_SYSV_ABI *)(
+      AjmBatchInfoAbi *, uint32_t, const void *, size_t, void *, size_t, void *);
+  const auto ajm_initialize =
+      reinterpret_cast<AjmInitializeFn>(find("dl+4eHSzUu4"));
+  const auto ajm_finalize =
+      reinterpret_cast<AjmFinalizeFn>(find("MHur6qCsUus"));
+  const auto ajm_module_register =
+      reinterpret_cast<AjmModuleFn>(find("Q3dyFuwGn64"));
+  const auto ajm_module_unregister =
+      reinterpret_cast<AjmInstanceDestroyFn>(find("Wi7DtlLV+KI"));
+  const auto ajm_instance_create =
+      reinterpret_cast<AjmInstanceCreateFn>(find("AxoDrINp4J8"));
+  const auto ajm_instance_destroy =
+      reinterpret_cast<AjmInstanceDestroyFn>(find("RbLbuKv8zho"));
+  const auto ajm_batch_initialize =
+      reinterpret_cast<AjmBatchInitializeFn>(find("MmpF1XsQiHw"));
+  const auto ajm_job_initialize =
+      reinterpret_cast<AjmJobInitializeFn>(find("ezM2OhNxzck"));
+  const auto ajm_job_decode =
+      reinterpret_cast<AjmJobDecodeFn>(find("5LLWbpP5xi8"));
+  uint32_t ajm_context = 0;
+  uint32_t ajm_instance = 0;
+  std::array<uint8_t, 512> ajm_commands{};
+  AjmBatchInfoAbi ajm_info{};
+  const AjmLpcmParamsAbi lpcm_params{0, 2, 48000};
+  std::array<uint8_t, 8> ajm_init_result{};
+  const std::array<int16_t, 4> lpcm_input = {32767, -32768, 16384, -16384};
+  std::array<float, 4> lpcm_output{};
+  std::array<uint8_t, 24> ajm_decode_result{};
+  const uint64_t lpcm_flags = 2u | (2u << 7u);
+  Require("SystemLibraryState", "AJM LPCM decoder",
+          ajm_initialize(0, &ajm_context) == OK &&
+              ajm_module_register(ajm_context, 23, 0) == OK &&
+              ajm_instance_create(ajm_context, 23, lpcm_flags,
+                                  &ajm_instance) == OK &&
+              ajm_batch_initialize(ajm_commands.data(), ajm_commands.size(),
+                                   &ajm_info) == OK &&
+              ajm_job_initialize(&ajm_info, ajm_instance, &lpcm_params,
+                                 sizeof(lpcm_params), ajm_init_result.data()) == OK &&
+              *reinterpret_cast<const int32_t *>(ajm_init_result.data()) == OK &&
+              ajm_job_decode(&ajm_info, ajm_instance, lpcm_input.data(),
+                             sizeof(lpcm_input), lpcm_output.data(),
+                             sizeof(lpcm_output), ajm_decode_result.data()) == OK &&
+              *reinterpret_cast<const int32_t *>(ajm_decode_result.data()) == OK &&
+              std::abs(lpcm_output[0] - 0.9999695f) < 0.0001f &&
+              std::abs(lpcm_output[1] + 1.0f) < 0.0001f &&
+              ajm_instance_destroy(ajm_context, ajm_instance) == OK &&
+              ajm_module_unregister(ajm_context, 23) == OK &&
+              ajm_finalize(ajm_context) == OK,
+          "AJM LPCM initialization or sample conversion failed");
+
+  using TtsStatusFn = int(KYTY_SYSV_ABI *)(int32_t *);
+  using TtsCancelFn = int(KYTY_SYSV_ABI *)();
+  const auto tts_status =
+      reinterpret_cast<TtsStatusFn>(find("08JSg9p6bgQ"));
+  const auto tts_cancel =
+      reinterpret_cast<TtsCancelFn>(find("2jiIxUmcsGo"));
+  int32_t speech_status = -1;
+  Require("SystemLibraryState", "TextToSpeech2 offline state",
+          tts_status(nullptr) != OK && tts_status(&speech_status) == OK &&
+              speech_status == 0 && tts_cancel() == OK,
+          "TextToSpeech2 status ABI or cancel state failed");
+
+  struct PsmlDirectBlockAbi {
+    uint64_t address;
+    uint64_t size;
+  };
+  struct PsmlSharedParamsAbi {
+    uint32_t type;
+    uint32_t reserved;
+    const PsmlDirectBlockAbi *blocks;
+    uint64_t block_count;
+    uint64_t virtual_address_start;
+  };
+  using PsmlInitFn = int(KYTY_SYSV_ABI *)();
+  using PsmlSharedInitFn = int(KYTY_SYSV_ABI *)(void *,
+                                                const PsmlSharedParamsAbi *);
+  using PsmlObjectFn = int(KYTY_SYSV_ABI *)(void *);
+  using PsmlContextInitFn = int(KYTY_SYSV_ABI *)(void *, const void *);
+  using PsmlDispatchFn = int(KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t);
+  using PsmlProgressFn = int(KYTY_SYSV_ABI *)(const void *, float *, uint32_t);
+  const auto psml_init = reinterpret_cast<PsmlInitFn>(find("3WVD91e12ZQ"));
+  const auto psml_shared_init =
+      reinterpret_cast<PsmlSharedInitFn>(find("eWoKNeB6V-k"));
+  const auto psml_shared_finalize =
+      reinterpret_cast<PsmlObjectFn>(find("jEevBXmagOQ"));
+  const auto psml_context_init =
+      reinterpret_cast<PsmlContextInitFn>(find("2ecEbQaf9VU"));
+  const auto psml_context_finalize =
+      reinterpret_cast<PsmlObjectFn>(find("JaLBe0P3jSU"));
+  const auto psml_dispatch =
+      reinterpret_cast<PsmlDispatchFn>(find("RUNLFro+qok"));
+  const auto psml_progress =
+      reinterpret_cast<PsmlProgressFn>(find("GHna9-DvnUk"));
+  const auto psml_capture =
+      reinterpret_cast<PsmlObjectFn>(find("GJY0MvuTcs8"));
+  alignas(16) std::array<uint8_t, 0x600> psml_resources{};
+  alignas(16) std::array<uint8_t, 0x600> psml_context{};
+  const PsmlDirectBlockAbi psml_block{0x100000000ull, 0x200000ull};
+  const PsmlSharedParamsAbi psml_shared_params{0, 0, &psml_block, 52,
+                                               0x200000000ull};
+  std::array<uint8_t, 16> psml_context_params{};
+  *reinterpret_cast<void **>(psml_context_params.data() + 8) =
+      psml_resources.data();
+  float psml_progress_value = -1.0f;
+  Require("SystemLibraryState", "PSML synchronous state",
+          psml_init() == OK &&
+              psml_shared_init(psml_resources.data(), &psml_shared_params) == OK &&
+              psml_context_init(psml_context.data(),
+                                psml_context_params.data()) == OK &&
+              psml_capture(psml_context.data()) == OK &&
+              psml_dispatch(psml_context.data(), 1, 1) == OK &&
+              psml_progress(psml_context.data(), &psml_progress_value, 0) == OK &&
+              psml_progress_value == 1.0f &&
+              psml_context_finalize(psml_context.data()) == OK &&
+              psml_shared_finalize(psml_resources.data()) == OK,
+          "PSML object lifecycle, dispatch progress, or capture request failed");
+
+  struct CesOpaqueStorageAbi {
+    void *system_use[32];
+  };
+  using CesProfileInitFn = CesOpaqueStorageAbi *(KYTY_SYSV_ABI *)(
+      CesOpaqueStorageAbi *);
+  using CesContextInitFn = int(KYTY_SYSV_ABI *)(
+      CesOpaqueStorageAbi *, const CesOpaqueStorageAbi *);
+  const auto ces_profile_init =
+      reinterpret_cast<CesProfileInitFn>(find("ZiDCxUUGbec"));
+  const auto ces_context_init =
+      reinterpret_cast<CesContextInitFn>(find("538bRGc6Zo8"));
+  CesOpaqueStorageAbi ces_profile{};
+  CesOpaqueStorageAbi ces_context{};
+  Require("SystemLibraryState", "CES CP932 lifecycle",
+          ces_profile_init(nullptr) == nullptr &&
+              ces_profile_init(&ces_profile) == &ces_profile &&
+              ces_profile.system_use[0] != nullptr &&
+              ces_context_init(&ces_context, &ces_profile) == OK &&
+              ces_context.system_use[0] == &ces_profile &&
+              ces_context_init(nullptr, &ces_profile) != OK,
+          "CES CP932 profile or MBCS context initialization failed");
 
   std::printf("[host]    %-32s ok\n", "SystemLibraryState");
 }
@@ -15340,6 +16090,77 @@ TestCase VectorCompareF16Ops() {
            O::V_CMPX_LE_F16, O::V_CMPX_GT_F16, O::V_CMPX_GE_F16,
            O::V_CMPX_NEQ_F16, O::V_CMPX_NLT_F16, O::V_CNDMASK_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorRemainingB16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x0000ffffu);
+  AppendVMovU32(&code, 1, 2);
+  AppendVMovU32(&code, 2, 5);
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovLiteral(&code, 4, 0x0000fffeu);
+  AppendVMovU32(&code, 5, 3);
+  AppendVMovLiteral(&code, 6, 0x00007fffu);
+  AppendVMovU32(&code, 7, 1);
+  AppendVMovLiteral(&code, 8, 0x00008000u);
+  AppendVMovU32(&code, 9, 1);
+  for (u32 dst = 20; dst <= 30; dst++) {
+    AppendVMovU32(&code, dst, 0);
+  }
+  for (u32 dst = 40; dst <= 51; dst++) {
+    AppendVMovU32(&code, dst, 0);
+  }
+
+  AppendVop3(&code, 0x303, 20, Vgpr(0), Vgpr(1));
+  AppendVop3(&code, 0x304, 21, Vgpr(2), Vgpr(3));
+  AppendVop3(&code, 0x309, 22, Vgpr(0), Vgpr(1));
+  AppendVop3(&code, 0x30a, 23, Vgpr(4), Vgpr(5));
+  AppendVop3(&code, 0x30b, 24, Vgpr(2), Vgpr(3));
+  AppendVop3(&code, 0x30c, 25, Vgpr(4), Vgpr(5));
+  AppendVop3(&code, 0x30d, 26, Vgpr(6), Vgpr(7));
+  AppendVop3(&code, 0x30e, 27, Vgpr(4), Vgpr(5));
+  AppendVop3(&code, 0x314, 28, Vgpr(1), Vgpr(5));
+  AppendVop3(&code, 0x307, 29, Vgpr(7), Vgpr(8));
+  AppendVop3(&code, 0x308, 30, Vgpr(7), Vgpr(4));
+
+  u32 compare_dst = 40;
+  auto append_compare = [&](u32 opcode, u32 src0, u32 src1) {
+    code.push_back(EncodeVopc(opcode, src0, src1));
+    code.push_back(EncodeVop2(0x01, compare_dst++, InlineU32(0), 9));
+  };
+  for (u32 opcode = 0x89; opcode <= 0x8e; opcode++) {
+    append_compare(opcode, Vgpr(4), 5);
+  }
+  for (u32 opcode = 0xa9; opcode <= 0xae; opcode++) {
+    append_compare(opcode, Vgpr(1), 5);
+  }
+
+  for (u32 i = 0; i < 11u; i++) {
+    AppendStoreVgpr(&code, 20u + i, i);
+  }
+  for (u32 i = 0; i < 12u; i++) {
+    AppendStoreVgpr(&code, 40u + i, 11u + i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorRemainingB16Ops",
+          code,
+          {},
+          {0x00000001u, 0x0000fffeu, 0x0000ffffu, 0x00000003u,
+           0x00000005u, 0x0000fffeu, 0x00008000u, 0x0000fffbu,
+           0x0000000cu, 0x00004000u, 0x0000ffffu,
+           1u, 0u, 1u, 0u, 1u, 0u, 1u, 0u, 1u, 0u, 1u, 0u},
+          {O::V_MOV_B32, O::V_ADD_NC_U16, O::V_SUB_NC_U16, O::V_MAX_U16,
+           O::V_MAX_I16, O::V_MIN_U16, O::V_MIN_I16, O::V_ADD_NC_I16,
+           O::V_SUB_NC_I16, O::V_LSHLREV_B16, O::V_LSHRREV_B16,
+           O::V_ASHRREV_I16, O::V_CMP_LT_I16, O::V_CMP_EQ_I16,
+           O::V_CMP_LE_I16, O::V_CMP_GT_I16, O::V_CMP_NE_I16,
+           O::V_CMP_GE_I16, O::V_CMP_LT_U16, O::V_CMP_EQ_U16,
+           O::V_CMP_LE_U16, O::V_CMP_GT_U16, O::V_CMP_NE_U16,
+           O::V_CMP_GE_U16, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase Vop2SdwaCndmaskSourceModifier() {
@@ -18869,7 +19690,9 @@ TestCase ImageSampleAndGather() {
   code.push_back(EncodeMimg1(8, 24));
   code.push_back(EncodeMimg0(0x60, 0x1));
   code.push_back(EncodeMimg1(12, 20));
-  for (u32 i = 0; i < 13u; i++) {
+  code.push_back(EncodeMimg0(0x61, 0x2));
+  code.push_back(EncodeMimg1(13, 20));
+  for (u32 i = 0; i < 17u; i++) {
     AppendStoreVgpr(&code, i, i);
   }
   AppendEnd(&code);
@@ -18877,7 +19700,8 @@ TestCase ImageSampleAndGather() {
   auto image = MakeRgbaImage(4, 4);
   for (u32 y = 0; y < 4u; y++) {
     for (u32 x = 0; x < 4u; x++) {
-      SetRgbaPixel(&image, 4, x, y, 0x3f800000u, 0, 0, 0);
+      SetRgbaPixel(&image, 4, x, y, 0x3f800000u, 0x40000000u,
+                   0x40400000u, 0x40800000u);
     }
   }
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
@@ -18898,12 +19722,18 @@ TestCase ImageSampleAndGather() {
                    0x3f800000u,
                    0x3f800000u,
                    0x3f800000u,
-                   0};
+                   0,
+                   0x40000000u,
+                   0x40000000u,
+                   0x40000000u,
+                   0x40000000u};
   test.opcodes = {
       O::V_MOV_B32,        O::IMAGE_SAMPLE,       O::IMAGE_GET_LOD,
       O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
-      O::S_ENDPGM};
+      O::IMAGE_GATHER4H,   O::S_ENDPGM};
   test.sampled_image_rgba = image;
+  test.decoded_counts = {{"gather_horizontal", 1}};
+  test.required_spirv = {"OpImageGather"};
   return test;
 }
 
@@ -19676,9 +20506,9 @@ TestCase ImageStoreAndAtomicUseSeparateBindings() {
 TestCase ImageAtomicVariants() {
   using O = ShaderOpcode;
 
-  const u32 initial[] = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
-  const u32 values[] = {5, 5, 0x0ff0u, 0x0f00u, 0x00ffu};
-  const u32 ops[] = {0x11, 0x15, 0x18, 0x19, 0x1a};
+  const u32 initial[] = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu, 10};
+  const u32 values[] = {5, 5, 0x0ff0u, 0x0f00u, 0x00ffu, 20};
+  const u32 ops[] = {0x11, 0x15, 0x18, 0x19, 0x1a, 0x17};
 
   std::vector<u32> code;
   for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
@@ -19695,10 +20525,11 @@ TestCase ImageAtomicVariants() {
   TestCase test;
   test.name = "ImageAtomicVariants";
   test.code = code;
-  test.expected = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
+  test.expected = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu, 10};
   test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD,
                   O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
                   O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
+                  O::IMAGE_ATOMIC_UMAX,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpImageTexelPointer", "R32ui", "storage_atomic_2d"};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
@@ -19715,6 +20546,7 @@ TestCase ImageAtomicVariants() {
   test.expected_storage_image_r32ui[2] = 0x00f0u;
   test.expected_storage_image_r32ui[3] = 0xff00u;
   test.expected_storage_image_r32ui[4] = 0xf0f0u;
+  test.expected_storage_image_r32ui[5] = 20;
   return test;
 }
 
@@ -20041,6 +20873,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarTrapDisabledFallsThroughExactRaw);
   AddCase(ScalarWaitcntDepctrCapturedVmVsrc);
   AddCase(ScalarExtendedArithmetic);
+  AddCase(ScalarRemainingAluOps);
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);
   AddCase(ScalarAbsI32UpdatesScc);
@@ -20091,6 +20924,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
   AddCase(VectorLaneAndPackedOps);
+  AddCase(VectorRemainingPackedOps);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
@@ -20099,6 +20933,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
+  AddCase(VectorRemainingF16Ops);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
@@ -20135,6 +20970,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3CmpxNeI64CapturedExecMask);
   AddCase(VectorCompareClassF32);
   AddCase(VectorCompareF16Ops);
+  AddCase(VectorRemainingB16Ops);
   AddCase(Vop2SdwaCndmaskSourceModifier);
   AddCase(Vop2SdwaCndmaskCapturedByte3Source);
   AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
@@ -23370,6 +24206,50 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
 }
 
+void CheckPm4IndirectRegisterPackets(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer);
+  const auto execute = [&](uint32_t opcode, const uint32_t *registers,
+                           uint32_t count) {
+    const auto address = reinterpret_cast<uint64_t>(registers);
+    std::array<uint32_t, 5> packet{
+        KYTY_PM4(5, opcode, Pm4::R_ZERO), static_cast<uint32_t>(address),
+        static_cast<uint32_t>(address >> 32u), 0u, count};
+    Pm4Execution execution;
+    return processor.Process(execution, packet.data(), packet.size()) ==
+           Pm4ProcessResult::Complete;
+  };
+
+  alignas(8) const std::array<uint32_t, 6> context_registers{
+      0x10000000u | Pm4::CB_BLEND_RED, std::bit_cast<uint32_t>(1.25f),
+      Pm4::CB_BLEND_GREEN, std::bit_cast<uint32_t>(2.5f), 0xffffffffu, 0u};
+  const bool context_ok =
+      execute(Pm4::IT_SET_CONTEXT_REG_INDIRECT, context_registers.data(), 3u);
+  const auto &blend = processor.GetCtx().GetBlendColor();
+
+  alignas(8) const std::array<uint32_t, 4> shader_registers{
+      0x20000000u | Pm4::SPI_SHADER_USER_DATA_PS_0, 0xdeadbeefu,
+      Pm4::SH_NOP, 0u};
+  const bool shader_ok =
+      execute(Pm4::IT_SET_SH_REG_INDIRECT, shader_registers.data(), 2u);
+
+  constexpr auto primitive_type = static_cast<Prospero::PrimitiveType>(0x35u);
+  alignas(8) const std::array<uint32_t, 2> uconfig_registers{
+      0x30000000u | Pm4::VGT_PRIMITIVE_TYPE,
+      static_cast<uint32_t>(primitive_type)};
+  const bool uconfig_ok = execute(Pm4::IT_SET_UCONFIG_REG_INDIRECT,
+                                  uconfig_registers.data(), 1u);
+
+  Require(
+      "Pm4IndirectRegisterPackets", "dynamic register streams",
+      context_ok && shader_ok && uconfig_ok && blend.red == 1.25f &&
+          blend.green == 2.5f &&
+          processor.GetShCtx().GetPs().ps_user_sgpr.value[0] == 0xdeadbeefu &&
+          processor.GetUcfg().GetPrimType() == primitive_type,
+      "indirect CX/SH/UC packets did not normalize selectors and update state");
+  std::printf("[host]    %-32s ok\n", "Pm4IndirectRegisterPackets");
+}
+
 void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer);
@@ -24340,6 +25220,7 @@ int main(int argc, char **argv) {
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
+  CheckPm4IndirectRegisterPackets(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());

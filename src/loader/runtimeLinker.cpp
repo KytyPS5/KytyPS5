@@ -338,6 +338,14 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 			     log_index, record_id);
 		}
 	}
+	if (Config::StrictUnresolvedImportsEnabled()) {
+		if (record_id < g_stubbed_imports.size()) {
+			const auto& record = g_stubbed_imports[record_id];
+			EXIT("strict unresolved import: %s (program=%s)\n", record.name.c_str(),
+			     record.program.c_str());
+		}
+		EXIT("strict unresolved import: bad record id=%" PRIu64 "\n", record_id);
+	}
 	return 0;
 }
 

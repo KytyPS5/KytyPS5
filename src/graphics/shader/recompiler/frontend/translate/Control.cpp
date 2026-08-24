@@ -220,11 +220,19 @@ bool Translator::TranslateLaneOperation(const IR::Instruction& inst) {
 			        inst.src[0].reg.file != IR::RegisterFile::Vector);
 			const auto base     = inst.src[0].reg.index;
 			const auto m0       = ir.BitwiseAnd(ReadU32(inst.src[1]), IR::U32(IR::Value(0xffu)));
-			auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-			for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
+			// SDK 12 specifies VGPR0 for an indexed read beyond the allocated VGPR range.
+			auto selected = ir.GetVectorReg(static_cast<IR::VectorReg>(0));
+			for (uint32_t index = base; index < current_vector_limit; index++) {
 				const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 				selected =
 				    ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+			}
+			selected = ApplyBitSourceModifiers(inst.src[0], selected);
+			if (inst.src[0].absolute) {
+				selected = ir.BitwiseAnd(selected, IR::U32(IR::Value(0x7fffffffu)));
+			}
+			if (inst.src[0].negate) {
+				selected = ir.BitwiseXor(selected, IR::U32(IR::Value(0x80000000u)));
 			}
 			WriteOperand(inst.dst, selected);
 			return true;

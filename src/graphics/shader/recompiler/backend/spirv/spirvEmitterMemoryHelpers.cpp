@@ -317,6 +317,32 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
 }
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
+	if ((control & 0xe000u) == 0xe000u) {
+		const uint32_t mask = control & 0x1fu;
+		uint32_t       bits = 5u;
+		while (bits != 0u && (mask & (1u << (bits - 1u))) != 0u) {
+			bits--;
+		}
+
+		auto reversed = ConstantU32(state, 0u);
+		for (uint32_t source = 0; source < bits; source++) {
+			const uint32_t destination = bits - source - 1u;
+			auto           bit = EmitAndConstant(state, subid, 1u << source);
+			if (destination > source) {
+				bit = EmitBinaryU32(state, OpShiftLeftLogical, bit,
+				                    ConstantU32(state, destination - source));
+			} else if (destination < source) {
+				bit = EmitBinaryU32(state, OpShiftRightLogical, bit,
+				                    ConstantU32(state, source - destination));
+			}
+			reversed = EmitOrU32(state, reversed, bit);
+		}
+
+		const auto kept = EmitAndConstant(state, subid, mask);
+		const auto base = EmitAndConstant(state, subid, 0xffffffe0u);
+		return EmitOrU32(state, base, EmitOrU32(state, kept, reversed));
+	}
+
 	if ((control & 0xc000u) == 0xc000u) {
 		const uint32_t mask         = control & 0x1fu;
 		const uint32_t rotate       = (control >> 5u) & 0x1fu;

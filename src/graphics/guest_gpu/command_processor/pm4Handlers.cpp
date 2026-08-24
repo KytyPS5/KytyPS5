@@ -243,23 +243,21 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0106900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0);
+	EXIT_NOT_IMPLEMENTED(dw < 16);
 
-	uint32_t count = 1;
+	uint32_t count = 16;
+
+	auto r = cp.GetCtx().GetAaSampleControl();
+	memcpy(r.locations, buffer, static_cast<size_t>(16) * sizeof(uint32_t));
 
 	if (dw >= 20 && buffer[16] == 0xc0026900 && buffer[17] == Pm4::PA_SC_CENTROID_PRIORITY_0) {
 		count = 20;
 
-		HW::AaSampleControl r;
-
-		memcpy(r.locations, buffer, static_cast<size_t>(16) * 4);
-
 		r.centroid_priority =
 		    static_cast<uint64_t>(buffer[18]) | (static_cast<uint64_t>(buffer[19]) << 32u);
-
-		cp.GetCtx().SetAaSampleControl(r);
-	} else {
-		KYTY_NOT_IMPLEMENTED;
 	}
+
+	cp.GetCtx().SetAaSampleControl(r);
 
 	return count;
 }
@@ -638,12 +636,16 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthHtileSurface) {
 
 KYTY_HW_CTX_PARSER(HwCtxSetDepthRenderTarget) {
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_Z_INFO);
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0 || num_values > 8 || dw < num_values);
 
-	uint32_t count = 1;
+	for (uint32_t i = 0; i < num_values; i++) {
+		g_hw_ctx_indirect_func[(cmd_offset + i) & (Pm4::CX_NUM - 1)](cp, cmd_offset + i, buffer[i]);
+	}
 
-	if (cmd_id == 0xC0016900) {
-		cp.GetCtx().SetDepthZInfo(HW::DepthZInfo::Decode(buffer[0]));
-	} else if (cmd_id == 0xC0086900) {
+	uint32_t count = num_values;
+
+	if (num_values == 8) {
 		if (dw >= 22 && buffer[8] == 0xC0016900 && buffer[9] == Pm4::DB_DEPTH_INFO &&
 		    buffer[11] == 0xC0016900 && buffer[12] == Pm4::DB_DEPTH_VIEW &&
 		    buffer[14] == 0xC0016900 && buffer[15] == Pm4::DB_HTILE_DATA_BASE &&
@@ -651,74 +653,22 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthRenderTarget) {
 		    buffer[20] == 0xC0001000) {
 			count = 22;
 
-			HW::DepthRenderTarget z;
-
-			z.z_info       = HW::DepthZInfo::Decode(buffer[0]);
-			z.stencil_info = HW::DepthStencilInfo::Decode(buffer[1]);
-
-			z.z_read_base_addr        = static_cast<uint64_t>(buffer[2]) << 8u;
-			z.stencil_read_base_addr  = static_cast<uint64_t>(buffer[3]) << 8u;
-			z.z_write_base_addr       = static_cast<uint64_t>(buffer[4]) << 8u;
-			z.stencil_write_base_addr = static_cast<uint64_t>(buffer[5]) << 8u;
-
-			// DB_DEPTH_SIZE
-			z.pitch_div8_minus1  = (buffer[6] >> Pm4::DB_DEPTH_SIZE_PITCH_TILE_MAX_SHIFT) &
-			                       Pm4::DB_DEPTH_SIZE_PITCH_TILE_MAX_MASK;
-			z.height_div8_minus1 = (buffer[6] >> Pm4::DB_DEPTH_SIZE_HEIGHT_TILE_MAX_SHIFT) &
-			                       Pm4::DB_DEPTH_SIZE_HEIGHT_TILE_MAX_MASK;
-			z.pitch_height_valid = true;
-
-			// DB_DEPTH_SLICE
-			z.slice_div64_minus1 = (buffer[7] >> Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT) &
-			                       Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_MASK;
-
-			z.depth_info.addr5_swizzle_mask =
-			    KYTY_PM4_GET(buffer[10], DB_DEPTH_INFO, ADDR5_SWIZZLE_MASK);
-			z.depth_info.array_mode  = (buffer[10] >> Pm4::DB_DEPTH_INFO_ARRAY_MODE_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_ARRAY_MODE_MASK;
-			z.depth_info.pipe_config = (buffer[10] >> Pm4::DB_DEPTH_INFO_PIPE_CONFIG_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_PIPE_CONFIG_MASK;
-			z.depth_info.bank_width  = (buffer[10] >> Pm4::DB_DEPTH_INFO_BANK_WIDTH_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_BANK_WIDTH_MASK;
-			z.depth_info.bank_height = (buffer[10] >> Pm4::DB_DEPTH_INFO_BANK_HEIGHT_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_BANK_HEIGHT_MASK;
-			z.depth_info.macro_tile_aspect =
-			    KYTY_PM4_GET(buffer[10], DB_DEPTH_INFO, MACRO_TILE_ASPECT);
-			z.depth_info.num_banks = (buffer[10] >> Pm4::DB_DEPTH_INFO_NUM_BANKS_SHIFT) &
-			                         Pm4::DB_DEPTH_INFO_NUM_BANKS_MASK;
-
-			// z.depth_view.slice_start = (buffer[13] >> Pm4::DB_DEPTH_VIEW_SLICE_START_SHIFT) &
-			// Pm4::DB_DEPTH_VIEW_SLICE_START_MASK; z.depth_view.slice_max   = (buffer[13] >>
-			// Pm4::DB_DEPTH_VIEW_SLICE_MAX_SHIFT) & Pm4::DB_DEPTH_VIEW_SLICE_MAX_MASK;
-
-			z.depth_view.slice_start =
-			    KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_START) +
-			    (KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_START_HI) << 11u);
-			z.depth_view.slice_max = KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_MAX) +
-			                         (KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_MAX_HI) << 11u);
-			z.depth_view.depth_write_disable =
-			    KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, Z_READ_ONLY) != 0;
-			z.depth_view.stencil_write_disable =
-			    KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, STENCIL_READ_ONLY) != 0;
-			z.depth_view.current_mip_level = KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, MIPID);
-
-			z.htile_data_base_addr = static_cast<uint64_t>(buffer[16]) << 8u;
-
-			z.htile_surface = ParseDepthHtileSurface(buffer[19]);
+			g_hw_ctx_indirect_func[Pm4::DB_DEPTH_INFO](cp, Pm4::DB_DEPTH_INFO, buffer[10]);
+			g_hw_ctx_indirect_func[Pm4::DB_DEPTH_VIEW](cp, Pm4::DB_DEPTH_VIEW, buffer[13]);
+			g_hw_ctx_indirect_func[Pm4::DB_HTILE_DATA_BASE](cp, Pm4::DB_HTILE_DATA_BASE,
+			                                                    buffer[16]);
+			g_hw_ctx_indirect_func[Pm4::DB_HTILE_SURFACE](cp, Pm4::DB_HTILE_SURFACE,
+			                                                  buffer[19]);
 
 			if (buffer[21] != 0) {
+				auto z = cp.GetCtx().GetDepthRenderTarget();
 				// CxDepthRenderTarget stores width/height as value - 1 in register 13.
 				z.width              = ((buffer[21] >> 0u) & 0x3fffu) + 1u;
 				z.height             = ((buffer[21] >> 16u) & 0x3fffu) + 1u;
 				z.width_height_valid = true;
+				cp.GetCtx().SetDepthRenderTarget(z);
 			}
-
-			cp.GetCtx().SetDepthRenderTarget(z);
-		} else {
-			KYTY_NOT_IMPLEMENTED;
 		}
-	} else {
-		KYTY_NOT_IMPLEMENTED;
 	}
 
 	return count;
@@ -1946,12 +1896,10 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 		return 5;
 	}
 	const auto dma_src = CopyDataSrcToDma(src_sel);
-	if (dma_src == 2 && num_bytes == 8) {
-		EXIT("unsupported 64-bit immediate copyData\n");
-	}
+	const auto dma_dst = CopyDataDstToDma(dst_sel);
 
-	cp.DmaData(0, CopyDataDstToDma(dst_sel), dst_cache, dst, dma_src, src_cache, src, num_bytes, 1,
-	           write_confirm, 1);
+	cp.DmaData(0, dma_dst, dst_cache, dst, dma_src, src_cache, src, num_bytes, 1, write_confirm, 1,
+	           dma_src == 2 && num_bytes == 8);
 
 	return 5;
 }

@@ -5,8 +5,12 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace Libs {
 
@@ -28,6 +32,26 @@ union ShareCurrentStatus {
 	ShareCurrentRecordingStatus recording_status;
 	uint8_t                     reserved[16];
 };
+
+struct ShareCallback {
+	void* callback  = nullptr;
+	void* user_data = nullptr;
+};
+
+struct ShareState {
+	std::mutex                 mutex;
+	std::vector<ShareCallback> callbacks;
+	std::string                overlay_path;
+	std::string                content_param;
+	std::string                application_title;
+	int32_t                    overlay_margin_x = 0;
+	int32_t                    overlay_margin_y = 0;
+	int32_t                    overlay_origin   = 0;
+	uint32_t                   capture_source   = 0;
+	uint32_t                   permitted        = 0xffffffffu;
+};
+
+static ShareState g_share_state;
 
 static bool share_feature_flag_valid(uint32_t feature_flags) {
 	constexpr uint32_t share_feature_flag_all = 0xffffffffu;
@@ -97,6 +121,12 @@ static KYTY_SYSV_ABI int ShareUnregisterContentEventCallback(void* callback) {
 
 	LOGF("\t callback = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(callback));
 
+	if (callback == nullptr) {
+		return SHARE_ERROR_INVALID_PARAM;
+	}
+	std::scoped_lock lock(g_share_state.mutex);
+	std::erase_if(g_share_state.callbacks,
+	              [callback](const ShareCallback& item) { return item.callback == callback; });
 	return OK;
 }
 
@@ -118,6 +148,14 @@ static KYTY_SYSV_ABI int ShareSetScreenshotOverlayImage(const char* file_path, i
 	     "\t origin    = %d\n",
 	     (file_path != nullptr ? file_path : "<null>"), margin_x, margin_y, origin);
 
+	if (file_path == nullptr) {
+		return SHARE_ERROR_INVALID_PARAM;
+	}
+	std::scoped_lock lock(g_share_state.mutex);
+	g_share_state.overlay_path     = file_path;
+	g_share_state.overlay_margin_x = margin_x;
+	g_share_state.overlay_margin_y = margin_y;
+	g_share_state.overlay_origin   = origin;
 	return OK;
 }
 
@@ -131,7 +169,8 @@ static KYTY_SYSV_ABI int ShareSetCaptureSource(uint32_t feature_flags, const voi
 	if (!share_feature_flag_valid(feature_flags)) {
 		return SHARE_ERROR_INVALID_PARAM;
 	}
-
+	std::scoped_lock lock(g_share_state.mutex);
+	g_share_state.capture_source = feature_flags;
 	return OK;
 }
 
@@ -144,6 +183,8 @@ static KYTY_SYSV_ABI int ShareSetContentParam(const char* content_param) {
 		return SHARE_ERROR_INVALID_PARAM;
 	}
 
+	std::scoped_lock lock(g_share_state.mutex);
+	g_share_state.content_param = content_param;
 	return OK;
 }
 
@@ -157,6 +198,8 @@ static KYTY_SYSV_ABI int ShareSetContentParamForApplicationTitle(const char* app
 		return SHARE_ERROR_INVALID_PARAM;
 	}
 
+	std::scoped_lock lock(g_share_state.mutex);
+	g_share_state.application_title = application_title;
 	return OK;
 }
 
@@ -167,6 +210,19 @@ static KYTY_SYSV_ABI int ShareRegisterContentEventCallback(void* callback, void*
 	     "\t user_data = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(callback), reinterpret_cast<uint64_t>(user_data));
 
+	if (callback == nullptr) {
+		return SHARE_ERROR_INVALID_PARAM;
+	}
+	std::scoped_lock lock(g_share_state.mutex);
+	const auto existing = std::find_if(g_share_state.callbacks.begin(), g_share_state.callbacks.end(),
+	                                   [callback](const ShareCallback& item) {
+			                                   return item.callback == callback;
+	                                   });
+	if (existing == g_share_state.callbacks.end()) {
+		g_share_state.callbacks.push_back({callback, user_data});
+	} else {
+		existing->user_data = user_data;
+	}
 	return OK;
 }
 
@@ -206,7 +262,8 @@ static KYTY_SYSV_ABI int ShareFeaturePermit(uint32_t feature_flags) {
 	if (!share_feature_flag_valid(feature_flags)) {
 		return SHARE_ERROR_INVALID_PARAM;
 	}
-
+	std::scoped_lock lock(g_share_state.mutex);
+	g_share_state.permitted |= feature_flags;
 	return OK;
 }
 
@@ -218,7 +275,8 @@ static KYTY_SYSV_ABI int ShareFeatureProhibit(uint32_t feature_flags) {
 	if (!share_feature_flag_valid(feature_flags)) {
 		return SHARE_ERROR_INVALID_PARAM;
 	}
-
+	std::scoped_lock lock(g_share_state.mutex);
+	g_share_state.permitted &= ~feature_flags;
 	return OK;
 }
 

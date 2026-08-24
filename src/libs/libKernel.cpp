@@ -1971,6 +1971,36 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
+int KYTY_SYSV_ABI fchmod(int d, uint16_t mode) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFchmod(d, mode));
+}
+
+int KYTY_SYSV_ABI futimes(int d, const LibKernel::KernelTimeval times[2]) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFutimes(d, times));
+}
+
+int KYTY_SYSV_ABI utimes(const char* path, const LibKernel::KernelTimeval times[2]) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelUtimes(path, times));
+}
+
+int KYTY_SYSV_ABI rename(const char* from, const char* to) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelRename(from, to));
+}
+
+int KYTY_SYSV_ABI rmdir(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -1994,6 +2024,16 @@ int KYTY_SYSV_ABI listen(int s, int backlog) {
 int KYTY_SYSV_ABI accept(int s, void* addr, uint32_t* addrlen) {
 	PRINT_NAME();
 	return Network::Net::Accept(s, addr, addrlen);
+}
+
+int KYTY_SYSV_ABI shutdown(int s, int how) {
+	PRINT_NAME();
+	return Network::Net::Shutdown(s, how);
+}
+
+int KYTY_SYSV_ABI getpeername(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+	return Network::Net::Getpeername(s, addr, addrlen);
 }
 
 int KYTY_SYSV_ABI getsockname(int s, void* addr, uint32_t* addrlen) {
@@ -2037,6 +2077,16 @@ int64_t KYTY_SYSV_ABI recvfrom(int s, void* buf, uint64_t len, int flags, void* 
                                uint32_t* addrlen) {
 	PRINT_NAME();
 	return Network::Net::Recvfrom(s, buf, len, flags, addr, addrlen);
+}
+
+int64_t KYTY_SYSV_ABI sendmsg(int s, const Network::Net::NetMsghdr* msg, int flags) {
+	PRINT_NAME();
+	return Network::Net::Sendmsg(s, msg, flags);
+}
+
+int64_t KYTY_SYSV_ABI recvmsg(int s, Network::Net::NetMsghdr* msg, int flags) {
+	PRINT_NAME();
+	return Network::Net::Recvmsg(s, msg, flags);
 }
 
 int KYTY_SYSV_ABI inet_pton(int af, const char* src, void* dst) {
@@ -2121,6 +2171,11 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("n01yNbQO5W4", Posix::fchmod);
+	LIB_FUNC("+0EDo7YzcoU", Posix::futimes);
+	LIB_FUNC("GDuV00CHrUg", Posix::utimes);
+	LIB_FUNC("NN01qLRhiqU", Posix::rename);
+	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -2193,6 +2248,8 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("XVL8So3QJUk", Posix::connect);
 	LIB_FUNC("pxnCmagrtao", Posix::listen);
 	LIB_FUNC("3e+4Iv7IJ8U", Posix::accept);
+	LIB_FUNC("TUuiYS2kE8s", Posix::shutdown);
+	LIB_FUNC("TXFFFiNldU8", Posix::getpeername);
 	LIB_FUNC("RenI1lL1WFk", Posix::getsockname);
 	LIB_FUNC("6O8EwYOgH9Y", Posix::getsockopt);
 	LIB_FUNC("fFxGkxF2bVo", Posix::setsockopt);
@@ -2201,6 +2258,8 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("oBr313PppNE", Posix::sendto);
 	LIB_FUNC("Ez8xjo9UF4E", Posix::recv);
 	LIB_FUNC("lUk6wrGXyMw", Posix::recvfrom);
+	LIB_FUNC("aNeavPDNKzA", Posix::sendmsg);
+	LIB_FUNC("hI7oVeOluPM", Posix::recvmsg);
 	LIB_FUNC("4n51s0zEf0c", Posix::inet_pton);
 	LIB_FUNC("5jRCs2axtr4", Posix::inet_ntop);
 	LIB_FUNC("cfwBSQyr5Ys", cfwBSQyr5Ys);

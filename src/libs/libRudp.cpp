@@ -6,6 +6,7 @@
 
 #include <cinttypes>
 #include <cstdint>
+#include <mutex>
 
 namespace Libs {
 
@@ -13,11 +14,15 @@ LIB_VERSION("Rudp", 1, "Rudp", 1, 1);
 
 namespace Rudp {
 
-using RudpEventHandler = void (*)(int ctx_id, int event_id, int error_code, void* arg);
+using RudpEventHandler = void(KYTY_SYSV_ABI *)(int ctx_id, int event_id, int error_code, void* arg);
 
 static RudpEventHandler g_event_handler = nullptr;
 static void*            g_event_arg     = nullptr;
 static bool             g_initialized   = false;
+static bool             g_io_thread_enabled = false;
+static void*            g_memory_pool       = nullptr;
+static int              g_memory_pool_size  = 0;
+static std::mutex       g_state_mutex;
 
 static KYTY_SYSV_ABI int RudpInit(void* mem_pool, int mem_pool_size) {
 	PRINT_NAME();
@@ -26,7 +31,17 @@ static KYTY_SYSV_ABI int RudpInit(void* mem_pool, int mem_pool_size) {
 	     "\t mem_pool_size = %d\n",
 	     reinterpret_cast<uint64_t>(mem_pool), mem_pool_size);
 
-	g_initialized = true;
+	if (mem_pool == nullptr || mem_pool_size <= 0) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	std::scoped_lock lock(g_state_mutex);
+	if (g_initialized) {
+		return LibKernel::KERNEL_ERROR_EALREADY;
+	}
+	g_memory_pool      = mem_pool;
+	g_memory_pool_size = mem_pool_size;
+	g_initialized      = true;
 
 	return OK;
 }
@@ -38,6 +53,14 @@ static KYTY_SYSV_ABI int RudpEnableInternalIOThread(uint32_t stack_size, uint32_
 	     "\t priority   = %" PRIu32 "\n",
 	     stack_size, priority);
 
+	std::scoped_lock lock(g_state_mutex);
+	if (!g_initialized) {
+		return LibKernel::KERNEL_ERROR_EPERM;
+	}
+	if (g_io_thread_enabled) {
+		return LibKernel::KERNEL_ERROR_EALREADY;
+	}
+	g_io_thread_enabled = true;
 	return OK;
 }
 
@@ -48,6 +71,10 @@ static KYTY_SYSV_ABI int RudpSetEventHandler(RudpEventHandler handler, void* arg
 	     "\t arg     = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(handler), reinterpret_cast<uint64_t>(arg));
 
+	std::scoped_lock lock(g_state_mutex);
+	if (!g_initialized) {
+		return LibKernel::KERNEL_ERROR_EPERM;
+	}
 	g_event_handler = handler;
 	g_event_arg     = arg;
 

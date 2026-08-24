@@ -3,8 +3,12 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+
+#include <mutex>
+#include <unordered_map>
 
 namespace Libs {
 
@@ -17,6 +21,31 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleI
 
 namespace Sysmodule {
 
+constexpr int SYSMODULE_ERROR_UNLOADED = static_cast<int32_t>(0x805a1001u);
+
+static std::mutex                             g_modules_mutex;
+static std::unordered_map<uint16_t, uint32_t> g_module_ref_counts;
+
+static int LoadModule(uint16_t id) {
+	std::scoped_lock lock(g_modules_mutex);
+	g_module_ref_counts[id]++;
+	return OK;
+}
+
+static int UnloadModule(uint16_t id) {
+	std::scoped_lock lock(g_modules_mutex);
+	const auto       module = g_module_ref_counts.find(id);
+	if (module == g_module_ref_counts.end()) {
+		return SYSMODULE_ERROR_UNLOADED;
+	}
+	if (module->second <= 1u) {
+		g_module_ref_counts.erase(module);
+	} else {
+		module->second--;
+	}
+	return OK;
+}
+
 static KYTY_SYSV_ABI int SysmoduleGetModuleInfoForUnwind(uint64_t addr, int flags,
                                                          LibKernel::ModuleInfoForUnwind* info) {
 	return LibKernel::KernelGetModuleInfoForUnwind(addr, flags, info);
@@ -27,7 +56,7 @@ static KYTY_SYSV_ABI int SysmoduleLoadModule(uint16_t id) {
 
 	LOGF("\t id = %d\n", static_cast<int>(id));
 
-	return 0;
+	return LoadModule(id);
 }
 
 static KYTY_SYSV_ABI int SysmoduleUnloadModule(uint16_t id) {
@@ -35,7 +64,7 @@ static KYTY_SYSV_ABI int SysmoduleUnloadModule(uint16_t id) {
 
 	LOGF("\t id = %d\n", static_cast<int>(id));
 
-	return 0;
+	return UnloadModule(id);
 }
 
 static KYTY_SYSV_ABI int SysmoduleLoadModuleInternalWithArg(uint16_t id, int arg1, int arg2,
@@ -44,14 +73,14 @@ static KYTY_SYSV_ABI int SysmoduleLoadModuleInternalWithArg(uint16_t id, int arg
 
 	LOGF("\t id = %d\n", static_cast<int>(id));
 
-	EXIT_IF(arg1 != 0);
-	EXIT_IF(arg2 != 0);
-	EXIT_IF(arg3 != 0);
-	EXIT_IF(ret == nullptr);
+	if (arg1 != 0 || arg2 != 0 || arg3 != 0 || ret == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
 
-	*ret = 0;
+	const auto result = LoadModule(id);
+	*ret              = result;
 
-	return 0;
+	return result;
 }
 
 static KYTY_SYSV_ABI int SysmoduleIsLoaded(uint16_t id) {
@@ -59,7 +88,10 @@ static KYTY_SYSV_ABI int SysmoduleIsLoaded(uint16_t id) {
 
 	LOGF("\t id = %d\n", static_cast<int>(id));
 
-	return 0;
+	std::scoped_lock lock(g_modules_mutex);
+	const auto       module = g_module_ref_counts.find(id);
+	return module != g_module_ref_counts.end() && module->second != 0u ? OK
+	                                                                   : SYSMODULE_ERROR_UNLOADED;
 }
 
 } // namespace Sysmodule

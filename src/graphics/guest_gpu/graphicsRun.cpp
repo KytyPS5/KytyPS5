@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -395,7 +396,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint8_t  src_cache_policy,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
-                               uint8_t block_engine) {
+                               uint8_t block_engine, bool immediate_64) {
 	EXIT_NOT_IMPLEMENTED(engine > 1);
 	if (num_bytes == 0) {
 		return;
@@ -429,6 +430,14 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	}
 	auto& buffer_cache = GetGpuResources().GetBufferCache();
 	if (src_sel == 2) {
+		if (immediate_64) {
+			EXIT_NOT_IMPLEMENTED(num_bytes != sizeof(uint64_t));
+			const auto bytes = std::span<const uint8_t>(
+			    reinterpret_cast<const uint8_t*>(&src_address_or_offset_or_immediate),
+			    sizeof(src_address_or_offset_or_immediate));
+			buffer_cache.WriteBuffer(dst_address_or_offset, bytes, dst_gds);
+			return;
+		}
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);

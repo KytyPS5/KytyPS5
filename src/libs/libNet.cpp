@@ -75,6 +75,16 @@ static int FinishSocketCall(int result) {
 	return net_error;
 }
 
+static int64_t FinishSocketCall64(int64_t result) {
+	if (result >= 0) {
+		return result;
+	}
+
+	const int net_error = PosixToNetError(*Posix::GetErrorAddr());
+	*GetNetErrorAddr()  = net_error;
+	return net_error;
+}
+
 int KYTY_SYSV_ABI NetSocket(const char* name, int family, int type, int protocol) {
 	LOGF("\t name = %s\n", name != nullptr ? name : "<null>");
 
@@ -89,6 +99,10 @@ int KYTY_SYSV_ABI NetBind(int s, const void* addr, uint32_t addrlen) {
 	return FinishSocketCall(Net::Bind(s, addr, addrlen));
 }
 
+int KYTY_SYSV_ABI NetConnect(int s, const void* addr, uint32_t addrlen) {
+	return FinishSocketCall(Net::Connect(s, addr, addrlen));
+}
+
 int KYTY_SYSV_ABI NetListen(int s, int backlog) {
 	return FinishSocketCall(Net::Listen(s, backlog));
 }
@@ -97,8 +111,16 @@ int KYTY_SYSV_ABI NetShutdown(int s, int how) {
 	return FinishSocketCall(Net::Shutdown(s, how));
 }
 
+int KYTY_SYSV_ABI NetGetpeername(int s, void* addr, uint32_t* addrlen) {
+	return FinishSocketCall(Net::Getpeername(s, addr, addrlen));
+}
+
 int KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
 	return FinishSocketCall(Net::Getsockname(s, addr, addrlen));
+}
+
+int KYTY_SYSV_ABI NetGetsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
+	return FinishSocketCall(Net::Getsockopt(s, level, optname, optval, optlen));
 }
 
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
@@ -113,9 +135,18 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	return NET_CALL(Net::NetResolverCreate(name, memid, flags));
 }
 
+int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
+	return NET_CALL(Net::NetResolverDestroy(rid));
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	return NET_CALL(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
+}
+
+int KYTY_SYSV_ABI NetResolverStartAton(int rid, const void* addr, char* hostname, int len,
+                                       int timeout, int retry, int flags) {
+	return NET_CALL(Net::NetResolverStartAton(rid, addr, hostname, len, timeout, retry, flags));
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
@@ -164,7 +195,33 @@ int KYTY_SYSV_ABI NetSocketClose(int s) {
 
 int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
                                 uint32_t optlen) {
-	return NET_CALL(Net::Setsockopt(s, level, optname, optval, optlen));
+	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
+}
+
+int64_t KYTY_SYSV_ABI NetSend(int s, const void* buf, uint64_t len, int flags) {
+	return FinishSocketCall64(Net::Send(s, buf, len, flags));
+}
+
+int64_t KYTY_SYSV_ABI NetSendto(int s, const void* buf, uint64_t len, int flags, const void* addr,
+                                uint32_t addrlen) {
+	return FinishSocketCall64(Net::Sendto(s, buf, len, flags, addr, addrlen));
+}
+
+int64_t KYTY_SYSV_ABI NetSendmsg(int s, const Net::NetMsghdr* msg, int flags) {
+	return FinishSocketCall64(Net::Sendmsg(s, msg, flags));
+}
+
+int64_t KYTY_SYSV_ABI NetRecv(int s, void* buf, uint64_t len, int flags) {
+	return FinishSocketCall64(Net::Recv(s, buf, len, flags));
+}
+
+int64_t KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, uint64_t len, int flags, void* addr,
+                                  uint32_t* addrlen) {
+	return FinishSocketCall64(Net::Recvfrom(s, buf, len, flags, addr, addrlen));
+}
+
+int64_t KYTY_SYSV_ABI NetRecvmsg(int s, Net::NetMsghdr* msg, int flags) {
+	return FinishSocketCall64(Net::Recvmsg(s, msg, flags));
 }
 
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
@@ -191,16 +248,21 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("HQOwnfMGipQ", LibNet::GetNetErrorAddr);
 	LIB_FUNC("PIWqhn9oSxc", LibNet::NetAccept);
 	LIB_FUNC("bErx49PgxyY", LibNet::NetBind);
+	LIB_FUNC("OXXX4mUk3uk", LibNet::NetConnect);
 	LIB_FUNC("dgJBaeJnGpo", LibNet::NetPoolCreate);
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
+	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
+	LIB_FUNC("Apb4YDxKsRI", LibNet::NetResolverStartAton);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);
 	LIB_FUNC("6Oc0bLsIYe0", LibNet::NetGetMacAddress);
 	LIB_FUNC("hLuXdjHnhiI", LibNet::NetGetSockInfo);
+	LIB_FUNC("TCkRD0DWNLg", LibNet::NetGetpeername);
 	LIB_FUNC("hoOAofhhRvE", LibNet::NetGetsockname);
+	LIB_FUNC("xphrZusl78E", LibNet::NetGetsockopt);
 	LIB_FUNC("SF47kB2MNTo", LibNet::NetEpollCreate);
 	LIB_FUNC("ZVw46bsasAk", LibNet::NetEpollControl);
 	LIB_FUNC("drjIbDbA7UQ", LibNet::NetEpollWait);
@@ -210,6 +272,12 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
+	LIB_FUNC("beRjXBn-z+o", LibNet::NetSend);
+	LIB_FUNC("gvD1greCu0A", LibNet::NetSendto);
+	LIB_FUNC("2eKbgcboJso", LibNet::NetSendmsg);
+	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
+	LIB_FUNC("304ooNZxWDY", LibNet::NetRecvfrom);
+	LIB_FUNC("wvuUDv0jrMI", LibNet::NetRecvmsg);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);

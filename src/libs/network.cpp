@@ -41,6 +41,7 @@ static constexpr SOCKET INVALID_SOCKET = -1;
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -106,6 +107,7 @@ public:
 	int  PoolCreate(const char* name, int size);
 	bool PoolDestroy(int memid);
 	int  ResolverCreate(const char* name, int memid);
+	bool ResolverDestroy(int rid);
 	bool ResolverValid(int rid);
 
 	Id   SslInit(uint64_t pool_size);
@@ -294,6 +296,19 @@ int Network::ResolverCreate(const char* name, int memid) {
 	}
 
 	return -1;
+}
+
+bool Network::ResolverDestroy(int rid) {
+	Common::LockGuard lock(m_mutex);
+
+	if (rid < 0 || rid >= RESOLVERS_MAX || !m_resolvers[rid].used) {
+		return false;
+	}
+
+	m_resolvers[rid].used = false;
+	m_resolvers[rid].name.clear();
+	m_resolvers[rid].memid = -1;
+	return true;
 }
 
 bool Network::ResolverValid(int rid) {
@@ -1215,6 +1230,13 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	return id;
 }
 
+int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->ResolverDestroy(rid) ? OK : NET_ERROR_EBADF;
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	PRINT_NAME();
@@ -1272,6 +1294,51 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 
 	freeaddrinfo(result);
 	return NET_ERROR_RESOLVER_ENORECORD;
+#else
+	return NET_ERROR_RESOLVER_ENOTIMPLEMENTED;
+#endif
+}
+
+int KYTY_SYSV_ABI NetResolverStartAton(int rid, const void* addr, char* hostname, int len,
+                                       int timeout, int retry, int flags) {
+	PRINT_NAME();
+
+	LOGF("\t rid      = %d\n"
+	     "\t addr     = 0x%016" PRIx64 "\n"
+	     "\t hostname = 0x%016" PRIx64 "\n"
+	     "\t len      = %d\n"
+	     "\t timeout  = %d\n"
+	     "\t retry    = %d\n"
+	     "\t flags    = 0x%08x\n",
+	     rid, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(hostname), len, timeout,
+	     retry, flags);
+
+	(void)timeout;
+	(void)retry;
+	constexpr int allowed_flags = 0x00010001;
+	if (addr == nullptr || hostname == nullptr || len <= 0 || (flags & ~allowed_flags) != 0) {
+		return NET_ERROR_EINVAL;
+	}
+
+	EXIT_IF(g_net == nullptr);
+	if (!g_net->ResolverValid(rid)) {
+		return NET_ERROR_EBADF;
+	}
+
+#if defined(_WIN32)
+	if (!EnsureSocketBackend()) {
+		return NET_ERROR_ENETDOWN;
+	}
+
+	sockaddr_in host_addr {};
+	host_addr.sin_family = AF_INET;
+	std::memcpy(&host_addr.sin_addr, addr, sizeof(host_addr.sin_addr));
+	const int result = getnameinfo(reinterpret_cast<const sockaddr*>(&host_addr), sizeof(host_addr),
+	                               hostname, static_cast<DWORD>(len), nullptr, 0, NI_NAMEREQD);
+	if (result == 0) {
+		return OK;
+	}
+	return result == EAI_NONAME ? NET_ERROR_RESOLVER_ENOHOST : NET_ERROR_RESOLVER_EINTERNAL;
 #else
 	return NET_ERROR_RESOLVER_ENOTIMPLEMENTED;
 #endif
@@ -1831,6 +1898,30 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 #endif
 }
 
+int KYTY_SYSV_ABI Getpeername(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+
+	NativeSocket socket    = INVALID_NATIVE_SOCKET;
+	const bool   socket_ok = GetSocketBackend(s, &socket);
+	if (addr == nullptr || addrlen == nullptr || !socket_ok) {
+		*Posix::GetErrorAddr() = (!socket_ok ? Posix::POSIX_EBADF : Posix::POSIX_EFAULT);
+		return -1;
+	}
+
+#if defined(_WIN32)
+	sockaddr_storage host_addr {};
+	int              host_addrlen = sizeof(host_addr);
+	if (::getpeername(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) ==
+	    SOCKET_ERROR) {
+		return SetPosixSocketError();
+	}
+	return ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen);
+#else
+	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+	return -1;
+#endif
+}
+
 int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
 	PRINT_NAME();
 
@@ -2008,6 +2099,83 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
 	return -1;
 #endif
+}
+
+static bool ValidateMessage(const NetMsghdr* msg, size_t* total_size) {
+	if (msg == nullptr || total_size == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return false;
+	}
+	if (msg->iovlen < 0 || msg->iovlen > 1024 || (msg->iovlen != 0 && msg->iov == nullptr)) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return false;
+	}
+
+	size_t total = 0;
+	for (int32_t i = 0; i < msg->iovlen; i++) {
+		const auto& iov = msg->iov[i];
+		if (iov.len != 0 && iov.base == nullptr) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+			return false;
+		}
+		if (iov.len > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+		    total > static_cast<size_t>(std::numeric_limits<int>::max()) -
+		                static_cast<size_t>(iov.len)) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+			return false;
+		}
+		total += static_cast<size_t>(iov.len);
+	}
+	*total_size = total;
+	return true;
+}
+
+int64_t KYTY_SYSV_ABI Sendmsg(int s, const NetMsghdr* msg, int flags) {
+	size_t total_size = 0;
+	if (!ValidateMessage(msg, &total_size)) {
+		return -1;
+	}
+	if (msg->control != nullptr || msg->controllen != 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
+		return -1;
+	}
+
+	std::vector<uint8_t> data(total_size == 0 ? 1 : total_size);
+	size_t               offset = 0;
+	for (int32_t i = 0; i < msg->iovlen; i++) {
+		const auto length = static_cast<size_t>(msg->iov[i].len);
+		if (length != 0) {
+			std::memcpy(data.data() + offset, msg->iov[i].base, length);
+			offset += length;
+		}
+	}
+	return Sendto(s, data.data(), total_size, flags, msg->name, msg->namelen);
+}
+
+int64_t KYTY_SYSV_ABI Recvmsg(int s, NetMsghdr* msg, int flags) {
+	size_t total_size = 0;
+	if (!ValidateMessage(msg, &total_size)) {
+		return -1;
+	}
+
+	std::vector<uint8_t> data(total_size == 0 ? 1 : total_size);
+	auto*                addrlen = msg->name != nullptr ? &msg->namelen : nullptr;
+	const auto           result  = Recvfrom(s, data.data(), total_size, flags, msg->name, addrlen);
+	if (result < 0) {
+		return result;
+	}
+
+	size_t remaining = std::min(static_cast<size_t>(result), total_size);
+	size_t offset    = 0;
+	for (int32_t i = 0; i < msg->iovlen && remaining != 0; i++) {
+		const auto length = std::min(static_cast<size_t>(msg->iov[i].len), remaining);
+		std::memcpy(msg->iov[i].base, data.data() + offset, length);
+		offset += length;
+		remaining -= length;
+	}
+	msg->controllen = 0;
+	msg->flags      = 0;
+	return result;
 }
 
 int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfds,

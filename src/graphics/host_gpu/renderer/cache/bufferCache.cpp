@@ -549,6 +549,35 @@ void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data)
 	}
 }
 
+void BufferCache::WriteBuffer(uint64_t vaddr, std::span<const uint8_t> data, bool is_gds) {
+	if (data.empty() || data.size() > UINT64_MAX - vaddr ||
+	    (!is_gds && vaddr == 0) ||
+	    (is_gds && (vaddr > m_gds_buffer.Size() || data.size() > m_gds_buffer.Size() - vaddr))) {
+		EXIT("BufferCache: invalid immediate write range\n");
+	}
+	if (is_gds) {
+		WriteDataBuffer(m_gds_buffer, vaddr, data.data(), data.size());
+		return;
+	}
+
+	(void)m_texture_cache.ClearMeta(vaddr);
+	const auto region = m_texture_cache.QueryRegion(vaddr, data.size());
+	if (!HasGpuDirtyBytes(vaddr, data.size()) && !region.gpu_image_bytes) {
+		if (region.image_bytes) {
+			m_texture_cache.InvalidateMemory(vaddr, data.size());
+		}
+		WriteHostMemory(vaddr, data);
+		return;
+	}
+
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, data.size());
+	const auto id          = FindBuffer(vaddr, data.size());
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, data.size(), true, true, id);
+	(void)dst_offset;
+	EXIT_IF(dst == nullptr);
+	WriteDataBuffer(*dst, vaddr, data.data(), data.size());
+}
+
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");

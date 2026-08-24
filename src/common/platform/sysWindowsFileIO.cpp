@@ -434,12 +434,11 @@ bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeS
 
 	bool ok = true;
 
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, &access.time, nullptr) == 0));
-
-	SysFileClose(f);
+	const auto wide = name.wstring();
+	const auto file = CreateFileW(wide.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_POSIX, nullptr,
+	                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	ok = file != INVALID_HANDLE_VALUE && SetFileTime(file, nullptr, &access.time, nullptr) != 0;
+	if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 
 	return ok;
 }
@@ -451,12 +450,11 @@ bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeSt
 
 	bool ok = true;
 
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, nullptr, &write.time) == 0));
-
-	SysFileClose(f);
+	const auto wide = name.wstring();
+	const auto file = CreateFileW(wide.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_POSIX, nullptr,
+	                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	ok = file != INVALID_HANDLE_VALUE && SetFileTime(file, nullptr, nullptr, &write.time) != 0;
+	if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 
 	return ok;
 }
@@ -469,12 +467,11 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 
 	bool ok = true;
 
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, &access.time, &write.time) == 0));
-
-	SysFileClose(f);
+	const auto wide = name.wstring();
+	const auto file = CreateFileW(wide.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_POSIX, nullptr,
+	                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	ok = file != INVALID_HANDLE_VALUE && SetFileTime(file, nullptr, &access.time, &write.time) != 0;
+	if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 
 	return ok;
 }

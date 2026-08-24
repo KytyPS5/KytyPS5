@@ -321,7 +321,6 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word0  = code[word_index];
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t offset = word0 & 0xfffu;
-	const uint32_t dlc    = (word0 >> 12u) & 1u;
 	const uint32_t lds    = (word0 >> 13u) & 1u;
 	const uint32_t seg    = (word0 >> 14u) & 0x3u;
 	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
@@ -343,8 +342,13 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (dlc != 0 || lds != 0 || inst.glc || inst.slc || seg == 3u) {
-		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
+	// GLC, SLC and DLC only augment cache policy for the load/store opcodes currently
+	// decoded here. The host backend is coherent, so accepting those hints preserves
+	// the observable data result. Direct-to-LDS and the reserved segment still need
+	// dedicated lowering.
+	if (lds != 0 || seg == 3u) {
+		SetUnsupported(inst, Family::FLAT, opcode,
+		               "FLAT direct-to-LDS or reserved segment is not implemented");
 		return;
 	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -388,8 +392,12 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		MarkMemoryUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
 	}
-	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
-		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
+	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && (inst.offset & 0xe000u) == 0xe000u) {
+		const auto mask = inst.offset & 0x1fu;
+		if (mask != 0x00u && mask != 0x10u && mask != 0x18u && mask != 0x1cu &&
+		    mask != 0x1eu && mask != 0x1fu) {
+			SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mask is invalid");
+		}
 	}
 	if (inst.gds &&
 	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||

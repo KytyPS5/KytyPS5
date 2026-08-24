@@ -35,13 +35,36 @@ struct NetEpollEvent {
 static_assert(sizeof(NetEpollData) == 8);
 static_assert(sizeof(NetEpollEvent) == 24);
 
+struct NetIovec {
+	void*    base;
+	uint64_t len;
+};
+
+struct NetMsghdr {
+	void*     name;
+	uint32_t  namelen;
+	uint32_t  reserved0;
+	NetIovec* iov;
+	int32_t   iovlen;
+	uint32_t  reserved1;
+	void*     control;
+	uint32_t  controllen;
+	int32_t   flags;
+};
+
+static_assert(sizeof(NetIovec) == 16);
+static_assert(sizeof(NetMsghdr) == 48);
+
 int KYTY_SYSV_ABI NetInit();
 int KYTY_SYSV_ABI NetTerm();
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
+int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
+int KYTY_SYSV_ABI NetResolverStartAton(int rid, const void* addr, char* hostname, int len,
+                                       int timeout, int retry, int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
 const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size);
 int KYTY_SYSV_ABI         NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len);
@@ -59,6 +82,7 @@ int KYTY_SYSV_ABI         Connect(int s, const void* addr, uint32_t addrlen);
 int KYTY_SYSV_ABI         Listen(int s, int backlog);
 int KYTY_SYSV_ABI         Accept(int s, void* addr, uint32_t* addrlen);
 int KYTY_SYSV_ABI         Shutdown(int s, int how);
+int KYTY_SYSV_ABI         Getpeername(int s, void* addr, uint32_t* addrlen);
 int KYTY_SYSV_ABI         Getsockname(int s, void* addr, uint32_t* addrlen);
 int KYTY_SYSV_ABI         Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen);
 int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, uint32_t optlen);
@@ -70,6 +94,8 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags);
 int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* addr,
                                uint32_t* addrlen);
+int64_t KYTY_SYSV_ABI Sendmsg(int s, const NetMsghdr* msg, int flags);
+int64_t KYTY_SYSV_ABI Recvmsg(int s, NetMsghdr* msg, int flags);
 
 } // namespace Net
 

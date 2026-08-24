@@ -4,4 +4,7 @@
 build/
 _Build/vscode-clang/
 _Build/
+_DownloadData/
+_SaveData/
+_TempData/
 cmake-build-debug/

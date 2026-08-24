@@ -126,7 +126,8 @@ public:
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
-	             uint8_t wait_for_previous, uint8_t write_confirm, uint8_t block_engine);
+	             uint8_t wait_for_previous, uint8_t write_confirm, uint8_t block_engine,
+	             bool immediate_64 = false);
 	void SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
 	                    const volatile void* address, uint32_t count_in_dwords);
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }

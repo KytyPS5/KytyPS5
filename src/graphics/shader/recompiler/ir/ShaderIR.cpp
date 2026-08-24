@@ -648,10 +648,8 @@ bool LowerVectorMoveRelSource(const Decoder::Instruction& decoded, BasicBlock& b
 		SetError(error, "V_MOVRELS_B32 requires VGPR source and destination");
 		return false;
 	}
-	if (decoded.dst.sdwa_sel != 6u || decoded.dst.omod != 0u || decoded.dst.clamp ||
-	    decoded.src0.sdwa_sel != 6u || decoded.src0.sdwa_sext || decoded.src0.negate ||
-	    decoded.src0.absolute || decoded.src0.dpp) {
-		SetError(error, "V_MOVRELS_B32 modifiers are not implemented");
+	if (decoded.dst.sdwa_sel != 6u || decoded.dst.omod != 0u || decoded.dst.clamp) {
+		SetError(error, "V_MOVRELS_B32 destination modifiers are not supported");
 		return false;
 	}
 
@@ -675,10 +673,8 @@ bool LowerVectorMoveRelDestination(const Decoder::Instruction& decoded, BasicBlo
 		SetError(error, "V_MOVRELD_B32 requires VGPR destination");
 		return false;
 	}
-	if (decoded.dst.sdwa_sel != 6u || decoded.dst.omod != 0u || decoded.dst.clamp ||
-	    decoded.src0.sdwa_sel != 6u || decoded.src0.sdwa_sext || decoded.src0.negate ||
-	    decoded.src0.absolute || decoded.src0.dpp) {
-		SetError(error, "V_MOVRELD_B32 modifiers are not implemented");
+	if (decoded.dst.sdwa_sel != 6u || decoded.dst.omod != 0u || decoded.dst.clamp) {
+		SetError(error, "V_MOVRELD_B32 destination modifiers are not supported");
 		return false;
 	}
 

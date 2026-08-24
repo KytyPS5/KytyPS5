@@ -89,6 +89,7 @@ public:
 
 	Id       AudioInOpen(uint32_t type, uint32_t samples_num, uint32_t freq, Format format);
 	bool     AudioInValid(Id handle);
+	bool     AudioInHasDevice(Id handle);
 	uint32_t AudioInInput(Id handle, void* dest);
 
 	static constexpr int OUT_PORTS_MAX = 32;
@@ -116,6 +117,10 @@ private:
 		uint32_t freq            = 0;
 		Format   format          = Format::Unknown;
 		uint64_t last_input_time = 0;
+		int      channels_num    = 0;
+
+		SDL_AudioDeviceID audio_device = 0;
+		SDL_AudioSpec     audio_spec   = {};
 	};
 
 	Common::Mutex m_mutex;
@@ -129,6 +134,8 @@ private:
 	static SDL_AudioFormat SdlFormat(Format format);
 	static bool            OpenSdlDevice(PortOut* port);
 	static void            CloseSdlDevice(PortOut* port);
+	static bool            OpenSdlCaptureDevice(PortIn* port);
+	static void            CloseSdlCaptureDevice(PortIn* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
@@ -196,6 +203,9 @@ Audio::~Audio() {
 	for (auto& port: m_out_ports) {
 		CloseSdlDevice(&port);
 	}
+	for (auto& port: m_in_ports) {
+		CloseSdlCaptureDevice(&port);
+	}
 }
 
 bool Audio::FormatIsFloat(Format format) {
@@ -252,6 +262,47 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 }
 
 void Audio::CloseSdlDevice(PortOut* port) {
+	EXIT_IF(port == nullptr);
+
+	if (port->audio_device != 0 && SDL_WasInit(SDL_INIT_AUDIO) != 0) {
+		SDL_ClearQueuedAudio(port->audio_device);
+		SDL_CloseAudioDevice(port->audio_device);
+	}
+
+	port->audio_device = 0;
+	port->audio_spec   = {};
+}
+
+bool Audio::OpenSdlCaptureDevice(PortIn* port) {
+	EXIT_IF(port == nullptr);
+
+	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+		LOGF("AudioIn: SDL audio init failed: %s\n", SDL_GetError());
+		return false;
+	}
+
+	SDL_AudioSpec desired {};
+	desired.freq     = static_cast<int>(port->freq);
+	desired.format   = SdlFormat(port->format);
+	desired.channels = static_cast<Uint8>(port->channels_num);
+	desired.samples  = static_cast<Uint16>(port->samples_num);
+	desired.callback = nullptr;
+
+	SDL_AudioSpec obtained {};
+	port->audio_device = SDL_OpenAudioDevice(nullptr, SDL_TRUE, &desired, &obtained, 0);
+	if (port->audio_device == 0) {
+		LOGF("AudioIn: SDL_OpenAudioDevice failed: %s; using silence fallback\n", SDL_GetError());
+		return false;
+	}
+
+	port->audio_spec = obtained;
+	SDL_PauseAudioDevice(port->audio_device, 0);
+	LOGF("AudioIn: opened SDL capture device (%d Hz, %u ch, format 0x%04x)\n", obtained.freq,
+	     obtained.channels, obtained.format);
+	return true;
+}
+
+void Audio::CloseSdlCaptureDevice(PortIn* port) {
 	EXIT_IF(port == nullptr);
 
 	if (port->audio_device != 0 && SDL_WasInit(SDL_INIT_AUDIO) != 0) {
@@ -566,12 +617,15 @@ Audio::Id Audio::AudioInOpen(uint32_t type, uint32_t samples_num, uint32_t freq,
 			port.samples_num = samples_num;
 			port.freq        = freq;
 			port.format      = format;
+			port.last_input_time = 0;
 
 			switch (format) {
-				case Format::Signed16bitMono:
-				case Format::Signed16bitStereo: break;
+				case Format::Signed16bitMono: port.channels_num = 1; break;
+				case Format::Signed16bitStereo: port.channels_num = 2; break;
 				default: EXIT("unknown format");
 			}
+
+			OpenSdlCaptureDevice(&port);
 
 			return Id::Create(id);
 		}
@@ -587,11 +641,20 @@ bool Audio::AudioInValid(Id handle) {
 	        m_in_ports[handle.GetId()].used);
 }
 
+bool Audio::AudioInHasDevice(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	return handle.GetId() >= 0 && handle.GetId() < IN_PORTS_MAX &&
+	       m_in_ports[handle.GetId()].used && m_in_ports[handle.GetId()].audio_device != 0;
+}
+
 uint32_t Audio::AudioInInput(Id handle, void* dest) {
 	EXIT_NOT_IMPLEMENTED(!AudioInValid(handle));
 	EXIT_NOT_IMPLEMENTED(dest == nullptr);
 
-	const auto& port = m_in_ports[handle.GetId()];
+	auto&      port       = m_in_ports[handle.GetId()];
+	const auto frame_size = BytesPerSample(port.format) * static_cast<uint32_t>(port.channels_num);
+	const auto block_size = frame_size * port.samples_num;
 
 	uint64_t block_time   = (1000000 * port.samples_num) / port.freq;
 	uint64_t current_time = LibKernel::KernelGetProcessTime();
@@ -599,10 +662,23 @@ uint32_t Audio::AudioInInput(Id handle, void* dest) {
 	uint64_t next_time = m_in_ports[handle.GetId()].last_input_time + block_time;
 	uint64_t wait_time = (next_time > current_time ? next_time - current_time : 0);
 
-	// TODO(): Audio input is not yet implemented, so simulate audio delay
-	Common::Thread::SleepMicro(wait_time);
+	if (port.audio_device != 0) {
+		const uint64_t deadline = current_time + block_time * 2u + 10000u;
+		while (SDL_GetQueuedAudioSize(port.audio_device) < block_size &&
+		       LibKernel::KernelGetProcessTime() < deadline) {
+			Common::Thread::SleepMicro(1000);
+		}
 
-	m_in_ports[handle.GetId()].last_input_time = LibKernel::KernelGetProcessTime();
+		const auto captured = SDL_DequeueAudio(port.audio_device, dest, block_size);
+		if (captured < block_size) {
+			std::memset(static_cast<uint8_t*>(dest) + captured, 0, block_size - captured);
+		}
+	} else {
+		Common::Thread::SleepMicro(wait_time);
+		std::memset(dest, 0, block_size);
+	}
+
+	port.last_input_time = LibKernel::KernelGetProcessTime();
 
 	return port.samples_num;
 }
@@ -863,8 +939,7 @@ int KYTY_SYSV_ABI AudioInGetSilentState(int handle) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
 
-	// Audio input has no device backend yet, so every valid port receives silence.
-	return AUDIO_IN_SILENT_STATE_DEVICE_NONE;
+	return g_audio->AudioInHasDevice(Audio::Id(handle)) ? 0 : AUDIO_IN_SILENT_STATE_DEVICE_NONE;
 }
 
 } // namespace AudioIn

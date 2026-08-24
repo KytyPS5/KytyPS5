@@ -39,6 +39,12 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// Gives the current thread a private stack for host fault handlers. The guest stack lives
+// inside the flexible-memory region that the GPU write-watching sweeps mprotect to read-only;
+// a handler running on it would kill the process the moment its own stack pages lose write
+// permission (see hostException.cpp). No-op on platforms that do not need it.
+void SetupSignalStack() noexcept;
+
 } // namespace Common::HostException
 
 #endif /* KYTY_COMMON_HOST_EXCEPTION_H_ */

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -3369,6 +3370,11 @@ static void CleanupThread(void* arg) {
 static void* RunThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 	void* ret    = nullptr;
+
+	// Guest code faults on its own stack, which lives inside the GPU-guarded flexible-memory
+	// region; give the fault handler a private stack so the GPU protection sweeps can never
+	// remove write permission from the stack the handler is executing on.
+	Common::HostException::SetupSignalStack();
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 

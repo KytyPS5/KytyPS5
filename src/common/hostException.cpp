@@ -11,6 +11,7 @@
 #else
 #include <csignal>
 #include <initializer_list>
+#include <sys/mman.h>
 #include <ucontext.h> // IWYU pragma: keep
 #include <unistd.h>
 #endif
@@ -91,6 +92,8 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+void SetupSignalStack() {}
+
 #elif defined(__APPLE__)
 
 static std::atomic<Handler> g_handler {nullptr};
@@ -162,11 +165,45 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	sigaction(sig, &dfl, nullptr);
 }
 
+void SetupSignalStack() {}
+
 #else
 
 // x86-64 page-fault error bits.
 constexpr uint64_t PAGE_FAULT_ERROR_WRITE       = 0x02;
 constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION = 0x10;
+
+// Size of the private stack used to run host fault handlers.
+constexpr size_t kSignalStackSize = 1u * 1024u * 1024u;
+
+// Runs every fault handler for this thread on a private host stack instead of the thread's
+// current stack. The guest stack and the flexible-memory GPU buffers share the same address
+// region, and the GPU write-watching sweeps mprotect that region to PROT_READ (r--s). If a
+// handler were running on a stack inside a chunk that gets swept read-only, its next stack
+// write would fault and the kernel could not build a signal frame on the read-only pages,
+// killing the process with a silent SIGSEGV (no nested dump). A private stack is never part
+// of the guarded guest region, so it can never lose write permission.
+void SetupSignalStack() noexcept {
+	thread_local bool installed = false;
+	if (installed) {
+		return;
+	}
+	installed = true;
+
+	stack_t ss {};
+	ss.ss_size = kSignalStackSize;
+#if defined(SS_AUTODISARM)
+	ss.ss_flags |= SS_AUTODISARM;
+#endif
+	ss.ss_sp = mmap(nullptr, kSignalStackSize, PROT_READ | PROT_WRITE,
+	                MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+	if (ss.ss_sp == MAP_FAILED) {
+		return; // Fall back to the normal stack; only affects robustness.
+	}
+	if (sigaltstack(&ss, nullptr) != 0) {
+		munmap(ss.ss_sp, kSignalStackSize);
+	}
+}
 
 // Let the kernel handle an unresolved fault on retry.
 static void ChainToDefault(int signal_number) noexcept {
@@ -271,11 +308,16 @@ bool InstallHandler(Handler handler) {
 		return false;
 	}
 #else
+	// Install the private fault-handler stack before the handlers so they never run on a stack
+	// that the GPU protection sweeps can make read-only (see SetupSignalStack).
+	SetupSignalStack();
+
 	struct sigaction action {};
 	action.sa_sigaction = SignalHandler;
 	sigemptyset(&action.sa_mask);
-	// Fault resolution needs the normal thread stack.
-	action.sa_flags = SA_SIGINFO | SA_RESTART;
+	// SA_ONSTACK runs the handler on the thread's private signal stack, keeping it out of the
+	// flexible-memory region that the GPU write-watching sweeps mprotect to PROT_READ.
+	action.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
 
 	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
 		if (::sigaction(signal_number, &action, nullptr) != 0) {

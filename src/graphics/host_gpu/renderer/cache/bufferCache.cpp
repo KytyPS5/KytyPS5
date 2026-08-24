@@ -684,14 +684,17 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Keep the Register/Unregister byte ledger intact; use the actual device usage (or the
+	// ledger when the driver cannot report budgets) only to decide whether to collect. Overwriting
+	// the ledger with raw VMA heap usage (which also covers textures, staging and fixed buffers)
+	// made Unregister underflow whenever a large merged buffer was retired after a collection.
+	const auto usage = m_graphics.CanReportMemoryUsage() ? m_graphics.GetDeviceMemoryUsage()
+	                                                     : m_total_used_memory;
+	if (usage < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = usage >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 

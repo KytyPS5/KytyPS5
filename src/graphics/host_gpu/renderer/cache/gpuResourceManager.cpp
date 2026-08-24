@@ -13,10 +13,19 @@ GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	constexpr uint64_t fault_size = 8;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	// A buffer whose guest pages are GPU-owned (uploaded, CPU reads protected) is registered in
+	// m_mapped_ranges when the guest mapped it as GPU memory. Shader/utility code can also live
+	// inside such a buffer even when the range itself was never registered there, so a CPU read
+	// of a GPU-dirty page must still be resolved through the buffer cache.
+	const bool mapped = IsMapped(fault_vaddr, fault_size);
+	const bool gpu_owned = m_buffer_cache.IsRegionGpuModified(fault_vaddr, fault_size);
+	if (!mapped && !gpu_owned) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		if (!mapped) {
+			return false;
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {

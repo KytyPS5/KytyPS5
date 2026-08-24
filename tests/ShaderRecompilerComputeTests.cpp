@@ -15068,6 +15068,43 @@ void CheckSystemLibraryStateContracts() {
   vag[50] = 0x11;
   Ngs2WaveformInfoAbi vag_info{};
   Ngs2WaveformBlockAbi vag_block{};
+  std::array<uint8_t, 196> atrac9_wave{};
+  const auto atrac9_write_fourcc = [&atrac9_wave](size_t offset,
+                                                  const char *text) {
+    std::memcpy(atrac9_wave.data() + offset, text, 4);
+  };
+  const auto atrac9_write_le16 = [&atrac9_wave](size_t offset, uint16_t value) {
+    atrac9_wave[offset] = static_cast<uint8_t>(value);
+    atrac9_wave[offset + 1] = static_cast<uint8_t>(value >> 8u);
+  };
+  const auto atrac9_write_le32 = [&atrac9_wave](size_t offset, uint32_t value) {
+    for (uint32_t i = 0; i < 4; i++) {
+      atrac9_wave[offset + i] = static_cast<uint8_t>(value >> (i * 8u));
+    }
+  };
+  atrac9_write_fourcc(0, "RIFF");
+  atrac9_write_le32(4, 188);
+  atrac9_write_fourcc(8, "WAVE");
+  atrac9_write_fourcc(12, "fmt ");
+  atrac9_write_le32(16, 52);
+  atrac9_write_le16(20, 0xfffe);
+  atrac9_write_le16(22, 2);
+  atrac9_write_le32(24, 48000);
+  atrac9_write_le16(32, 96);
+  atrac9_write_le16(38, 256);
+  const std::array<uint8_t, 16> atrac9_guid = {
+      0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d,
+      0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c};
+  std::memcpy(atrac9_wave.data() + 44, atrac9_guid.data(), atrac9_guid.size());
+  const std::array<uint8_t, 4> atrac9_config = {0xfe, 0x74, 0x0b, 0xe0};
+  std::memcpy(atrac9_wave.data() + 64, atrac9_config.data(),
+              atrac9_config.size());
+  atrac9_write_fourcc(72, "fact");
+  atrac9_write_le32(76, 12);
+  atrac9_write_le32(80, 256);
+  atrac9_write_fourcc(92, "data");
+  atrac9_write_le32(96, 96);
+  Ngs2WaveformInfoAbi atrac9_info{};
   const float speaker_angles[] = {270.0f, 90.0f};
   Ngs2PanWorkAbi pan_work{};
   const Ngs2PanParamAbi pan_param{0.0f, 1.0f, 0.0f, 0.0f};
@@ -15091,12 +15128,23 @@ void CheckSystemLibraryStateContracts() {
           ngs2_calc(&vag_info.format, 7, 8, &vag_block) == OK &&
           vag_block.data_offset == 0 && vag_block.data_size == 16 &&
           vag_block.num_skip_samples == 7 && vag_block.num_samples == 15 &&
+          ngs2_parse(atrac9_wave.data(), atrac9_wave.size(), &atrac9_info) ==
+              OK &&
+          atrac9_info.format.waveform_type == 0x40 &&
+          atrac9_info.format.num_channels == 2 &&
+          atrac9_info.format.sample_rate == 48000 &&
+          atrac9_info.data_offset == 100 && atrac9_info.data_size == 96 &&
+          atrac9_info.num_samples == 256 && atrac9_info.audio_unit_size == 96 &&
+          atrac9_info.num_audio_unit_samples == 256 &&
+          atrac9_info.num_audio_unit_per_frame == 1 &&
+          atrac9_info.num_blocks == 1 &&
           ngs2_pan_init(&pan_work, speaker_angles, 360.0f, 2) == OK &&
           ngs2_pan_matrix(&pan_work, &pan_param, 1, 2, pan_matrix.data()) ==
               OK &&
           std::abs(pan_matrix[0] - 0.7071067f) < 0.0001f &&
           std::abs(pan_matrix[1] - 0.7071067f) < 0.0001f,
-      "NGS2 PCM WAV parsing, block calculation, or equal-power pan failed");
+      "NGS2 PCM/VAG/ATRAC9 parsing, block calculation, or equal-power pan "
+      "failed");
 
   struct Ngs2ContextBufferInfoAbi {
     void *host_buffer;

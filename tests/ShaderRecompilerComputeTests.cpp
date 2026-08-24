@@ -14449,7 +14449,7 @@ TestCase Vop1MoveRelSource() {
 }
 
 int KYTY_SYSV_ABI TestRudpEventHandler(int, int, const uint8_t *, size_t,
-                                      const void *, uint32_t, void *) {
+                                       const void *, uint32_t, void *) {
   return OK;
 }
 
@@ -14474,31 +14474,26 @@ void CheckSystemLibraryStateContracts() {
   }
 
   constexpr const char *optional_psn_imports[] = {
-      "mA0zsbqm+kA", "BYIZGKm6bO4", "hqzi1IHdQQQ", "pLr1fEQS1z8",
-      "0aR2aWmQal4", "DfSCDRA3EjY", "m-I92Ab50W8", "r42bWcQbtZY",
-      "uKTDW8hk-ts", "DHmwsa6S8Tc", "dsqCVsNM0Zg", "5LiMEPuW0DQ",
-      "HFcQl9TMcFQ", "Z0eQj8m7XA8", "IQtb-TaIjSM", "69u+XqsoNd0",
-      "ShGBFuoSSsQ", "aFv8qms6XTM", "M4XlLFnzQaQ", "nAEqawEZG5s",
-      "jautSRs4OdQ", "uCZf2L27th8", "M8icY9OwkKs", "brbRxzr7qyI",
-      "eOxGbG3sPb0", "Aqae0TjLvQU", "P6piso307SE", "-Rjp3-YViXc",
-      "cRILAEvn+9M", "rKPTlHwGa4k", "gDm5a6GSE94", "JDwx3Bl4bB4",
-      "kFhuwHrIUqs", "AhqlQ8cngrk", "fSGHm9RjN5U", "xhAcaIwnrgk",
-      "ivMCitpSQNk", "+isUKw4zud4", "ZCd6IYoD3Bc", "0CAesfH963Q",
-      "DlWmn2ZQuWY", "hoINmSMlYjI", "r8mVMwlafF8", "9r7dM3puxMk",
-      "cQkBH-pXhF0", "OTilStjd9L8", "n1fn2KFeLDA", "yJw2m6UWDYU",
-      "aBuX0PX-T7I", "Z9Q9LzQDXf0", "r4XacqHvkn4", "CqJuNXo5yiM",
-      "zJGf8xjFnQE", "wVqxM58sIKs", "BsE-m8JxIOg", "EHQEDVXZ0TI",
-      "KJdPcOGmK58", "hOnIlcGrO6g", "lxtHJMwBsaU", "NNVf18SlbT8",
+      "mA0zsbqm+kA", "BYIZGKm6bO4", "hqzi1IHdQQQ", "pLr1fEQS1z8", "0aR2aWmQal4",
+      "DfSCDRA3EjY", "m-I92Ab50W8", "r42bWcQbtZY", "uKTDW8hk-ts", "DHmwsa6S8Tc",
+      "dsqCVsNM0Zg", "5LiMEPuW0DQ", "HFcQl9TMcFQ", "Z0eQj8m7XA8", "IQtb-TaIjSM",
+      "69u+XqsoNd0", "ShGBFuoSSsQ", "aFv8qms6XTM", "M4XlLFnzQaQ", "nAEqawEZG5s",
+      "jautSRs4OdQ", "uCZf2L27th8", "M8icY9OwkKs", "brbRxzr7qyI", "eOxGbG3sPb0",
+      "Aqae0TjLvQU", "P6piso307SE", "-Rjp3-YViXc", "cRILAEvn+9M", "rKPTlHwGa4k",
+      "gDm5a6GSE94", "JDwx3Bl4bB4", "kFhuwHrIUqs", "AhqlQ8cngrk", "fSGHm9RjN5U",
+      "xhAcaIwnrgk", "ivMCitpSQNk", "+isUKw4zud4", "ZCd6IYoD3Bc", "0CAesfH963Q",
+      "DlWmn2ZQuWY", "hoINmSMlYjI", "r8mVMwlafF8", "9r7dM3puxMk", "cQkBH-pXhF0",
+      "OTilStjd9L8", "n1fn2KFeLDA", "yJw2m6UWDYU", "aBuX0PX-T7I", "Z9Q9LzQDXf0",
+      "r4XacqHvkn4", "CqJuNXo5yiM", "zJGf8xjFnQE", "wVqxM58sIKs", "BsE-m8JxIOg",
+      "EHQEDVXZ0TI", "KJdPcOGmK58", "hOnIlcGrO6g", "lxtHJMwBsaU", "NNVf18SlbT8",
       "AAj9X+4aGYA"};
   for (const auto *nid : optional_psn_imports) {
     (void)find(nid);
   }
 
   using CxaRefFn = void(KYTY_SYSV_ABI *)(void *);
-  const auto cxa_increment =
-      reinterpret_cast<CxaRefFn>(find("PsrRUg671K0"));
-  const auto cxa_decrement =
-      reinterpret_cast<CxaRefFn>(find("MQFPAqQPt1s"));
+  const auto cxa_increment = reinterpret_cast<CxaRefFn>(find("PsrRUg671K0"));
+  const auto cxa_decrement = reinterpret_cast<CxaRefFn>(find("MQFPAqQPt1s"));
   int exception_marker = 0;
   cxa_increment(&exception_marker);
   cxa_decrement(&exception_marker);
@@ -14540,8 +14535,7 @@ void CheckSystemLibraryStateContracts() {
   alignas(8) std::array<uint8_t, 128> commerce_param{};
   alignas(8) std::array<uint8_t, 48> commerce_output{};
   Require("SystemLibraryState", "NP commerce offline",
-          commerce_init() == OK &&
-              commerce_open(commerce_param.data()) == OK &&
+          commerce_init() == OK && commerce_open(commerce_param.data()) == OK &&
               commerce_status() == 3 &&
               commerce_result(commerce_output.data()) == OK &&
               commerce_term() == OK,
@@ -14550,8 +14544,7 @@ void CheckSystemLibraryStateContracts() {
   using EntitlementInitFn = int(KYTY_SYSV_ABI *)(const void *, void *);
   using EntitlementRequestFn =
       int(KYTY_SYSV_ABI *)(int, uint32_t, const void *, int64_t *);
-  using EntitlementPollFn =
-      int(KYTY_SYSV_ABI *)(int64_t, int32_t *, void *);
+  using EntitlementPollFn = int(KYTY_SYSV_ABI *)(int64_t, int32_t *, void *);
   using EntitlementIdFn = int(KYTY_SYSV_ABI *)(int64_t);
   const auto entitlement_init =
       reinterpret_cast<EntitlementInitFn>(find("jO8DM8oyego"));
@@ -14594,8 +14587,7 @@ void CheckSystemLibraryStateContracts() {
       reinterpret_cast<SessionActivateFn>(find("9r7dM3puxMk"));
   const auto session_destroy =
       reinterpret_cast<SessionContextFn>(find("Z9Q9LzQDXf0"));
-  const auto session_term =
-      reinterpret_cast<DialogVoidFn>(find("CqJuNXo5yiM"));
+  const auto session_term = reinterpret_cast<DialogVoidFn>(find("CqJuNXo5yiM"));
   alignas(8) std::array<uint8_t, 40> session_init_param{};
   alignas(8) std::array<uint8_t, 64> session_create_param{};
   alignas(8) std::array<uint8_t, 16> session_local_info_output{};
@@ -14643,17 +14635,14 @@ void CheckSystemLibraryStateContracts() {
   };
   static_assert(sizeof(JsonPairAbi) == 48);
 
-  using JsonObjectCtorFn =
-      JsonObjectAbi *(KYTY_SYSV_ABI *)(JsonObjectAbi *);
+  using JsonObjectCtorFn = JsonObjectAbi *(KYTY_SYSV_ABI *)(JsonObjectAbi *);
   using JsonObjectDtorFn = void(KYTY_SYSV_ABI *)(JsonObjectAbi *);
   using JsonStringCtorFn =
       JsonStringAbi *(KYTY_SYSV_ABI *)(JsonStringAbi *, const char *);
   using JsonStringCopyCtorFn =
-      JsonStringAbi *(KYTY_SYSV_ABI *)(JsonStringAbi *,
-                                      const JsonStringAbi *);
+      JsonStringAbi *(KYTY_SYSV_ABI *)(JsonStringAbi *, const JsonStringAbi *);
   using JsonStringDtorFn = void(KYTY_SYSV_ABI *)(JsonStringAbi *);
-  using JsonStringCStrFn =
-      const char *(KYTY_SYSV_ABI *)(const JsonStringAbi *);
+  using JsonStringCStrFn = const char *(KYTY_SYSV_ABI *)(const JsonStringAbi *);
   using JsonObjectIndexFn =
       void *(KYTY_SYSV_ABI *)(JsonObjectAbi *, const JsonStringAbi *);
   using JsonValueSetIntFn = void(KYTY_SYSV_ABI *)(void *, int64_t);
@@ -14662,8 +14651,7 @@ void CheckSystemLibraryStateContracts() {
   using JsonObjectIteratorFn =
       JsonIteratorAbi(KYTY_SYSV_ABI *)(const JsonObjectAbi *);
   using JsonIteratorNotEqualFn =
-      bool(KYTY_SYSV_ABI *)(const JsonIteratorAbi *,
-                            const JsonIteratorAbi *);
+      bool(KYTY_SYSV_ABI *)(const JsonIteratorAbi *, const JsonIteratorAbi *);
   using JsonIteratorDereferenceFn =
       JsonPairAbi *(KYTY_SYSV_ABI *)(JsonIteratorAbi *);
   using JsonIteratorIncrementFn =
@@ -14748,22 +14736,84 @@ void CheckSystemLibraryStateContracts() {
   using RudpInitFn = int(KYTY_SYSV_ABI *)(void *, int);
   using RudpThreadFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t);
   using RudpHandler = int(KYTY_SYSV_ABI *)(int, int, const uint8_t *, size_t,
-                                          const void *, uint32_t, void *);
+                                           const void *, uint32_t, void *);
   using RudpSetHandlerFn = int(KYTY_SYSV_ABI *)(RudpHandler, void *);
+  using RudpEndFn = int(KYTY_SYSV_ABI *)();
+  using RudpCreateFn = int(KYTY_SYSV_ABI *)(void *, void *, int *);
+  using RudpBindFn = int(KYTY_SYSV_ABI *)(int, int, uint16_t, uint8_t);
+  using RudpConnectFn =
+      int(KYTY_SYSV_ABI *)(int, const void *, uint32_t, uint16_t);
+  using RudpActivateFn = int(KYTY_SYSV_ABI *)(int, const void *, uint32_t);
+  using RudpTransferFn =
+      int(KYTY_SYSV_ABI *)(int, const void *, size_t, uint8_t);
+  using RudpReadFn = int(KYTY_SYSV_ABI *)(int, void *, size_t, uint8_t, void *);
+  using RudpContextFn = int(KYTY_SYSV_ABI *)(int);
+  using RudpPollControlFn = int(KYTY_SYSV_ABI *)(int, int, int, uint16_t);
+  struct RudpPollEventAbi {
+    int context_id;
+    uint16_t requested_events;
+    uint16_t returned_events;
+  };
+  using RudpPollWaitFn =
+      int(KYTY_SYSV_ABI *)(int, RudpPollEventAbi *, size_t, uint64_t);
   const auto rudp_init = reinterpret_cast<RudpInitFn>(find("amuBfI-AQc4"));
   const auto rudp_thread = reinterpret_cast<RudpThreadFn>(find("6PBNpsgyaxw"));
   const auto rudp_set_handler =
       reinterpret_cast<RudpSetHandlerFn>(find("SUEVes8gvmw"));
+  const auto rudp_end = reinterpret_cast<RudpEndFn>(find("3hBvwqEwqj8"));
+  const auto rudp_create = reinterpret_cast<RudpCreateFn>(find("CAbbX6BuQZ0"));
+  const auto rudp_bind = reinterpret_cast<RudpBindFn>(find("l4SLBpKUDK4"));
+  const auto rudp_activate =
+      reinterpret_cast<RudpActivateFn>(find("J-6d0WTjzMc"));
+  const auto rudp_initiate =
+      reinterpret_cast<RudpConnectFn>(find("szEVu+edXV4"));
+  const auto rudp_write = reinterpret_cast<RudpTransferFn>(find("KaPL3fbTLCA"));
+  const auto rudp_read = reinterpret_cast<RudpReadFn>(find("rZqWV3eXgOA"));
+  const auto rudp_terminate =
+      reinterpret_cast<RudpContextFn>(find("OMYRTU0uc4w"));
+  const auto rudp_poll_create =
+      reinterpret_cast<RudpContextFn>(find("MVbmLASjn5M"));
+  const auto rudp_poll_control =
+      reinterpret_cast<RudpPollControlFn>(find("haMpc7TFx0A"));
+  const auto rudp_poll_wait =
+      reinterpret_cast<RudpPollWaitFn>(find("M6ggviwXpLs"));
+  const auto rudp_poll_destroy =
+      reinterpret_cast<RudpContextFn>(find("LjwbHpEeW0A"));
   alignas(16) std::array<uint8_t, 1024> rudp_pool{};
-  Require("SystemLibraryState", "RUDP lifecycle",
-          rudp_thread(0, 0) != OK && rudp_init(nullptr, 0) != OK &&
-              rudp_init(rudp_pool.data(), static_cast<int>(rudp_pool.size())) ==
-                  OK &&
-              rudp_init(rudp_pool.data(), static_cast<int>(rudp_pool.size())) !=
-                  OK &&
-              rudp_set_handler(TestRudpEventHandler, nullptr) == OK &&
-              rudp_thread(0, 0) == OK && rudp_thread(0, 0) != OK,
-          "RUDP did not enforce initialization and I/O-thread state");
+  int rudp_sender = 0;
+  int rudp_receiver = 0;
+  const uint32_t rudp_payload = 0x1234abcd;
+  uint32_t rudp_received = 0;
+  RudpPollEventAbi rudp_event{};
+  int rudp_poll = -1;
+  Require(
+      "SystemLibraryState", "RUDP lifecycle",
+      rudp_thread(0, 0) != OK && rudp_init(nullptr, 0) != OK &&
+          rudp_init(rudp_pool.data(), static_cast<int>(rudp_pool.size())) ==
+              OK &&
+          rudp_init(rudp_pool.data(), static_cast<int>(rudp_pool.size())) !=
+              OK &&
+          rudp_set_handler(TestRudpEventHandler, nullptr) == OK &&
+          rudp_thread(0, 0) == OK && rudp_thread(0, 0) != OK &&
+          rudp_create(nullptr, nullptr, &rudp_sender) == OK &&
+          rudp_create(nullptr, nullptr, &rudp_receiver) == OK &&
+          rudp_bind(rudp_sender, 10, 20, 0) == OK &&
+          rudp_bind(rudp_receiver, 11, 20, 0) == OK &&
+          rudp_activate(rudp_receiver, nullptr, 0) != OK &&
+          rudp_initiate(rudp_sender, nullptr, 0, 20) == OK &&
+          (rudp_poll = rudp_poll_create(2)) >= 0 &&
+          rudp_poll_control(rudp_poll, 1, rudp_receiver, 0x0001) == OK &&
+          rudp_write(rudp_sender, &rudp_payload, sizeof(rudp_payload), 0) ==
+              static_cast<int>(sizeof(rudp_payload)) &&
+          rudp_poll_wait(rudp_poll, &rudp_event, 1, 0) == 1 &&
+          rudp_event.context_id == rudp_receiver &&
+          (rudp_event.returned_events & 0x0001) != 0 &&
+          rudp_read(rudp_receiver, &rudp_received, sizeof(rudp_received), 0,
+                    nullptr) == static_cast<int>(sizeof(rudp_received)) &&
+          rudp_received == rudp_payload && rudp_poll_destroy(rudp_poll) == OK &&
+          rudp_terminate(rudp_sender) == OK &&
+          rudp_terminate(rudp_receiver) == OK && rudp_end() == OK,
+      "RUDP local context, loopback transfer, polling, or lifecycle failed");
 
   struct AcmBatchInfoAbi {
     void *buffer;
@@ -14772,25 +14822,60 @@ void CheckSystemLibraryStateContracts() {
   };
   using AcmContextCreateFn = int(KYTY_SYSV_ABI *)(uint32_t *);
   using AcmContextDestroyFn = int(KYTY_SYSV_ABI *)(uint32_t);
-  using AcmFftFn = int(KYTY_SYSV_ABI *)(
-      AcmBatchInfoAbi *, int, int, int, const void *const[], int,
-      void *const[], uint32_t);
-  using AcmPannerFn = int(KYTY_SYSV_ABI *)(
-      AcmBatchInfoAbi *, uint32_t, const float *const[], uint32_t, uint32_t,
-      uint32_t, const void *const[], void *const[], const float *const[],
-      float *const[]);
-  using AcmNotificationFn = int(KYTY_SYSV_ABI *)(AcmBatchInfoAbi *, uint8_t,
-                                                 volatile void *);
+  using AcmFftFn =
+      int(KYTY_SYSV_ABI *)(AcmBatchInfoAbi *, int, int, int,
+                           const void *const[], int, void *const[], uint32_t);
+  using AcmPannerFn =
+      int(KYTY_SYSV_ABI *)(AcmBatchInfoAbi *, uint32_t, const float *const[],
+                           uint32_t, uint32_t, uint32_t, const void *const[],
+                           void *const[], const float *const[], float *const[]);
+  using AcmNotificationFn =
+      int(KYTY_SYSV_ABI *)(AcmBatchInfoAbi *, uint8_t, volatile void *);
+  struct AcmConvBlockSizeAbi {
+    uint16_t memory_size;
+    uint16_t runtime_size;
+  };
+  struct AcmConvChannelAbi {
+    void *blocks;
+    AcmConvBlockSizeAbi *sizes;
+  };
+  struct AcmConvInputAbi {
+    uint32_t block_size;
+    uint32_t block_count;
+    uint32_t channel_count;
+    uint32_t format;
+    uint32_t history_position;
+    uint32_t history_count;
+    AcmConvChannelAbi **channels;
+    float **pcm;
+  };
+  struct AcmConvIrAbi {
+    uint32_t block_size;
+    uint32_t block_count;
+    uint32_t channel_count;
+    uint32_t format;
+    float *block_gains;
+    AcmConvChannelAbi **channels;
+  };
+  struct AcmConvOutputAbi {
+    uint32_t block_size;
+    uint32_t channel_count;
+    float **temps;
+    float **pcm;
+  };
+  using AcmConvFn =
+      int(KYTY_SYSV_ABI *)(AcmBatchInfoAbi *, uint32_t, void *, uint32_t,
+                           const void *const[], const float *, void *const[]);
   const auto acm_context_create =
       reinterpret_cast<AcmContextCreateFn>(find("ZIXln2K3XMk"));
   const auto acm_context_destroy =
       reinterpret_cast<AcmContextDestroyFn>(find("jBgBjAj02R8"));
   const auto acm_fft = reinterpret_cast<AcmFftFn>(find("KovqaFbmtsM"));
   const auto acm_ifft = reinterpret_cast<AcmFftFn>(find("DR-ZCmvVR9Q"));
-  const auto acm_panner =
-      reinterpret_cast<AcmPannerFn>(find("LA4RCNKnFjg"));
+  const auto acm_panner = reinterpret_cast<AcmPannerFn>(find("LA4RCNKnFjg"));
   const auto acm_notification =
       reinterpret_cast<AcmNotificationFn>(find("r7z5YQFZo+U"));
+  const auto acm_convolution = reinterpret_cast<AcmConvFn>(find("u70oWo92SYQ"));
 
   alignas(128) std::array<uint8_t, 4096> acm_commands{};
   AcmBatchInfoAbi acm_info{acm_commands.data(), 0, acm_commands.size()};
@@ -14807,11 +14892,12 @@ void CheckSystemLibraryStateContracts() {
       acm_context_create(&acm_context) == OK && acm_context != 0 &&
       acm_fft(&acm_info, 512, 1, 0, acm_fft_inputs, 0, acm_fft_outputs, 0) ==
           OK &&
-      acm_ifft(&acm_info, 512, 1, 0, acm_ifft_inputs, 0, acm_ifft_outputs,
-               0) == OK &&
+      acm_ifft(&acm_info, 512, 1, 0, acm_ifft_inputs, 0, acm_ifft_outputs, 0) ==
+          OK &&
       std::abs(acm_roundtrip[0] - 1.0f) < 0.0001f &&
-      std::all_of(acm_roundtrip.begin() + 1, acm_roundtrip.end(),
-                  [](float value) { return std::abs(value) < 0.0001f; });
+      std::all_of(
+          acm_roundtrip.begin() + 1, acm_roundtrip.end(),
+          [](float value) { return std::abs(value) < 0.0001f; });
 
   std::array<float, 256> acm_pan_input{};
   std::array<float, 256> acm_pan_left{};
@@ -14827,18 +14913,51 @@ void CheckSystemLibraryStateContracts() {
   void *acm_pan_states[] = {acm_pan_state.data()};
   float *acm_pan_outputs[] = {acm_pan_left.data(), acm_pan_right.data()};
   alignas(128) std::array<uint8_t, 128> acm_notify{};
+  std::array<float, 256> acm_conv_input_pcm{};
+  std::array<float, 512> acm_conv_input_history{};
+  std::array<float, 512> acm_conv_ir_frequency{};
+  std::array<float, 256> acm_conv_temp{};
+  std::array<float, 256> acm_conv_output{};
+  acm_conv_input_pcm[0] = 1.0f;
+  acm_conv_ir_frequency[0] = 1.0f;
+  acm_conv_ir_frequency[1] = 1.0f;
+  for (size_t bin = 1; bin < 256; bin++) {
+    acm_conv_ir_frequency[bin * 2] = 1.0f;
+  }
+  AcmConvChannelAbi acm_conv_input_channel{acm_conv_input_history.data(),
+                                           nullptr};
+  AcmConvChannelAbi acm_conv_ir_channel{acm_conv_ir_frequency.data(), nullptr};
+  AcmConvChannelAbi *acm_conv_input_channels[] = {&acm_conv_input_channel};
+  AcmConvChannelAbi *acm_conv_ir_channels[] = {&acm_conv_ir_channel};
+  float *acm_conv_input_pcm_channels[] = {acm_conv_input_pcm.data()};
+  float *acm_conv_temp_channels[] = {acm_conv_temp.data()};
+  float *acm_conv_output_channels[] = {acm_conv_output.data()};
+  AcmConvInputAbi acm_conv_input{
+      256, 1, 1, 0, 0, 0, acm_conv_input_channels, acm_conv_input_pcm_channels};
+  AcmConvIrAbi acm_conv_ir{256, 1, 1, 0, nullptr, acm_conv_ir_channels};
+  AcmConvOutputAbi acm_conv_out{256, 1, acm_conv_temp_channels,
+                                acm_conv_output_channels};
+  const void *acm_conv_irs[] = {&acm_conv_ir};
+  void *acm_conv_outputs[] = {&acm_conv_out};
+  const bool acm_convolution_ok =
+      acm_convolution(&acm_info, 1, &acm_conv_input, 1, acm_conv_irs, nullptr,
+                      acm_conv_outputs) == OK &&
+      std::abs(acm_conv_output[0] - 1.0f) < 0.0001f &&
+      std::all_of(
+          acm_conv_output.begin() + 1, acm_conv_output.end(),
+          [](float value) { return std::abs(value) < 0.0001f; });
   const bool acm_panner_ok =
-      acm_panner(&acm_info, 1, acm_pan_inputs, 0, 0, 2,
-                 acm_pan_parameters, acm_pan_states, nullptr,
-                 acm_pan_outputs) == OK &&
+      acm_panner(&acm_info, 1, acm_pan_inputs, 0, 0, 2, acm_pan_parameters,
+                 acm_pan_states, nullptr, acm_pan_outputs) == OK &&
       std::abs(acm_pan_left[128] - 0.25f) < 0.0001f &&
       std::abs(acm_pan_right[128] - 0.75f) < 0.0001f &&
       acm_notification(&acm_info, 0x5a, acm_notify.data()) == OK &&
       acm_notify[0] == 0x5a && acm_context_destroy(acm_context) == OK &&
       acm_context_destroy(acm_context) != OK;
   Require("SystemLibraryState", "ACM CPU processing",
-          acm_transform_ok && acm_panner_ok,
-          "ACM FFT/IFFT, panner, notification, or context lifecycle failed");
+          acm_transform_ok && acm_convolution_ok && acm_panner_ok,
+          "ACM FFT/IFFT, convolution, panner, notification, or context "
+          "lifecycle failed");
 
   struct Ngs2WaveformFormatAbi {
     uint32_t waveform_type;
@@ -14884,19 +15003,18 @@ void CheckSystemLibraryStateContracts() {
     float unit_angle;
     uint32_t num_speakers;
   };
-  using Ngs2ParseWaveformFn = int(KYTY_SYSV_ABI *)(
-      const void *, size_t, Ngs2WaveformInfoAbi *);
-  using Ngs2CalcBlockFn = int(KYTY_SYSV_ABI *)(
-      const Ngs2WaveformFormatAbi *, uint32_t, uint32_t,
-      Ngs2WaveformBlockAbi *);
-  using Ngs2PanInitFn = int(KYTY_SYSV_ABI *)(Ngs2PanWorkAbi *, const float *,
-                                            float, uint32_t);
+  using Ngs2ParseWaveformFn =
+      int(KYTY_SYSV_ABI *)(const void *, size_t, Ngs2WaveformInfoAbi *);
+  using Ngs2CalcBlockFn =
+      int(KYTY_SYSV_ABI *)(const Ngs2WaveformFormatAbi *, uint32_t, uint32_t,
+                           Ngs2WaveformBlockAbi *);
+  using Ngs2PanInitFn =
+      int(KYTY_SYSV_ABI *)(Ngs2PanWorkAbi *, const float *, float, uint32_t);
   using Ngs2PanMatrixFn = int(KYTY_SYSV_ABI *)(
       Ngs2PanWorkAbi *, const Ngs2PanParamAbi *, uint32_t, uint32_t, float *);
   const auto ngs2_parse =
       reinterpret_cast<Ngs2ParseWaveformFn>(find("hyVLT2VlOYk"));
-  const auto ngs2_calc =
-      reinterpret_cast<Ngs2CalcBlockFn>(find("3pCNbVM11UA"));
+  const auto ngs2_calc = reinterpret_cast<Ngs2CalcBlockFn>(find("3pCNbVM11UA"));
   const auto ngs2_pan_init =
       reinterpret_cast<Ngs2PanInitFn>(find("xa8oL9dmXkM"));
   const auto ngs2_pan_matrix =
@@ -14934,25 +15052,51 @@ void CheckSystemLibraryStateContracts() {
   write_le16(50, 0xe000);
   Ngs2WaveformInfoAbi waveform_info{};
   Ngs2WaveformBlockAbi waveform_block{};
+  std::array<uint8_t, 64> vag{};
+  std::memcpy(vag.data(), "VAGp", 4);
+  const auto write_vag_be32 = [&vag](size_t offset, uint32_t value) {
+    for (uint32_t i = 0; i < 4; i++) {
+      vag[offset + i] = static_cast<uint8_t>(value >> ((3u - i) * 8u));
+    }
+  };
+  write_vag_be32(4, 0x00020001);
+  write_vag_be32(12, 16);
+  write_vag_be32(16, 48000);
+  vag[30] = 1;
+  vag[48] = 0;
+  vag[49] = 0;
+  vag[50] = 0x11;
+  Ngs2WaveformInfoAbi vag_info{};
+  Ngs2WaveformBlockAbi vag_block{};
   const float speaker_angles[] = {270.0f, 90.0f};
   Ngs2PanWorkAbi pan_work{};
   const Ngs2PanParamAbi pan_param{0.0f, 1.0f, 0.0f, 0.0f};
   std::array<float, 2> pan_matrix{};
-  Require("SystemLibraryState", "NGS2 waveform and pan",
-          ngs2_parse(wave.data(), wave.size(), &waveform_info) == OK &&
-              waveform_info.format.waveform_type == 0x12 &&
-              waveform_info.format.num_channels == 2 &&
-              waveform_info.format.sample_rate == 48000 &&
-              waveform_info.data_offset == 44 &&
-              waveform_info.num_samples == 2 && waveform_info.num_blocks == 1 &&
-              ngs2_calc(&waveform_info.format, 1, 1, &waveform_block) == OK &&
-              waveform_block.data_offset == 4 && waveform_block.data_size == 4 &&
-              ngs2_pan_init(&pan_work, speaker_angles, 360.0f, 2) == OK &&
-              ngs2_pan_matrix(&pan_work, &pan_param, 1, 2,
-                              pan_matrix.data()) == OK &&
-              std::abs(pan_matrix[0] - 0.7071067f) < 0.0001f &&
-              std::abs(pan_matrix[1] - 0.7071067f) < 0.0001f,
-          "NGS2 PCM WAV parsing, block calculation, or equal-power pan failed");
+  Require(
+      "SystemLibraryState", "NGS2 waveform and pan",
+      ngs2_parse(wave.data(), wave.size(), &waveform_info) == OK &&
+          waveform_info.format.waveform_type == 0x12 &&
+          waveform_info.format.num_channels == 2 &&
+          waveform_info.format.sample_rate == 48000 &&
+          waveform_info.data_offset == 44 && waveform_info.num_samples == 2 &&
+          waveform_info.num_blocks == 1 &&
+          ngs2_calc(&waveform_info.format, 1, 1, &waveform_block) == OK &&
+          waveform_block.data_offset == 4 && waveform_block.data_size == 4 &&
+          ngs2_parse(vag.data(), vag.size(), &vag_info) == OK &&
+          vag_info.format.waveform_type == 0x1c &&
+          vag_info.format.num_channels == 1 &&
+          vag_info.format.sample_rate == 48000 && vag_info.data_offset == 48 &&
+          vag_info.num_samples == 28 && vag_info.audio_unit_size == 16 &&
+          vag_info.num_audio_unit_samples == 28 && vag_info.num_blocks == 1 &&
+          ngs2_calc(&vag_info.format, 7, 8, &vag_block) == OK &&
+          vag_block.data_offset == 0 && vag_block.data_size == 16 &&
+          vag_block.num_skip_samples == 7 && vag_block.num_samples == 15 &&
+          ngs2_pan_init(&pan_work, speaker_angles, 360.0f, 2) == OK &&
+          ngs2_pan_matrix(&pan_work, &pan_param, 1, 2, pan_matrix.data()) ==
+              OK &&
+          std::abs(pan_matrix[0] - 0.7071067f) < 0.0001f &&
+          std::abs(pan_matrix[1] - 0.7071067f) < 0.0001f,
+      "NGS2 PCM WAV parsing, block calculation, or equal-power pan failed");
 
   struct Ngs2ContextBufferInfoAbi {
     void *host_buffer;
@@ -14979,6 +15123,28 @@ void CheckSystemLibraryStateContracts() {
     uint16_t num_values;
     Ngs2CommandValueAbi value;
   };
+  struct Ngs2VoiceParamHeaderAbi {
+    uint16_t size;
+    int16_t next;
+    uint32_t id;
+  };
+  struct Ngs2VoiceEventParamAbi {
+    Ngs2VoiceParamHeaderAbi header;
+    uint32_t event_id;
+  };
+  struct Ngs2SamplerVoiceSetupParamAbi {
+    Ngs2VoiceParamHeaderAbi header;
+    Ngs2WaveformFormatAbi format;
+    uint32_t flags;
+    uint32_t reserved;
+  };
+  struct Ngs2SamplerVoiceWaveformBlocksParamAbi {
+    Ngs2VoiceParamHeaderAbi header;
+    const void *data;
+    uint32_t flags;
+    uint32_t num_blocks;
+    const Ngs2WaveformBlockAbi *blocks;
+  };
   using Ngs2SystemQueryBufferFn =
       int(KYTY_SYSV_ABI *)(const void *, Ngs2ContextBufferInfoAbi *);
   using Ngs2SystemCreateFn = int(KYTY_SYSV_ABI *)(
@@ -14992,6 +15158,8 @@ void CheckSystemLibraryStateContracts() {
       int(KYTY_SYSV_ABI *)(uintptr_t, uint32_t, uintptr_t *);
   using Ngs2VoiceRunCommandsFn =
       int(KYTY_SYSV_ABI *)(uintptr_t, const Ngs2CommandParamAbi *, size_t);
+  using Ngs2VoiceControlFn =
+      int(KYTY_SYSV_ABI *)(uintptr_t, const Ngs2VoiceParamHeaderAbi *);
   using Ngs2SystemRenderFn = int(KYTY_SYSV_ABI *)(
       uintptr_t, const Ngs2RenderBufferInfoAbi *, uint32_t);
   using Ngs2RackDestroyFn =
@@ -15010,6 +15178,8 @@ void CheckSystemLibraryStateContracts() {
       reinterpret_cast<Ngs2RackGetVoiceFn>(find("MwmHz8pAdAo"));
   const auto ngs2_voice_commands =
       reinterpret_cast<Ngs2VoiceRunCommandsFn>(find("AbYvTOZ8Pts"));
+  const auto ngs2_voice_control =
+      reinterpret_cast<Ngs2VoiceControlFn>(find("uu94irFOGpA"));
   const auto ngs2_render =
       reinterpret_cast<Ngs2SystemRenderFn>(find("i0VnXM-C9fc"));
   const auto ngs2_rack_destroy =
@@ -15057,12 +15227,71 @@ void CheckSystemLibraryStateContracts() {
   ngs2_commands[1] = {0x00010002, 0, 0x06, 0, {.p = ngs2_pcm.data()}};
   ngs2_commands[2] = {0x00010001, 0x04, 0x81, 1, {.p = &ngs2_pcm_block}};
   ngs2_commands[3] = {0x00000002, 0, 0x04, 0, {.u = 0x0001}};
+  const std::array<Ngs2CommandParamAbi, 4> ngs2_stream_start{{
+      {0x00010000, 0, 0x42, 0, {.p = &ngs2_pcm_format}},
+      {0x00010002, 0, 0x06, 0, {.p = ngs2_pcm.data()}},
+      {0x00010001, 0x04, 0x81, 0, {.p = nullptr}},
+      {0x00000002, 0, 0x04, 0, {.u = 0x0001}},
+  }};
+  const std::array<Ngs2CommandParamAbi, 1> ngs2_stream_block{{
+      {0x00010001, 0x01, 0x81, 1, {.p = &ngs2_pcm_block}},
+  }};
+  std::array<float, 16> ngs2_stream_gap_output{};
+  std::array<float, 16> ngs2_stream_output{};
+  const Ngs2RenderBufferInfoAbi ngs2_stream_gap_render_buffer{
+      ngs2_stream_gap_output.data(), sizeof(ngs2_stream_gap_output), 0x18, 8};
+  const Ngs2RenderBufferInfoAbi ngs2_stream_render_buffer{
+      ngs2_stream_output.data(), sizeof(ngs2_stream_output), 0x18, 8};
+  const Ngs2SamplerVoiceSetupParamAbi ngs2_legacy_setup{
+      {sizeof(Ngs2SamplerVoiceSetupParamAbi), 0, 0x10000000},
+      ngs2_pcm_format,
+      0x10,
+      0};
+  const Ngs2VoiceEventParamAbi ngs2_legacy_play{
+      {sizeof(Ngs2VoiceEventParamAbi), 0, 0x00000006}, 0x0001};
+  const Ngs2SamplerVoiceWaveformBlocksParamAbi ngs2_legacy_block{
+      {sizeof(Ngs2SamplerVoiceWaveformBlocksParamAbi), 0, 0x10000001},
+      ngs2_pcm.data(),
+      0x01,
+      1,
+      &ngs2_pcm_block};
   std::array<float, 16> ngs2_output{};
   const Ngs2RenderBufferInfoAbi ngs2_render_buffer{
       ngs2_output.data(), sizeof(ngs2_output), 0x18, 8};
-  const bool ngs2_mixer_ok =
+  bool ngs2_legacy_streaming_ok =
       ngs2_rack_created &&
+      ngs2_rack_get_voice(ngs2_rack, 256, &ngs2_voice) ==
+          static_cast<int32_t>(0x804a8351u) &&
       ngs2_rack_get_voice(ngs2_rack, 0, &ngs2_voice) == OK && ngs2_voice != 0 &&
+      ngs2_voice_control(ngs2_voice, &ngs2_legacy_setup.header) == OK &&
+      ngs2_voice_control(ngs2_voice, &ngs2_legacy_play.header) == OK &&
+      ngs2_render(ngs2_system, &ngs2_stream_gap_render_buffer, 1) == OK &&
+      std::all_of(ngs2_stream_gap_output.begin(), ngs2_stream_gap_output.end(),
+                  [](float value) { return value == 0.0f; });
+  for (uint32_t block = 0; block < 40 && ngs2_legacy_streaming_ok; block++) {
+    ngs2_stream_output.fill(0.0f);
+    ngs2_legacy_streaming_ok =
+        ngs2_voice_control(ngs2_voice, &ngs2_legacy_block.header) == OK &&
+        ngs2_render(ngs2_system, &ngs2_stream_render_buffer, 1) == OK &&
+        std::abs(ngs2_stream_output[0] - 32767.0f / 32768.0f) < 0.0001f &&
+        std::abs(ngs2_stream_output[1] + 1.0f) < 0.0001f;
+  }
+  ngs2_stream_gap_output.fill(0.0f);
+  ngs2_stream_output.fill(0.0f);
+  const bool ngs2_streaming_ok =
+      ngs2_legacy_streaming_ok &&
+      ngs2_voice_commands(ngs2_voice, ngs2_stream_start.data(),
+                          ngs2_stream_start.size()) == OK &&
+      ngs2_render(ngs2_system, &ngs2_stream_gap_render_buffer, 1) == OK &&
+      std::all_of(ngs2_stream_gap_output.begin(), ngs2_stream_gap_output.end(),
+                  [](float value) { return value == 0.0f; }) &&
+      ngs2_voice_commands(ngs2_voice, ngs2_stream_block.data(),
+                          ngs2_stream_block.size()) == OK &&
+      ngs2_render(ngs2_system, &ngs2_stream_render_buffer, 1) == OK &&
+      std::abs(ngs2_stream_output[0] - 32767.0f / 32768.0f) < 0.0001f &&
+      std::abs(ngs2_stream_output[1] + 1.0f) < 0.0001f;
+  const bool ngs2_mixer_ok =
+      ngs2_streaming_ok &&
       ngs2_voice_commands(ngs2_voice, ngs2_commands.data(),
                           ngs2_commands.size()) == OK &&
       ngs2_render(ngs2_system, &ngs2_render_buffer, 1) == OK &&
@@ -15076,13 +15305,61 @@ void CheckSystemLibraryStateContracts() {
       std::all_of(
           ngs2_output.begin() + 10, ngs2_output.end(),
           [](float value) { return value == 0.0f; });
-  const bool ngs2_destroyed = ngs2_rack_created &&
-                              ngs2_rack_destroy(ngs2_rack, nullptr) == OK &&
-                              ngs2_system_destroy(ngs2_system, nullptr) == OK;
-  Require("SystemLibraryState", "NGS2 PCM command mixer",
-          ngs2_mixer_ok && ngs2_destroyed,
-          "NGS2 player commands did not produce the expected 8-channel float "
-          "output");
+
+  ngs2_commands[0].value.p = &vag_info.format;
+  ngs2_commands[1].value.p = vag.data();
+  ngs2_commands[2].value.p = &vag_info.blocks[0];
+  std::array<float, 16> ngs2_vag_output{};
+  const Ngs2RenderBufferInfoAbi ngs2_vag_render_buffer{
+      ngs2_vag_output.data(), sizeof(ngs2_vag_output), 0x18, 8};
+  const bool ngs2_vag_mixer_ok =
+      ngs2_mixer_ok &&
+      ngs2_voice_commands(ngs2_voice, ngs2_commands.data(),
+                          ngs2_commands.size()) == OK &&
+      ngs2_render(ngs2_system, &ngs2_vag_render_buffer, 1) == OK &&
+      std::all_of(
+          ngs2_vag_output.begin(), ngs2_vag_output.end(),
+          [](float value) { return std::abs(value - 0.125f) < 0.0001f; });
+  const bool ngs2_standard_rack_destroyed =
+      ngs2_vag_mixer_ok && ngs2_rack_destroy(ngs2_rack, nullptr) == OK;
+
+  Ngs2ContextBufferInfoAbi ngs2_custom_rack_buffer{};
+  uintptr_t ngs2_custom_rack = 0;
+  const bool ngs2_custom_rack_sized =
+      ngs2_standard_rack_destroyed &&
+      ngs2_rack_query(0x4001, nullptr, &ngs2_custom_rack_buffer) == OK &&
+      ngs2_custom_rack_buffer.host_buffer_size != 0;
+  std::vector<uint64_t> ngs2_custom_rack_storage(
+      (ngs2_custom_rack_buffer.host_buffer_size + sizeof(uint64_t) - 1) /
+      sizeof(uint64_t));
+  ngs2_custom_rack_buffer.host_buffer = ngs2_custom_rack_storage.data();
+  const bool ngs2_custom_rack_created =
+      ngs2_custom_rack_sized &&
+      ngs2_rack_create(ngs2_system, 0x4001, nullptr, &ngs2_custom_rack_buffer,
+                       &ngs2_custom_rack) == OK &&
+      ngs2_custom_rack != 0;
+  uintptr_t ngs2_custom_voice = 0;
+  std::array<float, 16> ngs2_custom_output{};
+  const Ngs2RenderBufferInfoAbi ngs2_custom_render_buffer{
+      ngs2_custom_output.data(), sizeof(ngs2_custom_output), 0x18, 8};
+  const bool ngs2_custom_mixer_ok =
+      ngs2_custom_rack_created &&
+      ngs2_rack_get_voice(ngs2_custom_rack, 0, &ngs2_custom_voice) == OK &&
+      ngs2_custom_voice != 0 &&
+      ngs2_voice_commands(ngs2_custom_voice, ngs2_commands.data(),
+                          ngs2_commands.size()) == OK &&
+      ngs2_render(ngs2_system, &ngs2_custom_render_buffer, 1) == OK &&
+      std::equal(ngs2_vag_output.begin(), ngs2_vag_output.end(),
+                 ngs2_custom_output.begin());
+  const bool ngs2_destroyed =
+      ngs2_custom_rack_created &&
+      ngs2_rack_destroy(ngs2_custom_rack, nullptr) == OK &&
+      ngs2_system_destroy(ngs2_system, nullptr) == OK;
+  Require("SystemLibraryState", "NGS2 PCM/VAG command mixer",
+          ngs2_legacy_streaming_ok && ngs2_streaming_ok && ngs2_vag_mixer_ok &&
+              ngs2_custom_mixer_ok && ngs2_destroyed,
+          "NGS2 legacy/command streaming, PCM/VAG standard, or custom sampler "
+          "commands did not produce the expected 8-channel float output");
 
   struct AjmBatchInfoAbi {
     void *buffer;
@@ -15099,15 +15376,16 @@ void CheckSystemLibraryStateContracts() {
   using AjmInitializeFn = int(KYTY_SYSV_ABI *)(int64_t, uint32_t *);
   using AjmFinalizeFn = int(KYTY_SYSV_ABI *)(uint32_t);
   using AjmModuleFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t, int64_t);
-  using AjmInstanceCreateFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t,
-                                                   uint64_t, uint32_t *);
+  using AjmInstanceCreateFn =
+      int(KYTY_SYSV_ABI *)(uint32_t, uint32_t, uint64_t, uint32_t *);
   using AjmInstanceDestroyFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t);
-  using AjmBatchInitializeFn = int(KYTY_SYSV_ABI *)(void *, size_t,
-                                                    AjmBatchInfoAbi *);
-  using AjmJobInitializeFn = int(KYTY_SYSV_ABI *)(
-      AjmBatchInfoAbi *, uint32_t, const void *, size_t, void *);
-  using AjmJobDecodeFn = int(KYTY_SYSV_ABI *)(
-      AjmBatchInfoAbi *, uint32_t, const void *, size_t, void *, size_t, void *);
+  using AjmBatchInitializeFn =
+      int(KYTY_SYSV_ABI *)(void *, size_t, AjmBatchInfoAbi *);
+  using AjmJobInitializeFn = int(KYTY_SYSV_ABI *)(AjmBatchInfoAbi *, uint32_t,
+                                                  const void *, size_t, void *);
+  using AjmJobDecodeFn =
+      int(KYTY_SYSV_ABI *)(AjmBatchInfoAbi *, uint32_t, const void *, size_t,
+                           void *, size_t, void *);
   const auto ajm_initialize =
       reinterpret_cast<AjmInitializeFn>(find("dl+4eHSzUu4"));
   const auto ajm_finalize =
@@ -15136,33 +15414,149 @@ void CheckSystemLibraryStateContracts() {
   std::array<float, 4> lpcm_output{};
   std::array<uint8_t, 24> ajm_decode_result{};
   const uint64_t lpcm_flags = 2u | (2u << 7u);
-  Require("SystemLibraryState", "AJM LPCM decoder",
-          ajm_initialize(0, &ajm_context) == OK &&
-              ajm_module_register(ajm_context, 23, 0) == OK &&
-              ajm_instance_create(ajm_context, 23, lpcm_flags,
-                                  &ajm_instance) == OK &&
-              ajm_batch_initialize(ajm_commands.data(), ajm_commands.size(),
-                                   &ajm_info) == OK &&
-              ajm_job_initialize(&ajm_info, ajm_instance, &lpcm_params,
-                                 sizeof(lpcm_params), ajm_init_result.data()) == OK &&
-              *reinterpret_cast<const int32_t *>(ajm_init_result.data()) == OK &&
-              ajm_job_decode(&ajm_info, ajm_instance, lpcm_input.data(),
-                             sizeof(lpcm_input), lpcm_output.data(),
-                             sizeof(lpcm_output), ajm_decode_result.data()) == OK &&
-              *reinterpret_cast<const int32_t *>(ajm_decode_result.data()) == OK &&
-              std::abs(lpcm_output[0] - 0.9999695f) < 0.0001f &&
-              std::abs(lpcm_output[1] + 1.0f) < 0.0001f &&
-              ajm_instance_destroy(ajm_context, ajm_instance) == OK &&
-              ajm_module_unregister(ajm_context, 23) == OK &&
-              ajm_finalize(ajm_context) == OK,
-          "AJM LPCM initialization or sample conversion failed");
+  Require(
+      "SystemLibraryState", "AJM LPCM decoder",
+      ajm_initialize(0, &ajm_context) == OK &&
+          ajm_module_register(ajm_context, 23, 0) == OK &&
+          ajm_instance_create(ajm_context, 23, lpcm_flags, &ajm_instance) ==
+              OK &&
+          ajm_batch_initialize(ajm_commands.data(), ajm_commands.size(),
+                               &ajm_info) == OK &&
+          ajm_job_initialize(&ajm_info, ajm_instance, &lpcm_params,
+                             sizeof(lpcm_params),
+                             ajm_init_result.data()) == OK &&
+          *reinterpret_cast<const int32_t *>(ajm_init_result.data()) == OK &&
+          ajm_job_decode(&ajm_info, ajm_instance, lpcm_input.data(),
+                         sizeof(lpcm_input), lpcm_output.data(),
+                         sizeof(lpcm_output), ajm_decode_result.data()) == OK &&
+          *reinterpret_cast<const int32_t *>(ajm_decode_result.data()) == OK &&
+          std::abs(lpcm_output[0] - 0.9999695f) < 0.0001f &&
+          std::abs(lpcm_output[1] + 1.0f) < 0.0001f &&
+          ajm_instance_destroy(ajm_context, ajm_instance) == OK &&
+          ajm_module_unregister(ajm_context, 23) == OK &&
+          ajm_finalize(ajm_context) == OK,
+      "AJM LPCM initialization or sample conversion failed");
+
+  struct AjmHevagParamsAbi {
+    uint32_t sample_rate;
+    uint32_t channels;
+  };
+  uint32_t hevag_context = 0;
+  uint32_t hevag_instance = 0;
+  std::array<uint8_t, 512> hevag_commands{};
+  AjmBatchInfoAbi hevag_info{};
+  const AjmHevagParamsAbi hevag_params{48000, 1};
+  std::array<uint8_t, 8> hevag_init_result{};
+  std::array<uint8_t, 16> hevag_input{};
+  hevag_input[0] = 0x0c;
+  std::fill(hevag_input.begin() + 2, hevag_input.end(), 0x77);
+  std::array<float, 28> hevag_output{};
+  std::array<uint8_t, 24> hevag_decode_result{};
+  const uint64_t hevag_flags = 1u | (2u << 7u);
+  const int hevag_step_init = ajm_initialize(0, &hevag_context);
+  const int hevag_step_register = ajm_module_register(hevag_context, 22, 0);
+  const int hevag_step_create =
+      ajm_instance_create(hevag_context, 22, hevag_flags, &hevag_instance);
+  const int hevag_step_batch = ajm_batch_initialize(
+      hevag_commands.data(), hevag_commands.size(), &hevag_info);
+  const int hevag_step_codec_init =
+      ajm_job_initialize(&hevag_info, hevag_instance, &hevag_params,
+                         sizeof(hevag_params), hevag_init_result.data());
+  const int hevag_step_decode = ajm_job_decode(
+      &hevag_info, hevag_instance, hevag_input.data(), hevag_input.size(),
+      hevag_output.data(), sizeof(hevag_output), hevag_decode_result.data());
+  Require("SystemLibraryState", "AJM HE-VAG decoder",
+          hevag_step_init == OK && hevag_step_register == OK &&
+              hevag_step_create == OK && hevag_step_batch == OK &&
+              hevag_step_codec_init == OK &&
+              *reinterpret_cast<const int32_t *>(hevag_init_result.data()) ==
+                  OK &&
+              hevag_step_decode == OK &&
+              *reinterpret_cast<const int32_t *>(hevag_decode_result.data()) ==
+                  OK &&
+              std::any_of(
+                  hevag_output.begin(), hevag_output.end(),
+                  [](float value) { return std::abs(value) > 0.000001f; }) &&
+              ajm_instance_destroy(hevag_context, hevag_instance) == OK &&
+              ajm_module_unregister(hevag_context, 22) == OK &&
+              ajm_finalize(hevag_context) == OK,
+          "AJM HE-VAG initialization or ADPCM PSX conversion failed");
+
+  struct Audio3dOpenParamsAbi {
+    size_t size;
+    uint32_t granularity;
+    uint32_t rate;
+    uint32_t max_objects;
+    uint32_t queue_depth;
+    uint32_t buffer_mode;
+    uint32_t pad;
+  };
+  struct Audio3dPcmAbi {
+    uint32_t format;
+    uint32_t reserved;
+    const void *samples;
+    uint32_t num_samples;
+    uint32_t reserved2;
+  };
+  struct Audio3dAttributeAbi {
+    uint32_t attribute_id;
+    uint32_t reserved;
+    const void *value;
+    size_t value_size;
+  };
+  using Audio3dDefaultsFn = void(KYTY_SYSV_ABI *)(Audio3dOpenParamsAbi *);
+  using Audio3dOpenFn =
+      int(KYTY_SYSV_ABI *)(int, const Audio3dOpenParamsAbi *, uint32_t *);
+  using Audio3dPortFn = int(KYTY_SYSV_ABI *)(uint32_t);
+  using Audio3dReserveFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t *);
+  using Audio3dUnreserveFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t);
+  using Audio3dSetAttributesFn = int(KYTY_SYSV_ABI *)(
+      uint32_t, uint32_t, size_t, const Audio3dAttributeAbi *);
+  using Audio3dPushFn = int(KYTY_SYSV_ABI *)(uint32_t, uint32_t);
+  const auto audio3d_defaults =
+      reinterpret_cast<Audio3dDefaultsFn>(find("Im+jOoa5WAI"));
+  const auto audio3d_open =
+      reinterpret_cast<Audio3dOpenFn>(find("XeDDK0xJWQA"));
+  const auto audio3d_close =
+      reinterpret_cast<Audio3dPortFn>(find("OyVqOeVNtSk"));
+  const auto audio3d_reserve =
+      reinterpret_cast<Audio3dReserveFn>(find("jO2tec4dJ2M"));
+  const auto audio3d_unreserve =
+      reinterpret_cast<Audio3dUnreserveFn>(find("1HXxo-+1qCw"));
+  const auto audio3d_set_attributes =
+      reinterpret_cast<Audio3dSetAttributesFn>(find("4uyHN9q4ZeU"));
+  const auto audio3d_advance =
+      reinterpret_cast<Audio3dPortFn>(find("lw0qrdSjZt8"));
+  const auto audio3d_push =
+      reinterpret_cast<Audio3dPushFn>(find("VEVhZ9qd4ZY"));
+  Audio3dOpenParamsAbi audio3d_params{};
+  audio3d_defaults(&audio3d_params);
+  audio3d_params.max_objects = 4;
+  uint32_t audio3d_port = 0;
+  uint32_t audio3d_object = 0;
+  std::array<float, 256> audio3d_samples{};
+  audio3d_samples[0] = 0.5f;
+  const Audio3dPcmAbi audio3d_pcm{1, 0, audio3d_samples.data(),
+                                  static_cast<uint32_t>(audio3d_samples.size()),
+                                  0};
+  const Audio3dAttributeAbi audio3d_pcm_attribute{1, 0, &audio3d_pcm,
+                                                  sizeof(audio3d_pcm)};
+  Require(
+      "SystemLibraryState", "Audio3D object mixer",
+      audio3d_open(255, &audio3d_params, &audio3d_port) == OK &&
+          audio3d_reserve(audio3d_port, &audio3d_object) == OK &&
+          audio3d_set_attributes(audio3d_port, audio3d_object, 1,
+                                 &audio3d_pcm_attribute) == OK &&
+          audio3d_advance(audio3d_port) == OK &&
+          audio3d_push(audio3d_port, 1) == OK &&
+          audio3d_unreserve(audio3d_port, audio3d_object) == OK &&
+          audio3d_close(audio3d_port) == OK,
+      "Audio3D object PCM staging, queue playback, or port lifecycle failed");
 
   using TtsStatusFn = int(KYTY_SYSV_ABI *)(int32_t *);
   using TtsCancelFn = int(KYTY_SYSV_ABI *)();
-  const auto tts_status =
-      reinterpret_cast<TtsStatusFn>(find("08JSg9p6bgQ"));
-  const auto tts_cancel =
-      reinterpret_cast<TtsCancelFn>(find("2jiIxUmcsGo"));
+  const auto tts_status = reinterpret_cast<TtsStatusFn>(find("08JSg9p6bgQ"));
+  const auto tts_cancel = reinterpret_cast<TtsCancelFn>(find("2jiIxUmcsGo"));
   int32_t speech_status = -1;
   Require("SystemLibraryState", "TextToSpeech2 offline state",
           tts_status(nullptr) != OK && tts_status(&speech_status) == OK &&
@@ -15181,8 +15575,8 @@ void CheckSystemLibraryStateContracts() {
     uint64_t virtual_address_start;
   };
   using PsmlInitFn = int(KYTY_SYSV_ABI *)();
-  using PsmlSharedInitFn = int(KYTY_SYSV_ABI *)(void *,
-                                                const PsmlSharedParamsAbi *);
+  using PsmlSharedInitFn =
+      int(KYTY_SYSV_ABI *)(void *, const PsmlSharedParamsAbi *);
   using PsmlObjectFn = int(KYTY_SYSV_ABI *)(void *);
   using PsmlContextInitFn = int(KYTY_SYSV_ABI *)(void *, const void *);
   using PsmlDispatchFn = int(KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t);
@@ -15200,8 +15594,7 @@ void CheckSystemLibraryStateContracts() {
       reinterpret_cast<PsmlDispatchFn>(find("RUNLFro+qok"));
   const auto psml_progress =
       reinterpret_cast<PsmlProgressFn>(find("GHna9-DvnUk"));
-  const auto psml_capture =
-      reinterpret_cast<PsmlObjectFn>(find("GJY0MvuTcs8"));
+  const auto psml_capture = reinterpret_cast<PsmlObjectFn>(find("GJY0MvuTcs8"));
   alignas(16) std::array<uint8_t, 0x600> psml_resources{};
   alignas(16) std::array<uint8_t, 0x600> psml_context{};
   const PsmlDirectBlockAbi psml_block{0x100000000ull, 0x200000ull};
@@ -15211,26 +15604,27 @@ void CheckSystemLibraryStateContracts() {
   *reinterpret_cast<void **>(psml_context_params.data() + 8) =
       psml_resources.data();
   float psml_progress_value = -1.0f;
-  Require("SystemLibraryState", "PSML synchronous state",
-          psml_init() == OK &&
-              psml_shared_init(psml_resources.data(), &psml_shared_params) == OK &&
-              psml_context_init(psml_context.data(),
-                                psml_context_params.data()) == OK &&
-              psml_capture(psml_context.data()) == OK &&
-              psml_dispatch(psml_context.data(), 1, 1) == OK &&
-              psml_progress(psml_context.data(), &psml_progress_value, 0) == OK &&
-              psml_progress_value == 1.0f &&
-              psml_context_finalize(psml_context.data()) == OK &&
-              psml_shared_finalize(psml_resources.data()) == OK,
-          "PSML object lifecycle, dispatch progress, or capture request failed");
+  Require(
+      "SystemLibraryState", "PSML synchronous state",
+      psml_init() == OK &&
+          psml_shared_init(psml_resources.data(), &psml_shared_params) == OK &&
+          psml_context_init(psml_context.data(), psml_context_params.data()) ==
+              OK &&
+          psml_capture(psml_context.data()) == OK &&
+          psml_dispatch(psml_context.data(), 1, 1) == OK &&
+          psml_progress(psml_context.data(), &psml_progress_value, 0) == OK &&
+          psml_progress_value == 1.0f &&
+          psml_context_finalize(psml_context.data()) == OK &&
+          psml_shared_finalize(psml_resources.data()) == OK,
+      "PSML object lifecycle, dispatch progress, or capture request failed");
 
   struct CesOpaqueStorageAbi {
     void *system_use[32];
   };
-  using CesProfileInitFn = CesOpaqueStorageAbi *(KYTY_SYSV_ABI *)(
-      CesOpaqueStorageAbi *);
-  using CesContextInitFn = int(KYTY_SYSV_ABI *)(
-      CesOpaqueStorageAbi *, const CesOpaqueStorageAbi *);
+  using CesProfileInitFn =
+      CesOpaqueStorageAbi *(KYTY_SYSV_ABI *)(CesOpaqueStorageAbi *);
+  using CesContextInitFn =
+      int(KYTY_SYSV_ABI *)(CesOpaqueStorageAbi *, const CesOpaqueStorageAbi *);
   const auto ces_profile_init =
       reinterpret_cast<CesProfileInitFn>(find("ZiDCxUUGbec"));
   const auto ces_context_init =

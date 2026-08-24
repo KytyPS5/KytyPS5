@@ -5,7 +5,7 @@ Base revisada: `6eed46b`
 
 ## Actualización 2026-08-24
 
-Estado actual sobre `b9480fa`, rama `gods-will/runtime-compatibility`:
+Estado actual sobre `75b1c11`, rama `gods-will/runtime-compatibility`:
 
 - **Imports opcionales:** los 61 imports observados de NP, Commerce, Entitlements, Manager,
   Signaling, Trophy, WebApi y JSON tienen resolución local. Las rutas online conservan estado
@@ -13,21 +13,21 @@ Estado actual sobre `b9480fa`, rama `gods-will/runtime-compatibility`:
 - **GPU:** la matriz cubre 509 opcodes; los 61 ALU pendientes ya tienen lowering y regresiones.
   No quedan pendientes en ALU, float, memory, image o graphics de esa matriz. `S_SETPC_B64`
   cubre destinos estáticos, dinámicos y tablas de salto; PM4 indirecto cubre CX, SH y UC.
-- **Audio:** ACM incluye FFT/IFFT fp32/fp16 y panner CPU; NGS2 incluye WAV PCM, bloques,
-  listener, paneo, distancia, cono y doppler; AJM incluye LPCM (23) con S16/S32/float.
-- **Servicios offline:** RUDP valida lifecycle/callback; PSML mantiene objetos, dispatch,
-  progreso y capture state; TextToSpeech2 mantiene estado/cancelación; CES mantiene sus dos
-  contextos observados. Ninguno intenta PSN.
+- **Audio:** ACM incluye FFT/IFFT fp32/fp16, panner y convolution reverb por overlap-add;
+  Audio3D mezcla beds/objetos y entrega PCM a SDL; NGS2 reproduce PCM y VAG/HE-VAG en racks
+  sampler estándar y custom. AJM incluye LPCM (23) y HE-VAG (22) nativo.
+- **Servicios offline:** RUDP implementa contextos, bind, pairing local, mensajes, polling y
+  opciones sin PSN; PSML mantiene objetos, dispatch, progreso y solicitud de captura;
+  TextToSpeech2 mantiene el ABI observado de estado/cancelación; CES mantiene sus dos contextos.
 - **Pruebas:** pasan `shader_recompiler_compute_tests.exe`, `shader_cfg_tests.exe` y
   `kernel_file_system_tests.exe`; `kyty_emulator.exe` compila y se instala.
-- **Castlevania Dominus Collection 01.003:** llega al título a ~60 FPS. Después de entrar y
-  seleccionar un juego, Windows confirma `0xc0000005` por ejecución de dirección nula. Dump:
-  `C:\Users\TechX\AppData\Local\CrashDumps\kyty_emulator.exe.35036.dmp`. La repetición
-  estricta genera `kyty_emulator.exe.50000.dmp` y `_TempData/castlevania-post-title.log`.
-  El último PLT observado de `dra03.prx`, `MQFPAqQPt1s#F#G`, corresponde a
-  `libc::__cxa_decrement_exception_refcount`; libc registra ahora ese NID y su par de incremento
-  como shims conservadores. El handler nativo registra registros, pila y frames legibles cuando
-  una excepción no es atendida.
+- **Castlevania Dominus Collection 01.003:** llega al título y entra a Dawn of Sorrow a 60 FPS
+  sin repetir el antiguo `0xc0000005`. La música del título usa
+  VAGp HE-VAG estéreo a 44.1 kHz; `sceNgs2ParseWaveformData` devuelve ahora tipo `0x1c`, dos
+  bloques y el bucle embebido, donde antes devolvía formato cero y ningún bloque. Evidencia:
+  `_TempData/castlevania-hevag-guest.log`. La ruta PCM continua usada dentro del juego conserva
+  ahora la voz al esperar datos y recicla los bloques ya consumidos; el usuario confirmó música
+  audible en gameplay además del título y los efectos. Falta una partida prolongada.
 
 Audio y servicios se contrastaron explícitamente con SDK 10, porque el índice local disponible
 de SDK 12 no contiene esos contratos. Archivo consultado:
@@ -122,18 +122,17 @@ concreto es su fallback genérico para imports no resueltos.
 
 ## Pendientes priorizados actuales
 
-1. **Castlevania:** repetir la selección con el nuevo diagnóstico, confirmar si el import de
-   excepciones C++ era causal y localizar la llamada nula si persiste. Los dumps anteriores no
-   incluyen el guest stack necesario; la prueba interactiva queda aplazada mientras el usuario
-   está AFK.
+1. **Castlevania:** completar una partida prolongada. El título, la selección y Dawn of Sorrow
+   mantienen audio y 60 FPS; no reapareció el antiguo `0xc0000005` durante esta prueba.
 2. **Partidas completas:** ejecutar recorridos jugables prolongados en los diez títulos de
    `F:\APPs_IA\SharpEMU\Game`; llegar al título no equivale a completar una partida.
-3. **Audio avanzado:** kernel real de ACM convolution reverb, módulos custom NGS2 y render
-   audible de Audio3D; la cola de Audio3D todavía simula reproducción.
-4. **Codecs:** CELP/HEVAG y cualquier codec adicional observado en trazas reales. LPCM, MP3,
-   ATRAC9, AAC y Opus ya tienen rutas conocidas.
-5. **Servicios con backend local:** transporte RUDP, captura Share/PSML y síntesis TTS. Nunca
-   deben conectarse a la red oficial.
+3. **Audio avanzado:** validar Audio3D con un título real y ampliar módulos custom NGS2 solo al
+   aparecer controles no cubiertos en trazas. Convolution reverb y HE-VAG ya están implementados.
+4. **Codecs:** CELP8/CELP16 siguen pendientes: los perfiles MPE/RPE son propietarios y no existe
+   un decodificador verificable en las dependencias actuales. No se añadirá audio ficticio.
+5. **Servicios locales:** Share/PSML no tienen todavía una fuente de framebuffer/codificador para
+   crear artefactos de captura; TextToSpeech2 no ha expuesto en trazas una ABI de síntesis, solo
+   estado/cancelación. RUDP local ya está implementado. Nunca se conectarán a la red oficial.
 6. **GPU no reproducida:** ampliar PM4/ISA cuando una traza válida revele un caso nuevo; la
    matriz actual ya no tiene opcodes pendientes.
 

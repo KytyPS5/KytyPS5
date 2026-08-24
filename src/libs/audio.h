@@ -272,7 +272,9 @@ int KYTY_SYSV_ABI      AvPlayerSetLogCallback(void* callback, void* user_data);
 namespace Audio3d {
 
 struct Audio3dOpenParameters;
+struct Audio3dAttribute;
 
+void               Shutdown();
 int KYTY_SYSV_ABI  Audio3dInitialize(int64_t reserved);
 void KYTY_SYSV_ABI Audio3dGetDefaultOpenParameters(Audio3dOpenParameters* p);
 int KYTY_SYSV_ABI  Audio3dPortOpen(int user_id, const Audio3dOpenParameters* parameters,
@@ -283,6 +285,21 @@ int KYTY_SYSV_ABI  Audio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_le
                                             uint32_t* queue_available);
 int KYTY_SYSV_ABI  Audio3dPortAdvance(uint32_t port_id);
 int KYTY_SYSV_ABI  Audio3dPortPush(uint32_t port_id, uint32_t blocking);
+int KYTY_SYSV_ABI  Audio3dPortClose(uint32_t port_id);
+int KYTY_SYSV_ABI  Audio3dObjectReserve(uint32_t port_id, uint32_t* object_id);
+int KYTY_SYSV_ABI  Audio3dObjectUnreserve(uint32_t port_id, uint32_t object_id);
+int KYTY_SYSV_ABI  Audio3dObjectSetAttributes(uint32_t port_id, uint32_t object_id,
+                                              size_t                  num_attributes,
+                                              const Audio3dAttribute* attributes);
+int KYTY_SYSV_ABI  Audio3dBedWrite(uint32_t port_id, uint32_t num_channels, uint32_t format,
+                                   const void* buffer, uint32_t num_samples);
+int KYTY_SYSV_ABI  Audio3dBedWrite2(uint32_t port_id, uint32_t num_channels, uint32_t format,
+                                    const void* buffer, uint32_t num_samples, uint32_t output_route,
+                                    bool restricted);
+int KYTY_SYSV_ABI Audio3dAudioOutOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                      uint32_t param);
+int32_t KYTY_SYSV_ABI Audio3dAudioOutOutput(int32_t handle, const void* data);
+int32_t KYTY_SYSV_ABI Audio3dAudioOutOutputs(AudioOut::AudioOutOutputParam* params, uint32_t num);
 
 } // namespace Audio3d
 

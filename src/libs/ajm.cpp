@@ -324,6 +324,7 @@ protected:
 
 #include "libs/ajm/aac_decoder.h"
 #include "libs/ajm/atrac9_decoder.h"
+#include "libs/ajm/hevag_decoder.h"
 #include "libs/ajm/mp3_decoder.h"
 
 namespace Libs::Audio::Ajm {
@@ -654,7 +655,7 @@ static bool AjmCodecIsSupported(uint32_t codec) {
 	       codec == static_cast<uint32_t>(AjmCodec::DecAt9) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecM4aac) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecLpcm) ||
-	       codec == static_cast<uint32_t>(AjmCodec::DecOpus) ||
+	       codec == static_cast<uint32_t>(AjmCodec::DecOpus) || codec == 22 ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecUnknownNewABI);
 }
 
@@ -694,6 +695,7 @@ static std::unique_ptr<AjmDecoder> AjmCreateDecoder(uint32_t codec, uint64_t fla
 			return std::make_unique<AjmLpcmDecoder>(channels, 48000, encoding);
 		case static_cast<uint32_t>(AjmCodec::DecOpus):
 			return std::make_unique<AjmOpusDecoder>(channels, 48000, encoding, flags);
+		case 22: return std::make_unique<AjmHeVagDecoder>(channels, 48000, encoding, flags);
 		default: break;
 	}
 

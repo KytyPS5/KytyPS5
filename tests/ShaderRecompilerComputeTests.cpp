@@ -14954,6 +14954,136 @@ void CheckSystemLibraryStateContracts() {
               std::abs(pan_matrix[1] - 0.7071067f) < 0.0001f,
           "NGS2 PCM WAV parsing, block calculation, or equal-power pan failed");
 
+  struct Ngs2ContextBufferInfoAbi {
+    void *host_buffer;
+    size_t host_buffer_size;
+    uintptr_t reserved[5];
+    uintptr_t user_data;
+  };
+  struct Ngs2RenderBufferInfoAbi {
+    void *buffer;
+    size_t buffer_size;
+    uint32_t waveform_type;
+    uint32_t num_channels;
+  };
+  union Ngs2CommandValueAbi {
+    float f;
+    uint32_t u;
+    uint64_t w;
+    const void *p;
+  };
+  struct Ngs2CommandParamAbi {
+    uint32_t param_id;
+    uint8_t flags;
+    uint8_t value_type;
+    uint16_t num_values;
+    Ngs2CommandValueAbi value;
+  };
+  using Ngs2SystemQueryBufferFn =
+      int(KYTY_SYSV_ABI *)(const void *, Ngs2ContextBufferInfoAbi *);
+  using Ngs2SystemCreateFn = int(KYTY_SYSV_ABI *)(
+      const void *, const Ngs2ContextBufferInfoAbi *, uintptr_t *);
+  using Ngs2RackQueryBufferFn =
+      int(KYTY_SYSV_ABI *)(uint32_t, const void *, Ngs2ContextBufferInfoAbi *);
+  using Ngs2RackCreateFn =
+      int(KYTY_SYSV_ABI *)(uintptr_t, uint32_t, const void *,
+                           const Ngs2ContextBufferInfoAbi *, uintptr_t *);
+  using Ngs2RackGetVoiceFn =
+      int(KYTY_SYSV_ABI *)(uintptr_t, uint32_t, uintptr_t *);
+  using Ngs2VoiceRunCommandsFn =
+      int(KYTY_SYSV_ABI *)(uintptr_t, const Ngs2CommandParamAbi *, size_t);
+  using Ngs2SystemRenderFn = int(KYTY_SYSV_ABI *)(
+      uintptr_t, const Ngs2RenderBufferInfoAbi *, uint32_t);
+  using Ngs2RackDestroyFn =
+      int(KYTY_SYSV_ABI *)(uintptr_t, Ngs2ContextBufferInfoAbi *);
+  using Ngs2SystemDestroyFn =
+      int(KYTY_SYSV_ABI *)(uintptr_t, Ngs2ContextBufferInfoAbi *);
+  const auto ngs2_system_query =
+      reinterpret_cast<Ngs2SystemQueryBufferFn>(find("pgFAiLR5qT4"));
+  const auto ngs2_system_create =
+      reinterpret_cast<Ngs2SystemCreateFn>(find("koBbCMvOKWw"));
+  const auto ngs2_rack_query =
+      reinterpret_cast<Ngs2RackQueryBufferFn>(find("0eFLVCfWVds"));
+  const auto ngs2_rack_create =
+      reinterpret_cast<Ngs2RackCreateFn>(find("cLV4aiT9JpA"));
+  const auto ngs2_rack_get_voice =
+      reinterpret_cast<Ngs2RackGetVoiceFn>(find("MwmHz8pAdAo"));
+  const auto ngs2_voice_commands =
+      reinterpret_cast<Ngs2VoiceRunCommandsFn>(find("AbYvTOZ8Pts"));
+  const auto ngs2_render =
+      reinterpret_cast<Ngs2SystemRenderFn>(find("i0VnXM-C9fc"));
+  const auto ngs2_rack_destroy =
+      reinterpret_cast<Ngs2RackDestroyFn>(find("lCqD7oycmIM"));
+  const auto ngs2_system_destroy =
+      reinterpret_cast<Ngs2SystemDestroyFn>(find("u-WrYDaJA3k"));
+
+  Ngs2ContextBufferInfoAbi ngs2_system_buffer{};
+  uintptr_t ngs2_system = 0;
+  const bool ngs2_system_sized =
+      ngs2_system_query(nullptr, &ngs2_system_buffer) == OK &&
+      ngs2_system_buffer.host_buffer_size != 0;
+  std::vector<uint64_t> ngs2_system_storage(
+      (ngs2_system_buffer.host_buffer_size + sizeof(uint64_t) - 1) /
+      sizeof(uint64_t));
+  ngs2_system_buffer.host_buffer = ngs2_system_storage.data();
+  const bool ngs2_system_created =
+      ngs2_system_sized &&
+      ngs2_system_create(nullptr, &ngs2_system_buffer, &ngs2_system) == OK &&
+      ngs2_system != 0;
+
+  Ngs2ContextBufferInfoAbi ngs2_rack_buffer{};
+  uintptr_t ngs2_rack = 0;
+  const bool ngs2_rack_sized =
+      ngs2_system_created &&
+      ngs2_rack_query(0x1000, nullptr, &ngs2_rack_buffer) == OK &&
+      ngs2_rack_buffer.host_buffer_size != 0;
+  std::vector<uint64_t> ngs2_rack_storage(
+      (ngs2_rack_buffer.host_buffer_size + sizeof(uint64_t) - 1) /
+      sizeof(uint64_t));
+  ngs2_rack_buffer.host_buffer = ngs2_rack_storage.data();
+  const bool ngs2_rack_created =
+      ngs2_rack_sized &&
+      ngs2_rack_create(ngs2_system, 0x1000, nullptr, &ngs2_rack_buffer,
+                       &ngs2_rack) == OK &&
+      ngs2_rack != 0;
+
+  uintptr_t ngs2_voice = 0;
+  const std::array<int16_t, 4> ngs2_pcm = {32767, -32768, 16384, -16384};
+  const Ngs2WaveformFormatAbi ngs2_pcm_format{0x12, 2, 48000, 0, 0, 0};
+  const Ngs2WaveformBlockAbi ngs2_pcm_block{0,     sizeof(ngs2_pcm), 0, 0, 2, 0,
+                                            0x1234};
+  std::array<Ngs2CommandParamAbi, 4> ngs2_commands{};
+  ngs2_commands[0] = {0x00010000, 0, 0x42, 0, {.p = &ngs2_pcm_format}};
+  ngs2_commands[1] = {0x00010002, 0, 0x06, 0, {.p = ngs2_pcm.data()}};
+  ngs2_commands[2] = {0x00010001, 0x04, 0x81, 1, {.p = &ngs2_pcm_block}};
+  ngs2_commands[3] = {0x00000002, 0, 0x04, 0, {.u = 0x0001}};
+  std::array<float, 16> ngs2_output{};
+  const Ngs2RenderBufferInfoAbi ngs2_render_buffer{
+      ngs2_output.data(), sizeof(ngs2_output), 0x18, 8};
+  const bool ngs2_mixer_ok =
+      ngs2_rack_created &&
+      ngs2_rack_get_voice(ngs2_rack, 0, &ngs2_voice) == OK && ngs2_voice != 0 &&
+      ngs2_voice_commands(ngs2_voice, ngs2_commands.data(),
+                          ngs2_commands.size()) == OK &&
+      ngs2_render(ngs2_system, &ngs2_render_buffer, 1) == OK &&
+      std::abs(ngs2_output[0] - 32767.0f / 32768.0f) < 0.0001f &&
+      std::abs(ngs2_output[1] + 1.0f) < 0.0001f &&
+      std::all_of(
+          ngs2_output.begin() + 2, ngs2_output.begin() + 8,
+          [](float value) { return value == 0.0f; }) &&
+      std::abs(ngs2_output[8] - 0.5f) < 0.0001f &&
+      std::abs(ngs2_output[9] + 0.5f) < 0.0001f &&
+      std::all_of(
+          ngs2_output.begin() + 10, ngs2_output.end(),
+          [](float value) { return value == 0.0f; });
+  const bool ngs2_destroyed = ngs2_rack_created &&
+                              ngs2_rack_destroy(ngs2_rack, nullptr) == OK &&
+                              ngs2_system_destroy(ngs2_system, nullptr) == OK;
+  Require("SystemLibraryState", "NGS2 PCM command mixer",
+          ngs2_mixer_ok && ngs2_destroyed,
+          "NGS2 player commands did not produce the expected 8-channel float "
+          "output");
+
   struct AjmBatchInfoAbi {
     void *buffer;
     size_t offset;

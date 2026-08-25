@@ -77,7 +77,15 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
-		std::lock_guard<std::recursive_mutex> guest_as_lock(Libs::LibKernel::Memory::GetGuestAddressSpaceMutex());
+		// Only the clear phase runs an mprotect (under the region locks), so the guest
+		// address-space mutex (see InvalidateRegion) is required for that path alone. Read-only
+		// downloads must not hold it while the callback runs, or a disjoint-region GPU
+		// modification would serialize behind the download.
+		std::unique_lock<std::recursive_mutex> guest_as_lock(
+		    Libs::LibKernel::Memory::GetGuestAddressSpaceMutex(), std::defer_lock);
+		if constexpr (clear) {
+			guest_as_lock.lock();
+		}
 		std::vector<RegionManager*> managers;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
 			managers.push_back(manager);

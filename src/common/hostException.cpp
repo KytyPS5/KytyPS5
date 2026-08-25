@@ -92,7 +92,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
-void SetupSignalStack() {}
+void SetupSignalStack() noexcept {}
 
 #elif defined(__APPLE__)
 
@@ -165,7 +165,7 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	sigaction(sig, &dfl, nullptr);
 }
 
-void SetupSignalStack() {}
+void SetupSignalStack() noexcept {}
 
 #else
 

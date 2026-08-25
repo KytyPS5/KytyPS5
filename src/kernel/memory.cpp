@@ -3688,6 +3688,10 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 // same mutex. The mutex is recursive because a sweep both acquires it and runs an mprotect that
 // re-acquires it on the same thread.
 std::recursive_mutex& GetGuestAddressSpaceMutex() {
+	static std::recursive_mutex fallback;
+	if (g_guest_address_space == nullptr) {
+		return fallback;
+	}
 	return g_guest_address_space->GetMutex();
 }
 

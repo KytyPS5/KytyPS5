@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -821,6 +822,11 @@ namespace Libs::LibKernel::Memory {
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
                             Common::VirtualMemory::Mode mode) {
   return ProtectAddressSpace(vaddr, size, mode);
+}
+
+std::recursive_mutex &GetGuestAddressSpaceMutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
 }
 
 } // namespace Libs::LibKernel::Memory

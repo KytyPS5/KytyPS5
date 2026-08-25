@@ -17,8 +17,7 @@ namespace Sync {
                                            uint64_t& value);
 [[nodiscard]] uint64_t ReadReferenceClock();
 
-void TriggerAgcUserInterrupt();
-void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id);
+void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id);
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                         uint32_t value);
@@ -35,16 +34,16 @@ void WriteAtEndOfPipeWithWriteBack32(uint64_t submit_id, CommandBuffer& buffer,
 void WriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
                                      uint64_t* dst_gpu_addr, uint64_t value);
 void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint32_t* dst_gpu_addr, uint32_t value,
+                                     uint32_t* dst_gpu_addr, uint32_t value, int event_id,
                                      uint32_t context_id = 0);
 void WriteAtEndOfPipeWithInterrupt64(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint64_t* dst_gpu_addr, uint64_t value,
+                                     uint64_t* dst_gpu_addr, uint64_t value, int event_id,
                                      uint32_t context_id = 0);
 void WriteAtEndOfPipeWithInterruptWriteBack32(uint64_t submit_id, CommandBuffer& buffer,
-                                              uint32_t* dst_gpu_addr, uint32_t value,
+                                              uint32_t* dst_gpu_addr, uint32_t value, int event_id,
                                               uint32_t context_id = 0);
 void WriteAtEndOfPipeWithInterruptWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
-                                              uint64_t* dst_gpu_addr, uint64_t value,
+                                              uint64_t* dst_gpu_addr, uint64_t value, int event_id,
                                               uint32_t context_id = 0);
 
 [[nodiscard]] uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index,
@@ -57,11 +56,12 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuffer& buffer,
                                                   uint32_t* dst_gpu_addr, uint32_t value,
                                                   int handle, int index, int flip_mode,
-                                                  int64_t flip_arg, uint64_t request_id);
+                                                  int64_t flip_arg, uint64_t request_id,
+                                                  int event_id);
 
 int  AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
                 void* udata);
-int  DeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id);
+int  DeleteEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id);
 void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
 
 } // namespace Sync

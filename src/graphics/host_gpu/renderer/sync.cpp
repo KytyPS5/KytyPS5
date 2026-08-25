@@ -20,9 +20,7 @@
 
 namespace Libs::Graphics::Sync {
 
-constexpr int      GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT = 0x00;
-constexpr int      GRAPHICS_EVENT_EOP                       = 0x40;
-constexpr uint64_t GRAPHICS_REFERENCE_CLOCK_FREQUENCY       = 100000000;
+constexpr uint64_t GRAPHICS_REFERENCE_CLOCK_FREQUENCY = 100000000;
 
 bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t& value) {
 	if (host_frequency == 0) {
@@ -66,8 +64,9 @@ struct EndOfPipeSignal {
 	std::array<uint32_t, 4> debug_args      = {};
 	uint64_t                debug_data      = 0;
 	std::optional<uint64_t> destination;
-	EndOfPipeCompletion     completion      = EndOfPipeCompletion::None;
-	uint64_t                completion_data = 0;
+	EndOfPipeCompletion     completion         = EndOfPipeCompletion::None;
+	uint64_t                completion_data    = 0;
+	int                     interrupt_event_id = 0;
 };
 
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
@@ -96,8 +95,10 @@ static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
 		case EndOfPipeCompletion::None: return;
 		case EndOfPipeCompletion::Interrupt: {
 			const auto context_id = static_cast<uint32_t>(signal.completion_data);
-			scheduler.DeferPriorityOperation(
-			    [&renderer, context_id] { renderer.TriggerEopEvent(context_id); });
+			const auto event_id   = signal.interrupt_event_id;
+			scheduler.DeferPriorityOperation([&renderer, event_id, context_id] {
+				renderer.TriggerInterrupt(event_id, context_id);
+			});
 			return;
 		}
 		case EndOfPipeCompletion::Flip: {
@@ -108,9 +109,10 @@ static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
 		}
 		case EndOfPipeCompletion::FlipAndInterrupt: {
 			const auto request_id = signal.completion_data;
-			scheduler.DeferPriorityOperation([&renderer, request_id] {
+			const auto event_id   = signal.interrupt_event_id;
+			scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
 				renderer.GetVideoOut().CompleteFlip(request_id);
-				renderer.TriggerEopEvent(0);
+				renderer.TriggerInterrupt(event_id, 0);
 			});
 			return;
 		}
@@ -135,7 +137,8 @@ static bool TriggersInterrupt(EndOfPipeWriteAction action) {
 
 static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint64_t destination,
                                  uint64_t value, EndOfPipeWriteSize size,
-                                 EndOfPipeWriteAction action, uint32_t context_id = 0) {
+                                 EndOfPipeWriteAction action, int interrupt_event_id = 0,
+                                 uint32_t context_id = 0) {
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
 	const auto value_high = static_cast<uint32_t>(value >> 32u);
@@ -150,16 +153,10 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 	    .debug_data      = destination,
 	    .destination     = destination,
 	    .completion      = interrupt ? EndOfPipeCompletion::Interrupt : EndOfPipeCompletion::None,
-	    .completion_data = context_id != 0 ? context_id : value,
+	    .completion_data = interrupt ? context_id : value,
+	    .interrupt_event_id = interrupt_event_id,
 	};
 	RecordEndOfPipeSignal(signal);
-}
-
-void TriggerAgcUserInterrupt() {
-	auto tsc    = LibKernel::KernelReadTsc();
-	auto result = LibKernel::EventQueue::KernelTriggerUserEventForAll(AGC_USER_INTERRUPT_EVENT,
-	                                                                  reinterpret_cast<void*>(tsc));
-	EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_ENOENT);
 }
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -220,31 +217,35 @@ void WriteAtEndOfPipeWithWriteBack32(uint64_t submit_id, CommandBuffer& buffer,
 }
 
 void WriteAtEndOfPipeWithInterruptWriteBack64(uint64_t submit_id, CommandBuffer& buffer,
-                                              uint64_t* dst_gpu_addr, uint64_t value,
+                                              uint64_t* dst_gpu_addr, uint64_t value, int event_id,
                                               uint32_t context_id) {
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::InterruptWriteBack,
-	                     context_id);
+	                     event_id, context_id);
 }
 
 void WriteAtEndOfPipeWithInterruptWriteBack32(uint64_t submit_id, CommandBuffer& buffer,
-                                              uint32_t* dst_gpu_addr, uint32_t value,
+                                              uint32_t* dst_gpu_addr, uint32_t value, int event_id,
                                               uint32_t context_id) {
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::InterruptWriteBack,
-	                     context_id);
+	                     event_id, context_id);
 }
 
 void WriteAtEndOfPipeWithInterrupt64(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint64_t* dst_gpu_addr, uint64_t value, uint32_t context_id) {
+                                     uint64_t* dst_gpu_addr, uint64_t value, int event_id,
+                                     uint32_t context_id) {
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Interrupt, context_id);
+	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Interrupt, event_id,
+	                     context_id);
 }
 
 void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
-                                     uint32_t* dst_gpu_addr, uint32_t value, uint32_t context_id) {
+                                     uint32_t* dst_gpu_addr, uint32_t value, int event_id,
+                                     uint32_t context_id) {
 	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
-	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::Interrupt, context_id);
+	                     EndOfPipeWriteSize::Dword, EndOfPipeWriteAction::Interrupt, event_id,
+	                     context_id);
 }
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
@@ -270,18 +271,20 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuffer& buffer,
                                                   uint32_t* dst_gpu_addr, uint32_t value,
                                                   int handle, int index, int flip_mode,
-                                                  int64_t flip_arg, uint64_t request_id) {
+                                                  int64_t flip_arg, uint64_t request_id,
+                                                  int event_id) {
 	const auto destination = reinterpret_cast<uint64_t>(dst_gpu_addr);
 	RecordEndOfPipeSignal({
-	    .buffer          = &buffer,
-	    .submit_id       = submit_id,
-	    .debug_operation = CommandBufferDebugOp::EopWriteBackFlip,
-	    .debug_args      = {static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                        static_cast<uint32_t>(flip_mode), value},
-	    .debug_data      = static_cast<uint64_t>(flip_arg),
-	    .destination     = destination,
-	    .completion      = EndOfPipeCompletion::FlipAndInterrupt,
-	    .completion_data = request_id,
+	    .buffer             = &buffer,
+	    .submit_id          = submit_id,
+	    .debug_operation    = CommandBufferDebugOp::EopWriteBackFlip,
+	    .debug_args         = {static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
+	                           static_cast<uint32_t>(flip_mode), value},
+	    .debug_data         = static_cast<uint64_t>(flip_arg),
+	    .destination        = destination,
+	    .completion         = EndOfPipeCompletion::FlipAndInterrupt,
+	    .completion_data    = request_id,
+	    .interrupt_event_id = event_id,
 	});
 }
 
@@ -316,36 +319,24 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 	});
 }
 
-void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id) {
+void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
 	ValidateEndOfPipeSignal({.buffer = &buffer});
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 	scheduler.DeferPriorityOperation(
-	    [&renderer, context_id] { renderer.TriggerEopEvent(context_id); });
+	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
 }
 
-static void EopEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
+static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {
 	EXIT_IF(event == nullptr);
 	event->triggered    = false;
 	event->event.fflags = 0;
 	event->event.data   = 0;
 }
 
-static void EopEventDeleteFunc(LibKernel::EventQueue::KernelEqueue       eq,
-                               LibKernel::EventQueue::KernelEqueueEvent* event) {
-	EXIT_IF(event == nullptr);
-	EXIT_NOT_IMPLEMENTED(event->event.filter != LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS);
-	if (event->event.ident == GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT ||
-	    event->event.ident == GRAPHICS_EVENT_EOP) {
-		auto* renderer = static_cast<RenderContext*>(event->filter.data);
-		EXIT_IF(renderer == nullptr);
-		renderer->DeleteEopEq(eq, static_cast<int>(event->event.ident));
-	}
-}
-
-static void EopEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
-                                void*                                     trigger_data) {
+static void InterruptEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
+                                      void*                                     trigger_data) {
 	EXIT_IF(event == nullptr);
 
 	auto triggered_event = event->event;
@@ -362,30 +353,30 @@ static void EopEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* event,
 int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
                void* udata) {
 	LibKernel::EventQueue::KernelEqueueEvent event;
-	event.triggered                = false;
-	event.event.ident              = static_cast<uintptr_t>(id);
-	event.event.filter             = LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS;
-	event.event.udata              = udata;
-	event.event.fflags             = 0;
-	event.event.data               = id;
-	event.filter.delete_event_func = EopEventDeleteFunc;
-	event.filter.reset_func        = EopEventResetFunc;
-	event.filter.trigger_func      = EopEventTriggerFunc;
-	event.filter.data              = &renderer;
+	event.triggered           = false;
+	event.event.ident         = static_cast<uintptr_t>(id);
+	event.event.filter        = LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS;
+	event.event.udata         = udata;
+	event.event.fflags        = 0;
+	event.event.data          = id;
+	event.filter.reset_func   = InterruptEventResetFunc;
+	event.filter.trigger_func = InterruptEventTriggerFunc;
 
 	int result = LibKernel::EventQueue::KernelAddEvent(eq, event);
 
-	if (result == 0 &&
-	    (id == GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT || id == GRAPHICS_EVENT_EOP)) {
-		renderer.AddEopEq(eq, id);
+	if (result == 0) {
+		renderer.AddInterruptEq(eq, id);
 	}
 
 	return result;
 }
 
-int DeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
+int DeleteEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id) {
 	int result = LibKernel::EventQueue::KernelDeleteEvent(
 	    eq, static_cast<uintptr_t>(id), LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS);
+	if (result == OK || result == LibKernel::KERNEL_ERROR_ENOENT) {
+		renderer.DeleteInterruptEq(eq, id);
+	}
 
 	return result;
 }

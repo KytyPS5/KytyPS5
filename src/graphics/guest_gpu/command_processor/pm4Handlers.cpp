@@ -1859,11 +1859,11 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;
 	uint32_t function    = (buffer[0] >> 8u) & 0x7u;
-	auto*    then_buffer = reinterpret_cast<uint32_t*>((buffer[7] & 0xfffffffcu) |
-	                                                   (static_cast<uint64_t>(buffer[8]) << 32u));
+	auto*    then_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[7] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[8]) << 32u));
 	uint32_t then_num_dw = buffer[9] & 0xfffffu;
-	auto*    else_buffer = reinterpret_cast<uint32_t*>((buffer[10] & 0xfffffffcu) |
-	                                                   (static_cast<uint64_t>(buffer[11]) << 32u));
+	auto*    else_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[10] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[11]) << 32u));
 	uint32_t else_num_dw = buffer[12] & 0xfffffu;
 
 	EXIT_NOT_IMPLEMENTED(compare_addr == nullptr);
@@ -1877,10 +1877,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.ProcessIndirectBuffer(then_buffer, then_num_dw);
+		cp.ProcessIndirectBuffer({then_buffer, then_num_dw});
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer(else_buffer, else_num_dw);
+		cp.ProcessIndirectBuffer({else_buffer, else_num_dw});
 	}
 
 	return payload_dw;
@@ -2321,7 +2321,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t                     indirect_num_dw = control & 0xfffffu;
 	static std::atomic<uint32_t> indirect_log_count {0};
 	if (indirect_log_count.fetch_add(1) < 128) {
@@ -2341,7 +2341,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer(indirect_buffer, indirect_num_dw);
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
 
 	return 3;
 }

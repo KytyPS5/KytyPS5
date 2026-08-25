@@ -67,7 +67,7 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
-void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer) {
+void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 
 	static std::atomic_int id = 0;
@@ -4228,37 +4228,10 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
-static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dwords) {
-	if (dcb == nullptr) {
-		return false;
-	}
-
-	for (uint32_t offset = 0; offset < size_in_dwords;) {
-		auto cmd_id = dcb[offset];
-		auto len    = KYTY_PM4_LEN(cmd_id);
-		if (len == 0 || len > size_in_dwords - offset) {
-			return false;
-		}
-
-		auto op = (cmd_id >> 8u) & 0xffu;
-		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_RELEASE_MEM && len >= 6) {
-			auto interrupt = (dcb[offset + 2] >> 24u) & 0x7u;
-			if (interrupt == 1 || interrupt == 2 || interrupt >= 4) {
-				return true;
-			}
-		}
-
-		offset += len;
-	}
-
-	return false;
-}
-
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().Submit(dcb, size_in_dwords, nullptr, 0,
-	                            !dcb_has_queued_interrupt(dcb, size_in_dwords));
+	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
@@ -4333,9 +4306,8 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
-	const bool trigger_interrupt_on_done = !dcb_has_queued_interrupt(acb, size_in_dwords);
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().SubmitCompute(queue, acb, size_in_dwords, trigger_interrupt_on_done);
+	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }
 
 static uint32_t get_driver_queue(const void* queue_context) {
@@ -4461,7 +4433,8 @@ int KYTY_SYSV_ABI AgcDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq,
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
-	return Sync::DeleteEqEvent(eq, id);
+	EXIT_IF(g_renderer == nullptr);
+	return Sync::DeleteEqEvent(*g_renderer, eq, id);
 }
 
 int KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEvent* ev) {

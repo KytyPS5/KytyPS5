@@ -42,8 +42,10 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
@@ -2051,7 +2053,7 @@ public:
 
       constexpr uint64_t release_tick = 1;
       auto &gpu_scheduler = context.GetCommandScheduler();
-      auto processor = std::make_unique<CommandProcessor>(context);
+      auto processor = std::make_unique<CommandProcessor>(context, 0);
       gpu.SendCommandSync([&] {
         processor->BufferInit();
         SubmitInfo blocked_submit;
@@ -2070,8 +2072,7 @@ public:
           processor->TriggerEvent(0x16u, 0u);
           auto packet = make_release_mem(0, 0, nullptr, 0);
           Pm4Execution execution;
-          const auto result =
-              processor->Process(execution, packet.data(), packet.size());
+          const auto result = processor->Process(execution, packet);
           processor->IncrementDe();
           const bool cache_and_counter_did_not_submit =
               result == Pm4ProcessResult::Complete &&
@@ -2081,8 +2082,8 @@ public:
           auto cb_db_release =
               make_release_mem(2, 0, &cb_db_release_label, 0, 0x14u, 0);
           Pm4Execution cb_db_execution;
-          const auto cb_db_result = processor->Process(
-              cb_db_execution, cb_db_release.data(), cb_db_release.size());
+          const auto cb_db_result =
+              processor->Process(cb_db_execution, cb_db_release);
           const bool cb_db_release_did_not_submit =
               cb_db_result == Pm4ProcessResult::Complete &&
               cb_db_release_label == 0 &&
@@ -2092,9 +2093,8 @@ public:
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
           Pm4Execution gds_interrupt_execution;
           const auto interrupt_tick = gpu_scheduler.CurrentTick();
-          const auto interrupt_result = processor->Process(
-              gds_interrupt_execution, gds_interrupt_only.data(),
-              gds_interrupt_only.size());
+          const auto interrupt_result =
+              processor->Process(gds_interrupt_execution, gds_interrupt_only);
           parser_kept_nonblocking_boundaries =
               cache_and_counter_did_not_submit &&
               cb_db_release_did_not_submit &&
@@ -2133,24 +2133,23 @@ public:
         auto immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
         Pm4Execution immediate_execution;
         const auto immediate_tick = gpu_scheduler.CurrentTick();
-        const auto immediate_result = processor->Process(
-            immediate_execution, immediate.data(), immediate.size());
+        const auto immediate_result =
+            processor->Process(immediate_execution, immediate);
         const bool immediate_split_once =
             gpu_scheduler.CurrentTick() == immediate_tick + 1;
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
         Pm4Execution gds_execution;
         const auto gds_tick = gpu_scheduler.CurrentTick();
-        const auto gds_result =
-            processor->Process(gds_execution, gds.data(), gds.size());
+        const auto gds_result = processor->Process(gds_execution, gds);
         const bool gds_waited_once =
             gpu_scheduler.CurrentTick() == gds_tick + 1;
 
         auto interrupt_only = make_release_mem(0, 4, nullptr, 0);
         Pm4Execution interrupt_execution;
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
-        const auto interrupt_result = processor->Process(
-            interrupt_execution, interrupt_only.data(), interrupt_only.size());
+        const auto interrupt_result =
+            processor->Process(interrupt_execution, interrupt_only);
         const bool interrupt_split_once =
             gpu_scheduler.CurrentTick() == interrupt_tick + 1;
 
@@ -2158,8 +2157,7 @@ public:
         Pm4Execution gds_interrupt_execution;
         const auto gds_interrupt_tick = gpu_scheduler.CurrentTick();
         const auto gds_interrupt_result =
-            processor->Process(gds_interrupt_execution, gds_interrupt.data(),
-                               gds_interrupt.size());
+            processor->Process(gds_interrupt_execution, gds_interrupt);
         const bool gds_interrupt_waited_once =
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
 
@@ -2191,6 +2189,200 @@ public:
       packet[3] = static_cast<uint32_t>(destination_address >> 32u);
       packet[4] = value;
     };
+
+    uint32_t live_graphics_value = 0;
+    std::array<uint32_t, 5> live_graphics_commands{};
+    write_packet(live_graphics_commands.data(), &live_graphics_value, 11);
+    std::binary_semaphore graphics_gate_entered{0};
+    std::binary_semaphore graphics_gate_release{0};
+    gpu.SendCommand([&] {
+      graphics_gate_entered.release();
+      graphics_gate_release.acquire();
+    });
+    gpu.Submit(live_graphics_commands, {});
+    graphics_gate_entered.acquire();
+    live_graphics_commands[4] = 22;
+    graphics_gate_release.release();
+    gpu.Done();
+    Require("GpuCommandLane", "borrowed graphics commands",
+            live_graphics_value == 22,
+            "graphics submission executed a copied PM4 stream");
+
+    uint32_t live_compute_value = 0;
+    std::array<uint32_t, 5> live_compute_commands{};
+    write_packet(live_compute_commands.data(), &live_compute_value, 33);
+    std::binary_semaphore compute_gate_entered{0};
+    std::binary_semaphore compute_gate_release{0};
+    gpu.SendCommand([&] {
+      compute_gate_entered.release();
+      compute_gate_release.acquire();
+    });
+    gpu.SubmitCompute(0x20, live_compute_commands);
+    compute_gate_entered.acquire();
+    live_compute_commands[4] = 44;
+    compute_gate_release.release();
+    gpu.Done();
+    Require("GpuCommandLane", "borrowed compute commands",
+            live_compute_value == 44,
+            "compute submission executed a copied PM4 stream");
+
+    LibKernel::EventQueue::KernelEqueue interrupt_queue =
+        LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+    uint32_t graphics_interrupt_udata = 0;
+    uint32_t compute_interrupt_udata = 0;
+    uint32_t other_compute_interrupt_udata = 0;
+    const bool interrupt_queue_ready =
+        LibKernel::EventQueue::KernelCreateEqueue(&interrupt_queue,
+                                                  "pm4-interrupts") == 0 &&
+        Sync::AddEqEvent(context, interrupt_queue, 0,
+                         &graphics_interrupt_udata) == 0 &&
+        Sync::AddEqEvent(context, interrupt_queue, 0x20,
+                         &compute_interrupt_udata) == 0 &&
+        Sync::AddEqEvent(context, interrupt_queue, 0x21,
+                         &other_compute_interrupt_udata) == 0;
+    Require("GpuCommandLane", "interrupt queue", interrupt_queue_ready,
+            "failed to register the PM4 interrupt events");
+
+    const auto make_interrupt_packet =
+        [](uint32_t data_selector, uint32_t interrupt_selector,
+           void *destination, uint64_t value, uint32_t context_id) {
+          std::array<uint32_t, 8> packet{};
+          const auto address = reinterpret_cast<uint64_t>(destination);
+          packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+          packet[1] = 0x28u | (5u << 8u);
+          packet[2] = (interrupt_selector << 24u) | (data_selector << 29u);
+          packet[3] = static_cast<uint32_t>(address);
+          packet[4] = static_cast<uint32_t>(address >> 32u);
+          packet[5] = static_cast<uint32_t>(value);
+          packet[6] = static_cast<uint32_t>(value >> 32u);
+          packet[7] = context_id & 0x07ffffffu;
+          return packet;
+        };
+    const auto finish_gpu = [&] {
+      gpu.SendCommandSync([&] { context.GetCommandScheduler().Finish(); });
+    };
+    const auto wait_for_interrupt =
+        [&](LibKernel::EventQueue::KernelEvent &event, int &count) {
+          LibKernel::KernelUseconds timeout = 0;
+          return LibKernel::EventQueue::KernelWaitEqueue(
+              interrupt_queue, &event, 1, &count, &timeout);
+        };
+
+    uint32_t no_interrupt_graphics_value = 0;
+    std::array<uint32_t, 5> no_interrupt_graphics_commands{};
+    write_packet(no_interrupt_graphics_commands.data(),
+                 &no_interrupt_graphics_value, 55);
+    gpu.Submit(no_interrupt_graphics_commands, {});
+    gpu.Done();
+    finish_gpu();
+
+    LibKernel::EventQueue::KernelEvent interrupt_event{};
+    int interrupt_count = 0;
+    const auto no_graphics_interrupt_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "no implicit graphics interrupt",
+            no_graphics_interrupt_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+                interrupt_count == 0 && no_interrupt_graphics_value == 55,
+            "graphics submission completion synthesized an interrupt");
+
+    auto live_interrupt_commands =
+        make_interrupt_packet(0, 1, nullptr, 0, 0x234u);
+    std::binary_semaphore interrupt_gate_entered{0};
+    std::binary_semaphore interrupt_gate_release{0};
+    gpu.SendCommand([&] {
+      interrupt_gate_entered.release();
+      interrupt_gate_release.acquire();
+    });
+    gpu.SubmitCompute(0x20, live_interrupt_commands);
+    interrupt_gate_entered.acquire();
+    live_interrupt_commands[2] = 0;
+    interrupt_gate_release.release();
+    gpu.Done();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto no_interrupt_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "no implicit completion interrupt",
+            no_interrupt_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+                interrupt_count == 0,
+            "submission completion synthesized an interrupt absent from the "
+            "executed PM4 stream");
+
+    uint32_t graphics_interrupt_label = 0xa5a5a5a5u;
+    auto graphics_interrupt_commands = make_interrupt_packet(
+        1, 1, &graphics_interrupt_label, 0x11223344u, 0);
+    gpu.Submit(graphics_interrupt_commands, {});
+    gpu.Done();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto graphics_interrupt_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "graphics interrupt routing",
+            graphics_interrupt_wait == 0 && interrupt_count == 1 &&
+                interrupt_event.ident == 0 && interrupt_event.data == 0 &&
+                interrupt_event.udata == &graphics_interrupt_udata &&
+                graphics_interrupt_label == 0xa5a5a5a5u,
+            "graphics kOnly interrupt was misrouted or wrote its label");
+
+    uint32_t compute_interrupt_label = 0x5a5a5a5au;
+    auto compute_interrupt_commands = make_interrupt_packet(
+        1, 0, &compute_interrupt_label, 0x55667788u, 0x456u);
+    std::binary_semaphore compute_interrupt_gate_entered{0};
+    std::binary_semaphore compute_interrupt_gate_release{0};
+    gpu.SendCommand([&] {
+      compute_interrupt_gate_entered.release();
+      compute_interrupt_gate_release.acquire();
+    });
+    gpu.SubmitCompute(0x20, compute_interrupt_commands);
+    compute_interrupt_gate_entered.acquire();
+    compute_interrupt_commands[2] |= 1u << 24u;
+    compute_interrupt_gate_release.release();
+    gpu.Done();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto compute_interrupt_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    const bool compute_interrupt_matches =
+        compute_interrupt_wait == 0 && interrupt_count == 1 &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == 0x456u &&
+        interrupt_event.udata == &compute_interrupt_udata &&
+        compute_interrupt_label == 0x55667788u;
+
+    uint64_t compute_clock_label = 0;
+    auto compute_clock_commands = make_interrupt_packet(
+        3, 1, &compute_clock_label, 0, 0x567u);
+    gpu.SubmitCompute(0x20, compute_clock_commands);
+    gpu.Done();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto compute_clock_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    const bool compute_clock_matches =
+        compute_clock_wait == 0 && interrupt_count == 1 &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
+        interrupt_event.udata == &compute_interrupt_udata &&
+        compute_clock_label != 0;
+
+    interrupt_count = 0;
+    const auto extra_interrupt_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    const auto delete_other_compute_event =
+        Sync::DeleteEqEvent(context, interrupt_queue, 0x21);
+    LibKernel::EventQueue::KernelDeleteEqueue(interrupt_queue);
+    context.TriggerInterrupt(0, 0);
+    context.TriggerInterrupt(0x20, 0);
+    context.TriggerInterrupt(0x21, 0);
+    Require("GpuCommandLane", "compute interrupt routing",
+            compute_interrupt_matches && compute_clock_matches &&
+                extra_interrupt_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+                interrupt_count == 0 && delete_other_compute_event == 0,
+            "compute kOnly interrupt was misrouted, broadcast, or lost a "
+            "label write");
+
     std::array<uint32_t, 1024> polling_loop{};
     for (size_t i = 0; i < polling_loop.size() - 4; i += 2) {
       polling_loop[i] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
@@ -2217,7 +2409,7 @@ public:
       stream_gate_entered.release();
       stream_gate_release.acquire();
     });
-    gpu.Submit(polling_commands.data(), polling_commands.size(), nullptr, 0);
+    gpu.Submit(polling_commands, {});
     stream_gate_entered.acquire();
     stream_gate_release.release();
     uint32_t packet_marker_a_at_callback = UINT32_MAX;
@@ -2228,6 +2420,7 @@ public:
         if (packet_marker_a == 11 && packet_marker_b == 0) {
           packet_marker_a_at_callback = packet_marker_a;
           packet_marker_b_at_callback = packet_marker_b;
+          polling_commands[13] = 33;
           polling_loop[1020] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
           polling_loop[1021] = 0;
           polling_loop[1022] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
@@ -2240,8 +2433,9 @@ public:
     Require("GpuCommandLane", "packet-boundary command polling",
             packet_marker_a_at_callback == 11 &&
                 packet_marker_b_at_callback == 0 && packet_marker_a == 11 &&
-                packet_marker_b == 22,
-            "host command waited for an entire non-suspended PM4 stream");
+                packet_marker_b == 33,
+            "host command waited for an entire PM4 stream or resumed a copied "
+            "stream");
 
     uint32_t label = 0;
     uint32_t prefix = 0;
@@ -2266,8 +2460,7 @@ public:
     commands[14] = static_cast<uint32_t>(address(&suffix));
     commands[15] = static_cast<uint32_t>(address(&suffix) >> 32u);
     commands[16] = 22;
-    gpu.Submit(commands.data(), static_cast<uint32_t>(commands.size()), nullptr,
-               0);
+      gpu.Submit(commands, {});
 
     std::binary_semaphore ordered_started{0};
     std::atomic<bool> ordered_finished{false};
@@ -2297,8 +2490,7 @@ public:
     label = 0;
     prefix = 0;
     suffix = 0;
-    gpu.Submit(commands.data(), static_cast<uint32_t>(commands.size()), nullptr,
-               0);
+    gpu.Submit(commands, {});
 
     std::binary_semaphore unmap_complete{0};
     std::jthread unmap_thread([&] {
@@ -2438,8 +2630,7 @@ public:
     Require("GpuCommandLane", "DMA_DATA packet assembly",
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
-    gpu.Submit(dma_commands.data(), static_cast<uint32_t>(dma_commands.size()),
-               nullptr, 0);
+    gpu.Submit(dma_commands, {});
     gpu.Done();
     constexpr uint32_t clean_fill_value = 0xdecafbad;
     gpu.SendCommandSync([&] {
@@ -23118,7 +23309,7 @@ void CheckVulkan13FeatureRequirements() {
 
 void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   const std::array<uint32_t, 6> standard_payload{0x00400000u, 1u, 0u,
                                                  0u,          0u, 10u};
   const std::array<uint32_t, 7> custom_payload{
@@ -23141,7 +23332,7 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
 
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   constexpr uint64_t untouched = 0x1122334455667788ull;
   constexpr uint64_t ready_bit = 1ull << 63u;
   alignas(16) std::array<std::array<uint64_t, 2>, 16> results;
@@ -23156,7 +23347,7 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
         static_cast<uint32_t>(raw_address),
         static_cast<uint32_t>(raw_address >> 32u)};
     Pm4Execution execution;
-    return processor.Process(execution, packet.data(), packet.size());
+    return processor.Process(execution, packet);
   };
 
   const auto begin_result = dump(&results[0][0]);
@@ -23181,7 +23372,7 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
 }
 
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
   const auto consumed = HwCtxSetStencilInfo(
       processor, 0xC0016900u, Pm4::DB_STENCIL_INFO, payload.data(), 1);
@@ -23197,7 +23388,7 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
 
 void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   constexpr uint64_t shader_address = 0x0000123456789a00ull;
   std::array<uint32_t, 4> packet{
       KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
@@ -23207,8 +23398,7 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
   };
   Pm4Execution execution;
   Require("Pm4DirectShaderRegisterFallback", "ES program base",
-          processor.Process(execution, packet.data(), packet.size()) ==
-                  Pm4ProcessResult::Complete &&
+          processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
               processor.GetShCtx().GetVs().es_regs.data_addr == shader_address,
           "direct SET_SH_REG did not route its ES base pair through the "
           "register handlers");
@@ -23217,7 +23407,7 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
 
 void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
 
   std::array<uint32_t, 3> single{
@@ -23226,8 +23416,7 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
       std::bit_cast<uint32_t>(6.0f),
   };
   Pm4Execution single_execution;
-  const auto single_result =
-      processor.Process(single_execution, single.data(), single.size());
+  const auto single_result = processor.Process(single_execution, single);
   const auto &single_viewport = processor.GetCtx().GetScreenViewport();
   Require("Pm4GuardBandRegisterRanges", "single register",
           single_result == Pm4ProcessResult::Complete &&
@@ -23246,8 +23435,7 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
       std::bit_cast<uint32_t>(10.0f),
   };
   Pm4Execution range_execution;
-  const auto range_result =
-      processor.Process(range_execution, range.data(), range.size());
+  const auto range_result = processor.Process(range_execution, range);
   const auto &range_viewport = processor.GetCtx().GetScreenViewport();
   Require("Pm4GuardBandRegisterRanges", "full range",
           range_result == Pm4ProcessResult::Complete &&
@@ -23261,7 +23449,7 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
 
 void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetBlendColor({1.0f, 2.0f, 3.0f, 4.0f});
 
   constexpr std::array<std::pair<uint32_t, float>, 4> singleton_values{{
@@ -23279,8 +23467,7 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
     };
     Pm4Execution execution;
     singletons_complete &=
-        processor.Process(execution, packet.data(), packet.size()) ==
-        Pm4ProcessResult::Complete;
+        processor.Process(execution, packet) == Pm4ProcessResult::Complete;
   }
   const auto &singletons = processor.GetCtx().GetBlendColor();
   Require("Pm4BlendColorRegisterRanges", "single registers",
@@ -23296,8 +23483,7 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
       std::bit_cast<uint32_t>(10.0f),
   };
   Pm4Execution partial_execution;
-  const auto partial_result =
-      processor.Process(partial_execution, partial.data(), partial.size());
+  const auto partial_result = processor.Process(partial_execution, partial);
   const auto &partial_color = processor.GetCtx().GetBlendColor();
   Require("Pm4BlendColorRegisterRanges", "partial range",
           partial_result == Pm4ProcessResult::Complete &&
@@ -23314,8 +23500,7 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
       std::bit_cast<uint32_t>(14.0f),
   };
   Pm4Execution full_execution;
-  const auto full_result =
-      processor.Process(full_execution, full.data(), full.size());
+  const auto full_result = processor.Process(full_execution, full);
   const auto &full_color = processor.GetCtx().GetBlendColor();
   Require("Pm4BlendColorRegisterRanges", "full range",
           full_result == Pm4ProcessResult::Complete &&
@@ -23327,7 +23512,7 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
 
 void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   const auto &defaults = processor.GetCtx().GetPolyOffset();
   Require("Pm4PolygonOffset", "format defaults",
           defaults.neg_num_db_bits == -23 && defaults.db_is_float_fmt,
@@ -23380,11 +23565,11 @@ static_assert(offsetof(AgcCommandBufferLayout, reserved_dw) == 0x30);
 
 void CheckAgcWaitPackets(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
     Pm4Execution execution;
-    return processor.Process(execution, packet, size_dw) ==
+    return processor.Process(execution, {packet, size_dw}) ==
            Pm4ProcessResult::Complete;
   };
 
@@ -23515,10 +23700,10 @@ void CheckAgcWaitPackets(RenderContext &renderer) {
 
 void CheckAgcDrawIndirectMultiPacket(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
     Pm4Execution execution;
-    return processor.Process(execution, packet, size_dw) ==
+    return processor.Process(execution, {packet, size_dw}) ==
            Pm4ProcessResult::Complete;
   };
 
@@ -23561,7 +23746,7 @@ void CheckAgcDrawIndirectMultiPacket(RenderContext &renderer) {
 
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   constexpr auto primitive_type = static_cast<Prospero::PrimitiveType>(0x35u);
 
   HW::RenderControl original_control{};
@@ -23626,7 +23811,7 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
                 segment_offset == size_dw && packet_matches,
             "context-state HLE packet does not match its real allocation size");
     Pm4Execution execution;
-    return processor.Process(execution, packet.data(), size_dw);
+    return processor.Process(execution, {packet.data(), size_dw});
   };
 
   Require("Pm4ContextState", "push-clear",
@@ -23675,8 +23860,7 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
   std::array<uint32_t, 2> clear_state_packet{0xc0001200, 0};
   Pm4Execution clear_state_execution;
   Require("Pm4ContextState", "clear-state packet",
-          processor.Process(clear_state_execution, clear_state_packet.data(),
-                            clear_state_packet.size()) ==
+          processor.Process(clear_state_execution, clear_state_packet) ==
                   Pm4ProcessResult::Complete &&
               processor.GetCtx().GetRenderTargetMask() ==
                   HW::Context{}.GetRenderTargetMask(),
@@ -23711,7 +23895,7 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
 
 void CheckPm4WaitResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
 
   uint32_t label = 0;
   uint32_t prefix = 0;
@@ -23758,8 +23942,7 @@ void CheckPm4WaitResume(RenderContext &renderer) {
 
   Pm4Execution execution;
   Require("Pm4WaitResume", "suspend",
-          processor.Process(execution, commands.data(), commands.size()) ==
-                  Pm4ProcessResult::Blocked &&
+          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
               prefix == 11 && child_observation == 0 && suffix == 0,
           "blocked indirect wait did not preserve its command position");
 
@@ -23767,8 +23950,7 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   child[4] = 1;
   Require(
       "Pm4WaitResume", "resume",
-      processor.Process(execution, commands.data(), commands.size()) ==
-              Pm4ProcessResult::Complete &&
+      processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
           prefix == 11 && child_observation == 0 && suffix == 22,
       "resumed indirect wait replayed a child or did not finish its parent");
   std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
@@ -23776,7 +23958,7 @@ void CheckPm4WaitResume(RenderContext &renderer) {
 
 void CheckPm4RewindResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
 
   uint32_t suffix = 0;
   const auto address = reinterpret_cast<uint64_t>(&suffix);
@@ -23791,8 +23973,7 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 
   Pm4Execution execution;
   Require("Pm4RewindResume", "pending",
-          processor.Process(execution, commands.data(), commands.size()) ==
-                  Pm4ProcessResult::Blocked &&
+          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
               suffix == 0,
           "pending rewind did not preserve its command position");
   Require("Pm4RewindResume", "patch valid",
@@ -23800,7 +23981,7 @@ void CheckPm4RewindResume(RenderContext &renderer) {
               commands[1] == 0x80000000u,
           "rewind state patch did not set the valid bit");
   Require("Pm4RewindResume", "resume",
-          processor.Process(execution, commands.data(), commands.size()) ==
+          processor.Process(execution, commands) ==
                   Pm4ProcessResult::Complete &&
               suffix == 33,
           "valid rewind did not resume at the following packet");
@@ -23809,7 +23990,7 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 
 void CheckPm4CeCompletion(RenderContext &renderer) {
   GraphicsInitJmpTables();
-  CommandProcessor processor(renderer);
+  CommandProcessor processor(renderer, 0);
   uint32_t suffix = 0;
   const auto address = reinterpret_cast<uint64_t>(&suffix);
 
@@ -23827,35 +24008,33 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   processor.ResetDeCe();
   Pm4Execution execution;
   Require("Pm4CeCompletion", "wait",
-          processor.Process(execution, commands.data(), commands.size()) ==
-                  Pm4ProcessResult::Blocked &&
+          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
               suffix == 0,
           "DE did not wait for an active CE stream");
 
   std::array<uint32_t, 2> ce_increment{0xc0008400u, 1};
   Pm4Execution ce_execution;
   Require("Pm4CeCompletion", "CE increment",
-          processor.Process(ce_execution, ce_increment.data(),
-                            ce_increment.size()) == Pm4ProcessResult::Complete,
+          processor.Process(ce_execution, ce_increment) ==
+              Pm4ProcessResult::Complete,
           "CE counter increment did not complete");
   Require(
       "Pm4CeCompletion", "counter gate",
-      processor.Process(execution, commands.data(), commands.size()) ==
-              Pm4ProcessResult::Complete &&
+      processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
           suffix == 33,
       "DE did not resume after CE advanced or failed to increment its counter");
 
   suffix = 0;
   Pm4Execution balanced_execution;
   Require("Pm4CeCompletion", "balanced wait",
-          processor.Process(balanced_execution, commands.data(),
-                            commands.size()) == Pm4ProcessResult::Blocked &&
+          processor.Process(balanced_execution, commands) ==
+                  Pm4ProcessResult::Blocked &&
               suffix == 0,
           "balanced CE/DE counters did not gate the next DE packet");
   processor.SetCeComplete(true);
   Require("Pm4CeCompletion", "stream complete",
-          processor.Process(balanced_execution, commands.data(),
-                            commands.size()) == Pm4ProcessResult::Complete &&
+          processor.Process(balanced_execution, commands) ==
+                  Pm4ProcessResult::Complete &&
               suffix == 33,
           "DE remained blocked after the CE stream completed");
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");

@@ -29,7 +29,7 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Libs::Graphics::Shutdown;
 };
 
-void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer);
+void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);
 
 namespace Gen5 {
 

@@ -100,7 +100,7 @@ constexpr auto g_opcode_names   = MakeOpcodeNames();
 
 } // namespace
 
-void DumpPm4PacketStream(Common::File* file, uint32_t* cmd_buffer, uint32_t start_dw,
+void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw) {
 	// db_dump();
 
@@ -143,9 +143,9 @@ void DumpPm4PacketStream(Common::File* file, uint32_t* cmd_buffer, uint32_t star
 				if ((op == IT_SET_CONTEXT_REG_INDIRECT || op == IT_SET_SH_REG_INDIRECT ||
 				     op == IT_SET_UCONFIG_REG_INDIRECT) &&
 				    len == 4) {
-					auto* indirect_buffer =
-					    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(cmd[0]) & 0xfffffffcu) |
-					                                (static_cast<uint64_t>(cmd[1]) << 32u));
+					auto* indirect_buffer = reinterpret_cast<const uint32_t*>(
+					    (static_cast<uint64_t>(cmd[0]) & 0xfffffffcu) |
+					    (static_cast<uint64_t>(cmd[1]) << 32u));
 					const uint32_t indirect_num_regs = cmd[3] & 0x3fffu;
 
 					for (uint32_t i = 0; indirect_buffer != nullptr && i < indirect_num_regs;

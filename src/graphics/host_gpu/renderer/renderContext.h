@@ -23,7 +23,6 @@ class VideoOutDriver;
 
 namespace Libs::Graphics {
 
-constexpr int AGC_USER_INTERRUPT_EVENT = 0x1800;
 class GuestGpu;
 
 class RenderContext {
@@ -48,15 +47,14 @@ public:
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
-	void AddEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
-	void DeleteEopEq(LibKernel::EventQueue::KernelEqueue eq, int id);
-	void TriggerEopEvent(uint32_t context_id);
+	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
-	struct EopEqRegistration {
-		LibKernel::EventQueue::KernelEqueue    eq = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
-		LibKernel::EventQueue::KernelEqueueRef queue;
-		int                                    id = 0;
+	struct InterruptEqRegistration {
+		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+		int                                 event_id = 0;
 	};
 
 	GraphicContext&           m_graphics;
@@ -70,8 +68,8 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 
-	Common::Mutex                  m_eop_mutex;
-	std::vector<EopEqRegistration> m_eop_eqs;
+	Common::Mutex                        m_interrupt_mutex;
+	std::vector<InterruptEqRegistration> m_interrupt_eqs;
 };
 
 } // namespace Libs::Graphics

@@ -4,7 +4,6 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
-#include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -56,60 +55,54 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
-void RenderContext::AddEopEq(LibKernel::EventQueue::KernelEqueue eq, int id) {
-	auto queue = LibKernel::EventQueue::KernelPinEqueue(eq);
-	if (!queue) {
+void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
+	Common::LockGuard lock(m_interrupt_mutex);
+
+	auto it = std::find_if(
+	    m_interrupt_eqs.begin(), m_interrupt_eqs.end(),
+	    [eq, event_id](const auto& entry) { return entry.eq == eq && entry.event_id == event_id; });
+	if (it != m_interrupt_eqs.end()) {
 		return;
 	}
 
-	Common::LockGuard lock(m_eop_mutex);
-
-	auto it = std::find_if(m_eop_eqs.begin(), m_eop_eqs.end(), [eq, id](const auto& entry) {
-		return entry.eq == eq && entry.id == id;
-	});
-	if (it != m_eop_eqs.end()) {
-		return;
-	}
-
-	m_eop_eqs.push_back({eq, std::move(queue), id});
+	m_interrupt_eqs.push_back({eq, event_id});
 }
 
-void RenderContext::DeleteEopEq(LibKernel::EventQueue::KernelEqueue eq, int id) {
-	Common::LockGuard lock(m_eop_mutex);
+void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
+	Common::LockGuard lock(m_interrupt_mutex);
 
-	auto it = std::find_if(m_eop_eqs.begin(), m_eop_eqs.end(), [eq, id](const auto& entry) {
-		return entry.eq == eq && entry.id == id;
-	});
-	if (it == m_eop_eqs.end()) {
+	auto it = std::find_if(
+	    m_interrupt_eqs.begin(), m_interrupt_eqs.end(),
+	    [eq, event_id](const auto& entry) { return entry.eq == eq && entry.event_id == event_id; });
+	if (it == m_interrupt_eqs.end()) {
 		return;
 	}
 
-	m_eop_eqs.erase(it);
+	m_interrupt_eqs.erase(it);
 }
 
-void RenderContext::TriggerEopEvent(uint32_t context_id) {
-	std::vector<EopEqRegistration> registrations;
+void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	std::vector<InterruptEqRegistration> registrations;
 	{
-		Common::LockGuard lock(m_eop_mutex);
-		registrations = m_eop_eqs;
+		Common::LockGuard lock(m_interrupt_mutex);
+		for (const auto& registration: m_interrupt_eqs) {
+			if (registration.event_id == event_id) {
+				registrations.push_back(registration);
+			}
+		}
 	}
 
 	for (const auto& registration: registrations) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
-		    registration.eq, static_cast<uintptr_t>(registration.id),
+		    registration.eq, static_cast<uintptr_t>(registration.event_id),
 		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
 		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
 		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
-			DeleteEopEq(registration.eq, registration.id);
+			DeleteInterruptEq(registration.eq, registration.event_id);
 			continue;
 		}
 		EXIT_NOT_IMPLEMENTED(result != OK);
 	}
-
-	auto tsc    = LibKernel::KernelReadTsc();
-	auto result = LibKernel::EventQueue::KernelTriggerUserEventForAll(AGC_USER_INTERRUPT_EVENT,
-	                                                                  reinterpret_cast<void*>(tsc));
-	EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_ENOENT);
 }
 
 } // namespace Libs::Graphics

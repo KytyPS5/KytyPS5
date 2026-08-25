@@ -287,8 +287,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);
 int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address);
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference);
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t* cmd, const volatile Label* address);
-int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint32_t context_id,
-                                                   uint32_t data_sel, uint64_t data);
+int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data);
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
                                       int32_t display_buffer_index, uint32_t flip_mode,

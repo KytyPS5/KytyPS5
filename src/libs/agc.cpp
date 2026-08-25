@@ -3963,39 +3963,27 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint32_t context_id,
-                                                   uint32_t data_sel, uint64_t data) {
+int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
 	PRINT_NAME();
 
-	LOGF("\t cmd        = 0x%016" PRIx64 "\n"
-	     "\t context_id = 0x%08" PRIx32 "\n"
-	     "\t data_sel   = 0x%08" PRIx32 "\n"
-	     "\t data       = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), context_id, data_sel, data);
+	LOGF("\t cmd  = 0x%016" PRIx64 "\n"
+	     "\t data = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), data);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	auto op = (cmd[0] >> 8u) & 0xffu;
+	const auto op             = (cmd[0] >> 8u) & 0xffu;
+	const bool is_release_mem = op == Pm4::IT_RELEASE_MEM ||
+	                            (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM);
+	if (!is_release_mem) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
 
-	if ((op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM) ||
-	    op == Pm4::IT_RELEASE_MEM) {
-		uint64_t packet_data = data;
-		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM && context_id > 1 &&
-		    data_sel == 1) {
-			// Agc Core ring-buffer release packets pack the segment generation
-			// into bits 24..31 and wrap that byte every 256 submissions. The
-			// patch context carries the monotonic generation, so expand the
-			// packed value before it reaches the command processor.
-			packet_data = (static_cast<uint64_t>(context_id - 2u) << 24u) | (data & 0x00ffffffull);
-		}
-
-		cmd[5] = static_cast<uint32_t>(packet_data & 0xffffffffu);
-		cmd[6] = static_cast<uint32_t>((packet_data >> 32u) & 0xffffffffu);
-	} else if (op == Pm4::IT_EVENT_WRITE_EOP) {
-		cmd[4] = static_cast<uint32_t>(data & 0xffffffffu);
-		cmd[5] = static_cast<uint32_t>((data >> 32u) & 0xffffffffu);
-	} else {
-		EXIT("unsupported queueEndOfPipeAction packet for data patch: 0x%08" PRIx32 "\n", cmd[0]);
+	const auto interrupt = (cmd[2] >> 24u) & 0x7u;
+	const auto data_sel  = (cmd[2] >> 29u) & 0x7u;
+	if (interrupt != 4u && data_sel != 5u) {
+		cmd[5] = static_cast<uint32_t>(data & 0xffffffffu);
+		cmd[6] = static_cast<uint32_t>((data >> 32u) & 0xffffffffu);
 	}
 
 	return OK;
@@ -4279,23 +4267,6 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 }
 
 static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
-	if (acb != nullptr && size_in_dwords >= 5) {
-		auto descriptor_addr =
-		    static_cast<uint64_t>(acb[0]) | (static_cast<uint64_t>(acb[1]) << 32u);
-		auto descriptor_size  = acb[2];
-		auto descriptor_flags = acb[3];
-		auto descriptor_magic = acb[4];
-		if (descriptor_addr != 0 && descriptor_size != 0 && descriptor_flags == 0 &&
-		    descriptor_magic == 0x5533ccaau) {
-			LOGF("\t descriptor addr = 0x%016" PRIx64 "\n"
-			     "\t descriptor size = 0x%08" PRIx32 "\n"
-			     "\t descriptor magic = 0x%08" PRIx32 "\n",
-			     descriptor_addr, descriptor_size, descriptor_magic);
-			acb            = reinterpret_cast<uint32_t*>(descriptor_addr);
-			size_in_dwords = descriptor_size;
-		}
-	}
-
 	if (acb == nullptr || size_in_dwords == 0) {
 		return;
 	}

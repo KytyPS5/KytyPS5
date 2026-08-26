@@ -1496,26 +1496,6 @@ public:
     return Renderer();
   }
 
-  void CheckCommandPoolGrowth() {
-    EnsureRuntimeContext();
-    std::vector<std::unique_ptr<CommandBuffer>> commands;
-    for (uint32_t i = 0; i < 12; i++) {
-      commands.push_back(
-          std::make_unique<CommandBuffer>(Renderer().GetCommandScheduler()));
-    }
-    for (auto &command : commands) {
-      Require("CommandPoolGrowth", "allocation", !command->IsInvalid(),
-              "unified command pool failed to grow");
-      command->Begin();
-      command->End();
-      command->Execute();
-    }
-    for (auto &command : commands) {
-      command->WaitForFence();
-    }
-    std::printf("[host]    %-32s ok\n", "CommandPoolGrowth");
-  }
-
   void CheckDescriptorHeapLargeSet() {
     EnsureRuntimeContext();
     std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
@@ -1569,7 +1549,7 @@ public:
       for (uint32_t i = 0; i < 22; i++) {
         commit();
       }
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       for (uint32_t i = 0; i < 21; i++) {
         commit();
       }
@@ -3223,7 +3203,7 @@ public:
                   BufferCacheTestAccess::PageOwner(
                       cache, index_begin + 2 * index_page) == index_bridge,
               "bridging acquisition did not publish its merged Buffer range");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       constexpr uint64_t recycled_offset = index_offset + 4 * index_page;
       const auto recycled = cache.FindBuffer(base + recycled_offset + 0x100,
                                              sizeof(uint32_t));
@@ -4528,7 +4508,7 @@ public:
                       layered_raw_d16_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       const auto layered_raw_d16_words =
           ReadBuffer(name, layered_raw_d16_readback, 6);
       std::array<uint16_t, 12> layered_raw_d16_after{};
@@ -4598,7 +4578,7 @@ public:
       const bool compressed_block_download =
           TextureCacheTestAccess::TryDownload(texture_cache,
                                               compressed_block_image);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::array<uint32_t, block_alias_data.size()> block_alias_after{};
       std::memcpy(block_alias_after.data(), memory + block_alias_offset,
@@ -6151,7 +6131,7 @@ public:
                   gc_before_completion == gc_stale_values,
               "GC submitted per image or published a readback before GPU "
               "completion");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
           gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size,
@@ -6183,7 +6163,7 @@ public:
       HostReadBarrier(alias_readback.buffer, alias_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       Require(name, "post-image Buffer alias content",
               ReadBuffer(name, alias_readback, 1) ==
                   std::vector<u32>{gc_image_values[0]},
@@ -6224,7 +6204,7 @@ public:
               submit_before_completion == submit_readback_stale &&
                   scheduler.CurrentTick() == submit_readback_tick,
               "submit-time linear readback published synchronously");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       uint32_t submit_after_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
@@ -6293,7 +6273,7 @@ public:
               linear_depth_before == linear_depth_guest &&
                   scheduler.CurrentTick() == linear_depth_tick,
               "linear depth readback published before GPU completion");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::array<uint32_t, linear_depth_words> linear_depth_after{};
       std::array<uint8_t, linear_stencil_guest.size()> linear_stencil_after{};
@@ -6394,7 +6374,7 @@ public:
               tiled_depth_before == tiled_depth_guest &&
                   scheduler.CurrentTick() == tiled_depth_tick,
               "tiled depth readback published before GPU completion");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::vector<uint32_t> tiled_depth_after(tiled_depth_guest.size());
       std::memcpy(tiled_depth_after.data(), memory + tiled_depth_offset,
@@ -6453,7 +6433,7 @@ public:
       HostReadBarrier(tiled_depth_output.buffer, tiled_depth_size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       const auto tiled_depth_words =
           ReadBuffer(name, tiled_depth_output, tiled_depth_guest.size());
       bool tiled_depth_matches = true;
@@ -6516,7 +6496,7 @@ public:
           name, "tiled D16 download queue",
           TextureCacheTestAccess::TryDownload(texture_cache, tiled_d16_image),
           "layered tiled D16 fallback readback was rejected");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::vector<uint16_t> tiled_d16_after(tiled_d16_guest.size());
       std::array<uint8_t, tiled_d16_stencil.size()> tiled_d16_stencil_after{};
@@ -6573,7 +6553,7 @@ public:
       HostReadBarrier(tiled_d16_output.buffer, tiled_depth_size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       const auto tiled_d16_linear_words =
           ReadBuffer(name, tiled_d16_output, tiled_d16_words.size());
       std::vector<uint16_t> tiled_d16_linear_values(tiled_d16_guest.size());
@@ -6647,7 +6627,7 @@ public:
       HostReadBarrier(d16_storage_readback.buffer, d16_storage_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       const auto d16_storage_words = ReadBuffer(name, d16_storage_readback, 2);
       std::array<uint16_t, 4> d16_storage_values{};
       std::memcpy(d16_storage_values.data(), d16_storage_words.data(),
@@ -6690,7 +6670,7 @@ public:
               depth_image_retired, depth_proxy_retired, scheduler.CurrentTick(),
               depth_gc_tick, depth_before_completion, stale_added_stencil_depth)
               .c_str());
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       float depth_after_completion = 0.0f;
       Libs::LibKernel::Memory::TryReadBacking(
@@ -6789,7 +6769,7 @@ public:
             !TextureCacheTestAccess::Contains(texture_cache, image) &&
                 scheduler.CurrentTick() == tick,
             "near-capacity readback was rejected or synchronously submitted");
-        scheduler.FinishCurrent();
+        scheduler.Finish();
         scheduler.DrainPriorityOperations();
         bool content = true;
         for (const auto offset : sample_offsets) {
@@ -7388,7 +7368,7 @@ public:
                   color.desc.info.mip_layout[0].size == allocation_size &&
                   image.usage.render_target && image.IsGpuModified(),
               "supported depth-tiled color target was not resolved");
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       std::vector<uint8_t> cleared(allocation_size);
       Require(name, "clear guest backing",
@@ -8097,7 +8077,7 @@ public:
           !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
           "submit-time processing retained an acquired storage request");
       RenderExecutorTestAccess::ResetBindings(executor);
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       scheduler.DrainPriorityOperations();
       uint32_t storage_downloaded_value = 0;
       Libs::LibKernel::Memory::TryReadBacking(storage_address,
@@ -8748,7 +8728,7 @@ public:
       rebound_depth.height = 1;
       rebound_depth.samples = 1;
       rebound_depth.image_id = depth_id;
-      scheduler.FinishCurrent();
+      scheduler.Finish();
       Require(name, "deferred target slot erasure",
               TextureCacheTestAccess::Owner(texture_cache,
                                             target_subresource_id) == nullptr,
@@ -24302,7 +24282,6 @@ int main(int argc, char **argv) {
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
-  vulkan.CheckCommandPoolGrowth();
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorVolumeDiscovery();

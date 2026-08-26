@@ -143,7 +143,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		}
 		download.Commit();
 		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.FinishCurrent();
+		m_scheduler.Finish();
 		m_scheduler.WaitPriorityOperations(completion_tick);
 		cursor = 0;
 		for (const auto& copy: batch) {
@@ -315,7 +315,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	auto& command = m_scheduler.Current();
-	EXIT_IF(command.IsInvalid() || command.IsExecute());
+	EXIT_IF(command.IsInvalid());
 	auto       begin = vaddr & ~(CACHING_PAGE_SIZE - 1);
 	auto       end   = (vaddr + size + CACHING_PAGE_SIZE - 1) & ~(CACHING_PAGE_SIZE - 1);
 	auto       first = m_buffers.lower_bound(begin);
@@ -428,7 +428,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	auto& command = m_scheduler.Current();
-	if (command.IsInvalid() || command.IsExecute() || vaddr == 0 || size == 0 ||
+	if (command.IsInvalid() || vaddr == 0 || size == 0 ||
 	    vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}

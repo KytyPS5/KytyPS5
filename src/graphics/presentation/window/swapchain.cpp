@@ -58,10 +58,10 @@
 namespace Libs::Graphics {
 
 struct Presenter::Frame {
-	VulkanImage                    image;
-	std::unique_ptr<CommandBuffer> present_commands;
-	bool                           busy         = false;
-	bool                           reusing_last = false;
+	VulkanImage image;
+	uint64_t    present_tick = 0;
+	bool        busy         = false;
+	bool        reusing_last = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -71,12 +71,11 @@ struct Presenter::Frame {
 
 class FramePool final {
 public:
-	explicit FramePool(WindowContext& window): m_window(window) {}
+	FramePool(WindowContext& window, CommandScheduler& scheduler)
+	    : m_window(window), m_scheduler(scheduler) {}
 	~FramePool() {
+		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
-			if (frame->present_commands != nullptr) {
-				frame->present_commands->WaitForFenceOnly();
-			}
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
 			}
@@ -188,15 +187,10 @@ public:
 	}
 
 private:
-	static void WaitForFrame(Presenter::Frame& frame) {
-		// The producer only waits here. Reset stays on the presentation thread that owns the
-		// allocating Vulkan command pool.
-		if (frame.present_commands != nullptr) {
-			frame.present_commands->WaitForFenceOnly();
-		}
-	}
+	void WaitForFrame(Presenter::Frame& frame) { m_scheduler.Wait(frame.present_tick); }
 
 	WindowContext&                                 m_window;
+	CommandScheduler&                              m_scheduler;
 	Common::Mutex                                  m_mutex;
 	Common::CondVar                                m_available;
 	std::vector<std::unique_ptr<Presenter::Frame>> m_frames;
@@ -330,7 +324,7 @@ public:
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareImeOverlay();
 	void RecordPresentCommands(CommandBuffer& command, VulkanImage& source, bool draw_ime_overlay);
-	void Submit(CommandBuffer& command);
+	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -358,7 +352,7 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner) {
+	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
@@ -628,7 +622,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	}
 	EXIT_IF(m_image_index >= m_images.size());
 	auto vk_command = command.Handle();
-	command.Begin();
 
 	vk::ImageMemoryBarrier to_transfer {};
 	to_transfer.sType                           = vk::StructureType::eImageMemoryBarrier;
@@ -699,15 +692,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
 	}
-	command.End();
 }
 
-void Swapchain::Submit(CommandBuffer& command) {
+uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	command.Execute(submit);
+	return scheduler.Submit(submit);
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -782,15 +774,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
-		if (frame->present_commands == nullptr) {
-			frame->present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
-		}
-		auto& command = *frame->present_commands;
-		command.WaitForFenceAndReset();
-		command.Begin();
+		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
-		command.End();
-		command.Execute();
+		frame->present_tick = m_impl->present_scheduler.Submit();
 	}
 	return *frame;
 }
@@ -848,16 +834,12 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			m_impl->RecoverSwapchain(status);
 			continue;
 		}
-		if (frame.present_commands == nullptr) {
-			frame.present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
-		}
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			frame.present_commands->WaitForFenceAndReset();
-			auto&      command          = *frame.present_commands;
-			const bool draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
+			auto&             command          = m_impl->present_scheduler.BeginCommand();
+			const bool        draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
-			swapchain.Submit(command);
+			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

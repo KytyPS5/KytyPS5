@@ -25,7 +25,6 @@ class Shader;
 struct GraphicContext;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
-struct CommandSlot;
 struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
@@ -77,40 +76,31 @@ struct SubmitInfo {
 
 class CommandBuffer {
 public:
-	explicit CommandBuffer(CommandScheduler& scheduler);
-	~CommandBuffer();
+	~CommandBuffer() = default;
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
 
-	void Begin() const;
-	void End() const;
-	void Execute(const SubmitInfo& submit = {});
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
-	void WaitForFenceOnly();
-	void WaitForFence();
-	void WaitForFenceAndReset();
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] bool              IsExecute() const { return m_execute; }
+
+protected:
+	explicit CommandBuffer(CommandScheduler& scheduler);
 
 private:
-	void Release();
-	void FinalizeFence(bool reset_recording);
+	void Begin();
+	void End() const;
 
 	RenderContext&      m_context;
-	CommandScheduler&   m_scheduler;
 	GraphicContext&     m_graphics;
-	CommandSlot*        m_slot            = nullptr;
-	bool                m_execute         = false;
-	bool                m_fence_waited    = false;
-	uint64_t            m_submit_seq      = 0;
+	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;
@@ -120,12 +110,12 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering = false;
+
+	friend class CommandScheduler;
 };
 
 class RenderCommandBuffer final: public CommandBuffer {
 public:
-	explicit RenderCommandBuffer(CommandScheduler& scheduler): CommandBuffer(scheduler) {}
-
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
@@ -137,9 +127,13 @@ public:
 	[[nodiscard]] HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
 private:
+	explicit RenderCommandBuffer(CommandScheduler& scheduler): CommandBuffer(scheduler) {}
+
 	HW::Context*    m_registers   = nullptr;
 	HW::UserConfig* m_user_config = nullptr;
 	HW::Shader*     m_shaders     = nullptr;
+
+	friend class CommandScheduler;
 };
 
 class RenderExecutor {

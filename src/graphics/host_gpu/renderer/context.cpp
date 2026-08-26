@@ -1,7 +1,5 @@
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
-#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -16,70 +14,29 @@
 
 #include <algorithm>
 #include <bit>
-#include <cstdio>
 #include <cstring>
 namespace Libs::Graphics {
 
-namespace {
-
-void ReportVulkanFatal(const char* what, vk::Result result, uint32_t slot, uint64_t submit_seq,
-                       uint32_t debug_op, uint64_t debug_submit, uint32_t arg0, uint32_t arg1,
-                       uint32_t arg2, uint32_t arg3, uint64_t arg4) {
-	LOGF("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
-	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	     what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq, debug_op,
-	     debug_submit, arg0, arg1, arg2, arg3, arg4);
-	std::printf("%s failed: %s (%d), slot=%u submit_seq=%" PRIu64
-	            " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	            what, VulkanToString(result).c_str(), static_cast<int>(result), slot, submit_seq,
-	            debug_op, debug_submit, arg0, arg1, arg2, arg3, arg4);
-	std::fflush(stdout);
-}
-
-} // namespace
-
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_scheduler(scheduler), m_graphics(scheduler.Graphics()),
-      m_slot(scheduler.AllocateCommandBuffer()) {}
-
-CommandBuffer::~CommandBuffer() {
-	Release();
-}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_slot == nullptr;
+	return m_buffer == nullptr;
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
-
-	const auto handle = m_slot->buffer;
-	EXIT_IF(handle == nullptr);
-	return handle;
+	return m_buffer;
 }
 
-void CommandBuffer::Release() {
-	EXIT_IF(IsInvalid());
-
-	Common::LockGuard lock(*m_slot->pool_mutex);
-
-	WaitForFence();
-
-	m_slot->busy = false;
-	m_slot->Reset();
-	m_slot = nullptr;
-
-	EXIT_NOT_IMPLEMENTED(!IsInvalid());
-}
-
-void CommandBuffer::Begin() const {
-	EXIT_IF(m_rendering);
+void CommandBuffer::Begin() {
+	EXIT_IF(m_rendering || IsInvalid());
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.sType            = vk::StructureType::eCommandBufferBeginInfo;
 	begin_info.pNext            = nullptr;
-	begin_info.flags            = {};
+	begin_info.flags            = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	begin_info.pInheritanceInfo = nullptr;
 
 	auto result = buffer.begin(&begin_info);
@@ -105,106 +62,6 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-}
-
-void CommandBuffer::Execute(const SubmitInfo& submit) {
-	EXIT_IF(IsInvalid());
-	EXIT_IF(m_execute);
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores > SubmitInfo::MaxSemaphores);
-
-	auto buffer = Handle();
-	auto fence  = m_slot->fence;
-
-	vk::TimelineSemaphoreSubmitInfo timeline_info {};
-	timeline_info.sType                     = vk::StructureType::eTimelineSemaphoreSubmitInfo;
-	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-	vk::SubmitInfo submit_info {};
-	submit_info.sType                = vk::StructureType::eSubmitInfo;
-	submit_info.pNext                = &timeline_info;
-	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-	submit_info.commandBufferCount   = 1;
-	submit_info.pCommandBuffers      = &buffer;
-	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
-	auto& graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
-
-	auto result = graphics.device.resetFences(1, &fence);
-	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkResetFences (before submit)", result, m_slot->id, m_submit_seq,
-		                  m_debug_op, m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2,
-		                  m_debug_arg3, m_debug_arg4);
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	if (Config::GraphicsDebugDumpEnabled()) {
-		LOGF("vkQueueSubmit begin: slot=%u waits=%u signals=%u debug_op=%u debug_submit=%" PRIu64
-		     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-		     m_slot->id, submit.num_wait_semaphores, submit.num_signal_semaphores, m_debug_op,
-		     m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		     m_debug_arg4);
-	}
-
-	{
-		Common::LockGuard lock(graphics.queue_mutex);
-		m_submit_seq = m_scheduler.NextSubmitSequence();
-		result       = graphics.queue.submit(1, &submit_info, fence);
-	}
-
-	m_execute      = true;
-	m_fence_waited = false;
-
-	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, m_slot->id, m_submit_seq, m_debug_op,
-		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		                  m_debug_arg4);
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-}
-
-void CommandBuffer::WaitForFence() {
-	FinalizeFence(false);
-}
-
-void CommandBuffer::WaitForFenceOnly() {
-	EXIT_IF(IsInvalid());
-	if (!m_execute || m_fence_waited) {
-		return;
-	}
-	auto device = m_graphics.device;
-	auto result = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
-	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkWaitForFences", result, m_slot->id, m_submit_seq, m_debug_op,
-		                  m_debug_submit_id, m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3,
-		                  m_debug_arg4);
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	m_fence_waited = true;
-}
-
-void CommandBuffer::WaitForFenceAndReset() {
-	FinalizeFence(true);
-}
-
-void CommandBuffer::FinalizeFence(bool reset_recording) {
-	const bool was_executed = m_execute;
-	WaitForFenceOnly();
-	if (was_executed) {
-		m_execute      = false;
-		m_fence_waited = false;
-		if (reset_recording) {
-			Common::LockGuard lock(*m_slot->pool_mutex);
-			m_slot->Reset();
-		}
-	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

@@ -255,8 +255,7 @@ void CommandProcessor::BufferFlush() {
 }
 
 void CommandProcessor::BufferFlushAndWait() {
-	auto& submitted = GetScheduler().FlushAndGetSubmitted();
-	submitted.WaitForFenceOnly();
+	GetScheduler().FlushAndWait();
 }
 
 void CommandProcessor::BufferWait() {
@@ -1622,7 +1621,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
-	GetScheduler().FinishCurrent();
+	GetScheduler().Finish();
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

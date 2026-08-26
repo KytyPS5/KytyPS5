@@ -1,96 +1,97 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <optional>
 
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
-void CommandSlot::Reset() {
-	EXIT_IF(buffer == nullptr);
-	const auto result = buffer.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
-	if (result != vk::Result::eSuccess) {
-		EXIT("failed to reset Vulkan command buffer: %s (%d)\n", VulkanToString(result).c_str(),
-		     static_cast<int>(result));
-	}
+namespace {
+
+void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
+                       uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
+                       uint32_t arg3, uint64_t arg4) {
+	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	     what, VulkanToString(result).c_str(), static_cast<int>(result), tick, debug_op,
+	     debug_submit, arg0, arg1, arg2, arg3, arg4);
+	std::printf("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+	            what, VulkanToString(result).c_str(), static_cast<int>(result), tick, debug_op,
+	            debug_submit, arg0, arg1, arg2, arg3, arg4);
+	std::fflush(stdout);
 }
 
-CommandScheduler::CommandPool::~CommandPool() {
-	Destroy();
-}
+} // namespace
 
-void CommandScheduler::CommandPool::Create(GraphicContext& graphics) {
-	EXIT_IF(m_pool != nullptr || m_graphics != nullptr ||
-	        graphics.queue_family == static_cast<uint32_t>(-1));
-	m_graphics = &graphics;
-
+CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
+    : m_graphics(graphics), m_master(master) {
+	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
 	create.sType            = vk::StructureType::eCommandPoolCreateInfo;
 	create.queueFamilyIndex = graphics.queue_family;
-	create.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
 }
 
-CommandSlot* CommandScheduler::CommandPool::CreateSlot() {
-	EXIT_IF(m_graphics == nullptr);
-	auto& graphics = *m_graphics;
+CommandScheduler::CommandPool::~CommandPool() {
+	m_graphics.device.destroyCommandPool(m_pool, nullptr);
+}
+
+size_t CommandScheduler::CommandPool::Grow() {
+	const auto first = m_ticks.size();
+	m_ticks.resize(first + GrowStep);
+	m_buffers.resize(first + GrowStep);
 
 	vk::CommandBufferAllocateInfo allocate {};
 	allocate.sType              = vk::StructureType::eCommandBufferAllocateInfo;
 	allocate.commandPool        = m_pool;
 	allocate.level              = vk::CommandBufferLevel::ePrimary;
-	allocate.commandBufferCount = 1;
-	vk::CommandBuffer buffer    = nullptr;
-	EXIT_IF(graphics.device.allocateCommandBuffers(&allocate, &buffer) != vk::Result::eSuccess);
-
-	vk::FenceCreateInfo fence_create {};
-	fence_create.sType = vk::StructureType::eFenceCreateInfo;
-	fence_create.flags = vk::FenceCreateFlagBits::eSignaled;
-	vk::Fence fence    = nullptr;
-	if (graphics.device.createFence(&fence_create, nullptr, &fence) != vk::Result::eSuccess) {
-		graphics.device.freeCommandBuffers(m_pool, 1, &buffer);
-		EXIT("failed to create command-buffer fence\n");
-	}
-
-	auto& slot      = m_slots.emplace_back();
-	slot.pool_mutex = &m_mutex;
-	slot.id         = static_cast<uint32_t>(m_slots.size() - 1);
-	slot.buffer     = buffer;
-	slot.fence      = fence;
-	return &slot;
+	allocate.commandBufferCount = static_cast<uint32_t>(GrowStep);
+	EXIT_IF(m_graphics.device.allocateCommandBuffers(&allocate, m_buffers.data() + first) !=
+	        vk::Result::eSuccess);
+	return first;
 }
 
-CommandSlot* CommandScheduler::CommandPool::Allocate(GraphicContext& graphics) {
-	Common::LockGuard lock(m_mutex);
-	if (m_pool == nullptr) {
-		Create(graphics);
-	}
-	EXIT_IF(m_graphics != &graphics);
-	auto  found = std::ranges::find_if(m_slots, [](const auto& slot) { return !slot.busy; });
-	auto* slot  = found != m_slots.end() ? &*found : CreateSlot();
-	slot->busy  = true;
-	slot->Reset();
-	return slot;
-}
+vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+	auto       gpu_tick = m_master.KnownGpuTick();
+	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+		for (size_t index = begin; index < end; ++index) {
+			if (gpu_tick >= m_ticks[index]) {
+				m_ticks[index] = m_master.CurrentTick();
+				return index;
+			}
+		}
+		return std::nullopt;
+	};
 
-void CommandScheduler::CommandPool::Destroy() {
-	Common::LockGuard lock(m_mutex);
-	if (m_pool == nullptr) {
-		return;
+	auto found = search(m_hint, m_ticks.size());
+	if (!found) {
+		m_master.Refresh();
+		gpu_tick = m_master.KnownGpuTick();
+		found    = search(m_hint, m_ticks.size());
 	}
-	EXIT_IF(std::ranges::any_of(m_slots, [](const auto& slot) { return slot.busy; }));
-	EXIT_IF(m_graphics == nullptr);
-	for (const auto& slot: m_slots) {
-		m_graphics->device.destroyFence(slot.fence, nullptr);
+	if (!found) {
+		found = search(0, m_hint);
 	}
-	m_graphics->device.destroyCommandPool(m_pool, nullptr);
-	m_slots.clear();
-	m_pool     = nullptr;
-	m_graphics = nullptr;
+	if (!found) {
+		found           = Grow();
+		m_ticks[*found] = m_master.CurrentTick();
+	}
+
+	m_hint = *found + 1;
+	if (m_hint == m_ticks.size()) {
+		m_hint = 0;
+	}
+	return m_buffers[*found];
 }
 
 bool CommandScheduler::InDeferredOperation() noexcept {
@@ -99,10 +100,8 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	m_buffers.reserve(CommandBufferGrowStep);
-	m_buffer_ticks.reserve(CommandBufferGrowStep);
-}
+      m_command_pool(graphics, m_master), m_command(*this),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -128,9 +127,11 @@ void CommandScheduler::Shutdown() {
 		}
 		m_operation_state = OperationState::Draining;
 	}
-	if (Active() && m_recording) {
-		Finish();
+	if (!m_command.IsInvalid()) {
+		Submit();
 	}
+	m_master.Wait(CurrentTick() - 1);
+	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
@@ -156,14 +157,10 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	m_user_config = &user_config;
 	m_shaders     = &shaders;
 
-	if (!Active()) {
-		m_current = static_cast<int>(GrowCommandBuffers());
-	}
-
-	BindCurrent();
-	if (!m_recording) {
-		Current().Begin();
-		m_recording = true;
+	if (m_command.IsInvalid()) {
+		BeginNext();
+	} else {
+		BindCurrent();
 	}
 }
 
@@ -172,7 +169,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 }
 
 void CommandScheduler::EndRendering() {
-	if (Active() && m_recording) {
+	if (Active() && !m_command.IsInvalid()) {
 		Current().EndRendering();
 	}
 }
@@ -183,60 +180,40 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
-	SubmitCurrent(submit);
+	Submit(submit);
 	BeginNext();
 }
 
-CommandBuffer& CommandScheduler::FlushAndGetSubmitted() {
-	SubmitInfo submit;
-	auto&      submitted = SubmitCurrent(submit);
+void CommandScheduler::FlushAndWait() {
+	const auto tick = Submit();
+	m_master.Wait(tick);
 	BeginNext();
-	return submitted;
 }
 
 void CommandScheduler::Finish() {
 	CheckActive();
-	const auto tick = CurrentTick();
-	if (m_recording) {
-		SubmitInfo submit;
-		SubmitCurrent(submit);
+	if (!m_command.IsInvalid()) {
+		Submit();
 	}
-	for (auto& buffer: m_buffers) {
-		buffer->WaitForFenceAndReset();
-	}
-	m_master.Wait(tick);
+	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
-	BindCurrent();
-	Current().Begin();
-	m_recording = true;
-}
-
-void CommandScheduler::FinishCurrent() {
-	SubmitInfo submit;
-	auto&      submitted = SubmitCurrent(submit);
-	submitted.WaitForFenceAndReset();
-	m_master.Refresh();
-	PopPendingOperations();
-	submitted.Begin();
-	m_recording = true;
+	BeginNext();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
-	CheckActive();
 	EXIT_IF(tick > CurrentTick());
-	if (tick >= CurrentTick()) {
+	if (tick == CurrentTick()) {
+		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
-		// Current(). Recycle the same command object so that reference remains valid. Deferred
+		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		SubmitInfo submit;
-		auto&      submitted = SubmitCurrent(submit);
-		submitted.WaitForFenceAndReset();
-		m_master.Refresh();
-		submitted.Begin();
-		m_recording = true;
-		return;
+		const auto submitted_tick = Submit();
+		EXIT_IF(submitted_tick != tick);
+		m_master.Wait(tick);
+		BeginNext();
+	} else {
+		m_master.Wait(tick);
 	}
-	m_master.Wait(tick);
 }
 
 void CommandScheduler::PopPendingOperations() {
@@ -365,83 +342,81 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
-CommandSlot* CommandScheduler::AllocateCommandBuffer() {
-	return m_command_pool.Allocate(m_graphics);
-}
-
-uint64_t CommandScheduler::NextSubmitSequence() noexcept {
-	return m_submit_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-}
-
 void CommandScheduler::CheckActive() const {
-	EXIT_IF(!Active() || static_cast<size_t>(m_current) >= m_buffers.size());
+	EXIT_IF(!Active());
 }
 
-RenderCommandBuffer& CommandScheduler::Current() const {
+RenderCommandBuffer& CommandScheduler::Current() {
 	CheckActive();
-	EXIT_IF(m_buffers[m_current] == nullptr);
-	return *m_buffers[m_current];
+	return m_command;
 }
 
-void CommandScheduler::BindCurrent() const {
+void CommandScheduler::BindCurrent() {
 	EXIT_IF(m_registers == nullptr || m_user_config == nullptr || m_shaders == nullptr);
-	Current().Bind(*m_registers, *m_user_config, *m_shaders);
+	m_command.Bind(*m_registers, *m_user_config, *m_shaders);
 }
 
-CommandBuffer& CommandScheduler::SubmitCurrent(SubmitInfo& submit) {
-	CheckActive();
-	EXIT_IF(!m_recording);
-	auto& submitted = Current();
-	submitted.End();
-	const auto signal_tick = m_master.NextTick();
-	submit.AddSignal(m_master.Handle(), signal_tick);
-	submitted.Execute(submit);
-	m_buffer_ticks[static_cast<size_t>(m_current)] = signal_tick;
-	m_recording                                    = false;
-	return submitted;
+CommandBuffer& CommandScheduler::BeginCommand() {
+	EXIT_IF(!m_command.IsInvalid());
+	m_command.m_buffer = m_command_pool.Commit();
+	m_command.Begin();
+	return m_command;
 }
 
-int CommandScheduler::FindReusableBuffer(uint64_t gpu_tick) const {
-	EXIT_IF(m_buffer_ticks.size() != m_buffers.size());
-	const auto buffer_count = m_buffers.size();
-	for (size_t offset = 1; offset <= buffer_count; ++offset) {
-		const auto candidate = (static_cast<size_t>(m_current) + offset) % buffer_count;
-		if (gpu_tick >= m_buffer_ticks[candidate]) {
-			return static_cast<int>(candidate);
-		}
+uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	EXIT_IF(m_command.IsInvalid());
+	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
+	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+
+	m_command.End();
+	const auto buffer   = m_command.m_buffer;
+	auto&      graphics = m_graphics;
+	EXIT_IF(graphics.queue == nullptr);
+
+	vk::Result result;
+	uint64_t   tick;
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), tick);
+
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.sType                     = vk::StructureType::eTimelineSemaphoreSubmitInfo;
+		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+		vk::SubmitInfo submit_info {};
+		submit_info.sType                = vk::StructureType::eSubmitInfo;
+		submit_info.pNext                = &timeline_info;
+		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &buffer;
+		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
-	return -1;
-}
 
-size_t CommandScheduler::GrowCommandBuffers() {
-	const auto first = m_buffers.size();
-	const auto end   = first + CommandBufferGrowStep;
-	m_buffers.reserve(end);
-	m_buffer_ticks.reserve(end);
-	for (size_t i = first; i < end; ++i) {
-		m_buffers.emplace_back(std::make_unique<RenderCommandBuffer>(*this));
-		m_buffer_ticks.push_back(0);
+	if (result != vk::Result::eSuccess) {
+		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
+		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
+		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
+		                  m_command.m_debug_arg4);
 	}
-	return first;
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	m_command.m_buffer = nullptr;
+	return tick;
 }
 
 void CommandScheduler::BeginNext() {
-	EXIT_IF(m_recording);
-
-	auto candidate = FindReusableBuffer(m_master.KnownGpuTick());
-	if (candidate < 0) {
-		m_master.Refresh();
-		candidate = FindReusableBuffer(m_master.KnownGpuTick());
-	}
-	if (candidate < 0) {
-		candidate = static_cast<int>(GrowCommandBuffers());
-	}
-
-	m_current = candidate;
-	Current().WaitForFenceAndReset();
+	EXIT_IF(!m_command.IsInvalid());
 	BindCurrent();
-	Current().Begin();
-	m_recording = true;
+	BeginCommand();
 }
 
 } // namespace Libs::Graphics

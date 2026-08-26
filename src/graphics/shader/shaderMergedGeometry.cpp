@@ -238,6 +238,11 @@ bool ShaderComputeMeshDispatch(uint32_t total_primitives, uint32_t vertices_per_
 	if (max_output_per_subgroup != 0) {
 		primitives = std::min(primitives, max_output_per_subgroup / output_vertices_per_primitive);
 	}
+	// One output vertex and one output primitive per lane, so the emitted output has to fit the
+	// lane budget. GE_MAX_OUTPUT_PER_SUBGROUP is a maximum, so a smaller split is always legal.
+	primitives = std::min(primitives, MeshWaveLanes / output_vertices_per_primitive);
+	primitives = std::min(primitives,
+	                      MeshWaveLanes / MeshOutputPrimitivesPerPrimitive(output_vertices_per_primitive));
 	if (primitives == 0) {
 		return Fail(error, fmt::format("no primitive fits a workgroup: vert_group={} prim_group={} "
 		                               "max_out={} verts_per_prim={}",

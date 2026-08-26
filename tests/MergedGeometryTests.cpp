@@ -276,9 +276,12 @@ void AnAmplifyingGsIsSizedByWhatItEmits() {
                                                    MaxOut, dispatch, &error),
         "an amplifying GS splits");
 
-  // GE_MAX_OUTPUT_PER_SUBGROUP counts emitted vertices: 192 of them at 24 each is 8 primitives.
-  Check(dispatch.primitives_per_workgroup == MaxOut / Amplified,
-        "the subgroup output bound divides by what a primitive emits");
+  // The subgroup bound alone allows eight primitives; 64 lanes can only write two.
+  Check(MaxOut / Amplified == 8, "the subgroup output bound alone would allow eight primitives");
+  Check(dispatch.primitives_per_workgroup == 2, "but the lane budget clamps it to two");
+  Check(dispatch.output_vertices_per_workgroup <= 64 &&
+            dispatch.output_primitives_per_workgroup <= 64,
+        "so the emitted output fits the lanes that have to write it");
   Check(dispatch.vertices_per_workgroup == dispatch.primitives_per_workgroup * TriVerts,
         "its input vertices still come three to a primitive");
   Check(dispatch.output_vertices_per_workgroup == dispatch.primitives_per_workgroup * Amplified,

@@ -91,7 +91,9 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
-	const auto subid = EmitSubgroupLocalInvocationId(state);
+	// EmitLogicalReadLane stores at the logical lane, so the target must be in that space too.
+	const auto subid =
+	    state.logical_wave64 ? EmitCurrentLaneId(state) : EmitSubgroupLocalInvocationId(state);
 	if (control <= 0xffu) {
 		return EmitDppQuadPermTargetLane(state, subid, control);
 	}

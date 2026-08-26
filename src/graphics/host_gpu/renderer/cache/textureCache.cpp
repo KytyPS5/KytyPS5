@@ -1441,6 +1441,23 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	return true;
 }
 
+void TextureCache::DescribePageImages(uint64_t address) {
+	const auto       page = address & ~(TRACKER_PAGE_SIZE - 1);
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(page, TRACKER_PAGE_SIZE, true)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		printf("\t IMAGE id=%u data=[0x%016" PRIx64 ",0x%016" PRIx64 ") track=[0x%016" PRIx64
+		       ",0x%016" PRIx64 ") registered=%d gpu_modified=%d has_depth=%d\n",
+		       id.index, image->info.data.address, image->info.data.End(), image->track_addr,
+		       image->track_addr_end, static_cast<int>(image->registered),
+		       static_cast<int>(image->IsGpuModified()),
+		       static_cast<int>(static_cast<bool>(image->depth_id)));
+	}
+}
+
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
@@ -1745,9 +1762,14 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr || owner->depth_id) {
+		if (owner == nullptr) {
 			continue;
 		}
+		// A stencil association owns no contents, but RefreshImage still installs page watchers
+		// over its guest range. Skipping it here left the watcher in place forever: the guest
+		// store that raised the fault was resumed onto a still-read-only page and re-faulted
+		// immediately, livelocking the faulting thread. Invalidate it like any other image so the
+		// watcher is dropped and the plane is re-imported on its next binding.
 		if (owner->Overlaps(address, size)) {
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);

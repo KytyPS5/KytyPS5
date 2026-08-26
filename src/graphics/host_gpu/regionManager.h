@@ -84,6 +84,29 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+
+	// Diagnostics: this region's per-page belief about a single page. `writable`/`readable` are
+	// what the region thinks the host protection already is; a mismatch with the real protection
+	// means a protection update was skipped by the mask.None() early-out.
+	struct PageDiagnostics {
+		bool cpu_dirty = false;
+		bool gpu_dirty = false;
+		bool writable  = false;
+		bool readable  = false;
+	};
+	[[nodiscard]] PageDiagnostics DescribePage(uint64_t vaddr) const {
+		PageDiagnostics result {};
+		if (vaddr < m_cpu_addr || vaddr - m_cpu_addr >= TRACKER_REGION_SIZE) {
+			return result;
+		}
+		const auto index = static_cast<size_t>((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
+		result.cpu_dirty = m_cpu_dirty.Get(index);
+		result.gpu_dirty = m_gpu_dirty.Get(index);
+		result.writable  = m_writable.Get(index);
+		result.readable  = m_readable.Get(index);
+		return result;
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);

@@ -20,6 +20,16 @@ public:
 
 	[[nodiscard]] uint64_t GetPageSize() const;
 
+	// Diagnostics: the watcher state this manager believes a page has, and the protection that
+	// state implies. Compared against the real host protection it shows tracker/OS divergence.
+	struct PageDiagnostics {
+		bool     known               = false;
+		uint32_t write_watchers      = 0;
+		uint32_t access_watchers     = 0;
+		uint32_t expected_protection = 0;
+	};
+	[[nodiscard]] PageDiagnostics DescribePage(uint64_t vaddr) const;
+
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>

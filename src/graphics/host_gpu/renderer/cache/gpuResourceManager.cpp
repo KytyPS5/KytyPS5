@@ -3,7 +3,93 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "kernel/memory.h"
+
+#include <cinttypes>
+#include <cstdio>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
+
 namespace Libs::Graphics {
+
+namespace {
+
+// The real host protection of a page, so a claimed-but-unresolved fault can be told apart from a
+// genuine repeat. A tracker that believes a page is writable while the OS reports read-only is the
+// signature of a protection update that the mask.None() early-out skipped.
+uint32_t QueryHostProtection(uint64_t vaddr) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0) {
+		return 0;
+	}
+	return info.State == MEM_COMMIT ? info.Protect : 0;
+#else
+	(void)vaddr;
+	return 0;
+#endif
+}
+
+} // namespace
+
+// Safety net, not a fix. A fault this manager claims must actually be resolved: the filter resumes
+// the guest instruction, which re-executes the same store. If the caches leave the page protected
+// the store faults again immediately and the thread makes no progress at all -- a livelock that is
+// indistinguishable from a hang and that no amount of waiting escapes. Whenever a single page is
+// claimed this many times in a row without another page intervening, force the host protection
+// open so the thread advances, and report the tracker state that caused it. A redundant
+// VirtualProtect costs microseconds; a livelocked render thread costs the process.
+void GpuResourceManager::ResolveRepeatedFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	// Far above any legitimate consecutive-repeat burst (a page reprotected between two guest
+	// stores repeats a handful of times), far below the tens of millions a real livelock reaches.
+	constexpr uint64_t UNRESOLVED_FAULT_LIMIT = 4096;
+	constexpr uint64_t MAX_REPORTS            = 16;
+
+	static thread_local uint64_t last_page = 0;
+	static thread_local uint64_t repeats   = 0;
+	static thread_local uint64_t reported  = 0;
+
+	const auto page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	if (page != last_page) {
+		last_page = page;
+		repeats   = 1;
+		return;
+	}
+	if (++repeats < UNRESOLVED_FAULT_LIMIT) {
+		return;
+	}
+	repeats = 1;
+
+	if (reported < MAX_REPORTS) {
+		reported++;
+		const auto page_state   = m_page_manager.DescribePage(page);
+		const auto host_protect = QueryHostProtection(page);
+		printf("FAULTLOOP page=0x%016" PRIx64 " at=0x%016" PRIx64 " access=%d claimed %" PRIu64
+		       " times without progress; tracker(write_watchers=%" PRIu32 " access_watchers=%" PRIu32
+		       " known=%d expected_protect=0x%02" PRIx32 ") host_protect=0x%08" PRIx32 "\n",
+		       page, fault_vaddr, static_cast<int>(access), UNRESOLVED_FAULT_LIMIT,
+		       page_state.write_watchers, page_state.access_watchers,
+		       static_cast<int>(page_state.known), page_state.expected_protection, host_protect);
+		RegionManager::PageDiagnostics region {};
+		if (m_buffer_cache.DescribeTrackerPage(page, &region)) {
+			printf("\t BUFFER REGION cpu_dirty=%d gpu_dirty=%d writable=%d readable=%d\n",
+			       static_cast<int>(region.cpu_dirty), static_cast<int>(region.gpu_dirty),
+			       static_cast<int>(region.writable), static_cast<int>(region.readable));
+		}
+		m_texture_cache.DescribePageImages(page);
+		fflush(stdout);
+	}
+
+	(void)LibKernel::Memory::ProtectGuestHostMemory(page, TRACKER_PAGE_SIZE,
+	                                                Common::VirtualMemory::Mode::ReadWrite);
+}
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
@@ -22,6 +108,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
+	ResolveRepeatedFault(access, fault_vaddr);
 	return true;
 }
 

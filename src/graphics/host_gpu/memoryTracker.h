@@ -23,6 +23,20 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// Diagnostics: the region belief for one page, without creating a region.
+	[[nodiscard]] bool DescribePage(uint64_t vaddr, RegionManager::PageDiagnostics* out) const {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (index >= REGION_COUNT) {
+			return false;
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return false;
+		}
+		*out = manager->DescribePage(vaddr);
+		return true;
+	}
+
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);

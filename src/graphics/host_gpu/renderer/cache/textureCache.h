@@ -64,6 +64,8 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// Diagnostics: describe every image whose tracked range covers a page, for fault triage.
+	void               DescribePageImages(uint64_t address);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);

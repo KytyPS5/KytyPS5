@@ -331,6 +331,23 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
+PageManager::PageDiagnostics PageManager::DescribePage(uint64_t vaddr) const {
+	PageDiagnostics result {};
+	auto*           region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return result;
+	}
+	const auto region_base = vaddr / REGION_SIZE * REGION_SIZE;
+	const auto index       = static_cast<size_t>((PageStart(vaddr) - region_base) / PAGE_SIZE);
+	SpinGuard  lock(region->lock);
+	const auto& page = region->pages[index];
+	result.known               = true;
+	result.write_watchers      = page.write_watchers;
+	result.access_watchers     = page.access_watchers;
+	result.expected_protection = page.Perms();
+	return result;
+}
+
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);

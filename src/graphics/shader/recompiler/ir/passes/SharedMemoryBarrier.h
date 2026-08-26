@@ -9,7 +9,7 @@ struct SharedMemoryBarrierStats {
 };
 
 [[nodiscard]] SharedMemoryBarrierStats
-InsertSharedMemoryBarriers(ValueProgram& program, uint32_t wave_size,
+InsertSharedMemoryBarriers(Program& program, uint32_t wave_size,
 	                       const ShaderComputeInputInfo& compute_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -5,13 +5,11 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-bool UserDataDwordIndex(const EmitterState& state, IR::Register reg, uint32_t& dword_index) {
-	if (reg.file != IR::RegisterFile::Scalar) {
-		return false;
-	}
+bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
+	const auto register_index = IR::RegIndex(reg);
 	const auto& registers = state.program.bindings.user_data_registers;
-	const auto  found     = std::lower_bound(registers.begin(), registers.end(), reg.index);
-	if (found == registers.end() || *found != reg.index) {
+	const auto  found     = std::lower_bound(registers.begin(), registers.end(), register_index);
+	if (found == registers.end() || *found != register_index) {
 		return false;
 	}
 	dword_index = static_cast<uint32_t>(found - registers.begin());
@@ -504,7 +502,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::GetUserData: {
 			const auto reg   = inst.Arg(0).ScalarRegister();
 			uint32_t   dword = 0;
-			if (!UserDataDwordIndex(state, {IR::RegisterFile::Scalar, IR::RegIndex(reg)}, dword)) {
+			if (!UserDataDwordIndex(state, reg, dword)) {
 				ctx.Define(inst, ConstantU32(state, 0));
 			} else {
 				ctx.Define(inst, EmitShaderDataDwordLoad(state, dword));

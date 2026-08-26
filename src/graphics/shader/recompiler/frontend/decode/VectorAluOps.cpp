@@ -7,7 +7,7 @@ namespace {
 
 using Detail::OpcodeMap;
 
-// These profiles describe the selectors that the current lowering implements. They are not
+// These profiles describe the selectors that the current translator implements. They are not
 // architectural SDWA legality classes.
 enum class Vop2SdwaProfile {
 	None,

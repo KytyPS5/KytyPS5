@@ -38,7 +38,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -967,7 +967,6 @@ struct TestCase {
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
-  std::vector<std::pair<std::string, size_t>> native_ir_counts;
   u32 expected_storage_mip_descriptors = 0;
 };
 
@@ -1192,32 +1191,6 @@ CompiledShader CompileCase(const TestCase &test) {
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
   }
-  if (!test.native_ir_counts.empty()) {
-    ShaderRecompiler::Decoder::Program decoded;
-    ShaderRecompiler::CFG::Graph cfg;
-    ShaderRecompiler::IR::Program native;
-    std::string native_error;
-    Require(test.name, "native decode",
-            ShaderRecompiler::Decoder::DecodeProgram(test.code, decoded,
-                                                     &native_error),
-            native_error);
-    Require(test.name, "native CFG",
-            ShaderRecompiler::CFG::BuildGraph(decoded, cfg, &native_error) &&
-                ShaderRecompiler::CFG::Structurize(cfg, &native_error),
-            native_error);
-    Require(test.name, "native lowering",
-            ShaderRecompiler::IR::LowerProgram(decoded, cfg, options.stage,
-                                               options.wave_size, native,
-                                               &native_error),
-            native_error);
-    const auto native_ir = ShaderRecompiler::IR::ProgramToString(native);
-    for (const auto &[text, expected] : test.native_ir_counts) {
-      const auto actual = CountText(native_ir, text);
-      Require(test.name, "native IR", actual == expected,
-              text + " count=" + std::to_string(actual) +
-                  ", expected=" + std::to_string(expected));
-    }
-  }
   if (test.expected_storage_mip_descriptors != 0) {
     const auto image = std::ranges::find_if(
         result.program.info.images, [](const auto &resource) {
@@ -1242,7 +1215,7 @@ CompiledShader CompileCase(const TestCase &test) {
             "dynamic storage image did not receive one descriptor per mip");
   }
   if (test.expand_shader_data_storage) {
-    auto &block = *result.program.values->blocks.front();
+    auto &block = *result.program.blocks.front();
     for (u32 reg = 0; reg < 33; reg++) {
       auto &user_data = block.AppendNewInst(
           ShaderRecompiler::IR::ValueOpcode::GetUserData,
@@ -7519,8 +7492,6 @@ public:
 
       ShaderRecompiler::IR::Program null_program{};
       null_program.stage = ShaderType::Compute;
-      null_program.values =
-          std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       null_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource null_resource{};
       null_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
@@ -7630,8 +7601,6 @@ public:
       storage.fields[5] = 0x00700000u;
       ShaderRecompiler::IR::Program storage_program{};
       storage_program.stage = ShaderType::Vertex;
-      storage_program.values =
-          std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       storage_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource storage_resource{};
       storage_resource.kind =
@@ -7911,8 +7880,6 @@ public:
 
       ShaderRecompiler::IR::Program sampled_program{};
       sampled_program.stage = ShaderType::Pixel;
-      sampled_program.values =
-          std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       sampled_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource sampled_resource{};
       sampled_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
@@ -8003,15 +7970,19 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto vertex_sampled_program =
-          std::make_shared<ShaderRecompiler::IR::Program>(
-              *sampled_runtime.program);
+          std::make_shared<ShaderRecompiler::IR::Program>();
       vertex_sampled_program->stage = ShaderType::Vertex;
+      vertex_sampled_program->resource_tracking_complete = true;
+      vertex_sampled_program->info.images.push_back(sampled_resource);
+      allocate_bindings(*vertex_sampled_program);
       ShaderStageRuntime vertex_sampled_runtime{
           std::move(vertex_sampled_program), sampled_runtime.resources};
       auto pixel_storage_program =
-          std::make_shared<ShaderRecompiler::IR::Program>(
-              *storage_runtime.program);
+          std::make_shared<ShaderRecompiler::IR::Program>();
       pixel_storage_program->stage = ShaderType::Pixel;
+      pixel_storage_program->resource_tracking_complete = true;
+      pixel_storage_program->info.images.push_back(storage_resource);
+      allocate_bindings(*pixel_storage_program);
       ShaderStageRuntime pixel_storage_runtime{std::move(pixel_storage_program),
                                                storage_runtime.resources};
       auto writable_alias_bindings =
@@ -8083,8 +8054,6 @@ public:
 
       auto split_program = std::make_shared<ShaderRecompiler::IR::Program>();
       split_program->stage = ShaderType::Vertex;
-      split_program->values =
-          std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       split_program->resource_tracking_complete = true;
       split_program->info.images = {storage_resource, sampled_resource};
       allocate_bindings(*split_program);
@@ -8459,8 +8428,6 @@ public:
 
       ShaderRecompiler::IR::Program array_program{};
       array_program.stage = ShaderType::Compute;
-      array_program.values =
-          std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       array_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource array_resource{};
       array_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
@@ -8544,10 +8511,13 @@ public:
                 colliding_msaa_descriptor.dwords.begin());
       colliding_msaa_descriptor.dword_count = 8;
       auto colliding_msaa_program =
-          std::make_shared<ShaderRecompiler::IR::Program>(
-              *array_runtime.program);
-      colliding_msaa_program->info.images[0].dimension =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      colliding_msaa_program->stage = ShaderType::Compute;
+      colliding_msaa_program->resource_tracking_complete = true;
+      auto colliding_msaa_resource = array_resource;
+      colliding_msaa_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
+      colliding_msaa_program->info.images.push_back(colliding_msaa_resource);
       auto colliding_msaa_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
       colliding_msaa_snapshot->images.push_back(colliding_msaa_descriptor);
@@ -8604,10 +8574,13 @@ public:
       std::copy(std::begin(msaa_texture.fields), std::end(msaa_texture.fields),
                 msaa_descriptor.dwords.begin());
       msaa_descriptor.dword_count = 8;
-      auto msaa_program = std::make_shared<ShaderRecompiler::IR::Program>(
-          *array_runtime.program);
-      msaa_program->info.images[0].dimension =
+      auto msaa_program = std::make_shared<ShaderRecompiler::IR::Program>();
+      msaa_program->stage = ShaderType::Compute;
+      msaa_program->resource_tracking_complete = true;
+      auto msaa_resource = array_resource;
+      msaa_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
+      msaa_program->info.images.push_back(msaa_resource);
       auto msaa_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
       msaa_snapshot->images.push_back(msaa_descriptor);
@@ -8643,10 +8616,14 @@ public:
                 std::end(msaa_array_texture.fields),
                 msaa_array_descriptor.dwords.begin());
       msaa_array_descriptor.dword_count = 8;
-      auto msaa_array_program = std::make_shared<ShaderRecompiler::IR::Program>(
-          *msaa_runtime.program);
-      msaa_array_program->info.images[0].dimension =
+      auto msaa_array_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      msaa_array_program->stage = ShaderType::Compute;
+      msaa_array_program->resource_tracking_complete = true;
+      auto msaa_array_resource = array_resource;
+      msaa_array_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
+      msaa_array_program->info.images.push_back(msaa_array_resource);
       auto msaa_array_snapshot =
           std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
       msaa_array_snapshot->images.push_back(msaa_array_descriptor);
@@ -8868,7 +8845,6 @@ public:
 
       ShaderRecompiler::IR::Program program{};
       program.stage = ShaderType::Compute;
-      program.values = std::make_shared<ShaderRecompiler::IR::ValueProgram>();
       program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource stencil_resource{};
       stencil_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
@@ -8940,11 +8916,15 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
 
       auto stencil_storage_program =
-          std::make_shared<ShaderRecompiler::IR::Program>(*runtime.program);
-      stencil_storage_program->info.images[0].kind =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      stencil_storage_program->stage = ShaderType::Compute;
+      stencil_storage_program->resource_tracking_complete = true;
+      auto stencil_storage_resource = stencil_resource;
+      stencil_storage_resource.kind =
           ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-      stencil_storage_program->info.images[0].read = false;
-      stencil_storage_program->info.images[0].written = true;
+      stencil_storage_resource.read = false;
+      stencil_storage_resource.written = true;
+      stencil_storage_program->info.images.push_back(stencil_storage_resource);
       auto storage_stencil = stencil;
       storage_stencil.fields[5] = 0x00700000u;
       ShaderRecompiler::IR::DescriptorValue stencil_storage_descriptor{};
@@ -12132,7 +12112,6 @@ TestCase ScalarWaitcntDepctrCapturedVmVsrc() {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_WAITCNT_DEPCTR,
                   O::S_ENDPGM};
   test.decoded_counts = {{"0x00000010: S_WAITCNT_DEPCTR 0x0000ffe3\n", 1}};
-  test.native_ir_counts = {{"0x00000010: Waitcnt null, 0x0000ffe3", 1}};
   test.forbidden_spirv = {"OpControlBarrier", "OpMemoryBarrier"};
   return test;
 }
@@ -13289,7 +13268,6 @@ TestCase Vop3Med3I16Captured() {
   test.decoded_counts = {{"0x00000020: V_MED3_I16 v3.sdwa(sel=5,sext=0), "
                           "v5.opsel(lo=1,hi=0,neghi=0), s25, s27\n",
                           1}};
-  test.native_ir_counts = {{"IMed3I16", 1}};
   test.required_spirv = {"OpSLessThan"};
   return test;
 }
@@ -15227,8 +15205,6 @@ TestCase VectorVopcCmpxNeU64CapturedExecMask() {
                  O::S_MOV_B32, O::S_ENDPGM}};
   test.decoded_counts = {{"V_CMPX_NE_U64 exec_lo, 0, v7", 2},
                          {"V_CMPX_NE_U64 exec_lo, 0, v2", 2}};
-  test.native_ir_counts = {{"CompareNeU64 exec_lo, 0x00000000, v7", 2},
-                           {"CompareNeU64 exec_lo, 0x00000000, v2", 2}};
   return test;
 }
 
@@ -15258,7 +15234,6 @@ TestCase VectorVop3CmpxNeI64CapturedExecMask() {
                 {O::V_MOV_B32, O::V_CMPX_NE_I64, O::BUFFER_STORE_DWORD,
                  O::S_MOV_B32, O::S_ENDPGM}};
   test.decoded_counts = {{"V_CMPX_NE_I64 exec_lo, 0, v7", 2}};
-  test.native_ir_counts = {{"CompareNeU64 exec_lo, 0x00000000, v7", 2}};
   return test;
 }
 
@@ -17738,7 +17713,6 @@ TestCase DsReadU16D16CapturedPreservesHighHalf() {
                 {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_U16_D16,
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {{"DS_READ_U16_D16", 2}};
-  test.native_ir_counts = {{"DsReadUshort", 2}};
   return test;
 }
 
@@ -18652,7 +18626,6 @@ TestCase ImageLoadR128IgnoresAdjacentMaskSgprs() {
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
   test.decoded_counts = {{"r128=1", 1}};
-  test.native_ir_counts = {{"image_r128=1", 1}};
   return test;
 }
 
@@ -18974,8 +18947,6 @@ TestCase ImageD16GatherPacksHalfPairs() {
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.native_ir_counts = {
-      {"dmask=0x1 data_dwords=2 data_bits=16 component=0/4", 1}};
   test.required_spirv = {"OpImageGather", "PackHalf2x16"};
   return test;
 }
@@ -19196,8 +19167,6 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.expected_storage_image_rgba = expected_image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.native_ir_counts = {
-      {"dmask=0xf data_dwords=2 data_bits=16 component=0/4", 1}};
   test.required_spirv = {"UnpackHalf2x16", "OpImageWrite"};
   return test;
 }
@@ -19213,11 +19182,10 @@ void CheckIndirectImageKeySwitch() {
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   program.shader_info_complete = true;
-  program.values = std::make_shared<ValueProgram>();
-  program.values->block_storage.push_back(std::make_unique<Block>());
-  auto *block = program.values->block_storage.back().get();
-  program.values->blocks.push_back(block);
-  program.values->block_info.push_back({.id = 0});
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = 0});
 
   auto &key = block->AppendNewInst(ValueOpcode::LaneId);
   auto &image =
@@ -19242,7 +19210,7 @@ void CheckIndirectImageKeySwitch() {
   memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLod;
   memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   memory.image_address_components = 3;
-  program.values->memory_info.push_back(memory);
+  program.memory_info.push_back(memory);
   const MemoryFlags memory_flags{0u, 0x10f0u};
   uint64_t memory_flag_bits = 0;
   std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
@@ -19253,11 +19221,11 @@ void CheckIndirectImageKeySwitch() {
                                         {Value(&sample), Value(0u)});
   block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
 
-  program.values->descriptor_sources.resize(2);
-  program.values->descriptor_sources[0].dword_count = 8;
-  program.values->descriptor_sources[0].indirect_image =
+  program.descriptor_sources.resize(2);
+  program.descriptor_sources[0].dword_count = 8;
+  program.descriptor_sources[0].indirect_image =
       DescriptorSource::IndirectImage{0u, 0u, 224u, 12u, 0u};
-  program.values->descriptor_sources[1].dword_count = 4;
+  program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};
   root.source = 0;
@@ -20394,8 +20362,8 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto code = MakeCode();
   auto positive = Compile("exact Prospero kernel", code);
 
-  compute.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(positive.program);
+  compute.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      std::move(positive.program));
   compute.stage.resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
           positive.resources);
@@ -20488,7 +20456,8 @@ void CheckEmbeddedFetchVertexOffset() {
     Require(name, "compile",
             ShaderRecompiler::TryRecompile(code, options, result, &error),
             error);
-    Require(name, "fetch rewrite", vertex.resource_fetch_components[0] == 4,
+    Require(name, "fetch rewrite",
+            result.program.info.vertex_fetch_components[0] == 4,
             "encoded fetch sequence was not recognized and rewritten");
     return result;
   };
@@ -20497,8 +20466,11 @@ void CheckEmbeddedFetchVertexOffset() {
                           u32 index_offset) {
     ShaderVertexInputInfo vertex;
     vertex.fetch_embedded = true;
-    vertex.stage.program =
-        std::make_shared<const ShaderRecompiler::IR::Program>(result.program);
+    auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+    program->user_data_base = result.program.user_data_base;
+    program->info.vertex_offset_sgpr =
+        result.program.info.vertex_offset_sgpr;
+    vertex.stage.program = std::move(program);
     vertex.stage.resources =
         std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
             result.resources);
@@ -22366,52 +22338,55 @@ void CheckImageSpecializationId() {
   HW::ComputeShaderInfo regs{};
   regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
 
-  ShaderRecompiler::IR::Program identity_program;
-  identity_program.binding_layout_complete = true;
   ShaderRecompiler::IR::ImageResource image;
   image.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
   image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  identity_program.info.images.push_back(image);
-  auto rgb1_program = identity_program;
-  rgb1_program.info.images[0].shader_swizzle = DstSel(4, 5, 6, 1);
-  auto converted_program = identity_program;
-  converted_program.info.images[0].conversion_format =
+  const auto make_program = [](ShaderRecompiler::IR::ImageResource resource) {
+    ShaderRecompiler::IR::Program program;
+    program.binding_layout_complete = true;
+    program.info.images.push_back(std::move(resource));
+    return program;
+  };
+  auto rgb1_image = image;
+  rgb1_image.shader_swizzle = DstSel(4, 5, 6, 1);
+  auto converted_image = image;
+  converted_image.conversion_format =
       Prospero::BufferFormat::k11_11_10UInt;
-  auto mip1_program = identity_program;
-  mip1_program.info.images[0].mip_mode =
-      ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-  auto mip3_program = mip1_program;
-  mip3_program.info.images[0].mip_count = 3;
-  auto array_program = identity_program;
-  array_program.info.images[0].dimension =
+  auto mip1_image = image;
+  mip1_image.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+  auto mip3_image = mip1_image;
+  mip3_image.mip_count = 3;
+  auto array_image = image;
+  array_image.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  auto cube_program = array_program;
-  cube_program.info.images[0].cube = true;
+  auto cube_image = array_image;
+  cube_image.cube = true;
 
   const auto resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
   ShaderComputeInputInfo identity_info;
-  identity_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(identity_program);
+  identity_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      make_program(image));
   identity_info.stage.resources = resources;
   auto rgb1_info = identity_info;
-  rgb1_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(rgb1_program);
+  rgb1_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      make_program(rgb1_image));
   auto converted_info = identity_info;
   converted_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(converted_program);
+      std::make_shared<const ShaderRecompiler::IR::Program>(
+          make_program(converted_image));
   auto mip1_info = identity_info;
-  mip1_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(mip1_program);
+  mip1_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      make_program(mip1_image));
   auto mip3_info = identity_info;
-  mip3_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(mip3_program);
+  mip3_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      make_program(mip3_image));
   auto array_info = identity_info;
-  array_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(array_program);
+  array_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      make_program(array_image));
   auto cube_info = identity_info;
-  cube_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(cube_program);
+  cube_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      make_program(cube_image));
 
   const auto identity_id = ShaderGetIdCS(regs, identity_info, true);
   const auto rgb1_id = ShaderGetIdCS(regs, rgb1_info, true);
@@ -22452,8 +22427,6 @@ void CheckImageSpecializationId() {
           "forcing point filtering enabled mipmapping on a base-mip sampler");
 
   ShaderRecompiler::IR::Program mixed_sampler_program;
-  mixed_sampler_program.values =
-      std::make_shared<ShaderRecompiler::IR::ValueProgram>();
   mixed_sampler_program.resource_tracking_complete = true;
   ShaderRecompiler::IR::ImageResource sampled_image;
   sampled_image.kind = ShaderRecompiler::IR::ResourceKind::Image;
@@ -22500,8 +22473,6 @@ void CheckImageSpecializationId() {
           "native variants");
 
   ShaderRecompiler::IR::Program packed_atomic_program;
-  packed_atomic_program.values =
-      std::make_shared<ShaderRecompiler::IR::ValueProgram>();
   packed_atomic_program.resource_tracking_complete = true;
   auto packed_atomic_image = sampled_image;
   packed_atomic_image.kind =
@@ -23245,7 +23216,7 @@ void CheckEmbeddedFetchLaneSpill() {
   Require("EmbeddedFetchLaneSpill", "compile",
           ShaderRecompiler::TryRecompile(code, options, result, &error), error);
   Require("EmbeddedFetchLaneSpill", "fetch rewrite",
-          vertex.resource_fetch_components[0] == 4,
+          result.program.info.vertex_fetch_components[0] == 4,
           "lane-spilled fetch descriptor was not recognized and rewritten");
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchLaneSpill");
 }

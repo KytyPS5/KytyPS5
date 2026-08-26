@@ -1,11 +1,13 @@
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include "graphics/shader/shader.h"
 
 #include <fmt/format.h>
 #include <map>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -50,7 +52,7 @@ bool IsRuntimeRead(ValueOpcode opcode) {
 	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
-bool EquivalentValue(const ValueProgram& program, Value left, Value right,
+bool EquivalentValue(const Program& program, Value left, Value right,
                      std::vector<std::pair<const Inst*, const Inst*>>& visited) {
 	left  = left.Resolve();
 	right = right.Resolve();
@@ -93,7 +95,7 @@ bool EquivalentValue(const ValueProgram& program, Value left, Value right,
 
 } // namespace
 
-ValueProgram::~ValueProgram() {
+Program::~Program() {
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
 	for (auto* block: blocks) {
@@ -103,12 +105,20 @@ ValueProgram::~ValueProgram() {
 	}
 }
 
-bool EquivalentValue(const ValueProgram& program, Value left, Value right) {
+Program& Program::operator=(Program&& other) noexcept {
+	if (this != &other) {
+		this->~Program();
+		new (this) Program(std::move(other));
+	}
+	return *this;
+}
+
+bool EquivalentValue(const Program& program, Value left, Value right) {
 	std::vector<std::pair<const Inst*, const Inst*>> visited;
 	return EquivalentValue(program, left, right, visited);
 }
 
-Value ResolveInvariantPhi(const ValueProgram& program, Value value) {
+Value ResolveInvariantPhi(const Program& program, Value value) {
 	value            = value.Resolve();
 	const auto* root = value.TryInstruction();
 	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
@@ -139,7 +149,7 @@ Value ResolveInvariantPhi(const ValueProgram& program, Value value) {
 	return invariant;
 }
 
-bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::string* error) {
+bool ValidateProgram(const Program& program, bool require_ssa, std::string* error) {
 	if (program.blocks.size() != program.block_info.size() ||
 	    program.blocks.size() != program.block_storage.size()) {
 		return Fail(error, "value IR block storage is inconsistent");
@@ -591,14 +601,14 @@ bool ValidateValueProgram(const ValueProgram& program, bool require_ssa, std::st
 	return true;
 }
 
-void ResolveControlFlowIdentities(ValueProgram& program) {
+void ResolveControlFlowIdentities(Program& program) {
 	for (auto& info: program.block_info) {
 		info.condition       = info.condition.Resolve();
 		info.indirect_target = info.indirect_target.Resolve();
 	}
 }
 
-std::string ValueProgramToString(const ValueProgram& program) {
+std::string ProgramToString(const Program& program) {
 	std::map<const Inst*, size_t> ids;
 	size_t                        next_id = 1;
 	for (const auto* block: program.blocks) {

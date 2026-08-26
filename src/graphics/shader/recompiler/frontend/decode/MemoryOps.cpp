@@ -423,7 +423,7 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	DecodeVectorGpr(vdst, inst.dst);
 	if (inst.opcode == Opcode::DS_READ_U16_D16) {
 		// Native D16 reads update only the selected destination half. Reuse the partial
-		// destination representation so the typed lowering preserves the upper word.
+		// destination representation so typed IR translation preserves the upper word.
 		inst.dst.sdwa_sel = 4u;
 	}
 	DecodeVectorGpr(addr, inst.src0);

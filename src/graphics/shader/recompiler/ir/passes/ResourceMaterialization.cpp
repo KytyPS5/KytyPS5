@@ -1,7 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -105,10 +105,10 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 }
 
 const DescriptorSource* Source(const Program& program, uint32_t source) {
-	if (program.values == nullptr || source >= program.values->descriptor_sources.size()) {
+	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
 	}
-	return &program.values->descriptor_sources[source];
+	return &program.descriptor_sources[source];
 }
 
 void MarkCleanFlatSlots(const Program& program, const DescriptorSource* source,
@@ -131,7 +131,7 @@ void MarkCleanFlatSlots(const Program& program, const DescriptorSource* source,
 			const auto slot = inst->Arg(1).Resolve();
 			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
 				slots[slot.U32()] = 1u;
-				pending.push_back(program.values->srt_reads[slot.U32()].value);
+				pending.push_back(program.srt_reads[slot.U32()].value);
 			}
 			continue;
 		}
@@ -275,7 +275,7 @@ uint64_t AddressSpecialization(const AddressResource&           resource,
 }
 
 size_t FlattenedRuntimeDwords(const Program& program) {
-	size_t size = program.values != nullptr ? program.values->srt_reads.size() : 0u;
+	size_t size = program.srt_reads.size();
 	for (uint32_t resource = 0; resource < program.info.images.size(); resource++) {
 		const auto& image = program.info.images[resource];
 		if (image.indirect_root == resource) {
@@ -305,8 +305,7 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		}
 		return false;
 	}
-	if (program.values == nullptr ||
-	    snapshot.flattened_srt.size() != FlattenedRuntimeDwords(program)) {
+	if (snapshot.flattened_srt.size() != FlattenedRuntimeDwords(program)) {
 		if (error != nullptr) {
 			*error = "flattened SRT snapshot does not match the shader plan";
 		}
@@ -549,7 +548,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	}
 
 	std::vector<DescriptorSourceRequest> requests;
-	std::vector<uint8_t>                 clean_flat_slots(program.values->srt_reads.size());
+	std::vector<uint8_t>                 clean_flat_slots(program.srt_reads.size());
 	requests.reserve(program.info.buffers.size() + program.info.images.size() * 2u +
 	                 program.info.samplers.size() + program.info.addresses.size());
 	for (const auto& buffer: program.info.buffers) {
@@ -925,13 +924,7 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			}
 		}
 	}
-	if (program.values == nullptr) {
-		if (error != nullptr) {
-			*error = "typed SSA is not ready";
-		}
-		return false;
-	}
-	auto memory_info = program.values->memory_info;
+	auto memory_info = program.memory_info;
 
 	struct SamplerUsage {
 		bool native     = false;
@@ -980,7 +973,7 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			pair.sampler = point_sampler[pair.sampler];
 		}
 	}
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto image_opcode = ImageOpcodeInfoOf(inst.GetOpcode());
 			if (image_opcode.access == ImageAccess::None) {
@@ -1023,7 +1016,7 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		}
 	}
 	program.info                = std::move(next);
-	program.values->memory_info = std::move(memory_info);
+	program.memory_info = std::move(memory_info);
 	snapshot                    = std::move(next_snapshot);
 	return true;
 }

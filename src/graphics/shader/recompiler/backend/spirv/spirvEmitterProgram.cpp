@@ -79,9 +79,9 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 	}
 }
 
-const IR::Block* TargetBlock(const IR::ValueProgram& program, uint32_t id) {
+const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 	const auto found = std::ranges::find_if(
-	    program.block_info, [&](const IR::ValueBlockInfo& info) { return info.id == id; });
+	    program.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
 	if (found == program.block_info.end()) {
 		return nullptr;
 	}
@@ -94,7 +94,7 @@ void EmitReturn(ValueEmitContext& ctx) {
 }
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
-                              const IR::ValueBlockInfo& info) {
+                              const IR::BlockInfo& info) {
 	const auto& term       = info.terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -150,7 +150,7 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 }
 
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                              const IR::Block* block, const IR::ValueBlockInfo& info) {
+                              const IR::Block* block, const IR::BlockInfo& info) {
 	const auto& term = info.terminator;
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
@@ -503,7 +503,7 @@ void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) {
 	error  = fmt::format("typed opcode {} {}", IR::ValueOpcodeName(inst.GetOpcode()), reason);
 }
 
-bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std::string* error) {
+bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* error) {
 	ValueEmitContext                       ctx(state, program);
 	std::optional<DispatcherFunctionState> dispatcher;
 	if (state.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {

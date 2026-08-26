@@ -84,7 +84,6 @@ struct ShaderVertexInputInfo {
 
 	ShaderBufferResource    resources[RES_MAX];
 	ShaderVertexDestination resources_dst[RES_MAX];
-	int                     resource_fetch_components[RES_MAX] = {};
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
 	int                     resources_num       = 0;

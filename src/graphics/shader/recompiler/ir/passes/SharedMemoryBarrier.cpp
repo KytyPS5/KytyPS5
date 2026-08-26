@@ -1,6 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <queue>
@@ -12,7 +12,7 @@ namespace {
 
 enum class LdsPhase { None, Read, Write };
 
-LdsPhase GetLdsPhase(const ValueProgram& program, const Inst& inst) {
+LdsPhase GetLdsPhase(const Program& program, const Inst& inst) {
 	const auto access = SharedAccessOf(inst.GetOpcode());
 	if (access != SharedAccess::Read && access != SharedAccess::Write) {
 		return LdsPhase::None;
@@ -59,7 +59,7 @@ uint32_t InsertBarrier(Block& block, Block::iterator position) {
 	return 1;
 }
 
-uint32_t InsertBlockBarriers(ValueProgram& program, Block& block) {
+uint32_t InsertBlockBarriers(Program& program, Block& block) {
 	uint32_t inserted = 0;
 	LdsPhase phase    = LdsPhase::None;
 	for (auto inst = block.begin(); inst != block.end(); ++inst) {
@@ -94,7 +94,7 @@ uint32_t InsertMergeBarrier(Block& block) {
 
 } // namespace
 
-SharedMemoryBarrierStats InsertSharedMemoryBarriers(ValueProgram& program, uint32_t wave_size,
+SharedMemoryBarrierStats InsertSharedMemoryBarriers(Program& program, uint32_t wave_size,
 	                                                 const ShaderComputeInputInfo& compute_info) {
 	SharedMemoryBarrierStats stats;
 	const auto threadgroup_size = compute_info.threads_num[0] * compute_info.threads_num[1] *

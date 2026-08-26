@@ -101,7 +101,7 @@ Value GetRealValue(PhiMap& phi_map, Value source, uint32_t lane, uint32_t wave_s
 
 } // namespace
 
-ReadLaneStats EliminateReadLane(ValueProgram& program, uint32_t wave_size) {
+ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	ReadLaneStats stats;
 	if (wave_size != 32u && wave_size != 64u) {
 		return stats;

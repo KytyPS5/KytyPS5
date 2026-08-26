@@ -3,36 +3,39 @@
 #include <array>
 #include <utility>
 
-namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
+namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::TranslatePackedFloat16(const IR::Instruction& inst) {
+bool Translator::TranslatePackedFloat16(const Decoder::Instruction& inst) {
 	IR::ValueOpcode opcode;
-	switch (inst.op) {
-		case IR::Opcode::PackedAddF16: opcode = IR::ValueOpcode::FPAdd32; break;
-		case IR::Opcode::PackedMulF16: opcode = IR::ValueOpcode::FPMul32; break;
-		case IR::Opcode::PackedMinF16: opcode = IR::ValueOpcode::FPMin32; break;
-		case IR::Opcode::PackedMaxF16: opcode = IR::ValueOpcode::FPMax32; break;
-		case IR::Opcode::PackedFmaF16: opcode = IR::ValueOpcode::FPFma32; break;
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_PK_ADD_F16: opcode = IR::ValueOpcode::FPAdd32; break;
+		case Decoder::Opcode::V_PK_MUL_F16: opcode = IR::ValueOpcode::FPMul32; break;
+		case Decoder::Opcode::V_PK_MIN_F16: opcode = IR::ValueOpcode::FPMin32; break;
+		case Decoder::Opcode::V_PK_MAX_F16: opcode = IR::ValueOpcode::FPMax32; break;
+		case Decoder::Opcode::V_PK_FMA_F16: opcode = IR::ValueOpcode::FPFma32; break;
+		case Decoder::Opcode::V_PK_FMAC_F16: opcode = IR::ValueOpcode::FPFma32; break;
 		default: return false;
 	}
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src[0], high, true);
-		const auto rhs = ReadF16LaneAsF32(inst.src[1], high, true);
+		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
+		const auto rhs = ReadF16LaneAsF32(inst.src1, high, true);
 		IR::F32    result;
-		if (inst.src_count == 3u) {
-			result = IR::F32(
-			    ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src[2], high, true)}));
+		if (inst.opcode == Decoder::Opcode::V_PK_FMAC_F16) {
+			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high, true)}));
+		} else if (inst.src_count == 3u) {
+			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high, true)}));
 		} else {
 			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
 		}
 		return ApplyF32ResultModifiers(inst.dst, result);
 	};
-	auto raw    = inst.dst;
+	auto raw    = DestinationOperand(inst);
 	raw.omod    = 0u;
 	raw.clamp   = false;
 	auto result = PackHalf2x16(translate_lane(false), translate_lane(true));
-	if (inst.op == IR::Opcode::PackedMinF16 || inst.op == IR::Opcode::PackedMaxF16) {
-		const auto quiet_snan = [&](const IR::Operand& operand, bool high) {
+	if (inst.opcode == Decoder::Opcode::V_PK_MIN_F16 ||
+	    inst.opcode == Decoder::Opcode::V_PK_MAX_F16) {
+		const auto quiet_snan = [&](const Decoder::Operand& operand, bool high) {
 			const auto bits     = ReadU16LaneAsU32(operand, high, false);
 			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7c00u)));
 			const auto payload  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x01ffu)));
@@ -41,8 +44,8 @@ bool Translator::TranslatePackedFloat16(const IR::Instruction& inst) {
 			return std::pair {snan, ir.BitwiseOr(bits, IR::U32(IR::Value(0x0200u)))};
 		};
 		const auto override_lane = [&](bool high) {
-			const auto [lhs_snan, lhs_quiet] = quiet_snan(inst.src[0], high);
-			const auto [rhs_snan, rhs_quiet] = quiet_snan(inst.src[1], high);
+			const auto [lhs_snan, lhs_quiet] = quiet_snan(inst.src0, high);
+			const auto [rhs_snan, rhs_quiet] = quiet_snan(inst.src1, high);
 			const auto normal = high ? ir.ShiftRightLogical(result, IR::U32(IR::Value(16u)))
 			                         : ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu)));
 			return ir.Select(lhs_snan, lhs_quiet, ir.Select(rhs_snan, rhs_quiet, normal));
@@ -53,59 +56,71 @@ bool Translator::TranslatePackedFloat16(const IR::Instruction& inst) {
 	return true;
 }
 
-bool Translator::TranslateFloat16Operation(const IR::Instruction& inst) {
+bool Translator::TranslateFloat16Operation(const Decoder::Instruction& inst) {
 	IR::ValueOpcode opcode;
-	switch (inst.op) {
-		case IR::Opcode::AddF16: opcode = IR::ValueOpcode::FPAdd32; break;
-		case IR::Opcode::SubF16: opcode = IR::ValueOpcode::FPSub32; break;
-		case IR::Opcode::MulF16: opcode = IR::ValueOpcode::FPMul32; break;
-		case IR::Opcode::MinF16: opcode = IR::ValueOpcode::FPMin32; break;
-		case IR::Opcode::MaxF16: opcode = IR::ValueOpcode::FPMax32; break;
-		case IR::Opcode::FmaF16:
-		case IR::Opcode::MadMixF16: opcode = IR::ValueOpcode::FPFma32; break;
-		case IR::Opcode::RcpF16: opcode = IR::ValueOpcode::FPRecip32; break;
-		case IR::Opcode::SqrtF16: opcode = IR::ValueOpcode::FPSqrt; break;
-		case IR::Opcode::InverseSqrtF16: opcode = IR::ValueOpcode::FPRecipSqrt32; break;
-		case IR::Opcode::Log2F16: opcode = IR::ValueOpcode::FPLog2; break;
-		case IR::Opcode::Exp2F16: opcode = IR::ValueOpcode::FPExp2; break;
-		case IR::Opcode::FloorF16: opcode = IR::ValueOpcode::FPFloor32; break;
-		case IR::Opcode::CeilF16: opcode = IR::ValueOpcode::FPCeil32; break;
-		case IR::Opcode::TruncF16: opcode = IR::ValueOpcode::FPTrunc32; break;
-		case IR::Opcode::RoundEvenF16: opcode = IR::ValueOpcode::FPRoundEven32; break;
-		case IR::Opcode::Min3F16: opcode = IR::ValueOpcode::FPMinTri32; break;
-		case IR::Opcode::Max3F16: opcode = IR::ValueOpcode::FPMaxTri32; break;
-		case IR::Opcode::Med3F16: opcode = IR::ValueOpcode::FPMedTri32; break;
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_ADD_F16: opcode = IR::ValueOpcode::FPAdd32; break;
+		case Decoder::Opcode::V_SUB_F16: opcode = IR::ValueOpcode::FPSub32; break;
+		case Decoder::Opcode::V_SUBREV_F16: opcode = IR::ValueOpcode::FPSub32; break;
+		case Decoder::Opcode::V_MUL_F16: opcode = IR::ValueOpcode::FPMul32; break;
+		case Decoder::Opcode::V_MIN_F16: opcode = IR::ValueOpcode::FPMin32; break;
+		case Decoder::Opcode::V_MAX_F16: opcode = IR::ValueOpcode::FPMax32; break;
+		case Decoder::Opcode::V_FMAC_F16:
+		case Decoder::Opcode::V_FMAMK_F16:
+		case Decoder::Opcode::V_FMAAK_F16:
+		case Decoder::Opcode::V_FMA_F16:
+		case Decoder::Opcode::V_MAD_MIXLO_F16: opcode = IR::ValueOpcode::FPFma32; break;
+		case Decoder::Opcode::V_MAD_MIXHI_F16: opcode = IR::ValueOpcode::FPFma32; break;
+		case Decoder::Opcode::V_RCP_F16: opcode = IR::ValueOpcode::FPRecip32; break;
+		case Decoder::Opcode::V_SQRT_F16: opcode = IR::ValueOpcode::FPSqrt; break;
+		case Decoder::Opcode::V_RSQ_F16: opcode = IR::ValueOpcode::FPRecipSqrt32; break;
+		case Decoder::Opcode::V_LOG_F16: opcode = IR::ValueOpcode::FPLog2; break;
+		case Decoder::Opcode::V_EXP_F16: opcode = IR::ValueOpcode::FPExp2; break;
+		case Decoder::Opcode::V_FLOOR_F16: opcode = IR::ValueOpcode::FPFloor32; break;
+		case Decoder::Opcode::V_CEIL_F16: opcode = IR::ValueOpcode::FPCeil32; break;
+		case Decoder::Opcode::V_TRUNC_F16: opcode = IR::ValueOpcode::FPTrunc32; break;
+		case Decoder::Opcode::V_RNDNE_F16: opcode = IR::ValueOpcode::FPRoundEven32; break;
+		case Decoder::Opcode::V_MIN3_F16: opcode = IR::ValueOpcode::FPMinTri32; break;
+		case Decoder::Opcode::V_MAX3_F16: opcode = IR::ValueOpcode::FPMaxTri32; break;
+		case Decoder::Opcode::V_MED3_F16: opcode = IR::ValueOpcode::FPMedTri32; break;
 		default: return false;
 	}
+	const bool               accumulator  = inst.opcode == Decoder::Opcode::V_FMAC_F16;
+	const uint32_t           source_count = accumulator ? 3u : inst.src_count;
 	std::array<IR::Value, 3> args;
-	for (uint32_t index = 0; index < inst.src_count; index++) {
-		args[index] = inst.op == IR::Opcode::MadMixF16 ? IR::Value(ReadMixF32(inst.src[index]))
-		                                               : IR::Value(ReadF16AsF32(inst.src[index]));
+	for (uint32_t index = 0; index < source_count; index++) {
+		auto operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
+		if (inst.opcode == Decoder::Opcode::V_SUBREV_F16 && index < 2u) {
+			operand = SourceAt(inst, 1u - index);
+		}
+		const bool mix = inst.opcode == Decoder::Opcode::V_MAD_MIXLO_F16 ||
+		                 inst.opcode == Decoder::Opcode::V_MAD_MIXHI_F16;
+		args[index]    = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
 	}
 	IR::F32 result;
-	switch (inst.src_count) {
+	switch (source_count) {
 		case 1: result = IR::F32(ir.Emit(opcode, {args[0]})); break;
 		case 2: result = IR::F32(ir.Emit(opcode, {args[0], args[1]})); break;
 		case 3: result = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})); break;
 		default: EXIT("invalid half-float source count: %u", inst.src_count);
 	}
-	if (inst.op == IR::Opcode::SqrtF16 || inst.op == IR::Opcode::InverseSqrtF16 ||
-	    inst.op == IR::Opcode::Log2F16) {
-		const auto negative = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {args[0], IR::Value::F32(0.0f)}));
-		result = ApplyF32ResultModifiers(inst.dst, result);
-		const auto bits = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
+	if (inst.opcode == Decoder::Opcode::V_SQRT_F16 || inst.opcode == Decoder::Opcode::V_RSQ_F16 ||
+	    inst.opcode == Decoder::Opcode::V_LOG_F16) {
+		const auto negative =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {args[0], IR::Value::F32(0.0f)}));
+		result             = ApplyF32ResultModifiers(inst.dst, result);
+		const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 		const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
-		WriteU16(inst.dst, ir.Select(negative, invalid, bits));
+		WriteU16(DestinationOperand(inst), ir.Select(negative, invalid, bits));
 		return true;
 	}
-	WriteF16(inst.dst, result);
+	WriteF16(DestinationOperand(inst), result);
 	return true;
 }
 
-bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
-	if (inst.op == IR::Opcode::FrexpMantF32) {
-		const auto bits     = ReadU32(inst.src[0]);
+bool Translator::TranslateFloatOperation(const Decoder::Instruction& inst) {
+	if (inst.opcode == Decoder::Opcode::V_FREXP_MANT_F32) {
+		const auto bits     = ReadU32(inst.src0);
 		const auto exponent = IR::U32(
 		    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(23u), IR::Value(8u)}));
 		const auto mantissa = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x007fffffu)));
@@ -121,84 +136,99 @@ bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
 		const auto finite    = ir.Select(ir.INotEqual(exponent, IR::U32(IR::Value(0u))), normal,
 		                                 ir.Select(zero, bits, subnormal));
 		const auto result = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0xffu))), bits, finite);
-		WriteOperand(inst.dst, ir.BitCastF32(result));
+		WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
 		return true;
 	}
 	IR::ValueOpcode opcode {};
-	switch (inst.op) {
-		case IR::Opcode::RcpF32: opcode = IR::ValueOpcode::FPRecip32; break;
-		case IR::Opcode::RcpIflagF32: opcode = IR::ValueOpcode::FPRecipIFlag32; break;
-		case IR::Opcode::FractF32: opcode = IR::ValueOpcode::FPFract32; break;
-		case IR::Opcode::TruncF32: opcode = IR::ValueOpcode::FPTrunc32; break;
-		case IR::Opcode::CeilF32: opcode = IR::ValueOpcode::FPCeil32; break;
-		case IR::Opcode::RoundEvenF32: opcode = IR::ValueOpcode::FPRoundEven32; break;
-		case IR::Opcode::FloorF32: opcode = IR::ValueOpcode::FPFloor32; break;
-		case IR::Opcode::Exp2F32: opcode = IR::ValueOpcode::FPExp2; break;
-		case IR::Opcode::Log2F32: opcode = IR::ValueOpcode::FPLog2; break;
-		case IR::Opcode::InverseSqrtF32: opcode = IR::ValueOpcode::FPRecipSqrt32; break;
-		case IR::Opcode::SqrtF32: opcode = IR::ValueOpcode::FPSqrt; break;
-		case IR::Opcode::SinF32: opcode = IR::ValueOpcode::FPSin; break;
-		case IR::Opcode::CosF32: opcode = IR::ValueOpcode::FPCos; break;
-		case IR::Opcode::FAddF32: opcode = IR::ValueOpcode::FPAdd32; break;
-		case IR::Opcode::FSubF32: opcode = IR::ValueOpcode::FPSub32; break;
-		case IR::Opcode::FMulF32: opcode = IR::ValueOpcode::FPMul32; break;
-		case IR::Opcode::FMinF32: opcode = IR::ValueOpcode::FPMin32; break;
-		case IR::Opcode::FMaxF32: opcode = IR::ValueOpcode::FPMax32; break;
-		case IR::Opcode::FMadF32: opcode = IR::ValueOpcode::FPFma32; break;
-		case IR::Opcode::FMin3F32: opcode = IR::ValueOpcode::FPMinTri32; break;
-		case IR::Opcode::FMax3F32: opcode = IR::ValueOpcode::FPMaxTri32; break;
-		case IR::Opcode::FMed3F32: opcode = IR::ValueOpcode::FPMedTri32; break;
-		case IR::Opcode::LdexpF32: opcode = IR::ValueOpcode::FPLdexp; break;
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_RCP_F32: opcode = IR::ValueOpcode::FPRecip32; break;
+		case Decoder::Opcode::V_RCP_IFLAG_F32: opcode = IR::ValueOpcode::FPRecipIFlag32; break;
+		case Decoder::Opcode::V_FRACT_F32: opcode = IR::ValueOpcode::FPFract32; break;
+		case Decoder::Opcode::V_TRUNC_F32: opcode = IR::ValueOpcode::FPTrunc32; break;
+		case Decoder::Opcode::V_CEIL_F32: opcode = IR::ValueOpcode::FPCeil32; break;
+		case Decoder::Opcode::V_RNDNE_F32: opcode = IR::ValueOpcode::FPRoundEven32; break;
+		case Decoder::Opcode::V_FLOOR_F32: opcode = IR::ValueOpcode::FPFloor32; break;
+		case Decoder::Opcode::V_EXP_F32: opcode = IR::ValueOpcode::FPExp2; break;
+		case Decoder::Opcode::V_LOG_F32: opcode = IR::ValueOpcode::FPLog2; break;
+		case Decoder::Opcode::V_RSQ_F32: opcode = IR::ValueOpcode::FPRecipSqrt32; break;
+		case Decoder::Opcode::V_SQRT_F32: opcode = IR::ValueOpcode::FPSqrt; break;
+		case Decoder::Opcode::V_SIN_F32: opcode = IR::ValueOpcode::FPSin; break;
+		case Decoder::Opcode::V_COS_F32: opcode = IR::ValueOpcode::FPCos; break;
+		case Decoder::Opcode::V_ADD_F32: opcode = IR::ValueOpcode::FPAdd32; break;
+		case Decoder::Opcode::V_SUB_F32: opcode = IR::ValueOpcode::FPSub32; break;
+		case Decoder::Opcode::V_SUBREV_F32: opcode = IR::ValueOpcode::FPSub32; break;
+		case Decoder::Opcode::V_MUL_F32: opcode = IR::ValueOpcode::FPMul32; break;
+		case Decoder::Opcode::V_MIN_F32: opcode = IR::ValueOpcode::FPMin32; break;
+		case Decoder::Opcode::V_MAX_F32: opcode = IR::ValueOpcode::FPMax32; break;
+		case Decoder::Opcode::V_MAC_F32: opcode = IR::ValueOpcode::FPFma32; break;
+		case Decoder::Opcode::V_MADMK_F32:
+		case Decoder::Opcode::V_MADAK_F32:
+		case Decoder::Opcode::V_MAD_F32:
+		case Decoder::Opcode::V_FMA_F32: opcode = IR::ValueOpcode::FPFma32; break;
+		case Decoder::Opcode::V_MIN3_F32: opcode = IR::ValueOpcode::FPMinTri32; break;
+		case Decoder::Opcode::V_MAX3_F32: opcode = IR::ValueOpcode::FPMaxTri32; break;
+		case Decoder::Opcode::V_MED3_F32: opcode = IR::ValueOpcode::FPMedTri32; break;
+		case Decoder::Opcode::V_LDEXP_F32: opcode = IR::ValueOpcode::FPLdexp; break;
 		default: break;
 	}
 	if (opcode != IR::ValueOpcode {}) {
+		const bool     accumulator  = inst.opcode == Decoder::Opcode::V_MAC_F32;
+		const bool     fused        = accumulator || inst.opcode == Decoder::Opcode::V_MADMK_F32 ||
+		                              inst.opcode == Decoder::Opcode::V_MADAK_F32 ||
+		                              inst.opcode == Decoder::Opcode::V_MAD_F32 ||
+		                              inst.opcode == Decoder::Opcode::V_FMA_F32;
+		const uint32_t source_count = accumulator ? 3u : inst.src_count;
 		std::array<IR::Value, 3> args;
-		for (uint32_t index = 0; index < inst.src_count; index++) {
+		for (uint32_t index = 0; index < source_count; index++) {
 			const auto arg_type = IR::ArgTypeOf(opcode, index);
-			args[index] =
-			    arg_type == IR::Type::F32
-			        ? (inst.op == IR::Opcode::FMadF32 ? IR::Value(ReadMixF32(inst.src[index]))
-			                                          : ReadOperand(inst.src[index], IR::Type::F32))
-			        : ReadOperand(inst.src[index], arg_type);
+			auto       operand  = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
+			if (inst.opcode == Decoder::Opcode::V_SUBREV_F32 && index < 2u) {
+				operand = SourceAt(inst, 1u - index);
+			}
+			args[index] = arg_type == IR::Type::F32 ? (fused ? IR::Value(ReadMixF32(operand))
+			                                                 : ReadOperand(operand, IR::Type::F32))
+			                                        : ReadOperand(operand, arg_type);
 		}
 		IR::Value result;
-		switch (inst.src_count) {
+		switch (source_count) {
 			case 1: result = ir.Emit(opcode, {args[0]}); break;
 			case 2: result = ir.Emit(opcode, {args[0], args[1]}); break;
 			case 3: result = ir.Emit(opcode, {args[0], args[1], args[2]}); break;
 			default: EXIT("invalid floating-point source count: %u", inst.src_count);
 		}
-		WriteOperand(inst.dst, result);
+		WriteOperand(DestinationOperand(inst), result);
 		return true;
 	}
 
 	const auto select_f32 = [&](IR::U1 condition, IR::F32 true_value, IR::F32 false_value) {
 		return IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {condition, true_value, false_value}));
 	};
-	if (inst.op == IR::Opcode::Dot2AccF32F16) {
-		auto a          = inst.src[0];
+	if (inst.opcode == Decoder::Opcode::V_DOT2C_F32_F16) {
+		auto a          = inst.src0;
 		a.op_sel        = false;
 		a.op_sel_hi     = true;
-		auto b          = inst.src[1];
+		auto b          = inst.src1;
 		b.op_sel        = false;
 		b.op_sel_hi     = true;
 		const auto a_lo = ReadF16LaneAsF32(a, false);
 		const auto a_hi = ReadF16LaneAsF32(a, true);
 		const auto b_lo = ReadF16LaneAsF32(b, false);
 		const auto b_hi = ReadF16LaneAsF32(b, true);
-		const auto acc  = ReadMixF32(inst.src[2]);
+		const auto acc  = ReadMixF32(inst.dst);
 		const auto lo   = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32, {a_lo, b_lo, acc}));
-		WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::FPFma32, {a_hi, b_hi, lo}));
+		WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::FPFma32, {a_hi, b_hi, lo}));
 		return true;
 	}
-	if (inst.op != IR::Opcode::CubeIdF32 && inst.op != IR::Opcode::CubeScF32 &&
-	    inst.op != IR::Opcode::CubeTcF32 && inst.op != IR::Opcode::CubeMaF32) {
+	if (inst.opcode != Decoder::Opcode::V_CUBEID_F32 &&
+	    inst.opcode != Decoder::Opcode::V_CUBESC_F32 &&
+	    inst.opcode != Decoder::Opcode::V_CUBETC_F32 &&
+	    inst.opcode != Decoder::Opcode::V_CUBEMA_F32) {
 		return false;
 	}
 
-	const auto x  = ReadMixF32(inst.src[0]);
-	const auto y  = ReadMixF32(inst.src[1]);
-	const auto z  = ReadMixF32(inst.src[2]);
+	const auto x  = ReadMixF32(inst.src0);
+	const auto y  = ReadMixF32(inst.src1);
+	const auto z  = ReadMixF32(inst.src2);
 	const auto nx = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {x}));
 	const auto ny = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {y}));
 	const auto nz = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {z}));
@@ -216,18 +246,20 @@ bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
 		return select_f32(z_face, z_value, select_f32(y_face, y_value, x_value));
 	};
 	IR::F32 result;
-	switch (inst.op) {
-		case IR::Opcode::CubeIdF32:
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_CUBEID_F32:
 			result = select_face(
 			    select_f32(x_neg, IR::F32(IR::Value::F32(1.0f)), IR::F32(IR::Value::F32(0.0f))),
 			    select_f32(y_neg, IR::F32(IR::Value::F32(3.0f)), IR::F32(IR::Value::F32(2.0f))),
 			    select_f32(z_neg, IR::F32(IR::Value::F32(5.0f)), IR::F32(IR::Value::F32(4.0f))));
 			break;
-		case IR::Opcode::CubeScF32:
+		case Decoder::Opcode::V_CUBESC_F32:
 			result = select_face(select_f32(x_neg, z, nz), x, select_f32(z_neg, nx, x));
 			break;
-		case IR::Opcode::CubeTcF32: result = select_face(ny, select_f32(y_neg, nz, z), ny); break;
-		case IR::Opcode::CubeMaF32: {
+		case Decoder::Opcode::V_CUBETC_F32:
+			result = select_face(ny, select_f32(y_neg, nz, z), ny);
+			break;
+		case Decoder::Opcode::V_CUBEMA_F32: {
 			const auto two = IR::F32(IR::Value::F32(2.0f));
 			result         = select_face(IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {x, two})),
 			                             IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {y, two})),
@@ -236,8 +268,8 @@ bool Translator::TranslateFloatOperation(const IR::Instruction& inst) {
 		}
 		default: return false;
 	}
-	WriteOperand(inst.dst, result);
+	WriteOperand(DestinationOperand(inst), result);
 	return true;
 }
 
-} // namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

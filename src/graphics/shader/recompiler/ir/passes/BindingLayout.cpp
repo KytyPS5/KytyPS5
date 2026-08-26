@@ -1,6 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <array>
@@ -16,7 +16,7 @@ constexpr uint32_t ImageBindingCount =
 
 bool CollectUserData(const Program& program, std::vector<uint32_t>& result) {
 	std::array<bool, NumScalarRegs> registers {};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::GetUserData || !inst.HasUses()) {
 				continue;
@@ -47,16 +47,16 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 
 bool UsesGds(const Program& program, bool& uses_gds) {
 	uses_gds = false;
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (SharedAccessOf(inst.GetOpcode()) == SharedAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
-			if (index >= program.values->memory_info.size()) {
+			if (index >= program.memory_info.size()) {
 				return false;
 			}
-			const auto kind = program.values->memory_info[index].kind;
+			const auto kind = program.memory_info[index].kind;
 			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
 				return false;
 			}
@@ -73,12 +73,6 @@ bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::stri
 		if (error != nullptr) {
 			*error = !program.shader_info_complete ? "shader info is not ready"
 			                                       : "binding layout already allocated";
-		}
-		return false;
-	}
-	if (program.values == nullptr) {
-		if (error != nullptr) {
-			*error = "typed value program is not available";
 		}
 		return false;
 	}
@@ -171,7 +165,7 @@ bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::stri
 		AddBinding(next, DescriptorBindingKind::AddressMemory, std::move(resources));
 	}
 	const bool uses_flattened_runtime =
-	    !program.values->srt_reads.empty() ||
+	    !program.srt_reads.empty() ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
 		    return image.indirect_mapping_capacity != 0u;
 	    });

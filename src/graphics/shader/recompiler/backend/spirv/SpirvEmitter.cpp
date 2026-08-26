@@ -1,7 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -51,22 +51,20 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
 	bool uses_gds = false;
-	if (program.values != nullptr) {
-		for (const auto* block: program.values->blocks) {
-			for (const auto& inst: *block) {
-				if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) {
-					continue;
-				}
-				const auto index = inst.Flags<IR::MemoryFlags>().index;
-				if (index >= program.values->memory_info.size()) {
-					return Fail(error, "shared operation has invalid memory metadata");
-				}
-				const auto kind = program.values->memory_info[index].kind;
-				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
-					return Fail(error, "shared operation has invalid resource kind");
-				}
-				uses_gds |= kind == IR::ResourceKind::Gds;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) {
+				continue;
 			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				return Fail(error, "shared operation has invalid memory metadata");
+			}
+			const auto kind = program.memory_info[index].kind;
+			if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
+				return Fail(error, "shared operation has invalid resource kind");
+			}
+			uses_gds |= kind == IR::ResourceKind::Gds;
 		}
 	}
 	if (uses_gds) {
@@ -76,11 +74,10 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		Expect(Kind::AddressMemory, Dense(program.info.addresses.size()));
 	}
 	const bool uses_flattened_runtime =
-	    program.values != nullptr &&
-	    (!program.values->srt_reads.empty() ||
+	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
 		     return image.indirect_mapping_capacity != 0u;
-	     }));
+	     });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
@@ -120,9 +117,6 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		return Fail(error, "native user-data layout is inconsistent");
 	}
 
-	if (program.values == nullptr) {
-		return Fail(error, "native shader plan has no typed SSA");
-	}
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
@@ -132,11 +126,11 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
-			       return index < program.values->memory_info.size() &&
-			              program.values->memory_info[index].planning_only;
+			       return index < program.memory_info.size() &&
+			              program.memory_info[index].planning_only;
 		       });
 	};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto dense = inst.Flags<uint32_t>();
 			switch (inst.GetOpcode()) {
@@ -174,7 +168,7 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 				case IR::ValueOpcode::ReadConst: {
 					const auto slot = inst.Arg(1).Resolve();
 					if (!slot.IsImmediate() || slot.GetType() != IR::Type::U32 ||
-					    slot.U32() >= program.values->srt_reads.size()) {
+					    slot.U32() >= program.srt_reads.size()) {
 						return Fail(error, "flattened SRT read has an invalid dense slot");
 					}
 					break;
@@ -191,19 +185,15 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 	program.spirv_requirements.reset();
 	IR::SpirvRequirements requirements {};
-	if (program.values == nullptr) {
-		program.spirv_requirements.emplace(requirements);
-		return true;
-	}
 	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
-				if (memory_index >= program.values->memory_info.size()) {
+				if (memory_index >= program.memory_info.size()) {
 					return Fail(error, "address operation has invalid memory metadata");
 				}
-				if (program.values->memory_info[memory_index].kind == IR::ResourceKind::Scratch) {
+				if (program.memory_info[memory_index].kind == IR::ResourceKind::Scratch) {
 					if (program.scratch_dwords == 0) {
 						return Fail(error, "scratch operation has no per-thread storage");
 					}
@@ -212,10 +202,10 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
-				if (memory_index >= program.values->memory_info.size()) {
+				if (memory_index >= program.memory_info.size()) {
 					return Fail(error, "buffer operation has invalid memory metadata");
 				}
-				const auto& memory = program.values->memory_info[memory_index];
+				const auto& memory = program.memory_info[memory_index];
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					if (memory.resource >= program.info.buffers.size()) {
 						return Fail(error, "buffer operation has invalid resource metadata");
@@ -231,10 +221,10 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
 			if (shared_access != IR::SharedAccess::None) {
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
-				if (index >= program.values->memory_info.size()) {
+				if (index >= program.memory_info.size()) {
 					return Fail(error, "shared operation has invalid memory metadata");
 				}
-				const auto kind = program.values->memory_info[index].kind;
+				const auto kind = program.memory_info[index].kind;
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					return Fail(error, "shared operation has invalid resource kind");
 				}
@@ -288,11 +278,11 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 					break;
 				case IR::ValueOpcode::SetAttribute: {
 					const auto index = inst.Flags<IR::ExportFlags>().index;
-					if (index >= program.values->export_info.size()) {
+					if (index >= program.export_info.size()) {
 						return Fail(error, "attribute export has invalid metadata");
 					}
 					if (program.stage == ShaderType::Pixel &&
-					    program.values->export_info[index].vm) {
+					    program.export_info[index].vm) {
 						requirements.pixel_valid_mask = true;
 					}
 					break;
@@ -330,12 +320,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	if (!ValidateNativeProgram(program, error)) {
 		return false;
 	}
-	if (program.values == nullptr) {
-		SetError(error, "SPIR-V emitter requires planned typed SSA");
-		return false;
-	}
-	const auto& value_program = *program.values;
-	if (!IR::ValidateValueProgram(value_program, true, error)) {
+	if (!IR::ValidateProgram(program, true, error)) {
 		return false;
 	}
 	EmitterState state(program, resources, input_info);
@@ -348,7 +333,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
 	DefineModule(state);
-	if (!EmitValueProgram(state, value_program, error)) {
+	if (!EmitProgram(state, program, error)) {
 		return false;
 	}
 

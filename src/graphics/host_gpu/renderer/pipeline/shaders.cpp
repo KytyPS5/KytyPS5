@@ -548,9 +548,10 @@ void CreatePipelineInternal(
 
 			uint32_t attr_size       = 4;
 			auto     registers_num   = vs_input_info.resources_dst[index].registers_num;
-			auto     used_components = (vs_input_info.resource_fetch_components[index] > 0
-			                                ? vs_input_info.resource_fetch_components[index]
-			                                : registers_num);
+			const auto compiled_components =
+			    vs_input_info.stage.program->info.vertex_fetch_components[index];
+			auto used_components =
+			    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
 			GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
 			               static_cast<uint32_t>(used_components));
 

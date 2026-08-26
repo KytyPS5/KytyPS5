@@ -6,7 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
-#include "graphics/shader/recompiler/ir/opcodes/Opcodes.h"
+#include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
@@ -18,47 +18,6 @@
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-
-struct ValueProgram;
-
-enum class RegisterFile { Scalar, Vector, Vcc, Exec, Scc, M0 };
-
-struct Register {
-	RegisterFile file  = RegisterFile::Scalar;
-	uint32_t     index = 0;
-
-	bool operator==(const Register& other) const {
-		return file == other.file && index == other.index;
-	}
-};
-
-enum class OperandKind { Register, ImmediateU32, PcRelativeU32, PcRelativeHighU32, Null };
-
-struct Operand {
-	OperandKind kind = OperandKind::Null;
-	Register    reg;
-	uint32_t    imm                = 0;
-	bool        float_inline       = false;
-	bool        sext_64            = false;
-	uint32_t    sdwa_sel           = 6;
-	uint32_t    sdwa_dst_unused    = 2;
-	uint32_t    omod               = 0;
-	bool        sdwa_sext          = false;
-	bool        op_sel             = false;
-	bool        op_sel_hi          = false;
-	bool        negate             = false;
-	bool        negate_hi          = false;
-	bool        absolute           = false;
-	bool        clamp              = false;
-	uint32_t    dpp_ctrl           = 0;
-	uint32_t    dpp_row_mask       = 0xf;
-	uint32_t    dpp_bank_mask      = 0xf;
-	bool        dpp_fetch_inactive = false;
-	bool        dpp_bound_ctrl     = false;
-	bool        dpp                = false;
-
-	bool operator==(const Operand& other) const = default;
-};
 
 enum class ResourceKind {
 	None,
@@ -142,44 +101,6 @@ struct ExportInfo {
 	bool             vm     = false;
 
 	bool operator==(const ExportInfo& other) const = default;
-};
-
-struct InputInfo {
-	uint32_t attr               = 0;
-	uint32_t chan               = 0;
-	uint32_t component_count    = 1;
-	uint32_t interpolation_mode = 3;
-
-	bool operator==(const InputInfo& other) const = default;
-};
-
-enum class SaveexecMode { And, Orn2, Andn1 };
-
-struct Instruction {
-	uint32_t     pc = 0;
-	Opcode       op = Opcode::MoveU32;
-	Operand      dst;
-	Operand      dst2;
-	Operand      src[4];
-	uint32_t     src_count = 0;
-	MemoryInfo   memory;
-	ExportInfo   export_info;
-	InputInfo    input_info;
-	SaveexecMode saveexec_mode = SaveexecMode::And;
-
-	bool operator==(const Instruction& other) const = default;
-};
-
-struct BasicBlock {
-	uint32_t                 id         = 0;
-	uint32_t                 start_pc   = 0;
-	uint32_t                 end_pc     = 0;
-	uint32_t                 inst_begin = 0;
-	uint32_t                 inst_end   = 0;
-	std::vector<uint32_t>    predecessors;
-	std::vector<uint32_t>    successors;
-	CFG::Terminator          terminator;
-	std::vector<Instruction> instructions;
 };
 
 struct DescriptorValue {
@@ -522,6 +443,7 @@ struct ShaderInfo {
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
+	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 
@@ -539,7 +461,50 @@ struct SpirvRequirements {
 	bool pixel_valid_mask             = false;
 };
 
+struct BlockInfo {
+	uint32_t        id       = 0;
+	uint32_t        start_pc = 0;
+	uint32_t        end_pc   = 0;
+	CFG::Terminator terminator;
+	Value           condition;
+	Value           indirect_target;
+};
+
+struct DescriptorSource {
+	struct IndirectImage {
+		uint32_t material_source = 0;
+		uint32_t heap_source     = 0;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+		uint32_t key_arg         = 0;
+
+		bool operator==(const IndirectImage& other) const = default;
+	};
+
+	std::array<Value, 8>         dwords {};
+	uint32_t                     dword_count = 0;
+	std::optional<IndirectImage> indirect_image;
+
+	bool operator==(const DescriptorSource& other) const = default;
+};
+
+struct SrtRead {
+	Value    value;
+	uint32_t flat_offset = 0;
+	uint32_t use_pc      = 0;
+
+	bool operator==(const SrtRead& other) const = default;
+};
+
 struct Program {
+	Program() = default;
+	~Program();
+
+	Program(const Program&)            = delete;
+	Program& operator=(const Program&) = delete;
+	Program(Program&&) noexcept         = default;
+	Program& operator=(Program&& other) noexcept;
+
 	ShaderType                    stage               = ShaderType::Unknown;
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      wave_size           = 64;
@@ -549,8 +514,17 @@ struct Program {
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
-	std::vector<BasicBlock>       blocks;
-	std::shared_ptr<ValueProgram> values;
+	std::vector<std::unique_ptr<Block>> block_storage;
+	BlockList                           blocks;
+	std::vector<BlockInfo>              block_info;
+	// Decoded MIMG/VMEM metadata carries details such as RDNA2 NSA address registers and
+	// storage-image swizzles. Typed memory instructions carry a dense index into these shader-local
+	// tables until those fields are consumed by emission.
+	std::vector<MemoryInfo>       memory_info;
+	std::vector<ExportInfo>       export_info;
+	std::vector<DescriptorSource> descriptor_sources;
+	std::vector<SrtRead>          srt_reads;
+	std::vector<Value>            dynamic_reads;
 	bool                          srt_plan_complete = false;
 	ShaderInfo                    info;
 	bool                          resource_tracking_complete = false;
@@ -561,14 +535,12 @@ struct Program {
 	std::optional<SpirvRequirements> spirv_requirements;
 };
 
-bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,
-                  uint32_t wave_size, Program& program, std::string* error);
-
-std::string RegisterToString(Register reg);
-std::string OperandToString(const Operand& operand);
-std::string ExportTargetKindToString(ExportTargetKind kind);
-std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
+
+bool  ValidateProgram(const Program& program, bool require_ssa, std::string* error);
+void  ResolveControlFlowIdentities(Program& program);
+bool  EquivalentValue(const Program& program, Value left, Value right);
+Value ResolveInvariantPhi(const Program& program, Value value);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

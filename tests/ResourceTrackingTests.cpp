@@ -1,5 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -35,7 +35,6 @@ struct Fixture {
 
   explicit Fixture(ShaderType stage = ShaderType::Compute) {
     program.stage = stage;
-    program.values = std::make_shared<ValueProgram>();
     program.user_data_count = 64;
     block = AddBlock();
   }
@@ -43,10 +42,10 @@ struct Fixture {
   Block *AddBlock() {
     auto storage = std::make_unique<Block>();
     auto *result = storage.get();
-    program.values->block_storage.push_back(std::move(storage));
-    program.values->blocks.push_back(result);
-    program.values->block_info.push_back(
-        {.id = static_cast<uint32_t>(program.values->block_info.size())});
+    program.block_storage.push_back(std::move(storage));
+    program.blocks.push_back(result);
+    program.block_info.push_back(
+        {.id = static_cast<uint32_t>(program.block_info.size())});
     return result;
   }
 
@@ -77,8 +76,8 @@ struct Fixture {
 
   MemoryFlags AddMemory(MemoryInfo memory, uint32_t pc) {
     const auto index =
-        static_cast<uint32_t>(program.values->memory_info.size());
-    program.values->memory_info.push_back(memory);
+        static_cast<uint32_t>(program.memory_info.size());
+    program.memory_info.push_back(memory);
     return {index, pc};
   }
 
@@ -241,19 +240,19 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
-  EliminateDeadCode(fixture->program.values->blocks);
+  EliminateDeadCode(fixture->program.blocks);
   std::string validation_error;
   Check(
-      ValidateValueProgram(*fixture->program.values, true, &validation_error),
+      ValidateProgram(fixture->program, true, &validation_error),
       "post-tracking dead-code elimination invalidated descriptor provenance");
 
   Check(fixture->program.info.buffers.size() == 1 &&
             fixture->program.info.images.size() == 1 &&
-            fixture->program.values->dynamic_reads.size() == 1,
+            fixture->program.dynamic_reads.size() == 1,
         "indirect image key was not retained as a scalar-buffer read");
   const auto source = fixture->program.info.images[0].source;
-  Check(source < fixture->program.values->descriptor_sources.size() &&
-            fixture->program.values->descriptor_sources[source]
+  Check(source < fixture->program.descriptor_sources.size() &&
+            fixture->program.descriptor_sources[source]
                 .indirect_image.has_value(),
         "indirect image source was not retained for runtime proof");
   const auto image_handle =
@@ -407,7 +406,7 @@ void TestInvariantIndirectImageMaterialization() {
 
   auto memory_backed = MakeIndirectImageFixture(false, 0u, true);
   memory_backed->PlanAndTrack();
-  EliminateDeadCode(memory_backed->program.values->blocks);
+  EliminateDeadCode(memory_backed->program.blocks);
   std::array<uint32_t, 11> memory_backed_user_data{0x1000u, 224u << 16u, 2u, 0u,
                                                    0x2000u, 16u << 16u,  4u, 0u,
                                                    7u,      0x3100u,     0u};
@@ -431,7 +430,7 @@ void TestInvariantIndirectImageMaterialization() {
             error.find("ReadFirstLane") != std::string::npos &&
             !malformed->program.resource_tracking_complete &&
             malformed->program.info.images.empty() &&
-            malformed->program.values->descriptor_sources.empty(),
+            malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
   auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
@@ -484,7 +483,7 @@ void TestDenseBufferTracking() {
 
   Check(fixture.program.info.buffers.size() == 2,
         "typed buffer sources were not densely interned");
-  Check(fixture.program.values->descriptor_sources.size() == 2,
+  Check(fixture.program.descriptor_sources.size() == 2,
         "descriptor source table did not match dense topology");
   const auto &resource = fixture.program.info.buffers[0];
   Check(resource.read && resource.written && resource.atomic &&
@@ -494,10 +493,10 @@ void TestDenseBufferTracking() {
   Check(first.Instruction()->Flags<uint32_t>() == 0 &&
             second.Instruction()->Flags<uint32_t>() == 1,
         "typed handles were not assigned dense indices");
-  Check(fixture.program.values->memory_info[load_flags.index].resource == 0 &&
-            fixture.program.values->memory_info[store_flags.index].resource ==
+  Check(fixture.program.memory_info[load_flags.index].resource == 0 &&
+            fixture.program.memory_info[store_flags.index].resource ==
                 0 &&
-            fixture.program.values->memory_info[other_flags.index].resource ==
+            fixture.program.memory_info[other_flags.index].resource ==
                 1,
         "typed memory metadata was not patched to dense indices");
 
@@ -531,8 +530,8 @@ void TestScalarAndVectorBufferAlias() {
   Check(fixture.program.info.buffers.size() == 1 &&
             fixture.program.info.buffers[0].scalar,
         "typed scalar and vector uses of one descriptor were split");
-  Check(fixture.program.values->memory_info[scalar_flags.index].resource == 0 &&
-            fixture.program.values->memory_info[vector_flags.index].resource ==
+  Check(fixture.program.memory_info[scalar_flags.index].resource == 0 &&
+            fixture.program.memory_info[vector_flags.index].resource ==
                 0,
         "scalar/vector alias did not share a dense index");
 }
@@ -625,7 +624,7 @@ void TestImagesSamplersAndAliases() {
             repeated.second.Instruction()->Flags<uint32_t>() == 0,
         "unused sampler border colors prevented source interning");
   const auto sampler_source = fixture.program.info.samplers[0].source;
-  Check(fixture.program.values->descriptor_sources[sampler_source]
+  Check(fixture.program.descriptor_sources[sampler_source]
                 .dwords[3]
                 .U32() == 0,
         "unused sampler border color was not canonicalized");
@@ -665,7 +664,7 @@ void TestSampleAdjustSamplerScratch() {
   fixture.PlanAndTrack();
 
   const auto source = fixture.program.info.samplers[0].source;
-  const auto stored = fixture.program.values->descriptor_sources[source]
+  const auto stored = fixture.program.descriptor_sources[source]
                           .dwords[3]
                           .Resolve()
                           .TryInstruction();
@@ -758,10 +757,10 @@ void TestDynamicStorageMipTracking() {
             mip1.first.Instruction()->Flags<uint32_t>() == 1 &&
             mip2.first.Instruction()->Flags<uint32_t>() == 1 &&
             dynamic.first.Instruction()->Flags<uint32_t>() == 1 &&
-            fixture.program.values->memory_info[plain.second].resource == 0 &&
-            fixture.program.values->memory_info[mip1.second].resource == 1 &&
-            fixture.program.values->memory_info[mip2.second].resource == 1 &&
-            fixture.program.values->memory_info[dynamic.second].resource == 1,
+            fixture.program.memory_info[plain.second].resource == 0 &&
+            fixture.program.memory_info[mip1.second].resource == 1 &&
+            fixture.program.memory_info[mip2.second].resource == 1 &&
+            fixture.program.memory_info[dynamic.second].resource == 1,
         "dynamic storage mip handles and memory metadata were not patched");
 
   DescriptorValue descriptor{};
@@ -795,7 +794,6 @@ void TestDynamicStorageMipTracking() {
         "dynamic storage mip descriptors were not expanded consecutively");
 
   Program null_program;
-  null_program.values = std::make_shared<ValueProgram>();
   null_program.resource_tracking_complete = true;
   ImageResource null_image;
   null_image.kind = ResourceKind::StorageImage;
@@ -847,12 +845,12 @@ void TestSrtFlatteningAndRuntimeMemoization() {
                fixture.AddMemory(buffer, 16));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.values->srt_reads.size() == 1,
+  Check(fixture.program.srt_reads.size() == 1,
         "shared typed scalar read did not receive one flat SRT slot");
   Check(fixture.program.info.buffers.size() == 1 &&
             fixture.program.info.addresses.empty(),
         "planning-only scalar reads leaked into resource topology");
-  Check(fixture.program.values->memory_info[0].planning_only,
+  Check(fixture.program.memory_info[0].planning_only,
         "canonical runtime scalar read was not marked planning-only");
 
   std::array<uint32_t, 2> user_data{0x1000u, 0u};
@@ -910,8 +908,8 @@ void TestDynamicSrtReadRemainsExplicit() {
                fixture.AddMemory(buffer, 8));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.values->srt_reads.empty() &&
-            fixture.program.values->dynamic_reads.size() == 1 &&
+  Check(fixture.program.srt_reads.empty() &&
+            fixture.program.dynamic_reads.size() == 1 &&
             fixture.program.info.addresses.size() == 1,
         "dynamic scalar read was incorrectly flattened or lost");
   std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
@@ -973,7 +971,7 @@ void TestPhiValidation() {
             error.find("control-dependent phi") != std::string::npos &&
             !fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.values->descriptor_sources.empty(),
+            fixture.program.descriptor_sources.empty(),
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
@@ -1295,7 +1293,7 @@ void TestResourceLimitIsTransactional() {
             error.find("buffer resource limit exceeded") != std::string::npos &&
             !fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.values->descriptor_sources.empty(),
+            fixture.program.descriptor_sources.empty(),
         "resource-limit failure partially mutated typed resource state");
 }
 
@@ -1412,10 +1410,15 @@ int main() {
 
 // The full emulator supplies these assertion hooks through common. This focused
 // target links only fmt; keep assertion failures observable without widening
-// its legacy build manifest.
+// its focused build manifest.
 namespace Common {
 int DbgExitIfHandler(const char *expression, const char *file, int line) {
   throw std::runtime_error(std::string("typed IR assertion: ") + expression +
+                           " at " + file + ':' + std::to_string(line));
+}
+
+int DbgNotImplementedHandler(const char *expression, const char *file, int line) {
+  throw std::runtime_error(std::string("typed IR not implemented: ") + expression +
                            " at " + file + ':' + std::to_string(line));
 }
 
@@ -1427,6 +1430,6 @@ void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 #include "graphics/shader/recompiler/ir/Block.cpp"
 #include "graphics/shader/recompiler/ir/Type.cpp"
 #include "graphics/shader/recompiler/ir/Value.cpp"
-#include "graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "graphics/shader/recompiler/ir/Program.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"

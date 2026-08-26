@@ -7,7 +7,6 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -49,7 +48,7 @@ std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
 	dump += "\nIR:\n";
 	dump += fmt::format("mode={} scratch_dwords={}\n",
 	                    ir.dispatcher_fallback ? "dispatcher" : "structured", ir.scratch_dwords);
-	dump += ir.values != nullptr ? IR::ValueProgramToString(*ir.values) : IR::ProgramToString(ir);
+	dump += IR::ProgramToString(ir);
 	return dump;
 }
 
@@ -117,17 +116,8 @@ void ClearEmbeddedFetchVectorLanes(EmbeddedFetchVectorLanes* lanes, uint32_t reg
 	lanes->erase(first, last);
 }
 
-struct EmbeddedFetchLoad {
-	uint32_t              pc         = 0;
-	int                   attrib_id  = -1;
-	uint32_t              components = 0;
-	std::vector<uint32_t> prolog_loads;
-};
-
-struct EmbeddedFetchData {
-	std::vector<EmbeddedFetchLoad> loads;
-	int32_t                        vertex_offset_sgpr = -1;
-};
+using EmbeddedFetchLoad = Frontend::EmbeddedFetchLoad;
+using EmbeddedFetchData = Frontend::EmbeddedFetchPlan;
 
 bool IsDecodedSgpr(const Decoder::Operand& op) {
 	return op.kind == Decoder::OperandKind::Sgpr || op.kind == Decoder::OperandKind::VccLo ||
@@ -244,15 +234,6 @@ bool IsEmbeddedFetchAttribPropagationAlu(const Decoder::Instruction& inst) {
 
 int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
-}
-
-void AppendUniquePcs(std::vector<uint32_t>& dst, const std::vector<uint32_t>& src) {
-	dst.reserve(dst.size() + src.size());
-	for (auto pc: src) {
-		if (std::find(dst.begin(), dst.end(), pc) == dst.end()) {
-			dst.push_back(pc);
-		}
-	}
 }
 
 EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded,
@@ -489,103 +470,6 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	return data;
 }
 
-const EmbeddedFetchLoad* FindEmbeddedFetchLoad(const std::vector<EmbeddedFetchLoad>& loads,
-                                               uint32_t                              pc) {
-	for (const auto& load: loads) {
-		if (load.pc == pc) {
-			return &load;
-		}
-	}
-	return nullptr;
-}
-
-bool EmbeddedFetchPcInList(const std::vector<uint32_t>& pcs, uint32_t pc) {
-	return std::find(pcs.begin(), pcs.end(), pc) != pcs.end();
-}
-
-bool IsIrFetchPrologLoad(const IR::Instruction& inst) {
-	return inst.op == IR::Opcode::SLoadDword || inst.op == IR::Opcode::SBufferLoadDword;
-}
-
-int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo* input_info,
-                                 const EmbeddedFetchLoad&     load) {
-	if (load.attrib_id >= 0 && load.attrib_id < input_info->resources_num &&
-	    input_info->resources_dst[load.attrib_id].attr_id == load.attrib_id) {
-		return load.attrib_id;
-	}
-	for (int i = 0; i < input_info->resources_num; i++) {
-		const auto& dst = input_info->resources_dst[i];
-		if (dst.attr_id == load.attrib_id &&
-		    load.components <= static_cast<uint32_t>(std::max(dst.registers_num, 1))) {
-			return i;
-		}
-	}
-	for (int i = 0; i < input_info->resources_num; i++) {
-		if (input_info->resources_dst[i].attr_id == load.attrib_id) {
-			return i;
-		}
-	}
-	return -1;
-}
-
-uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputInfo* input_info,
-                                      const std::vector<EmbeddedFetchLoad>& loads) {
-	if (loads.empty()) {
-		return 0;
-	}
-
-	std::vector<uint32_t> prolog_pcs;
-	prolog_pcs.reserve(loads.size());
-	for (const auto& load: loads) {
-		AppendUniquePcs(prolog_pcs, load.prolog_loads);
-	}
-
-	auto*    mutable_input_info = const_cast<ShaderVertexInputInfo*>(input_info);
-	uint32_t rewritten          = 0;
-	for (auto& block: ir.blocks) {
-		for (auto& inst: block.instructions) {
-			if (IsIrFetchPrologLoad(inst) && EmbeddedFetchPcInList(prolog_pcs, inst.pc)) {
-				auto pc = inst.pc;
-				inst    = {};
-				inst.pc = pc;
-				inst.op = IR::Opcode::ControlNop;
-				continue;
-			}
-
-			if (inst.op != IR::Opcode::BufferLoadDword) {
-				continue;
-			}
-			const auto* load = FindEmbeddedFetchLoad(loads, inst.pc);
-			if (load == nullptr || inst.memory.data_dwords != load->components ||
-			    inst.dst.kind != IR::OperandKind::Register ||
-			    inst.dst.reg.file != IR::RegisterFile::Vector) {
-				continue;
-			}
-
-			const auto resource_id = ResolveEmbeddedFetchResource(input_info, *load);
-			if (resource_id < 0 || resource_id >= input_info->resources_num) {
-				LOGF("ShaderRecompiler VS embedded fetch remap failed: pc=0x%08" PRIx32
-				     " attrib=%d resources=%d\n",
-				     inst.pc, load->attrib_id, input_info->resources_num);
-				continue;
-			}
-
-			inst.op                         = IR::Opcode::LoadInputF32;
-			inst.input_info.attr            = static_cast<uint32_t>(resource_id);
-			inst.input_info.chan            = 0;
-			inst.input_info.component_count = load->components;
-			inst.memory                     = {};
-			inst.src_count                  = 0;
-			mutable_input_info->resource_fetch_components[resource_id] =
-			    std::max(mutable_input_info->resource_fetch_components[resource_id],
-			             static_cast<int>(load->components));
-			rewritten += load->components;
-		}
-	}
-
-	return rewritten;
-}
-
 } // namespace
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
@@ -677,27 +561,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 
 	IR::Program ir;
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR LowerProgram\n", GetDumpLabel(options),
-	     StageName(options.stage), options.shader_hash);
-	const auto lower_program = [&](IR::Program& output) {
-		output = {};
-		if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, output, error)) {
-			return false;
-		}
-		output.shader_hash     = options.shader_hash;
-		output.user_data_base  = options.user_data_base;
-		output.user_data_count = options.user_data_count;
-		output.scratch_dwords  = options.scratch_dwords;
-		return true;
-	};
-	if (!lower_program(ir)) {
-		return false;
-	}
-
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR LowerProgram blocks=%" PRIu64
-	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
 	const ShaderComputeInputInfo* compute = nullptr;
@@ -709,42 +572,55 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 	EmbeddedFetchData embedded_fetch;
 	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
-		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, ir.user_data_base,
-		                                           ir.user_data_count, options.wave_size);
-		auto rewritten = RewriteEmbeddedVertexFetches(ir, vertex, embedded_fetch.loads);
-		if (rewritten > 0 || !embedded_fetch.loads.empty()) {
-			LOGF("%s embedded vertex fetch rewrite: detected=%" PRIu64 " rewritten=%" PRIu32 "\n",
-			     GetDumpLabel(options), static_cast<uint64_t>(embedded_fetch.loads.size()),
-			     rewritten);
+		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, options.user_data_base,
+		                                           options.user_data_count, options.wave_size);
+		if (!embedded_fetch.loads.empty()) {
+			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
+			     static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
-	ir.dispatcher_fallback = dispatcher_fallback;
-	if (!dispatcher_reason.empty()) {
-		ir.fallback_reason = dispatcher_reason;
-	}
-
-	ir.values = std::make_shared<IR::ValueProgram>();
-	if (!Frontend::TranslateProgram(ir, *ir.values, vertex, pixel, compute, error)) {
+	Frontend::TranslateOptions translate_options {
+	    .stage               = options.stage,
+	    .wave_size           = options.wave_size,
+	    .shader_hash         = options.shader_hash,
+	    .user_data_base      = options.user_data_base,
+	    .user_data_count     = options.user_data_count,
+	    .scratch_dwords      = options.scratch_dwords,
+	    .dispatcher_fallback = dispatcher_fallback,
+	    .cfg_failure_kind    = cfg.failure_kind,
+	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
+	                                                    : dispatcher_reason,
+	    .vertex              = vertex,
+	    .pixel               = pixel,
+	    .compute             = compute,
+	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	};
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	if (!Frontend::TranslateProgram(decoded, cfg, translate_options, ir, error)) {
 		return false;
 	}
-	ir.blocks.clear();
-	IR::RewriteToSsa(ir.values->blocks);
-	IR::ConstantPropagationPass(ir.values->blocks);
-	IR::ResolveControlFlowIdentities(*ir.values);
-	IR::RemoveIdentities(ir.values->blocks);
-	IR::EliminateDeadCode(ir.values->blocks);
-	const auto read_lane_stats = IR::EliminateReadLane(*ir.values, ir.wave_size);
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	IR::RewriteToSsa(ir.blocks);
+	IR::ConstantPropagationPass(ir.blocks);
+	IR::ResolveControlFlowIdentities(ir);
+	IR::RemoveIdentities(ir.blocks);
+	IR::EliminateDeadCode(ir.blocks);
+	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.values->blocks);
-		IR::ResolveControlFlowIdentities(*ir.values);
-		IR::RemoveIdentities(ir.values->blocks);
-		IR::EliminateDeadCode(ir.values->blocks);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
 	}
 	if (options.stage == ShaderType::Compute) {
 		const auto lds_barriers =
-		    IR::InsertSharedMemoryBarriers(*ir.values, ir.wave_size, *compute);
+		    IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *compute);
 		if (lds_barriers.inserted_barriers != 0) {
 			LOGF("%s wave64 LDS synchronization: barriers=%" PRIu32 "\n", GetDumpLabel(options),
 			     lds_barriers.inserted_barriers);
@@ -758,11 +634,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
-	IR::EliminateDeadCode(ir.values->blocks);
+	IR::EliminateDeadCode(ir.blocks);
 	if (!IR::TrackResources(ir, error)) {
 		return false;
 	}
-	IR::EliminateDeadCode(ir.values->blocks);
+	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}

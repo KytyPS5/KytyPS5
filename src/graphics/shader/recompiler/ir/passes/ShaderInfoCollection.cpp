@@ -1,6 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -66,7 +66,7 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 		}
 		return false;
 	};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			switch (inst.GetOpcode()) {
 				case ValueOpcode::GetAttribute: {
@@ -140,7 +140,7 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					break;
 				}
 				case ValueOpcode::SetAttribute:
-					if (inst.Flags<ExportFlags>().index >= program.values->export_info.size()) {
+					if (inst.Flags<ExportFlags>().index >= program.export_info.size()) {
 						return Fail("typed export metadata index is out of range");
 					}
 					break;
@@ -156,7 +156,7 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 	AddInput(info, StageInputKind::VertexIndex, 0, 1, "gl_VertexIndex");
 	AddInput(info, StageInputKind::InstanceIndex, 0, 1, "gl_InstanceIndex");
 	uint32_t used_components[ShaderVertexInputInfo::RES_MAX] = {};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
 				const auto attr       = inst.Arg(0).U32();
@@ -185,7 +185,7 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 	}
 	std::array<bool, 32> per_vertex {};
 	std::array<bool, 32> interpolated {};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
 				interpolated[inst.Arg(0).U32()] = true;
@@ -228,7 +228,7 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 }
 
 void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::GetBuiltin) {
 				continue;
@@ -277,12 +277,12 @@ bool CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 		}
 		return false;
 	};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
 				continue;
 			}
-			const auto& export_info = program.values->export_info[inst.Flags<ExportFlags>().index];
+			const auto& export_info = program.export_info[inst.Flags<ExportFlags>().index];
 			if (export_info.kind == ExportTargetKind::MrtZ) {
 				if (program.stage == ShaderType::Pixel && (export_info.en & 0x1u) != 0 &&
 				    pixel->ps_depth_export_enable) {
@@ -360,12 +360,6 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 		}
 		return false;
 	}
-	if (program.values == nullptr) {
-		if (error != nullptr) {
-			*error = "typed value program is not available";
-		}
-		return false;
-	}
 	if (!ValidateOptions(program, options, error)) {
 		return false;
 	}
@@ -377,7 +371,7 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	next.inputs.clear();
 	next.outputs.clear();
 	next.has_bitwise_xor = std::any_of(
-	    program.values->blocks.begin(), program.values->blocks.end(), [](const auto* block) {
+	    program.blocks.begin(), program.blocks.end(), [](const auto* block) {
 		    return std::any_of(block->begin(), block->end(), [](const auto& inst) {
 			    return inst.GetOpcode() == ValueOpcode::BitwiseXor32;
 		    });

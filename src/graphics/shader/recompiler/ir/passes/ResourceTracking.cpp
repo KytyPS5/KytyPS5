@@ -1,6 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
 
@@ -94,8 +94,7 @@ ImageMipMode MipMode(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	Tracker(Program& program, ValueProgram& values)
-	    : m_program(program), m_values(values), m_info(program.info) {
+	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
 		m_info.buffers.clear();
 		m_info.addresses.clear();
 		m_info.images.clear();
@@ -111,7 +110,7 @@ public:
 			return Fail(0, error, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
-		for (auto* block: m_values.blocks) {
+		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (!Collect(inst, error)) {
 					return false;
@@ -123,7 +122,7 @@ public:
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
 		for (const auto& patch: m_memory_patches) {
-			auto& memory    = m_values.memory_info[patch.index];
+			auto& memory    = m_program.memory_info[patch.index];
 			memory.resource = patch.resource;
 			if (patch.has_sampler) {
 				memory.sampler = patch.sampler;
@@ -138,16 +137,16 @@ public:
 				plan.handle->SetArg(dword, plan.key);
 			}
 			for (const auto index: plan.memory) {
-				m_values.memory_info[index].planning_only = true;
+				m_program.memory_info[index].planning_only = true;
 			}
 		}
-		std::erase_if(m_values.dynamic_reads, [&](Value value) {
+		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::ranges::any_of(m_indirect_images, [&](const IndirectImagePlan& plan) {
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
 		});
-		m_values.descriptor_sources          = std::move(m_sources);
+		m_program.descriptor_sources          = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
 		return true;
@@ -208,19 +207,19 @@ private:
 			if (left.value.IsEmpty() || right.value.IsEmpty()) {
 				return require_both ? AddressPart {} : (left.value.IsEmpty() ? right : left);
 			}
-			return EquivalentValue(m_values, left.value, right.value)
+			return EquivalentValue(m_program, left.value, right.value)
 			           ? AddressPart {left.value, left.rooted || right.rooted}
 			           : AddressPart {};
 		};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::SelectU32:
-				if (EquivalentValue(m_values, inst->Arg(0), active)) {
+				if (EquivalentValue(m_program, inst->Arg(0), active)) {
 					return finish(FindAddressPart(inst->Arg(1), active, visiting));
 				}
 				return finish(merge(FindAddressPart(inst->Arg(1), active, visiting),
 				                    FindAddressPart(inst->Arg(2), active, visiting), true));
 			case ValueOpcode::Phi: {
-				const auto invariant = ResolveInvariantPhi(m_values, value);
+				const auto invariant = ResolveInvariantPhi(m_program, value);
 				return finish(invariant.IsEmpty() ? AddressPart {}
 				                                  : FindAddressPart(invariant, active, visiting));
 			}
@@ -312,7 +311,7 @@ private:
 			}
 			bool same = true;
 			for (uint32_t i = 0; i < descriptor.dword_count; i++) {
-				same = same && EquivalentValue(m_values, current.dwords[i], descriptor.dwords[i]);
+				same = same && EquivalentValue(m_program, current.dwords[i], descriptor.dwords[i]);
 			}
 			if (same) {
 				return candidate;
@@ -342,10 +341,10 @@ private:
 			return nullptr;
 		}
 		index = read.Flags<MemoryFlags>().index;
-		if (index >= m_values.memory_info.size()) {
+		if (index >= m_program.memory_info.size()) {
 			return nullptr;
 		}
-		const auto& memory = m_values.memory_info[index];
+		const auto& memory = m_program.memory_info[index];
 		return memory.kind == ResourceKind::ScalarBuffer && memory.data_bits == 32u &&
 		               memory.data_dwords == 1u
 		           ? &memory
@@ -353,7 +352,7 @@ private:
 	}
 
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_values.blocks) {
+		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
 				const auto op = inst.GetOpcode();
 				if ((BufferAccessOf(op) == BufferAccess::None &&
@@ -446,7 +445,7 @@ private:
 			heap_handle = current_handle;
 			if (dword == 0u) {
 				heap_offset = heap_reads[dword]->Arg(1).Resolve();
-			} else if (!EquivalentValue(m_values, heap_offset, heap_reads[dword]->Arg(1))) {
+			} else if (!EquivalentValue(m_program, heap_offset, heap_reads[dword]->Arg(1))) {
 				return false;
 			}
 			plan.memory[dword] = memory_index;
@@ -537,7 +536,7 @@ private:
 	}
 
 	void PlanIndirectImages() {
-		for (auto* block: m_values.blocks) {
+		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
 				    inst.NumArgs() == 0u) {
@@ -588,7 +587,7 @@ private:
 			return Fail(pc, error, "GetAddressResource must have two address dwords");
 		}
 		DescriptorSource descriptor;
-		const auto&      memory = m_values.memory_info[memory_inst.Flags<MemoryFlags>().index];
+		const auto&      memory = m_program.memory_info[memory_inst.Flags<MemoryFlags>().index];
 		if (memory.address_is_full) {
 			const auto active = memory_inst.Arg(memory_inst.NumArgs() - 1u);
 			if (memory.kind != ResourceKind::Flat ||
@@ -797,14 +796,14 @@ private:
 			return true;
 		}
 		const auto flags = inst.Flags<MemoryFlags>();
-		if (flags.index >= m_values.memory_info.size()) {
+		if (flags.index >= m_program.memory_info.size()) {
 			return Fail(flags.pc, error,
 			            fmt::format("memory metadata index {} is out of range", flags.index));
 		}
 		if (inst.NumArgs() == 0) {
 			return Fail(flags.pc, error, "memory operation has no resource handle");
 		}
-		const auto& memory = m_values.memory_info[flags.index];
+		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
 			return true;
 		}
@@ -914,7 +913,7 @@ private:
 				}
 				bool alias = true;
 				for (uint32_t dword = 0; dword < 4; dword++) {
-					alias = alias && EquivalentValue(m_values, buffer_source->dwords[dword],
+					alias = alias && EquivalentValue(m_program, buffer_source->dwords[dword],
 					                                 image_source->dwords[dword]);
 				}
 				if (alias) {
@@ -926,7 +925,6 @@ private:
 	}
 
 	Program&                       m_program;
-	ValueProgram&                  m_values;
 	ShaderInfo                     m_info;
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
@@ -937,13 +935,7 @@ private:
 } // namespace
 
 bool TrackResources(Program& program, std::string* error) {
-	if (program.values == nullptr) {
-		if (error != nullptr) {
-			*error = "shader resource tracking requires typed IR";
-		}
-		return false;
-	}
-	return Tracker(program, *program.values).Run(error);
+	return Tracker(program).Run(error);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

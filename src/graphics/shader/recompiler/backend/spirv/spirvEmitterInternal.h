@@ -6,7 +6,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -407,7 +407,7 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 }
 
 struct ValueEmitContext {
-	ValueEmitContext(EmitterState& state_, const IR::ValueProgram& program_)
+	ValueEmitContext(EmitterState& state_, const IR::Program& program_)
 	    : state(state_), program(program_) {}
 
 	uint32_t              Def(IR::Value value);
@@ -425,7 +425,7 @@ struct ValueEmitContext {
 	void                  Fail(const IR::Inst& inst, const char* reason);
 
 	EmitterState&                                                      state;
-	const IR::ValueProgram&                                            program;
+	const IR::Program&                                            program;
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	std::unordered_map<const IR::Block*, uint32_t>                     labels;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
@@ -847,7 +847,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
-bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std::string* error);
+bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* error);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

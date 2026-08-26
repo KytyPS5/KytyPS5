@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
@@ -27,16 +27,15 @@ struct Fixture {
     program.stage = ShaderType::Compute;
     program.shader_hash = 0x12345678u;
     program.user_data_base = 2;
-    program.values = std::make_shared<ValueProgram>();
     for (uint32_t index = 0; index < block_count; index++) {
-      program.values->block_storage.push_back(std::make_unique<Block>());
-      auto *block = program.values->block_storage.back().get();
-      program.values->blocks.push_back(block);
-      program.values->block_info.push_back({.id = index});
+      program.block_storage.push_back(std::make_unique<Block>());
+      auto *block = program.block_storage.back().get();
+      program.blocks.push_back(block);
+      program.block_info.push_back({.id = index});
     }
   }
 
-  Block &BlockAt(uint32_t index = 0) { return *program.values->blocks[index]; }
+  Block &BlockAt(uint32_t index = 0) { return *program.blocks[index]; }
 
   Value Emit(ValueOpcode opcode, std::initializer_list<Value> args = {},
              uint64_t flags = 0, uint32_t block = 0) {
@@ -55,8 +54,8 @@ struct Fixture {
     MemoryInfo info;
     info.kind = kind;
     info.offset = static_cast<uint32_t>(offset);
-    program.values->memory_info.push_back(info);
-    return static_cast<uint32_t>(program.values->memory_info.size() - 1u);
+    program.memory_info.push_back(info);
+    return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
   void Plan() {
@@ -103,11 +102,11 @@ void TestImmediateFlatteningAndGvn() {
                {first, second, Value(16u), Value(0u)});
 
   fixture.Plan();
-  Check(fixture.program.values->srt_reads.size() == 1,
+  Check(fixture.program.srt_reads.size() == 1,
         "equivalent typed scalar reads were not coalesced");
-  Check(fixture.program.values->dynamic_reads.empty(),
+  Check(fixture.program.dynamic_reads.empty(),
         "immediate scalar read was classified as dynamic");
-  Check(fixture.program.values->memory_info[memory].planning_only,
+  Check(fixture.program.memory_info[memory].planning_only,
         "flattened raw read was not kept as a planning-only root");
 
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
@@ -173,8 +172,8 @@ void TestDynamicReadRemainsTyped() {
                {read, Value(0u), Value(16u), Value(0u)});
 
   fixture.Plan();
-  Check(fixture.program.values->srt_reads.empty() &&
-            fixture.program.values->dynamic_reads == std::vector<Value>{read},
+  Check(fixture.program.srt_reads.empty() &&
+            fixture.program.dynamic_reads == std::vector<Value>{read},
         "dynamic scalar read received a fake flattened slot");
 }
 
@@ -209,7 +208,7 @@ void TestShaderBaseAndUserData() {
                                  {Value(static_cast<ScalarReg>(2))});
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {user, Value(4u)});
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, sum}, .dword_count = 3});
 
   const std::array user_data{0x20u};
@@ -239,7 +238,7 @@ void TestCarryAndBitFields() {
   const auto sign = fixture.Emit(ValueOpcode::BitFieldSExtract,
                                  {Value(0x000000f0u), Value(4u), Value(4u)});
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
   DescriptorValue result;
@@ -262,9 +261,9 @@ void TestInvariantAndDivergentPhi() {
   divergent.AddPhiOperand(&fixture.BlockAt(0), Value(7u));
   divergent.AddPhiOperand(&fixture.BlockAt(1), Value(9u));
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&invariant)}, .dword_count = 1});
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
   DescriptorValue result;
@@ -293,10 +292,10 @@ void TestControlDependentStandaloneLoadStaysTyped() {
       RawRead(fixture, Address(fixture, Value(&base), Value(0u), 2), Value(0u),
               memory, 2);
   fixture.Plan();
-  Check(fixture.program.values->srt_reads.empty() &&
+  Check(fixture.program.srt_reads.empty() &&
             read.ResolveInstruction()->GetOpcode() ==
                 ValueOpcode::LoadAddressU32 &&
-            !fixture.program.values->memory_info[memory].planning_only,
+            !fixture.program.memory_info[memory].planning_only,
         "control-dependent standalone scalar load was flattened into a host "
         "snapshot");
 }
@@ -315,7 +314,7 @@ void TestRuntime64BitDescriptorOps() {
   const auto high =
       fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(1u)});
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high}, .dword_count = 2});
 
   DescriptorValue result;
@@ -370,7 +369,7 @@ void TestReadLaneElimination() {
                                   {undef, Value(0xdeadbeefu), Value(5u)});
   const auto read = fixture.Emit(ValueOpcode::ReadLane, {write, Value(5u)});
   const auto use = fixture.Emit(ValueOpcode::IAdd32, {read, Value(1u)});
-  const auto stats = EliminateReadLane(*fixture.program.values, 64);
+  const auto stats = EliminateReadLane(fixture.program, 64);
   Check(stats.rewritten_reads == 1 &&
             use.ResolveInstruction()->Arg(0).Resolve() == Value(0xdeadbeefu),
         "fixed-lane typed read was not rewritten from its SSA write chain");
@@ -379,7 +378,7 @@ void TestReadLaneElimination() {
                                      {Value(static_cast<ScalarReg>(2))});
   const auto dynamic = fixture.Emit(ValueOpcode::ReadLane, {write, selector});
   fixture.Emit(ValueOpcode::IAdd32, {dynamic, Value(1u)});
-  Check(EliminateReadLane(*fixture.program.values, 64).rewritten_reads == 0,
+  Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 0,
         "dynamic-lane read was rewritten unsafely");
 }
 
@@ -390,9 +389,9 @@ void TestOptimizationPipeline() {
   fixture.Emit(ValueOpcode::ReferenceU32, {kept});
   fixture.Emit(ValueOpcode::IMul32, {Value(6u), Value(7u)});
 
-  ConstantPropagationPass(fixture.program.values->blocks);
-  RemoveIdentities(fixture.program.values->blocks);
-  EliminateDeadCode(fixture.program.values->blocks);
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
 
   const auto &instructions = fixture.BlockAt().Instructions();
   Check(instructions.size() == 1 &&
@@ -404,20 +403,20 @@ void TestOptimizationPipeline() {
 
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
-  auto *entry = fixture.program.values->blocks[0];
-  auto *taken = fixture.program.values->blocks[1];
-  auto *other = fixture.program.values->blocks[2];
+  auto *entry = fixture.program.blocks[0];
+  auto *taken = fixture.program.blocks[1];
+  auto *other = fixture.program.blocks[2];
   entry->AddBranch(taken);
   entry->AddBranch(other);
 
-  auto &entry_info = fixture.program.values->block_info[0];
+  auto &entry_info = fixture.program.block_info[0];
   entry_info.terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
   entry_info.terminator.true_block = 1;
   entry_info.terminator.false_block = 2;
-  fixture.program.values->block_info[1].terminator.kind =
+  fixture.program.block_info[1].terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
-  fixture.program.values->block_info[2].terminator.kind =
+  fixture.program.block_info[2].terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
 
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
@@ -429,16 +428,16 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
       fixture.Emit(ValueOpcode::IEqual32, {read, Value(42u)});
   fixture.Emit(ValueOpcode::Reference, {entry_info.condition});
 
-  Check(EliminateReadLane(*fixture.program.values, 64).rewritten_reads == 1,
+  Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 1,
         "control-flow fixture did not eliminate its fixed-lane read");
-  ConstantPropagationPass(fixture.program.values->blocks);
-  ResolveControlFlowIdentities(*fixture.program.values);
-  RemoveIdentities(fixture.program.values->blocks);
-  EliminateDeadCode(fixture.program.values->blocks);
+  ConstantPropagationPass(fixture.program.blocks);
+  ResolveControlFlowIdentities(fixture.program);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
 
   std::string error;
   Check(entry_info.condition == Value(true) &&
-            ValidateValueProgram(*fixture.program.values, true, &error),
+            ValidateProgram(fixture.program, true, &error),
         error.empty() ? "folded branch condition did not survive identity removal"
                       : error.c_str());
 }
@@ -447,7 +446,7 @@ void TestUndefinedRuntimeValueFails() {
   Fixture fixture;
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
   result.dword_count = 3;
@@ -499,7 +498,7 @@ int main() {
 #include "../src/graphics/shader/recompiler/ir/Block.cpp"
 #include "../src/graphics/shader/recompiler/ir/Type.cpp"
 #include "../src/graphics/shader/recompiler/ir/Value.cpp"
-#include "../src/graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "../src/graphics/shader/recompiler/ir/Program.cpp"
 #include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"

@@ -1,6 +1,6 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
-namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
+namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 IR::F32 Translator::SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value) {
 	return IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {condition, true_value, false_value}));
@@ -38,11 +38,11 @@ IR::U32 Translator::ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, f
 	return ir.Select(nan, IR::U32(IR::Value(0u)), clamped);
 }
 
-bool Translator::TranslateConversion(const IR::Instruction& inst) {
+bool Translator::TranslateConversion(const Decoder::Instruction& inst) {
 	const auto f32 = [&](uint32_t index) {
-		return IR::F32(ReadOperand(inst.src[index], IR::Type::F32));
+		return IR::F32(ReadOperand(SourceAt(inst, index), IR::Type::F32));
 	};
-	const auto u32         = [&](uint32_t index) { return ReadU32(inst.src[index]); };
+	const auto u32         = [&](uint32_t index) { return ReadU32(SourceAt(inst, index)); };
 	const auto convert_u32 = [&](IR::F32 value) {
 		return ConvertF32ToU32Saturated(value, 4294967296.0f, 4294967040.0f, 0xffffffffu);
 	};
@@ -51,65 +51,77 @@ bool Translator::TranslateConversion(const IR::Instruction& inst) {
 		                                0x80000000u, 0x7fffffffu);
 	};
 
-	switch (inst.op) {
-		case IR::Opcode::ConvertByteU32ToF32: {
-			const auto index =
-			    inst.src[1].kind == IR::OperandKind::ImmediateU32 ? inst.src[1].imm & 3u : 0u;
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_CVT_F32_UBYTE0:
+		case Decoder::Opcode::V_CVT_F32_UBYTE1:
+		case Decoder::Opcode::V_CVT_F32_UBYTE2:
+		case Decoder::Opcode::V_CVT_F32_UBYTE3: {
+			const auto index = static_cast<uint32_t>(inst.opcode) -
+			                   static_cast<uint32_t>(Decoder::Opcode::V_CVT_F32_UBYTE0);
 			const auto byte =
 			    ir.BitwiseAnd(ir.ShiftRightLogical(u32(0), IR::U32(IR::Value(index * 8u))),
 			                  IR::U32(IR::Value(0xffu)));
-			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ConvertF32U32, {byte}));
+			WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertF32U32, {byte}));
 			return true;
 		}
-		case IR::Opcode::ConvertU32ToF32:
-			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ConvertF32U32, {u32(0)}));
+		case Decoder::Opcode::V_CVT_F32_U32:
+			WriteOperand(DestinationOperand(inst),
+			             ir.Emit(IR::ValueOpcode::ConvertF32U32, {u32(0)}));
 			return true;
-		case IR::Opcode::ConvertI32ToF32:
-			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ConvertF32S32, {u32(0)}));
+		case Decoder::Opcode::V_CVT_F32_I32:
+			WriteOperand(DestinationOperand(inst),
+			             ir.Emit(IR::ValueOpcode::ConvertF32S32, {u32(0)}));
 			return true;
-		case IR::Opcode::ConvertF32ToU32: WriteOperand(inst.dst, convert_u32(f32(0))); return true;
-		case IR::Opcode::ConvertF32ToI32: WriteOperand(inst.dst, convert_i32(f32(0))); return true;
-		case IR::Opcode::ConvertF32ToF16: WriteF16(inst.dst, f32(0)); return true;
-		case IR::Opcode::ConvertF16ToF32:
-			WriteOperand(inst.dst, ReadF16AsF32(inst.src[0]));
+		case Decoder::Opcode::V_CVT_U32_F32:
+			WriteOperand(DestinationOperand(inst), convert_u32(f32(0)));
 			return true;
-		case IR::Opcode::ConvertU16ToF16: {
-			const auto value = IR::F32(
-			    ir.Emit(IR::ValueOpcode::ConvertF32U32, {ReadU16AsU32(inst.src[0], false)}));
-			WriteF16(inst.dst, value);
+		case Decoder::Opcode::V_CVT_I32_F32:
+			WriteOperand(DestinationOperand(inst), convert_i32(f32(0)));
 			return true;
-		}
-		case IR::Opcode::ConvertI16ToF16: {
+		case Decoder::Opcode::V_CVT_F16_F32:
+			WriteF16(DestinationOperand(inst), f32(0));
+			return true;
+		case Decoder::Opcode::V_CVT_F32_F16:
+			WriteOperand(DestinationOperand(inst), ReadF16AsF32(inst.src0));
+			return true;
+		case Decoder::Opcode::V_CVT_F16_U16: {
 			const auto value =
-			    IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32S32, {ReadU16AsU32(inst.src[0], true)}));
-			WriteF16(inst.dst, value);
+			    IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32U32, {ReadU16AsU32(inst.src0, false)}));
+			WriteF16(DestinationOperand(inst), value);
 			return true;
 		}
-		case IR::Opcode::ConvertF16ToU16: {
+		case Decoder::Opcode::V_CVT_F16_I16: {
+			const auto value =
+			    IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32S32, {ReadU16AsU32(inst.src0, true)}));
+			WriteF16(DestinationOperand(inst), value);
+			return true;
+		}
+		case Decoder::Opcode::V_CVT_U16_F16: {
 			const auto converted =
-			    ConvertF32ToU32Saturated(ReadF16AsF32(inst.src[0]), 65536.0f, 65535.0f, 0xffffu);
-			WriteU16(inst.dst, converted);
+			    ConvertF32ToU32Saturated(ReadF16AsF32(inst.src0), 65536.0f, 65535.0f, 0xffffu);
+			WriteU16(DestinationOperand(inst), converted);
 			return true;
 		}
-		case IR::Opcode::ConvertF16ToI16: {
+		case Decoder::Opcode::V_CVT_I16_F16: {
 			const auto converted = ConvertF32ToI32Saturated(
-			    ReadF16AsF32(inst.src[0]), -32768.0f, 32768.0f, 32767.0f, 0xffff8000u, 0x7fffu);
-			WriteU16(inst.dst, ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
+			    ReadF16AsF32(inst.src0), -32768.0f, 32768.0f, 32767.0f, 0xffff8000u, 0x7fffu);
+			WriteU16(DestinationOperand(inst),
+			         ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
 			return true;
 		}
-		case IR::Opcode::ConvertRoundPlusInfF32ToI32: {
+		case Decoder::Opcode::V_CVT_RPI_I32_F32: {
 			const auto biased =
 			    IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {f32(0), IR::Value::F32(0.5f)}));
 			const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPFloor32, {biased}));
-			WriteOperand(inst.dst, convert_i32(rounded));
+			WriteOperand(DestinationOperand(inst), convert_i32(rounded));
 			return true;
 		}
-		case IR::Opcode::ConvertFloorF32ToI32: {
+		case Decoder::Opcode::V_CVT_FLR_I32_F32: {
 			const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPFloor32, {f32(0)}));
-			WriteOperand(inst.dst, convert_i32(rounded));
+			WriteOperand(DestinationOperand(inst), convert_i32(rounded));
 			return true;
 		}
-		case IR::Opcode::FrexpExpI32F32: {
+		case Decoder::Opcode::V_FREXP_EXP_I32_F32: {
 			const auto bits     = ir.BitCastU32(f32(0));
 			const auto exponent = IR::U32(
 			    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(23u), IR::Value(8u)}));
@@ -123,43 +135,45 @@ bool Translator::TranslateConversion(const IR::Instruction& inst) {
 			    ir.INotEqual(exponent, IR::U32(IR::Value(0xffu))),
 			    ir.Select(ir.INotEqual(exponent, IR::U32(IR::Value(0u))), normal, denormal),
 			    IR::U32(IR::Value(0u)));
-			WriteOperand(inst.dst, finite);
+			WriteOperand(DestinationOperand(inst), finite);
 			return true;
 		}
-		case IR::Opcode::ConvertI4ToOffsetF32: {
+		case Decoder::Opcode::V_CVT_OFF_F32_I4: {
 			const auto nibble = IR::U32(
 			    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {u32(0), IR::Value(0u), IR::Value(4u)}));
 			const auto value = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32S32, {nibble}));
-			WriteOperand(inst.dst,
+			WriteOperand(DestinationOperand(inst),
 			             ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(1.0f / 16.0f)}));
 			return true;
 		}
-		case IR::Opcode::PackF32ToF16Rtz:
-			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::PackFloat2x16Rtz, {f32(0), f32(1)}));
+		case Decoder::Opcode::V_CVT_PKRTZ_F16_F32:
+			WriteOperand(DestinationOperand(inst),
+			             ir.Emit(IR::ValueOpcode::PackFloat2x16Rtz, {f32(0), f32(1)}));
 			return true;
-		case IR::Opcode::PackSnorm2x16F32:
-		case IR::Opcode::PackUnorm2x16F32: {
+		case Decoder::Opcode::V_CVT_PKNORM_I16_F32:
+		case Decoder::Opcode::V_CVT_PKNORM_U16_F32: {
 			const auto pair   = ir.Emit(IR::ValueOpcode::CompositeConstructF32x2, {f32(0), f32(1)});
-			const auto opcode = inst.op == IR::Opcode::PackSnorm2x16F32
+			const auto opcode = inst.opcode == Decoder::Opcode::V_CVT_PKNORM_I16_F32
 			                        ? IR::ValueOpcode::PackSnorm2x16
 			                        : IR::ValueOpcode::PackUnorm2x16;
-			WriteOperand(inst.dst, ir.Emit(opcode, {pair}));
+			WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {pair}));
 			return true;
 		}
-		case IR::Opcode::PackU8F32: {
+		case Decoder::Opcode::V_CVT_PK_U8_F32: {
 			const auto byte  = ConvertF32ToU32Saturated(f32(0), 255.0f, 255.0f, 255u);
 			const auto index = ir.BitwiseAnd(u32(1), IR::U32(IR::Value(3u)));
 			const auto shift = ir.ShiftLeftLogical(index, IR::U32(IR::Value(3u)));
 			const auto mask  = ir.ShiftLeftLogical(IR::U32(IR::Value(0xffu)), shift);
 			const auto base  = ir.BitwiseAnd(u32(2), ir.BitwiseNot(mask));
-			WriteOperand(inst.dst, ir.BitwiseOr(base, ir.ShiftLeftLogical(byte, shift)));
+			WriteOperand(DestinationOperand(inst),
+			             ir.BitwiseOr(base, ir.ShiftLeftLogical(byte, shift)));
 			return true;
 		}
-		case IR::Opcode::PackB32F16: {
-			const auto low = ReadF16LaneBits(inst.src[0], false);
+		case Decoder::Opcode::V_PACK_B32_F16: {
+			const auto low = ReadF16LaneBits(inst.src0, false);
 			const auto high =
-			    ir.ShiftLeftLogical(ReadF16LaneBits(inst.src[1], false), IR::U32(IR::Value(16u)));
-			WriteOperand(inst.dst, ir.BitwiseOr(low, high));
+			    ir.ShiftLeftLogical(ReadF16LaneBits(inst.src1, false), IR::U32(IR::Value(16u)));
+			WriteOperand(DestinationOperand(inst), ir.BitwiseOr(low, high));
 			return true;
 		}
 		default: return false;
@@ -172,4 +186,4 @@ IR::U32 Translator::PackU16Lanes(IR::U32 low, IR::U32 high) {
 	                    ir.ShiftLeftLogical(ir.BitwiseAnd(high, mask), IR::U32(IR::Value(16u))));
 }
 
-} // namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

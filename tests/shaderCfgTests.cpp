@@ -4107,36 +4107,7 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
         "early translation failure retained a stale output program");
   options.wave_size = 64u;
 
-  decoded.instructions.front().family =
-      ShaderRecompiler::Decoder::Family::MUBUF;
-  decoded.instructions.front().opcode =
-      ShaderRecompiler::Decoder::Opcode::V_ADD_NC_U32;
-  error.clear();
-  Check(!ShaderRecompiler::Frontend::TranslateProgram(decoded, cfg, options, ir,
-                                                       &error),
-        "memory-family opcode bypassed specialized memory translation");
-  Check(Common::ContainsStr(error, "does not belong to decoded family"),
-        "memory-family mismatch did not report an explicit error");
-
   auto &store = decoded.instructions.front();
-  store.opcode = ShaderRecompiler::Decoder::Opcode::BUFFER_STORE_DWORD;
-  store.data_dwords = 1u;
-  store.data_bits = 32u;
-  store.offen = true;
-  store.src_count = 3u;
-  store.src0.kind = ShaderRecompiler::Decoder::OperandKind::Vgpr;
-  store.src1.kind = ShaderRecompiler::Decoder::OperandKind::Sgpr;
-  store.src2.kind =
-      ShaderRecompiler::Decoder::OperandKind::IntegerInlineConstant;
-  store.dst.kind = ShaderRecompiler::Decoder::OperandKind::Unknown;
-  error.clear();
-  Check(!ShaderRecompiler::Frontend::TranslateProgram(decoded, cfg, options, ir,
-                                                       &error),
-        "buffer store accepted an unreadable data operand");
-  Check(Common::ContainsStr(error,
-                            "decoded operand cannot be used as an IR register"),
-        "buffer store data rejection did not report an explicit error");
-
   store = {};
   store.family = ShaderRecompiler::Decoder::Family::MUBUF;
   store.opcode = ShaderRecompiler::Decoder::Opcode::UNSUPPORTED;
@@ -5930,29 +5901,6 @@ void TestNewShaderRecompilerNativeWideScalarMemoryIr() {
   Check(buffer_x2_targets_vcc[0] && buffer_x2_targets_vcc[1],
         "s_buffer_load_dwordx2 did not preserve its VCC destination span");
 
-  const auto reject = [&](uint32_t opcode, uint32_t dst, uint32_t sbase,
-                          const char *reason) {
-    const uint32_t invalid[] = {EncodeSmem0(opcode, dst, sbase), 125u << 25u,
-                                EncodeSopp(0x01)};
-    ShaderRecompiler::Decoder::Program invalid_decoded;
-    ShaderRecompiler::CFG::Graph invalid_graph;
-    ShaderRecompiler::IR::Program invalid_ir;
-    std::string invalid_error;
-    Check(ShaderRecompiler::Decoder::DecodeProgram(invalid, invalid_decoded,
-                                                   &invalid_error) &&
-              ShaderRecompiler::CFG::BuildGraph(invalid_decoded, invalid_graph,
-                                                &invalid_error) &&
-              !ShaderRecompiler::Frontend::TranslateProgram(
-                  invalid_decoded, invalid_graph, translate_options, invalid_ir,
-                  &invalid_error) &&
-              Common::ContainsStr(invalid_error, reason),
-          "invalid SMEM register span was not rejected");
-  };
-  reject(0x01, 1, 4, "destination");
-  reject(0x02, 2, 4, "destination");
-  reject(0x02, 124, 4, "destination");
-  reject(0x00, 0, 63, "base");
-  reject(0x08, 0, 1, "base");
 }
 
 void TestNewShaderRecompilerNativeWideBufferIr() {

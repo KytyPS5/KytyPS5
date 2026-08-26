@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cinttypes>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -21,6 +24,7 @@
 #include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
+#include <windows.h> // IWYU pragma: keep
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #endif
@@ -129,11 +133,13 @@ struct DecodedCodeInstruction {
 	bool                                                     changes_stack_pointer {};
 	bool                                                     replaces_stack_pointer {};
 	std::optional<s64>                                       stack_pointer_delta;
+	std::array<std::optional<s64>, 16>                       stack_registers {};
 };
 
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
 	std::set<uintptr_t>                         branch_targets;
+	std::map<uintptr_t, std::vector<uintptr_t>> indirect_targets;
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
@@ -239,36 +245,235 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFD ||
 		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSHFQ) {
 			decoded.stack_pointer_delta = -static_cast<s64>(sizeof(u64));
-		} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP ||
-		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPF ||
-		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFD ||
-		           decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFQ) {
+		} else if ((decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP ||
+		            decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPF ||
+		            decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFD ||
+		            decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFQ) &&
+		           !(operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		             IsStackPointerRegister(operands[0].reg.value))) {
+			// `pop rsp` loads a new stack pointer rather than advancing it by eight.
 			decoded.stack_pointer_delta = sizeof(u64);
+		}
+	}
+
+	return decoded;
+}
+
+// Offset of every general purpose register from the stack pointer the function was entered with,
+// for the registers that provably hold a stack address. Index 4 (RSP) doubles as the current
+// stack depth. A register with no value either does not hold a stack address or was merged from
+// paths that disagree.
+constexpr size_t GprCount    = 16;
+constexpr size_t RspGprIndex = 4;
+using StackRegisterState     = std::array<std::optional<s64>, GprCount>;
+
+std::optional<size_t> GprIndex(ZydisRegister reg) {
+	if (reg == ZYDIS_REGISTER_NONE) {
+		return std::nullopt;
+	}
+	const auto full = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
+	if (ZydisRegisterGetClass(full) != ZYDIS_REGCLASS_GPR64) {
+		return std::nullopt;
+	}
+	const auto id = ZydisRegisterGetId(full);
+	if (id < 0 || static_cast<size_t>(id) >= GprCount) {
+		return std::nullopt;
+	}
+	return static_cast<size_t>(id);
+}
+
+// Segment overrides other than the implicit stack/data segments never address the stack.
+bool IsStackAddressableSegment(const ZydisDecodedOperand& operand) {
+	return operand.mem.segment == ZYDIS_REGISTER_SS || operand.mem.segment == ZYDIS_REGISTER_DS ||
+	       operand.mem.segment == ZYDIS_REGISTER_NONE;
+}
+
+StackRegisterState TransferStackRegisters(const DecodedCodeInstruction& decoded,
+                                          const StackRegisterState&     state_in) {
+	StackRegisterState state_out = state_in;
+
+	// The only forms that hand a stack address to another register.
+	std::optional<std::pair<size_t, std::optional<s64>>> propagated;
+	const auto&                                          operands = decoded.operands;
+	if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+	    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	    operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER && operands[0].size == 64 &&
+	    operands[1].size == 64) {
+		const auto destination = GprIndex(operands[0].reg.value);
+		const auto source      = GprIndex(operands[1].reg.value);
+		if (destination && source) {
+			propagated = {*destination, state_in[*source]};
+		}
+	} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+	           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER && operands[0].size == 64 &&
+	           operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+	           operands[1].mem.index == ZYDIS_REGISTER_NONE &&
+	           IsStackAddressableSegment(operands[1])) {
+		const auto destination = GprIndex(operands[0].reg.value);
+		const auto base        = GprIndex(operands[1].mem.base);
+		if (destination) {
+			std::optional<s64> value;
+			if (base && state_in[*base]) {
+				value = *state_in[*base] + operands[1].mem.disp.value;
+			}
+			propagated = {*destination, value};
+		}
+	}
+
+	for (u8 index = 0; index < decoded.instruction.operand_count; ++index) {
+		const auto& operand = decoded.operands[index];
+		if (operand.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		    (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) == 0) {
+			continue;
+		}
+		if (const auto gpr = GprIndex(operand.reg.value)) {
+			state_out[*gpr] = std::nullopt;
+		}
+	}
+	if (propagated) {
+		state_out[propagated->first] = propagated->second;
+	}
+
+	const bool pops_stack_pointer =
+	    (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP ||
+	     decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPF ||
+	     decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFD ||
+	     decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POPFQ) &&
+	    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	    IsStackPointerRegister(operands[0].reg.value);
+	if (propagated && propagated->first == RspGprIndex) {
+		// `mov rsp, reg` / `lea rsp, [reg + disp]` already produced the new depth.
+	} else if (pops_stack_pointer) {
+		state_out[RspGprIndex] = std::nullopt;
+	} else if (decoded.stack_pointer_delta.has_value()) {
+		state_out[RspGprIndex] = state_in[RspGprIndex].has_value()
+		                             ? std::optional<s64>(*state_in[RspGprIndex] +
+		                                                  *decoded.stack_pointer_delta)
+		                             : std::nullopt;
+	} else if (decoded.changes_stack_pointer) {
+		state_out[RspGprIndex] = std::nullopt;
+	} else {
+		// Everything else, calls included: a call restores the stack pointer before the next
+		// instruction of this function runs.
+		state_out[RspGprIndex] = state_in[RspGprIndex];
+	}
+
+	// Zydis models a call's register effects as RIP and RSP only, so nothing above would drop the
+	// registers the callee is free to destroy. Believing a clobbered register still holds a stack
+	// address would classify a genuine heap dereference as a stack access and silently leave it
+	// unprotected.
+	if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL) {
+		constexpr std::array<size_t, 9> CallerSavedGprs = {0, 1, 2, 6, 7, 8, 9, 10, 11};
+		for (const size_t gpr: CallerSavedGprs) {
+			state_out[gpr] = std::nullopt;
+		}
+	}
+	return state_out;
+}
+
+// Recompute the memory classification of one instruction now that the stack pointer relationship
+// of every base register is known. This is what lets a frame-pointer function be seen at all: its
+// red zone slots are addressed as [rbp - n], never as [rsp - n].
+void ClassifyStackOperands(DecodedCodeInstruction& decoded, const StackRegisterState& state) {
+	decoded.red_zone_use.reset();
+	decoded.red_zone_def.reset();
+	decoded.has_red_zone_operand           = false;
+	decoded.has_unmodeled_red_zone_operand = false;
+	decoded.accesses_memory                = false;
+
+	// Offset of the operand's address from the current stack pointer, when it is knowable. A base
+	// of RSP needs no dataflow at all, so a function whose stack depth stops being tracked (an
+	// alloca, an `and rsp, -16`) keeps the protection it had before the frame registers were
+	// modelled.
+	const bool addresses_are_64_bit = decoded.instruction.address_width == 64;
+	const auto stack_relative_offset =
+	    [&state, addresses_are_64_bit](const ZydisDecodedOperand& operand) -> std::optional<s64> {
+		if (!IsStackAddressableSegment(operand) || !addresses_are_64_bit) {
+			return std::nullopt;
+		}
+		if (IsStackPointerRegister(operand.mem.base)) {
+			return operand.mem.disp.value;
+		}
+		const auto base = GprIndex(operand.mem.base);
+		if (!base || !state[*base] || !state[RspGprIndex]) {
+			return std::nullopt;
+		}
+		return *state[*base] + operand.mem.disp.value - *state[RspGprIndex];
+	};
+	// A 0x67 prefix truncates the effective address to 32 bits, so `[ebp + n]` is not the frame
+	// slot it looks like; treat nothing as stack relative in that case.
+	const auto is_stack_register = [&state, addresses_are_64_bit](ZydisRegister reg) {
+		if (!addresses_are_64_bit) {
+			return false;
+		}
+		if (IsStackPointerRegister(reg)) {
+			return true;
+		}
+		const auto gpr = GprIndex(reg);
+		return gpr.has_value() && state[*gpr].has_value();
+	};
+
+	for (u8 index = 0; index < decoded.instruction.operand_count; ++index) {
+		const auto& operand = decoded.operands[index];
+		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+			continue;
+		}
+		// Only the base decides. A tracked register appearing as a *scaled* index is an array
+		// subscript, not a stack address, and treating it as one would drop protection from a
+		// genuinely faultable access.
+		const bool stack_relative =
+		    IsStackAddressableSegment(operand) && is_stack_register(operand.mem.base);
+		constexpr ZydisOperandActions MemoryAccessMask =
+		    ZYDIS_OPERAND_ACTION_MASK_READ | ZYDIS_OPERAND_ACTION_MASK_WRITE;
+		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEA &&
+		    decoded.instruction.mnemonic != ZYDIS_MNEMONIC_NOP && !stack_relative &&
+		    (operand.actions & MemoryAccessMask) != 0) {
+			decoded.accesses_memory = true;
 		}
 	}
 
 	for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
 		const auto& operand = decoded.operands[index];
-		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
-		    !IsStackPointerRegister(operand.mem.base) || operand.mem.disp.size == 0 ||
-		    operand.mem.disp.value >= 0) {
+		if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+			continue;
+		}
+		const auto offset_from_stack_pointer = stack_relative_offset(operand);
+		if (!offset_from_stack_pointer.has_value()) {
+			// A frame register whose depth is no longer tracked still addresses the frame, so the
+			// red zone traffic of this function can no longer be seen precisely.
+			decoded.has_unmodeled_red_zone_operand |= is_stack_register(operand.mem.base);
+			continue;
+		}
+		if (operand.mem.index != ZYDIS_REGISTER_NONE) {
+			// An indexed access whose base already sits below the stack pointer can land anywhere
+			// in the red zone; give up on precise liveness rather than assume it misses. A base at
+			// or above the stack pointer is an ordinary local array and is left alone, because
+			// making every one of those conservative floods the trampoline arena.
+			decoded.has_unmodeled_red_zone_operand |= *offset_from_stack_pointer < 0;
 			continue;
 		}
 
-		decoded.has_red_zone_operand = true;
+		const s64 access_start = *offset_from_stack_pointer;
 		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
-			if (decoded.stack_pointer_delta.has_value()) {
-				decoded.has_red_zone_operand = false;
+			// `lea rsp, [rsp - n]` is the stack adjustment itself, not a red zone reference.
+			if (decoded.stack_pointer_delta.has_value() || access_start >= 0) {
 				continue;
 			}
+			// The address escapes into a register and may be dereferenced anywhere, including
+			// through memory or a callee, so stop trusting the liveness of this function.
+			decoded.has_red_zone_operand           = true;
 			decoded.has_unmodeled_red_zone_operand = true;
 			continue;
 		}
 
-		const s64 access_start = operand.mem.disp.value;
-		const s64 access_size  = std::max<s64>(operand.size / 8, 1);
-		const s64 range_start  = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
-		const s64 range_end    = std::min(access_start + access_size, 0LL);
+		const s64 access_size = std::max<s64>(operand.size / 8, 1);
+		const s64 range_start = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
+		const s64 range_end   = std::min(access_start + access_size, 0LL);
+		if (range_start >= range_end) {
+			continue;
+		}
+
+		decoded.has_red_zone_operand = true;
 		for (s64 offset = range_start; offset < range_end; ++offset) {
 			const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
 			if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
@@ -279,7 +484,94 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 			}
 		}
 	}
-	return decoded;
+}
+
+// Successors of one instruction inside the function, including the targets of an indirect branch
+// once its jump table has been resolved.
+template <typename Fn>
+void ForEachSuccessor(const DecodedFunction& function, const DecodedCodeInstruction& decoded,
+                      Fn&& fn) {
+	const uintptr_t next_address  = decoded.address + decoded.instruction.length;
+	const uintptr_t branch_target = GetRelativeTarget(decoded);
+	if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+		fn(next_address);
+		fn(branch_target);
+		return;
+	}
+	if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+		if (branch_target != 0) {
+			fn(branch_target);
+			return;
+		}
+		const auto resolved = function.indirect_targets.find(decoded.address);
+		if (resolved != function.indirect_targets.end()) {
+			for (const uintptr_t target: resolved->second) {
+				fn(target);
+			}
+		}
+		return;
+	}
+	if (!IsControlFlowTerminator(decoded.instruction)) {
+		fn(next_address);
+	}
+}
+
+// Forward dataflow over the decoded CFG, recording for every instruction which registers hold a
+// known offset from the stack pointer the function was entered with.
+void AnalyzeStackRegisters(DecodedFunction& function, uintptr_t function_start) {
+	const auto entry = function.instructions.find(function_start);
+	if (entry == function.instructions.end()) {
+		return;
+	}
+
+	std::vector<DecodedCodeInstruction*> instructions;
+	instructions.reserve(function.instructions.size());
+	std::map<uintptr_t, size_t> indices;
+	for (auto& [address, decoded]: function.instructions) {
+		indices.emplace(address, instructions.size());
+		instructions.push_back(&decoded);
+	}
+
+	std::vector<StackRegisterState> state_in(instructions.size());
+	std::vector<bool>               reached(instructions.size(), false);
+	const size_t                    entry_index = indices.at(function_start);
+	state_in[entry_index][RspGprIndex]          = 0;
+	reached[entry_index]                        = true;
+
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (size_t index = 0; index < instructions.size(); ++index) {
+			if (!reached[index]) {
+				continue;
+			}
+			const auto state_out = TransferStackRegisters(*instructions[index], state_in[index]);
+			ForEachSuccessor(function, *instructions[index], [&](uintptr_t address) {
+				const auto successor = indices.find(address);
+				if (successor == indices.end()) {
+					return;
+				}
+				const size_t target = successor->second;
+				if (!reached[target]) {
+					reached[target]  = true;
+					state_in[target] = state_out;
+					changed          = true;
+					return;
+				}
+				for (size_t gpr = 0; gpr < GprCount; ++gpr) {
+					if (state_in[target][gpr].has_value() &&
+					    state_in[target][gpr] != state_out[gpr]) {
+						state_in[target][gpr] = std::nullopt;
+						changed               = true;
+					}
+				}
+			});
+		}
+	}
+
+	for (size_t index = 0; index < instructions.size(); ++index) {
+		instructions[index]->stack_registers = state_in[index];
+	}
 }
 
 bool IsSameRegister(ZydisRegister lhs, ZydisRegister rhs) {
@@ -296,6 +588,62 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 		           (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
 		           IsSameRegister(operand.reg.value, reg);
 	    });
+}
+
+// A jump table usually lives in a read-only data segment, not in the executable one, and a guest
+// module can contain segments that are deliberately left unreadable. Check before dereferencing.
+bool IsReadableRange(uintptr_t address, size_t size) {
+	MEMORY_BASIC_INFORMATION region {};
+	if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) !=
+	    sizeof(region)) {
+		return false;
+	}
+	constexpr DWORD ReadableProtection = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+	                                     PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+	                                     PAGE_EXECUTE_WRITECOPY;
+	if (region.State != MEM_COMMIT || (region.Protect & ReadableProtection) == 0 ||
+	    (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+		return false;
+	}
+	const auto region_end = reinterpret_cast<uintptr_t>(region.BaseAddress) + region.RegionSize;
+	return address + size <= region_end;
+}
+
+// clang bounds checks a switch index in its narrow form and then widens it, as in
+//     cmp al, 6 / ja default / movzx eax, al / movsxd rax, [table + rax*4]
+// so a redefinition of the index register that only changes its width still carries the bound and
+// must not abandon the search for the compare.
+bool IsWidthChangeOfRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg,
+                             bool* widened) {
+	switch (decoded.instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+		case ZYDIS_MNEMONIC_MOVZX:
+		case ZYDIS_MNEMONIC_MOVSX:
+		case ZYDIS_MNEMONIC_MOVSXD: break;
+		// `and reg, imm` is how a compiler bounds an index *without* a compare, so stepping over
+		// one would let the scan latch onto an older and larger bound.
+		default: return false;
+	}
+	if (decoded.instruction.operand_count_visible != 2 ||
+	    decoded.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    decoded.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    !IsSameRegister(decoded.operands[0].reg.value, reg) ||
+	    !IsSameRegister(decoded.operands[1].reg.value, reg) ||
+	    decoded.operands[0].size < decoded.operands[1].size) {
+		return false;
+	}
+	// A high-byte source is a different half of the register, not a narrower view of the value.
+	switch (decoded.operands[1].reg.value) {
+		case ZYDIS_REGISTER_AH:
+		case ZYDIS_REGISTER_CH:
+		case ZYDIS_REGISTER_DH:
+		case ZYDIS_REGISTER_BH: return false;
+		default: break;
+	}
+	if (widened != nullptr && decoded.operands[0].size > decoded.operands[1].size) {
+		*widened = true;
+	}
+	return true;
 }
 
 std::optional<std::vector<uintptr_t>>
@@ -362,7 +710,8 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	constexpr size_t         MaxPatternInstructions = 64;
 	std::optional<size_t>    table_size;
 	std::optional<uintptr_t> guarded_path_start;
-	auto                     cursor = load;
+	bool                     index_was_widened = false;
+	auto                     cursor            = load;
 	for (size_t count = 0; count < MaxPatternInstructions; ++count) {
 		cursor = previous_contiguous(cursor);
 		if (cursor == function.instructions.end()) {
@@ -384,6 +733,12 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 			if (bound < 0) {
 				return std::nullopt;
 			}
+			// A bound taken on an 8 or 16 bit alias only carries to the register the table is
+			// indexed with if something explicitly widened it in between; a 32 bit compare is
+			// already carried by the implicit zero extension of every 32 bit write.
+			if (decoded.operands[0].size < 32 && !index_was_widened) {
+				return std::nullopt;
+			}
 			if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNBE) {
 				table_size = static_cast<size_t>(bound) + 1;
 			} else if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNB) {
@@ -394,7 +749,8 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 			guarded_path_start = next_address + bounds_branch->second.instruction.length;
 			break;
 		}
-		if (WritesRegister(decoded, index_reg)) {
+		if (WritesRegister(decoded, index_reg) &&
+		    !IsWidthChangeOfRegister(decoded, index_reg, &index_was_widened)) {
 			return std::nullopt;
 		}
 	}
@@ -456,7 +812,8 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	std::optional<std::vector<uintptr_t>> resolved_targets;
 	for (const uintptr_t table_address: table_candidates) {
 		if (table_address < segment_start || table_address > segment_end ||
-		    *table_size > (segment_end - table_address) / sizeof(s32)) {
+		    *table_size > (segment_end - table_address) / sizeof(s32) ||
+		    !IsReadableRange(table_address, *table_size * sizeof(s32))) {
 			continue;
 		}
 
@@ -510,11 +867,6 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 					break;
 				}
 
-				function.uses_red_zone |= decoded.has_red_zone_operand;
-				function.requires_conservative_red_zone_tracking |=
-				    decoded.has_unmodeled_red_zone_operand ||
-				    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
-
 				const uintptr_t next_address  = address + decoded.instruction.length;
 				const uintptr_t branch_target = GetRelativeTarget(decoded);
 				if (branch_target >= function_start && branch_target < function_end) {
@@ -551,6 +903,7 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 				continue;
 			}
 			resolved_indirect_branches.insert(branch_address);
+			function.indirect_targets[branch_address] = *targets;
 			for (const uintptr_t target: *targets) {
 				function.branch_targets.insert(target);
 				if (!visited.contains(target)) {
@@ -564,6 +917,15 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+
+	AnalyzeStackRegisters(function, function_start);
+	for (auto& [address, decoded]: function.instructions) {
+		ClassifyStackOperands(decoded, decoded.stack_registers);
+		function.uses_red_zone |= decoded.has_red_zone_operand;
+		function.requires_conservative_red_zone_tracking |=
+		    decoded.has_unmodeled_red_zone_operand ||
+		    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
+	}
 	return function;
 }
 
@@ -619,16 +981,7 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 				}
 			};
 
-			const uintptr_t next_address  = decoded.address + decoded.instruction.length;
-			const uintptr_t branch_target = GetRelativeTarget(decoded);
-			if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
-				add_successor(next_address);
-				add_successor(branch_target);
-			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
-				add_successor(branch_target);
-			} else if (!IsControlFlowTerminator(decoded.instruction)) {
-				add_successor(next_address);
-			}
+			ForEachSuccessor(function, decoded, add_successor);
 
 			const RedZoneMask translated_live_out =
 			    decoded.stack_pointer_delta.has_value()
@@ -741,6 +1094,72 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 }
 } // namespace
 
+namespace {
+
+// Debug aid: set KYTY_RZ_DUMP to a comma separated list of hex guest addresses to have the
+// containing function's decode and classification printed once during patching.
+const std::vector<uintptr_t>& GetDumpAddresses() {
+	static const std::vector<uintptr_t> addresses = [] {
+		std::vector<uintptr_t> value;
+		const char*            env = std::getenv("KYTY_RZ_DUMP");
+		if (env == nullptr) {
+			return value;
+		}
+		const char* cursor = env;
+		while (*cursor != '\0') {
+			char*      end   = nullptr;
+			const auto parsed = std::strtoull(cursor, &end, 16);
+			if (end == cursor) {
+				break;
+			}
+			value.push_back(static_cast<uintptr_t>(parsed));
+			cursor = end;
+			while (*cursor == ',' || *cursor == ' ') {
+				cursor++;
+			}
+		}
+		return value;
+	}();
+	return addresses;
+}
+
+void DumpFunction(uintptr_t function_start, uintptr_t function_end, const DecodedFunction& function,
+                  const std::map<uintptr_t, InstructionRewrite>& rewrite_sites) {
+	static ZydisFormatter formatter = [] {
+		ZydisFormatter value {};
+		ZydisFormatterInit(&value, ZYDIS_FORMATTER_STYLE_INTEL);
+		return value;
+	}();
+
+	printf("RZDUMP function 0x%016" PRIx64 " .. 0x%016" PRIx64
+	       " instructions=%zu uses_red_zone=%d indirect=%d conservative=%d\n",
+	       static_cast<u64>(function_start), static_cast<u64>(function_end),
+	       function.instructions.size(), static_cast<int>(function.uses_red_zone),
+	       static_cast<int>(function.has_indirect_branch),
+	       static_cast<int>(function.requires_conservative_red_zone_tracking));
+	for (const auto& [address, decoded]: function.instructions) {
+		char text[256] {};
+		ZydisFormatterFormatInstruction(&formatter, &decoded.instruction, decoded.operands.data(),
+		                                decoded.instruction.operand_count_visible, text,
+		                                sizeof(text), address, nullptr);
+		const auto rewrite = rewrite_sites.find(address);
+		printf("RZDUMP   0x%016" PRIx64 " len=%u mem=%d rsp=%d rz_op=%d use=%d def=%d live=%d "
+		       "patch=%d | %s\n",
+		       static_cast<u64>(address), decoded.instruction.length,
+		       static_cast<int>(decoded.accesses_memory),
+		       static_cast<int>(decoded.uses_stack_pointer),
+		       static_cast<int>(decoded.has_red_zone_operand),
+		       static_cast<int>(decoded.red_zone_use.any()),
+		       static_cast<int>(decoded.red_zone_def.any()),
+		       static_cast<int>(decoded.red_zone_live.any()),
+		       static_cast<int>(rewrite != rewrite_sites.end() && rewrite->second.protect_red_zone),
+		       text);
+	}
+	fflush(stdout);
+}
+
+} // namespace
+
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts) {
 	RedZonePatchResult result {};
@@ -771,7 +1190,11 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		// Jump tables are emitted into read-only data, which is a different segment from the code
+		// being patched, so table addresses are validated against the whole module.
+		auto function = DecodeFunction(function_start, function_end,
+		                               reinterpret_cast<uintptr_t>(module->start),
+		                               reinterpret_cast<uintptr_t>(module->end));
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
 
@@ -812,6 +1235,13 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 				rewrite_sites[address].protect_red_zone = true;
 			}
 		}
+		for (const uintptr_t dump_address: GetDumpAddresses()) {
+			if (dump_address >= function_start && dump_address < function_end) {
+				DumpFunction(function_start, function_end, function, rewrite_sites);
+				break;
+			}
+		}
+
 		if (rewrite_sites.empty()) {
 			continue;
 		}

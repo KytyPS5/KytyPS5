@@ -1289,8 +1289,8 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
 	std::string                     recompile_error;
 	if (!ShaderRecompiler::TryRecompile(params.code, options, result, &recompile_error)) {
 		if (error != nullptr) {
-			return ShaderError::Fail(error, fmt::format("recompile failed: {}", recompile_error)),
-			       nullptr;
+			*error = fmt::format("recompile failed: {}", recompile_error);
+			return nullptr;
 		}
 		ExitShaderRecompilerFailure(label, options.shader_hash, recompile_error.c_str());
 	}
@@ -1299,7 +1299,8 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
 	if (!SpirvValidateBinary(label, options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
 		if (error != nullptr) {
-			return ShaderError::Fail(error, "SPIR-V validation failed"), nullptr;
+			*error = "SPIR-V validation failed";
+			return nullptr;
 		}
 		ExitShaderRecompilerFailure(label, options.shader_hash, "SPIR-V validation failed");
 	}
@@ -1330,14 +1331,32 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
 	return module;
 }
 
-// A merged ES+GS pair is assembled from two guest programs rather than read straight out of
-// guest memory, so the caller owns the assembled words and `params.code` views them. The
-// launch state the pair was planned for is folded into `input_info`, and lands in the static
-// key below so two dispatches of the same pair do not share one permutation.
-static std::span<const uint32_t> MergedGeometryUserData(const HW::VertexShaderInfo& regs) {
-	const auto count =
-	    std::max(static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr), regs.gs_user_sgpr.count);
-	return {regs.gs_user_sgpr.value, count};
+// A merged ES+GS wave does not start its user data at s0: the SPI reserves s0..s7 for the
+// launch state it hands the pair. s[0:1] is the address the guest wrote to
+// SPI_SHADER_USER_DATA_ADDR_LO/HI_GS, and the GS half loads its own resource table from it,
+// so the recompiler has to see the whole window from s0 rather than only the guest's user
+// SGPRs at s8.
+struct MergedGeometryScalars {
+	static constexpr uint32_t LaunchSgprCount = 8;
+
+	std::array<uint32_t, LaunchSgprCount + HW::UserSgprInfo::SGPRS_MAX> value {};
+	uint32_t                                                           count = 0;
+
+	[[nodiscard]] std::span<const uint32_t> Span() const { return {value.data(), count}; }
+};
+
+static MergedGeometryScalars MergedGeometryUserData(const HW::VertexShaderInfo& regs) {
+	MergedGeometryScalars out;
+	const auto            user_count = std::min<uint32_t>(
+	               std::max(static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr), regs.gs_user_sgpr.count),
+	               HW::UserSgprInfo::SGPRS_MAX);
+	out.value[0] = regs.gs_user_data_addr[0];
+	out.value[1] = regs.gs_user_data_addr[1];
+	for (uint32_t i = 0; i < user_count; i++) {
+		out.value[MergedGeometryScalars::LaunchSgprCount + i] = regs.gs_user_sgpr.value[i];
+	}
+	out.count = MergedGeometryScalars::LaunchSgprCount + user_count;
+	return out;
 }
 
 static bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& data) {
@@ -1354,9 +1373,11 @@ static bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& data) {
 
 bool PrepareMeshProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                         const MeshDispatch& dispatch, MeshInputTopology topology, bool indexed,
-                        ShaderVertexInputInfo& info, ShaderParams& params, std::string* error) {
+                        ShaderVertexInputInfo& info, std::vector<uint32_t>& user_data,
+                        ShaderParams& params, std::string* error) {
 	KYTY_PROFILER_FUNCTION();
 
+	user_data.clear();
 	params = {};
 
 	if (regs.es_regs.data_addr == 0 || regs.gs_regs.data_addr == 0) {
@@ -1385,7 +1406,11 @@ bool PrepareMeshProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegist
 	info.mesh_indexed                  = indexed;
 	info.mesh_lds_size_dwords          = MeshLdsDwords(regs.gs_regs.rsrc2.lds_size);
 
-	params.user_data     = MergedGeometryUserData(regs);
+	// The launch window is synthesised rather than read out of a register file, so the caller
+	// owns it and `params` only views it.
+	const auto scalars = MergedGeometryUserData(regs);
+	user_data.assign(scalars.Span().begin(), scalars.Span().end());
+	params.user_data     = user_data;
 	params.hash          = regs.gs_regs.chksum;
 	// The assembled words live on the host heap, so key the permutation on the ES address the
 	// guest actually launched instead of wherever the assembly happened to land.
@@ -1422,10 +1447,12 @@ bool AssembleMeshProgram(const HW::VertexShaderInfo& regs, std::vector<uint32_t>
 vk::ShaderModule CompileMeshProgram(vk::Device device, const ShaderParams& params,
                                     ShaderVertexInputInfo& input_info, std::string* error) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::Amber300);
-	auto options              = MakeCompileOptions(params, ShaderType::Mesh);
-	options.wave_size         = input_info.wave_size;
-	options.user_data_base    = 8;
+	auto options           = MakeCompileOptions(params, ShaderType::Mesh);
+	options.wave_size      = input_info.wave_size;
+	// `params.user_data` already starts at the SPI's launch window, so the pair sees s0.
+	options.user_data_base    = 0;
 	options.scratch_dwords    = input_info.scratch_size_dwords;
+	options.read_memory       = ReadShaderMappedMemory;
 	options.input_info.vertex = &input_info;
 	const auto module         = CompileModule(device, params, options, input_info.stage, error);
 	if (module == nullptr) {

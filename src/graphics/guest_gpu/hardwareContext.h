@@ -724,6 +724,9 @@ struct VertexShaderInfo {
 	GsStageRegisters gs_regs;
 	UserSgprInfo     hs_user_sgpr;
 	UserSgprInfo     gs_user_sgpr;
+	// SPI_SHADER_USER_DATA_ADDR_LO/HI_GS. A merged ES+GS wave starts with this address in
+	// s[0:1]; the GS half loads its own resource table from it.
+	uint32_t gs_user_data_addr[2] = {0, 0};
 };
 
 struct PixelShaderInfo {
@@ -1156,6 +1159,11 @@ public:
 		m_vs.hs_user_sgpr.type[id]  = type;
 		m_vs.hs_user_sgpr.count =
 		    ((id + 1) > m_vs.hs_user_sgpr.count ? (id + 1) : m_vs.hs_user_sgpr.count);
+	}
+	void SetGsUserDataAddr(uint32_t half, uint32_t value) {
+		if (half < 2) {
+			m_vs.gs_user_data_addr[half] = value;
+		}
 	}
 	void SetGsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
 		m_vs.gs_user_sgpr.value[id] = value;

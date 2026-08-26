@@ -160,8 +160,8 @@ constexpr auto MakeShaderDispatchTable() {
 	g_hw_sh_func[Pm4::SPI_SHADER_REQ_CTRL_PS]          = HwShIgnoreRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC3_GS]         = HwShIgnoreRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC4_GS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShIgnoreRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetGsUserDataAddr;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetGsUserDataAddr;
 	g_hw_sh_func[Pm4::SPI_SHADER_REQ_CTRL_ESGS]        = HwShIgnoreRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC3_HS]         = HwShIgnoreRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC4_HS]         = HwShIgnoreRegisters;

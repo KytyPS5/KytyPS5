@@ -58,8 +58,8 @@ vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
 // ordinary vertex path instead of terminating the emulator.
 bool PrepareMeshProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                         const MeshDispatch& dispatch, MeshInputTopology topology, bool indexed,
-                        ShaderVertexInputInfo& input_info, ShaderParams& params,
-                        std::string* error);
+                        ShaderVertexInputInfo& input_info, std::vector<uint32_t>& user_data,
+                        ShaderParams& params, std::string* error);
 bool AssembleMeshProgram(const HW::VertexShaderInfo& regs, std::vector<uint32_t>& code,
                          ShaderParams& params, std::string* error);
 vk::ShaderModule CompileMeshProgram(vk::Device device, const ShaderParams& params,

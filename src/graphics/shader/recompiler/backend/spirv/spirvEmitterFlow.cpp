@@ -408,6 +408,28 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 	}
 }
 
+// All 64 invocations run, so lanes past the end of an output array must not store.
+static uint32_t MeshStoreCondition(EmitterState& state, uint32_t exec, uint32_t bound) {
+	if (state.stage != ShaderType::Mesh || bound == 0) {
+		return exec;
+	}
+	const auto in_range = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThan, TypeBool(state), in_range, EmitCurrentLaneId(state),
+	                           ConstantU32(state, bound)});
+	const auto both = state.builder.AllocateId();
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), both, exec, in_range});
+	return both;
+}
+
+static uint32_t MeshVertexBound(const EmitterState& state) {
+	return state.input_info.vertex != nullptr ? state.input_info.vertex->mesh_output_vertices : 0u;
+}
+
+static uint32_t MeshPrimitiveBound(const EmitterState& state) {
+	return state.input_info.vertex != nullptr ? state.input_info.vertex->mesh_output_primitives
+	                                          : 0u;
+}
+
 void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -423,7 +445,7 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 		// The guest packs a triangle's connectivity into one dword, with 10-bit indices where the
 		// published GFX10.1 layout uses 9:
 		//   [9:0] index0 | [19:10] index1 | [29:20] index2 | bit 31 = cull this primitive
-		EmitIfCondition(state, exec, [&]() {
+		EmitIfCondition(state, MeshStoreCondition(state, exec, MeshPrimitiveBound(state)), [&]() {
 			const auto packed = ExportRawComponent(ctx, ctx.Arg(inst, 0), 0);
 			const auto prim   = EmitCurrentLaneId(state);
 			const auto index  = [&](uint32_t shift) {
@@ -461,20 +483,36 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (state.stage == ShaderType::Mesh && exp.kind == IR::ExportTargetKind::Position &&
 	    exp.index != 0) {
-		// POS1 packs (point size, edge flag, layer, viewport index); only the layer, in
-		// component z, is used here.
-		if ((exp.en & 4u) != 0u) {
-			EmitIfCondition(state, exec, [&]() {
-				const auto raw = ExportRawComponent(ctx, ctx.Arg(inst, 0), 2);
-				const auto layer = state.builder.AllocateId();
-				state.builder.AddFunction({OpBitcast, TypeI32(state), layer, raw});
-				const auto pointer = state.builder.AllocateId();
-				state.builder.AddFunction({OpAccessChain,
-				                           TypePointer(state, StorageClassOutput, TypeI32(state)),
-				                           pointer, state.mesh_layer_variable,
-				                           EmitCurrentLaneId(state)});
-				state.builder.AddFunction({OpStore, pointer, layer});
-			});
+		// Only the layer has a mesh output; point size and clip/cull distances are not modelled.
+		if (state.mesh_layer_variable != 0) {
+			for (uint32_t component = 0; component < 4; component++) {
+				if ((exp.en & (1u << component)) == 0) {
+					continue;
+				}
+				const auto output = IR::DecodePositionExportComponent(
+				    state.input_info.vertex->pa_cl_vs_out_cntl, exp.index, component);
+				if (!output.layer) {
+					continue;
+				}
+				// Exported per vertex, but gl_Layer is per primitive, so primitive i takes
+				// vertex i's layer. Exact only where the two compactions agree.
+				EmitIfCondition(state, MeshStoreCondition(state, exec, MeshPrimitiveBound(state)),
+				                [&]() {
+					const auto raw    = ExportRawComponent(ctx, ctx.Arg(inst, 0), component);
+					const auto masked = state.builder.AllocateId();
+					const auto layer  = state.builder.AllocateId();
+					state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), masked, raw,
+					                           ConstantU32(state, 0x7ffu)});
+					state.builder.AddFunction({OpBitcast, TypeI32(state), layer, masked});
+					const auto pointer = state.builder.AllocateId();
+					state.builder.AddFunction({OpAccessChain,
+					                           TypePointer(state, StorageClassOutput,
+					                                       TypeI32(state)),
+					                           pointer, state.mesh_layer_variable,
+					                           EmitCurrentLaneId(state)});
+					state.builder.AddFunction({OpStore, pointer, layer});
+				});
+			}
 		}
 		return;
 	}
@@ -482,7 +520,13 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    exp.en == 0u) {
 		return;
 	}
-	EmitIfCondition(state, exec, [&]() {
+	const auto per_vertex_store = state.stage == ShaderType::Mesh &&
+	                              (exp.kind == IR::ExportTargetKind::Position ||
+	                               exp.kind == IR::ExportTargetKind::Parameter);
+	EmitIfCondition(state,
+	                per_vertex_store ? MeshStoreCondition(state, exec, MeshVertexBound(state))
+	                                 : exec,
+	                [&]() {
 		const auto data = ctx.Arg(inst, 0);
 		if (exp.kind == IR::ExportTargetKind::Position && exp.index != 0) {
 			EmitAuxPositionExport(ctx, data, exp);
@@ -567,15 +611,17 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			if (state.stage != ShaderType::Mesh) {
 				return true;
 			}
-			// GS_ALLOC_REQ reserves the program's output space: m0 packs
-			// vertex_count[11:0] | primitive_count << 12.
+			// m0 packs vertex_count[10:0] | primitive_count[22:12].
 			const auto m0         = ctx.Arg(inst, 0);
 			const auto vertices   = state.builder.AllocateId();
+			const auto shifted    = state.builder.AllocateId();
 			const auto primitives = state.builder.AllocateId();
 			state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), vertices, m0,
-			                           ConstantU32(state, 0xfffu)});
-			state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), primitives, m0,
+			                           ConstantU32(state, 0x7ffu)});
+			state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), shifted, m0,
 			                           ConstantU32(state, 12)});
+			state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), primitives, shifted,
+			                           ConstantU32(state, 0x7ffu)});
 			state.builder.AddFunction({OpSetMeshOutputsEXT, vertices, primitives});
 			return true;
 		}

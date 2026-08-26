@@ -230,6 +230,10 @@ private:
 	bool S_GETPC_B64(const Decoder::Instruction& inst, std::string* error);
 	void S_CSELECT_B32(const Decoder::Instruction& inst);
 	void S_CSELECT_B64(const Decoder::Instruction& inst);
+	void S_CMOV_B32(const Decoder::Instruction& inst);
+	void S_CMOV_B64(const Decoder::Instruction& inst);
+	void SelectOn32(const Decoder::Instruction& inst, const Decoder::Operand& if_false);
+	void SelectOn64(const Decoder::Instruction& inst, const Decoder::Operand& if_false);
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);
 	void S_WQM_B64(const Decoder::Instruction& inst);

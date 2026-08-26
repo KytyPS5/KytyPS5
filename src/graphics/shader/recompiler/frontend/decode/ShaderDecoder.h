@@ -38,6 +38,8 @@ enum class Opcode {
 
 	S_MOV_B32,
 	S_MOV_B64,
+	S_CMOV_B32,
+	S_CMOV_B64,
 	S_MOVK_I32,
 	S_ABS_I32,
 	S_BREV_B32,

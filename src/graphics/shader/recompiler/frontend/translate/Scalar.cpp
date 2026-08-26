@@ -13,6 +13,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst, std::string* error
 		case O::S_SETPC_B64: return true;
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return true;
 		case O::S_CSELECT_B64: S_CSELECT_B64(inst); return true;
+		case O::S_CMOV_B32: S_CMOV_B32(inst); return true;
+		case O::S_CMOV_B64: S_CMOV_B64(inst); return true;
 		case O::S_SETREG_B32: EmitControlNop(); return true;
 		case O::S_WAITCNT: EmitWaitcnt(); return true;
 

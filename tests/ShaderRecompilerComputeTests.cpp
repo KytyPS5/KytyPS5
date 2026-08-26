@@ -12501,6 +12501,54 @@ TestCase ScalarMinMaxSccComparisonEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// S_CMOV writes the source only when SCC is set; when SCC is clear the
+// destination has to keep its previous value rather than take the source or
+// get zeroed. The merged ES+GS prologues Pathless ships open with
+// s_cmov_b64 exec, -1, so the 64-bit form has to preserve the mask too.
+TestCase ScalarCmovPreservesDestinationWhenSccClear() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  auto set_scc = [&](bool value) {
+    code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(value ? 1u : 0u)));
+  };
+
+  // 32-bit: SCC clear keeps 7, SCC set takes 9.
+  code.push_back(EncodeSMovB32(20, InlineU32(7)));
+  set_scc(false);
+  code.push_back(EncodeSop1(0x05, 20, InlineU32(9)));
+
+  code.push_back(EncodeSMovB32(21, InlineU32(7)));
+  set_scc(true);
+  code.push_back(EncodeSop1(0x05, 21, InlineU32(9)));
+
+  // 64-bit: s[2:3] is the source pair, s[22:23] and s[24:25] the destinations.
+  code.push_back(EncodeSMovB32(2, InlineU32(9)));
+  code.push_back(EncodeSMovB32(3, InlineU32(11)));
+
+  code.push_back(EncodeSMovB32(22, InlineU32(7)));
+  code.push_back(EncodeSMovB32(23, InlineU32(5)));
+  set_scc(false);
+  code.push_back(EncodeSop1(0x06, 22, 2));
+
+  code.push_back(EncodeSMovB32(24, InlineU32(7)));
+  code.push_back(EncodeSMovB32(25, InlineU32(5)));
+  set_scc(true);
+  code.push_back(EncodeSop1(0x06, 24, 2));
+
+  for (u32 i = 0; i < 6u; i++) {
+    AppendStoreSgpr(&code, 20u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"ScalarCmovPreservesDestinationWhenSccClear",
+          code,
+          {},
+          {7, 9, 7, 5, 9, 11},
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CMOV_B32, O::S_CMOV_B64,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarAbsI32UpdatesScc() {
   using O = ShaderOpcode;
 
@@ -20335,6 +20383,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarExtendedArithmetic);
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);
+  AddCase(ScalarCmovPreservesDestinationWhenSccClear);
   AddCase(ScalarAbsI32UpdatesScc);
   AddCase(ScalarShiftLeftAddSccCarryEdges);
   AddCase(ScalarCompareOps);

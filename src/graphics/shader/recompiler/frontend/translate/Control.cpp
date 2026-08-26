@@ -229,19 +229,37 @@ bool Translator::S_GETPC_B64(const Decoder::Instruction& inst, std::string* erro
 }
 
 void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
-	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.src1));
-	WriteOperand(DestinationOperand(inst), result);
+	SelectOn32(inst, inst.src1);
 }
 
 void Translator::S_CSELECT_B64(const Decoder::Instruction& inst) {
+	SelectOn64(inst, inst.src1);
+}
+
+// S_CMOV leaves the destination untouched when SCC is clear, so it is the same select with the
+// destination itself standing in as the false operand.
+void Translator::S_CMOV_B32(const Decoder::Instruction& inst) {
+	SelectOn32(inst, inst.dst);
+}
+
+void Translator::S_CMOV_B64(const Decoder::Instruction& inst) {
+	SelectOn64(inst, inst.dst);
+}
+
+void Translator::SelectOn32(const Decoder::Instruction& inst, const Decoder::Operand& if_false) {
+	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(if_false));
+	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::SelectOn64(const Decoder::Instruction& inst, const Decoder::Operand& if_false) {
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
-	const auto rhs           = ReadU32Pair(inst.src1);
+	const auto rhs           = ReadU32Pair(if_false);
 	const auto selected_mask = IR::U1(
-	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(inst.src1)}));
+	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(if_false)}));
 	const auto selected_mask_valid =
 	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
-	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(inst.src1)}));
+	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(if_false)}));
 	if (IsExecOrVcc(inst.dst)) {
 		WriteMask64(inst.dst, selected_mask);
 		return;

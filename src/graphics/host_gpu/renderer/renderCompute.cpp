@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -17,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -74,6 +76,34 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
+static bool ResolveConstantDwordStore(const ShaderRecompiler::IR::Program& program,
+                                      uint32_t&                            clear) {
+	constexpr size_t StoreValueArg = 4;
+	bool             found         = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op != ShaderRecompiler::IR::ValueOpcode::StoreBufferU32) {
+				if (ShaderRecompiler::IR::BufferAccessOf(op) !=
+				    ShaderRecompiler::IR::BufferAccess::None) {
+					return false; // some other buffer traffic: not a plain fill
+				}
+				continue;
+			}
+			if (found || inst.NumArgs() <= StoreValueArg) {
+				return false; // more than one store, or an unexpected shape
+			}
+			const auto value = inst.Arg(StoreValueArg);
+			if (!value.IsImmediate()) {
+				return false; // the fill value is computed, not a constant we can name
+			}
+			clear = value.U32();
+			found = true;
+		}
+	}
+	return found;
+}
+
 bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
@@ -88,12 +118,15 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	const auto& resource   = program.info.buffers.front();
 	const auto& raw        = resources.buffers.front();
 	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	const bool quad_fill = resource.max_byte_extent == 16 && descriptor.Stride() == 16 &&
+	                       descriptor.Format() == Prospero::BufferFormat::k32_32_32_32UInt;
+	const bool dword_fill = resource.max_byte_extent == 4 && descriptor.Stride() == 4 &&
+	                        descriptor.Format() == Prospero::BufferFormat::k32UInt;
 	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
-	    resource.scalar || resource.max_byte_extent != 16 || descriptor.Stride() != 16 ||
-	    descriptor.Format() != Prospero::BufferFormat::k32_32_32_32UInt ||
-	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    resource.scalar || (!quad_fill && !dword_fill) || descriptor.SwizzleEnabled() ||
+	    descriptor.IndexStride() != 0 || descriptor.AddTid() ||
 	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
-	    program.user_data_base != 0 || resources.user_data.size() != 8) {
+	    program.user_data_base != 0 || resources.user_data.size() < raw.dword_count) {
 		return false;
 	}
 	for (uint32_t i = 0; i < raw.dword_count; i++) {
@@ -101,19 +134,34 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 			return false;
 		}
 	}
-	const uint32_t clear = resources.user_data[4];
-	if (resources.user_data[5] != clear || resources.user_data[6] != clear ||
-	    resources.user_data[7] != clear) {
+	uint32_t clear = 0;
+	if (quad_fill) {
+		if (resources.user_data.size() != 8) {
+			return false;
+		}
+		clear = resources.user_data[4];
+		if (resources.user_data[5] != clear || resources.user_data[6] != clear ||
+		    resources.user_data[7] != clear) {
+			return false;
+		}
+	} else if (!ResolveConstantDwordStore(program, clear)) {
 		return false;
 	}
+	// group_x is a thread count for the quad shape and a group count for the dword one.
+	const bool common =
+	    input.threads_num[0] == 64 && input.threads_num[1] == 1 && input.threads_num[2] == 1 &&
+	    group_x != 0 && group_y == 1 && group_z == 1 && input.group_id[0] && !input.group_id[1] &&
+	    !input.group_id[2] && input.thread_ids_num == 1 && input.wave_size == 64 &&
+	    !input.tg_size_en;
 	const bool full_dispatch =
-	    input.dispatch_thread_dimensions && input.threads_num[0] == 64 &&
-	    input.threads_num[1] == 1 && input.threads_num[2] == 1 && group_x != 0 && group_y == 1 &&
-	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
-	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
-	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 64 && !input.tg_size_en && mode == 0x61u &&
-	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
+	    common &&
+	    (quad_fill ? (input.dispatch_thread_dimensions && mode == 0x61u &&
+	                  input.dispatch_threads_num[0] == group_x &&
+	                  input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
+	                  group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x)
+	               : (!input.dispatch_thread_dimensions &&
+	                  descriptor.NumRecords() ==
+	                      static_cast<uint64_t>(group_x) * input.threads_num[0]));
 	const auto size = BufferDescriptorSize(descriptor);
 	if (!full_dispatch || size == 0) {
 		return false;
@@ -135,7 +183,9 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 		return false;
 	}
 	auto& cache = command.GetContext().GetTextureCache();
-	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
+	const bool image_cleared = cache.ClearImageFromBuffer(command, descriptor.Base48(), size,
+	                                                      packed_clear);
+	if (!image_cleared) {
 		// Recognized metadata-fill shaders access DCC as an ordinary storage buffer and may run
 		// before the render target is bound. TryConsumeDccFill either consumes registered state
 		// or retains a PendingDcc fill while allowing the dispatch to run.

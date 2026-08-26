@@ -2,6 +2,10 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -33,6 +37,186 @@ static_assert(decltype(g_install_state)::is_always_lock_free);
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// A fault the guest handler declines is fatal, and Windows tears the process down without
+// printing anything, which leaves a truncated log and no way to tell where it died. Report
+// the faulting instruction before letting the search continue. The report is capped because
+// this also sees first-chance faults that somebody else's __except may go on to handle.
+static std::atomic_uint32_t g_unhandled_reports {0};
+
+static void DumpExceptionRing() noexcept;
+
+static void ReportUnhandledFault(PEXCEPTION_POINTERS exception, const ExceptionInfo& info) noexcept {
+	if (g_unhandled_reports.fetch_add(1, std::memory_order_relaxed) >= 4) {
+		return;
+	}
+
+	const char* access = "unknown";
+	switch (info.access_violation_type) {
+		case AccessViolationType::Read: access = "read"; break;
+		case AccessViolationType::Write: access = "write"; break;
+		case AccessViolationType::Execute: access = "execute"; break;
+		default: break;
+	}
+
+	const auto module_base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	printf("\nUnhandled host fault: code=0x%08" PRIx32 " %s at 0x%016" PRIx64 "\n",
+	       info.native_code, access, info.access_violation_vaddr);
+	printf("\t rip = 0x%016" PRIx64 " (kyty_emulator.exe base 0x%016" PRIx64 ")\n",
+	       info.exception_address, module_base);
+	printf("\t rsp = 0x%016" PRIx64 ", rbp = 0x%016" PRIx64 "\n", info.rsp, info.rbp);
+	printf("\t thread = %" PRIu32 "\n", static_cast<uint32_t>(GetCurrentThreadId()));
+
+	printf("\t rax=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 " rbx=%016" PRIx64 "\n",
+	       info.rax, info.rcx, info.rdx, info.rbx);
+	printf("\t rsi=%016" PRIx64 " rdi=%016" PRIx64 " r8 =%016" PRIx64 " r9 =%016" PRIx64 "\n",
+	       info.rsi, info.rdi, info.r8, info.r9);
+	printf("\t r10=%016" PRIx64 " r11=%016" PRIx64 " r12=%016" PRIx64 " r13=%016" PRIx64 "\n",
+	       info.r10, info.r11, info.r12, info.r13);
+	printf("\t r14=%016" PRIx64 " r15=%016" PRIx64 "\n", info.r14, info.r15);
+
+	// Everything below rsp has already been overwritten by the exception frame this very fault
+	// pushed, so it cannot say who clobbered the red zone. What is still original is the memory
+	// *above* rsp: the callee-saved registers this frame pushed and the caller frames. If a guest
+	// stack was recycled and zero-filled under the running thread, those read back as zeroes while
+	// the live registers do not; if only the red zone was hit, they are intact.
+	constexpr int64_t DumpBelow = 0xc0;
+	constexpr int64_t DumpAbove = 0x200;
+	MEMORY_BASIC_INFORMATION region {};
+	const auto  low  = reinterpret_cast<const uint8_t*>(info.rsp - DumpBelow);
+	const auto  high = reinterpret_cast<const uint8_t*>(info.rsp + DumpAbove);
+	const bool  readable =
+	    VirtualQuery(low, &region, sizeof(region)) == sizeof(region) &&
+	    region.State == MEM_COMMIT &&
+	    high <= static_cast<const uint8_t*>(region.BaseAddress) + region.RegionSize;
+	printf("\t stack window [rsp-0x%" PRIx64 " .. rsp+0x%" PRIx64 ") readable=%d\n",
+	       static_cast<uint64_t>(DumpBelow), static_cast<uint64_t>(DumpAbove),
+	       static_cast<int>(readable));
+	if (readable) {
+		for (int64_t offset = -DumpBelow; offset < DumpAbove; offset += 32) {
+			uint64_t words[4] {};
+			memcpy(words, reinterpret_cast<const void*>(info.rsp + offset), sizeof(words));
+			printf("\t rsp%c0x%03" PRIx64 ": %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+			       " %016" PRIx64 "\n",
+			       offset < 0 ? '-' : '+', static_cast<uint64_t>(offset < 0 ? -offset : offset),
+			       words[0], words[1], words[2], words[3]);
+		}
+		uint64_t saved[8] {};
+		memcpy(saved, reinterpret_cast<const void*>(info.rsp), sizeof(saved));
+		int zero_words = 0;
+		for (const uint64_t word: saved) {
+			zero_words += static_cast<int>(word == 0);
+		}
+		printf("\t saved-frame words above rsp zero=%d of 8 (a zero-filled guest stack shows 8)\n",
+		       zero_words);
+	}
+
+	void* frames[32] {};
+	const auto count = CaptureStackBackTrace(0, 32, frames, nullptr);
+	for (USHORT i = 0; i < count; i++) {
+		printf("\t [%02d] 0x%016" PRIx64 "\n", i, reinterpret_cast<uint64_t>(frames[i]));
+	}
+	DumpExceptionRing();
+	fflush(stdout);
+}
+
+// Direct measurement of the hazard this patcher exists to remove, rather than of the rare crash it
+// eventually causes. Set KYTY_FAULT_WATCH=lo-hi (hex guest addresses) to have every fault taken
+// inside that range reported with the stack pointer it was taken at. An instruction the red zone
+// patcher covered faults with rsp already biased down by 128; an uncovered one faults at the
+// guest's own rsp, which is precisely when the kernel's exception frame lands on live data.
+static void ReportWatchedFault(uint64_t rip, uint64_t rsp) noexcept {
+	static const auto range = [] {
+		std::pair<uint64_t, uint64_t> value {1, 0};
+		if (const char* env = std::getenv("KYTY_FAULT_WATCH"); env != nullptr) {
+			char*      end = nullptr;
+			const auto lo  = std::strtoull(env, &end, 16);
+			if (end != env && *end == '-') {
+				const char* second = end + 1;
+				const auto  hi     = std::strtoull(second, &end, 16);
+				if (end != second) {
+					value = {lo, hi};
+				}
+			}
+		}
+		return value;
+	}();
+	if (rip < range.first || rip >= range.second) {
+		return;
+	}
+
+	static std::atomic_uint64_t seen {0};
+	const auto count = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 64 || count % 256 == 0) {
+		printf("FAULTWATCH n=%" PRIu64 " rip=0x%016" PRIx64 " rsp=0x%016" PRIx64 "\n", count, rip,
+		       rsp);
+		fflush(stdout);
+	}
+}
+
+// Every exception the process takes, per thread, in a small ring. Windows dispatches a fault by
+// building its exception frame on the faulting thread's own stack, below rsp, so a fault taken
+// while a System V guest frame holds live data in its 128-byte red zone destroys that data. The
+// ring makes the destroying fault visible after the fact: at the crash it names the instruction
+// and the stack pointer of the last faults this thread took.
+struct ExceptionRingEntry {
+	uint32_t serial = 0;
+	uint32_t code   = 0;
+	uint64_t rip    = 0;
+	uint64_t rsp    = 0;
+	uint64_t vaddr  = 0;
+};
+
+constexpr uint32_t                  EXCEPTION_RING_SIZE = 24;
+static thread_local ExceptionRingEntry g_exception_ring[EXCEPTION_RING_SIZE] {};
+static thread_local uint32_t           g_exception_ring_next = 0;
+static thread_local uint32_t           g_exception_serial    = 0;
+
+// Where the kernel put the frame it built for this fault, relative to the stack pointer the guest
+// was running on. Windows has no red zone, so the frame is free to start immediately below rsp;
+// System V guest code keeps live data in the 128 bytes below rsp. Reported once so a run can be
+// read without guessing.
+static void ReportFrameExtentOnce(PEXCEPTION_POINTERS exception, uint64_t rsp) noexcept {
+	static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+	if (reported.test_and_set(std::memory_order_relaxed)) {
+		return;
+	}
+	const auto record  = reinterpret_cast<uint64_t>(exception->ExceptionRecord);
+	const auto context = reinterpret_cast<uint64_t>(exception->ContextRecord);
+	const auto record_top  = record + sizeof(EXCEPTION_RECORD);
+	const auto context_top = context + sizeof(CONTEXT);
+	const auto top         = record_top > context_top ? record_top : context_top;
+	printf("FRAMEEXTENT rsp=0x%016" PRIx64 " record=0x%016" PRIx64 " context=0x%016" PRIx64
+	       " frame_top=0x%016" PRIx64 " bytes_of_red_zone_destroyed=%" PRId64 "\n",
+	       rsp, record, context, top, static_cast<int64_t>(rsp) - static_cast<int64_t>(top) >= 128
+	                                      ? 0
+	                                      : 128 - (static_cast<int64_t>(rsp) - static_cast<int64_t>(top)));
+	fflush(stdout);
+}
+
+static void RecordException(uint32_t code, uint64_t rip, uint64_t rsp, uint64_t vaddr) noexcept {
+	auto& entry  = g_exception_ring[g_exception_ring_next++ % EXCEPTION_RING_SIZE];
+	entry.serial = ++g_exception_serial;
+	entry.code   = code;
+	entry.rip    = rip;
+	entry.rsp    = rsp;
+	entry.vaddr  = vaddr;
+}
+
+static void DumpExceptionRing() noexcept {
+	printf("\t last faults on this thread (%" PRIu32 " total); a fault taken at the guest's own "
+	       "rsp destroys its red zone\n",
+	       g_exception_serial);
+	for (uint32_t i = 0; i < EXCEPTION_RING_SIZE; i++) {
+		const auto& entry = g_exception_ring[(g_exception_ring_next + i) % EXCEPTION_RING_SIZE];
+		if (entry.serial == 0) {
+			continue;
+		}
+		printf("\t FAULT n=%" PRIu32 " code=0x%08" PRIx32 " rip=0x%016" PRIx64 " rsp=0x%016" PRIx64
+		       " at=0x%016" PRIx64 "\n",
+		       entry.serial, entry.code, entry.rip, entry.rsp, entry.vaddr);
+	}
+}
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
@@ -67,6 +251,13 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
+	ReportWatchedFault(reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
+	                   exception->ContextRecord->Rsp);
+	ReportFrameExtentOnce(exception, exception->ContextRecord->Rsp);
+	RecordException(exception_record->ExceptionCode,
+	                reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
+	                exception->ContextRecord->Rsp, info.access_violation_vaddr);
+
 	info.rax = exception->ContextRecord->Rax;
 	info.rbx = exception->ContextRecord->Rbx;
 	info.rcx = exception->ContextRecord->Rcx;
@@ -87,6 +278,12 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	// Breakpoints and single-steps also land here whenever a handler declines the
+	// event, and those are routine; only a genuine fault is worth reporting.
+	if (info.type == ExceptionType::AccessViolation ||
+	    info.type == ExceptionType::IllegalInstruction) {
+		ReportUnhandledFault(exception, info);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }

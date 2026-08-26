@@ -25,6 +25,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +77,68 @@ static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
 	::exit(code);
+}
+
+// Titles keep their own fatal-error text in static buffers that outlive the throwaway string the
+// error printer builds, so a post-mortem can still read them here. The addresses are title
+// specific, hence the environment variables: KYTY_ABORT_WIDE is a comma separated list of guest
+// addresses holding NUL terminated UTF-16 text (UE4's GErrorHist, for example), and
+// KYTY_ABORT_BYTE the same for single byte flags (GIsCriticalError, GIsGuarded).
+static void PrintAbortWideBuffer(const char* name, uint64_t addr) {
+	if (!Graphics::HostMemoryIsReadable(addr)) {
+		LOGF("\t %s @ 0x%016" PRIx64 " is unreadable\n", name, addr);
+		return;
+	}
+
+	constexpr size_t MAX_CHARS = 16384;
+
+	std::string text;
+	const auto* ptr = reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(addr));
+
+	for (size_t i = 0;
+	     i < MAX_CHARS && Graphics::HostMemoryIsReadable(addr + i * sizeof(uint16_t) + 1); i++) {
+		const auto c = ptr[i];
+		if (c == 0) {
+			break;
+		}
+		if (c == '\n') {
+			text += "\n\t   ";
+		} else if (c == '\r' || c == '\t') {
+			text += ' ';
+		} else if (c >= 0x20 && c < 0x7f) {
+			text += static_cast<char>(c);
+		} else {
+			text += fmt::format("\\u{:04x}", c);
+		}
+	}
+
+	LOGF("\t %s @ 0x%016" PRIx64 " = \"%s\"\n", name, addr, text.c_str());
+}
+
+static void PrintAbortEnvBuffers() {
+	if (const auto* wide = std::getenv("KYTY_ABORT_WIDE"); wide != nullptr) {
+		for (const auto& part: Common::Split(wide, ',')) {
+			const auto addr = std::strtoull(part.c_str(), nullptr, 0);
+			if (addr != 0) {
+				PrintAbortWideBuffer("KYTY_ABORT_WIDE", addr);
+			}
+		}
+	}
+
+	if (const auto* flags = std::getenv("KYTY_ABORT_BYTE"); flags != nullptr) {
+		for (const auto& part: Common::Split(flags, ',')) {
+			const auto addr = std::strtoull(part.c_str(), nullptr, 0);
+			if (addr == 0) {
+				continue;
+			}
+			if (!Graphics::HostMemoryIsReadable(addr)) {
+				LOGF("\t KYTY_ABORT_BYTE @ 0x%016" PRIx64 " is unreadable\n", addr);
+				continue;
+			}
+			LOGF("\t KYTY_ABORT_BYTE @ 0x%016" PRIx64 " = 0x%02" PRIx8 "\n", addr,
+			     *reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr)));
+		}
+	}
 }
 
 static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
@@ -250,6 +313,8 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 			PrintAbortPointerArrayCandidate(fmt::format("stack[{:02d}]", i).c_str(), value);
 		}
 	}
+
+	PrintAbortEnvBuffers();
 
 	EXIT("Guest abort()\n");
 	std::abort();

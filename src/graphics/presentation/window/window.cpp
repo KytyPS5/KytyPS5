@@ -40,6 +40,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -988,6 +989,18 @@ void WindowContext::UpdateTitle() {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+
+	// The title is the only live progress signal, and a headless or scripted run never sees it.
+	// KYTY_FLIP_LOG=<n> mirrors it to stdout every n flips so a run's progress is measurable from
+	// its log alone. Unset, this costs one comparison per flip.
+	static const uint64_t flip_log_interval = [] {
+		const char* env = std::getenv("KYTY_FLIP_LOG");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0;
+	}();
+	if (flip_log_interval != 0 && frame_num % flip_log_interval == 0) {
+		printf("FLIP frame=%" PRIu64 " fps=%.2f\n", frame_num, current_fps);
+		fflush(stdout);
+	}
 
 #if defined(__APPLE__)
 	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.

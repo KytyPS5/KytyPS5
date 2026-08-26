@@ -179,7 +179,16 @@ void Translator::S_BARRIER() {
 	ir.Emit(IR::ValueOpcode::Barrier);
 }
 
-void Translator::S_SENDMSG() {
+void Translator::S_SENDMSG(const Decoder::Instruction& inst) {
+	// Only the allocation request reaches the mesh output; the other messages address hardware
+	// the mesh stage does not have, so emitting them would export a primitive that is not there.
+	constexpr uint32_t GsAllocReq = 9;
+	const auto&        message    = inst.src0;
+	const bool         immediate  = message.kind == Decoder::OperandKind::LiteralConstant ||
+	                        message.kind == Decoder::OperandKind::IntegerInlineConstant;
+	if (immediate && (message.value & 0xfu) != GsAllocReq) {
+		return;
+	}
 	ir.Emit(IR::ValueOpcode::Sendmsg, {ir.GetM0()});
 }
 

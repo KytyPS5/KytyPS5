@@ -224,7 +224,7 @@ private:
 	void EmitControlNop();
 	void EmitWaitcnt();
 	void S_BARRIER();
-	void S_SENDMSG();
+	void S_SENDMSG(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();
 	void S_INST_PREFETCH();
 	bool S_GETPC_B64(const Decoder::Instruction& inst, std::string* error);

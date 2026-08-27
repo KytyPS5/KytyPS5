@@ -2969,6 +2969,21 @@ int KYTY_SYSV_ABI KernelAioSubmitWriteCommands(KernelAioRwRequest* req, int32_t 
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelAioPollRequest(int32_t id, int32_t* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	if (!kernel_aio_is_valid_id(id)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	*state = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec) {
 	PRINT_NAME();
 
@@ -3337,6 +3352,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("lLMT9vJAck0", LibKernel::clock_gettime);
 	LIB_FUNC("5TgME6AYty4", KernelAioDeleteRequest);
 	LIB_FUNC("HgX7+AORI58", KernelAioSubmitReadCommands);
+	LIB_FUNC("2pOuoWoCxdk", KernelAioPollRequest);
 	LIB_FUNC("KOF-oJbQVvc", KernelAioWaitRequest);
 	LIB_FUNC("XQ8C8y+de+E", KernelAioSubmitWriteCommands);
 	LIB_FUNC("nu4a0-arQis", KernelAioInitializeParam);

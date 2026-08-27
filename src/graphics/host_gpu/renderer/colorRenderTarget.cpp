@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 
 namespace Libs::Graphics {
@@ -143,12 +144,23 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	uint32_t   pitch  = 0;
 	uint64_t   size   = 0;
 	bool       tile   = false;
-	const bool volume = rt.attrib3.dimension == 2;
-	if (rt.attrib3.dimension != 1 && !volume) {
+	static constexpr std::array image_types {Prospero::ImageType::kColor1D,
+	                                         Prospero::ImageType::kColor2D,
+	                                         Prospero::ImageType::kColor3D};
+	if (rt.attrib3.dimension >= image_types.size()) {
 		EXIT("unsupported render-target dimension: %u\n", rt.attrib3.dimension);
 	}
+	const auto image_type = image_types[rt.attrib3.dimension];
+	const bool is_1d      = image_type == Prospero::ImageType::kColor1D;
+	const bool volume     = image_type == Prospero::ImageType::kColor3D;
+	if (is_1d && rt.attrib2.height != 0) {
+		EXIT("1D render target has nonzero height: %u\n", rt.attrib2.height);
+	}
 	if (!volume && rt.attrib3.depth != 0) {
-		EXIT("2D render target has nonzero depth: %u\n", rt.attrib3.depth);
+		EXIT("non-3D render target has nonzero depth: %u\n", rt.attrib3.depth);
+	}
+	if (is_1d && samples != 1) {
+		EXIT("multisampled 1D render targets are unsupported\n");
 	}
 	if (volume && samples != 1) {
 		EXIT("multisampled 3D render targets are unsupported\n");
@@ -325,7 +337,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = transfer_format;
-	desc.info.type         = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+	desc.info.type         = image_type;
 	desc.info.extent       = {width, height, depth};
 	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
 	desc.info.pitch        = pitch;
@@ -364,8 +376,13 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		};
 	}
 	desc.view_info.format = target_format.format;
-	desc.view_info.type =
-	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	if (is_1d) {
+		desc.view_info.type =
+		    view.layer_count == 1 ? vk::ImageViewType::e1D : vk::ImageViewType::e1DArray;
+	} else {
+		desc.view_info.type =
+		    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	}
 	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.base_level  = rt.view.current_mip_level;
 	desc.view_info.level_count = 1;

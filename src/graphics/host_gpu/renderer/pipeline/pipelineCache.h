@@ -20,7 +20,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
-class RenderCommandBuffer;
+class CommandBuffer;
 
 namespace HW {
 class Context;
@@ -121,7 +121,7 @@ public:
 
 	GraphicsPipeline&
 	CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
-	                       ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
+	                       ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                       bool primitive_restart_enable, bool ps_active,
 	                       std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv);

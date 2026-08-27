@@ -346,7 +346,7 @@ void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }
 
-RenderCommandBuffer& CommandScheduler::Current() {
+CommandBuffer& CommandScheduler::Current() {
 	CheckActive();
 	return m_command;
 }

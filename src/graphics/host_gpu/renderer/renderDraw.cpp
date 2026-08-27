@@ -103,7 +103,7 @@ static bool IsDualSourceBlendFactor(uint32_t factor) {
 }
 
 static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color,
-                               const RenderDepthInfo& depth, const RenderCommandBuffer& buffer,
+                               const RenderDepthInfo& depth, const CommandBuffer& buffer,
                                uint32_t index_count, uint32_t flags) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
@@ -126,7 +126,7 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
 }
 
-static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer,
+static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
                         const ShaderPixelInputInfo& ps_input_info) {
 	const auto& ctx            = buffer.GetRegisters();
 	const auto& sh_regs        = ctx.GetShaderRegisters();
@@ -177,7 +177,7 @@ static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer
 }
 
 static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& color,
-                               const RenderDepthInfo& depth, const RenderCommandBuffer& buffer,
+                               const RenderDepthInfo& depth, const CommandBuffer& buffer,
                                const ShaderPixelInputInfo& ps_input_info, uint32_t index_count,
                                uint32_t flags) {
 	const auto& ctx  = buffer.GetRegisters();
@@ -231,7 +231,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	LogMrtState(draw_name, buffer, ps_input_info);
 }
 
-static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderColorInfo& color,
+static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo& color,
                               const ShaderVertexInputInfo& vs_input_info,
                               uint32_t index_type_and_size, uint32_t index_count,
                               const void* index_addr) {
@@ -309,7 +309,7 @@ static void LogDrawInputState(const RenderCommandBuffer& buffer, const RenderCol
 	}
 }
 
-static void SetGraphicsDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const RenderColorInfo* colors, uint32_t color_count,
                                      const RenderDepthInfo& depth) {
 	KYTY_PROFILER_FUNCTION();
@@ -421,7 +421,7 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_execute_on_noop;
 }
 
-static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
+static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	const auto& ctx         = buffer.GetRegisters();
 	const auto& ucfg        = buffer.GetUserConfig();
 	const auto& sh_ctx      = buffer.GetShaders();
@@ -706,7 +706,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	return state;
 }
 
-static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer) {
+static bool DrawHasActivePixelShader(const CommandBuffer& buffer) {
 	const auto& ctx              = buffer.GetRegisters();
 	const auto& sh_regs          = ctx.GetShaderRegisters();
 	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
@@ -723,7 +723,7 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const RenderCommandBuffer& buffer) {
+static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
 	// These special modes run color-buffer metadata or decompression operations. The shader is a
@@ -779,7 +779,7 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
-static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         buffer,
+static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
@@ -869,8 +869,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(RenderCommandBuffer&         b
 	return prepared;
 }
 
-static void SetDrawDebugPhase(RenderCommandBuffer& buffer, uint64_t submit_id,
-                              const DrawCallInfo& draw, uint32_t phase) {
+static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
+                              uint32_t phase) {
 	EXIT_IF(draw.name == nullptr);
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count,
@@ -918,8 +918,8 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 	return true;
 }
 
-static bool ResolvePrimitiveRestart(const RenderCommandBuffer& buffer,
-                                    vk::PrimitiveTopology topology, uint32_t index_type_and_size) {
+static bool ResolvePrimitiveRestart(const CommandBuffer& buffer, vk::PrimitiveTopology topology,
+                                    uint32_t index_type_and_size) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
 	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
 	if ((control & 0x1u) == 0) {
@@ -953,7 +953,7 @@ static bool ResolvePrimitiveRestart(const RenderCommandBuffer& buffer,
 	return true;
 }
 
-bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuffer& buffer,
+bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
                                             const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
                                             bool log_setup_phases, DrawRenderState& state) {
@@ -993,7 +993,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	return true;
 }
 
-static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
+static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	EXIT_IF(draw.name == nullptr);
 	auto& ctx    = buffer.GetRegisters();
@@ -1031,7 +1031,7 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	}
 }
 
-static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, RenderCommandBuffer& buffer,
+static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
                                                   const DrawCallInfo&          draw,
                                                   const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(draw.name == nullptr);
@@ -1041,7 +1041,7 @@ static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, RenderComm
 	return AcquireVertexBuffers(buffer, vs_input_info);
 }
 
-static PreparedIndexBuffer PrepareIndexBuffer(RenderCommandBuffer&         buffer,
+static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
 	PreparedIndexBuffer prepared;
 	if (!source.enabled) {
@@ -1091,7 +1091,7 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
-static void LogDrawStateIfNeeded(const RenderCommandBuffer& buffer, const DrawCallInfo& draw,
+static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
                                  const DrawRenderState& state, bool always_log,
                                  bool force_legacy_rect_log, uint32_t index_type_and_size,
                                  const void* index_addr) {
@@ -1159,7 +1159,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
-void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer& buffer,
+void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
@@ -1243,7 +1243,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	}
 }
 
-void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
+void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                uint32_t index_type_and_size, uint32_t index_count,
                                const void* index_addr, uint32_t flags, uint32_t type,
                                uint32_t instance_count, uint32_t render_target_slice_offset,
@@ -1376,7 +1376,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t index_count,
+void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count,
                               uint32_t flags, uint32_t render_target_slice_offset,
                               uint32_t instance_count, uint32_t first_vertex,
                               uint32_t first_instance) {
@@ -1475,7 +1475,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	ResetBindings();
 }
 
-bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, RenderCommandBuffer& buffer,
+bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,
                                          uint32_t render_target_slice_offset) {
 	const auto& hw = buffer.GetRegisters();
 	if (hw.GetColorControl().mode != 3) {

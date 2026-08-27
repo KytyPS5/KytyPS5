@@ -459,14 +459,14 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
                                        uint64_t submit_id,
-                                       RenderCommandBuffer &buffer,
+                                       CommandBuffer &buffer,
                                        RenderDepthInfo &depth) {
     executor.ResolveRenderDepthTarget(submit_id, buffer, depth);
   }
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        uint64_t submit_id,
-                                       RenderCommandBuffer &buffer,
+                                       CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
     executor.ResolveRenderColorTarget(submit_id, buffer, color, 0, slot);
   }

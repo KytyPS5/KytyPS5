@@ -70,8 +70,8 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
 }
 
-[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const RenderCommandBuffer& buffer,
-                                                                 const DepthFormatPolicy&   policy,
+[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
+                                                                 const DepthFormatPolicy& policy,
                                                                  bool     has_stencil,
                                                                  uint32_t samples) {
 	auto&      graphics         = buffer.GetGraphics();
@@ -97,7 +97,7 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
                                               RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
 	(void)submit_id;

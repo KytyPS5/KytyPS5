@@ -11,8 +11,6 @@
 
 namespace Libs::Graphics {
 
-class RenderCommandBuffer;
-
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
                                                                   bool htile_stencil_disabled) {
 	return htile_stencil_disabled || (has_stencil && has_htile);

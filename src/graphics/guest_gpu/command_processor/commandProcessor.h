@@ -153,10 +153,10 @@ private:
 	                          uint32_t render_target_slice_offset, uint32_t first_vertex,
 	                          uint32_t first_instance);
 
-	CommandScheduler&    GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	RenderCommandBuffer& CurrentBuffer() { return GetScheduler().Current(); }
-	void                 CheckBuffer() const { GetScheduler().CheckActive(); }
-	GpuResourceManager&  GetGpuResources() const { return m_renderer.GetGpuResources(); }
+	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	void                CheckBuffer() const { GetScheduler().CheckActive(); }
+	GpuResourceManager& GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;

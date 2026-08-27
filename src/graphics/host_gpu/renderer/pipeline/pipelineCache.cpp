@@ -53,12 +53,13 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
-    RenderColorInfo* colors, uint32_t color_count, RenderDepthInfo& depth,
-    ShaderVertexInputInfo& vs_input_info, RenderCommandBuffer& command,
-    ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, bool ps_active, std::span<const uint32_t> vs_spirv,
-    std::span<const uint32_t> ps_spirv) {
+PipelineCache::GraphicsPipeline&
+PipelineCache::CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count,
+                                      RenderDepthInfo& depth, ShaderVertexInputInfo& vs_input_info,
+                                      CommandBuffer& command, ShaderPixelInputInfo* ps_input_info,
+                                      vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                      bool ps_active, std::span<const uint32_t> vs_spirv,
+                                      std::span<const uint32_t> ps_spirv) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors == nullptr);

@@ -44,7 +44,7 @@ public:
 
 	[[nodiscard]] bool             Active() const noexcept { return m_registers != nullptr; }
 	void                           CheckActive() const;
-	RenderCommandBuffer&           Current();
+	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
@@ -90,7 +90,7 @@ private:
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
-	RenderCommandBuffer          m_command;
+	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

@@ -43,7 +43,7 @@ static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool h
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
                                               RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
                                               uint32_t render_target_slot, bool ignore_target_mask,

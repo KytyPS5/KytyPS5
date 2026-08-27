@@ -10,8 +10,6 @@
 
 namespace Libs::Graphics {
 
-class RenderCommandBuffer;
-
 enum class RenderColorType {
 	NoColorOutput,
 	RenderTexture,

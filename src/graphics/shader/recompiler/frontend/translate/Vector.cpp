@@ -124,6 +124,9 @@ bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error
 		case O::V_CMP_GT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThan32, false, false);
 			return true;
+		case O::V_CMPX_GT_U16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThan32, false, true);
+			return true;
 		case O::V_CMP_GE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThanEqual32, false, false);
 			return true;

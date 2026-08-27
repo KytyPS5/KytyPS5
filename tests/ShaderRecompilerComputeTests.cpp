@@ -15746,6 +15746,32 @@ TestCase VectorVopcSdwaCmpxWritesExecMask() {
           {O::V_MOV_B32, O::V_CMPX_LT_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorVopcCmpxGtU16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 2, 0x00008000u);
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovU32(&code, 31, 0);
+  code.insert(code.end(), {0x7d7900f9u, 0x86060002u});
+  AppendBufferStoreDword(&code, 3, 31);
+  AppendVMovU32(&code, 2, 0x00010000u);
+  AppendVMovU32(&code, 3, 9);
+  AppendVMovU32(&code, 31, 4);
+  code.insert(code.end(), {0x7d7900f9u, 0x86060002u});
+  AppendBufferStoreDword(&code, 3, 31);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCmpxGtU16CapturedSdwaExecMask",
+                code,
+                {0x11111111u, 0x22222222u},
+                {7, 0x22222222u},
+                {O::V_MOV_B32, O::V_CMPX_GT_U16, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMPX_GT_U16", 2}};
+  return test;
+}
+
 TestCase VectorCompareInvertedMaskSelect() {
   using O = ShaderOpcode;
 
@@ -20270,6 +20296,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3FloatCompareNegSourceModifier);
   AddCase(VectorVop3CmpxWritesExecMask);
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
+  AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);

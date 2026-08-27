@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -76,32 +77,91 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
-static bool ResolveConstantDwordStore(const ShaderRecompiler::IR::Program& program,
-                                      uint32_t&                            clear) {
+// Locate the single dword store of a fill shader and name the value it writes.
+//
+// A fast-clear shader either stores an immediate or loads the clear code from a small read-only
+// constant buffer. The latter is resolved out of guest memory: the guest has already written that
+// constant by the time it issues the dispatch, so reading it here yields the value the shader is
+// about to store. Constant reads are tolerated; anything else touching a buffer is not, so a
+// shader that computes its value per lane is still rejected.
+static bool ResolveConstantDwordStore(const ShaderComputeInputInfo& input, uint32_t fill_resource,
+                                      uint32_t& clear) {
+	using namespace ShaderRecompiler;
 	constexpr size_t StoreValueArg = 4;
-	bool             found         = false;
+	const auto&      program       = *input.stage.program;
+	const auto&      resources     = *input.stage.resources;
+	const auto       memory_of     = [&program](const IR::Inst& inst) -> const IR::MemoryInfo* {
+        const auto index = inst.template Flags<IR::MemoryFlags>().index;
+        if (index >= program.memory_info.size()) {
+            return nullptr;
+        }
+        return &program.memory_info[index];
+	};
+
+	const IR::Inst* store = nullptr;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			const auto op = inst.GetOpcode();
-			if (op != ShaderRecompiler::IR::ValueOpcode::StoreBufferU32) {
-				if (ShaderRecompiler::IR::BufferAccessOf(op) !=
-				    ShaderRecompiler::IR::BufferAccess::None) {
-					return false; // some other buffer traffic: not a plain fill
-				}
+			const auto op     = inst.GetOpcode();
+			const auto access = IR::BufferAccessOf(op);
+			if (access == IR::BufferAccess::None) {
 				continue;
 			}
-			if (found || inst.NumArgs() <= StoreValueArg) {
-				return false; // more than one store, or an unexpected shape
+			if (access == IR::BufferAccess::Read) {
+				continue; // reading a constant is how the clear code reaches the shader
 			}
-			const auto value = inst.Arg(StoreValueArg);
-			if (!value.IsImmediate()) {
-				return false; // the fill value is computed, not a constant we can name
+			if (op != IR::ValueOpcode::StoreBufferU32 || store != nullptr) {
+				return false;
 			}
-			clear = value.U32();
-			found = true;
+			store = &inst;
 		}
 	}
-	return found;
+	if (store == nullptr || store->NumArgs() <= StoreValueArg) {
+		return false;
+	}
+	const auto* store_memory = memory_of(*store);
+	if (store_memory == nullptr || store_memory->kind != IR::ResourceKind::Buffer ||
+	    store_memory->resource != fill_resource) {
+		return false;
+	}
+
+	const auto value = store->Arg(StoreValueArg);
+	if (value.IsImmediate()) {
+		clear = value.U32();
+		return true;
+	}
+
+	const auto* source = value.ResolveInstruction();
+	if (source == nullptr) {
+		return false;
+	}
+	if (source->GetOpcode() != IR::ValueOpcode::ReadConstBuffer || source->NumArgs() < 2 ||
+	    !source->Arg(1).IsImmediate()) {
+		return false;
+	}
+	const auto* source_memory = memory_of(*source);
+	// A constant load carries ResourceKind::ScalarBuffer; only a vector access is ::Buffer.
+	if (source_memory == nullptr ||
+	    (source_memory->kind != IR::ResourceKind::Buffer &&
+	     source_memory->kind != IR::ResourceKind::ScalarBuffer) ||
+	    source_memory->resource >= program.info.buffers.size() ||
+	    source_memory->resource >= resources.buffers.size() ||
+	    source_memory->resource == fill_resource ||
+	    program.info.buffers[source_memory->resource].written) {
+		return false;
+	}
+	const auto descriptor =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[source_memory->resource]);
+	const uint64_t offset = static_cast<uint64_t>(source_memory->offset) + source->Arg(1).U32();
+	if (offset > BufferDescriptorSize(descriptor) - sizeof(uint32_t)) {
+		return false;
+	}
+	uint32_t loaded = 0;
+	if (!Libs::LibKernel::Memory::TryReadBacking(descriptor.Base48() + offset, &loaded,
+	                                             sizeof(loaded))) {
+		return false;
+	}
+	clear = loaded;
+	return true;
 }
 
 bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
@@ -110,13 +170,31 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
                               uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
-	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	if (resources.buffers.size() != program.info.buffers.size() || program.info.buffers.empty() ||
 	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
 	    !resources.images.empty() || !resources.samplers.empty()) {
 		return false;
 	}
-	const auto& resource   = program.info.buffers.front();
-	const auto& raw        = resources.buffers.front();
+	// Exactly one buffer is filled. A fast-clear shader may additionally bind small read-only
+	// constant buffers that hold the clear code, so tolerate those and nothing else: any second
+	// written buffer, atomic, or formatted read means this is real compute work, not a fill.
+	uint32_t fill_index = UINT32_MAX;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& candidate = program.info.buffers[i];
+		if (candidate.written) {
+			if (fill_index != UINT32_MAX) {
+				return false;
+			}
+			fill_index = i;
+		} else if (candidate.atomic || candidate.formatted || !candidate.scalar) {
+			return false;
+		}
+	}
+	if (fill_index == UINT32_MAX) {
+		return false;
+	}
+	const auto& resource   = program.info.buffers[fill_index];
+	const auto& raw        = resources.buffers[fill_index];
 	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
 	const bool quad_fill = resource.max_byte_extent == 16 && descriptor.Stride() == 16 &&
 	                       descriptor.Format() == Prospero::BufferFormat::k32_32_32_32UInt;
@@ -129,14 +207,26 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	    program.user_data_base != 0 || resources.user_data.size() < raw.dword_count) {
 		return false;
 	}
-	for (uint32_t i = 0; i < raw.dword_count; i++) {
-		if (raw.dwords[i] != resources.user_data[i]) {
-			return false;
+	// The descriptor must have reached the shader verbatim through user data, so that the address
+	// we are about to clear is the one the guest named. Which slot it occupies depends on how the
+	// shader lays its resources out, so find it rather than assuming a fixed position.
+	bool descriptor_from_user_data = false;
+	for (size_t base = 0;
+	     !descriptor_from_user_data && base + raw.dword_count <= resources.user_data.size();
+	     base += 4) {
+		bool match = true;
+		for (uint32_t i = 0; i < raw.dword_count && match; i++) {
+			match = raw.dwords[i] == resources.user_data[base + i];
 		}
+		descriptor_from_user_data = match;
+	}
+	if (!descriptor_from_user_data) {
+		return false;
 	}
 	uint32_t clear = 0;
 	if (quad_fill) {
-		if (resources.user_data.size() != 8) {
+		// The quad shape carries its clear value inline, immediately after the sole descriptor.
+		if (program.info.buffers.size() != 1 || resources.user_data.size() != 8) {
 			return false;
 		}
 		clear = resources.user_data[4];
@@ -144,7 +234,7 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 		    resources.user_data[7] != clear) {
 			return false;
 		}
-	} else if (!ResolveConstantDwordStore(program, clear)) {
+	} else if (!ResolveConstantDwordStore(input, fill_index, clear)) {
 		return false;
 	}
 	// group_x is a thread count for the quad shape and a group count for the dword one.

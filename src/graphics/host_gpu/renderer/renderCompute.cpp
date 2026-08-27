@@ -82,8 +82,8 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	const auto& resources = *input.stage.resources;
 	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() ||
-	    !program.info.addresses.empty() || !resources.images.empty() ||
-	    !resources.samplers.empty() || !resources.addresses.empty()) {
+	    program.info.uses_dma || !resources.images.empty() ||
+	    !resources.samplers.empty()) {
 		return false;
 	}
 	const auto& resource   = program.info.buffers.front();
@@ -337,6 +337,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
+	if (program.info.uses_dma) {
+		m_context.GetGpuResources().PrepareBda();
+	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);
 

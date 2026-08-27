@@ -5,15 +5,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-constexpr uint64_t FlatAddressWindowSize = 0x10000;
-
 struct ResourceSnapshot {
-	struct Address {
-		uint64_t guest_base   = 0;
-		uint64_t binding_base = 0;
-
-		bool operator==(const Address& other) const = default;
-	};
 	struct IndirectImage {
 		uint32_t                     resource = 0;
 		uint32_t                     capacity = 0;
@@ -25,7 +17,6 @@ struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
-	std::vector<Address>         addresses;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<IndirectImage>   indirect_images;

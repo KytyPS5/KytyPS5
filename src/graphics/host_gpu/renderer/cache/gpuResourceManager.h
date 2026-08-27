@@ -30,6 +30,7 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               PrepareBda();
 	void               RunGarbageCollector();
 
 private:
@@ -40,6 +41,7 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	GuestGpu*                 m_gpu = nullptr;
+	bool                      m_fault_process_pending = false;
 };
 
 } // namespace Libs::Graphics

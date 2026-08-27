@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -26,7 +27,11 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	static constexpr uint64_t CACHING_PAGE_SIZE = 16ull * 1024ull;
+	static constexpr uint32_t CACHING_PAGEBITS  = 14;
+	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
+	static constexpr uint64_t BDA_PAGETABLE_SIZE =
+	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -51,6 +56,8 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -60,14 +67,16 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	void               ProcessFaultBuffer();
+	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
 
 	struct DownloadCopy;
-	using PageTable = MultiLevelPageTable<BufferId, 14, 40, 16>;
-	static_assert(CACHING_PAGE_SIZE == (uint64_t {1} << PageTable::kPageBits));
+	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
+	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
 	[[nodiscard]] static constexpr uint64_t AlignDownload(uint64_t size) noexcept {
 		return (size + DOWNLOAD_ALIGNMENT - 1) & ~(DOWNLOAD_ALIGNMENT - 1);
@@ -78,6 +87,8 @@ private:
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
+	template <bool insert>
+	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
@@ -90,7 +101,9 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
+	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	std::map<uint64_t, BufferId>                      m_buffers;

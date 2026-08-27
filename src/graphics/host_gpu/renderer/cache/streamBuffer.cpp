@@ -73,8 +73,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 	buffer_info.sharingMode = vk::SharingMode::eExclusive;
 
+	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	const VmaAllocationCreateFlags bda_flag =
+	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags =
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -99,6 +103,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	m_buffer->memory.type            = allocation_result.memoryType;
 	m_buffer->memory.unique_id       = VulkanNextMemoryUniqueId();
 	graphics.device.getBufferMemoryRequirements(m_buffer->buffer, &m_buffer->memory.requirements);
+	if (static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.sType  = vk::StructureType::eBufferDeviceAddressInfo;
+		address_info.buffer = m_buffer->buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+	}
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_buffer->memory.allocation, &properties);
@@ -122,6 +133,11 @@ vk::Buffer Buffer::Handle() const noexcept {
 	return m_buffer->buffer;
 }
 
+vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
+	EXIT_IF(m_device_address == 0);
+	return m_device_address;
+}
+
 bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
 	return address >= m_cpu_address && size <= m_size && address - m_cpu_address <= m_size - size;
 }
@@ -137,6 +153,15 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	if (!m_is_coherent && size != 0) {
 		const auto result =
 		    vmaFlushAllocation(m_graphics->allocator, m_buffer->memory.allocation, offset, size);
+		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
+	}
+}
+
+void Buffer::Invalidate(uint64_t offset, uint64_t size) {
+	EXIT_IF(m_usage != MemoryUsage::Download || offset > m_size || size > m_size - offset);
+	if (!m_is_coherent && size != 0) {
+		const auto result =
+		    vmaInvalidateAllocation(m_graphics->allocator, m_buffer->memory.allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -308,16 +333,6 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
-}
-
-void StreamBuffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(Usage() != MemoryUsage::Download || offset > Size() || size > Size() - offset);
-	if (IsCoherent() || size == 0) {
-		return;
-	}
-	const auto result = vmaInvalidateAllocation(Graphics().allocator,
-	                                            NativeBuffer().memory.allocation, offset, size);
-	EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

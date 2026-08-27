@@ -994,10 +994,10 @@ static void LogShaderProgramCacheHit(const char* stage, uint64_t shader_hash, ui
 
 static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Program& program) {
 	std::string ret = fmt::format(
-	    "push={} groups={} user={} buffers={} images={} samplers={} addresses={} srt={}",
+	    "push={} groups={} user={} buffers={} images={} samplers={} dma={} srt={}",
 	    program.bindings.push_constant_size, program.bindings.descriptors.size(),
 	    program.bindings.user_data_registers.size(), program.info.buffers.size(),
-	    program.info.images.size(), program.info.samplers.size(), program.info.addresses.size(),
+	    program.info.images.size(), program.info.samplers.size(), program.info.uses_dma,
 	    program.srt_reads.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& buffer = program.info.buffers[i];
@@ -1013,9 +1013,6 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 		    static_cast<uint32_t>(image.mip_mode), image.mip_count,
 		    static_cast<uint32_t>(image.conversion_format), image.shader_swizzle,
 		    image.indirect_root, image.indirect_mapping_offset, image.indirect_mapping_capacity);
-	}
-	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
-		ret += fmt::format(" a{}[base=0x{:x}]", i, program.info.addresses[i].specialized_base);
 	}
 	return ret;
 }
@@ -1055,11 +1052,6 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 		ids.push_back(image.indirect_mapping_capacity);
 		ids.push_back(static_cast<uint32_t>(image.indirect_resources.size()));
 		ids.insert(ids.end(), image.indirect_resources.begin(), image.indirect_resources.end());
-	}
-	ids.push_back(static_cast<uint32_t>(program.info.addresses.size()));
-	for (const auto& address: program.info.addresses) {
-		ids.push_back(static_cast<uint32_t>(address.specialized_base));
-		ids.push_back(static_cast<uint32_t>(address.specialized_base >> 32u));
 	}
 }
 

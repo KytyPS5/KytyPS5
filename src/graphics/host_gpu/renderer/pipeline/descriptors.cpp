@@ -216,48 +216,6 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	return result;
 }
 
-static BufferView
-NativeAddressBuffer(RenderContext& context, const ShaderRecompiler::IR::AddressResource& resource,
-                    const ShaderRecompiler::IR::ResourceSnapshot::Address& address,
-                    ShaderType stage, uint32_t slot, uint32_t& address_offset, BufferId id) {
-	BufferView result;
-	address_offset = 0;
-	if (address.binding_base == 0) {
-		BindNullStorageBuffer(context, result);
-		return result;
-	}
-	if (resource.written) {
-		EXIT("writable address resources are unsupported\n");
-	}
-	const auto limit =
-	    resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
-	        ? ShaderRecompiler::IR::FlatAddressWindowSize
-	        : static_cast<uint64_t>(
-	              context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
-	uint64_t   size   = 0;
-	const auto access = HostMemoryAccess::Mapped;
-	if (!HostMemoryQueryRange(address.binding_base, limit, access, size)) {
-		EXIT("address resource is not host-accessible: base=0x%016" PRIx64 "\n",
-		     address.binding_base);
-	}
-	const auto& graphics  = context.GetGraphics();
-	const auto  alignment = graphics.StorageMinAlignment();
-	auto [buffer, offset] =
-	    context.GetBufferCache().ObtainBuffer(address.binding_base, size, false, false, id);
-	const auto aligned_offset = offset - offset % alignment;
-	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	const auto visible_size   = std::min(size, static_cast<uint64_t>(max_range - adjustment));
-	address_offset            = static_cast<uint32_t>(adjustment);
-	result.buffer             = buffer->Handle();
-	result.offset             = aligned_offset;
-	result.range              = static_cast<vk::DeviceSize>(visible_size + adjustment);
-	SetVulkanObjectNameF(graphics.device, result.buffer,
-	                     "Kyty.{}.AddressBuffer[slot={} guest=0x{:016x} size=0x{:x}]",
-	                     ShaderStageResourceName(stage), slot, address.binding_base, visible_size);
-	return result;
-}
-
 static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageResource& resource) {
 	bool supported_dimension = false;
 	switch (resource.dimension) {
@@ -1000,25 +958,6 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		prepared.buffer_ids.push_back(cache.FindBuffer(address, size));
 	}
 
-	prepared.address_ids.clear();
-	prepared.address_ids.reserve(program.info.addresses.size());
-	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
-		const auto& resource = program.info.addresses[i];
-		const auto& address  = snapshot.addresses[i];
-		if (address.binding_base == 0) {
-			prepared.address_ids.emplace_back();
-			continue;
-		}
-		EXIT_IF(resource.written);
-		const auto limit = resource.kind == ShaderRecompiler::IR::ResourceKind::Flat
-		                       ? ShaderRecompiler::IR::FlatAddressWindowSize
-		                       : static_cast<uint64_t>(m_context.GetGraphics()
-		                                                   .GetPhysicalDeviceProperties()
-		                                                   .limits.maxStorageBufferRange);
-		uint64_t   size  = 0;
-		EXIT_IF(!HostMemoryQueryRange(address.binding_base, limit, HostMemoryAccess::Mapped, size));
-		prepared.address_ids.push_back(cache.FindBuffer(address.binding_base, size));
-	}
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -1028,8 +967,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_ids.size() != program.info.buffers.size() ||
-	        prepared.address_ids.size() != program.info.addresses.size());
+	EXIT_IF(prepared.buffer_ids.size() != program.info.buffers.size());
 
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
@@ -1048,15 +986,6 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                                program.info.buffers[i], program.stage, i,
 		                                                buffer_offset, prepared.buffer_ids[i]));
 		pack_memory_offset(i, buffer_offset);
-	}
-	resources.addresses.clear();
-	resources.addresses.reserve(program.info.addresses.size());
-	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
-		uint32_t address_offset = 0;
-		resources.addresses.push_back(NativeAddressBuffer(m_context, program.info.addresses[i],
-		                                                  snapshot.addresses[i], program.stage, i,
-		                                                  address_offset, prepared.address_ids[i]));
-		pack_memory_offset(static_cast<uint32_t>(program.info.buffers.size()) + i, address_offset);
 	}
 	if (!prepared.flattened_srt.empty()) {
 		resources.flattened_srt = NativeUpload(m_context, prepared.flattened_srt);
@@ -1128,6 +1057,10 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		FindBuffers(*bindings.pixel);
+	}
+	if (bindings.vertex.program->info.uses_dma ||
+	    (bindings.pixel && bindings.pixel->program->info.uses_dma)) {
+		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
@@ -1241,13 +1174,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
 					}
 					break;
-				case BindingKind::AddressMemory:
-					for (const auto resource: binding.resources) {
-						const auto& view = descriptors.addresses.at(resource);
-						EXIT_IF(view.buffer == nullptr);
-						m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
-					}
+				case BindingKind::BdaPagetable:
+				case BindingKind::FaultBuffer: {
+					auto& cache = m_context.GetBufferCache();
+					const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
+					                             ? cache.GetBdaPageTableBuffer()
+					                             : cache.GetFaultBuffer();
+					m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0, bda_buffer->Size());
 					break;
+				}
 				case BindingKind::FlattenedSrt:
 				case BindingKind::UserData:
 				case BindingKind::Gds: {

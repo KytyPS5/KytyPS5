@@ -4319,14 +4319,14 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
         error.c_str());
   const auto *address_binding = ShaderRecompiler::IR::FindBinding(
       raw.program.bindings,
-      ShaderRecompiler::IR::DescriptorBindingKind::AddressMemory);
-  Check(raw.program.info.addresses.size() == 1u &&
-            raw.program.info.addresses[0].kind ==
-                ShaderRecompiler::IR::ResourceKind::ScalarAddress &&
-            raw.program.info.addresses[0].read &&
-            !raw.program.info.addresses[0].written &&
-            raw.program.info.buffers.empty() && address_binding != nullptr &&
-            address_binding->resources == std::vector<uint32_t>{0u} &&
+      ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable);
+  const auto *fault_binding = ShaderRecompiler::IR::FindBinding(
+      raw.program.bindings,
+      ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer);
+  Check(raw.program.info.uses_dma && raw.program.info.buffers.empty() &&
+            address_binding != nullptr && fault_binding != nullptr &&
+            address_binding->resources.empty() &&
+            fault_binding->resources.empty() &&
             ShaderRecompiler::IR::FindBinding(
                 raw.program.bindings,
                 ShaderRecompiler::IR::DescriptorBindingKind::Buffers) ==
@@ -4335,17 +4335,12 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
                 raw.program.bindings,
                 ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
                 nullptr &&
-            raw.program.bindings.memory_offset_count == 1u,
-        "raw scalar load did not use only the address-memory domain");
+            raw.program.bindings.memory_offset_count == 0u,
+        "raw scalar load did not use only the DMA domain");
   Check(count_live_memory_ops(
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 1u,
         "raw scalar load did not remain a live typed address operation");
-  Check(raw.resources.addresses.size() == 1u &&
-            raw.resources.addresses[0].guest_base == 0x1000u &&
-            raw.resources.addresses[0].binding_base == 0x1000u &&
-            raw.program.info.addresses[0].specialized_base == 0u,
-        "raw scalar address specialization was incorrect");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
   CheckSpirvBinaryValidates(raw.spirv);
@@ -4377,12 +4372,12 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
       ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   Check(buffer.program.info.buffers.size() == 1u &&
             buffer.program.info.buffers[0].scalar &&
-            buffer.program.info.addresses.empty() &&
+            !buffer.program.info.uses_dma &&
             buffer_binding != nullptr &&
             buffer_binding->resources == std::vector<uint32_t>{0u} &&
             ShaderRecompiler::IR::FindBinding(
                 buffer.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::AddressMemory) ==
+                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) ==
                 nullptr &&
             ShaderRecompiler::IR::FindBinding(
                 buffer.program.bindings,
@@ -6201,7 +6196,6 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -6224,23 +6218,32 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerUnbasedFlatRequiresTranslator() {
+void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
       EncodeFlat1(0, 0x7d, 0, 1),
-      EncodeFlat0(0x1c, 0, 0),
-      EncodeFlat1(0, 0x7d, 0, 2),
-      0xbf810000u,
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
 
   ShaderRecompiler::CompileResult result;
   std::string error;
-  Check(!ShaderRecompiler::TryRecompile(shader, options, result, &error) &&
-            Common::ContainsStr(error,
-                                "requires runtime guest-address translation"),
-        "unbased FLAT compiled without an explicit translator");
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(result.program.info.uses_dma &&
+            ShaderRecompiler::IR::FindBinding(
+                result.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) !=
+                nullptr &&
+            ShaderRecompiler::IR::FindBinding(
+                result.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer) !=
+                nullptr,
+        "unbased FLAT did not compile through BDA");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerFlatSignedLoadTranslation() {
@@ -6256,7 +6259,6 @@ void TestNewShaderRecompilerFlatSignedLoadTranslation() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -6311,7 +6313,6 @@ void TestNewShaderRecompilerFlatStoreTranslation() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -11966,49 +11967,40 @@ void TestNewShaderRecompilerUnsupportedMemoryDecode() {
                              "MTBUF", "opcode=0x08");
 }
 
-void TestNewShaderRecompilerFlatUserPointerProvenance() {
+void TestNewShaderRecompilerFlatUserPointerUsesDma() {
   const uint32_t shader[] = {
       EncodeVop2(0x25, 0, 0, 2), // v_add_nc_u32 v0, s0, v2
       EncodeVop1(0x01, 1, 1),    // v_mov_b32 v1, s1
-      EncodeFlat0(0x1c, 0, 0),
-      EncodeFlat1(0, 0x7d, 3, 0), // flat_store_dword v3, v[0:1]
-      0xbf810000u,
+      EncodeFlat0(0x0c, 0, 0),
+      EncodeFlat1(3, 0x7d, 0, 0), // flat_load_dword v3, v[0:1]
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(3, 0, 0, 0),
+      EncodeSopp(0x01),
   };
   const uint32_t user_data[] = {0x34567000u, 0x00000012u};
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
   const bool compiled =
       ShaderRecompiler::TryRecompile(shader, options, result, &error);
   Check(compiled, error.c_str());
-  Check(result.program.info.addresses.size() == 1 &&
-            !result.program.info.addresses[0].unbased &&
-            result.program.info.addresses[0].source <
-                result.program.descriptor_sources.size(),
-        "FLAT user pointer provenance was not attached");
-  Check(result.resources.addresses.size() == 1 &&
-            result.resources.addresses[0].guest_base == 0x0000001234567000ull &&
-            result.resources.addresses[0].binding_base ==
-                0x0000001234560000ull &&
-            result.program.info.addresses[0].specialized_base ==
-                0x0000001234560000ull,
-        "FLAT user pointer did not materialize its guest base");
+  Check(result.program.info.uses_dma,
+        "FLAT user pointer did not enable DMA");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
+void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
   const uint32_t segmented_shader[] = {
       EncodeVop2(0x25, 0, 0, 2),
       EncodeVop1(0x01, 1, 1),
-      EncodeFlat0(0x1c, 2, 0),
-      EncodeFlat1(0, 0x7d, 3, 0), // global_store_dword v3, v[0:1]
+      EncodeFlat0(0x0c, 2, 0),
+      EncodeFlat1(3, 0x7d, 0, 0), // global_load_dword v3, v[0:1]
       EncodeFlat0(0x1c, 1, 0),
-      EncodeFlat1(0, 0x7d, 4, 0), // scratch_store_dword v4, v[0:1]
+      EncodeFlat1(0, 0x7d, 3, 0), // scratch_store_dword v3, v[0:1]
       0xbf810000u,
   };
   const uint32_t user_data[] = {0x34567000u, 0u, 0x1000u};
@@ -12016,19 +12008,14 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
-  options.flat_memory_base = 0;
   options.scratch_dwords = 1;
   ShaderRecompiler::CompileResult result;
   std::string error;
   const bool compiled =
       ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
   Check(compiled, error.c_str());
-  Check(result.program.info.addresses.size() == 1 &&
-            result.program.info.addresses[0].kind ==
-                ShaderRecompiler::IR::ResourceKind::Global &&
-            result.program.info.addresses[0].unbased &&
-            result.program.info.addresses[0].source == UINT32_MAX,
-        "GLOBAL null-SADDR did not remain an unbased guest address");
+  Check(result.program.info.uses_dma,
+        "GLOBAL null-SADDR did not enable DMA");
   Check(Common::ContainsStr(result.ir_dump, "GetScratchResource") &&
             result.program.scratch_dwords == 1,
         "SCRATCH incorrectly entered guest address tracking");
@@ -12324,9 +12311,9 @@ int main() {
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestPsInputCountRegisterDecode();
-  TestNewShaderRecompilerUnbasedFlatRequiresTranslator();
-  TestNewShaderRecompilerFlatUserPointerProvenance();
-  TestNewShaderRecompilerFlatAddressProvenanceBoundaries();
+  TestNewShaderRecompilerUnbasedFlatUsesBda();
+  TestNewShaderRecompilerFlatUserPointerUsesDma();
+  TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();
   TestNewShaderRecompilerCfgIfElse();
   TestNewShaderRecompilerCfgConsecutiveNativePhis();

@@ -51,41 +51,50 @@ struct BufferCache::DownloadCopy {
 };
 
 void BufferCache::Register(BufferId id) {
-	auto& buffer = m_slot_buffers[id];
-	PageTable::PageRange pages {};
-	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-		m_page_table[page] = id;
-	}
-	const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
-	(void)it;
-	EXIT_IF(!inserted);
-	buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
-	m_total_used_memory += buffer.Size();
+	ChangeRegister<true>(id);
 }
 
 void BufferCache::Unregister(BufferId id) {
+	ChangeRegister<false>(id);
+}
+
+template <bool insert>
+void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
-	if (buffer.is_deleted) {
-		return;
-	}
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-		auto* owner = m_page_table.Find(page);
-		if (owner != nullptr && *owner == id) {
-			*owner = {};
+		if constexpr (insert) {
+			m_page_table[page] = id;
+		} else {
+			m_page_table[page] = {};
 		}
 	}
-	const auto found = m_buffers.find(buffer.CpuAddress());
-	EXIT_IF(found == m_buffers.end() || found->second != id);
-	m_buffers.erase(found);
-	if (buffer.Size() > m_total_used_memory) {
-		EXIT("BufferCache: allocation accounting underflow\n");
+	const auto size_pages = pages.last_exclusive - pages.first;
+	if constexpr (insert) {
+		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
+		(void)it;
+		EXIT_IF(!inserted);
+		m_total_used_memory += buffer.Size();
+		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		std::vector<vk::DeviceAddress> addresses;
+		addresses.reserve(size_pages);
+		for (uint64_t i = 0; i < size_pages; ++i) {
+			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
+		}
+		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
+		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+	} else {
+		const auto found = m_buffers.find(buffer.CpuAddress());
+		EXIT_IF(found == m_buffers.end() || found->second != id);
+		m_buffers.erase(found);
+		EXIT_IF(buffer.Size() > m_total_used_memory);
+		m_total_used_memory -= buffer.Size();
+		m_lru_cache.Free(buffer.lru_id);
+		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
+		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		buffer.is_deleted = true;
 	}
-	m_total_used_memory -= buffer.Size();
-	m_lru_cache.Free(buffer.lru_id);
-	buffer.is_deleted = true;
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
@@ -184,16 +193,21 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
-    : m_graphics(graphics), m_scheduler(scheduler),
-      m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
-      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache) {
+	: m_graphics(graphics), m_scheduler(scheduler),
+	  m_fault_manager(graphics, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES),
+	  m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
+	  m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+	                         BDA_PAGETABLE_SIZE),
+	  m_memory_tracker(page_manager),
+	  m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+	  m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+	  m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
+	  m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+	  m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	                     "BDA Page Table Buffer");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -316,8 +330,8 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	auto& command = m_scheduler.Current();
 	EXIT_IF(command.IsInvalid());
-	auto       begin = vaddr & ~(CACHING_PAGE_SIZE - 1);
-	auto       end   = (vaddr + size + CACHING_PAGE_SIZE - 1) & ~(CACHING_PAGE_SIZE - 1);
+	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
 	auto       first = m_buffers.lower_bound(begin);
 	if (first != m_buffers.begin()) {
 		const auto previous = std::prev(first);
@@ -333,8 +347,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
 	}
 
-	const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
-	                                      AllFlags, end - begin);
+	const auto id = m_slot_buffers.insert(
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, end - begin);
 	auto&      buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
@@ -433,7 +448,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGE_SIZE &&
+	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -734,6 +749,26 @@ void BufferCache::RunGarbageCollector() {
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
 		m_slot_buffers.erase(id);
+	}
+}
+
+void BufferCache::ProcessFaultBuffer() {
+	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+		}
 	}
 }
 

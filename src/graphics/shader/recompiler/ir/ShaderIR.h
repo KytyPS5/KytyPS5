@@ -176,20 +176,6 @@ struct SampledResourcePair {
 	bool operator==(const SampledResourcePair& other) const = default;
 };
 
-struct AddressResource {
-	uint32_t     source           = UINT32_MAX;
-	uint32_t     first_use_pc     = 0;
-	ResourceKind kind             = ResourceKind::Flat;
-	int32_t      min_offset       = 0;
-	uint64_t     specialized_base = 0;
-	bool         unbased          = true;
-	bool         read             = false;
-	bool         written          = false;
-	bool         atomic           = false;
-
-	bool operator==(const AddressResource& other) const = default;
-};
-
 enum class StageInputKind {
 	VertexIndex,
 	InstanceIndex,
@@ -321,7 +307,8 @@ enum class DescriptorBindingKind {
 	StorageAtomic3D,
 	Samplers,
 	Gds,
-	AddressMemory,
+	BdaPagetable,
+	FaultBuffer,
 	FlattenedSrt,
 	UserData,
 	Count,
@@ -431,13 +418,11 @@ struct BindingLayout {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxAddresses    = 32;
 	static constexpr uint32_t MaxImages       = 32;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
 	std::vector<BufferResource>      buffers;
-	std::vector<AddressResource>     addresses;
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
@@ -446,6 +431,7 @@ struct ShaderInfo {
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
+	bool                             uses_dma           = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

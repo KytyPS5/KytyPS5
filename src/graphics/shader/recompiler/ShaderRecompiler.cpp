@@ -665,7 +665,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			runtime.read_memory = ReadZeroMemory;
 		}
 		runtime.userdata         = options.read_memory_data;
-		runtime.flat_memory_base = options.flat_memory_base;
 		if (!IR::MaterializeResources(ir, runtime, resources, error)) {
 			return false;
 		}

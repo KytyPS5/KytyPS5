@@ -108,20 +108,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			return access;
 		case IR::ResourceKind::ScalarAddress:
 		case IR::ResourceKind::Flat:
-		case IR::ResourceKind::Global: {
-			if (state.address_memory_variable == 0) {
-				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
-				                             mem.resource,
-				                             "address memory binding was not emitted");
-			}
-			const auto binding = ResourceForDescriptor(
-			    state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
-			access.object_pointer = state.builder.AllocateId();
-			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
-			                           access.object_pointer, state.address_memory_variable,
-			                           ConstantU32(state, binding.array_index)});
-			break;
-		}
+		case IR::ResourceKind::Global:
+			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
 			if (state.storage_buffer_variable == 0) {

@@ -28,6 +28,10 @@ uint32_t TypeU64(EmitterState& state) {
 	return TypeU32Vector(state, 2);
 }
 
+uint32_t TypeDeviceAddress(EmitterState& state) {
+	return state.builder.Type(OpTypeInt, {64, 0});
+}
+
 uint32_t TypeU32Pair(EmitterState& state) {
 	const auto element = TypeU32(state);
 	return state.builder.Type(OpTypeStruct, {element, element});
@@ -90,6 +94,14 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state) {
 	return TypePointer(state, StorageClassStorageBuffer, TypeU32(state));
 }
 
+uint32_t TypeDeviceAddressStoragePointer(EmitterState& state) {
+	return TypePointer(state, StorageClassStorageBuffer, TypeDeviceAddress(state));
+}
+
+uint32_t TypePhysicalU32Pointer(EmitterState& state) {
+	return TypePointer(state, StorageClassPhysicalStorageBuffer, TypeU32(state));
+}
+
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, StorageClassPushConstant, TypeU32(state));
 }
@@ -130,6 +142,15 @@ uint32_t SampleMaskArrayType(EmitterState& state) {
 	return state.builder.Type(OpTypeArray, {TypeI32(state), ConstantU32(state, 1)});
 }
 
+uint32_t BdaPagetableType(EmitterState& state) {
+	const auto array = state.builder.DecoratedType(
+	    OpTypeRuntimeArray, {TypeDeviceAddress(state)},
+	    {{OpDecorate, {DecorationArrayStride, sizeof(uint64_t)}}});
+	return state.builder.DecoratedType(
+	    OpTypeStruct, {array},
+	    {{OpMemberDecorate, {0, DecorationOffset, 0}}, {OpDecorate, {DecorationBlock}}});
+}
+
 uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(OpTypeArray, {TypeF32(state), ConstantU32(state, count)});
 }
@@ -143,13 +164,14 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.storage_buffer_variable =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassStorageBuffer);
 	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::AddressMemory) != nullptr) {
-		const auto count =
-		    ConstantU32(state, DescriptorCount(state, IR::DescriptorBindingKind::AddressMemory));
-		const auto array_type = state.builder.Type(OpTypeArray, {StorageBufferType(state), count});
-		const auto pointer_type = TypePointer(state, StorageClassStorageBuffer, array_type);
-		state.address_memory_variable =
-		    state.builder.DefineGlobalVariable(pointer_type, StorageClassStorageBuffer);
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::BdaPagetable) != nullptr) {
+		state.bda_pagetable_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, StorageClassStorageBuffer, BdaPagetableType(state)),
+		    StorageClassStorageBuffer);
+	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::FaultBuffer) != nullptr) {
+		state.fault_buffer_variable = state.builder.DefineGlobalVariable(
+		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
 	if (state.program.bindings.push_constant_size != 0) {
 		const auto pointer_type =
@@ -564,9 +586,13 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	if (state.storage_buffer_variable != 0) {
 		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
 	}
-	if (state.address_memory_variable != 0) {
-		Decorate(state.address_memory_variable, "address_memory",
-		         IR::DescriptorBindingKind::AddressMemory);
+	if (state.bda_pagetable_variable != 0) {
+		Decorate(state.bda_pagetable_variable, "bda_pagetable",
+		         IR::DescriptorBindingKind::BdaPagetable);
+	}
+	if (state.fault_buffer_variable != 0) {
+		Decorate(state.fault_buffer_variable, "fault_buffer",
+		         IR::DescriptorBindingKind::FaultBuffer);
 	}
 	constexpr const char* SampledNames[] = {"sampled_1d",
 	                                        "sampled_1d_array",
@@ -644,6 +670,11 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(CapabilityShader);
 	state.builder.RequireCapability(CapabilitySignedZeroInfNanPreserve);
+	if (state.program.info.uses_dma) {
+		state.builder.RequireCapability(CapabilityInt64);
+		state.builder.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
+		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
+	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(CapabilityClipDistance);
 	}
@@ -682,7 +713,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
+	state.builder.AddMemoryModel(
+	    {state.program.info.uses_dma ? AddressingModelPhysicalStorageBuffer64
+	                                 : AddressingModelLogical,
+	     MemoryModelGLSL450});
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
 	                            state.interface_variables);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that

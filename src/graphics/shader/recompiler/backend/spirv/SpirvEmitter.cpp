@@ -70,8 +70,9 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	if (uses_gds) {
 		Expect(Kind::Gds);
 	}
-	if (!program.info.addresses.empty()) {
-		Expect(Kind::AddressMemory, Dense(program.info.addresses.size()));
+	if (program.info.uses_dma) {
+		Expect(Kind::BdaPagetable);
+		Expect(Kind::FaultBuffer);
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
@@ -104,8 +105,7 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	    program.bindings.push_constant_offset + program.bindings.push_constant_size >
 	        IR::NativePushConstantSize ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.memory_offset_count !=
-	        program.info.buffers.size() + program.info.addresses.size() ||
+	    program.bindings.memory_offset_count != program.info.buffers.size() ||
 	    (!has_user_storage &&
 	     program.bindings.push_constant_size != program.bindings.ShaderDataDwords() * 4u) ||
 	    (has_user_storage && program.bindings.push_constant_size != 0) ||
@@ -146,8 +146,8 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 					if (planning_only_handle(inst)) {
 						break;
 					}
-					if (dense >= program.info.addresses.size()) {
-						return Fail(error, "typed address handle has an invalid dense resource");
+					if (inst.NumArgs() != 2 || !program.info.uses_dma) {
+						return Fail(error, "typed address handle has invalid DMA metadata");
 					}
 					break;
 				case IR::ValueOpcode::GetScratchResource:
@@ -188,7 +188,8 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None) {
+			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+			if (address_access != IR::AddressAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
 					return Fail(error, "address operation has invalid memory metadata");
@@ -198,6 +199,8 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 						return Fail(error, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
+				} else if (address_access == IR::AddressAccess::Write) {
+					return Fail(error, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {

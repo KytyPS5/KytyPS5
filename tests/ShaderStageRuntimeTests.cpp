@@ -73,12 +73,7 @@ UnbasedFlatProgram() {
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   AddValueBlock(program);
-  AddressResource address;
-  address.source = UINT32_MAX;
-  address.first_use_pc = 0x80;
-  address.kind = ResourceKind::Flat;
-  address.unbased = true;
-  program.info.addresses.push_back(address);
+  program.info.uses_dma = true;
   return std::make_shared<const Program>(std::move(program));
 }
 
@@ -102,7 +97,7 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
-void TestUnbasedFlatCacheHitFailsClosed() {
+void TestUnbasedFlatCacheHitMaterializes() {
   using namespace Libs::Graphics;
   auto cached_program = UnbasedFlatProgram();
   auto prior_program = std::make_shared<const ShaderRecompiler::IR::Program>();
@@ -110,12 +105,9 @@ void TestUnbasedFlatCacheHitFailsClosed() {
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
   ShaderStageRuntime stage{prior_program, prior_resources};
   std::string error;
-  Check(!ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error) &&
-            error.find("requires runtime guest-address translation") !=
-                std::string::npos,
-        "unbased FLAT cache hit did not fail without a runtime translator");
-  Check(stage.program == prior_program && stage.resources == prior_resources,
-        "unbased FLAT cache rejection replaced the prior stage snapshot");
+  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error), error.c_str());
+  Check(stage.program == cached_program && stage.resources != prior_resources,
+        "unbased FLAT cache hit did not publish its BDA stage snapshot");
 }
 
 } // namespace
@@ -130,7 +122,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
-  TestUnbasedFlatCacheHitFailsClosed();
+  TestUnbasedFlatCacheHitMaterializes();
   std::puts("ShaderStageRuntimeTests: all cases passed");
   return 0;
 }

@@ -136,12 +136,10 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.offen         = decoded.offen;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
-	if (memory.kind == ResourceKind::ScalarAddress) {
-		memory.resource = RawScalarLoadBase(decoded.src0);
-	} else if (memory.kind == ResourceKind::ScalarBuffer) {
+	if (memory.kind == ResourceKind::ScalarBuffer) {
 		memory.resource = ResourceIndexFromOperand(decoded.src0);
-	} else if (memory.kind == ResourceKind::Lds || memory.kind == ResourceKind::Gds ||
-	           memory.kind == ResourceKind::Scratch) {
+	} else if (IsAddressResourceKind(memory.kind) || memory.kind == ResourceKind::Lds ||
+	           memory.kind == ResourceKind::Gds) {
 		memory.resource = 0;
 		memory.sampler  = 0;
 	}
@@ -421,7 +419,7 @@ IR::Value Translator::NarrowSubdword(IR::U32 value, uint32_t bits) {
 bool Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto resource =
-	    raw ? GetScalarAddressResource(memory.resource) : GetBufferResource(memory);
+	    raw ? GetScalarAddressResource(RawScalarLoadBase(inst.src0)) : GetBufferResource(memory);
 	const auto                offset = ReadU32(inst.src1);
 	std::array<IR::Value, 16> loaded {};
 	for (uint32_t component = 0; component < memory.data_dwords; component++) {

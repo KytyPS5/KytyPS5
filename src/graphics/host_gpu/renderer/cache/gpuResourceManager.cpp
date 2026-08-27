@@ -76,7 +76,19 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+void GpuResourceManager::PrepareBda() {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+	});
+	m_fault_process_pending = true;
+}
+
 void GpuResourceManager::RunGarbageCollector() {
+	if (m_fault_process_pending) {
+		m_fault_process_pending = false;
+		m_buffer_cache.ProcessFaultBuffer();
+	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();

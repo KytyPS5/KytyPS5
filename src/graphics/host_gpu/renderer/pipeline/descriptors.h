@@ -38,7 +38,6 @@ struct NativeDescriptors {
 	std::vector<BufferView>     buffers;
 	std::vector<TextureBinding> images;
 	std::vector<vk::Sampler>    samplers;
-	std::vector<BufferView>     addresses;
 	BufferView                  gds;
 	BufferView                  flattened_srt;
 	BufferView                  user_data;
@@ -49,7 +48,6 @@ struct PreparedBindings {
 	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
 	NativeDescriptors                             resources;
 	std::vector<BufferId>                         buffer_ids;
-	std::vector<BufferId>                         address_ids;
 	std::vector<uint32_t>                         flattened_srt;
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;

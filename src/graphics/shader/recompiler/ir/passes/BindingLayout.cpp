@@ -93,8 +93,7 @@ bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::stri
 		return false;
 	}
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count =
-	    static_cast<uint32_t>(program.info.buffers.size() + program.info.addresses.size());
+	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
 
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources(program.info.buffers.size());
@@ -157,12 +156,9 @@ bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::stri
 	if (uses_gds) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
-	if (!program.info.addresses.empty()) {
-		std::vector<uint32_t> resources(program.info.addresses.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
-		}
-		AddBinding(next, DescriptorBindingKind::AddressMemory, std::move(resources));
+	if (program.info.uses_dma) {
+		AddBinding(next, DescriptorBindingKind::BdaPagetable);
+		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||

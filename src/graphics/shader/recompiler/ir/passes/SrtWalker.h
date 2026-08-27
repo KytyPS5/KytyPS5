@@ -3,7 +3,6 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <optional>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -17,7 +16,6 @@ struct SrtRuntime {
 	uint64_t                  shader_base = 0;
 	SrtMemoryReader           read_memory = nullptr;
 	void*                     userdata    = nullptr;
-	std::optional<uint64_t>   flat_memory_base;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 };
 

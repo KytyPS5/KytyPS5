@@ -36,8 +36,10 @@ enum : uint32_t {
 	ExecutionModeSignedZeroInfNanPreserve    = 4461,
 	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
 	AddressingModelLogical                   = 0,
+	AddressingModelPhysicalStorageBuffer64   = 5348,
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
+	CapabilityInt64                          = 11,
 	CapabilityImageGatherExtended            = 25,
 	CapabilityClipDistance                   = 32,
 	CapabilityCullDistance                   = 33,
@@ -52,6 +54,7 @@ enum : uint32_t {
 	CapabilityShaderViewportIndexLayerEXT    = 5254,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
+	CapabilityPhysicalStorageBufferAddresses = 5347,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
@@ -60,6 +63,7 @@ enum : uint32_t {
 	StorageClassPushConstant                 = 9,
 	StorageClassImage                        = 11,
 	StorageClassStorageBuffer                = 12,
+	StorageClassPhysicalStorageBuffer        = 5349,
 	FunctionControlNone                      = 0,
 	SelectionControlNone                     = 0,
 	LoopControlNone                          = 0,
@@ -148,7 +152,9 @@ enum : uint32_t {
 	OpConstantComposite            = 44,
 	OpUndef                        = 1,
 	OpFunction                     = 54,
+	OpFunctionParameter            = 55,
 	OpFunctionEnd                  = 56,
+	OpFunctionCall                 = 57,
 	OpVariable                     = 59,
 	OpImageTexelPointer            = 60,
 	OpLoad                         = 61,
@@ -178,6 +184,8 @@ enum : uint32_t {
 	OpConvertFToS                  = 110,
 	OpConvertSToF                  = 111,
 	OpConvertUToF                  = 112,
+	OpUConvert                     = 113,
+	OpConvertUToPtr                = 120,
 	OpBitcast                      = 124,
 	OpSNegate                      = 126,
 	OpFNegate                      = 127,
@@ -256,9 +264,14 @@ enum : uint32_t {
 	OpSwitch                       = 251,
 	OpKill                         = 252,
 	OpReturn                       = 253,
+	OpReturnValue                  = 254,
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
+};
+
+enum : uint32_t {
+	MemoryAccessAlignedMask = 0x2,
 };
 
 enum : uint32_t {
@@ -345,9 +358,10 @@ struct EmitterState {
 	ShaderType                   stage                   = ShaderType::Unknown;
 	uint32_t                     wave_size               = 64;
 	uint32_t                     storage_buffer_variable = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers + IR::ShaderInfo::MaxAddresses>
-	                                                     memory_byte_offsets {};
-	uint32_t                                             address_memory_variable = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers>      memory_byte_offsets {};
+	uint32_t                                             bda_pagetable_variable = 0;
+	uint32_t                                             fault_buffer_variable  = 0;
+	uint32_t                                             bda_pointer_function   = 0;
 	uint32_t                                             gds_variable            = 0;
 	uint32_t                                             gds_length              = 0;
 	uint32_t                                             push_constant_variable  = 0;
@@ -384,6 +398,7 @@ uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
+uint32_t TypeDeviceAddress(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -397,6 +412,8 @@ uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t point
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferPointer(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state);
+uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
+uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
@@ -848,6 +865,8 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* error);
+
+void DefineGetBdaPointer(EmitterState& state);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

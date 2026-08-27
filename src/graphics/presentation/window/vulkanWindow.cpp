@@ -594,20 +594,16 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderClipDistance != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderCullDistance != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.largePoints != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features12.shaderOutputLayer != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.bufferDeviceAddress != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
 	features12.timelineSemaphore = VK_TRUE;
 	features12.shaderOutputLayer = VK_TRUE;
-
-	if (Config::GpuAssistedValidationEnabled()) {
-		if (supported_features12.bufferDeviceAddress != VK_TRUE) {
-			EXIT("--gpu-assisted-validation requires bufferDeviceAddress, unsupported by this "
-			     "device\n");
-		}
-		features12.bufferDeviceAddress = VK_TRUE;
-	}
+	features12.bufferDeviceAddress = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
@@ -625,12 +621,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderClipDistance                   = VK_TRUE;
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
+	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
-	device_features.vertexPipelineStoresAndAtomics =
-	    supported_features2.features.vertexPipelineStoresAndAtomics;
-	if (Config::GpuAssistedValidationEnabled()) {
-		device_features.shaderInt64 = supported_features2.features.shaderInt64;
-	}
+	device_features.shaderInt64 = VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;

@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <span>
-#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -96,10 +95,10 @@ class Tracker {
 public:
 	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
 		m_info.buffers.clear();
-		m_info.addresses.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
+		m_info.uses_dma = false;
 	}
 
 	bool Run(std::string* error) {
@@ -178,90 +177,6 @@ private:
 		return ShaderError::Fail(
 		    error, fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                       m_program.shader_hash, StageName(m_program.stage), pc, reason));
-	}
-
-	struct AddressPart {
-		Value value;
-		bool  rooted = false;
-	};
-
-	AddressPart FindAddressPart(Value value, Value active,
-	                            std::unordered_set<const Inst*>& visiting) const {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			return {value, false};
-		}
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || !visiting.insert(inst).second) {
-			return {};
-		}
-		const auto finish = [&](AddressPart part) {
-			visiting.erase(inst);
-			return part;
-		};
-		std::string reason;
-		if (ValidateRuntimeValue(m_program, value, reason)) {
-			return finish({value, true});
-		}
-		const auto merge = [&](AddressPart left, AddressPart right, bool require_both) {
-			if (left.value.IsEmpty() || right.value.IsEmpty()) {
-				return require_both ? AddressPart {} : (left.value.IsEmpty() ? right : left);
-			}
-			return EquivalentValue(m_program, left.value, right.value)
-			           ? AddressPart {left.value, left.rooted || right.rooted}
-			           : AddressPart {};
-		};
-		switch (inst->GetOpcode()) {
-			case ValueOpcode::SelectU32:
-				if (EquivalentValue(m_program, inst->Arg(0), active)) {
-					return finish(FindAddressPart(inst->Arg(1), active, visiting));
-				}
-				return finish(merge(FindAddressPart(inst->Arg(1), active, visiting),
-				                    FindAddressPart(inst->Arg(2), active, visiting), true));
-			case ValueOpcode::Phi: {
-				const auto invariant = ResolveInvariantPhi(m_program, value);
-				return finish(invariant.IsEmpty() ? AddressPart {}
-				                                  : FindAddressPart(invariant, active, visiting));
-			}
-			case ValueOpcode::IAdd32:
-			case ValueOpcode::ISub32: {
-				const auto left  = FindAddressPart(inst->Arg(0), active, visiting);
-				const auto right = FindAddressPart(inst->Arg(1), active, visiting);
-				if (left.rooted == right.rooted ||
-				    (inst->GetOpcode() == ValueOpcode::ISub32 && right.rooted)) {
-					return finish({});
-				}
-				return finish(left.rooted ? left : right);
-			}
-			case ValueOpcode::CompositeExtractU32x2: {
-				const auto* source = inst->Arg(0).ResolveInstruction();
-				if (source == nullptr || source->GetOpcode() != ValueOpcode::IAddCarry32) {
-					return finish({});
-				}
-				const auto left  = FindAddressPart(source->Arg(0), active, visiting);
-				const auto right = FindAddressPart(source->Arg(1), active, visiting);
-				if (left.rooted == right.rooted) {
-					return finish({});
-				}
-				return finish(left.rooted ? left : right);
-			}
-			default: return finish({});
-		}
-	}
-
-	bool MakeFlatAddressSource(const Inst& handle, Value active,
-	                           DescriptorSource& descriptor) const {
-		std::unordered_set<const Inst*> visiting;
-		auto                            low = FindAddressPart(handle.Arg(0), active, visiting);
-		visiting.clear();
-		auto high = FindAddressPart(handle.Arg(1), active, visiting);
-		if ((!low.rooted && !high.rooted) || low.value.IsEmpty() || high.value.IsEmpty()) {
-			return false;
-		}
-		descriptor.dword_count = 2;
-		descriptor.dwords[0]   = low.value;
-		descriptor.dwords[1]   = high.value;
-		return true;
 	}
 
 	bool MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -577,42 +492,14 @@ private:
 		return true;
 	}
 
-	bool GetAddressHandle(const Inst& memory_inst, Value value, uint32_t pc, Inst*& handle,
-	                      uint32_t& source, bool& unbased, std::string* error) {
-		handle = value.Resolve().TryInstruction();
+	bool ValidateAddressHandle(Value value, uint32_t pc, std::string* error) const {
+		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
 			return Fail(pc, error, "address operation requires GetAddressResource");
 		}
 		if (handle->NumArgs() != 2) {
 			return Fail(pc, error, "GetAddressResource must have two address dwords");
 		}
-		DescriptorSource descriptor;
-		const auto&      memory = m_program.memory_info[memory_inst.Flags<MemoryFlags>().index];
-		if (memory.address_is_full) {
-			const auto active = memory_inst.Arg(memory_inst.NumArgs() - 1u);
-			if (memory.kind != ResourceKind::Flat ||
-			    !MakeFlatAddressSource(*handle, active, descriptor)) {
-				unbased = true;
-				source  = UINT32_MAX;
-				return true;
-			}
-		} else if (!MakeSource(*handle, 2, false, false, descriptor, pc, error)) {
-			return false;
-		}
-		std::string reason;
-		uint32_t    bad_dword = 0;
-		if (!ValidateSource(descriptor, reason, bad_dword)) {
-			if (memory.address_is_full) {
-				unbased = true;
-				source  = UINT32_MAX;
-				return true;
-			}
-			return Fail(
-			    pc, error,
-			    fmt::format("scalar memory base dword {} is unresolved: {}", bad_dword, reason));
-		}
-		unbased = false;
-		source  = InternSource(descriptor);
 		return true;
 	}
 
@@ -704,39 +591,6 @@ private:
 		}
 		m_info.samplers.push_back({source, pc});
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
-	}
-
-	uint32_t AddAddress(uint32_t source, bool unbased, const MemoryInfo& memory,
-	                    AddressAccess access, uint32_t pc) {
-		auto immediate = static_cast<int32_t>(memory.offset);
-		if (memory.kind == ResourceKind::ScalarAddress) {
-			immediate = static_cast<int32_t>(static_cast<uint32_t>(immediate) & ~3u);
-		}
-		const auto min_offset = unbased ? 0 : std::min(immediate, 0);
-		for (uint32_t i = 0; i < m_info.addresses.size(); i++) {
-			auto& address = m_info.addresses[i];
-			if (address.source == source && address.unbased == unbased &&
-			    address.kind == memory.kind) {
-				address.first_use_pc = std::min(address.first_use_pc, pc);
-				address.min_offset   = std::min(address.min_offset, min_offset);
-				address.read         = address.read || access == AddressAccess::Read;
-				address.written      = address.written || access == AddressAccess::Write;
-				return i;
-			}
-		}
-		if (m_info.addresses.size() >= ShaderInfo::MaxAddresses) {
-			return UINT32_MAX;
-		}
-		AddressResource address;
-		address.source       = source;
-		address.first_use_pc = pc;
-		address.kind         = memory.kind;
-		address.min_offset   = min_offset;
-		address.unbased      = unbased;
-		address.read         = access == AddressAccess::Read;
-		address.written      = access == AddressAccess::Write;
-		m_info.addresses.push_back(address);
-		return static_cast<uint32_t>(m_info.addresses.size() - 1);
 	}
 
 	bool AddSampledPair(uint32_t image, uint32_t sampler, uint32_t pc, std::string* error) {
@@ -839,16 +693,11 @@ private:
 				}
 				return true;
 			}
-			bool unbased = false;
-			if (!GetAddressHandle(inst, inst.Arg(0), flags.pc, handle, source, unbased, error)) {
+			if (!ValidateAddressHandle(inst.Arg(0), flags.pc, error)) {
 				return false;
 			}
-			resource = AddAddress(source, unbased, memory, address_info.access, flags.pc);
-			if (resource == UINT32_MAX) {
-				return Fail(flags.pc, error, "address resource limit exceeded");
-			}
-			return AddHandlePatch(handle, resource, flags.pc, error) &&
-			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc, error);
+			m_info.uses_dma = true;
+			return true;
 		}
 
 		if (!ImageResourceKindMatches(memory.kind, image_info.resource_class)) {

@@ -53,6 +53,15 @@ public:
 		}
 	}
 
+	void Clear() { m_ranges.clear(); }
+
+	template <typename Func>
+	void ForEach(Func&& func) const {
+		for (const auto& [begin, end]: m_ranges) {
+			func(begin, end);
+		}
+	}
+
 	[[nodiscard]] std::vector<Range> Intersections(uint64_t address, uint64_t size) const {
 		std::vector<Range> result;
 		ForEachIntersection(address, size, [&result](Range range) { result.push_back(range); });
@@ -98,7 +107,7 @@ public:
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {
-		if (address == 0 || size == 0 || size > UINT64_MAX - address) {
+		if (size == 0 || size > UINT64_MAX - address) {
 			EXIT("invalid range-set address or size\n");
 		}
 		return address + size;

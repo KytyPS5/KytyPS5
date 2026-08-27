@@ -267,13 +267,6 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	return true;
 }
 
-uint64_t AddressSpecialization(const AddressResource&           resource,
-                               const ResourceSnapshot::Address& snapshot) {
-	return resource.kind == ResourceKind::Flat || resource.unbased
-	           ? snapshot.binding_base
-	           : snapshot.guest_base - snapshot.binding_base;
-}
-
 size_t FlattenedRuntimeDwords(const Program& program) {
 	size_t size = program.srt_reads.size();
 	for (uint32_t resource = 0; resource < program.info.images.size(); resource++) {
@@ -298,8 +291,7 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 	}
 	if (snapshot.buffers.size() != program.info.buffers.size() ||
 	    snapshot.images.size() != program.info.images.size() ||
-	    snapshot.samplers.size() != program.info.samplers.size() ||
-	    snapshot.addresses.size() != program.info.addresses.size()) {
+	    snapshot.samplers.size() != program.info.samplers.size()) {
 		if (error != nullptr) {
 			*error = "resource snapshot does not match dense shader topology";
 		}
@@ -343,14 +335,6 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		}
 		return true;
 	};
-	for (uint32_t i = 0; i < snapshot.addresses.size(); i++) {
-		if (snapshot.addresses[i].binding_base > snapshot.addresses[i].guest_base) {
-			if (error != nullptr) {
-				*error = fmt::format("address resource {} binds above its guest base", i);
-			}
-			return false;
-		}
-	}
 	std::unordered_set<uint32_t> indirect_resources;
 	for (const auto& table: snapshot.indirect_images) {
 		const auto* source = table.resource < program.info.images.size()
@@ -526,15 +510,6 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			}
 		}
 	}
-	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
-		if (program.info.addresses[i].specialized_base !=
-		    AddressSpecialization(program.info.addresses[i], snapshot.addresses[i])) {
-			if (error != nullptr) {
-				*error = fmt::format("address resource {} no longer matches specialization", i);
-			}
-			return false;
-		}
-	}
 	return true;
 }
 
@@ -550,7 +525,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	std::vector<DescriptorSourceRequest> requests;
 	std::vector<uint8_t>                 clean_flat_slots(program.srt_reads.size());
 	requests.reserve(program.info.buffers.size() + program.info.images.size() * 2u +
-	                 program.info.samplers.size() + program.info.addresses.size());
+	                 program.info.samplers.size());
 	for (const auto& buffer: program.info.buffers) {
 		requests.push_back({buffer.source, buffer.first_use_pc});
 	}
@@ -576,12 +551,6 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	for (const auto& sampler: program.info.samplers) {
 		requests.push_back({sampler.source, sampler.first_use_pc});
 	}
-	for (const auto& address: program.info.addresses) {
-		if (!address.unbased) {
-			requests.push_back({address.source, address.first_use_pc});
-		}
-	}
-
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
 	if (!EvaluateRuntimeSources(program, requests, runtime, values, flattened_srt, clean_flat_slots,
@@ -686,37 +655,6 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		return false;
 	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
-	cursor += program.info.samplers.size();
-	for (const auto& address: program.info.addresses) {
-		if (!address.unbased) {
-			const auto value = *cursor++;
-			auto       base  = (static_cast<uint64_t>(value.dwords[0]) |
-			                    static_cast<uint64_t>(value.dwords[1]) << 32u) &
-			                   AddressMask;
-			if (address.kind == ResourceKind::ScalarAddress) {
-				base &= ~uint64_t {3};
-			}
-			const auto before = static_cast<uint64_t>(-static_cast<int64_t>(address.min_offset));
-			uint64_t   binding_base = 0;
-			if (address.kind == ResourceKind::Flat) {
-				binding_base = base & ~(FlatAddressWindowSize - 1u);
-			} else if (base >= before) {
-				binding_base = base - before;
-			}
-			next.addresses.push_back({base, binding_base});
-		} else {
-			if (!runtime.flat_memory_base.has_value()) {
-				if (error != nullptr) {
-					*error = fmt::format("unbased {} address at pc 0x{:08x} requires runtime "
-					                     "guest-address translation",
-					                     address.kind == ResourceKind::Flat ? "FLAT" : "global",
-					                     address.first_use_pc);
-				}
-				return false;
-			}
-			next.addresses.push_back({*runtime.flat_memory_base, *runtime.flat_memory_base});
-		}
-	}
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!ValidateResourceSnapshot(program, next, error)) {
 		return false;
@@ -790,10 +728,6 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		next.buffers[i].packed_stride      = descriptor.PackedStride();
 		next.buffers[i].descriptor_format  = descriptor.Format();
 		next.buffers[i].descriptor_swizzle = descriptor.DstSelXYZW();
-	}
-	for (uint32_t i = 0; i < next.addresses.size(); i++) {
-		next.addresses[i].specialized_base =
-		    AddressSpecialization(next.addresses[i], next_snapshot.addresses[i]);
 	}
 	for (uint32_t i = 0; i < next.images.size(); i++) {
 		const auto& descriptor = next_snapshot.images[i];

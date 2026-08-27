@@ -6,7 +6,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -20,7 +19,6 @@ struct CompileOptions {
 	uint32_t                    scratch_dwords  = 0;
 	uint64_t                    shader_hash     = 0;
 	uint64_t                    shader_base     = 0;
-	std::optional<uint64_t>     flat_memory_base;
 	uint32_t                    push_constant_offset      = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;

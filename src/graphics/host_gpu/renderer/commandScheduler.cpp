@@ -196,8 +196,8 @@ void CommandScheduler::Finish() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
-	PopPendingOperations();
 	BeginNext();
+	PopPendingOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {

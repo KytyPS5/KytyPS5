@@ -295,7 +295,7 @@ void TestInvariantIndirectImageMaterialization() {
   const auto same_snapshot = [](const ResourceSnapshot &lhs,
                                 const ResourceSnapshot &rhs) {
     return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
-           lhs.samplers == rhs.samplers && lhs.addresses == rhs.addresses &&
+           lhs.samplers == rhs.samplers &&
            lhs.flattened_srt == rhs.flattened_srt &&
            lhs.user_data == rhs.user_data &&
            lhs.indirect_images.empty() == rhs.indirect_images.empty();
@@ -848,7 +848,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
   Check(fixture.program.srt_reads.size() == 1,
         "shared typed scalar read did not receive one flat SRT slot");
   Check(fixture.program.info.buffers.size() == 1 &&
-            fixture.program.info.addresses.empty(),
+            !fixture.program.info.uses_dma,
         "planning-only scalar reads leaked into resource topology");
   Check(fixture.program.memory_info[0].planning_only,
         "canonical runtime scalar read was not marked planning-only");
@@ -910,7 +910,7 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   Check(fixture.program.srt_reads.empty() &&
             fixture.program.dynamic_reads.size() == 1 &&
-            fixture.program.info.addresses.size() == 1,
+            fixture.program.info.uses_dma,
         "dynamic scalar read was incorrectly flattened or lost");
   std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
   TestMemory memory;
@@ -932,11 +932,13 @@ void TestDynamicSrtReadRemainsExplicit() {
             FindBinding(fixture.program.bindings,
                         DescriptorBindingKind::FlattenedSrt) == nullptr &&
             FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::AddressMemory) != nullptr,
+                        DescriptorBindingKind::BdaPagetable) != nullptr &&
+            FindBinding(fixture.program.bindings,
+                        DescriptorBindingKind::FaultBuffer) != nullptr,
         "dynamic scalar read received the wrong resource bindings");
   Check(fixture.program.bindings.memory_offset_dword ==
                 fixture.program.bindings.user_data_registers.size() &&
-            fixture.program.bindings.memory_offset_count == 2u &&
+            fixture.program.bindings.memory_offset_count == 1u &&
             fixture.program.bindings.ShaderDataDwords() ==
                 fixture.program.bindings.memory_offset_dword + 1u,
         "unified memory-offset layout is inconsistent");
@@ -1029,7 +1031,7 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
-void TestAddressMaterializationAndSpecialization() {
+void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
       fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
@@ -1050,29 +1052,19 @@ void TestAddressMaterializationAndSpecialization() {
                fixture.AddMemory(flat, 8));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.info.addresses.size() == 2 &&
-            !fixture.program.info.addresses[0].unbased &&
-            fixture.program.info.addresses[0].min_offset == -8 &&
-            fixture.program.info.addresses[1].unbased,
-        "typed based and unbased addresses were classified incorrectly");
+  Check(fixture.program.info.uses_dma,
+        "typed address operations did not enable DMA");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
-  SrtRuntime runtime{.user_data = user_data, .flat_memory_base = 0x9000u};
+  SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   std::string error;
   Check(MaterializeResources(fixture.program, runtime, snapshot, &error),
-        "address resources did not materialize");
-  Check(snapshot.addresses.size() == 2 &&
-            snapshot.addresses[0].guest_base == 0x2008u &&
-            snapshot.addresses[0].binding_base == 0x2000u &&
-            snapshot.addresses[1].binding_base == 0x9000u,
-        "materialized address windows are incorrect");
-  Check(SpecializeResources(fixture.program, snapshot, &error) &&
-            fixture.program.info.addresses[0].specialized_base == 8u &&
-            fixture.program.info.addresses[1].specialized_base == 0x9000u,
-        "typed address specialization was not applied");
+        "DMA shader resources did not materialize");
+  Check(SpecializeResources(fixture.program, snapshot, &error),
+        "DMA shader resources were not specialized");
 }
 
-void TestExecMaskedFlatAddressProvenance() {
+void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
   const auto high_root = fixture.UserData(1);
@@ -1092,18 +1084,14 @@ void TestExecMaskedFlatAddressProvenance() {
                fixture.AddMemory(flat, 0xa4));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.info.addresses.size() == 1 &&
-            !fixture.program.info.addresses[0].unbased,
-        "exec-masked FLAT address lost its active user-data root");
+  Check(fixture.program.info.uses_dma,
+        "exec-masked FLAT address did not enable DMA");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   std::string error;
-  Check(MaterializeResources(fixture.program, runtime, snapshot, &error) &&
-            snapshot.addresses.size() == 1 &&
-            snapshot.addresses[0].guest_base == 0x0000000123456780ull &&
-            snapshot.addresses[0].binding_base == 0x0000000123450000ull,
-        "exec-masked FLAT address materialized the wrong user-data root");
+  Check(MaterializeResources(fixture.program, runtime, snapshot, &error),
+        "exec-masked FLAT shader resources did not materialize");
 
   Fixture mismatch;
   const auto mismatch_active = mismatch.Emit(ValueOpcode::INotEqual32,
@@ -1122,9 +1110,8 @@ void TestExecMaskedFlatAddressProvenance() {
                 {mismatch_address, mismatch_low, mismatch_high, other_active},
                 mismatch.AddMemory(flat, 0xa4));
   mismatch.PlanAndTrack();
-  Check(mismatch.program.info.addresses.size() == 1 &&
-            mismatch.program.info.addresses[0].unbased,
-        "FLAT address used a select arm guarded by a different active mask");
+  Check(mismatch.program.info.uses_dma,
+        "dynamic FLAT address did not enable DMA");
 }
 
 void TestBufferSwizzleSpecialization() {
@@ -1393,8 +1380,8 @@ int main() {
     Run("phi validation", TestPhiValidation);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
-    Run("address materialization", TestAddressMaterializationAndSpecialization);
-    Run("exec-masked FLAT address", TestExecMaskedFlatAddressProvenance);
+    Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("graphics push constants", TestGraphicsPushConstantLayout);

@@ -42,6 +42,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -1057,12 +1058,14 @@ void CheckRectListShaders() {
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
   pixel.stage.program = program;
-  HW::PixelShaderInfo ps_regs{};
-  const auto perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+  std::vector<uint32_t> perspective_specialization;
+  BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
-  const auto no_perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+  std::vector<uint32_t> no_perspective_specialization;
+  BuildStageStaticKey(pixel, no_perspective_specialization);
   pixel.ps_no_perspective = false;
-  Require(name, "pipeline identity", perspective_id != no_perspective_id,
+  Require(name, "pipeline identity",
+          perspective_specialization != no_perspective_specialization,
           "pixel interpolation mode must participate in the shader and "
           "pipeline key");
 
@@ -22508,83 +22511,12 @@ void CheckStorageTextureDepthTileUploadLayout() {
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
-void CheckImageSpecializationId() {
-  std::array<u32, 1> code{};
-  HW::ComputeShaderInfo regs{};
-  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
-
-  ShaderRecompiler::IR::ImageResource image;
-  image.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
-  image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  const auto make_program = [](ShaderRecompiler::IR::ImageResource resource) {
-    ShaderRecompiler::IR::Program program;
-    program.binding_layout_complete = true;
-    program.info.images.push_back(std::move(resource));
-    return program;
-  };
-  auto rgb1_image = image;
-  rgb1_image.shader_swizzle = DstSel(4, 5, 6, 1);
-  auto converted_image = image;
-  converted_image.conversion_format =
-      Prospero::BufferFormat::k11_11_10UInt;
-  auto mip1_image = image;
-  mip1_image.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-  auto mip3_image = mip1_image;
-  mip3_image.mip_count = 3;
-  auto array_image = image;
-  array_image.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  auto cube_image = array_image;
-  cube_image.cube = true;
-
-  const auto resources =
-      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
-  ShaderComputeInputInfo identity_info;
-  identity_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(image));
-  identity_info.stage.resources = resources;
-  auto rgb1_info = identity_info;
-  rgb1_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(rgb1_image));
-  auto converted_info = identity_info;
-  converted_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(
-          make_program(converted_image));
-  auto mip1_info = identity_info;
-  mip1_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(mip1_image));
-  auto mip3_info = identity_info;
-  mip3_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(mip3_image));
-  auto array_info = identity_info;
-  array_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(array_image));
-  auto cube_info = identity_info;
-  cube_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(cube_image));
-
-  const auto identity_id = ShaderGetIdCS(regs, identity_info, true);
-  const auto rgb1_id = ShaderGetIdCS(regs, rgb1_info, true);
-  const auto converted_id = ShaderGetIdCS(regs, converted_info, true);
-  const auto mip1_id = ShaderGetIdCS(regs, mip1_info, true);
-  const auto mip3_id = ShaderGetIdCS(regs, mip3_info, true);
-  const auto array_id = ShaderGetIdCS(regs, array_info, true);
-  const auto cube_id = ShaderGetIdCS(regs, cube_info, true);
-  Require("ImageSpecializationId", "pipeline cache key",
-          identity_id != rgb1_id &&
-              identity_id.ids.size() == rgb1_id.ids.size() &&
-              identity_id != converted_id &&
-              identity_id.ids.size() == converted_id.ids.size() &&
-              mip1_id != mip3_id && mip1_id.ids.size() == mip3_id.ids.size() &&
-              array_id != cube_id && array_id.ids.size() == cube_id.ids.size(),
-          "image conversion, swizzle, mip-count, or cube variants share a "
-          "pipeline ID");
-
+void CheckImageSamplerSpecialization() {
   ShaderSamplerResource filtered_sampler{};
   filtered_sampler.fields[2] =
       (1u << 20u) | (3u << 22u) | (2u << 24u) | (2u << 26u);
   filtered_sampler.SetPointFiltering();
-  Require("ImageSpecializationId", "forced point sampler",
+  Require("ImageSamplerSpecialization", "forced point sampler",
           filtered_sampler.XyMagFilter() == 0u &&
               filtered_sampler.XyMinFilter() == 0u &&
               filtered_sampler.ZFilter() == 1u &&
@@ -22594,7 +22526,7 @@ void CheckImageSpecializationId() {
   ShaderSamplerResource base_mip_sampler{};
   base_mip_sampler.fields[2] = (3u << 20u) | (1u << 22u) | (2u << 24u);
   base_mip_sampler.SetPointFiltering();
-  Require("ImageSpecializationId", "base-mip point sampler",
+  Require("ImageSamplerSpecialization", "base-mip point sampler",
           base_mip_sampler.XyMagFilter() == 0u &&
               base_mip_sampler.XyMinFilter() == 0u &&
               base_mip_sampler.ZFilter() == 1u &&
@@ -22632,12 +22564,12 @@ void CheckImageSpecializationId() {
   sampler_descriptor.dword_count = 4;
   mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
   std::string specialization_error;
-  Require("ImageSpecializationId", "mixed sampler specialization",
+  Require("ImageSamplerSpecialization", "mixed sampler specialization",
           ShaderRecompiler::IR::SpecializeResources(mixed_sampler_program,
                                                     mixed_sampler_snapshot,
                                                     &specialization_error),
           specialization_error);
-  Require("ImageSpecializationId", "mixed sampler variant",
+  Require("ImageSamplerSpecialization", "mixed sampler variant",
           mixed_sampler_program.info.samplers.size() == 2u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
               mixed_sampler_program.info.samplers[1].force_point_filtering &&
@@ -22658,7 +22590,7 @@ void CheckImageSpecializationId() {
   ShaderRecompiler::IR::ResourceSnapshot packed_atomic_snapshot;
   packed_atomic_snapshot.images.push_back(packed_image_descriptor);
   std::string atomic_error;
-  Require("ImageSpecializationId", "packed atomic rejection",
+  Require("ImageSamplerSpecialization", "packed atomic rejection",
           !ShaderRecompiler::IR::SpecializeResources(
               packed_atomic_program, packed_atomic_snapshot, &atomic_error) &&
               atomic_error.find("unsupported format 34") != std::string::npos,
@@ -24389,7 +24321,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
-    CheckImageSpecializationId();
+    CheckImageSamplerSpecialization();
     CheckIndirectImageKeySwitch();
     return 0;
   }
@@ -24431,7 +24363,7 @@ int main(int argc, char **argv) {
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
-  CheckImageSpecializationId();
+  CheckImageSamplerSpecialization();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureVolumeMipRegions();

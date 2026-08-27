@@ -10,11 +10,14 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/shaderCompiler.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -36,6 +39,88 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 
 } // namespace
 
+struct PipelineCache::ProgramCache {
+	struct SourceKey {
+		ShaderType stage = ShaderType::Unknown;
+		uint64_t   hash  = 0;
+
+		bool operator==(const SourceKey&) const = default;
+	};
+
+	struct Permutation {
+		std::vector<uint32_t>                               static_key;
+		std::shared_ptr<const ShaderRecompiler::IR::Program> program;
+		ShaderProgram                                       handle;
+	};
+
+	struct SourceKeyHash {
+		std::size_t operator()(const SourceKey& key) const {
+			std::size_t hash = static_cast<std::size_t>(key.stage);
+			PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.hash));
+			if constexpr (sizeof(std::size_t) < sizeof(uint64_t)) {
+				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.hash >> 32u));
+			}
+			return hash;
+		}
+	};
+
+	static uint64_t MixId(uint64_t hash, uint64_t value) {
+		return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
+	}
+
+	static constexpr std::size_t MaxStaticKeyWords =
+	    5 + ShaderVertexInputInfo::RES_MAX * 17;
+
+	template <typename InputInfo>
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info) {
+		constexpr ShaderType stage = [] {
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				return ShaderType::Vertex;
+			} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+				return ShaderType::Pixel;
+			} else {
+				static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+				return ShaderType::Compute;
+			}
+		}();
+
+		BuildStageStaticKey(input_info, key_scratch);
+		auto& permutations = programs[{stage, params.hash}];
+		for (const auto& permutation: permutations) {
+			if (permutation.static_key == key_scratch &&
+			    MaterializeProgram(permutation.program, params, input_info)) {
+				return permutation.handle;
+			}
+		}
+
+		const auto module = CompileProgram(device, params, input_info);
+		EXIT_IF(module == nullptr || !input_info.stage);
+		uint64_t id = MixId(MixId(params.hash, static_cast<uint64_t>(stage)), permutations.size());
+		if (id == 0) {
+			id = 1;
+		}
+		const ShaderProgram handle {.id = id, .module = module};
+		permutations.push_back({key_scratch, input_info.stage.program, handle});
+
+		std::printf("Num compiled %u shaders\n", ++num_compiled);
+		return handle;
+	}
+
+	explicit ProgramCache(vk::Device device): device(device) {
+		key_scratch.reserve(MaxStaticKeyWords);
+	}
+
+	std::unordered_map<SourceKey, std::vector<Permutation>, SourceKeyHash> programs;
+	std::vector<uint32_t> key_scratch;
+	vk::Device device;
+	uint32_t   num_compiled = 0;
+};
+
+PipelineCache::PipelineCache(GraphicContext& graphics)
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+}
+
 PipelineCache::~PipelineCache() {
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -47,32 +132,62 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	for (const auto& [key, permutations]: m_program_cache->programs) {
+		(void)key;
+		for (const auto& permutation: permutations) {
+			m_graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
+		}
+	}
+}
+
+ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
+                                              const HW::ShaderRegisters&  sh,
+                                              ShaderVertexInputInfo&      input_info) {
+	const auto params = PrepareProgram(regs, sh, input_info);
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->Get(params, input_info);
+}
+
+ShaderProgram PipelineCache::GetPixelProgram(
+    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    const ShaderVertexInputInfo&                        vertex_info,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    ShaderPixelInputInfo&                               input_info) {
+	const auto params = PrepareProgram(regs, sh, vertex_info, target_export_mapping, input_info);
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->Get(params, input_info);
+}
+
+ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
+                                               const HW::ShaderRegisters&   sh,
+                                               ShaderComputeInputInfo&      input_info) {
+	input_info.needs_lds_barriers = !m_graphics.compute_wave64_supported;
+	const auto params             = PrepareProgram(regs, sh, input_info);
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->Get(params, input_info);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::GraphicsPipeline&
-PipelineCache::CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_count,
-                                      RenderDepthInfo& depth, ShaderVertexInputInfo& vs_input_info,
-                                      CommandBuffer& command, ShaderPixelInputInfo* ps_input_info,
-                                      vk::PrimitiveTopology topology, bool primitive_restart_enable,
-                                      bool ps_active, std::span<const uint32_t> vs_spirv,
-                                      std::span<const uint32_t> ps_spirv) {
+PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const ShaderProgram& vertex_program,
+    const ShaderProgram& pixel_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
-	EXIT_IF(colors == nullptr);
-	EXIT_IF(color_count > RENDER_COLOR_ATTACHMENTS_MAX);
-	EXIT_IF(vs_spirv.empty());
-	EXIT_IF(ps_active && ps_spirv.empty());
+	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
+	EXIT_IF(!vertex_program);
+	const bool ps_active = ps_input_info != nullptr;
+	EXIT_IF(ps_active && !pixel_program);
+	const auto color_count = static_cast<uint32_t>(colors.size());
 
 	Common::LockGuard lock(m_mutex);
-	auto&             ctx    = command.GetRegisters();
-	auto&             sh_ctx = command.GetShaders();
+	auto&             ctx = command.GetRegisters();
 
-	const auto&           vertex_info                              = sh_ctx.GetVs();
-	const auto&           ps_regs                                  = sh_ctx.GetPs();
 	const HW::BlendColor& bclr                                     = ctx.GetBlendColor();
 	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
@@ -83,11 +198,8 @@ PipelineCache::CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_co
 	}
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
-	auto     vs_id = ShaderGetIdVS(vertex_info, vs_input_info, true);
-	ShaderId ps_id {};
-	if (ps_active) {
-		ps_id = ShaderGetIdPS(ps_regs, *ps_input_info, true);
-	}
+	const auto vs_id = vertex_program.id;
+	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	PipelineStaticParameters static_params {};
 	GraphicsPipeline         p {};
@@ -203,20 +315,17 @@ PipelineCache::CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_co
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(*ps_input_info);
 		}
-		LOGF("PipelineTrace: shader binaries VS=0x%08" PRIx32 "/0x%08" PRIx32 " words=%" PRIu64
-		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 " words=%" PRIu64 "\n",
-		     vs_id.hash0, vs_id.crc32, static_cast<uint64_t>(vs_spirv.size()), ps_id.hash0,
-		     ps_id.crc32, static_cast<uint64_t>(ps_spirv.size()));
+		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64
+		     " module=%p\n",
+		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
+		     static_cast<void*>(pixel_program.module));
 	}
 
 	auto cached = std::make_unique<GraphicsPipeline>(p);
-	LogPipelineTrace("CreatePipelineInternal begin", vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                 ps_id.crc32);
-	CreatePipelineInternal(m_graphics, *cached, rendering, vs_input_info, vs_spirv, ps_input_info,
-	                       ps_spirv, static_params, vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                       ps_id.crc32, ps_active);
-	LogPipelineTrace("CreatePipelineInternal done", vs_id.hash0, vs_id.crc32, ps_id.hash0,
-	                 ps_id.crc32);
+	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	CreatePipelineInternal(m_graphics, *cached, rendering, vs_input_info, vertex_program.module,
+	                       ps_input_info, pixel_program.module, static_params);
+	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -228,19 +337,16 @@ PipelineCache::CreateGraphicsPipeline(RenderColorInfo* colors, uint32_t color_co
 }
 
 PipelineCache::ComputePipeline&
-PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
-                                     const HW::ComputeShaderInfo& cs_regs,
-                                     std::span<const uint32_t>    cs_spirv) {
+PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&    compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(cs_spirv.empty());
+	EXIT_IF(!compute_program);
 
 	Common::LockGuard lock(m_mutex);
 
-	auto cs_id = ShaderGetIdCS(cs_regs, input_info, true);
-
 	ComputePipeline p {};
-	p.cs_shader_id = cs_id;
+	p.cs_shader_id = compute_program.id;
 
 	ComputePipelineKey key {};
 	key.cs_shader_id = p.cs_shader_id;
@@ -254,7 +360,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
-	CreatePipelineInternal(m_graphics, *cached, input_info, cs_spirv);
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

@@ -483,15 +483,15 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 }
 
 struct DrawRenderState {
-	RenderDepthInfo           depth_info;
-	RenderColorInfo           color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t                  color_count                              = 0;
-	bool                      ps_active                                = true;
-	RenderState               rendering;
-	ShaderVertexInputInfo     vs_input_info;
-	ShaderPixelInputInfo      ps_input_info;
-	std::span<const uint32_t> vs_shader;
-	std::span<const uint32_t> ps_shader;
+	RenderDepthInfo       depth_info;
+	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t              color_count                              = 0;
+	bool                  ps_active                                = true;
+	RenderState           rendering;
+	ShaderVertexInputInfo vs_input_info;
+	ShaderPixelInputInfo  ps_input_info;
+	ShaderProgram         vertex_program;
+	ShaderProgram         pixel_program;
 };
 
 struct DrawCallInfo {
@@ -1003,32 +1003,30 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
-	state.vs_shader     = {};
-	state.ps_shader     = {};
-	state.ps_input_info = {};
+	state.vertex_program = {};
+	state.pixel_program  = {};
+	state.ps_input_info  = {};
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		target_export_mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
 	}
 	if (log_phases) {
-		LogDrawPhase(draw.name, "ShaderCompileInfoVS");
+		LogDrawPhase(draw.name, "GetVertexProgram");
 	}
-	if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, state.vs_input_info,
-	                         state.vs_shader)) {
-		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
-	}
+	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
+	state.vertex_program =
+	    pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, state.vs_input_info);
 
 	if (!state.ps_active) {
 		return;
 	}
 	if (log_phases) {
-		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
+		LogDrawPhase(draw.name, "GetPixelProgram");
 	}
-	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, state.vs_input_info,
-	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
-		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
-	}
+	state.pixel_program =
+	    pipeline_cache.GetPixelProgram(pixel_shader_info, shader_regs, state.vs_input_info,
+	                                   target_export_mapping, state.ps_input_info);
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
@@ -1180,9 +1178,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    state.color_info, state.color_count, state.depth_info, state.vs_input_info, buffer,
-	    &state.ps_input_info, topology, primitive_restart_enable, state.ps_active, state.vs_shader,
-	    state.ps_shader);
+	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    state.vertex_program, state.pixel_program);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

@@ -422,43 +422,19 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
     const PipelineRenderingState& rendering, const ShaderVertexInputInfo& vs_input_info,
-    std::span<const uint32_t> vs_shader, const ShaderPixelInputInfo* ps_input_info,
-    std::span<const uint32_t> ps_shader, const PipelineStaticParameters& static_params,
-    uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0, uint32_t ps_crc32, bool ps_active) {
-	EXIT_IF(ps_active && ps_input_info == nullptr);
+    vk::ShaderModule vertex_module, const ShaderPixelInputInfo* ps_input_info,
+	vk::ShaderModule pixel_module, const PipelineStaticParameters& static_params) {
+	const bool ps_active = ps_input_info != nullptr;
+	EXIT_IF(vertex_module == nullptr || (ps_active && pixel_module == nullptr));
 
 	const bool rect_list = static_params.topology == vk::PrimitiveTopology::ePatchList;
 
-	vk::ShaderModule vert_shader_module         = nullptr;
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
-	vk::ShaderModule frag_shader_module         = nullptr;
 
 	vk::ShaderModuleCreateInfo create_info {};
-
 	create_info.sType = vk::StructureType::eShaderModuleCreateInfo;
-	create_info.pNext = nullptr;
-	create_info.flags = {};
-
-	create_info.codeSize = vs_shader.size() * 4;
-	create_info.pCode    = vs_shader.data();
-	auto result = graphics.device.createShaderModule(&create_info, nullptr, &vert_shader_module);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateShaderModule VS done result=%s module=%p\n",
-		     VulkanToString(result).c_str(), static_cast<void*>(vert_shader_module));
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	if (ps_active) {
-		create_info.codeSize = ps_shader.size() * 4;
-		create_info.pCode    = ps_shader.data();
-		result = graphics.device.createShaderModule(&create_info, nullptr, &frag_shader_module);
-		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule PS done result=%s module=%p\n",
-			     VulkanToString(result).c_str(), static_cast<void*>(frag_shader_module));
-		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	}
+	vk::Result result {};
 	if (rect_list) {
 		const auto shaders =
 		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
@@ -483,10 +459,8 @@ void CreatePipelineInternal(
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
 
-	EXIT_NOT_IMPLEMENTED(vert_shader_module == nullptr);
 	EXIT_NOT_IMPLEMENTED(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
-	EXIT_NOT_IMPLEMENTED(ps_active && frag_shader_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo vert_shader_stage_info {};
 
@@ -494,7 +468,7 @@ void CreatePipelineInternal(
 	vert_shader_stage_info.pNext               = nullptr;
 	vert_shader_stage_info.flags               = {};
 	vert_shader_stage_info.stage               = vk::ShaderStageFlagBits::eVertex;
-	vert_shader_stage_info.module              = vert_shader_module;
+	vert_shader_stage_info.module              = vertex_module;
 	vert_shader_stage_info.pName               = "main";
 	vert_shader_stage_info.pSpecializationInfo = nullptr;
 
@@ -503,7 +477,7 @@ void CreatePipelineInternal(
 	frag_shader_stage_info.pNext               = nullptr;
 	frag_shader_stage_info.flags               = {};
 	frag_shader_stage_info.stage               = vk::ShaderStageFlagBits::eFragment;
-	frag_shader_stage_info.module              = frag_shader_module;
+	frag_shader_stage_info.module              = pixel_module;
 	frag_shader_stage_info.pName               = "main";
 	frag_shader_stage_info.pSpecializationInfo = nullptr;
 
@@ -854,9 +828,9 @@ void CreatePipelineInternal(
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
 	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=0x%08" PRIx32 "/0x%08" PRIx32
-		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     vs_hash0, vs_crc32, ps_hash0, ps_crc32, 1u);
+		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
+		     " set_layouts=1 push_constants=%" PRIu32 "\n",
+		     pipeline.vs_shader_id, pipeline.ps_shader_id, 1u);
 	}
 	result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                              &pipeline.pipeline_layout);
@@ -955,11 +929,12 @@ void CreatePipelineInternal(
 	EXIT_IF(pipeline.pipeline != nullptr);
 
 	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=0x%08" PRIx32 "/0x%08" PRIx32
-		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 " topology=%" PRIu32 " color_mask=0x%08" PRIx32
+		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
+		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 " viewport=%f,%f %fx%f"
 		     " scissor=%d,%d %ux%u\n",
-		     vs_hash0, vs_crc32, ps_hash0, ps_crc32, static_cast<uint32_t>(static_params.topology),
+		     pipeline.vs_shader_id, pipeline.ps_shader_id,
+		     static_cast<uint32_t>(static_params.topology),
 		     static_params.color_mask[0], (static_params.with_depth ? "true" : "false"),
 		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count, viewport.x,
 		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
@@ -975,39 +950,19 @@ void CreatePipelineInternal(
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 
-	if (frag_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(frag_shader_module, nullptr);
-	}
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	}
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
-	graphics.device.destroyShaderModule(vert_shader_module, nullptr);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            std::span<const uint32_t>     cs_shader) {
-	vk::ShaderModule comp_shader_module = nullptr;
-
-	vk::ShaderModuleCreateInfo create_info {};
-
-	create_info.sType    = vk::StructureType::eShaderModuleCreateInfo;
-	create_info.pNext    = nullptr;
-	create_info.flags    = {};
-	create_info.codeSize = cs_shader.size() * 4;
-	create_info.pCode    = cs_shader.data();
-	LOGF("PipelineTrace: vkCreateShaderModule CS begin words=%" PRIu64 "\n",
-	     static_cast<uint64_t>(cs_shader.size()));
-	auto result = graphics.device.createShaderModule(&create_info, nullptr, &comp_shader_module);
-	LOGF("PipelineTrace: vkCreateShaderModule CS done result=%s module=%p\n",
-	     VulkanToString(result).c_str(), static_cast<void*>(comp_shader_module));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(comp_shader_module == nullptr);
+                            vk::ShaderModule              compute_module) {
+	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
@@ -1015,7 +970,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	comp_shader_stage_info.pNext               = nullptr;
 	comp_shader_stage_info.flags               = {};
 	comp_shader_stage_info.stage               = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module              = comp_shader_module;
+	comp_shader_stage_info.module              = compute_module;
 	comp_shader_stage_info.pName               = "main";
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
@@ -1048,8 +1003,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
 	     1u);
-	result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                              &pipeline.pipeline_layout);
+	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                  &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -1075,8 +1030,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
-
-	graphics.device.destroyShaderModule(comp_shader_module, nullptr);
 }
 
 } // namespace Libs::Graphics

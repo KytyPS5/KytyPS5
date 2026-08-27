@@ -888,12 +888,10 @@ void LogDrawPhase(const char* draw_name, const char* phase) {
 	}
 }
 
-void LogPipelineTrace(const char* phase, uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0,
-                      uint32_t ps_crc32) {
+void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id) {
 	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: %s VS=0x%08" PRIx32 "/0x%08" PRIx32 " PS=0x%08" PRIx32 "/0x%08" PRIx32
-		     "\n",
-		     phase, vs_hash0, vs_crc32, ps_hash0, ps_crc32);
+		LOGF("PipelineTrace: %s VS=%" PRIu64 " PS=%" PRIu64 "\n", phase, vertex_program_id,
+		     pixel_program_id);
 	}
 }
 

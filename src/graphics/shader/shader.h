@@ -60,17 +60,6 @@ bool ShaderMaterializeStageRuntime(
     std::string* error, ShaderSpecializationMemoryReader read_specialization_memory = nullptr,
     void* read_memory_data = nullptr);
 
-struct ShaderId {
-	uint32_t              hash0 = 0;
-	uint32_t              crc32 = 0;
-	std::vector<uint32_t> ids;
-
-	bool operator==(const ShaderId& other) const {
-		return hash0 == other.hash0 && crc32 == other.crc32 && ids == other.ids;
-	}
-	bool operator!=(const ShaderId& other) const { return !(*this == other); }
-};
-
 constexpr uint32_t DstSel(uint32_t x, uint32_t y = 0, uint32_t z = 0, uint32_t w = 0) {
 	return x | (y << 3u) | (z << 6u) | (w << 9u);
 }
@@ -254,28 +243,6 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
-ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInputInfo& input_info,
-                       bool include_bind_specialization);
-ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputInfo& input_info,
-                       bool include_bind_specialization);
-ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInputInfo& input_info,
-                       bool include_bind_specialization);
-// Returned SPIR-V spans are read-only views backed by the shader program cache.
-bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderVertexInputInfo& input_info, std::span<const uint32_t>& spirv);
-bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         const ShaderVertexInputInfo&                        vs_info,
-                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-                         ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv);
-bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         bool needs_lds_barriers, ShaderComputeInputInfo& input_info,
-                         std::span<const uint32_t>& spirv);
-bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderVertexInputInfo& input_info, std::vector<uint32_t>& spirv);
-bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderPixelInputInfo& input_info, std::vector<uint32_t>& spirv);
-bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);
 
 } // namespace Libs::Graphics

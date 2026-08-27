@@ -1400,6 +1400,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
 		sys_dbg_stack_info_t stack {};
 		SysStackUsage(stack);
+		if (stack.reserved_size <= stack.guard_size) {
+			break;
+		}
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}

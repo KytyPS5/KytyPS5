@@ -341,6 +341,15 @@ void FoldInstruction(Inst& inst) {
 				ReplaceBinaryIdentity(inst, Type::U64, 1u);
 			}
 			return;
+		case ValueOpcode::WqmU32: {
+			const auto value = Arg(inst, 0);
+			if (IsImmediate(value, Type::U32)) {
+				auto quads = value.U32() | (value.U32() >> 1u);
+				quads |= quads >> 2u;
+				Replace(inst, Value((quads & 0x11111111u) * 0x0fu));
+			}
+			return;
+		}
 		case ValueOpcode::WqmU64: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U64)) {

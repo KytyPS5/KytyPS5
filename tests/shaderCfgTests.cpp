@@ -4858,20 +4858,28 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
               1,
           "pixel IMAGE_SAMPLE_LZ must use explicit lod");
   }
+  // A shadow lookup is an ordinary sample followed by the comparison in the shader: a host
+  // comparison sampler is only legal against a depth-format view, which a guest shadow map is
+  // not unless it also happens to be a depth target.
   {
     const auto result = compile(0x28, 0x1); // image_sample_c
     Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefImplicitLod) == 1,
-          "pixel IMAGE_SAMPLE_C must use OpImageSampleDrefImplicitLod");
-    Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefExplicitLod) == 0,
-          "pixel IMAGE_SAMPLE_C unexpectedly used explicit dref lod");
+                                      OpImageSampleDrefImplicitLod) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv,
+                                          OpImageSampleDrefExplicitLod) == 0,
+          "pixel IMAGE_SAMPLE_C must not build a hardware comparison sample");
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleImplicitLod) ==
+              1,
+          "pixel IMAGE_SAMPLE_C must sample with implicit lod");
   }
   {
     const auto result = compile(0x2f, 0x1); // image_sample_c_lz
     Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefExplicitLod) == 1,
-          "pixel IMAGE_SAMPLE_C_LZ must use explicit dref lod");
+                                      OpImageSampleDrefExplicitLod) == 0,
+          "pixel IMAGE_SAMPLE_C_LZ must not build a hardware comparison sample");
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleExplicitLod) ==
+              1,
+          "pixel IMAGE_SAMPLE_C_LZ must sample with explicit lod");
   }
 }
 
@@ -5164,8 +5172,9 @@ void TestNewShaderRecompilerImageGatherVariants() {
         "SPIR-V binary does not request ImageGatherExtended");
   Check(SpirvContainsOpcode(result.spirv, 96),
         "SPIR-V binary does not contain OpImageGather");
-  Check(SpirvContainsOpcode(result.spirv, 97),
-        "SPIR-V binary does not contain OpImageDrefGather");
+  // A shadow gather is an ordinary gather now, with the four texels compared in the shader.
+  Check(!SpirvContainsOpcode(result.spirv, 97),
+        "SPIR-V binary must not build a hardware comparison gather");
   Check(SpirvContainsOpcode(result.spirv, 202),
         "SPIR-V binary does not contain packed gather offset extraction");
   Check(SpirvContainsOpcode(result.spirv, 81),
@@ -11805,17 +11814,15 @@ void TestSharedMemoryBarrierSafety() {
     return ir.INotEqual(local_id, U32(Value(0u)));
   };
 
-  ShaderComputeInputInfo compute_info{};
-  compute_info.needs_lds_barriers = true;
-  compute_info.lds_size_dwords = 128;
-  compute_info.threads_num[0] = 64;
-  compute_info.threads_num[1] = 1;
-  compute_info.threads_num[2] = 1;
+  // The pass takes the facts directly now, so a mesh program - one guest wave64 as a
+  // 64-invocation workgroup - can use it too.
+  constexpr uint32_t kThreadgroup = 64;
+  constexpr uint32_t kLdsDwords   = 128;
 
   auto phases = make_program(1);
   append_write(*phases.blocks[0]);
   append_read(*phases.blocks[0]);
-  const auto phase_stats = InsertSharedMemoryBarriers(phases, 64u, compute_info);
+  const auto phase_stats = InsertSharedMemoryBarriers(phases, 64u, kThreadgroup, kLdsDwords, true);
   std::vector<ValueOpcode> phase_opcodes;
   for (const auto& inst : *phases.blocks[0]) {
     phase_opcodes.push_back(inst.GetOpcode());
@@ -11835,7 +11842,7 @@ void TestSharedMemoryBarrierSafety() {
   append_write(*selection.blocks[1]);
   append_read(*selection.blocks[2]);
   const auto selection_stats =
-      InsertSharedMemoryBarriers(selection, 64u, compute_info);
+      InsertSharedMemoryBarriers(selection, 64u, kThreadgroup, kLdsDwords, true);
   Check(selection_stats.inserted_barriers == 2 &&
             count_barriers(*selection.blocks[1]) == 0 &&
             selection.blocks[2]->begin()->GetOpcode() ==
@@ -11848,7 +11855,7 @@ void TestSharedMemoryBarrierSafety() {
   loop.block_info[0].condition = divergent_condition(loop, 0);
   append_write(*loop.blocks[0]);
   append_read(*loop.blocks[0]);
-  const auto loop_stats = InsertSharedMemoryBarriers(loop, 64u, compute_info);
+  const auto loop_stats = InsertSharedMemoryBarriers(loop, 64u, kThreadgroup, kLdsDwords, true);
   Check(loop_stats.inserted_barriers == 0 &&
             count_barriers(*loop.blocks[0]) == 0,
         "workgroup barrier was inserted into divergent loop control");

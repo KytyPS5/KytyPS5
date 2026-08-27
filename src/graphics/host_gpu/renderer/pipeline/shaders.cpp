@@ -467,7 +467,9 @@ void CreatePipelineInternal(
 	vert_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 	vert_shader_stage_info.pNext               = nullptr;
 	vert_shader_stage_info.flags               = {};
-	vert_shader_stage_info.stage               = vk::ShaderStageFlagBits::eVertex;
+	vert_shader_stage_info.stage =
+	    vs_input_info.stage.program->stage == ShaderType::Mesh ? vk::ShaderStageFlagBits::eMeshEXT
+	                                                           : vk::ShaderStageFlagBits::eVertex;
 	vert_shader_stage_info.module              = vertex_module;
 	vert_shader_stage_info.pName               = "main";
 	vert_shader_stage_info.pSpecializationInfo = nullptr;
@@ -803,18 +805,20 @@ void CreatePipelineInternal(
 
 	EXIT_IF(!vs_input_info.stage);
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, *vs_input_info.stage.program,
-	                  vk::ShaderStageFlagBits::eVertex);
+	const auto first_stage = vs_input_info.stage.program->stage == ShaderType::Mesh
+	                             ? vk::ShaderStageFlagBits::eMeshEXT
+	                             : vk::ShaderStageFlagBits::eVertex;
+	AddLayoutBindings(descriptor_bindings, *vs_input_info.stage.program, first_stage);
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	constexpr auto GraphicsStages =
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	const auto graphics_stages =
+	    ps_active ? first_stage | vk::ShaderStageFlagBits::eFragment : first_stage;
 	const vk::PushConstantRange push_constants {
-	    GraphicsStages, 0, ShaderRecompiler::IR::NativePushConstantSize};
+	    graphics_stages, 0, ShaderRecompiler::IR::NativePushConstantSize};
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
@@ -908,8 +912,9 @@ void CreatePipelineInternal(
 	pipeline_info.flags                    = {};
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
-	pipeline_info.pVertexInputState        = &vertex_input_info;
-	pipeline_info.pInputAssemblyState      = &input_assembly;
+	const bool mesh_stage = vs_input_info.stage.program->stage == ShaderType::Mesh;
+	pipeline_info.pVertexInputState        = mesh_stage ? nullptr : &vertex_input_info;
+	pipeline_info.pInputAssemblyState      = mesh_stage ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.sType              = vk::StructureType::ePipelineTessellationStateCreateInfo;
 	tessellation_state.patchControlPoints = 3;

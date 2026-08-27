@@ -9024,12 +9024,21 @@ public:
       auto storage_redirected =
           executor.PrepareBindings(stencil_storage_runtime);
       executor.RebindImages(storage_redirected);
-      Require(
-          name, "storage stencil acquisition",
-          storage_redirected.resources.images[0].image_id == depth_id &&
-              storage_redirected.resources.images[0].image_view != nullptr &&
-              texture_cache.GetImage(depth_id).usage.storage,
-          "storage stencil binding did not acquire the associated depth owner");
+      // A storage binding is the one case that must NOT redirect to the depth owner: a depth
+      // image is never created with VK_IMAGE_USAGE_STORAGE_BIT, so the shader writes the plane's
+      // own colour image and the result is copied into the depth image's stencil aspect
+      // afterwards.
+      const auto storage_stencil_id =
+          storage_redirected.resources.images[0].image_id;
+      Require(name, "storage stencil acquisition",
+              storage_stencil_id != depth_id &&
+                  storage_redirected.resources.images[0].image_view !=
+                      nullptr &&
+                  texture_cache.GetImage(storage_stencil_id).depth_id ==
+                      depth_id &&
+                  texture_cache.GetImage(storage_stencil_id).usage.storage &&
+                  !texture_cache.GetImage(depth_id).usage.storage,
+              "storage stencil binding did not stay on the plane's own image");
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -12490,6 +12499,54 @@ TestCase ScalarMinMaxSccComparisonEdges() {
           {O::S_MOV_B32, O::S_MIN_I32, O::S_MAX_I32, O::S_MIN_U32, O::S_MAX_U32,
            O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+// S_CMOV writes the source only when SCC is set; when SCC is clear the
+// destination has to keep its previous value rather than take the source or
+// get zeroed. The merged ES+GS prologues Pathless ships open with
+// s_cmov_b64 exec, -1, so the 64-bit form has to preserve the mask too.
+TestCase ScalarCmovPreservesDestinationWhenSccClear() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  auto set_scc = [&](bool value) {
+    code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(value ? 1u : 0u)));
+  };
+
+  // 32-bit: SCC clear keeps 7, SCC set takes 9.
+  code.push_back(EncodeSMovB32(20, InlineU32(7)));
+  set_scc(false);
+  code.push_back(EncodeSop1(0x05, 20, InlineU32(9)));
+
+  code.push_back(EncodeSMovB32(21, InlineU32(7)));
+  set_scc(true);
+  code.push_back(EncodeSop1(0x05, 21, InlineU32(9)));
+
+  // 64-bit: s[2:3] is the source pair, s[22:23] and s[24:25] the destinations.
+  code.push_back(EncodeSMovB32(2, InlineU32(9)));
+  code.push_back(EncodeSMovB32(3, InlineU32(11)));
+
+  code.push_back(EncodeSMovB32(22, InlineU32(7)));
+  code.push_back(EncodeSMovB32(23, InlineU32(5)));
+  set_scc(false);
+  code.push_back(EncodeSop1(0x06, 22, 2));
+
+  code.push_back(EncodeSMovB32(24, InlineU32(7)));
+  code.push_back(EncodeSMovB32(25, InlineU32(5)));
+  set_scc(true);
+  code.push_back(EncodeSop1(0x06, 24, 2));
+
+  for (u32 i = 0; i < 6u; i++) {
+    AppendStoreSgpr(&code, 20u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"ScalarCmovPreservesDestinationWhenSccClear",
+          code,
+          {},
+          {7, 9, 7, 5, 9, 11},
+          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CMOV_B32, O::S_CMOV_B64,
+           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarAbsI32UpdatesScc() {
@@ -19325,7 +19382,7 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+  test.required_spirv = {"OpImageSampleExplicitLod", "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
 }
@@ -19369,7 +19426,7 @@ TestCase ImageGatherCompareOpcodes() {
       O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
       O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
       O::S_ENDPGM};
-  test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
+  test.required_spirv = {"OpImageGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
 }
@@ -20326,6 +20383,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarExtendedArithmetic);
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);
+  AddCase(ScalarCmovPreservesDestinationWhenSccClear);
   AddCase(ScalarAbsI32UpdatesScc);
   AddCase(ScalarShiftLeftAddSccCarryEdges);
   AddCase(ScalarCompareOps);

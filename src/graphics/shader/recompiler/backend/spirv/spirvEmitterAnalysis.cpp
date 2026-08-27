@@ -336,6 +336,7 @@ uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return ExecutionModelVertex;
 		case ShaderType::Pixel: return ExecutionModelFragment;
+		case ShaderType::Mesh: return ExecutionModelMeshEXT;
 		default: return ExecutionModelGLCompute;
 	}
 }

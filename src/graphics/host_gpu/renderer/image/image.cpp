@@ -531,6 +531,80 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+void Image::CopyStencilFromColor(Image& source, Buffer& buffer) {
+	EXIT_IF(m_scheduler == nullptr || buffer.Handle() == nullptr);
+	const bool destination_has_stencil =
+	    static_cast<bool>(FullAspectMask(backing.format) & vk::ImageAspectFlagBits::eStencil);
+	if (!destination_has_stencil ||
+	    FullAspectMask(source.backing.format) != vk::ImageAspectFlagBits::eColor ||
+	    source.info.bytes_per_block != 1 || source.backing.samples != 1 || backing.samples != 1 ||
+	    source.backing.image == nullptr || backing.image == nullptr ||
+	    source.backing.mip_levels != 1 || backing.mip_levels != 1 ||
+	    source.backing.image_type != vk::ImageType::e2D ||
+	    backing.image_type != vk::ImageType::e2D ||
+	    source.backing.extent.width != backing.extent.width ||
+	    source.backing.extent.height != backing.extent.height) {
+		EXIT("unsupported stencil plane copy: source_format=%d source_bpb=%u source=%ux%u "
+		     "source_levels=%u source_samples=%u source_type=%d destination_format=%d "
+		     "destination=%ux%u destination_levels=%u destination_samples=%u destination_type=%d\n",
+		     static_cast<int>(source.backing.format), source.info.bytes_per_block,
+		     source.backing.extent.width, source.backing.extent.height, source.backing.mip_levels,
+		     source.backing.samples, static_cast<int>(source.backing.image_type),
+		     static_cast<int>(backing.format), backing.extent.width, backing.extent.height,
+		     backing.mip_levels, backing.samples, static_cast<int>(backing.image_type));
+	}
+	m_scheduler->EndRendering();
+
+	const auto     width         = backing.extent.width;
+	const auto     height        = backing.extent.height;
+	const auto     layers        = std::min(source.backing.layers, backing.layers);
+	const uint64_t row_size      = width;
+	const auto     rows_per_copy = CopyRows(row_size, height, buffer.Size());
+	EXIT_IF(layers == 0 || rows_per_copy == 0);
+
+	vk::BufferMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = buffer.Handle();
+	barrier.offset              = 0;
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &barrier;
+
+	auto command = m_scheduler->Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		for (uint32_t row = 0; row < height; row += rows_per_copy) {
+			const auto          copy_height = std::min(rows_per_copy, height - row);
+			vk::BufferImageCopy copy {};
+			copy.imageSubresource         = {vk::ImageAspectFlagBits::eColor, 0, layer, 1};
+			copy.imageOffset              = {0, static_cast<int32_t>(row), 0};
+			copy.imageExtent              = {width, copy_height, 1};
+			auto stencil_copy             = copy;
+			stencil_copy.imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, layer, 1};
+
+			barrier.size          = row_size * copy_height;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			command.pipelineBarrier2(dependency);
+			command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+			                          buffer.Handle(), copy);
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+			command.pipelineBarrier2(dependency);
+			command.copyBufferToImage(buffer.Handle(), backing.image,
+			                          vk::ImageLayout::eTransferDstOptimal, stencil_copy);
+		}
+	}
+}
+
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(m_scheduler == nullptr || source.backing.samples != backing.samples ||
 	        mip >= backing.mip_levels || layer >= backing.layers);

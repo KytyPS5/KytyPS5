@@ -25,14 +25,20 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+inline constexpr uint32_t SpirvVersion15 = 0x00010500u;
+
 enum : uint32_t {
 	ExecutionModelVertex                     = 0,
+	ExecutionModelMeshEXT                    = 5365,
 	ExecutionModelFragment                   = 4,
 	ExecutionModelGLCompute                  = 5,
 	ExecutionModeOriginUpperLeft             = 7,
 	ExecutionModeEarlyFragmentTests          = 9,
 	ExecutionModeDepthReplacing              = 12,
 	ExecutionModeLocalSize                   = 17,
+	ExecutionModeOutputVertices              = 26,
+	ExecutionModeOutputPrimitivesEXT         = 5270,
+	ExecutionModeOutputTrianglesEXT          = 5298,
 	ExecutionModeSignedZeroInfNanPreserve    = 4461,
 	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
 	AddressingModelLogical                   = 0,
@@ -40,12 +46,14 @@ enum : uint32_t {
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
 	CapabilityInt64                          = 11,
+	CapabilityMeshShadingEXT                 = 5283,
 	CapabilityImageGatherExtended            = 25,
 	CapabilityClipDistance                   = 32,
 	CapabilityCullDistance                   = 33,
 	CapabilitySampled1D                      = 43,
 	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
+	CapabilityShaderLayer                    = 69,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
 	CapabilityGroupNonUniformBallot          = 64,
@@ -72,6 +80,7 @@ enum : uint32_t {
 enum : uint32_t {
 	DecorationBlock         = 2,
 	DecorationBuiltIn       = 11,
+	DecorationPerPrimitiveEXT = 5271,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
 	DecorationLocation      = 30,
@@ -88,6 +97,8 @@ enum : uint32_t {
 	BuiltInClipDistance              = 3,
 	BuiltInCullDistance              = 4,
 	BuiltInLayer                     = 9,
+	BuiltInPrimitiveTriangleIndicesEXT = 5296,
+	BuiltInCullPrimitiveEXT            = 5299,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
 	BuiltInSampleMask                = 20,
@@ -242,6 +253,7 @@ enum : uint32_t {
 	OpBitReverse                   = 204,
 	OpBitCount                     = 205,
 	OpControlBarrier               = 224,
+	OpSetMeshOutputsEXT            = 5295,
 	OpMemoryBarrier                = 225,
 	OpAtomicLoad                   = 227,
 	OpAtomicExchange               = 229,
@@ -288,6 +300,7 @@ enum : uint32_t {
 	GlslSqrt            = 31,
 	GlslInverseSqrt     = 32,
 	GlslFMin            = 37,
+	GlslUMin            = 38,
 	GlslFMax            = 40,
 	GlslFClamp          = 43,
 	GlslLdexp           = 53,
@@ -357,6 +370,14 @@ struct EmitterState {
 	const IR::SpirvRequirements& requirements;
 	ShaderType                   stage                   = ShaderType::Unknown;
 	uint32_t                     wave_size               = 64;
+	bool                         logical_wave64          = false;
+	uint32_t                     local_invocation_index_variable = 0;
+	uint32_t                     wave_exchange_variable          = 0;
+	uint32_t                     wave_ballot_variable            = 0;
+	uint32_t                     mesh_vertices_variable          = 0;
+	uint32_t                     mesh_prim_indices_variable      = 0;
+	uint32_t                     mesh_layer_variable             = 0;
+	uint32_t                     mesh_cull_variable              = 0;
 	uint32_t                     storage_buffer_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers>      memory_byte_offsets {};
 	uint32_t                                             bda_pagetable_variable = 0;
@@ -367,6 +388,7 @@ struct EmitterState {
 	uint32_t                                             push_constant_variable  = 0;
 	uint32_t                                             vsharp_storage_variable = 0;
 	uint32_t                                             flattened_srt_variable  = 0;
+	uint32_t                                             mesh_index_variable     = 0;
 	uint32_t                                             lds_variable            = 0;
 	uint32_t                                             scratch_variable        = 0;
 	std::array<uint32_t, 2u * SampledImageViewKindCount> sampled_image_variables {};
@@ -734,6 +756,16 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component);
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
+
+inline constexpr uint32_t LogicalWave64Lanes = 64;
+
+void     PrepareLogicalWave64Storage(EmitterState& state);
+uint32_t EmitLogicalLaneId(EmitterState& state);
+uint32_t EmitCurrentLaneId(EmitterState& state);
+void     RejectUnsupportedLogicalWave64(const EmitterState& state, const char* operation);
+uint32_t EmitLogicalBallot(EmitterState& state, uint32_t condition);
+uint32_t EmitLogicalReadLane(EmitterState& state, uint32_t value, uint32_t lane);
+void     EmitLogicalWaveBarrier(EmitterState& state);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 

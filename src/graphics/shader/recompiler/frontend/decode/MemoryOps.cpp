@@ -211,7 +211,129 @@ bool IsFlatStoreOpcode(Opcode opcode) {
 	}
 }
 
+bool IsDsNonReturningAtomicOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::DS_ADD_U32:
+		case Opcode::DS_SUB_U32:
+		case Opcode::DS_MIN_I32:
+		case Opcode::DS_MAX_I32:
+		case Opcode::DS_MIN_U32:
+		case Opcode::DS_MAX_U32:
+		case Opcode::DS_AND_B32:
+		case Opcode::DS_OR_B32:
+		case Opcode::DS_XOR_B32:
+		case Opcode::DS_MIN_F32:
+		case Opcode::DS_MAX_F32: return true;
+		default: return false;
+	}
+}
+
+bool IsBufferStoreOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::BUFFER_STORE_FORMAT_X:
+		case Opcode::BUFFER_STORE_FORMAT_XY:
+		case Opcode::BUFFER_STORE_FORMAT_XYZ:
+		case Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Opcode::BUFFER_STORE_BYTE:
+		case Opcode::BUFFER_STORE_SHORT:
+		case Opcode::BUFFER_STORE_DWORD:
+		case Opcode::BUFFER_STORE_DWORDX2:
+		case Opcode::BUFFER_STORE_DWORDX3:
+		case Opcode::BUFFER_STORE_DWORDX4:
+		case Opcode::TBUFFER_STORE_FORMAT_X:
+		case Opcode::TBUFFER_STORE_FORMAT_XY:
+		case Opcode::TBUFFER_STORE_FORMAT_XYZ:
+		case Opcode::TBUFFER_STORE_FORMAT_XYZW: return true;
+		default: return false;
+	}
+}
+
+bool IsBufferAtomicOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::BUFFER_ATOMIC_SWAP:
+		case Opcode::BUFFER_ATOMIC_ADD:
+		case Opcode::BUFFER_ATOMIC_SUB:
+		case Opcode::BUFFER_ATOMIC_SMIN:
+		case Opcode::BUFFER_ATOMIC_UMIN:
+		case Opcode::BUFFER_ATOMIC_SMAX:
+		case Opcode::BUFFER_ATOMIC_UMAX:
+		case Opcode::BUFFER_ATOMIC_AND:
+		case Opcode::BUFFER_ATOMIC_OR:
+		case Opcode::BUFFER_ATOMIC_XOR:
+		case Opcode::BUFFER_ATOMIC_FMIN:
+		case Opcode::BUFFER_ATOMIC_FMAX: return true;
+		default: return false;
+	}
+}
+
+bool IsImageAtomicOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::IMAGE_ATOMIC_ADD:
+		case Opcode::IMAGE_ATOMIC_UMIN:
+		case Opcode::IMAGE_ATOMIC_UMAX:
+		case Opcode::IMAGE_ATOMIC_AND:
+		case Opcode::IMAGE_ATOMIC_OR:
+		case Opcode::IMAGE_ATOMIC_XOR: return true;
+		default: return false;
+	}
+}
+
 } // namespace
+
+bool InstructionWritesDestination(const Instruction& inst) {
+	switch (inst.family) {
+		case Family::DS:
+			return !IsDsWriteOpcode(inst.opcode) && !IsDsNonReturningAtomicOpcode(inst.opcode);
+		case Family::MUBUF:
+		case Family::MTBUF:
+			return !IsBufferStoreOpcode(inst.opcode) &&
+			       (!IsBufferAtomicOpcode(inst.opcode) || inst.glc);
+		case Family::FLAT: return !IsFlatStoreOpcode(inst.opcode);
+		case Family::MIMG:
+			return inst.opcode != Opcode::IMAGE_STORE && inst.opcode != Opcode::IMAGE_STORE_MIP &&
+			       (!IsImageAtomicOpcode(inst.opcode) || inst.glc);
+		default: return true;
+	}
+}
+
+uint32_t InstructionSourceRegisterCount(const Instruction& inst, uint32_t index) {
+	switch (inst.family) {
+		case Family::SMEM:
+			if (index != 0) {
+				return 1;
+			}
+			switch (inst.opcode) {
+				case Opcode::S_BUFFER_LOAD_DWORD:
+				case Opcode::S_BUFFER_LOAD_DWORDX2:
+				case Opcode::S_BUFFER_LOAD_DWORDX4:
+				case Opcode::S_BUFFER_LOAD_DWORDX8:
+				case Opcode::S_BUFFER_LOAD_DWORDX16: return 4;
+				default: return 2;
+			}
+		case Family::MUBUF:
+		case Family::MTBUF:
+			return index == 1 ? 4u : 1u;
+		case Family::MIMG:
+			if (index == 1) {
+				return inst.image_r128 ? 4u : 8u;
+			}
+			return index == 2 ? 4u : 1u;
+		default: return 1;
+	}
+}
+
+bool InstructionReadsDestination(const Instruction& inst) {
+	switch (inst.family) {
+		case Family::MUBUF:
+		case Family::MTBUF:
+			return IsBufferStoreOpcode(inst.opcode) || IsBufferAtomicOpcode(inst.opcode);
+		case Family::FLAT: return IsFlatStoreOpcode(inst.opcode);
+		case Family::MIMG:
+			return inst.opcode == Opcode::IMAGE_STORE || inst.opcode == Opcode::IMAGE_STORE_MIP ||
+			       IsImageAtomicOpcode(inst.opcode);
+		default: return false;
+	}
+}
 
 void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {

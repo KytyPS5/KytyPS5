@@ -32,6 +32,12 @@ struct GraphicContext {
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               compute_wave64_supported              = false;
+	bool                               mesh_shader_enabled                   = false;
+	uint32_t                           max_mesh_work_group_invocations       = 0;
+	uint32_t                           max_mesh_output_vertices              = 0;
+	uint32_t                           max_mesh_output_primitives            = 0;
+	uint32_t                           max_mesh_shared_memory_size           = 0;
+	uint32_t                           max_mesh_work_group_count[3]          = {};
 	bool                               sample_rate_shading_enabled           = false;
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;

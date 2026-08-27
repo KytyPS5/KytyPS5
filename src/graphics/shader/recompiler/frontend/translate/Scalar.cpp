@@ -13,6 +13,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst, std::string* error
 		case O::S_SETPC_B64: return true;
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return true;
 		case O::S_CSELECT_B64: S_CSELECT_B64(inst); return true;
+		case O::S_CMOV_B32: S_CMOV_B32(inst); return true;
+		case O::S_CMOV_B64: S_CMOV_B64(inst); return true;
 		case O::S_SETREG_B32: EmitControlNop(); return true;
 		case O::S_WAITCNT: EmitWaitcnt(); return true;
 
@@ -203,7 +205,7 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst, std::string* error
 		case O::S_TRAP: EmitControlNop(); return true;
 		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return true;
 		case O::S_BARRIER: S_BARRIER(); return true;
-		case O::S_SENDMSG: S_SENDMSG(); return true;
+		case O::S_SENDMSG: S_SENDMSG(inst); return true;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return true;
 		case O::S_INST_PREFETCH: S_INST_PREFETCH(); return true;
 		case O::S_BRANCH:

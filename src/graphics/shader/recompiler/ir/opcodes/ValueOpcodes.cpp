@@ -90,6 +90,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::SetAttribute:
+		case ValueOpcode::Sendmsg:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
 	}

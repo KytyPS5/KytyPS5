@@ -494,6 +494,8 @@ std::string InstructionToString(const Instruction& inst) {
 	switch (inst.opcode) {
 		case Opcode::S_MOV_B32:
 		case Opcode::S_MOV_B64:
+		case Opcode::S_CMOV_B32:
+		case Opcode::S_CMOV_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.dst).c_str(),
@@ -504,6 +506,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_FF1_I32_B32:
 		case Opcode::S_FF1_I32_B64:
 		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:

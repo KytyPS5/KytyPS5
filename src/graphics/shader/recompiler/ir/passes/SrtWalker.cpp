@@ -21,6 +21,7 @@ const char* StageName(ShaderType stage) {
 		case ShaderType::Pixel: return "pixel";
 		case ShaderType::Fetch: return "fetch";
 		case ShaderType::Compute: return "compute";
+		case ShaderType::Mesh: return "mesh";
 		default: return "unknown";
 	}
 }
@@ -565,7 +566,10 @@ private:
 		uint32_t word = 0;
 		if (m_runtime.read_memory != nullptr) {
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
-				return Fail(error, fmt::format("constant read failed at 0x{:016x}", address));
+				return Fail(error,
+				            fmt::format("constant read failed at 0x{:016x} (descriptor base "
+				                        "0x{:012x}, dword offset 0x{:x})",
+				                        address, base, address - base));
 			}
 		} else {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));

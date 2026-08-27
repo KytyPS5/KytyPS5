@@ -13,6 +13,16 @@ bool IsExecOrVcc(const Decoder::Operand& operand) {
 	}
 }
 
+// A 32-bit move only names the whole lane mask through its low half; naming the high half is a
+// plain raw copy, so it must not be widened into a mask move.
+bool IsExecOrVccLo(const Decoder::Operand& operand) {
+	switch (operand.kind) {
+		case Decoder::OperandKind::ExecLo:
+		case Decoder::OperandKind::VccLo: return true;
+		default: return false;
+	}
+}
+
 Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 	Decoder::Operand operand;
 	operand.kind = kind;
@@ -23,6 +33,34 @@ Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
+	if (current_logical_wave64) {
+		// The logical wave is wider than the host subgroup, so the mask lives in the raw
+		// EXEC halves rather than in a per-invocation bit.
+		const auto old_low  = ir.GetExecLo();
+		const auto old_high = ir.GetExecHi();
+		const auto src_low  = ReadRawU32(inst.src0);
+		const auto src_high =
+		    write_64 ? ReadRawU32(OffsetOperand(inst.src0, 1)) : IR::U32(IR::Value(0u));
+		const auto apply = [&](IR::U32 old_value, IR::U32 src_value) {
+			const auto lhs = negate_exec ? ir.BitwiseNot(old_value) : old_value;
+			const auto rhs = negate_source ? ir.BitwiseNot(src_value) : src_value;
+			return operation == IR::ValueOpcode::LogicalOr ? ir.BitwiseOr(lhs, rhs)
+			                                               : ir.BitwiseAnd(lhs, rhs);
+		};
+		const auto result_low  = apply(old_low, src_low);
+		const auto result_high = write_64 ? apply(old_high, src_high) : old_high;
+		if (write_64) {
+			WriteU32Pair(inst.dst, {old_low, old_high});
+		} else {
+			WriteOperand(inst.dst, old_low);
+		}
+		ir.SetExecLo(result_low);
+		ir.SetExecHi(result_high);
+		ir.SetExec(ThreadBit(result_low, result_high));
+		const auto nonzero = write_64 ? ir.BitwiseOr(result_low, result_high) : result_low;
+		ir.SetScc(ir.INotEqual(nonzero, IR::U32(IR::Value(0u))));
+		return;
+	}
 	const auto old    = ir.GetExec();
 	const auto src    = ReadMask(inst.src0);
 	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
@@ -141,8 +179,17 @@ void Translator::S_BARRIER() {
 	ir.Emit(IR::ValueOpcode::Barrier);
 }
 
-void Translator::S_SENDMSG() {
-	ir.Emit(IR::ValueOpcode::Sendmsg);
+void Translator::S_SENDMSG(const Decoder::Instruction& inst) {
+	// Only the allocation request reaches the mesh output; the other messages address hardware
+	// the mesh stage does not have, so emitting them would export a primitive that is not there.
+	constexpr uint32_t GsAllocReq = 9;
+	const auto&        message    = inst.src0;
+	const bool         immediate  = message.kind == Decoder::OperandKind::LiteralConstant ||
+	                        message.kind == Decoder::OperandKind::IntegerInlineConstant;
+	if (immediate && (message.value & 0xfu) != GsAllocReq) {
+		return;
+	}
+	ir.Emit(IR::ValueOpcode::Sendmsg, {ir.GetM0()});
 }
 
 void Translator::S_TTRACEDATA() {
@@ -191,19 +238,37 @@ bool Translator::S_GETPC_B64(const Decoder::Instruction& inst, std::string* erro
 }
 
 void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
-	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.src1));
-	WriteOperand(DestinationOperand(inst), result);
+	SelectOn32(inst, inst.src1);
 }
 
 void Translator::S_CSELECT_B64(const Decoder::Instruction& inst) {
+	SelectOn64(inst, inst.src1);
+}
+
+// S_CMOV leaves the destination untouched when SCC is clear, so it is the same select with the
+// destination itself standing in as the false operand.
+void Translator::S_CMOV_B32(const Decoder::Instruction& inst) {
+	SelectOn32(inst, inst.dst);
+}
+
+void Translator::S_CMOV_B64(const Decoder::Instruction& inst) {
+	SelectOn64(inst, inst.dst);
+}
+
+void Translator::SelectOn32(const Decoder::Instruction& inst, const Decoder::Operand& if_false) {
+	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(if_false));
+	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::SelectOn64(const Decoder::Instruction& inst, const Decoder::Operand& if_false) {
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
-	const auto rhs           = ReadU32Pair(inst.src1);
+	const auto rhs           = ReadU32Pair(if_false);
 	const auto selected_mask = IR::U1(
-	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(inst.src1)}));
+	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(if_false)}));
 	const auto selected_mask_valid =
 	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
-	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(inst.src1)}));
+	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(if_false)}));
 	if (IsExecOrVcc(inst.dst)) {
 		WriteMask64(inst.dst, selected_mask);
 		return;
@@ -218,7 +283,7 @@ void Translator::S_CSELECT_B64(const Decoder::Instruction& inst) {
 }
 
 void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers) {
-	if (IsExecOrVcc(inst.src0) && IsExecOrVcc(inst.dst)) {
+	if (IsExecOrVccLo(inst.src0) && IsExecOrVccLo(inst.dst)) {
 		WriteMask(inst.dst, ReadMask(inst.src0));
 	} else if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute)) {
 		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));

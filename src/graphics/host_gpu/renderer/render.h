@@ -146,6 +146,8 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	void SetMeshIndices(const void* index_addr, uint32_t index_type_and_size,
+	                    uint32_t index_count);
 
 private:
 	struct GraphicsBindings {
@@ -190,6 +192,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	std::vector<uint32_t>                 m_mesh_index_scratch;
+	BufferView                            m_mesh_index_view {};
 	std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>
 	    m_push_constants {};
 

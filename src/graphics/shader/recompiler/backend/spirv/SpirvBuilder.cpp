@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include <algorithm>
 
 #include "common/debug.h"
 
@@ -35,6 +36,10 @@ void Builder::RequireCapability(uint32_t capability) {
 	if (m_required_capabilities.insert(capability).second) {
 		AddCapability({capability});
 	}
+}
+
+void Builder::RequireVersion(uint32_t version) {
+	m_version = std::max(m_version, version);
 }
 
 void Builder::RequireExtension(const char* name) {
@@ -133,6 +138,7 @@ uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_c
 
 void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class) {
 	AddType({59u, pointer_type, id, storage_class});
+	m_global_variables.push_back(id);
 }
 
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
@@ -187,10 +193,9 @@ void Builder::AddMemoryModel(std::initializer_list<uint32_t> operands) {
 
 void Builder::AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,
                             const std::vector<uint32_t>& interfaces) {
-	std::vector<uint32_t> operands = {execution_model, entry_point};
-	AppendString(operands, name);
-	operands.insert(operands.end(), interfaces.begin(), interfaces.end());
-	AppendInstruction(m_entry_points, 15u, operands);
+	m_entry_point_prefix = {execution_model, entry_point};
+	AppendString(m_entry_point_prefix, name);
+	m_entry_point_interface = interfaces;
 }
 
 void Builder::AddExecutionMode(std::initializer_list<uint32_t> operands) {
@@ -241,9 +246,24 @@ void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value,
 std::vector<uint32_t> Builder::Build() const {
 	EXIT_IF(m_unpatched_phi_incomings != 0);
 
+	std::vector<uint32_t> entry_points;
+	if (!m_entry_point_prefix.empty()) {
+		auto operands = m_entry_point_prefix;
+		operands.insert(operands.end(), m_entry_point_interface.begin(),
+		                m_entry_point_interface.end());
+		if (m_version >= 0x00010400u) {
+			for (const auto id: m_global_variables) {
+				if (std::find(operands.begin(), operands.end(), id) == operands.end()) {
+					operands.push_back(id);
+				}
+			}
+		}
+		AppendInstruction(entry_points, 15u, operands);
+	}
+
 	std::vector<uint32_t> module;
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +
-	               m_memory_model.size() + m_entry_points.size() + m_execution_modes.size() +
+	               m_memory_model.size() + entry_points.size() + m_execution_modes.size() +
 	               m_debug.size() + m_annotations.size() + m_declarations.size() +
 	               m_functions.size());
 
@@ -257,7 +277,7 @@ std::vector<uint32_t> Builder::Build() const {
 	module.insert(module.end(), m_extensions.begin(), m_extensions.end());
 	module.insert(module.end(), m_ext_inst_imports.begin(), m_ext_inst_imports.end());
 	module.insert(module.end(), m_memory_model.begin(), m_memory_model.end());
-	module.insert(module.end(), m_entry_points.begin(), m_entry_points.end());
+	module.insert(module.end(), entry_points.begin(), entry_points.end());
 	module.insert(module.end(), m_execution_modes.begin(), m_execution_modes.end());
 	module.insert(module.end(), m_debug.begin(), m_debug.end());
 	module.insert(module.end(), m_annotations.begin(), m_annotations.end());

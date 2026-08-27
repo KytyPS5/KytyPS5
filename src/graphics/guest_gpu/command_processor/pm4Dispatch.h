@@ -98,6 +98,7 @@ uint32_t HwCtxSetViewportScaleOffset(CommandProcessor&, uint32_t, uint32_t, cons
                                      uint32_t);
 uint32_t HwShSetPsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetGsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
+uint32_t HwShSetGsUserDataAddr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetHsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetCsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetPsUserAccumSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

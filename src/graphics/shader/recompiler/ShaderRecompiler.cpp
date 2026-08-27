@@ -17,6 +17,7 @@
 #include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/shaderMergedGeometry.h"
 
 #include <algorithm>
 #include <array>
@@ -481,9 +482,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		return false;
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel) {
+	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh) {
 		if (error != nullptr) {
-			*error = "shader recompiler supports compute, vertex, and pixel stages";
+			*error = "shader recompiler supports compute, vertex, pixel, and mesh stages";
 		}
 		return false;
 	}
@@ -565,6 +566,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	const ShaderPixelInputInfo*   pixel   = nullptr;
 	const ShaderComputeInputInfo* compute = nullptr;
 	switch (options.stage) {
+		case ShaderType::Mesh:
 		case ShaderType::Vertex: vertex = options.input_info.vertex; break;
 		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
 		case ShaderType::Compute: compute = options.input_info.compute; break;
@@ -618,9 +620,16 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	if (options.stage == ShaderType::Compute) {
-		const auto lds_barriers =
-		    IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *compute);
+	if (options.stage == ShaderType::Compute || options.stage == ShaderType::Mesh) {
+		const bool mesh = options.stage == ShaderType::Mesh;
+		const auto threadgroup_size =
+		    mesh ? MeshWaveLanes
+		         : compute->threads_num[0] * compute->threads_num[1] * compute->threads_num[2];
+		const auto lds_size_dwords =
+		    mesh ? vertex->mesh_lds_size_dwords : compute->lds_size_dwords;
+		const auto needs_barriers = mesh || compute->needs_lds_barriers;
+		const auto lds_barriers   = IR::InsertSharedMemoryBarriers(
+		      ir, ir.wave_size, threadgroup_size, lds_size_dwords, needs_barriers);
 		if (lds_barriers.inserted_barriers != 0) {
 			LOGF("%s wave64 LDS synchronization: barriers=%" PRIu32 "\n", GetDumpLabel(options),
 			     lds_barriers.inserted_barriers);

@@ -19,6 +19,9 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eCompute) {
 		result |= vk::PipelineStageFlagBits::eComputeShader;
 	}
+	if (stages & vk::ShaderStageFlagBits::eMeshEXT) {
+		result |= vk::PipelineStageFlagBits::eMeshShaderEXT;
+	}
 	EXIT_IF(!result);
 	return result;
 }
@@ -122,7 +125,7 @@ void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sour
 	    source_stages,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eVertexInput |
 	        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader |
-	        vk::PipelineStageFlagBits::eTransfer |
+	        vk::PipelineStageFlagBits::eMeshShaderEXT | vk::PipelineStageFlagBits::eTransfer |
 	        vk::PipelineStageFlagBits::eColorAttachmentOutput,
 	    vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }

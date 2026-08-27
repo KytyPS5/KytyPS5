@@ -862,6 +862,10 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+bool HasGuestAddressSpace() {
+	return g_guest_address_space != nullptr;
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);

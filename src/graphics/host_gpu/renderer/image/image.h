@@ -40,6 +40,7 @@ struct ImageBinding {
 	bool needs_rebind  = false;
 	bool force_general = false;
 	bool shader_write  = false;
+	bool stencil_write = false;
 };
 
 class Image final {
@@ -65,6 +66,7 @@ public:
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
+	void CopyStencilFromColor(Image& source, Buffer& buffer);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {

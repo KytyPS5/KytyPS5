@@ -95,12 +95,10 @@ uint32_t InsertMergeBarrier(Block& block) {
 } // namespace
 
 SharedMemoryBarrierStats InsertSharedMemoryBarriers(Program& program, uint32_t wave_size,
-	                                                 const ShaderComputeInputInfo& compute_info) {
+                                                    uint32_t threadgroup_size,
+                                                    uint32_t lds_size_dwords, bool needs_barriers) {
 	SharedMemoryBarrierStats stats;
-	const auto threadgroup_size = compute_info.threads_num[0] * compute_info.threads_num[1] *
-	                              compute_info.threads_num[2];
-	if (wave_size != 64u || !compute_info.needs_lds_barriers ||
-	    compute_info.lds_size_dwords == 0u || threadgroup_size != 64u) {
+	if (wave_size != 64u || !needs_barriers || lds_size_dwords == 0u || threadgroup_size != 64u) {
 		return stats;
 	}
 	if (program.blocks.size() != program.block_info.size()) {

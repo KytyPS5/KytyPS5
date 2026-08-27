@@ -137,6 +137,12 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters& sh,
 	                                ShaderComputeInputInfo& input_info);
+	// Returns an empty program when the merged pair cannot be translated; the caller then
+	// falls back to the ordinary vertex path.
+	ShaderProgram GetMeshProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                             const MeshDispatch& dispatch, MeshInputTopology topology,
+	                             bool indexed, ShaderVertexInputInfo& input_info,
+	                             std::string* error);
 
 	GraphicsPipeline& CreateGraphicsPipeline(
 	    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,

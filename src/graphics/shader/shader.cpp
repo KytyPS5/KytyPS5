@@ -1,4 +1,5 @@
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderMergedGeometry.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -11,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -53,6 +55,20 @@ namespace {
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
+
+bool ReadShaderMappedMemory(void*, uint64_t address, uint32_t* value) {
+	if (value == nullptr) {
+		return false;
+	}
+	if (Libs::LibKernel::Memory::HasGuestAddressSpace()) {
+		return Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+	}
+	if (!HostMemoryRangeIsReadable(address, sizeof(*value))) {
+		return false;
+	}
+	std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	return true;
 }
 
 } // namespace
@@ -925,6 +941,19 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 			key.push_back(buffer.attr_offsets[j]);
 		}
 	}
+
+	// A mesh permutation bakes its launch state into the program, so two dispatches of the
+	// same ES+GS pair with different geometry are different programs.
+	key.push_back(info.mesh_vertices_per_workgroup);
+	key.push_back(info.mesh_primitives_per_workgroup);
+	key.push_back(info.mesh_last_group_index);
+	key.push_back(info.mesh_last_vertices);
+	key.push_back(info.mesh_last_primitives);
+	key.push_back(info.mesh_output_vertices);
+	key.push_back(info.mesh_output_primitives);
+	key.push_back(info.mesh_topology);
+	key.push_back(static_cast<uint32_t>(info.mesh_indexed));
+	key.push_back(info.mesh_lds_size_dwords);
 }
 
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
@@ -1219,6 +1248,7 @@ static const char* ShaderStageName(ShaderType stage) {
 		case ShaderType::Vertex: return "vs";
 		case ShaderType::Pixel: return "ps";
 		case ShaderType::Compute: return "cs";
+		case ShaderType::Mesh: return "ms";
 		default: EXIT("invalid shader stage\n");
 	}
 }
@@ -1228,6 +1258,7 @@ static const char* ShaderStageLabel(ShaderType stage) {
 		case ShaderType::Vertex: return "ShaderRecompiler VS";
 		case ShaderType::Pixel: return "ShaderRecompiler PS";
 		case ShaderType::Compute: return "ShaderRecompiler CS";
+		case ShaderType::Mesh: return "ShaderRecompiler MS";
 		default: EXIT("invalid shader stage\n");
 	}
 }
@@ -1247,20 +1278,30 @@ static ShaderRecompiler::CompileOptions MakeCompileOptions(const ShaderParams& p
 	return options;
 }
 
+// `error` makes a failed recompile recoverable: mesh draws fall back to the ES/GS path
+// instead of terminating the emulator. Every other stage passes nullptr and exits.
 static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& params,
                                       ShaderRecompiler::CompileOptions options,
-                                      ShaderStageRuntime& stage) {
+                                      ShaderStageRuntime& stage, std::string* error = nullptr) {
 	const auto* stage_name = ShaderStageName(options.stage);
 	const auto* label      = ShaderStageLabel(options.stage);
 	ShaderRecompiler::CompileResult result;
-	std::string                     error;
-	if (!ShaderRecompiler::TryRecompile(params.code, options, result, &error)) {
-		ExitShaderRecompilerFailure(label, options.shader_hash, error.c_str());
+	std::string                     recompile_error;
+	if (!ShaderRecompiler::TryRecompile(params.code, options, result, &recompile_error)) {
+		if (error != nullptr) {
+			*error = fmt::format("recompile failed: {}", recompile_error);
+			return nullptr;
+		}
+		ExitShaderRecompilerFailure(label, options.shader_hash, recompile_error.c_str());
 	}
 
 	DumpShaderRecompilerOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 	if (!SpirvValidateBinary(label, options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
+		if (error != nullptr) {
+			*error = "SPIR-V validation failed";
+			return nullptr;
+		}
 		ExitShaderRecompilerFailure(label, options.shader_hash, "SPIR-V validation failed");
 	}
 	DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
@@ -1287,6 +1328,137 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
 		LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", label,
 		     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 	}
+	return module;
+}
+
+// A merged ES+GS wave does not start its user data at s0: the SPI reserves s0..s7 for the
+// launch state it hands the pair. s[0:1] is the address the guest wrote to
+// SPI_SHADER_USER_DATA_ADDR_LO/HI_GS, and the GS half loads its own resource table from it,
+// so the recompiler has to see the whole window from s0 rather than only the guest's user
+// SGPRs at s8.
+struct MergedGeometryScalars {
+	static constexpr uint32_t LaunchSgprCount = 8;
+
+	std::array<uint32_t, LaunchSgprCount + HW::UserSgprInfo::SGPRS_MAX> value {};
+	uint32_t                                                           count = 0;
+
+	[[nodiscard]] std::span<const uint32_t> Span() const { return {value.data(), count}; }
+};
+
+static MergedGeometryScalars MergedGeometryUserData(const HW::VertexShaderInfo& regs) {
+	MergedGeometryScalars out;
+	const auto            user_count = std::min<uint32_t>(
+	               std::max(static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr), regs.gs_user_sgpr.count),
+	               HW::UserSgprInfo::SGPRS_MAX);
+	out.value[0] = regs.gs_user_data_addr[0];
+	out.value[1] = regs.gs_user_data_addr[1];
+	for (uint32_t i = 0; i < user_count; i++) {
+		out.value[MergedGeometryScalars::LaunchSgprCount + i] = regs.gs_user_sgpr.value[i];
+	}
+	out.count = MergedGeometryScalars::LaunchSgprCount + user_count;
+	return out;
+}
+
+static bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& data) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+
+	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		data = iter->second;
+		return true;
+	}
+	return false;
+}
+
+bool PrepareMeshProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
+                        const MeshDispatch& dispatch, MeshInputTopology topology, bool indexed,
+                        ShaderVertexInputInfo& info, std::vector<uint32_t>& user_data,
+                        ShaderParams& params, std::string* error) {
+	KYTY_PROFILER_FUNCTION();
+
+	user_data.clear();
+	params = {};
+
+	if (regs.es_regs.data_addr == 0 || regs.gs_regs.data_addr == 0) {
+		return ShaderError::Fail(error, "a merged geometry pair needs both an ES and a GS address");
+	}
+
+	ShaderMappedData es_data;
+	ShaderMappedData gs_data;
+	if (!ShaderTryGetMappedData(regs.es_regs.data_addr, es_data) ||
+	    !ShaderTryGetMappedData(regs.gs_regs.data_addr, gs_data)) {
+		return ShaderError::Fail(error, "the ES or GS program is missing from ShaderMap");
+	}
+
+	if (!ShaderGetStaticInputInfoVS(regs, sh, es_data, info)) {
+		return ShaderError::Fail(error, "could not read the ES half's resource bindings");
+	}
+	info.wave_size                     = 64;
+	info.mesh_vertices_per_workgroup   = dispatch.vertices_per_workgroup;
+	info.mesh_primitives_per_workgroup = dispatch.primitives_per_workgroup;
+	info.mesh_last_group_index         = dispatch.workgroup_count - 1;
+	info.mesh_last_vertices            = dispatch.last_vertices;
+	info.mesh_last_primitives          = dispatch.last_primitives;
+	info.mesh_output_vertices          = dispatch.output_vertices_per_workgroup;
+	info.mesh_output_primitives        = dispatch.output_primitives_per_workgroup;
+	info.mesh_topology                 = static_cast<uint32_t>(topology);
+	info.mesh_indexed                  = indexed;
+	info.mesh_lds_size_dwords          = MeshLdsDwords(regs.gs_regs.rsrc2.lds_size);
+
+	// The launch window is synthesised rather than read out of a register file, so the caller
+	// owns it and `params` only views it.
+	const auto scalars = MergedGeometryUserData(regs);
+	user_data.assign(scalars.Span().begin(), scalars.Span().end());
+	params.user_data     = user_data;
+	params.hash          = regs.gs_regs.chksum;
+	// The assembled words live on the host heap, so key the permutation on the ES address the
+	// guest actually launched instead of wherever the assembly happened to land.
+	params.base_override = regs.es_regs.data_addr;
+	return true;
+}
+
+bool AssembleMeshProgram(const HW::VertexShaderInfo& regs, std::vector<uint32_t>& code,
+                         ShaderParams& params, std::string* error) {
+	KYTY_PROFILER_FUNCTION();
+
+	ShaderMappedData es_data;
+	ShaderMappedData gs_data;
+	if (!ShaderTryGetMappedData(regs.es_regs.data_addr, es_data) ||
+	    !ShaderTryGetMappedData(regs.gs_regs.data_addr, gs_data)) {
+		return ShaderError::Fail(error, "the ES or GS program is missing from ShaderMap");
+	}
+
+	MergedGeometryProgram merged;
+	if (!ShaderAssembleMergedGeometry(
+	        {reinterpret_cast<const uint32_t*>(regs.es_regs.data_addr),
+	         es_data.code_size_bytes / sizeof(uint32_t)},
+	        {reinterpret_cast<const uint32_t*>(regs.gs_regs.data_addr),
+	         gs_data.code_size_bytes / sizeof(uint32_t)},
+	        merged, error)) {
+		return false;
+	}
+
+	code        = std::move(merged.code);
+	params.code = code;
+	return true;
+}
+
+vk::ShaderModule CompileMeshProgram(vk::Device device, const ShaderParams& params,
+                                    ShaderVertexInputInfo& input_info, std::string* error) {
+	KYTY_PROFILER_FUNCTION(profiler::colors::Amber300);
+	auto options           = MakeCompileOptions(params, ShaderType::Mesh);
+	options.wave_size      = input_info.wave_size;
+	// `params.user_data` already starts at the SPI's launch window, so the pair sees s0.
+	options.user_data_base    = 0;
+	options.scratch_dwords    = input_info.scratch_size_dwords;
+	options.read_memory       = ReadShaderMappedMemory;
+	options.input_info.vertex = &input_info;
+	const auto module         = CompileModule(device, params, options, input_info.stage, error);
+	if (module == nullptr) {
+		return nullptr;
+	}
+	ApplyVertexOutputs(input_info, *input_info.stage.program);
 	return module;
 }
 

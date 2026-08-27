@@ -42,6 +42,7 @@ bool ValidateOptions(const Program& program, const ShaderInfoOptions& options, s
 		return false;
 	};
 	switch (program.stage) {
+		case ShaderType::Mesh:
 		case ShaderType::Vertex:
 			if (options.vertex->resources_num < 0 ||
 			    options.vertex->resources_num > ShaderVertexInputInfo::RES_MAX) {
@@ -380,7 +381,12 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
-		default: return false;
+		case ShaderType::Mesh: break;
+		default:
+			if (error != nullptr) {
+				*error = "unsupported shader stage for input collection";
+			}
+			return false;
 	}
 	CollectBuiltinInputs(program, next);
 	if (!CollectOutputs(program, options.vertex, options.pixel, next, error)) {

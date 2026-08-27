@@ -9,9 +9,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
-	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size)
+	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size,
+	           bool logical_wave64 = false)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      current_wave_size(wave_size) {}
+	      current_wave_size(wave_size), current_logical_wave64(logical_wave64) {}
 
 	bool TranslateInstruction(const Decoder::Instruction& inst, std::string* error);
 	bool TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -29,7 +30,7 @@ private:
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
 	IR::Value              ReadOperand(const Decoder::Operand& operand, IR::Type type);
-	IR::U1                 ThreadBit(IR::U32 low);
+	IR::U1                 ThreadBit(IR::U32 low, IR::U32 high);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
@@ -223,12 +224,16 @@ private:
 	void EmitControlNop();
 	void EmitWaitcnt();
 	void S_BARRIER();
-	void S_SENDMSG();
+	void S_SENDMSG(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();
 	void S_INST_PREFETCH();
 	bool S_GETPC_B64(const Decoder::Instruction& inst, std::string* error);
 	void S_CSELECT_B32(const Decoder::Instruction& inst);
 	void S_CSELECT_B64(const Decoder::Instruction& inst);
+	void S_CMOV_B32(const Decoder::Instruction& inst);
+	void S_CMOV_B64(const Decoder::Instruction& inst);
+	void SelectOn32(const Decoder::Instruction& inst, const Decoder::Operand& if_false);
+	void SelectOn64(const Decoder::Instruction& inst, const Decoder::Operand& if_false);
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);
 	void S_WQM_B64(const Decoder::Instruction& inst);
@@ -250,10 +255,11 @@ private:
 
 	IR::Program&    program;
 	IR::IREmitter   ir;
-	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
-	uint32_t        current_pc           = 0;
-	uint32_t        current_vector_limit = 1;
-	uint32_t        current_wave_size    = 64;
+	Decoder::Opcode current_opcode         = Decoder::Opcode::UNKNOWN;
+	uint32_t        current_pc             = 0;
+	uint32_t        current_vector_limit   = 1;
+	uint32_t        current_wave_size      = 64;
+	bool            current_logical_wave64 = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

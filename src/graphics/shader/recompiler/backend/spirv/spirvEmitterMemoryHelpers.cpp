@@ -64,14 +64,20 @@ void EmitMemoryOffsets(EmitterState& state) {
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
-	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
+	if (state.stage == ShaderType::Compute) {
+		return state.input_info.compute->lds_size_dwords;
+	}
+	if (state.stage == ShaderType::Mesh) {
+		return state.input_info.vertex->mesh_lds_size_dwords;
+	}
+	return 8192u;
 }
 
 static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
-	if (state.stage != ShaderType::Compute) {
+	if (state.stage != ShaderType::Compute && state.stage != ShaderType::Mesh) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
 	state.lds_variable = state.builder.DefineGlobalVariable(
@@ -153,9 +159,11 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
                                   uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		const auto shared_lds =
+		    state.stage == ShaderType::Compute || state.stage == ShaderType::Mesh;
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
-		                           : state.stage == ShaderType::Compute     ? StorageClassWorkgroup
-		                                                                    : StorageClassFunction;
+		                           : shared_lds                            ? StorageClassWorkgroup
+		                                                                   : StorageClassFunction;
 		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                           pointer, access.object_pointer, index});
 	} else {

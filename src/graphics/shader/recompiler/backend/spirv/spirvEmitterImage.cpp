@@ -199,6 +199,46 @@ uint32_t FloatBits(ValueEmitContext& ctx, uint32_t value) {
 	return Unary(ctx.state, OpBitcast, TypeU32(ctx.state), value);
 }
 
+uint32_t DepthCompareOpcode(uint32_t compare_func) {
+	switch (compare_func) {
+		case 1: return OpFOrdLessThan;
+		case 2: return OpFOrdEqual;
+		case 3: return OpFOrdLessThanEqual;
+		case 4: return OpFOrdGreaterThan;
+		case 5: return OpFOrdNotEqual;
+		case 6: return OpFOrdGreaterThanEqual;
+		default: return 0;
+	}
+}
+
+uint32_t EmitDepthCompareTexel(EmitterState& state, uint32_t texel, uint32_t reference,
+                               uint32_t compare_func) {
+	const auto compare_op = DepthCompareOpcode(compare_func);
+	if (compare_op == 0) {
+		return ConstantF32Value(state, compare_func == 7u ? 1.0f : 0.0f);
+	}
+	const auto passed = state.builder.AllocateId();
+	state.builder.AddFunction({compare_op, TypeBool(state), passed, reference, texel});
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeF32(state), result, passed,
+	                           ConstantF32Value(state, 1.0f), ConstantF32Value(state, 0.0f)});
+	return result;
+}
+
+uint32_t EmitDepthCompareGather(EmitterState& state, uint32_t sample, uint32_t reference,
+                                uint32_t compare_func) {
+	std::array<uint32_t, 4> components {};
+	for (uint32_t i = 0; i < components.size(); i++) {
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, TypeF32(state), texel, sample, i});
+		components[i] = EmitDepthCompareTexel(state, texel, reference, compare_func);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 4), result, components[0],
+	                           components[1], components[2], components[3]});
+	return result;
+}
+
 uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool dref,
                       const IR::MemoryInfo& mem, bool gather = false) {
 	if (mem.data_bits == 16u) {
@@ -615,25 +655,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			const auto            sampled = MakeSampledImage(state, mem, pc, view);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words =
-			    dref ? std::vector<uint32_t> {OpImageDrefGather,
-			                                  TypeF32Vector(state, 4),
-			                                  sample,
-			                                  sampled,
-			                                  coord,
-			                                  layout.dref != NoImageComponent
-			                                      ? AddressF32(ctx, mem, *address, layout.dref)
-			                                      : ZeroF32(state)}
-			         : std::vector<uint32_t> {
-			               OpImageGather,
-			               integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4),
-			               sample,
-			               sampled,
-			               coord,
-			               ConstantU32(state, ImageConversionFormat(state, mem).format ==
-			                                          Prospero::BufferFormat::kInvalid
-			                                      ? ImageGatherComponent(mem.dmask)
-			                                      : 0u)};
+			std::vector<uint32_t> words {
+			    OpImageGather,
+			    integer && !dref ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4),
+			    sample,
+			    sampled,
+			    coord,
+			    ConstantU32(state, dref || ImageConversionFormat(state, mem).format !=
+			                                   Prospero::BufferFormat::kInvalid
+			                           ? 0u
+			                           : ImageGatherComponent(mem.dmask))};
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(ImageOperandsConstOffsetsMask);
 				words.push_back(HorizontalOffsets(state, view));
@@ -642,7 +673,17 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
 			}
 			state.builder.AddFunction(words);
-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+			const auto gathered =
+			    dref ? EmitDepthCompareGather(
+			               state, sample,
+			               layout.dref != NoImageComponent
+			                   ? AddressF32(ctx, mem, *address, layout.dref)
+			                   : ZeroF32(state),
+			               mem.sampler < state.program.info.samplers.size()
+			                   ? state.program.info.samplers[mem.sampler].depth_compare_func
+			                   : 0u)
+			         : sample;
+			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, gathered),
 			                              integer && !dref, false, mem, true));
 			return true;
 		}
@@ -650,11 +691,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 		                          state.stage != ShaderType::Pixel;
-		const auto opcode = explicit_lod
-		                        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
-		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
-		const auto result_type =
-		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
+		const auto opcode      = explicit_lod ? OpImageSampleExplicitLod : OpImageSampleImplicitLod;
+		const auto result_type = integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		const auto dref_value =
 		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
 		                                            : ZeroF32(state))
@@ -681,9 +719,6 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto            sampled = MakeSampledImage(state, mem, pc, view, resource);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
-			if (dref) {
-				words.push_back(dref_value);
-			}
 			if (operand_mask != 0u) {
 				words.push_back(operand_mask);
 				words.insert(words.end(), operands.begin(), operands.end());
@@ -691,10 +726,21 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(words);
 			return sample;
 		};
+		const auto EmitDepthCompare = [&](uint32_t sample) {
+			const auto texel = state.builder.AllocateId();
+			state.builder.AddFunction({OpCompositeExtract, TypeF32(state), texel, sample, 0u});
+			return EmitDepthCompareTexel(
+			    state, texel, dref_value,
+			    mem.sampler < state.program.info.samplers.size()
+			        ? state.program.info.samplers[mem.sampler].depth_compare_func
+			        : 0u);
+		};
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
+			ctx.Define(inst, ResultVector(ctx,
+			                              dref ? EmitDepthCompare(sample)
+			                                   : UnpackImageTexel(ctx, mem, sample),
 			                              integer, dref, mem));
 			return true;
 		}
@@ -787,7 +833,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
 		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
+		           ResultVector(ctx,
+		                        dref ? EmitDepthCompare(phi_words[2])
+		                             : UnpackImageTexel(ctx, mem, phi_words[2]),
 		                        integer, dref, mem));
 		return true;
 	}

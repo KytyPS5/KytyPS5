@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderMergedGeometry.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -421,7 +422,202 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_execute_on_noop;
 }
 
-static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
+struct MeshDrawPlan {
+	bool         active = false;
+	MeshDispatch dispatch;
+	uint32_t          instance_count = 1;
+	MeshInputTopology topology       = MeshInputTopology::TriangleList;
+	bool        indexed     = false;
+	const void* index_addr  = nullptr;
+	uint32_t    index_type  = 0;
+	uint32_t    index_count = 0;
+};
+
+static bool IsSupportedMeshIndexType(uint32_t index_type_and_size) {
+	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
+		case Prospero::IndexType::kIndex8:
+		case Prospero::IndexType::kIndex16:
+		case Prospero::IndexType::kIndex32: return true;
+		default: return false;
+	}
+}
+
+static bool DrawIndicesAreIdentity(const void* index_addr, uint32_t index_type_and_size,
+                                   uint32_t index_count) {
+	if (index_addr == nullptr) {
+		return false;
+	}
+	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
+		case Prospero::IndexType::kIndex8: {
+			const auto* indices = static_cast<const uint8_t*>(index_addr);
+			for (uint32_t i = 0; i < index_count; i++) {
+				if (indices[i] != i) {
+					return false;
+				}
+			}
+			return index_count <= 0x100u;
+		}
+		case Prospero::IndexType::kIndex16: {
+			const auto* indices = static_cast<const uint16_t*>(index_addr);
+			for (uint32_t i = 0; i < index_count; i++) {
+				if (indices[i] != i) {
+					return false;
+				}
+			}
+			return index_count <= 0x10000u;
+		}
+		case Prospero::IndexType::kIndex32: {
+			const auto* indices = static_cast<const uint32_t*>(index_addr);
+			for (uint32_t i = 0; i < index_count; i++) {
+				if (indices[i] != i) {
+					return false;
+				}
+			}
+			return true;
+		}
+		default: return false;
+	}
+}
+
+static bool PlanMeshDraw(const CommandBuffer& buffer, const void* index_addr,
+                         uint32_t index_type_and_size, uint32_t index_count,
+                         uint32_t instance_count, uint32_t first_instance, int32_t vertex_offset,
+                         MeshDrawPlan& plan, std::string* reason) {
+	plan = {};
+
+	const auto& ctx = buffer.GetRegisters();
+	if (!ctx.GetShaderStagesEn().IsNggMergedEsGs()) {
+		return false; // Not a geometry draw at all; nothing to report.
+	}
+
+	const auto& graphics = buffer.GetContext().GetGraphics();
+	const auto& sh_regs  = ctx.GetShaderRegisters();
+	const auto& ge_cntl  = buffer.GetUserConfig().GetGeControl();
+	const auto& vs_regs  = buffer.GetShaders().GetVs();
+
+	const auto reject = [reason](const std::string& message) {
+		if (reason != nullptr) {
+			*reason = message;
+		}
+		return false;
+	};
+
+	if (!graphics.mesh_shader_enabled) {
+		return reject("VK_EXT_mesh_shader is unavailable");
+	}
+	if (vs_regs.es_regs.data_addr == 0 || vs_regs.gs_regs.data_addr == 0) {
+		return reject("the pair is missing one of its two programs");
+	}
+	if (ctx.GetShaderStagesEn().gs_w32_en) {
+		return reject("the merged pair is wave32, and only wave64 is translated");
+	}
+	if (static_cast<Prospero::GsOutputPrimitiveType>(sh_regs.m_vgtGsOutPrimType) !=
+	    Prospero::GsOutputPrimitiveType::kTriangles) {
+		return reject(fmt::format("output primitive type {} is not triangles",
+		                          sh_regs.m_vgtGsOutPrimType));
+	}
+	if (sh_regs.m_vgtGsMaxVertOut < 3) {
+		return reject(fmt::format("{} output vertices per primitive cannot form a triangle",
+		                          sh_regs.m_vgtGsMaxVertOut));
+	}
+	const auto prim_type = buffer.GetUserConfig().GetPrimType();
+	switch (prim_type) {
+		case Prospero::PrimitiveType::kTriList:
+			plan.topology = MeshInputTopology::TriangleList;
+			break;
+		case Prospero::PrimitiveType::kTriStrip:
+			plan.topology = MeshInputTopology::TriangleStrip;
+			break;
+		default:
+			return reject(fmt::format("input primitive type {} is not a triangle list or strip",
+			                          static_cast<uint32_t>(prim_type)));
+	}
+	if (prim_type == Prospero::PrimitiveType::kTriList && index_count % 3u != 0) {
+		return reject(fmt::format("{} indices do not divide into whole triangles", index_count));
+	}
+	if (vertex_offset != 0 || first_instance != 0) {
+		return reject(fmt::format("vertex offset {} / first instance {} are not folded into the "
+		                          "launch state",
+		                          vertex_offset, first_instance));
+	}
+	const bool identity_indices =
+	    index_addr == nullptr || DrawIndicesAreIdentity(index_addr, index_type_and_size,
+	                                                    index_count);
+	if (!identity_indices) {
+		if (!IsSupportedMeshIndexType(index_type_and_size)) {
+			return reject(
+			    fmt::format("index type {} is not a known index encoding", index_type_and_size));
+		}
+		plan.indexed    = true;
+		plan.index_addr = index_addr;
+		plan.index_type = index_type_and_size;
+	}
+	plan.index_count = index_count;
+
+	std::string error;
+	if (!ShaderComputeMeshDispatch(MeshPrimitiveCount(plan.topology, index_count), 3u,
+	                               sh_regs.m_vgtGsMaxVertOut, ge_cntl.vertex_group_size,
+	                               ge_cntl.primitive_group_size, sh_regs.m_geMaxOutputPerSubgroup,
+	                               plan.dispatch, &error)) {
+		return reject(error);
+	}
+	if (plan.dispatch.workgroup_count == 0) {
+		return reject("the draw has no whole primitives");
+	}
+	if (!ShaderValidateMeshLds(MeshLdsDwords(vs_regs.gs_regs.rsrc2.lds_size),
+	                           graphics.max_mesh_shared_memory_size, &error)) {
+		return reject(error);
+	}
+	if (plan.dispatch.output_vertices_per_workgroup > graphics.max_mesh_output_vertices ||
+	    plan.dispatch.output_primitives_per_workgroup > graphics.max_mesh_output_primitives ||
+	    MeshWaveLanes > graphics.max_mesh_work_group_invocations) {
+		return reject(fmt::format("a workgroup emitting {} vertices / {} primitives over {} "
+		                          "invocations exceeds the host mesh limits ({} / {} / {})",
+		                          plan.dispatch.output_vertices_per_workgroup,
+		                          plan.dispatch.output_primitives_per_workgroup, MeshWaveLanes,
+		                          graphics.max_mesh_output_vertices,
+		                          graphics.max_mesh_output_primitives,
+		                          graphics.max_mesh_work_group_invocations));
+	}
+
+	if (plan.dispatch.workgroup_count > graphics.max_mesh_work_group_count[0] ||
+	    instance_count > graphics.max_mesh_work_group_count[1]) {
+		return reject(fmt::format("a {}x{} workgroup grid exceeds the host's {}x{}",
+		                          plan.dispatch.workgroup_count, instance_count,
+		                          graphics.max_mesh_work_group_count[0],
+		                          graphics.max_mesh_work_group_count[1]));
+	}
+
+	plan.instance_count = instance_count;
+	plan.active         = true;
+
+	return true;
+}
+
+static void LogMergedGeometryRejection(const CommandBuffer& buffer, const std::string& reason,
+                                       uint32_t index_count) {
+	if (reason.empty() || !buffer.GetRegisters().GetShaderStagesEn().IsNggMergedEsGs()) {
+		return;
+	}
+	static std::mutex               seen_mutex;
+	static std::vector<std::string> seen;
+	{
+		std::scoped_lock lock(seen_mutex);
+		if (std::find(seen.begin(), seen.end(), reason) != seen.end()) {
+			return;
+		}
+		seen.push_back(reason);
+	}
+	const auto& hw     = buffer.GetRegisters();
+	const auto& target = hw.GetRenderTarget(render_target_first_bound_slot(buffer));
+	LOGF("Dropping merged geometry draw (%" PRIu32 " indices): %s\n"
+	     "  would target 0x%010" PRIx64 " %" PRIu32 "x%" PRIu32 " depth=%" PRIu32
+	     " dim=%" PRIu32 "\n",
+	     index_count, reason.c_str(), target.base.addr, target.attrib2.width + 1,
+	     target.attrib2.height + 1, target.attrib3.depth + 1, target.attrib3.dimension);
+}
+
+static bool ShouldSkipGeShader(const CommandBuffer& buffer, const MeshDrawPlan& mesh_plan) {
 	const auto& ctx         = buffer.GetRegisters();
 	const auto& ucfg        = buffer.GetUserConfig();
 	const auto& sh_ctx      = buffer.GetShaders();
@@ -459,6 +655,9 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
+		if (mesh_plan.active) {
+			return false;
+		}
 		static std::once_flag warning_once;
 		std::call_once(warning_once, [] {
 			std::printf("Warning: game uses unsupported graphics pipelines; some draw calls were "
@@ -492,6 +691,7 @@ struct DrawRenderState {
 	ShaderPixelInputInfo  ps_input_info;
 	ShaderProgram         vertex_program;
 	ShaderProgram         pixel_program;
+	MeshDrawPlan          mesh;
 };
 
 struct DrawCallInfo {
@@ -664,7 +864,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.samples);
 		}
-		const auto layout = depth_attachment_layout(depth);
+		const auto layout =
+		    image.binding.is_bound ? vk::ImageLayout::eGeneral : depth_attachment_layout(depth);
 		const auto writes = depth.AttachmentWriteAspects();
 		auto       access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead};
 		if (writes) {
@@ -993,7 +1194,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	return true;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
+static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	EXIT_IF(draw.name == nullptr);
 	auto& ctx    = buffer.GetRegisters();
@@ -1012,14 +1213,31 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 		target_export_mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
 	}
 	if (log_phases) {
-		LogDrawPhase(draw.name, "GetVertexProgram");
+		LogDrawPhase(draw.name, state.mesh.active ? "GetMeshProgram" : "GetVertexProgram");
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
-	state.vertex_program =
-	    pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, state.vs_input_info);
+	if (state.mesh.active) {
+		std::string mesh_error;
+		state.vertex_program =
+		    pipeline_cache.GetMeshProgram(vertex_shader_info, shader_regs, state.mesh.dispatch,
+		                                  state.mesh.topology, state.mesh.indexed,
+		                                  state.vs_input_info, &mesh_error);
+		if (!state.vertex_program) {
+			static std::once_flag mesh_failure_once;
+			std::call_once(mesh_failure_once, [&mesh_error, &draw] {
+				LOGF("Dropping merged geometry draw (%s): mesh compile failed: %s\n", draw.name,
+				     mesh_error.c_str());
+			});
+			state.mesh.active = false;
+			return false;
+		}
+	} else {
+		state.vertex_program =
+		    pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, state.vs_input_info);
+	}
 
 	if (!state.ps_active) {
-		return;
+		return true;
 	}
 	if (log_phases) {
 		LogDrawPhase(draw.name, "GetPixelProgram");
@@ -1027,6 +1245,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	state.pixel_program =
 	    pipeline_cache.GetPixelProgram(pixel_shader_info, shader_regs, state.vs_input_info,
 	                                   target_export_mapping, state.ps_input_info);
+	return true;
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
@@ -1169,8 +1388,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	LogDrawPhase(draw.name, "PrepareBindings");
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
-	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
-	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
+	auto vertex_bindings = state.mesh.active
+	                           ? PreparedVertexBuffers {}
+	                           : PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
+	auto index_binding =
+	    state.mesh.active ? PreparedIndexBuffer {} : PrepareIndexBuffer(buffer, index_source);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
 
@@ -1203,6 +1425,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel) {
 		descriptor_stages[1] = &*bindings.pixel;
 	}
+	if (state.mesh.active && state.mesh.indexed) {
+		SetMeshIndices(state.mesh.index_addr, state.mesh.index_type, state.mesh.index_count);
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
 	CommitIndexBuffer(vk_buffer, index_binding);
@@ -1219,14 +1444,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	if (state.mesh.active) {
+		vk_buffer.drawMeshTasksEXT(state.mesh.dispatch.workgroup_count, state.mesh.instance_count,
+		                           1);
+	} else {
+		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	}
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
 	if (HasShaderBufferWrites(state.vs_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eVertexShader;
+		shader_write_stages |= state.mesh.active ? vk::PipelineStageFlagBits::eMeshShaderEXT
+		                                         : vk::PipelineStageFlagBits::eVertexShader;
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
@@ -1271,7 +1502,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ShouldSkipGeShader(buffer)) {
+	MeshDrawPlan mesh_plan;
+	std::string  mesh_reject;
+	PlanMeshDraw(buffer, index_addr, index_type_and_size, index_count, instance_count,
+	             first_instance, static_cast<int32_t>(ucfg.GetIndexOffset()) + vertex_offset_add,
+	             mesh_plan, &mesh_reject);
+
+	if (ShouldSkipGeShader(buffer, mesh_plan)) {
+		LogMergedGeometryRejection(buffer, mesh_reject, index_count);
 		return;
 	}
 
@@ -1352,12 +1590,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.type = index_type;
 
 	DrawRenderState state {};
+	state.mesh = mesh_plan;
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, true, state)) {
 		ResetBindings();
 		return;
 	}
 
-	RefreshShaders(buffer, draw, true, state);
+	if (!RefreshShaders(buffer, draw, true, state)) {
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
 
@@ -1402,7 +1644,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		return;
 	}
 
-	if (ShouldSkipGeShader(buffer)) {
+	MeshDrawPlan mesh_plan;
+	std::string  mesh_reject;
+	PlanMeshDraw(buffer, nullptr, 0, index_count, instance_count, first_instance, 0, mesh_plan,
+	             &mesh_reject);
+
+	if (ShouldSkipGeShader(buffer, mesh_plan)) {
+		LogMergedGeometryRejection(buffer, mesh_reject, index_count);
 		return;
 	}
 
@@ -1432,6 +1680,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	                         instance_count,  first_instance};
 
 	DrawRenderState state {};
+	state.mesh = mesh_plan;
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();
@@ -1443,7 +1692,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		ResetBindings();
 		return;
 	}
-	RefreshShaders(buffer, draw, false, state);
+	if (!RefreshShaders(buffer, draw, false, state)) {
+		ResetBindings();
+		return;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&

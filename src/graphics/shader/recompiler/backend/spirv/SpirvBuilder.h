@@ -29,6 +29,7 @@ public:
 
 	uint32_t AllocateId();
 	void     RequireCapability(uint32_t capability);
+	void     RequireVersion(uint32_t version);
 	void     RequireExtension(const char* name);
 	uint32_t Import(const char* name);
 	uint32_t Type(uint32_t opcode, std::initializer_list<uint32_t> operands = {});
@@ -72,6 +73,9 @@ private:
 	std::vector<uint32_t>                     m_ext_inst_imports;
 	std::vector<uint32_t>                     m_memory_model;
 	std::vector<uint32_t>                     m_entry_points;
+	std::vector<uint32_t>                     m_entry_point_prefix;
+	std::vector<uint32_t>                     m_entry_point_interface;
+	std::vector<uint32_t>                     m_global_variables;
 	std::vector<uint32_t>                     m_execution_modes;
 	std::vector<uint32_t>                     m_debug;
 	std::vector<uint32_t>                     m_annotations;

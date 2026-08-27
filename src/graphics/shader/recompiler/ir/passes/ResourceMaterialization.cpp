@@ -864,6 +864,10 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		bool native     = false;
 		bool point_only = false;
 	};
+	for (uint32_t i = 0; i < next.samplers.size(); i++) {
+		next.samplers[i].depth_compare_func = (next_snapshot.samplers[i].dwords[0] >> 12u) & 0x7u;
+	}
+
 	std::vector<SamplerUsage> sampler_usage(next.samplers.size());
 	for (const auto& pair: next.sampled_pairs) {
 		if (pair.image >= next.images.size() || pair.sampler >= next.samplers.size()) {

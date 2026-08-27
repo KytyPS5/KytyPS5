@@ -106,6 +106,41 @@ struct PipelineCache::ProgramCache {
 		return handle;
 	}
 
+	// Mesh programs share ShaderVertexInputInfo with the vertex stage, so the stage cannot be
+	// deduced from the input type and the assembled code is only produced on a miss.
+	template <typename Assemble>
+	ShaderProgram GetMesh(const ShaderParams& params, ShaderVertexInputInfo& input_info,
+	                      Assemble&& assemble, std::string* error) {
+		BuildStageStaticKey(input_info, key_scratch);
+		auto& permutations = programs[{ShaderType::Mesh, params.hash}];
+		for (const auto& permutation: permutations) {
+			if (permutation.static_key == key_scratch &&
+			    MaterializeProgram(permutation.program, params, input_info)) {
+				return permutation.handle;
+			}
+		}
+
+		ShaderParams assembled = params;
+		if (!assemble(assembled)) {
+			return {};
+		}
+		const auto module = CompileMeshProgram(device, assembled, input_info, error);
+		if (module == nullptr) {
+			return {};
+		}
+		EXIT_IF(!input_info.stage);
+		uint64_t id =
+		    MixId(MixId(params.hash, static_cast<uint64_t>(ShaderType::Mesh)), permutations.size());
+		if (id == 0) {
+			id = 1;
+		}
+		const ShaderProgram handle {.id = id, .module = module};
+		permutations.push_back({key_scratch, input_info.stage.program, handle});
+
+		std::printf("Num compiled %u shaders\n", ++num_compiled);
+		return handle;
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {
 		key_scratch.reserve(MaxStaticKeyWords);
 	}
@@ -146,6 +181,29 @@ ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
 	const auto params = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	return m_program_cache->Get(params, input_info);
+}
+
+ShaderProgram PipelineCache::GetMeshProgram(const HW::VertexShaderInfo& regs,
+                                            const HW::ShaderRegisters& sh,
+                                            const MeshDispatch&        dispatch,
+                                            MeshInputTopology topology, bool indexed,
+                                            ShaderVertexInputInfo& input_info,
+                                            std::string*           error) {
+	// `user_data` and `code` back the spans in `params`, so both outlive the lookup below.
+	std::vector<uint32_t> user_data;
+	ShaderParams          params;
+	if (!PrepareMeshProgram(regs, sh, dispatch, topology, indexed, input_info, user_data, params,
+	                        error)) {
+		return {};
+	}
+	std::vector<uint32_t> code;
+	Common::LockGuard     lock(m_mutex);
+	return m_program_cache->GetMesh(
+	    params, input_info,
+	    [&](ShaderParams& assembled) {
+		    return AssembleMeshProgram(regs, code, assembled, error);
+	    },
+	    error);
 }
 
 ShaderProgram PipelineCache::GetPixelProgram(

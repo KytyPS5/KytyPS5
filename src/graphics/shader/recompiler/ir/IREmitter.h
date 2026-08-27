@@ -62,6 +62,7 @@ public:
 	U32 IAdd(U32 lhs, U32 rhs);
 	U32 ISub(U32 lhs, U32 rhs);
 	U32 IMul(U32 lhs, U32 rhs);
+	U32 UDiv(U32 lhs, U32 rhs);
 	U32 ShiftLeftLogical(U32 value, U32 shift);
 	U32 ShiftRightLogical(U32 value, U32 shift);
 	U32 ShiftRightArithmetic(U32 value, U32 shift);

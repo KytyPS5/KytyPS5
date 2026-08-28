@@ -21,6 +21,7 @@
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
+#include "loader/unresolvedImportReport.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -137,6 +138,46 @@ static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
+
+static std::string ImportNid(const std::string& qualified_symbol) {
+	const auto separator = qualified_symbol.find('[');
+	return separator == std::string::npos ? qualified_symbol
+	                                      : qualified_symbol.substr(0, separator);
+}
+
+static void WriteConfiguredUnresolvedImportReport() {
+	const auto report_path = Config::GetUnresolvedImportReportPath();
+	if (report_path.empty()) {
+		return;
+	}
+
+	std::vector<UnresolvedImportReportEntry> entries;
+	entries.reserve(g_stubbed_imports.size());
+	for (const auto& record: g_stubbed_imports) {
+		// A record remains allocated after late resolution so its thunk ID stays stable. Only report
+		// records whose live relocation slot still points at that unresolved thunk.
+		if (record.patch_vaddr == 0 || record.thunk_vaddr == 0) {
+			continue;
+		}
+		uint64_t current_target = 0;
+		std::memcpy(&current_target, reinterpret_cast<const void*>(record.patch_vaddr),
+		            sizeof(current_target));
+		if (current_target != record.thunk_vaddr) {
+			continue;
+		}
+
+		entries.push_back({record.program, ImportNid(record.name), record.name,
+		                   Common::EnumName(record.type), Common::EnumName(record.bind), 1});
+	}
+
+	if (WriteUnresolvedImportReportFile(report_path, entries)) {
+		LOGF("Unresolved import report: %s (%zu active relocation sites)\n",
+		     Common::PathToString(report_path).c_str(), entries.size());
+	} else {
+		LOGF("Failed to write unresolved import report: %s\n",
+		     Common::PathToString(report_path).c_str());
+	}
+}
 
 static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id);
 
@@ -1277,6 +1318,7 @@ void RuntimeLinker::RelocateAll() {
 	}
 
 	m_relocated = true;
+	WriteConfiguredUnresolvedImportReport();
 }
 
 void RuntimeLinker::RelocateProgram(Program* program) {
@@ -1286,6 +1328,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	Relocate(program);
+	WriteConfiguredUnresolvedImportReport();
 }
 
 void RuntimeLinker::UnloadProgram(Program* program) {

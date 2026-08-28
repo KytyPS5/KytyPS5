@@ -94,7 +94,9 @@ ResourceKind MemoryKind(const Decoder::Instruction& decoded) {
 				case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
 				case Decoder::Opcode::IMAGE_ATOMIC_AND:
 				case Decoder::Opcode::IMAGE_ATOMIC_OR:
-				case Decoder::Opcode::IMAGE_ATOMIC_XOR: return ResourceKind::StorageImageUint;
+				case Decoder::Opcode::IMAGE_ATOMIC_XOR:
+				case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
+				case Decoder::Opcode::IMAGE_ATOMIC_FMAX: return ResourceKind::StorageImageUint;
 				default: return ResourceKind::Image;
 			}
 		default: return ResourceKind::None;
@@ -240,7 +242,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		const bool store_or_atomic = decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
 		                             decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP ||
 		                             (decoded.opcode >= Decoder::Opcode::IMAGE_ATOMIC_ADD &&
-		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_XOR);
+		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_FMAX);
 		return store_or_atomic ? (index == 0u ? decoded.dst : decoded.src0) : decoded.src0;
 	}
 	if (decoded.family == Decoder::Family::DS) {
@@ -998,6 +1000,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32);
 		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMin32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMAX:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMax32);
 
 		case Decoder::Opcode::FLAT_LOAD_UBYTE:
 		case Decoder::Opcode::FLAT_LOAD_SBYTE:

@@ -547,6 +547,30 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Emit(inst, OpSelect, IR::Type::U32, {write, ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
 			return true;
 		}
+		case IR::ValueOpcode::Dpp8MoveU32: {
+			const auto flags    = inst.Flags<IR::Dpp8MoveFlags>();
+			const auto target   = EmitDpp8TargetLane(state, flags.lane_selectors);
+			const auto shuffled = state.builder.AllocateId();
+			state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
+			                           target.lane});
+			if (flags.fetch_inactive) {
+				ctx.Define(inst, shuffled);
+				return true;
+			}
+			const auto ballot = state.builder.AllocateId();
+			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 1)});
+			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
+			ctx.Emit(inst, OpSelect, IR::Type::U32,
+			         {source_active, shuffled, ConstantU32(state, 0)});
+			return true;
+		}
+		case IR::ValueOpcode::Dpp8UpdateU32: {
+			ctx.Emit(inst, OpSelect, IR::Type::U32,
+			         {ctx.Arg(inst, 2), ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
+			return true;
+		}
 		case IR::ValueOpcode::WqmU64:
 			ctx.Define(inst, EmitWqmU64(ctx.state, ctx.Arg(inst, 0)));
 			return true;

@@ -244,16 +244,19 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: MarkBallot(); break;
 				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::Dpp8MoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
 					MarkBallot();
 					requirements.subgroup_shuffle = true;
-					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32 ||
+					    inst.GetOpcode() == IR::ValueOpcode::Dpp8MoveU32) {
 						requirements.subgroup_local_invocation_id = true;
 					}
 					break;
 				}
 				case IR::ValueOpcode::DppUpdateU32:
+				case IR::ValueOpcode::Dpp8UpdateU32:
 				case IR::ValueOpcode::WqmMask:
 				case IR::ValueOpcode::WriteLane: {
 					MarkBallot();

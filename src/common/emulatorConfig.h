@@ -27,6 +27,8 @@ enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
 
+enum class PresentMode { Fifo, Mailbox, Immediate };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -37,6 +39,7 @@ struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
 	std::string            user_name                   = "Kyty";
+	PresentMode            present_mode                = PresentMode::Fifo;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -67,6 +70,7 @@ void Load(const ConfigOptions& cfg);
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 const std::string& GetUserName();
+PresentMode GetPresentMode();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();

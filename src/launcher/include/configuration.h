@@ -62,6 +62,9 @@ public:
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
 
+	enum class PresentMode { Fifo, Mailbox, Immediate };
+	Q_ENUM(PresentMode)
+
 	enum class ShaderLogDirection { Silent, Console, File };
 	Q_ENUM(ShaderLogDirection)
 
@@ -88,6 +91,7 @@ public:
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
+	PresentMode            present_mode                = PresentMode::Fifo;
 	bool                   fullscreen_enabled          = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -112,6 +116,7 @@ public:
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
 		user_name                   = other.user_name;
+		present_mode                = other.present_mode;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
@@ -153,6 +158,7 @@ public:
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
 		KYTY_CFG_SET(user_name);
+		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
@@ -181,6 +187,10 @@ public:
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
 		user_name = s->value("user_name", user_name).toString();
+		KYTY_CFG_GET(present_mode);
+		if (EnumToText(present_mode).isEmpty()) {
+			present_mode = PresentMode::Fifo;
+		}
 		KYTY_CFG_GET(fullscreen_enabled);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();

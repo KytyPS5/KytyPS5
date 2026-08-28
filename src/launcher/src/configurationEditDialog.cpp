@@ -157,6 +157,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
@@ -290,6 +291,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
+	info.present_mode =
+	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();

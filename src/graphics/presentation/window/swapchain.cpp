@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -428,7 +429,21 @@ void Swapchain::Create() {
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
-	create_info.presentMode      = vk::PresentModeKHR::eFifo;
+	switch (Config::GetPresentMode()) {
+		case Config::PresentMode::Mailbox:
+			create_info.presentMode = vk::PresentModeKHR::eMailbox;
+			break;
+		case Config::PresentMode::Immediate:
+			create_info.presentMode = vk::PresentModeKHR::eImmediate;
+			break;
+		case Config::PresentMode::Fifo:
+		default: create_info.presentMode = vk::PresentModeKHR::eFifo; break;
+	}
+	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
+	              create_info.presentMode) == surface.present_modes.end()) {
+		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
+		create_info.presentMode = vk::PresentModeKHR::eFifo;
+	}
 	create_info.clipped          = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");

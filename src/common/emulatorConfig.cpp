@@ -38,6 +38,10 @@ const std::string& GetUserName() {
 	return g_config->user_name;
 }
 
+PresentMode GetPresentMode() {
+	return g_config->present_mode;
+}
+
 bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }

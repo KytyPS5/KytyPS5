@@ -1050,6 +1050,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
 		case Decoder::Opcode::DS_READ_U16_D16:
+		case Decoder::Opcode::DS_READ_U16_D16_HI:
 		case Decoder::Opcode::DS_READ_B32:
 		case Decoder::Opcode::DS_READ_B64:
 		case Decoder::Opcode::DS_READ_B96:

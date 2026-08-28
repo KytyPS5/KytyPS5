@@ -443,9 +443,17 @@ bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
 	}
 }
 
-void ApplyDefaultVop2F16Destination(Instruction& inst) {
+void ApplyDefaultVop2F16Selectors(Instruction& inst) {
 	if (IsVop2LowHalfF16Opcode(inst.opcode)) {
 		inst.dst.sdwa_sel = 4;
+	}
+
+	if (inst.opcode == Opcode::V_PK_FMAC_F16) {
+		// VOP2 has no OP_SEL_HI fields. Its packed high operation implicitly reads the
+		// high halves of both multiplicands and of the destination accumulator.
+		inst.src0.op_sel_hi = true;
+		inst.src1.op_sel_hi = true;
+		inst.dst.op_sel_hi  = true;
 	}
 }
 
@@ -1088,7 +1096,7 @@ bool DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
 		return false;
 	}
-	ApplyDefaultVop2F16Destination(inst);
+	ApplyDefaultVop2F16Selectors(inst);
 	ApplyDppModifier(inst.src0, modifier);
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
@@ -1557,7 +1565,7 @@ bool DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (!DecodeScalarSource(src0, pc, inst.src0, error)) {
 		return false;
 	}
-	ApplyDefaultVop2F16Destination(inst);
+	ApplyDefaultVop2F16Selectors(inst);
 	return FinalizeVop2Instruction(pc, code, word_index, inst, error);
 }
 

@@ -4079,6 +4079,19 @@ void TestNewShaderDecoderArchitecture() {
               packed_inst.src2.op_sel_hi == (source == 2u),
           "VOP3P OPSEL_HI source bit mapping is incorrect");
   }
+
+  const uint32_t vop2_packed_fmac[] = {
+      EncodeVop2(0x3cu, 2u, 0u + 256u, 1u),
+  };
+  Instruction packed_fmac;
+  Check(DecodeInstruction(vop2_packed_fmac, 0u, packed_fmac, &error),
+        error.c_str());
+  Check(packed_fmac.family == Family::VOP2 &&
+            packed_fmac.opcode == Opcode::V_PK_FMAC_F16 &&
+            !packed_fmac.src0.op_sel && packed_fmac.src0.op_sel_hi &&
+            !packed_fmac.src1.op_sel && packed_fmac.src1.op_sel_hi &&
+            !packed_fmac.dst.op_sel && packed_fmac.dst.op_sel_hi,
+        "VOP2 V_PK_FMAC_F16 did not select both packed halves");
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {

@@ -291,7 +291,14 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 }
 
 uint32_t EmitPackHalf(EmitterState& state, uint32_t src) {
-	return EmitExt(state, TypeU32(state), GlslPackHalf2x16, {src});
+	const auto low_f32  = state.builder.AllocateId();
+	const auto high_f32 = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), low_f32, src, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), high_f32, src, 1});
+	const auto low = EmitF32ToF16RneBits(state, low_f32);
+	const auto high = NewBinary(state, OpShiftLeftLogical, TypeU32(state),
+	                            EmitF32ToF16RneBits(state, high_f32), ConstantU32(state, 16));
+	return NewBinary(state, OpBitwiseOr, TypeU32(state), low, high);
 }
 
 uint32_t EmitUnpackHalf(EmitterState& state, uint32_t bits) {
@@ -334,10 +341,7 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			         {ctx.Arg(inst, 0), ConstantU32(state, 0xffu)});
 			return true;
 		case IR::ValueOpcode::ConvertF16F32: {
-			const auto pair = state.builder.AllocateId();
-			state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 2), pair,
-			                           ctx.Arg(inst, 0), ConstantF32(state, 0)});
-			ctx.Define(inst, EmitPackHalf(state, pair));
+			ctx.Define(inst, EmitF32ToF16RneBits(state, ctx.Arg(inst, 0)));
 			return true;
 		}
 		case IR::ValueOpcode::ConvertF32F16:
@@ -383,7 +387,7 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			         {ctx.Arg(inst, 0), inst.Arg(1).U32()});
 			return true;
 		case IR::ValueOpcode::PackHalf2x16:
-			ctx.Define(inst, EmitExt(state, TypeU32(state), GlslPackHalf2x16, {ctx.Arg(inst, 0)}));
+			ctx.Define(inst, EmitPackHalf(state, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::PackSnorm2x16:
 			ctx.Define(inst, EmitExt(state, TypeU32(state), GlslPackSnorm2x16, {ctx.Arg(inst, 0)}));

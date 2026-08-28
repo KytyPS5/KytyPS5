@@ -200,6 +200,10 @@ void Run(const RunOptions& options) {
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
+	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
+	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
+	EXIT_NOT_IMPLEMENTED(ok != 0);
+
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 

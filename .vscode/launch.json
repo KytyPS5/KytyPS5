@@ -10,7 +10,14 @@
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}\\_Build\\vscode-clang\\launcher",
             "environment": [],
-            "externalConsole": false
+            "externalConsole": false,
+            "linux": {
+                "type": "cppdbg",
+                "program": "${workspaceFolder}/_Build/vscode-clang/launcher/launcher",
+                "cwd": "${workspaceFolder}/_Build/vscode-clang/launcher",
+                "MIMode": "gdb",
+                "miDebuggerPath": "/usr/bin/gdb"
+            }
         },
         {
             "name": "Debug kyty_emulator",
@@ -25,13 +32,25 @@
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}\\_Build\\vscode-clang",
             "environment": [],
-            "externalConsole": true
+            "externalConsole": true,
+            "linux": {
+                "type": "cppdbg",
+                "program": "${workspaceFolder}/_Build/vscode-clang/kyty_emulator",
+                "cwd": "${workspaceFolder}/_Build/vscode-clang",
+                "MIMode": "gdb",
+                "miDebuggerPath": "/usr/bin/gdb"
+            }
         },
         {
             "name": "Attach to running kyty_emulator",
             "type": "cppvsdbg",
             "request": "attach",
-            "processId": "${command:pickProcess}"
+            "processId": "${command:pickProcess}",
+            "linux": {
+                "type": "cppdbg",
+                "MIMode": "gdb",
+                "miDebuggerPath": "/usr/bin/gdb"
+            }
         }
     ]
 }

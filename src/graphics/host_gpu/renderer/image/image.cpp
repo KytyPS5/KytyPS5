@@ -313,9 +313,9 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	if (source_type == destination_type) {
 		source_layers = destination_layers = std::min(source_layers, destination_layers);
 	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
-		source_layers = depth;
+		source_layers = std::min(source_layers, depth);
 	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
-		destination_layers = depth;
+		destination_layers = std::min(destination_layers, depth);
 	}
 	return {source_layers, destination_layers};
 }
@@ -334,9 +334,15 @@ void Image::CopyImage(Image& source) {
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
-		const auto depth  = std::max(base_depth >> level, 1u);
+		const auto width  = std::min(std::max(source.backing.extent.width >> level, 1u),
+		                             std::max(backing.extent.width >> level, 1u));
+		const auto height = std::min(std::max(source.backing.extent.height >> level, 1u),
+		                             std::max(backing.extent.height >> level, 1u));
+		auto       depth  = std::max(base_depth >> level, 1u);
+		if (source.backing.image_type == vk::ImageType::e3D &&
+		    backing.image_type == vk::ImageType::e3D) {
+			depth = std::min(depth, std::max(source.backing.extent.depth >> level, 1u));
+		}
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};
 		copy.srcSubresource = {source_aspect, level, 0, 1};
@@ -477,8 +483,10 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		const auto width             = std::min(std::max(source.backing.extent.width >> level, 1u),
+		                                        std::max(backing.extent.width >> level, 1u));
+		const auto height            = std::min(std::max(source.backing.extent.height >> level, 1u),
+		                                        std::max(backing.extent.height >> level, 1u));
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;

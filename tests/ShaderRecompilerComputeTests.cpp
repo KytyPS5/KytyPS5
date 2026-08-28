@@ -182,6 +182,12 @@ struct ImageTestAccess {
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
   }
+
+  static std::pair<uint32_t, uint32_t>
+  SanitizeCopyLayers(const Image &source, const Image &destination,
+                     uint32_t depth) {
+    return Image::SanitizeCopyLayers(source, destination, depth);
+  }
 };
 
 struct TileManagerTestAccess {
@@ -4538,14 +4544,22 @@ public:
       native_array_info.data = {};
       auto native_volume_info = volume_desc.info;
       native_volume_info.data = {};
+      native_volume_info.extent.depth = 4;
       Libs::Graphics::Image native_array(m_runtime_context, scheduler,
                                          native_array_info);
       Libs::Graphics::Image native_volume(m_runtime_context, scheduler,
                                           native_volume_info);
+      const auto array_to_volume_layers = ImageTestAccess::SanitizeCopyLayers(
+          native_array, native_volume, native_volume_info.extent.depth);
+      const auto volume_to_array_layers = ImageTestAccess::SanitizeCopyLayers(
+          native_volume, native_array, native_volume_info.extent.depth);
       native_volume.CopyImage(native_array);
       native_array.CopyImage(native_volume);
       Require(name, "Image-owned 2D-array/3D copy state",
-              native_volume.backing.state.layout ==
+              array_to_volume_layers == std::pair<uint32_t, uint32_t>{2, 1} &&
+                  volume_to_array_layers ==
+                      std::pair<uint32_t, uint32_t>{1, 2} &&
+                  native_volume.backing.state.layout ==
                       vk::ImageLayout::eTransferSrcOptimal &&
                   native_volume.backing.state.access_mask ==
                       vk::AccessFlagBits2::eTransferRead &&
@@ -4555,7 +4569,8 @@ public:
                       (vk::AccessFlagBits2::eShaderRead |
                        vk::AccessFlagBits2::eTransferRead),
               "Image::CopyImage did not retain pinned "
-              "source/destination states");
+              "source/destination states or clamp unequal array/volume "
+              "slices");
 
       constexpr uint64_t block_alias_offset = 0x23000;
       constexpr std::array<uint32_t, 4> block_alias_data{

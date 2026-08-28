@@ -57,6 +57,32 @@
 
 namespace Libs::Graphics {
 
+static vk::PresentModeKHR RequestedPresentMode() {
+	switch (Config::GetPresentMode()) {
+		case Config::PresentMode::Fifo: return vk::PresentModeKHR::eFifo;
+		case Config::PresentMode::Mailbox: return vk::PresentModeKHR::eMailbox;
+		case Config::PresentMode::FifoRelaxed: return vk::PresentModeKHR::eFifoRelaxed;
+		case Config::PresentMode::Immediate: return vk::PresentModeKHR::eImmediate;
+	}
+	return vk::PresentModeKHR::eFifo;
+}
+
+static vk::PresentModeKHR SelectPresentMode(const SurfaceCapabilities& surface) {
+	EXIT_IF(surface.present_modes.empty());
+	const auto requested = RequestedPresentMode();
+	if (std::ranges::find(surface.present_modes, requested) != surface.present_modes.end()) {
+		return requested;
+	}
+	// FIFO is required by VK_KHR_surface. Keep the first reported mode as a defensive fallback for
+	// non-conforming drivers so vkCreateSwapchainKHR still receives a supported value.
+	const auto fifo = std::ranges::find(surface.present_modes, vk::PresentModeKHR::eFifo);
+	const auto fallback =
+	    fifo != surface.present_modes.end() ? *fifo : surface.present_modes.front();
+	LOGF("Requested Vulkan present mode %s is unavailable; falling back to %s\n",
+	     vk::to_string(requested).c_str(), vk::to_string(fallback).c_str());
+	return fallback;
+}
+
 struct Presenter::Frame {
 	VulkanImage image;
 	uint64_t    present_tick = 0;
@@ -426,6 +452,7 @@ void Swapchain::Create() {
 	    surface.capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
+	const auto present_mode = SelectPresentMode(surface);
 
 	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
 	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
@@ -459,8 +486,9 @@ void Swapchain::Create() {
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
-	create_info.presentMode      = vk::PresentModeKHR::eFifo;
+	create_info.presentMode      = present_mode;
 	create_info.clipped          = VK_TRUE;
+	LOGF("Vulkan swapchain present mode: %s\n", vk::to_string(present_mode).c_str());
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);

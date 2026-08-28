@@ -93,6 +93,7 @@ struct ShaderComputeInputInfo {
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           lds_size_dwords            = 0;
 	uint32_t           scratch_size_dwords        = 0;
+	bool               fp16_overflow              = false;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               needs_lds_barriers          = false;

@@ -9,9 +9,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
-	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size)
+	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit, uint32_t wave_size,
+	           bool fp16_overflow)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      current_wave_size(wave_size) {}
+	      current_wave_size(wave_size), current_fp16_overflow(fp16_overflow) {}
 
 	bool TranslateInstruction(const Decoder::Instruction& inst, std::string* error);
 	bool TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -32,6 +33,9 @@ private:
 	IR::U1                 ThreadBit(IR::U32 low);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
+	IR::F32                ApplyF16Overflow(Decoder::Opcode opcode, IR::F32 value,
+	                                       const std::array<IR::F32, 3>& args,
+	                                       uint32_t arg_count);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
 	IR::U32                PackHalf2x16(IR::F32 low, IR::F32 high);
 	void                   WriteF16(const Decoder::Operand& operand, IR::F32 value);
@@ -254,6 +258,7 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	uint32_t        current_wave_size    = 64;
+	bool            current_fp16_overflow = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

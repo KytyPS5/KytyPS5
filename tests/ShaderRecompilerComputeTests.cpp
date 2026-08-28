@@ -14253,6 +14253,52 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ComputeFp16OverflowMode(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7bff7bffu); // packed +MAX_FP16
+  AppendVMovLiteral(&code, 1, 0x40004000u); // packed +2.0h
+  AppendVMovLiteral(&code, 2, 0x7c007c00u); // packed +Inf
+  AppendVMovLiteral(&code, 3, 0x12347bffu); // scalar +MAX_FP16
+  AppendVMovLiteral(&code, 4, 0x00004000u); // scalar +2.0h
+  AppendVMovLiteral(&code, 5, 0x4788b800u); // +70000.0f
+  AppendVMovLiteral(&code, 6, 0xc788b800u); // -70000.0f
+  AppendVMovLiteral(&code, 7, 0x7f800000u); // +Inf
+
+  AppendVop3p(&code, 0x10, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x10, 11, Vgpr(2), Vgpr(1), 0, 0x3);
+  code.push_back(EncodeVop2(0x35, 3, Vgpr(3), 4));
+  code.push_back(EncodeVop1(0x0a, 12, Vgpr(5)));
+  code.push_back(EncodeVop1(0x0a, 13, Vgpr(6)));
+  code.push_back(EncodeVop1(0x0a, 14, Vgpr(7)));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreVgpr(&code, 3, 2);
+  AppendStoreVgpr(&code, 12, 3);
+  AppendStoreVgpr(&code, 13, 4);
+  AppendStoreVgpr(&code, 14, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeFp16OverflowEnabled"
+                      : "ComputeFp16OverflowDisabled";
+  test.code = std::move(code);
+  test.expected = enabled
+                      ? std::vector<u32>{0x7bff7bffu, 0x7c007c00u,
+                                         0x12347bffu, 0x00007bffu,
+                                         0x0000fbffu, 0x00007c00u}
+                      : std::vector<u32>{0x7c007c00u, 0x7c007c00u,
+                                         0x12347c00u, 0x00007c00u,
+                                         0x0000fc00u, 0x00007c00u};
+  test.opcodes = {O::V_MOV_B32, O::V_PK_MUL_F16, O::V_MUL_F16,
+                  O::V_CVT_F16_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.fp16_overflow = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorMinMaxF16Ops() {
   using O = ShaderOpcode;
 
@@ -20378,6 +20424,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
+  cases.push_back(ComputeFp16OverflowMode(false));
+  cases.push_back(ComputeFp16OverflowMode(true));
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(VectorMinMaxMed3F16Ops);
@@ -22961,6 +23009,20 @@ void CheckNativeMsaaState() {
   std::printf("[host]    %-32s ok\n", "NativeMsaaState");
 }
 
+void CheckComputeFp16OverflowStaticKey() {
+  ShaderComputeInputInfo disabled{};
+  ShaderComputeInputInfo enabled{};
+  enabled.fp16_overflow = true;
+  std::vector<u32> disabled_key;
+  std::vector<u32> enabled_key;
+  BuildStageStaticKey(disabled, disabled_key);
+  BuildStageStaticKey(enabled, enabled_key);
+  Require("ComputeFp16OverflowStaticKey", "pipeline cache separation",
+          disabled_key.size() == enabled_key.size() && disabled_key != enabled_key,
+          "FP16_OVFL did not specialize the compute program cache key");
+  std::printf("[host]    %-32s ok\n", "ComputeFp16OverflowStaticKey");
+}
+
 void CheckDepthHtileStencilCompatibility() {
   Require("DepthHtileStencilCompatibility", "disabled acceleration",
           depth_htile_stencil_acceleration_compatible(false, false, true),
@@ -24470,6 +24532,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureVolumeMipRegions();
   CheckStorageTextureGpuOwnedRebindState();
   CheckNativeMsaaState();
+  CheckComputeFp16OverflowStaticKey();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
   CheckStencilAttachmentAccess();

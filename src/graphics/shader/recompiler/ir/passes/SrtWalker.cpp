@@ -550,11 +550,15 @@ private:
 			const auto size = stride == 0u
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return Fail(
-				    error, fmt::format("constant-buffer offset {} exceeds size {}", aligned, size));
+			if (size < sizeof(uint32_t)) {
+				return Fail(error, fmt::format(
+				                       "constant-buffer size {} has no complete dword", size));
 			}
-			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+			// Scalar buffer reads beyond the descriptor are clamped per dword to the
+			// final complete element rather than returning zero or rejecting the walk.
+			const auto last_valid_offset = (size - sizeof(uint32_t)) & ~uint64_t {3};
+			const auto clamped_offset    = std::min(aligned, last_valid_offset);
+			address = (base & ~uint64_t {3}) + clamped_offset;
 		} else {
 			const auto relative = (immediate & ~int64_t {3}) +
 			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);

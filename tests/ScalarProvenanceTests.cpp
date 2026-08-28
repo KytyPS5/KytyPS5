@@ -356,10 +356,9 @@ void TestConstantBufferBounds() {
                 {overflow_read, Value(0u), Value(16u), Value(0u)});
   overflow.Plan();
   flat = {0x55u};
-  Check(!WalkSrt(overflow.program, runtime, flat, &error) &&
-            flat == std::vector<uint32_t>{0x55u} &&
-            error.find("exceeds size") != std::string::npos,
-        "out-of-bounds constant-buffer walk was not transactional");
+  Check(WalkSrt(overflow.program, runtime, flat, &error) &&
+            flat == std::vector<uint32_t>{0xa5a5a5a5u},
+        "out-of-bounds constant-buffer read did not clamp to the final dword");
 }
 
 void TestReadLaneElimination() {

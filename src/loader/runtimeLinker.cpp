@@ -21,6 +21,7 @@
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
+#include "loader/unresolvedImportPolicy.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -337,6 +338,24 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
 			     log_index, record_id);
 		}
+	}
+
+	if (Config::StrictUnresolvedImportsEnabled()) {
+		StrictUnresolvedImportDetails        details {};
+		const StrictUnresolvedImportDetails* details_ptr = nullptr;
+		if (record_id < g_stubbed_imports.size()) {
+			const auto& record       = g_stubbed_imports[record_id];
+			details.symbol           = record.name;
+			details.type             = Common::EnumName(record.type);
+			details.bind             = Common::EnumName(record.bind);
+			details.program          = record.program;
+			details.patch_vaddr      = record.patch_vaddr;
+			details.relocation_index = record.index;
+			details_ptr              = &details;
+		}
+
+		const auto error = FormatStrictUnresolvedImportError(record_id, details_ptr);
+		EXIT("%s\n", error.c_str());
 	}
 	return 0;
 }

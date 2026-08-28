@@ -409,6 +409,13 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(strict_unresolved_import_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StrictUnresolvedImportTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/unresolvedImportPolicy.cpp"
+)
+target_link_libraries(strict_unresolved_import_tests common fmt::fmt)
+target_include_directories(strict_unresolved_import_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -531,6 +538,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME strict_unresolved_import COMMAND $<TARGET_FILE:strict_unresolved_import_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -585,6 +593,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		strict_unresolved_import_tests
 		shader_vertex_metadata_tests
 		shader_stage_runtime_tests
 		resource_tracking_tests

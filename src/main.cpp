@@ -67,6 +67,7 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --strict-unresolved-imports         Abort when an unresolved import is called.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -146,6 +147,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--playgo-hack") {
 			options.config.playgo_hack_enabled = true;
+			continue;
+		}
+
+		if (arg == "--strict-unresolved-imports") {
+			options.config.strict_unresolved_imports = true;
 			continue;
 		}
 

@@ -109,6 +109,10 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool StrictUnresolvedImportsEnabled() {
+	return g_config->strict_unresolved_imports;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

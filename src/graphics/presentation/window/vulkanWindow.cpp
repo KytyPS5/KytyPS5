@@ -22,7 +22,6 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
-#include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1037,10 +1036,6 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
-	memcpy(device_name, device_properties.deviceName, sizeof(device_name));
-	std::snprintf(processor_name, sizeof(processor_name), "%s",
-	              Common::GetSystemInfo().ProcessorName.c_str());
-
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
@@ -1079,7 +1074,6 @@ void WindowContext::RecreateSurface() {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
 	surface = native_surface;
-	RefreshSurfaceCapabilities();
 }
 
 WindowContext::~WindowContext() {

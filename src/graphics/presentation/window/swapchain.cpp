@@ -1,30 +1,8 @@
-#include "SDL.h"
-#include "SDL_error.h"
-#include "SDL_events.h"
-#include "SDL_gamecontroller.h"
-#include "SDL_hints.h"
-#include "SDL_joystick.h"
-#include "SDL_keyboard.h"
-#include "SDL_keycode.h"
-#include "SDL_mouse.h"
-#include "SDL_pixels.h"
-#include "SDL_rwops.h"
-#include "SDL_stdinc.h"
-#include "SDL_surface.h"
-#include "SDL_thread.h"
-#include "SDL_touch.h"
-#include "SDL_video.h"
-#include "SDL_vulkan.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
-#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
-#include "common/systemInfo.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -34,19 +12,11 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
-#include "libs/controller.h"
-#include "loader/systemContent.h"
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <deque>
-#include <fmt/format.h>
 #include <limits>
 #include <memory>
-#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -334,7 +304,6 @@ public:
 
 private:
 	void Destroy();
-	void RefreshSurfaceSize();
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
@@ -396,12 +365,12 @@ struct Presenter::Impl {
 
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
-	EXIT_IF(graphics.screen_width == 0);
-	EXIT_IF(graphics.screen_height == 0);
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
 
 	Common::LockGuard lock(m_window.mutex);
+	EXIT_IF(graphics.screen_width == 0);
+	EXIT_IF(graphics.screen_height == 0);
 	const auto&       surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
@@ -554,30 +523,18 @@ void Swapchain::Destroy() {
 	m_render_complete.clear();
 }
 
-void Swapchain::RefreshSurfaceSize() {
-	int width  = 0;
-	int height = 0;
-	SDL_Vulkan_GetDrawableSize(m_window.window, &width, &height);
-	if (width > 0 && height > 0) {
-		m_window.graphic_ctx.screen_width  = static_cast<uint32_t>(width);
-		m_window.graphic_ctx.screen_height = static_cast<uint32_t>(height);
-	}
-
-	m_window.RefreshSurfaceCapabilities();
-}
-
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
 		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
 		// window's view/layer and must run on the main thread on macOS.
-		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); }, true);
+		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); });
 #else
 		m_window.RecreateSurface();
 #endif
 	}
-	RefreshSurfaceSize();
+	m_window.RefreshSurfaceCapabilities();
 	Create();
 }
 
@@ -803,29 +760,6 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
-	auto& window = m_impl->window;
-	if (window.window_hidden) {
-#if defined(__APPLE__)
-		// AppKit traps if a window is shown off the main thread; marshal and wait so the
-		// swapchain below is recreated against a visible window.
-		window.RunOnMainThread(
-		    [&window] {
-			    window.UpdateIcon();
-			    SDL_ShowWindow(window.window);
-			    SDL_RaiseWindow(window.window);
-		    },
-		    true);
-#else
-		window.UpdateIcon();
-
-		SDL_ShowWindow(window.window);
-		SDL_RaiseWindow(window.window);
-#endif
-
-		window.window_hidden = false;
-		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
-	}
-
 	const auto ime_visual = GetImeVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
@@ -848,7 +782,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 
 		m_impl->presented_ime_revision.store(ime_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;
 	}

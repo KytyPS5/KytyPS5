@@ -23,7 +23,6 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
@@ -39,20 +38,17 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
-#include <algorithm>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+#include <fmt/format.h>
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
 #include "stb_image.h"
-
-#include <fmt/format.h>
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -197,8 +193,6 @@ std::unique_ptr<WindowContext> g_window;
 } // namespace
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
-constexpr uint32_t    KYTY_SDL_WINDOW_FLAGS =
-    (static_cast<uint32_t>(SDL_WINDOW_HIDDEN) | static_cast<uint32_t>(SDL_WINDOW_VULKAN));
 constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
 static void SetPause(WindowLoopState& game, bool flag) {
@@ -407,6 +401,7 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	EXIT_IF(new_width == 0 || new_height == 0);
+	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;
 }
@@ -728,8 +723,7 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
-#if defined(__APPLE__)
-void WindowContext::RunOnMainThread(std::function<void()> task, bool wait) {
+void WindowContext::RunOnMainThread(std::function<void()> task) {
 	if (Common::Thread::IsMainThread()) {
 		task();
 		return;
@@ -747,9 +741,6 @@ void WindowContext::RunOnMainThread(std::function<void()> task, bool wait) {
 	event.type = SDL_USEREVENT;
 	SDL_PushEvent(&event);
 
-	if (!wait) {
-		return;
-	}
 	Common::LockGuard lock(main_task_mutex);
 	while (main_tasks_run < ticket) {
 		main_task_done.Wait(&main_task_mutex);
@@ -772,7 +763,6 @@ void WindowContext::DrainMainThreadTasks() {
 	main_tasks_run += tasks.size();
 	main_task_done.SignalAll();
 }
-#endif
 
 void WindowContext::Run() {
 	Common::Timer timer;
@@ -783,9 +773,7 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
-#if defined(__APPLE__)
 		DrainMainThreadTasks();
-#endif
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -821,10 +809,7 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
-	uint32_t window_flags = KYTY_SDL_WINDOW_FLAGS;
-	if (Config::FullscreenEnabled()) {
-		window_flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
-	}
+	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
 #if defined(__APPLE__)
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
@@ -836,13 +821,20 @@ static void WindowCreate(WindowContext& context) {
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
 	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
-	context.window_hidden = true;
-
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
 	SDL_SetWindowResizable(context.window, SDL_FALSE);
+	context.UpdateIcon();
+}
+
+uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN);
+	if (fullscreen) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	}
+	return flags;
 }
 
 Presenter& WindowInit(uint32_t width, uint32_t height) {
@@ -959,6 +951,7 @@ void WindowContext::UpdateTitle() {
 	    Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id));
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
+	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
 	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
 	static uint64_t frame_num   = 0;
 	static uint64_t fps_frames  = 0;
@@ -983,19 +976,14 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps = fmt::format(
+	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-#if defined(__APPLE__)
-	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.
-	RunOnMainThread([this, fps = std::move(fps)] { SDL_SetWindowTitle(window, fps.c_str()); },
-	                false);
-#else
-	SDL_SetWindowTitle(window, fps.c_str());
-#endif
+	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }
 
 } // namespace Libs::Graphics

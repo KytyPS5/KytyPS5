@@ -484,6 +484,11 @@ struct RenderExecutorTestAccess {
     return executor.AcquireRenderTargets(buffer, colors, color_count, depth);
   }
 
+  static vk::Extent2D AttachmentViewExtent(const Image &image,
+                                           const ImageViewInfo &view) {
+    return RenderExecutor::AttachmentViewExtent(image, view);
+  }
+
   static void ResetBindings(RenderExecutor &executor) {
     executor.ResetBindings();
   }
@@ -2895,6 +2900,8 @@ public:
     auto mip_info = sampled;
     mip_info.base_level = 1;
     const auto mip = color.FindView(mip_info);
+    const auto mip_extent =
+        RenderExecutorTestAccess::AttachmentViewExtent(color, mip_info);
     auto layer_info = sampled;
     layer_info.base_layer = 1;
     const auto layer = color.FindView(layer_info);
@@ -2919,9 +2926,9 @@ public:
                 array != first && reinterpreted != nullptr &&
                 reinterpreted != first && storage != nullptr &&
                 storage != first && attachment == first &&
-                color.views.size() == 7,
+                color.views.size() == 7 && mip_extent == vk::Extent2D{4, 4},
             "dynamic view identity omitted mapping, format, mip, layer, type, "
-            "or storage usage");
+            "storage usage, or the selected mip extent");
 
     ImageInfo depth_info{};
     depth_info.pixel_format = vk::Format::eD32Sfloat;

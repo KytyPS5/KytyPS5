@@ -1252,6 +1252,9 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 	program->dbg_print_reloc = true;
 
 	rt->RelocateProgram(program);
+	// The module's exports may satisfy imports that were left pending in programs loaded earlier.
+	// Rebinding is intentionally selective so live, valid relocation targets remain untouched.
+	rt->RebindPendingImports();
 
 	int result = rt->StartModule(program, args, argp, nullptr);
 

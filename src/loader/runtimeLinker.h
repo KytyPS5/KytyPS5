@@ -158,6 +158,8 @@ public:
 
 	void RelocateAll();
 	void RelocateProgram(Program* program);
+	// Resolve only import slots that still contain a linker-owned pending value.
+	void RebindPendingImports();
 
 	void  Execute(const std::filesystem::path& game_patch = {});
 	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func);
@@ -212,6 +214,7 @@ private:
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
+bool TestPendingImportTargetClassifier();
 #endif
 
 } // namespace Loader

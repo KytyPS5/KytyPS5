@@ -1073,6 +1073,88 @@ static void RelocateRecords(Elf64_Rela* records, uint64_t size, Program* program
 	}
 }
 
+// Loading a shared module can make imports from already-relocated programs resolvable. Only
+// replace values that still carry one of the linker's pending-import sentinels; guest code may
+// legitimately update other relocation slots after startup.
+static bool IsPendingImportTarget(uint64_t patch_vaddr, uint64_t current, SymbolType type,
+                                  uint64_t initial_no_type_value, uint64_t invalid_memory,
+                                  const std::vector<StubbedImportRecord>& stubs) {
+	if (current == 0 || current == invalid_memory) {
+		return true;
+	}
+
+	if (type == SymbolType::NoType && current == initial_no_type_value) {
+		return true;
+	}
+
+	return std::any_of(stubs.begin(), stubs.end(), [=](const auto& record) {
+		return record.patch_vaddr == patch_vaddr && record.thunk_vaddr == current;
+	});
+}
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestPendingImportTargetClassifier() {
+	constexpr uint64_t patch_vaddr           = 0x1000;
+	constexpr uint64_t thunk_vaddr           = 0x2000;
+	constexpr uint64_t invalid_memory        = 0x3000;
+	constexpr uint64_t initial_no_type_value = 0x4000;
+	constexpr uint64_t resolved_vaddr        = 0x5000;
+	const std::vector<StubbedImportRecord> stubs = {
+	    {.patch_vaddr = patch_vaddr, .thunk_vaddr = thunk_vaddr}};
+
+	return IsPendingImportTarget(patch_vaddr, 0, SymbolType::Object, 0, invalid_memory, stubs) &&
+	       IsPendingImportTarget(patch_vaddr, invalid_memory, SymbolType::Object, 0,
+	                             invalid_memory, stubs) &&
+	       IsPendingImportTarget(patch_vaddr, thunk_vaddr, SymbolType::Func, 0, invalid_memory,
+	                             stubs) &&
+	       IsPendingImportTarget(patch_vaddr, initial_no_type_value, SymbolType::NoType,
+	                             initial_no_type_value, invalid_memory, stubs) &&
+	       !IsPendingImportTarget(patch_vaddr + 8, thunk_vaddr, SymbolType::Func, 0,
+	                              invalid_memory, stubs) &&
+	       !IsPendingImportTarget(patch_vaddr, initial_no_type_value, SymbolType::Object,
+	                              initial_no_type_value, invalid_memory, stubs) &&
+	       !IsPendingImportTarget(patch_vaddr, resolved_vaddr, SymbolType::Func, 0,
+	                              invalid_memory, stubs);
+}
+#endif
+
+static uint32_t RebindPendingRecords(Elf64_Rela* records, uint64_t size, Program* program) {
+	if (records == nullptr || size == 0) {
+		return 0;
+	}
+
+	uint32_t rebound = 0;
+	uint32_t index   = 0;
+	for (auto* r = records;
+	     reinterpret_cast<uint8_t*>(r) < reinterpret_cast<uint8_t*>(records) + size; r++, index++) {
+		auto ri = GetRelocationInfo(r, program);
+		if (!ri.resolved || ri.bind_self ||
+		    (ri.bind != BindType::Global && ri.bind != BindType::Weak)) {
+			continue;
+		}
+
+		uint64_t current = 0;
+		std::memcpy(&current, reinterpret_cast<const void*>(ri.vaddr), sizeof(current));
+		const uint64_t initial_no_type_value =
+		    ri.type == SymbolType::NoType
+		        ? RuntimeLinker::ReadFromElf(program, ri.vaddr) + ri.base_vaddr
+		        : 0;
+		if (!IsPendingImportTarget(ri.vaddr, current, ri.type, initial_no_type_value,
+		                           g_invalid_memory, g_stubbed_imports)) {
+			continue;
+		}
+
+		if (PatchGuestMemory64(ri.vaddr, ri.value)) {
+			rebound++;
+			LOGF("Rebound pending import [%u] [0x%016" PRIx64 "] <- 0x%016" PRIx64
+			     ", %s, %s, %s\n",
+			     index, ri.vaddr, ri.value, ri.name.c_str(), Common::EnumName(ri.type).c_str(),
+			     Common::PathToString(program->file_name).c_str());
+		}
+	}
+	return rebound;
+}
+
 __attribute__((naked)) static KYTY_SYSV_ABI void RelocateHandlerReturnStub() {
 	asm volatile("addq $8, %rsp\n\t"
 	             "retq\n");
@@ -1286,6 +1368,28 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	Relocate(program);
+}
+
+void RuntimeLinker::RebindPendingImports() {
+	Common::LockGuard lock(m_mutex);
+
+	uint32_t rebound = 0;
+	for (auto* program: m_programs) {
+		if (program == nullptr || !program->relocated) {
+			continue;
+		}
+
+		// Relocation tables describe every candidate slot, while IsPendingImportTarget keeps
+		// already-valid and guest-modified values intact.
+		rebound += RebindPendingRecords(program->dynamic_info->rela_table,
+		                                program->dynamic_info->rela_table_total_size, program);
+		rebound += RebindPendingRecords(program->dynamic_info->jmprela_table,
+		                                program->dynamic_info->jmprela_table_size, program);
+	}
+
+	if (rebound != 0) {
+		LOGF("Rebound %u pending imports after module load\n", rebound);
+	}
 }
 
 void RuntimeLinker::UnloadProgram(Program* program) {

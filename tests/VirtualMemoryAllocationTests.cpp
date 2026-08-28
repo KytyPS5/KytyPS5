@@ -2506,9 +2506,21 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestPendingImportTargetClassifier() {
+	const char* test = "PendingImportTargetClassifier";
+	Check(test, Loader::TestPendingImportTargetClassifier(),
+	      "valid import targets were not kept distinct from linker-owned pending values");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+	if (argc == 2 && std::strcmp(argv[1], "--import-rebind-only") == 0) {
+		RunTest(TestPendingImportTargetClassifier);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
@@ -2563,6 +2575,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestPendingImportTargetClassifier);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

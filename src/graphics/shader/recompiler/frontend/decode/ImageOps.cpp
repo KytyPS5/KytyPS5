@@ -208,6 +208,8 @@ constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x18u, "image_atomic_and", Opcode::IMAGE_ATOMIC_AND},
     {0x19u, "image_atomic_or", Opcode::IMAGE_ATOMIC_OR},
     {0x1au, "image_atomic_xor", Opcode::IMAGE_ATOMIC_XOR},
+    {0x1eu, "image_atomic_fmin", Opcode::IMAGE_ATOMIC_FMIN},
+    {0x1fu, "image_atomic_fmax", Opcode::IMAGE_ATOMIC_FMAX},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);

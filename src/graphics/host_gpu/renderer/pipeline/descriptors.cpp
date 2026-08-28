@@ -512,10 +512,15 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
+	const bool raw_bit_atomic_format = format == Prospero::BufferFormat::k32UInt ||
+	                                   format == Prospero::BufferFormat::k32SInt ||
+	                                   format == Prospero::BufferFormat::k32Float;
 	const bool format_ok =
-	    raw_sint_storage || (Prospero::IsSampledTextureFormat(format) &&
-	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
-	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	    raw_sint_storage ||
+	    (resource.atomic
+	         ? (uint_resource && raw_bit_atomic_format && Prospero::IsSampledTextureFormat(format))
+	         : (Prospero::IsSampledTextureFormat(format) &&
+	            uint_resource == Prospero::IsUintTextureFormat(format)));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -776,9 +781,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	const auto pixel_format        = surface_format.vk_format;
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
-	                                     ? vk::Format::eR32Uint
-	                                     : SrgbStorageViewFormat(pixel_format);
+	const bool atomic_raw_view =
+	    storage && resource.atomic &&
+	    (format == Prospero::BufferFormat::k32UInt || format == Prospero::BufferFormat::k32SInt ||
+	     format == Prospero::BufferFormat::k32Float);
+	const auto storage_view_format =
+	    (storage && format == Prospero::BufferFormat::k32SInt) || atomic_raw_view
+	        ? vk::Format::eR32Uint
+	        : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
 	                                     : pixel_format;

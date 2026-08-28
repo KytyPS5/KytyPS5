@@ -82,6 +82,7 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	int                     export_count        = 0;
 	uint32_t                scratch_size_dwords = 0;
+	bool                    dx10_clamp          = false;
 	uint32_t                param_export_mask   = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	bool                    fetch_external      = false;
@@ -115,6 +116,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       mrt_output_mask              = 0;
 	uint32_t                                       push_constant_offset         = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	bool                                           dx10_clamp                   = false;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_xy                    = false;

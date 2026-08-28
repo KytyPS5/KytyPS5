@@ -1129,7 +1129,11 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto         typed_index = block_indices.at(cfg_block.id);
-		const bool dx10_clamp = options.compute != nullptr && options.compute->dx10_clamp;
+		const bool dx10_clamp = options.compute != nullptr
+		                              ? options.compute->dx10_clamp
+		                          : options.pixel != nullptr ? options.pixel->dx10_clamp
+		                          : options.vertex != nullptr ? options.vertex->dx10_clamp
+		                                                       : false;
 		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size,
 		                      dx10_clamp);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {

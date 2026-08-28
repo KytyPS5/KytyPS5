@@ -524,6 +524,11 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME emulator_user_name_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
+	add_test(NAME emulator_user_name_too_long
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 12345678901234567)
+	set_tests_properties(emulator_user_name_too_long PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)

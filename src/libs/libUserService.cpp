@@ -1,11 +1,10 @@
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/stringUtils.h"
+#include "common/emulatorConfig.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
-#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 
@@ -96,7 +95,8 @@ static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t 
 	EXIT_NOT_IMPLEMENTED(user_id != 1000);
 	EXIT_NOT_IMPLEMENTED(size < 5);
 
-	int s = snprintf(name, size, "%s", "Kyty");
+	const auto& user_name = Config::GetUserName();
+	int         s         = snprintf(name, size, "%s", user_name.c_str());
 
 	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);
 

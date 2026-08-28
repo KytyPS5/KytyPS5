@@ -21,6 +21,7 @@ void Shutdown() {
 
 void Load(const ConfigOptions& cfg) {
 	EXIT_IF(g_config == nullptr);
+	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 
 	*g_config = cfg;
 }
@@ -31,6 +32,10 @@ uint32_t GetScreenWidth() {
 
 uint32_t GetScreenHeight() {
 	return g_config->screen_height;
+}
+
+const std::string& GetUserName() {
+	return g_config->user_name;
 }
 
 bool FullscreenEnabled() {

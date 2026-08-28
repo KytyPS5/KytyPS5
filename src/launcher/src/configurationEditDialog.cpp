@@ -1,5 +1,6 @@
 #include "configurationEditDialog.h"
 
+#include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
 
@@ -12,6 +13,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
+#include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
 #include <QMessageBox>
@@ -152,6 +154,8 @@ static void ListInit(QComboBox* combo, T value) {
 }
 
 void ConfigurationEditDialog::Init(const Configuration& info) {
+	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
+	m_ui->lineEdit_user_name->setText(info.user_name);
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
@@ -283,6 +287,7 @@ void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 }
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
+	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
@@ -321,6 +326,14 @@ void ConfigurationEditDialog::save() {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
 		return;
 	}
+
+	const auto user_name = m_ui->lineEdit_user_name->text().trimmed();
+	if (user_name.isEmpty() || user_name.toUtf8().size() > Config::MAX_USER_NAME_LENGTH) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("User name must contain 1-16 UTF-8 bytes"));
+		return;
+	}
+	m_ui->lineEdit_user_name->setText(user_name);
 
 	update_info();
 

@@ -102,27 +102,44 @@
        </widget>
       </item>
       <item row="1" column="0">
+       <widget class="QLabel" name="label_user_name">
+        <property name="text">
+         <string>User name:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="MandatoryLineEdit" name="lineEdit_user_name">
+        <property name="toolTip">
+         <string>Local user name exposed to games</string>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
        <widget class="QLabel" name="label_16">
         <property name="text">
          <string>Screen resolution:</string>
         </property>
        </widget>
       </item>
-      <item row="1" column="1">
+      <item row="2" column="1">
        <widget class="QComboBox" name="comboBox_screen_resolution">
         <property name="toolTip">
          <string>Window resolution</string>
         </property>
        </widget>
       </item>
-      <item row="2" column="0">
+      <item row="3" column="0">
        <widget class="QLabel" name="label_vblank_frequency">
         <property name="text">
          <string>Vblank frequency:</string>
         </property>
        </widget>
       </item>
-      <item row="2" column="1">
+      <item row="3" column="1">
        <widget class="QSpinBox" name="spinBox_vblank_frequency">
         <property name="toolTip">
          <string>Virtual display refresh rate used for frame pacing</string>
@@ -138,56 +155,56 @@
         </property>
        </widget>
       </item>
-      <item row="3" column="0">
+      <item row="4" column="0">
        <widget class="QLabel" name="label_console_language">
         <property name="text">
          <string>Console language:</string>
         </property>
        </widget>
       </item>
-      <item row="3" column="1">
+      <item row="4" column="1">
        <widget class="QComboBox" name="comboBox_console_language">
         <property name="toolTip">
          <string>Language</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="0">
+      <item row="5" column="0">
        <widget class="QLabel" name="label_20">
         <property name="text">
          <string>Shader optimization type:</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="1">
+      <item row="5" column="1">
        <widget class="QComboBox" name="comboBox_shader_optimization_type">
         <property name="toolTip">
          <string>Optimize shaders for code size or performance</string>
         </property>
        </widget>
       </item>
-      <item row="5" column="0">
+      <item row="6" column="0">
        <widget class="QLabel" name="label_21">
         <property name="text">
          <string>Shader log direction:</string>
         </property>
        </widget>
       </item>
-      <item row="5" column="1">
+      <item row="6" column="1">
        <widget class="QComboBox" name="comboBox_shader_log_direction">
         <property name="toolTip">
          <string>Dump shaders to file or console window. If enabled may decrease emulator performance</string>
         </property>
        </widget>
       </item>
-      <item row="6" column="0">
+      <item row="7" column="0">
        <widget class="QLabel" name="label_22">
         <property name="text">
          <string>Shader log folder:</string>
         </property>
        </widget>
       </item>
-      <item row="6" column="1">
+      <item row="7" column="1">
        <widget class="MandatoryLineEdit" name="lineEdit_shader_log_folder">
         <property name="toolTip">
          <string>Specify directory to dump shaders</string>
@@ -197,14 +214,14 @@
         </property>
        </widget>
       </item>
-      <item row="7" column="0">
+      <item row="8" column="0">
        <widget class="QLabel" name="label_24">
         <property name="text">
          <string>Command buffer dump folder:</string>
         </property>
        </widget>
       </item>
-      <item row="7" column="1">
+      <item row="8" column="1">
        <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
         <property name="toolTip">
          <string>Specify directory to dump command buffers</string>
@@ -214,28 +231,28 @@
         </property>
        </widget>
       </item>
-      <item row="8" column="0">
+      <item row="9" column="0">
        <widget class="QLabel" name="label_25">
         <property name="text">
          <string>Printf direction:</string>
         </property>
        </widget>
       </item>
-      <item row="8" column="1">
+      <item row="9" column="1">
        <widget class="QComboBox" name="comboBox_printf_direction">
         <property name="toolTip">
          <string>Print logs to file or console window. If enabled may decrease emulator performance</string>
         </property>
        </widget>
       </item>
-      <item row="9" column="0">
+      <item row="10" column="0">
        <widget class="QLabel" name="label_26">
         <property name="text">
          <string>Printf output file:</string>
         </property>
        </widget>
       </item>
-      <item row="9" column="1">
+      <item row="10" column="1">
        <widget class="MandatoryLineEdit" name="lineEdit_printf_file">
         <property name="toolTip">
          <string>Specify file to dump logs</string>
@@ -245,14 +262,14 @@
         </property>
        </widget>
       </item>
-      <item row="10" column="0">
+      <item row="11" column="0">
        <widget class="QLabel" name="label_27">
         <property name="text">
          <string>Profiler direction:</string>
         </property>
        </widget>
       </item>
-      <item row="10" column="1">
+      <item row="11" column="1">
        <widget class="QComboBox" name="comboBox_profiler_direction">
         <property name="toolTip">
          <string>Enable or disable profiler. If enabled may decrease emulator performance</string>

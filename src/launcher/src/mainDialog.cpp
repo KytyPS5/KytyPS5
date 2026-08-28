@@ -204,6 +204,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
+	args << "--user-name" << info.user_name;
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
 	}

@@ -106,6 +106,19 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 	return EmitInputComponentU32(state, kind, component);
 }
 
+uint32_t EmitGuestLaneId(EmitterState& state) {
+	// A guest wave64 may span two host wave32 subgroups. The subgroup builtin restarts at 0 for
+	// the upper half, while the flattened compute invocation index preserves the logical lane.
+	if (state.stage == ShaderType::Compute && state.wave_size == 64u) {
+		const auto local_index = EmitLocalInvocationIndex(state);
+		const auto lane        = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, local_index,
+		                           ConstantU32(state, 63)});
+		return lane;
+	}
+	return EmitSubgroupLocalInvocationId(state);
+}
+
 uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 	auto&      state  = ctx.state;
 	const auto ballot = state.builder.AllocateId();
@@ -554,7 +567,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitWqm(ctx, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
+			ctx.Define(inst, EmitGuestLaneId(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
 			ctx.Emit(inst, OpGroupNonUniformBallot, IR::Type::U32x4,

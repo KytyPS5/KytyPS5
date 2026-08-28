@@ -636,6 +636,9 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	uint32_t dpp8_lane_selectors = 0;
+	bool     dpp8_fetch_inactive = false;
+	bool     dpp8                = false;
 };
 
 struct Instruction {

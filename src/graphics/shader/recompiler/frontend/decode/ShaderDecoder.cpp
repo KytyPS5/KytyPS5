@@ -478,6 +478,10 @@ std::string OperandToString(const Operand& operand) {
 		text += fmt::format(".dpp(ctrl=0x{:x},fi={},bc={})", operand.dpp_ctrl,
 		                    operand.dpp_fetch_inactive ? 1u : 0u, operand.dpp_bound_ctrl ? 1u : 0u);
 	}
+	if (operand.dpp8) {
+		text += fmt::format(".dpp8(sel=0x{:06x},fi={})", operand.dpp8_lane_selectors,
+		                    operand.dpp8_fetch_inactive ? 1u : 0u);
+	}
 	return text;
 }
 

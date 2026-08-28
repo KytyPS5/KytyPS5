@@ -113,6 +113,28 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	return {subid, EmitTrueBool(state)};
 }
 
+DppTargetLane EmitDpp8TargetLane(EmitterState& state, uint32_t lane_selectors) {
+	const auto subid    = EmitSubgroupLocalInvocationId(state);
+	const auto group    = state.builder.AllocateId();
+	const auto in_group = state.builder.AllocateId();
+	const auto shift    = state.builder.AllocateId();
+	const auto shifted  = state.builder.AllocateId();
+	const auto sel      = state.builder.AllocateId();
+	const auto lane     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), group, subid, ConstantU32(state, 0xfffffff8u)});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), in_group, subid, ConstantU32(state, 7u)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU32(state), shift, in_group, ConstantU32(state, 3u)});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), shifted,
+	                           ConstantU32(state, lane_selectors), shift});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), sel, shifted, ConstantU32(state, 7u)});
+	state.builder.AddFunction({OpIAdd, TypeU32(state), lane, group, sel});
+	return {lane, EmitTrueBool(state)};
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");

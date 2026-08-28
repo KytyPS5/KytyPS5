@@ -46,6 +46,14 @@ namespace {
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
 }
 
+[[nodiscard]] vk::Format BlockStorageViewFormat(Prospero::BufferFormat guest_format) {
+	switch (Prospero::BlockCompressedBytesPerBlock(guest_format)) {
+		case 8: return vk::Format::eR32G32Uint;
+		case 16: return vk::Format::eR32G32B32A32Uint;
+		default: return vk::Format::eUndefined;
+	}
+}
+
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
 	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -63,7 +71,10 @@ namespace {
 	    HasFormatFeature(properties, vk::FormatFeatureFlagBits::eStorageImage)) {
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	} else if (info.samples == 1) {
-		const auto compatible = SrgbStorageViewFormat(info.pixel_format);
+		const auto block_compatible = BlockStorageViewFormat(info.guest_format);
+		const auto compatible       = block_compatible != vk::Format::eUndefined
+		                                  ? block_compatible
+		                                  : SrgbStorageViewFormat(info.pixel_format);
 		if (compatible != vk::Format::eUndefined &&
 		    HasFormatFeature(graphics.GetFormatProperties(compatible),
 		                     vk::FormatFeatureFlagBits::eStorageImage)) {

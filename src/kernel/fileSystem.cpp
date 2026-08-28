@@ -112,6 +112,48 @@ static void SecToTimespec(KernelTimespec* ts, double sec) {
 	ts->tv_nsec = static_cast<int64_t>((sec - static_cast<double>(ts->tv_sec)) * 1000000000.0);
 }
 
+static bool TimevalToDateTime(const KernelTimeval& tv, Common::DateTime* date_time) {
+	EXIT_IF(date_time == nullptr);
+
+	if (tv.tv_usec < 0 || tv.tv_usec >= 1000000) {
+		return false;
+	}
+
+	// DateTime uses a Julian day plus milliseconds since midnight. Normalize negative Unix
+	// timestamps explicitly because C++ integer division truncates toward zero.
+	constexpr int64_t seconds_per_day = 86400;
+	constexpr int64_t unix_epoch_jd   = 2440588;
+	int64_t           days            = tv.tv_sec / seconds_per_day;
+	int64_t           seconds         = tv.tv_sec % seconds_per_day;
+	if (seconds < 0) {
+		seconds += seconds_per_day;
+		days--;
+	}
+
+	const int64_t julian_day = unix_epoch_jd + days;
+	if (julian_day < INT32_MIN || julian_day > INT32_MAX) {
+		return false;
+	}
+
+	const int64_t milliseconds = seconds * 1000 + tv.tv_usec / 1000;
+	*date_time = Common::DateTime(Common::Date(static_cast<Common::jd_t>(julian_day)),
+	                             Common::Time(static_cast<int>(milliseconds)));
+	return !date_time->IsInvalid();
+}
+
+static bool SetFileTimes(const std::filesystem::path& real_name, const KernelTimeval times[2]) {
+	Common::DateTime access;
+	Common::DateTime write;
+	if (times == nullptr) {
+		access = Common::DateTime::FromSystemUTC();
+		write  = access;
+	} else if (!TimevalToDateTime(times[0], &access) || !TimevalToDateTime(times[1], &write)) {
+		return false;
+	}
+
+	return Common::File::SetLastAccessAndWriteTimeUTC(real_name, access, write);
+}
+
 static uint64_t AlignDown(uint64_t value, uint64_t alignment) {
 	return (alignment != 0 ? value & ~(alignment - 1) : value);
 }
@@ -1005,6 +1047,84 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	     Common::PathToString(file->real_name).c_str());
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFchmod(int d, uint16_t mode) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EPERM;
+	}
+
+	using Permissions = std::filesystem::perms;
+	Permissions permissions = Permissions::none;
+	if ((mode & 0400u) != 0) permissions |= Permissions::owner_read;
+	if ((mode & 0200u) != 0) permissions |= Permissions::owner_write;
+	if ((mode & 0100u) != 0) permissions |= Permissions::owner_exec;
+	if ((mode & 0040u) != 0) permissions |= Permissions::group_read;
+	if ((mode & 0020u) != 0) permissions |= Permissions::group_write;
+	if ((mode & 0010u) != 0) permissions |= Permissions::group_exec;
+	if ((mode & 0004u) != 0) permissions |= Permissions::others_read;
+	if ((mode & 0002u) != 0) permissions |= Permissions::others_write;
+	if ((mode & 0001u) != 0) permissions |= Permissions::others_exec;
+
+	std::error_code error;
+	std::filesystem::permissions(file->real_name, permissions,
+	                             std::filesystem::perm_options::replace, error);
+	return error ? KERNEL_ERROR_EIO : OK;
+}
+
+int KYTY_SYSV_ABI KernelFutimes(int d, const KernelTimeval times[2]) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EPERM;
+	}
+	if (times != nullptr && (times[0].tv_usec < 0 || times[0].tv_usec >= 1000000 ||
+	                         times[1].tv_usec < 0 || times[1].tv_usec >= 1000000)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	return SetFileTimes(file->real_name, times) ? OK : KERNEL_ERROR_EIO;
+}
+
+int KYTY_SYSV_ABI KernelUtimes(const char* path, const KernelTimeval times[2]) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (times != nullptr && (times[0].tv_usec < 0 || times[0].tv_usec >= 1000000 ||
+	                         times[1].tv_usec < 0 || times[1].tv_usec >= 1000000)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	const std::string mounted_path(path);
+	auto              real_name = g_mount_points->GetRealFilename(mounted_path);
+	if (!Common::File::IsFileExisting(real_name)) {
+		real_name = g_mount_points->GetRealDirectory(mounted_path);
+		if (!Common::File::IsDirectoryExisting(real_name)) {
+			return KERNEL_ERROR_ENOENT;
+		}
+	}
+
+	return SetFileTimes(real_name, times) ? OK : KERNEL_ERROR_EIO;
 }
 
 int KYTY_SYSV_ABI KernelUnlink(const char* path) {

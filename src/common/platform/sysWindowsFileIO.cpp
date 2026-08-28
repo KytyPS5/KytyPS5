@@ -432,15 +432,16 @@ bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeS
 		return false;
 	}
 
-	bool ok = true;
-
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, &access.time, nullptr) == 0));
-
-	SysFileClose(f);
-
+	// Timestamp updates require FILE_WRITE_ATTRIBUTES, not file-content write access. Opening with
+	// SysFileOpenW would incorrectly reject read-only files and directories.
+	const auto wide = name.wstring();
+	const auto file = CreateFileW(wide.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_POSIX, nullptr,
+	                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	const bool ok =
+	    file != INVALID_HANDLE_VALUE && SetFileTime(file, nullptr, &access.time, nullptr) != 0;
+	if (file != INVALID_HANDLE_VALUE) {
+		CloseHandle(file);
+	}
 	return ok;
 }
 
@@ -449,15 +450,14 @@ bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeSt
 		return false;
 	}
 
-	bool ok = true;
-
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, nullptr, &write.time) == 0));
-
-	SysFileClose(f);
-
+	const auto wide = name.wstring();
+	const auto file = CreateFileW(wide.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_POSIX, nullptr,
+	                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	const bool ok =
+	    file != INVALID_HANDLE_VALUE && SetFileTime(file, nullptr, nullptr, &write.time) != 0;
+	if (file != INVALID_HANDLE_VALUE) {
+		CloseHandle(file);
+	}
 	return ok;
 }
 
@@ -467,15 +467,14 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 		return false;
 	}
 
-	bool ok = true;
-
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, &access.time, &write.time) == 0));
-
-	SysFileClose(f);
-
+	const auto wide = name.wstring();
+	const auto file = CreateFileW(wide.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_POSIX, nullptr,
+	                              OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	const bool ok = file != INVALID_HANDLE_VALUE &&
+	                SetFileTime(file, nullptr, &access.time, &write.time) != 0;
+	if (file != INVALID_HANDLE_VALUE) {
+		CloseHandle(file);
+	}
 	return ok;
 }
 

@@ -1971,6 +1971,24 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
+int KYTY_SYSV_ABI fchmod(int d, uint16_t mode) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFchmod(d, mode));
+}
+
+int KYTY_SYSV_ABI futimes(int d, const LibKernel::KernelTimeval times[2]) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelFutimes(d, times));
+}
+
+int KYTY_SYSV_ABI utimes(const char* path, const LibKernel::KernelTimeval times[2]) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelUtimes(path, times));
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2121,6 +2139,9 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("n01yNbQO5W4", Posix::fchmod);
+	LIB_FUNC("+0EDo7YzcoU", Posix::futimes);
+	LIB_FUNC("GDuV00CHrUg", Posix::utimes);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -3071,6 +3092,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("j2AIqSqJP0w", FileSystem::KernelGetdents);
 	LIB_FUNC("1-LFLmRFxxM", FileSystem::KernelMkdir);
 	LIB_FUNC("naInUjYt3so", FileSystem::KernelRmdir);
+	LIB_FUNC("0Cq8ipKr9n0", FileSystem::KernelUtimes);
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
 }
 

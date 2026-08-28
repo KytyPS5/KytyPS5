@@ -43,8 +43,10 @@ uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
 uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
 bool                       IsSampledTextureFormat(BufferFormat format);
+bool                       IsSampledSintTextureFormat(BufferFormat format);
 bool                       IsUintTextureFormat(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
+BufferFormat               RemapSampledTextureFormat(BufferFormat format);
 
 } // namespace Libs::Graphics::Prospero
 

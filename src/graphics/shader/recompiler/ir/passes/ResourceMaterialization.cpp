@@ -77,9 +77,10 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
-Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
-	return Prospero::RemapTextureFormat(format) != format ? format
-	                                                     : Prospero::BufferFormat::kInvalid;
+Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format, bool storage) {
+	const auto backing_format = storage ? Prospero::RemapTextureFormat(format)
+	                                    : Prospero::RemapSampledTextureFormat(format);
+	return backing_format != format ? format : Prospero::BufferFormat::kInvalid;
 }
 
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
@@ -470,7 +471,7 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
-			const auto conversion_format = ImageConversionFormat(format);
+			const auto conversion_format = ImageConversionFormat(format, storage);
 			if (image.conversion_format != conversion_format) {
 				if (error != nullptr) {
 					*error = fmt::format("image descriptor {} changed format conversion", i);
@@ -487,8 +488,9 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			const bool raw_sint_storage =
 			    storage && format == Prospero::BufferFormat::k32SInt && image.written &&
 			    !image.read && !image.atomic;
+			const bool sampled_sint = !storage && Prospero::IsSampledSintTextureFormat(format);
 			const bool uint_descriptor =
-			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+			    Prospero::IsUintTextureFormat(format) || sampled_sint || raw_sint_storage;
 			const auto uint_program = image.kind == ResourceKind::ImageUint ||
 			                          image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
@@ -779,13 +781,15 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		}
 		const bool storage = image.kind == ResourceKind::StorageImage ||
 		                     image.kind == ResourceKind::StorageImageUint;
-		image.conversion_format = ImageConversionFormat(format);
+		image.conversion_format = ImageConversionFormat(format, storage);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              image.written && !image.read && !image.atomic;
-		const bool uint_image = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+		const bool sampled_sint = !storage && Prospero::IsSampledSintTextureFormat(format);
+		const bool uint_image =
+		    Prospero::IsUintTextureFormat(format) || sampled_sint || raw_sint_storage;
 		if (uint_image) {
 			switch (image.kind) {
 				case ResourceKind::Image: image.kind = ResourceKind::ImageUint; break;

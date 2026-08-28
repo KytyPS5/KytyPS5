@@ -363,12 +363,18 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto format = state.program.info.images[mem.resource].conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
 	const auto info = Format::GetFormatInfo(format);
+	const bool packed_uint = Prospero::IsUintTextureFormat(format) &&
+	                         info.type == Format::ComponentType::Uint && info.packed_bitfield &&
+	                         info.byte_size == sizeof(uint32_t) && info.component_count != 0u &&
+	                         info.component_count <= 4u;
+	// Sampled R16_SINT and RG8_SINT share an R16_UINT backing. Signed extraction restores the
+	// guest-visible 32-bit component values without introducing signed Vulkan image descriptors.
+	const bool sint16_word = info.type == Format::ComponentType::Sint &&
+	                         !info.packed_bitfield && info.byte_size == sizeof(uint16_t) &&
+	                         info.component_count != 0u && info.component_count <= 2u;
 	EXIT_IF(!Prospero::IsSampledTextureFormat(format) ||
-	        !Prospero::IsUintTextureFormat(format) ||
-	        Prospero::RemapTextureFormat(format) == format ||
-	        info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
-	        info.byte_size != sizeof(uint32_t) || info.component_count == 0u ||
-	        info.component_count > 4u);
+	        Prospero::RemapSampledTextureFormat(format) == format ||
+	        (!packed_uint && !sint16_word));
 	return info;
 }
 
@@ -382,10 +388,11 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	                          ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
 	for (uint32_t component = 0; component < info.component_count; component++) {
 		components[component] = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction({OpBitFieldUExtract, TypeU32(ctx.state),
-		                               components[component], packed,
-		                               ConstantU32(ctx.state, info.component_bit_offset[component]),
-		                               ConstantU32(ctx.state, info.component_bits[component])});
+		ctx.state.builder.AddFunction(
+		    {info.type == Format::ComponentType::Sint ? OpBitFieldSExtract : OpBitFieldUExtract,
+		     TypeU32(ctx.state), components[component], packed,
+		     ConstantU32(ctx.state, info.component_bit_offset[component]),
+		     ConstantU32(ctx.state, info.component_bits[component])});
 	}
 	for (uint32_t component = info.component_count; component < 4u; component++) {
 		components[component] = components[component % info.component_count];
@@ -429,9 +436,11 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 		    {OpCompositeExtract, TypeU32(ctx.state), packed, gathered, lane});
 		values[lane]        = ctx.state.builder.AllocateId();
 		const auto physical = (selector - 4u) % info.component_count;
-		ctx.state.builder.AddFunction({OpBitFieldUExtract, TypeU32(ctx.state), values[lane], packed,
-		                               ConstantU32(ctx.state, info.component_bit_offset[physical]),
-		                               ConstantU32(ctx.state, info.component_bits[physical])});
+		ctx.state.builder.AddFunction(
+		    {info.type == Format::ComponentType::Sint ? OpBitFieldSExtract : OpBitFieldUExtract,
+		     TypeU32(ctx.state), values[lane], packed,
+		     ConstantU32(ctx.state, info.component_bit_offset[physical]),
+		     ConstantU32(ctx.state, info.component_bits[physical])});
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,

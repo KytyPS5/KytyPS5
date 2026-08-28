@@ -513,7 +513,8 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage || (Prospero::IsSampledTextureFormat(format) &&
+	    raw_sint_storage || (!Prospero::IsSampledSintTextureFormat(format) &&
+	                         Prospero::IsSampledTextureFormat(format) &&
 	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
 	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
@@ -733,13 +734,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    multisampled ? 1u : static_cast<uint32_t>(view_last_level - base_level) + 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = descriptor.Format();
-	const auto surface_format = TextureGetSurfaceFormatInfo(format);
+	const auto surface_format = TextureGetSurfaceFormatInfo(format, !storage);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
+	const bool sampled_uint_class =
+	    Prospero::IsUintTextureFormat(format) || Prospero::IsSampledSintTextureFormat(format);
 	const bool sampled_numeric_class =
 	    storage || (Prospero::IsSampledTextureFormat(format) &&
 	                (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
-	                    Prospero::IsUintTextureFormat(format));
+	                    sampled_uint_class);
 	if (!storage &&
 	    (resource.kind == ShaderRecompiler::IR::ResourceKind::Image ||
 	     resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) &&

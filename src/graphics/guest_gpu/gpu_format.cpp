@@ -24,12 +24,12 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16UInt, 2, 0, 2, true, true},
-	{BufferFormat::k16SInt, 2, 0, 2, false, false},
+	{BufferFormat::k16SInt, 2, 0, 2, true, false},
 	{BufferFormat::k16Float, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UInt, 2, 0, 2, true, true},
-	{BufferFormat::k8_8SInt, 2, 0, 2, false, false},
+	{BufferFormat::k8_8SInt, 2, 0, 2, true, false},
 	{BufferFormat::k32UInt, 4, 0, 4, true, true},
 	{BufferFormat::k32SInt, 4, 0, 4, false, false},
 	{BufferFormat::k32Float, 4, 0, 4, true, false},
@@ -211,6 +211,10 @@ bool IsSampledTextureFormat(BufferFormat format) {
 	return info != nullptr && info->sampled_texture;
 }
 
+bool IsSampledSintTextureFormat(BufferFormat format) {
+	return format == BufferFormat::k16SInt || format == BufferFormat::k8_8SInt;
+}
+
 bool IsUintTextureFormat(BufferFormat format) {
 	const auto* info = FindFormatInfo(format);
 	return info != nullptr && info->uint_texture;
@@ -218,6 +222,15 @@ bool IsUintTextureFormat(BufferFormat format) {
 
 BufferFormat RemapTextureFormat(BufferFormat format) {
 	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
+}
+
+BufferFormat RemapSampledTextureFormat(BufferFormat format) {
+	// Vulkan image types cannot change their numeric class after creation. Read the two supported
+	// 16-bit SINT layouts through one UINT word and restore each signed component in the shader.
+	if (IsSampledSintTextureFormat(format)) {
+		return BufferFormat::k16UInt;
+	}
+	return RemapTextureFormat(format);
 }
 
 } // namespace Libs::Graphics::Prospero

@@ -43,8 +43,9 @@ struct TextureUploadLayout {
 	TextureUploadMipLayout mips[16] = {};
 };
 
-vk::ComponentMapping   TextureGetComponentMapping(uint32_t swizzle);
-SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
+vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle);
+SurfaceFormatInfo    TextureGetSurfaceFormatInfo(Prospero::BufferFormat format,
+                                                 bool sampled = false);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);

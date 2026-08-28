@@ -119,8 +119,9 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
 	return components;
 }
 
-SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
-	const auto backing_format    = Prospero::RemapTextureFormat(format);
+SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format, bool sampled) {
+	const auto backing_format = sampled ? Prospero::RemapSampledTextureFormat(format)
+	                                    : Prospero::RemapTextureFormat(format);
 	const auto vk_format         = VulkanFormat(backing_format);
 	const auto conversion_format =
 	    backing_format != format ? format : Prospero::BufferFormat::kInvalid;

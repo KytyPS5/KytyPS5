@@ -10620,6 +10620,49 @@ public:
                   storage_only_surface.conversion_format ==
                       Prospero::BufferFormat::kInvalid,
               "storage-only native backing was conflated with sampled support");
+
+      constexpr auto sampled_sint_format = Prospero::BufferFormat::k16SInt;
+      const auto sampled_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_sint_format, true);
+      const auto storage_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_sint_format);
+      Require(name, "R16 SINT sampled conversion",
+              Prospero::IsSampledTextureFormat(sampled_sint_format) &&
+                  Prospero::IsSampledSintTextureFormat(sampled_sint_format) &&
+                  !Prospero::IsUintTextureFormat(sampled_sint_format) &&
+                  Prospero::RemapTextureFormat(sampled_sint_format) ==
+                      sampled_sint_format &&
+                  Prospero::RemapSampledTextureFormat(sampled_sint_format) ==
+                      Prospero::BufferFormat::k16UInt &&
+                  sampled_sint_surface.vk_format == vk::Format::eR16Uint &&
+                  sampled_sint_surface.conversion_format ==
+                      sampled_sint_format &&
+                  storage_sint_surface.vk_format == vk::Format::eR16Sint &&
+                  storage_sint_surface.conversion_format ==
+                      Prospero::BufferFormat::kInvalid,
+              "R16 SINT sampled conversion changed storage semantics");
+
+      constexpr auto sampled_rg8_sint_format = Prospero::BufferFormat::k8_8SInt;
+      const auto sampled_rg8_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_rg8_sint_format, true);
+      const auto storage_rg8_sint_surface =
+          TextureGetSurfaceFormatInfo(sampled_rg8_sint_format);
+      Require(
+          name, "RG8 SINT sampled conversion",
+          Prospero::IsSampledTextureFormat(sampled_rg8_sint_format) &&
+              Prospero::IsSampledSintTextureFormat(sampled_rg8_sint_format) &&
+              !Prospero::IsUintTextureFormat(sampled_rg8_sint_format) &&
+              Prospero::RemapTextureFormat(sampled_rg8_sint_format) ==
+                  sampled_rg8_sint_format &&
+              Prospero::RemapSampledTextureFormat(sampled_rg8_sint_format) ==
+                  Prospero::BufferFormat::k16UInt &&
+              sampled_rg8_sint_surface.vk_format == vk::Format::eR16Uint &&
+              sampled_rg8_sint_surface.conversion_format ==
+                  sampled_rg8_sint_format &&
+              storage_rg8_sint_surface.vk_format == vk::Format::eR8G8Sint &&
+              storage_rg8_sint_surface.conversion_format ==
+                  Prospero::BufferFormat::kInvalid,
+          "RG8 SINT sampled conversion changed storage semantics");
     }
 
     {
@@ -18811,6 +18854,63 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadR16SintSignExtends() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadR16SintSignExtends";
+  test.code = std::move(code);
+  test.expected = {0xffff8001u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[3] = 0x00008001u;
+  test.sampled_image_format = vk::Format::eR16Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k16SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+                         "OpImageFetch %v4uint", "OpBitFieldSExtract"};
+  return test;
+}
+
+TestCase ImageLoadRg8SintSignExtends() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x3));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadRg8SintSignExtends";
+  test.code = std::move(code);
+  test.expected = {0xffffffffu, 0xffffff80u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[3] = 0x000080ffu;
+  test.sampled_image_format = vk::Format::eR16Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8_8SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+                         "OpImageFetch %v4uint", "OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   using O = ShaderOpcode;
 
@@ -20531,6 +20631,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadR16SintSignExtends);
+  AddCase(ImageLoadRg8SintSignExtends);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);

@@ -2458,47 +2458,40 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-__attribute__((noinline, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
-	int ret = 0;
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq %%rbx, 0(%%r10)\n\t"
-	             "movq %%rbp, 8(%%r10)\n\t"
-	             "movq %%rdi, 16(%%r10)\n\t"
-	             "movq %%rsi, 24(%%r10)\n\t"
-	             "movq %%r12, 32(%%r10)\n\t"
-	             "movq %%r13, 40(%%r10)\n\t"
-	             "movq %%r14, 48(%%r10)\n\t"
-	             "movq %%r15, 56(%%r10)\n\t"
-	             "leaq 8(%%rsp), %%r11\n\t"
-	             "movq %%r11, 64(%%r10)\n\t"
-	             "movq (%%rsp), %%r11\n\t"
-	             "movq %%r11, 72(%%r10)\n\t"
-	             "xorl %%eax, %%eax\n\t"
-	             : "=a"(ret)
-	             : [ctx] "r"(ctx)
-	             : "memory", "r10", "r11");
-	return ret;
+[[gnu::naked,
+  gnu::returns_twice]] static KYTY_SYSV_ABI int FiberSaveContext(FiberCpuContext* /*ctx*/) {
+	asm volatile("movq %rdi, %r10\n\t"
+	             "movq %rbx, 0(%r10)\n\t"
+	             "movq %rbp, 8(%r10)\n\t"
+	             "movq %rdi, 16(%r10)\n\t"
+	             "movq %rsi, 24(%r10)\n\t"
+	             "movq %r12, 32(%r10)\n\t"
+	             "movq %r13, 40(%r10)\n\t"
+	             "movq %r14, 48(%r10)\n\t"
+	             "movq %r15, 56(%r10)\n\t"
+	             "leaq 8(%rsp), %r11\n\t"
+	             "movq %r11, 64(%r10)\n\t"
+	             "movq (%rsp), %r11\n\t"
+	             "movq %r11, 72(%r10)\n\t"
+	             "xorl %eax, %eax\n\t"
+	             "retq\n");
 }
 
-__attribute__((noreturn, noinline)) static void FiberRestoreContext(FiberCpuContext* ctx,
-                                                                    uint64_t         ret) {
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq 72(%%r10), %%r11\n\t"
-	             "movq 0(%%r10), %%rbx\n\t"
-	             "movq 8(%%r10), %%rbp\n\t"
-	             "movq 16(%%r10), %%rdi\n\t"
-	             "movq 24(%%r10), %%rsi\n\t"
-	             "movq 32(%%r10), %%r12\n\t"
-	             "movq 40(%%r10), %%r13\n\t"
-	             "movq 48(%%r10), %%r14\n\t"
-	             "movq 56(%%r10), %%r15\n\t"
-	             "movq 64(%%r10), %%rsp\n\t"
-	             "movq %[ret], %%rax\n\t"
-	             "jmp *%%r11\n\t"
-	             :
-	             : [ctx] "r"(ctx), [ret] "r"(ret)
-	             : "memory", "rax", "r10", "r11");
-	__builtin_unreachable();
+[[gnu::naked, gnu::noreturn]] static KYTY_SYSV_ABI void
+FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
+	asm volatile("movq %rdi, %r10\n\t"
+	             "movq %rsi, %rax\n\t"
+	             "movq 72(%r10), %r11\n\t"
+	             "movq 0(%r10), %rbx\n\t"
+	             "movq 8(%r10), %rbp\n\t"
+	             "movq 16(%r10), %rdi\n\t"
+	             "movq 24(%r10), %rsi\n\t"
+	             "movq 32(%r10), %r12\n\t"
+	             "movq 40(%r10), %r13\n\t"
+	             "movq 48(%r10), %r14\n\t"
+	             "movq 56(%r10), %r15\n\t"
+	             "movq 64(%r10), %rsp\n\t"
+	             "jmp *%r11\n");
 }
 #else
 static int FiberSaveContext(FiberCpuContext* ctx) {

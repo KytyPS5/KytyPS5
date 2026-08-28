@@ -569,6 +569,8 @@ if(BUILD_TESTING)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
+		add_test(NAME color_render_target_1d
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
 		add_test(NAME texture_cache_htile_clear

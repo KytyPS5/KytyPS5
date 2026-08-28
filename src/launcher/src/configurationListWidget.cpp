@@ -163,11 +163,12 @@ static void ApplyGameListStyle(Ui::ConfigurationListWidget* ui) {
 	    "#267bd8; }"
 	    "QLineEdit:focus { border-color: rgba(80,160,255,180); }"));
 	ui->global_settings_button->setStyleSheet(QStringLiteral(
-	    "QToolButton { background: rgba(255,255,255,18); border: 1px solid transparent; "
-	    "border-radius: 5px; padding: 3px; }"
-	    "QToolButton:hover { background: rgba(255,255,255,45); border-color: rgba(255,255,255,70); "
-	    "}"
-	    "QToolButton:disabled { background: transparent; }"));
+	    "QToolButton { background: #202733; border: 1px solid #4b5c73; border-radius: 5px; "
+	    "padding: 3px; }"
+	    "QToolButton:hover { background: #267bd8; border-color: #70b5ff; }"
+	    "QToolButton:pressed { background: #185d9f; border-color: #9bcaff; }"
+	    "QToolButton:focus { border: 2px solid #70b5ff; padding: 2px; }"
+	    "QToolButton:disabled { background: #59616d; border-color: #737d8a; }"));
 	ui->edit_button->setStyleSheet(ui->global_settings_button->styleSheet());
 	ui->delete_button->setStyleSheet(ui->global_settings_button->styleSheet());
 	ui->input_mapping_button->setStyleSheet(ui->global_settings_button->styleSheet());

@@ -100,6 +100,22 @@ constexpr auto g_opcode_names   = MakeOpcodeNames();
 
 } // namespace
 
+const char* GetOpcodeName(uint8_t opcode) noexcept {
+	return g_opcode_names[opcode];
+}
+
+const char* GetCustomOpcodeName(uint32_t opcode) noexcept {
+	return opcode < g_register_names.size() ? g_register_names[opcode] : "<unknown>";
+}
+
+bool IsOpcodeNamed(uint8_t opcode) noexcept {
+	return g_opcode_names[opcode][0] != '<';
+}
+
+bool IsCustomOpcodeNamed(uint32_t opcode) noexcept {
+	return opcode < g_register_names.size() && g_register_names[opcode][0] != '<';
+}
+
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw) {
 	// db_dump();
@@ -132,8 +148,8 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 
 				EXIT_NOT_IMPLEMENTED(len >= dw);
 
-				file->Printf("%s %s(OP:0x%02" PRIx8 ") SH:%s CNT:%u\n", g_opcode_names[op],
-				             (op == IT_NOP ? g_register_names[r] : ""), op, sh_gx ? "GX" : "CX",
+				file->Printf("%s %s(OP:0x%02" PRIx8 ") SH:%s CNT:%u\n", GetOpcodeName(op),
+				             (op == IT_NOP ? GetCustomOpcodeName(r) : ""), op, sh_gx ? "GX" : "CX",
 				             len);
 
 				for (uint32_t i = 0; i < len; i++) {

@@ -1091,6 +1091,12 @@ constexpr uint32_t UC_NUM = 0x3FFF + 1;
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw);
 
+// Shared by text dumps and the structured inspector so opcode naming stays consistent.
+[[nodiscard]] const char* GetOpcodeName(uint8_t opcode) noexcept;
+[[nodiscard]] const char* GetCustomOpcodeName(uint32_t opcode) noexcept;
+[[nodiscard]] bool        IsOpcodeNamed(uint8_t opcode) noexcept;
+[[nodiscard]] bool        IsCustomOpcodeNamed(uint32_t opcode) noexcept;
+
 } // namespace Libs::Graphics::Pm4
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_PM4_H_ */

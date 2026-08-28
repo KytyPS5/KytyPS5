@@ -488,6 +488,14 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(pm4_inspector_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Pm4InspectorTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/pm4.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/pm4Inspector.cpp"
+)
+target_link_libraries(pm4_inspector_tests common fmt::fmt nlohmann_json::nlohmann_json)
+target_include_directories(pm4_inspector_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -528,6 +536,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME pm4_inspector COMMAND $<TARGET_FILE:pm4_inspector_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
@@ -582,6 +591,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests
+		pm4_inspector_tests
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests

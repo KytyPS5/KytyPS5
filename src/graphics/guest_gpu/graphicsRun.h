@@ -19,6 +19,9 @@
 namespace Libs::Graphics {
 
 class RenderContext;
+namespace Pm4 {
+class SubmissionInspector;
+}
 
 class GuestGpu final {
 public:
@@ -91,6 +94,7 @@ private:
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
+	std::unique_ptr<Pm4::SubmissionInspector>                        m_pm4_inspector;
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;

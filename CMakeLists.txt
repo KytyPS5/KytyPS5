@@ -464,6 +464,12 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(ajm_atrac9_streaming_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmAtrac9StreamingTests.cpp"
+)
+target_link_libraries(ajm_atrac9_streaming_tests common FFmpeg::ffmpeg fmt::fmt LibAtrac9)
+target_include_directories(ajm_atrac9_streaming_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -538,6 +544,7 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME ajm_atrac9_streaming COMMAND $<TARGET_FILE:ajm_atrac9_streaming_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -594,6 +601,7 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		ajm_atrac9_streaming_tests
 	)
 endif()
 

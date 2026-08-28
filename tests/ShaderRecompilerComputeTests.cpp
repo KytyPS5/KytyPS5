@@ -22961,6 +22961,30 @@ void CheckNativeMsaaState() {
   std::printf("[host]    %-32s ok\n", "NativeMsaaState");
 }
 
+void CheckRenderTargetViewRanges() {
+  constexpr auto array_view = ResolveTargetViewInfo(2, 5);
+  constexpr auto volume_view = ResolveVolumeTargetViewInfo(0, 64, 64);
+  constexpr auto volume_subview = ResolveVolumeTargetViewInfo(5, 70, 64);
+  constexpr auto invalid_volume = ResolveVolumeTargetViewInfo(64, 64, 64);
+
+  Require("RenderTargetViewRanges", "2D array inclusive range",
+          array_view.type == TargetViewType::Image2DArray &&
+              array_view.base_layer == 2 && array_view.layer_count == 4 &&
+              array_view.image_layers == 6,
+          "2D array view semantics changed");
+  Require("RenderTargetViewRanges", "3D mip-depth clamp",
+          volume_view.type == TargetViewType::Image2DArray &&
+              volume_view.base_layer == 0 && volume_view.layer_count == 64,
+          "3D slice maximum was not clamped to mip depth");
+  Require("RenderTargetViewRanges", "3D subrange clamp",
+          volume_subview.base_layer == 5 && volume_subview.layer_count == 59,
+          "3D subrange did not preserve its base slice");
+  Require("RenderTargetViewRanges", "3D invalid base",
+          invalid_volume.type == TargetViewType::Unsupported,
+          "3D view admitted a base slice outside the mip depth");
+  std::printf("[host]    %-32s ok\n", "RenderTargetViewRanges");
+}
+
 void CheckDepthHtileStencilCompatibility() {
   Require("DepthHtileStencilCompatibility", "disabled acceleration",
           depth_htile_stencil_acceleration_compatible(false, false, true),
@@ -24470,6 +24494,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureVolumeMipRegions();
   CheckStorageTextureGpuOwnedRebindState();
   CheckNativeMsaaState();
+  CheckRenderTargetViewRanges();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
   CheckStencilAttachmentAccess();

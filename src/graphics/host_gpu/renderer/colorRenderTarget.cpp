@@ -100,17 +100,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, rt.view.last_array_slice_index, render_target_slice_offset);
-	switch (view.type) {
-		case TargetViewType::Image2D:
-		case TargetViewType::Image2DArray: break;
-		case TargetViewType::Unsupported:
-			EXIT("invalid render-target view: base=%u last=%u draw_offset=%u\n",
-			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
-			     render_target_slice_offset);
-	}
-	r.base_array_layer    = view.base_layer;
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
 		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
@@ -165,11 +154,27 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	if (volume && samples != 1) {
 		EXIT("multisampled 3D render targets are unsupported\n");
 	}
-	const uint32_t depth        = volume ? rt.attrib3.depth + 1u : 1u;
-	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
-	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
-	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	const uint32_t depth      = volume ? rt.attrib3.depth + 1u : 1u;
+	const uint32_t view_depth = std::max(depth >> rt.view.current_mip_level, 1u);
+	const auto     view =
+	    volume ? ResolveVolumeTargetViewInfo(rt.view.base_array_slice_index,
+	                                         rt.view.last_array_slice_index, view_depth,
+	                                         render_target_slice_offset)
+	           : ResolveTargetViewInfo(rt.view.base_array_slice_index,
+	                                   rt.view.last_array_slice_index, render_target_slice_offset);
+	switch (view.type) {
+		case TargetViewType::Image2D:
+		case TargetViewType::Image2DArray: break;
+		case TargetViewType::Unsupported:
+			EXIT("invalid render-target view: base=%u last=%u depth=%u mip=%u draw_offset=%u\n",
+			     rt.view.base_array_slice_index, rt.view.last_array_slice_index, view_depth,
+			     rt.view.current_mip_level, render_target_slice_offset);
+	}
+	r.base_array_layer      = view.base_layer;
+	const bool standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
+	const bool standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const bool texture_tile = standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
@@ -314,12 +319,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
-	const uint32_t     view_depth  = std::max(depth >> rt.view.current_mip_level, 1u);
-	if (volume &&
-	    (view.base_layer >= view_depth || view.layer_count > view_depth - view.base_layer)) {
-		EXIT("3D render-target view exceeds mip depth: base=%u count=%u depth=%u mip=%u\n",
-		     view.base_layer, view.layer_count, view_depth, rt.view.current_mip_level);
-	}
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
 	if (decision_log_id < 128) {

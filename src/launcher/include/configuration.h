@@ -54,6 +54,7 @@ public:
 	enum class Resolution {
 		R1280X720,
 		R1920X1080,
+		R2560X1440,
 	};
 	Q_ENUM(Resolution)
 

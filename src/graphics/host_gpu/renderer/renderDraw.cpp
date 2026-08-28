@@ -664,7 +664,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.samples);
 		}
-		const auto layout = depth_attachment_layout(depth);
+		// A depth image the same draw also samples cannot stay in an attachment-optimal
+		// layout: CommitBindings runs after this point and moves it to a read-only layout,
+		// which leaves the layout declared to vkCmdBeginRendering stale and trips
+		// VUID-vkCmdBeginRendering-pRenderingInfo-09588. The colour path above already solves
+		// this with eGeneral, valid both as an attachment and as a sampled image; mark the
+		// image so the descriptor path settles on the same layout.
+		auto layout = depth_attachment_layout(depth);
+		if (image.binding.is_bound) {
+			image.binding.force_general = true;
+			layout                      = vk::ImageLayout::eGeneral;
+		}
 		const auto writes = depth.AttachmentWriteAspects();
 		auto       access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead};
 		if (writes) {

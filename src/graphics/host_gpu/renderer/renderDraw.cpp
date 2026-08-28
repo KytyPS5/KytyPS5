@@ -450,15 +450,14 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	const bool unsupported_stage_mask = (stages != 0 && stages != 0x02002000);
 	const bool unsupported_gs_stage = (vertex_info.es_regs.data_addr != 0 &&
 	                                   vertex_info.gs_regs.data_addr != 0 && !ps5_ngg_vertex_path);
-	const bool ge_group_size =
-	    ge_cntl.primitive_group_size > 0x0040 || ge_cntl.vertex_group_size > 0x0040;
+	// GE_CNTL group sizes control guest scheduling and do not constrain the host vertex path.
 	const bool ge_shader_regs =
 	    (sh_regs.m_geNggSubgrpCntl != 0x00000000 && sh_regs.m_geNggSubgrpCntl != 0x00000001) ||
 	    sh_regs.m_vgtGsMaxVertOut != 0x00000000 ||
 	    !is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType) ||
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
-	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
+	if (unsupported_stage_mask || unsupported_gs_stage || ge_shader_regs) {
 		static std::once_flag warning_once;
 		std::call_once(warning_once, [] {
 			std::printf("Warning: game uses unsupported graphics pipelines; some draw calls were "

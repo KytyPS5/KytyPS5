@@ -327,25 +327,8 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 		return -1;
 	}
 
-	if (overwrite == 0 && std::getenv(name) != nullptr) {
-		return 0;
-	}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const auto ret = ::_putenv_s(name, value);
-	if (ret != 0) {
-		*Posix::GetErrorAddr() = ret;
-		return -1;
-	}
+	// Guest environment changes must not leak into emulator host libraries.
 	return 0;
-#else
-	const auto ret = ::setenv(name, value, overwrite);
-	if (ret != 0) {
-		*Posix::GetErrorAddr() = errno;
-		return -1;
-	}
-	return 0;
-#endif
 }
 
 static KYTY_SYSV_ABI int64_t libc_time(int64_t* timer) {

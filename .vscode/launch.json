@@ -37,8 +37,16 @@
                 "type": "cppdbg",
                 "program": "${workspaceFolder}/_Build/vscode-clang/kyty_emulator",
                 "cwd": "${workspaceFolder}/_Build/vscode-clang",
+                "externalConsole": false,
                 "MIMode": "gdb",
-                "miDebuggerPath": "/usr/bin/gdb"
+                "miDebuggerPath": "/usr/bin/gdb",
+                "setupCommands": [
+                    {
+                        "description": "Pass Kyty's internal signals to its handlers",
+                        "text": "handle SIG37 SIGSEGV SIGBUS SIGILL nostop noprint pass",
+                        "ignoreFailures": false
+                    }
+                ]
             }
         },
         {
@@ -49,7 +57,14 @@
             "linux": {
                 "type": "cppdbg",
                 "MIMode": "gdb",
-                "miDebuggerPath": "/usr/bin/gdb"
+                "miDebuggerPath": "/usr/bin/gdb",
+                "setupCommands": [
+                    {
+                        "description": "Pass Kyty's internal signals to its handlers",
+                        "text": "handle SIG37 SIGSEGV SIGBUS SIGILL nostop noprint pass",
+                        "ignoreFailures": false
+                    }
+                ]
             }
         }
     ]

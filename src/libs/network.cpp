@@ -16,11 +16,6 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-// POSIX uses plain int file descriptors for sockets; provide the Winsock spellings
-// the shared (non-guarded) code paths reference.
-using SOCKET                           = int;
-static constexpr SOCKET INVALID_SOCKET = -1;
 #endif
 
 #include "common/assert.h"
@@ -823,9 +818,11 @@ struct NetEtherAddr {
 #if defined(_WIN32)
 using NativeSocket                                  = SOCKET;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
+using SocketLength                                  = int;
 #else
 using NativeSocket                                  = int;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
+using SocketLength                                  = socklen_t;
 #endif
 
 struct SocketSlot {
@@ -898,7 +895,12 @@ static bool EnsureSocketBackend() {
 	return true;
 }
 
-static int SetPosixSocketError(int error) {
+static int SetGuestSocketError(int error) {
+	*Posix::GetErrorAddr() = error;
+	return -1;
+}
+
+static int SetHostSocketError(int error) {
 	int posix_error = Posix::POSIX_EIO;
 #if defined(_WIN32)
 	switch (error) {
@@ -933,17 +935,31 @@ static int SetPosixSocketError(int error) {
 		default: break;
 	}
 #else
-	posix_error = error;
+	switch (error) {
+		case EACCES: posix_error = Posix::POSIX_EACCES; break;
+		case EADDRINUSE: posix_error = Posix::POSIX_EADDRINUSE; break;
+		case EADDRNOTAVAIL: posix_error = Posix::POSIX_EADDRNOTAVAIL; break;
+		case EAFNOSUPPORT: posix_error = Posix::POSIX_EAFNOSUPPORT; break;
+		case EBADF: posix_error = Posix::POSIX_EBADF; break;
+		case EFAULT: posix_error = Posix::POSIX_EFAULT; break;
+		case EINVAL: posix_error = Posix::POSIX_EINVAL; break;
+		case EMFILE: posix_error = Posix::POSIX_EMFILE; break;
+		case ENFILE: posix_error = Posix::POSIX_ENFILE; break;
+		case ENOBUFS: posix_error = Posix::POSIX_ENOBUFS; break;
+		case ENOMEM: posix_error = Posix::POSIX_ENOMEM; break;
+		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
+		default: break;
+	}
 #endif
-	*Posix::GetErrorAddr() = posix_error;
-	return -1;
+	return SetGuestSocketError(posix_error);
 }
 
-static int SetPosixSocketError() {
+static int SetHostSocketError() {
 #if defined(_WIN32)
-	return SetPosixSocketError(WSAGetLastError());
+	return SetHostSocketError(WSAGetLastError());
 #else
-	return SetPosixSocketError(errno);
+	return SetHostSocketError(errno);
 #endif
 }
 
@@ -991,9 +1007,8 @@ static int ConvertMessageFlags(int flags) {
 #endif
 }
 
-#if defined(_WIN32)
 static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_storage* out,
-                                int* out_len) {
+                                SocketLength* out_len) {
 	EXIT_IF(out == nullptr);
 	EXIT_IF(out_len == nullptr);
 
@@ -1028,6 +1043,7 @@ static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_sto
 	return 0;
 }
 
+#if defined(_WIN32)
 static int ConvertHostSockaddr(const sockaddr_storage* addr, int addrlen, void* out,
                                uint32_t* out_len) {
 	EXIT_IF(addr == nullptr);
@@ -1364,7 +1380,7 @@ int KYTY_SYSV_ABI NetGetSockInfo(int s, void* info, int n, int flags) {
 
 int KYTY_SYSV_ABI EpollCreate(const char* name, int flags) {
 	if (name == nullptr || flags != 0) {
-		return SetPosixSocketError(Posix::POSIX_EINVAL);
+		return SetGuestSocketError(Posix::POSIX_EINVAL);
 	}
 
 	std::lock_guard lock(g_epoll_mutex);
@@ -1378,7 +1394,7 @@ int KYTY_SYSV_ABI EpollCreate(const char* name, int flags) {
 		}
 	}
 
-	return SetPosixSocketError(Posix::POSIX_EMFILE);
+	return SetGuestSocketError(Posix::POSIX_EMFILE);
 }
 
 int KYTY_SYSV_ABI EpollControl(int eid, int op, int id, const NetEpollEvent* event) {
@@ -1387,22 +1403,22 @@ int KYTY_SYSV_ABI EpollControl(int eid, int op, int id, const NetEpollEvent* eve
 	constexpr int EPOLL_CTL_DEL = 3;
 
 	if ((op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) && event == nullptr) {
-		return SetPosixSocketError(Posix::POSIX_EINVAL);
+		return SetGuestSocketError(Posix::POSIX_EINVAL);
 	}
 	if (op == EPOLL_CTL_DEL && event != nullptr) {
-		return SetPosixSocketError(Posix::POSIX_EINVAL);
+		return SetGuestSocketError(Posix::POSIX_EINVAL);
 	}
 	if (op < EPOLL_CTL_ADD || op > EPOLL_CTL_DEL) {
-		return SetPosixSocketError(Posix::POSIX_EINVAL);
+		return SetGuestSocketError(Posix::POSIX_EINVAL);
 	}
 	if (!IsSocket(id)) {
-		return SetPosixSocketError(Posix::POSIX_EBADF);
+		return SetGuestSocketError(Posix::POSIX_EBADF);
 	}
 
 	std::lock_guard lock(g_epoll_mutex);
 	auto*           slot = GetEpollSlot(eid);
 	if (slot == nullptr) {
-		return SetPosixSocketError(Posix::POSIX_EBADF);
+		return SetGuestSocketError(Posix::POSIX_EBADF);
 	}
 
 	auto registration = std::find_if(slot->registrations.begin(), slot->registrations.end(),
@@ -1410,19 +1426,19 @@ int KYTY_SYSV_ABI EpollControl(int eid, int op, int id, const NetEpollEvent* eve
 	switch (op) {
 		case EPOLL_CTL_ADD:
 			if (registration != slot->registrations.end()) {
-				return SetPosixSocketError(Posix::POSIX_EEXIST);
+				return SetGuestSocketError(Posix::POSIX_EEXIST);
 			}
 			slot->registrations.push_back({id, *event});
 			break;
 		case EPOLL_CTL_MOD:
 			if (registration == slot->registrations.end()) {
-				return SetPosixSocketError(Posix::POSIX_ENOENT);
+				return SetGuestSocketError(Posix::POSIX_ENOENT);
 			}
 			registration->event = *event;
 			break;
 		case EPOLL_CTL_DEL:
 			if (registration == slot->registrations.end()) {
-				return SetPosixSocketError(Posix::POSIX_ENOENT);
+				return SetGuestSocketError(Posix::POSIX_ENOENT);
 			}
 			slot->registrations.erase(registration);
 			break;
@@ -1435,10 +1451,10 @@ int KYTY_SYSV_ABI EpollControl(int eid, int op, int id, const NetEpollEvent* eve
 
 int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int timeout) {
 	if (events == nullptr) {
-		return SetPosixSocketError(Posix::POSIX_EFAULT);
+		return SetGuestSocketError(Posix::POSIX_EFAULT);
 	}
 	if (maxevents <= 0 || timeout < -1) {
-		return SetPosixSocketError(Posix::POSIX_EINVAL);
+		return SetGuestSocketError(Posix::POSIX_EINVAL);
 	}
 
 	std::vector<EpollRegistration> registrations;
@@ -1446,7 +1462,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 		std::unique_lock lock(g_epoll_mutex);
 		auto*            slot = GetEpollSlot(eid);
 		if (slot == nullptr) {
-			return SetPosixSocketError(Posix::POSIX_EBADF);
+			return SetGuestSocketError(Posix::POSIX_EBADF);
 		}
 
 		if (slot->registrations.empty() && timeout != 0) {
@@ -1461,7 +1477,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 			}
 			slot = GetEpollSlot(eid);
 			if (slot == nullptr) {
-				return SetPosixSocketError(Posix::POSIX_EBADF);
+				return SetGuestSocketError(Posix::POSIX_EBADF);
 			}
 		}
 		registrations = slot->registrations;
@@ -1492,7 +1508,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 			continue;
 		}
 		if (host_registrations.size() >= FD_SETSIZE) {
-			return SetPosixSocketError(Posix::POSIX_EINVAL);
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
 		if ((registration.event.events & EPOLL_IN) != 0) {
 			FD_SET(socket, &host_read);
@@ -1518,7 +1534,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 
 	const int result = ::select(0, &host_read, &host_write, &host_except, host_timeout_ptr);
 	if (result == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 	if (result == 0) {
 		return 0;
@@ -1552,7 +1568,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 	return count;
 #else
 	(void)timeout;
-	return SetPosixSocketError(Posix::POSIX_ENOSYS);
+	return SetGuestSocketError(Posix::POSIX_ENOSYS);
 #endif
 }
 
@@ -1560,7 +1576,7 @@ int KYTY_SYSV_ABI EpollDestroy(int eid) {
 	std::lock_guard lock(g_epoll_mutex);
 	auto*           slot = GetEpollSlot(eid);
 	if (slot == nullptr) {
-		return SetPosixSocketError(Posix::POSIX_EBADF);
+		return SetGuestSocketError(Posix::POSIX_EBADF);
 	}
 
 	slot->used = false;
@@ -1582,14 +1598,15 @@ int KYTY_SYSV_ABI SocketClose(int s) {
 	RemoveSocketFromEpolls(s);
 
 #if defined(_WIN32)
-	if (closesocket(socket) == SOCKET_ERROR) {
+	const int result = closesocket(socket);
+#else
+	const int result = ::close(socket);
+#endif
+	if (result != 0) {
 		return NET_ERROR_EBADF;
 	}
 
 	return OK;
-#else
-	return NET_ERROR_ENOSYS;
-#endif
 }
 
 int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
@@ -1601,7 +1618,7 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	     family, type, protocol);
 
 	if (!EnsureSocketBackend()) {
-		return SetPosixSocketError(Posix::POSIX_ENETDOWN);
+		return SetGuestSocketError(Posix::POSIX_ENETDOWN);
 	}
 
 	const int host_family = ConvertFamily(family);
@@ -1610,25 +1627,24 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	NativeSocket socket = ::socket(host_family, type, protocol);
 	if (socket == INVALID_NATIVE_SOCKET) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	const int fd = AllocSocketFd(socket);
 	if (fd < 0) {
+#if defined(_WIN32)
 		closesocket(socket);
+#else
+		::close(socket);
+#endif
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
 		return -1;
 	}
 
 	LOGF("\t fd = %d\n", fd);
 	return fd;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
@@ -1645,23 +1661,17 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	sockaddr_storage host_addr {};
-	int              host_addrlen = 0;
+	SocketLength     host_addrlen = 0;
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 		return -1;
 	}
 
-	if (::bind(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) ==
-	    SOCKET_ERROR) {
-		return SetPosixSocketError();
+	if (::bind(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
+		return SetHostSocketError();
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
@@ -1687,7 +1697,7 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 
 	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) ==
 	    SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return 0;
@@ -1712,7 +1722,7 @@ int KYTY_SYSV_ABI Listen(int s, int backlog) {
 
 #if defined(_WIN32)
 	if (::listen(socket, backlog) == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return 0;
@@ -1742,7 +1752,7 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	NativeSocket     accepted =
 	    ::accept(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
 	if (accepted == INVALID_NATIVE_SOCKET) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	const int fd = AllocSocketFd(accepted);
@@ -1791,7 +1801,7 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 
 #if defined(_WIN32)
 	if (::shutdown(socket, how) == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return 0;
@@ -1821,7 +1831,7 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 	int              host_addrlen = sizeof(host_addr);
 	if (::getsockname(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) ==
 	    SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen);
@@ -1850,7 +1860,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	int len = static_cast<int>(*optlen);
 	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(optval),
 	                 &len) == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 	*optlen = static_cast<uint32_t>(len);
 	return 0;
@@ -1881,14 +1891,14 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 	    optlen >= sizeof(int)) {
 		u_long enabled = (*static_cast<const int*>(optval) != 0 ? 1 : 0);
 		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
-			return SetPosixSocketError();
+			return SetHostSocketError();
 		}
 		return 0;
 	}
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
 	                 static_cast<const char*>(optval), static_cast<int>(optlen)) == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return 0;
@@ -1941,7 +1951,7 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 		                  reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen);
 	}
 	if (result == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return result;
@@ -2000,7 +2010,7 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		}
 	}
 	if (result == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	return result;
@@ -2101,7 +2111,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 	const int result = ::select(0, read_ptr, write_ptr, except_ptr, host_timeout_ptr);
 	if (result == SOCKET_ERROR) {
-		return SetPosixSocketError();
+		return SetHostSocketError();
 	}
 
 	GuestFdZero(readfds, nfds);

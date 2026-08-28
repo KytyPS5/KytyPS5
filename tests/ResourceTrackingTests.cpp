@@ -21,6 +21,7 @@ namespace {
 using namespace Libs::Graphics::ShaderRecompiler::IR;
 using Libs::Graphics::ShaderComputeInputInfo;
 using Libs::Graphics::ShaderType;
+namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
 namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
 
 void Check(bool condition, const char *message) {
@@ -977,6 +978,81 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
+void TestInactiveDescriptorPhiEdgeCase(bool negate_condition) {
+  Fixture fixture;
+  auto *inactive = fixture.block;
+  auto *live = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  auto *resource = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  inactive->AddBranch(merge);
+  live->AddBranch(merge);
+  merge->AddBranch(resource);
+  merge->AddBranch(exit);
+
+  const auto inactive_word = fixture.UserData(0);
+  const auto live_word = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))}, 0, live);
+  auto &condition = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                         static_cast<uint64_t>(Type::U1));
+  condition.AddPhiOperand(inactive, Value(false));
+  condition.AddPhiOperand(live, Value(true));
+  const auto branch_condition =
+      negate_condition
+          ? fixture.Emit(ValueOpcode::LogicalNot, {Value(&condition)}, 0, merge)
+          : Value(&condition);
+  auto &descriptor_word = merge->AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  descriptor_word.AddPhiOperand(inactive, inactive_word);
+  descriptor_word.AddPhiOperand(live, live_word);
+
+  const auto merge_index = static_cast<size_t>(
+      std::ranges::find(fixture.program.blocks, merge) -
+      fixture.program.blocks.begin());
+  const auto resource_index = static_cast<size_t>(
+      std::ranges::find(fixture.program.blocks, resource) -
+      fixture.program.blocks.begin());
+  auto &merge_info = fixture.program.block_info[merge_index];
+  merge_info.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  const auto resource_id = fixture.program.block_info[resource_index].id;
+  const auto exit_id = fixture.program.block_info.back().id;
+  merge_info.terminator.true_block = negate_condition ? exit_id : resource_id;
+  merge_info.terminator.false_block = negate_condition ? resource_id : exit_id;
+  merge_info.condition = branch_condition;
+
+  const auto handle = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(&descriptor_word), Value(0u), Value(64u), Value(0u)},
+      MemoryFlags{0, 24}, resource);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 24), resource);
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.buffers.size() == 1u,
+        "inactive descriptor Phi produced an unexpected buffer count");
+  const auto source = fixture.program.info.buffers[0].source;
+  Check(source < fixture.program.descriptor_sources.size() &&
+            fixture.program.descriptor_sources[source].dwords[0].Resolve() ==
+                live_word.Resolve(),
+        "inactive descriptor Phi input was not removed");
+  std::array<uint32_t, 2> user_data{0xdeadbeefu, 0x12345678u};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  std::string error;
+  Check(EvaluateDescriptorSource(fixture.program,
+                                 source, 24, runtime, descriptor, &error) &&
+            descriptor.dwords[0] == user_data[1],
+        "descriptor source retained the input from the unreachable edge");
+}
+
+void TestInactiveDescriptorPhiEdge() {
+  TestInactiveDescriptorPhiEdgeCase(false);
+  TestInactiveDescriptorPhiEdgeCase(true);
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -1378,6 +1454,7 @@ int main() {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
+    Run("inactive descriptor Phi edge", TestInactiveDescriptorPhiEdge);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

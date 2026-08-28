@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <optional>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -61,6 +63,92 @@ Value CanonicalizeSampleAdjustDword3(Value value) {
 			return value;
 		}
 	}
+}
+
+std::optional<bool> BooleanOnIncomingEdge(Value value, const Block* merge,
+                                          const Block* predecessor,
+                                          std::unordered_set<const Inst*>& visiting) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U1 ? std::optional<bool>(value.U1()) : std::nullopt;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || !visiting.insert(inst).second) {
+		return std::nullopt;
+	}
+	const auto finish = [&](std::optional<bool> result) {
+		visiting.erase(inst);
+		return result;
+	};
+	if (inst->GetOpcode() == ValueOpcode::Phi && inst->Parent() == merge) {
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			if (inst->PhiBlock(index) == predecessor) {
+				return finish(BooleanOnIncomingEdge(inst->Arg(index), merge, predecessor, visiting));
+			}
+		}
+		return finish(std::nullopt);
+	}
+	if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+		auto operand = BooleanOnIncomingEdge(inst->Arg(0), merge, predecessor, visiting);
+		return finish(operand.has_value() ? std::optional<bool>(!*operand) : std::nullopt);
+	}
+	return finish(std::nullopt);
+}
+
+std::optional<bool> BooleanOnIncomingEdge(Value value, const Block* merge,
+                                          const Block* predecessor) {
+	std::unordered_set<const Inst*> visiting;
+	return BooleanOnIncomingEdge(value, merge, predecessor, visiting);
+}
+
+// A descriptor used directly after a conditional merge cannot observe Phi inputs whose incoming
+// edge selects the other successor. Collapse only when every remaining input is equivalent.
+Value CanonicalizeInactivePhi(const Program& program, const Inst& user, Value value) {
+	value            = value.Resolve();
+	const auto* root = value.TryInstruction();
+	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+		return value;
+	}
+	const auto* merge      = root->Parent();
+	const auto* user_block = user.Parent();
+	if (merge == nullptr || user_block == nullptr ||
+	    std::ranges::find(merge->ImmSuccessors(), user_block) == merge->ImmSuccessors().end() ||
+	    program.blocks.size() != program.block_info.size()) {
+		return value;
+	}
+	const auto merge_it = std::ranges::find(program.blocks, merge);
+	const auto user_it  = std::ranges::find(program.blocks, user_block);
+	if (merge_it == program.blocks.end() || user_it == program.blocks.end()) {
+		return value;
+	}
+	const auto& info = program.block_info[static_cast<size_t>(merge_it - program.blocks.begin())];
+	if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
+		return value;
+	}
+	const auto user_id = program.block_info[static_cast<size_t>(user_it - program.blocks.begin())].id;
+	const bool true_target  = info.terminator.true_block == user_id;
+	const bool false_target = info.terminator.false_block == user_id;
+	if (true_target == false_target) {
+		return value;
+	}
+	const std::optional<bool> target = true_target;
+
+	Value candidate;
+	bool  discarded = false;
+	for (size_t index = 0; index < root->NumArgs(); index++) {
+		const auto edge = BooleanOnIncomingEdge(info.condition, merge, root->PhiBlock(index));
+		if (edge.has_value() && edge != target) {
+			discarded = true;
+			continue;
+		}
+		const auto current = root->Arg(index).Resolve();
+		if (candidate.IsEmpty()) {
+			candidate = current;
+		} else if (!EquivalentValue(program, candidate, current)) {
+			return value;
+		}
+	}
+	return discarded && !candidate.IsEmpty() ? candidate : value;
 }
 
 const char* StageName(ShaderType stage) {
@@ -188,7 +276,7 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = handle.Arg(i).Resolve();
+			descriptor.dwords[i] = CanonicalizeInactivePhi(m_program, handle, handle.Arg(i));
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);

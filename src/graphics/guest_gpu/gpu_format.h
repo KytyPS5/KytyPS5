@@ -44,6 +44,9 @@ uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
 bool                       IsSampledTextureFormat(BufferFormat format);
 bool                       IsUintTextureFormat(BufferFormat format);
+// True for the guest sRGB formats whose host image cannot carry the sRGB encoding, so the
+// decode has to be emitted into the shader instead of coming from the sampler.
+bool                       IsShaderDecodedSrgbTextureFormat(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 
 } // namespace Libs::Graphics::Prospero

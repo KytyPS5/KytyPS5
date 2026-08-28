@@ -216,6 +216,18 @@ bool IsUintTextureFormat(BufferFormat format) {
 	return info != nullptr && info->uint_texture;
 }
 
+bool IsShaderDecodedSrgbTextureFormat(BufferFormat format) {
+	// Deliberately an explicit two-case test rather than a column in the format table, because
+	// this is not a property of the guest format on its own - it is a property of what the host
+	// can express. k8Srgb and k8_8Srgb are created as unorm images (see the comment on their
+	// entries in vulkanCommon.cpp) because R8_SRGB and R8G8_SRGB are optional in Vulkan and
+	// plenty of devices expose no features for them at all, so their sRGB decode is owed by the
+	// shader. Every other guest sRGB format has a real host counterpart - k8_8_8_8Srgb maps to
+	// eR8G8B8A8Srgb and each BC*Srgb to a native sRGB block format - and the sampler already
+	// decodes those. A shared table column would sweep them in and decode them twice.
+	return format == BufferFormat::k8Srgb || format == BufferFormat::k8_8Srgb;
+}
+
 BufferFormat RemapTextureFormat(BufferFormat format) {
 	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
 }

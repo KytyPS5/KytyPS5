@@ -856,6 +856,8 @@ uint32_t EmitFAbsValue(EmitterState& state, uint32_t value);
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 
+uint32_t EmitSrgbToLinearF32(EmitterState& state, uint32_t value);
+
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst);

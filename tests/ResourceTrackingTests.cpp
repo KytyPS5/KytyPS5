@@ -716,6 +716,88 @@ void TestSampleAdjustSamplerScratch() {
                 "SampleAdjust canonicalization discarded border-mode bits");
 }
 
+void TestShaderDecodedSrgbSpecialization() {
+  const auto MakeSampleFixture = [] {
+    auto fixture = std::make_unique<Fixture>(ShaderType::Pixel);
+    const auto image =
+        fixture->Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                        Value(0u), Value(0u), Value(0u)},
+                       0x100);
+    const auto sampler =
+        fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x100);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto sampled =
+        fixture->Emit(ValueOpcode::ImageSampleRaw,
+                      {image, sampler, fixture->ImageAddress()},
+                      fixture->AddMemory(sample, 0x100));
+    fixture->Emit(ValueOpcode::ReferenceU32,
+                  {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                 {sampled, Value(0u)})});
+    fixture->PlanAndTrack();
+    return fixture;
+  };
+  const auto Descriptor = [](Libs::Graphics::Prospero::BufferFormat format) {
+    DescriptorValue descriptor{};
+    descriptor.dwords[0] = 0x1000u;
+    descriptor.dwords[1] = static_cast<uint32_t>(format) << 20u;
+    descriptor.dwords[2] = 3u | (3u << 14u);
+    descriptor.dwords[3] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+         << 28u);
+    descriptor.dword_count = 8;
+    return descriptor;
+  };
+  const auto srgb =
+      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8Srgb);
+  const auto unorm =
+      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8UNorm);
+
+  DescriptorValue sampler_descriptor{};
+  sampler_descriptor.dword_count = 4;
+
+  auto decoded = MakeSampleFixture();
+  ResourceSnapshot snapshot;
+  snapshot.images.assign(1, srgb);
+  snapshot.samplers.assign(1, sampler_descriptor);
+  std::string error;
+  Check(SpecializeResources(decoded->program, snapshot, &error) &&
+            decoded->program.info.images[0].srgb_decode &&
+            ValidateResourceSpecialization(decoded->program, snapshot, &error),
+        "a k8Srgb sampled image was not specialized to a shader-side decode");
+
+  // The uint check cannot stand in for this: k8UNorm and k8Srgb are both
+  // non-uint, so only the sRGB comparison keeps the two permutations apart.
+  snapshot.images[0] = unorm;
+  Check(!ValidateResourceSpecialization(decoded->program, snapshot, &error) &&
+            error.find("sRGB decode") != std::string::npos,
+        "a unorm descriptor reused the permutation compiled with the decode");
+
+  DescriptorValue null_descriptor{};
+  null_descriptor.dword_count = 8;
+  snapshot.images[0] = null_descriptor;
+  Check(!ValidateResourceSpecialization(decoded->program, snapshot, &error),
+        "a null descriptor reused the permutation compiled with the decode");
+
+  auto plain = MakeSampleFixture();
+  ResourceSnapshot plain_snapshot;
+  plain_snapshot.images.assign(1, unorm);
+  plain_snapshot.samplers.assign(1, sampler_descriptor);
+  Check(SpecializeResources(plain->program, plain_snapshot, &error) &&
+            !plain->program.info.images[0].srgb_decode &&
+            ValidateResourceSpecialization(plain->program, plain_snapshot,
+                                           &error),
+        "a k8UNorm sampled image was specialized to a shader-side decode");
+  plain_snapshot.images[0] = srgb;
+  Check(!ValidateResourceSpecialization(plain->program, plain_snapshot,
+                                        &error) &&
+            error.find("sRGB decode") != std::string::npos,
+        "an sRGB descriptor reused the permutation compiled without the "
+        "decode");
+}
+
 void TestDynamicStorageMipTracking() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -1373,6 +1455,7 @@ int main() {
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
+    Run("shader-decoded sRGB", TestShaderDecodedSrgbSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

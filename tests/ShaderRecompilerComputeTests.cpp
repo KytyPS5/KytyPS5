@@ -24426,6 +24426,13 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cmpx-sdwa-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcSdwaCmpxWritesExecMask());
+    RunCase(&vulkan, VectorVopcCmpxGtU16CapturedSdwaExecMask());
+    RunCase(&vulkan, VectorVopcCmpxNgtF16CapturedSdwaExecMask());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();

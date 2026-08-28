@@ -695,6 +695,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	const HW::UserSgprInfo& user_sgpr     = regs.gs_user_sgpr;
 	auto                    user_sgpr_num = regs.gs_regs.rsrc2.user_sgpr;
 	info.scratch_size_dwords = data.scratch_size_dwords;
+	info.fp16_overflow       = regs.gs_regs.rsrc1.fp16_overflow;
 
 	if (data.user_data == nullptr) {
 		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
@@ -744,6 +745,7 @@ static void ShaderGetStaticInputInfoPS(
 
 	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
+	ps_info.fp16_overflow       = regs.ps_regs.rsrc1.fp16_overflow;
 	ps_info.push_constant_offset =
 	    vs_info.stage.program != nullptr
 	        ? vs_info.stage.program->bindings.push_constant_offset +
@@ -892,6 +894,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(info.resources_num);
 	key.push_back(info.scratch_size_dwords);
+	key.push_back(static_cast<uint32_t>(info.fp16_overflow));
 	key.push_back(info.pa_cl_vs_out_cntl);
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -933,6 +936,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.clear();
 	key.push_back(info.push_constant_offset);
 	key.push_back(info.scratch_size_dwords);
+	key.push_back(static_cast<uint32_t>(info.fp16_overflow));
 	key.push_back(info.input_num);
 	key.push_back(info.ps_system_input_base);
 	key.push_back(info.custom_interpolation_mask);

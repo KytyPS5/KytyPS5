@@ -1155,8 +1155,11 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto         typed_index = block_indices.at(cfg_block.id);
-		const bool fp16_overflow =
-		    options.compute != nullptr && options.compute->fp16_overflow;
+		const bool fp16_overflow = options.compute != nullptr
+		                                 ? options.compute->fp16_overflow
+		                             : options.pixel != nullptr ? options.pixel->fp16_overflow
+		                             : options.vertex != nullptr ? options.vertex->fp16_overflow
+		                                                          : false;
 		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size,
 		                      fp16_overflow);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {

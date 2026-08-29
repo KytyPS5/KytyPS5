@@ -5,6 +5,7 @@
 #include <QStringList>
 
 class QPushButton;
+class QDoubleSpinBox;
 class QTreeWidget;
 class QTreeWidgetItem;
 class QWidget;
@@ -22,10 +23,11 @@ private:
 	void SetBinding(QTreeWidgetItem* item, const QString& binding);
 	void UpdateButtons();
 
-	QTreeWidget* m_bindings      = nullptr;
-	QPushButton* m_change_button = nullptr;
-	QPushButton* m_clear_button  = nullptr;
-	bool         m_customized    = false;
+	QTreeWidget*    m_bindings        = nullptr;
+	QPushButton*    m_change_button   = nullptr;
+	QPushButton*    m_clear_button    = nullptr;
+	QDoubleSpinBox* m_sensitivity     = nullptr;
+	bool            m_custom_bindings = false;
 };
 
 #endif /* LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_ */

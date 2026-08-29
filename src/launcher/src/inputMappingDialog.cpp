@@ -2,6 +2,7 @@
 
 #include <QAbstractItemView>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QHeaderView>
@@ -16,7 +17,9 @@
 
 namespace {
 
-constexpr int BINDING_COLUMN = 1;
+constexpr int  BINDING_COLUMN            = 1;
+constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
+constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
 
 struct PadControl {
 	const char* id;
@@ -128,7 +131,8 @@ public:
 
 		auto* layout = new QVBoxLayout(this);
 		m_label      = new QLabel(
-		    tr("Press a key or mouse button.\nSpace and F1 are reserved; Esc cancels."), this);
+		    tr("Press a key or mouse button.\nSpace, F1, F7, and F11 are reserved; Esc cancels."),
+		    this);
 		m_label->setAlignment(Qt::AlignCenter);
 		layout->addWidget(m_label);
 	}
@@ -144,7 +148,8 @@ protected:
 			reject();
 			return;
 		}
-		if (event->key() == Qt::Key_Space || event->key() == Qt::Key_F1) {
+		if (event->key() == Qt::Key_Space || event->key() == Qt::Key_F1 ||
+		    event->key() == Qt::Key_F7 || event->key() == Qt::Key_F11) {
 			m_label->setText(tr("That key is reserved by the emulator."));
 			return;
 		}
@@ -177,6 +182,9 @@ private:
 QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	QHash<QString, QString> result;
 	for (const auto& entry: mapping) {
+		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY))) {
+			continue;
+		}
 		const auto separator = entry.indexOf(QLatin1Char('='));
 		if (separator > 0 && separator + 1 < entry.size()) {
 			const auto binding = entry.mid(separator + 1);
@@ -193,15 +201,42 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 	return result;
 }
 
+double ParseMouseSensitivity(const QStringList& mapping) {
+	for (const auto& entry: mapping) {
+		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY))) {
+			return entry.mid(sizeof(MOUSE_SENSITIVITY) - 1).toDouble();
+		}
+	}
+	return DEFAULT_MOUSE_SENSITIVITY;
+}
+
 } // namespace
 
 InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* parent)
-    : QDialog(parent), m_customized(!mapping.isEmpty()) {
+    : QDialog(parent) {
 	setWindowTitle(tr("Input Mapping"));
 	resize(460, 650);
 
 	auto* layout = new QVBoxLayout(this);
-	layout->addWidget(new QLabel(tr("Map keyboard or mouse input to DualSense controls."), this));
+	layout->addWidget(
+	    new QLabel(tr("Map keyboard or mouse buttons to DualSense controls.\n"
+	                  "Press F7 in-game to toggle mouse movement on the right stick."),
+	               this));
+
+	const auto parsed = ParseMapping(mapping);
+	m_custom_bindings = !parsed.isEmpty();
+
+	auto* sensitivity_layout = new QHBoxLayout;
+	sensitivity_layout->addWidget(new QLabel(tr("Mouse sensitivity"), this));
+	m_sensitivity = new QDoubleSpinBox(this);
+	m_sensitivity->setRange(0.1, 5.0);
+	m_sensitivity->setSingleStep(0.1);
+	m_sensitivity->setDecimals(1);
+	m_sensitivity->setSuffix(QStringLiteral("x"));
+	m_sensitivity->setValue(ParseMouseSensitivity(mapping));
+	sensitivity_layout->addWidget(m_sensitivity);
+	sensitivity_layout->addStretch();
+	layout->addLayout(sensitivity_layout);
 
 	m_bindings = new QTreeWidget(this);
 	m_bindings->setColumnCount(2);
@@ -212,13 +247,12 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	m_bindings->header()->setSectionResizeMode(1, QHeaderView::Stretch);
 	layout->addWidget(m_bindings);
 
-	const auto parsed = ParseMapping(mapping);
 	for (const auto& control: PAD_CONTROLS) {
 		auto* item = new QTreeWidgetItem(m_bindings);
 		item->setText(0, tr(control.label));
 		item->setData(0, Qt::UserRole, QString::fromLatin1(control.id));
-		SetBinding(item, m_customized ? parsed.value(QString::fromLatin1(control.id))
-		                              : QString::fromLatin1(control.default_binding));
+		SetBinding(item, m_custom_bindings ? parsed.value(QString::fromLatin1(control.id))
+		                                   : QString::fromLatin1(control.default_binding));
 	}
 	m_bindings->setCurrentItem(m_bindings->topLevelItem(0));
 
@@ -248,15 +282,18 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 
 QStringList InputMappingDialog::Mapping() const {
 	QStringList result;
-	if (!m_customized) {
-		return result;
-	}
-	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
-		const auto* item    = m_bindings->topLevelItem(index);
-		const auto  binding = item->data(BINDING_COLUMN, Qt::UserRole).toString();
-		if (!binding.isEmpty()) {
-			result.append(item->data(0, Qt::UserRole).toString() + QLatin1Char('=') + binding);
+	if (m_custom_bindings) {
+		for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
+			const auto* item    = m_bindings->topLevelItem(index);
+			const auto  binding = item->data(BINDING_COLUMN, Qt::UserRole).toString();
+			if (!binding.isEmpty()) {
+				result.append(item->data(0, Qt::UserRole).toString() + QLatin1Char('=') + binding);
+			}
 		}
+	}
+	if (m_sensitivity->value() != DEFAULT_MOUSE_SENSITIVITY) {
+		result.append(QLatin1String(MOUSE_SENSITIVITY) +
+		              QString::number(m_sensitivity->value(), 'f', 1));
 	}
 	return result;
 }
@@ -281,12 +318,12 @@ void InputMappingDialog::ChangeBinding() {
 		}
 	}
 	SetBinding(item, dialog.Binding());
-	m_customized = true;
+	m_custom_bindings = true;
 }
 
 void InputMappingDialog::ClearBinding() {
 	SetBinding(m_bindings->currentItem(), {});
-	m_customized = true;
+	m_custom_bindings = true;
 }
 
 void InputMappingDialog::RestoreDefaults() {
@@ -294,7 +331,8 @@ void InputMappingDialog::RestoreDefaults() {
 		SetBinding(m_bindings->topLevelItem(index),
 		           QString::fromLatin1(PAD_CONTROLS[index].default_binding));
 	}
-	m_customized = false;
+	m_sensitivity->setValue(DEFAULT_MOUSE_SENSITIVITY);
+	m_custom_bindings = false;
 }
 
 void InputMappingDialog::SetBinding(QTreeWidgetItem* item, const QString& binding) {

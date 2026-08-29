@@ -507,6 +507,13 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
+	    event->key.keysym.sym == SDLK_F7) {
+		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+			HostInputToggleMouseToJoystick();
+		}
+		return;
+	}
 	if (ProcessImeInput(*event)) {
 		return;
 	}
@@ -783,8 +790,8 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (SDL_WaitEvent(&loop.event) == 0) {
-			EXIT("%s\n", SDL_GetError());
+		if (!HostInputWaitEvent(&loop.event)) {
+			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
 	}

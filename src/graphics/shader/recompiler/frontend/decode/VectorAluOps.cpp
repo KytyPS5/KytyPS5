@@ -940,7 +940,7 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
      true, true},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {SdwaSelFull(), SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), false, false},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelWords() | SdwaSelFull(), false, false},
     {SdwaSelFull(), SdwaSelFull(), SdwaSelAll(), false, false},
     {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
 };

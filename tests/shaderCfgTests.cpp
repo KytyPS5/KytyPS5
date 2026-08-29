@@ -4043,6 +4043,22 @@ void TestNewShaderDecoderArchitecture() {
         "decoder rejected or misdecoded captured partial-destination "
         "V_ADD_NC_U32");
 
+  const uint32_t vop2_sdwa_byte_shift[] = {
+      0x2c0910f9u,
+      0x86000613u, // v_lshrrev_b32 v4, v19.byte0, 8
+  };
+  Instruction byte_shift;
+  Check(DecodeInstruction(vop2_sdwa_byte_shift, 0u, byte_shift, &error),
+        error.c_str());
+  Check(byte_shift.family == Family::VOP2 &&
+            byte_shift.opcode == Opcode::V_LSHRREV_B32 &&
+            byte_shift.word_count == 2u && byte_shift.dst.reg == 4u &&
+            byte_shift.src0.kind == OperandKind::Vgpr &&
+            byte_shift.src0.reg == 19u && byte_shift.src0.sdwa_sel == 0u &&
+            byte_shift.src1.kind == OperandKind::IntegerInlineConstant &&
+            byte_shift.src1.value == 8u,
+        "decoder rejected or misdecoded captured V_LSHRREV_B32 byte shift");
+
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,
                                0x07060504u, 0x0b0a0908u};

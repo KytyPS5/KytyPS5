@@ -651,8 +651,13 @@ void CreatePipelineInternal(
 	input_assembly.pNext    = nullptr;
 	input_assembly.flags    = {};
 	input_assembly.topology = static_params.topology;
+#if defined(__APPLE__)
+	// MoltenVK/Metal does not support disabling primitive restart.
+	input_assembly.primitiveRestartEnable = VK_TRUE;
+#else
 	input_assembly.primitiveRestartEnable =
 	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
+#endif
 
 	vk::Viewport viewport {};
 	viewport.x        = static_params.viewport_offset[0] - static_params.viewport_scale[0];

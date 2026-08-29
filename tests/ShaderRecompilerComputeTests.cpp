@@ -13957,37 +13957,35 @@ TestCase VectorAddcUsesPerLaneCarryIn() {
 TestCase VectorAddcWritesPerLaneCarryOut() {
   using O = ShaderOpcode;
 
-  std::vector<u32> code = {
-      EncodeVop1(0x01, 1, 0),
-      EncodeVop2(0x1a, 1, InlineU32(2), 1),
-      EncodeVop2(0x25, 1, Vgpr(0), 1),
-      EncodeVopc(0xc0, Vgpr(0), 0),
-  };
-  AppendVMovLiteral(&code, 2, 0xffffffffu);
-  code.push_back(EncodeVop1(0x01, 3, InlineU32(1)));
-  code.push_back(EncodeVop2(0x28, 5, Vgpr(2), 3));
+  std::vector<u32> code = {EncodeVop1(0x01, 1, Vgpr(0)),
+                           EncodeVop2(0x1a, 4, InlineU32(2), 1),
+                           EncodeVopc(0xc7, Vgpr(0), 0)};
+  AppendBufferLoadDword(&code, 26, 4);
+  code.push_back(0x500434f9u);
+  code.push_back(0x0c860680u);
   code.push_back(EncodeVop1(0x01, 6, 106));
-  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 1));
   AppendBufferStoreDword(&code, 6, 4);
   AppendEnd(&code);
 
   TestCase test;
   test.name = "VectorAddcWritesPerLaneCarryOut";
   test.code = code;
+  test.initial = {0x0000ffffu, 0u, 0x0000ffffu, 0u};
   // VCC is represented as the current invocation's carry bit, not a shared
   // four-lane ballot word.
-  test.expected = std::vector<u32>(8, 1u);
-  test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32, O::V_ADD_NC_U32,
-                  O::V_CMP_F_U32, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
+  test.expected = {1u, 0u, 1u, 0u};
+  test.opcodes = {O::V_MOV_B32,         O::V_LSHLREV_B32, O::V_CMP_T_U32,
+                  O::BUFFER_LOAD_DWORD, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
+  test.decoded_counts = {
+      {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
+  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = IAddCarry32 ", 2}};
+  test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
-  test.compute_info.group_id[0] = true;
   test.compute_info.thread_ids_num = 1;
-  test.compute_info.workgroup_register = 0;
   test.has_compute_info = true;
-  test.dispatch_x = 2;
   return test;
 }
 
@@ -24516,6 +24514,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop2SdwaAshrrevCapturedWord0SignExtends());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-addc-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorAddcWritesPerLaneCarryOut());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {

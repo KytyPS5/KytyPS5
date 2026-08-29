@@ -194,12 +194,19 @@ void TestSelfContainer() {
 	          error.find("unsupported SELF") != std::string::npos,
 	      "unsupported SELF variant");
 
-	auto declared_size = image;
-	auto self          = Self();
-	self.segments_num  = 1;
-	self.file_size     = declared_size.size() + 1;
-	Store(declared_size, 0, self);
-	Check(!ValidateElfImage(declared_size, nullptr, &error) &&
+	auto aligned_declared_size = image;
+	aligned_declared_size.resize(image.size() - 8u);
+	auto self         = Self();
+	self.segments_num = 1;
+	self.file_size    = image.size();
+	Store(aligned_declared_size, 0, self);
+	Check(ValidateElfImage(aligned_declared_size, nullptr, &error),
+	      "SELF omitted final alignment padding");
+
+	auto invalid_declared_size = image;
+	self.file_size             = invalid_declared_size.size() + 1u;
+	Store(invalid_declared_size, 0, self);
+	Check(!ValidateElfImage(invalid_declared_size, nullptr, &error) &&
 	          error.find("declared file size") != std::string::npos,
 	      "SELF declared file size");
 

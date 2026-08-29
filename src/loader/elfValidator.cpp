@@ -31,6 +31,19 @@ bool RangeFits(uint64_t offset, uint64_t size, uint64_t total) {
 	return size == 0 || (offset <= total && size <= total - offset);
 }
 
+bool SelfDeclaredFileSizeFits(uint64_t declared_size, uint64_t actual_size) {
+	if (declared_size <= actual_size) {
+		return true;
+	}
+
+	// Retail SELF files may omit the final bytes of 16-byte alignment padding while retaining the
+	// aligned container extent in the header. Accept only that absent tail padding; every segment
+	// payload is still checked independently against the bytes that are actually present.
+	constexpr uint64_t SelfAlignment = 16u;
+	return declared_size - actual_size < SelfAlignment &&
+	       (declared_size & (SelfAlignment - 1u)) == 0u;
+}
+
 bool TableFits(uint64_t base, uint64_t offset, uint64_t count, uint64_t element_size,
 	           uint64_t total, uint64_t* table_offset = nullptr) {
 	if (count == 0) {
@@ -113,7 +126,7 @@ bool ValidateElfImage(std::span<const uint8_t> image, ElfValidationReport* repor
 		if (!IsSupportedSelfHeader(self_header)) {
 			return Fail(error, "unsupported SELF header variant");
 		}
-		if (self_header.file_size > image.size()) {
+		if (!SelfDeclaredFileSizeFits(self_header.file_size, image.size())) {
 			return Fail(error, "SELF declared file size is outside the file");
 		}
 		if (!TableFits(sizeof(SelfHeader), 0, self_header.segments_num, sizeof(SelfSegment),

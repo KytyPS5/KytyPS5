@@ -220,17 +220,22 @@ cmake --install _Build/macos --prefix _Build/macos/install
 ```
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required.
+guest code; no manual signing step is required. When the launcher is built, the install
+also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
+A flat `kyty_emulator` is kept for CLI usage.
 
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` and ad-hoc sign it:
+`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` (and, for
+the bundle, into `KytyPS5.app/Contents/MacOS/`) and ad-hoc sign it:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
+# For the bundle (if present):
+codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib
 ```
 
-Release archives already include a signed `libMoltenVK.dylib`.
+Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
 
 ### Regression tests
 
@@ -272,6 +277,10 @@ To use the graphical launcher:
 
 ```bash
 ./_Build/linux/install/launcher
+```
+
+```bash
+open _Build/macos/install/KytyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those

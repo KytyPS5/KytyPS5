@@ -218,18 +218,39 @@ jobs:
             _Build/macos/install/libMoltenVK.dylib
           install -m 644 "$package/LICENSE" _Build/macos/install/LICENSE.MoltenVK
           codesign --force --sign - --timestamp=none _Build/macos/install/libMoltenVK.dylib
+          # Also bundle inside KytyPS5.app when the launcher bundle is produced.
+          if [[ -d _Build/macos/install/KytyPS5.app ]]; then
+            install -m 755 \
+              "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
+              _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib
+            install -m 644 "$package/LICENSE" _Build/macos/install/KytyPS5.app/Contents/Resources/LICENSE.MoltenVK 2>/dev/null || \
+              install -m 644 "$package/LICENSE" _Build/macos/install/KytyPS5.app/Contents/MacOS/LICENSE.MoltenVK
+            codesign --force --sign - --timestamp=none _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib
+          fi
 
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/macos/install/launcher
           file _Build/macos/install/kyty_emulator
           file _Build/macos/install/libMoltenVK.dylib
-          lipo _Build/macos/install/launcher -verify_arch x86_64
           lipo _Build/macos/install/kyty_emulator -verify_arch x86_64
           lipo _Build/macos/install/libMoltenVK.dylib -verify_arch x86_64
           codesign --verify --strict _Build/macos/install/kyty_emulator
           codesign --verify --strict _Build/macos/install/libMoltenVK.dylib
+          if [[ -d _Build/macos/install/KytyPS5.app ]]; then
+            file _Build/macos/install/KytyPS5.app/Contents/MacOS/KytyPS5
+            file _Build/macos/install/KytyPS5.app/Contents/MacOS/kyty_emulator
+            lipo _Build/macos/install/KytyPS5.app/Contents/MacOS/KytyPS5 -verify_arch x86_64
+            lipo _Build/macos/install/KytyPS5.app/Contents/MacOS/kyty_emulator -verify_arch x86_64
+            codesign --verify --strict _Build/macos/install/KytyPS5.app/Contents/MacOS/kyty_emulator
+            if [[ -f _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib ]]; then
+              lipo _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib -verify_arch x86_64
+              codesign --verify --strict _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib
+            fi
+          else
+            file _Build/macos/install/launcher
+            lipo _Build/macos/install/launcher -verify_arch x86_64
+          fi
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
@@ -426,8 +447,18 @@ jobs:
         run: |
           macos_dir="artifacts/KytyPS5-macOS-x86_64"
           test -d "$macos_dir"
+          if [[ -d "$macos_dir/KytyPS5.app" ]]; then
+            chmod a+x \
+              "$macos_dir/KytyPS5.app/Contents/MacOS/KytyPS5" \
+              "$macos_dir/KytyPS5.app/Contents/MacOS/kyty_emulator" || true
+            if [[ -f "$macos_dir/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib" ]]; then
+              chmod a+x "$macos_dir/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib"
+            fi
+          fi
+          if [[ -f "$macos_dir/launcher" ]]; then
+            chmod a+x "$macos_dir/launcher"
+          fi
           chmod a+x \
-            "$macos_dir/launcher" \
             "$macos_dir/kyty_emulator" \
             "$macos_dir/libMoltenVK.dylib"
           (

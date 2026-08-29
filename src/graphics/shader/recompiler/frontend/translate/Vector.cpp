@@ -491,7 +491,8 @@ bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error
 		case O::V_AND_OR_B32: return V_AND_OR_B32(inst);
 		case O::V_OR3_B32: return V_OR3_B32(inst);
 		case O::V_XOR3_B32: return V_XOR3_B32(inst);
-		case O::V_FFBH_U32: return V_FFBH_U32(inst);
+		case O::V_FFBH_U32: return V_FFBH_32(inst, false);
+		case O::V_FFBH_I32: return V_FFBH_32(inst, true);
 
 		case O::V_MAD_I32_I24: return Integer24(inst, true, true);
 		case O::V_MAD_U32_U24: return Integer24(inst, false, true);

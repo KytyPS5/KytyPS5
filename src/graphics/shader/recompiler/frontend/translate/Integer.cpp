@@ -224,11 +224,14 @@ bool Translator::S_FF1_I32_B64(const Decoder::Instruction& inst) {
 	return true;
 }
 
-bool Translator::V_FFBH_U32(const Decoder::Instruction& inst) {
-	const auto source   = ReadU32(inst.src0);
-	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {source}));
+bool Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
+	const auto source = ReadU32(inst.src0);
+	const auto value  = sign ? ir.BitwiseXor(
+	                              source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))))
+	                         : source;
+	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {value}));
 	const auto position = ir.ISub(IR::U32(IR::Value(31u)), msb);
-	const auto result   = ir.Select(ir.INotEqual(source, IR::U32(IR::Value(0u))), position,
+	const auto result   = ir.Select(ir.INotEqual(value, IR::U32(IR::Value(0u))), position,
 	                                IR::U32(IR::Value(0xffffffffu)));
 	WriteOperand(DestinationOperand(inst), result);
 	return true;

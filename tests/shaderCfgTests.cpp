@@ -4019,6 +4019,18 @@ void TestNewShaderDecoderArchitecture() {
             cmp_eq_u64.src1.kind == OperandKind::VccLo,
         "decoder rejected the captured VOP3 V_CMP_EQ_U64 instruction");
 
+  const uint32_t ffbh_i32_code[] = {0x7e1c770eu};
+  Instruction ffbh_i32;
+  Check(DecodeInstruction(ffbh_i32_code, 0u, ffbh_i32, &error),
+        error.c_str());
+  Check(ffbh_i32.family == Family::VOP1 &&
+            ffbh_i32.opcode == Opcode::V_FFBH_I32 &&
+            ffbh_i32.dst.kind == OperandKind::Vgpr && ffbh_i32.dst.reg == 14u &&
+            ffbh_i32.src_count == 1u &&
+            ffbh_i32.src0.kind == OperandKind::Vgpr &&
+            ffbh_i32.src0.reg == 14u,
+        "decoder rejected the captured VOP1 V_FFBH_I32 instruction");
+
   const uint32_t literal_code[] = {EncodeVop1(0x01, 2, 255u), 0x12345678u};
   Instruction literal;
   Check(DecodeInstruction(literal_code, 0u, literal, &error), error.c_str());

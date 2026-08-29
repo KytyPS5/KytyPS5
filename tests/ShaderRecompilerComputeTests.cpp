@@ -13356,6 +13356,37 @@ TestCase VectorIntegerOps() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorFfbhI32NativeAndVop3OnGpu() {
+  using O = ShaderOpcode;
+
+  constexpr std::array inputs = {0x00000000u, 0x40000000u, 0x80000000u,
+                                 0x0fffffffu, 0xffff0000u, 0xfffffffeu,
+                                 0xffffffffu, 0x80000000u};
+  std::vector<u32> code;
+  for (u32 i = 0; i < inputs.size() - 1u; i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 14, 30);
+    code.push_back(0x7e1c770eu); // v_ffbh_i32 v14, v14
+    AppendStoreVgpr(&code, 14, i);
+  }
+  AppendVMovU32(&code, 30, (inputs.size() - 1u) * 4u);
+  AppendBufferLoadDword(&code, 14, 30);
+  AppendVop3(&code, 0x1bbu, 15, Vgpr(14), 0);
+  AppendStoreVgpr(&code, 15, inputs.size() - 1u);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorFfbhI32NativeAndVop3OnGpu";
+  test.code = std::move(code);
+  test.initial.assign(inputs.begin(), inputs.end());
+  test.expected = {0xffffffffu, 1u, 1u, 4u, 16u, 31u, 0xffffffffu, 1u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FFBH_I32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FFBH_I32 v14, v14", inputs.size() - 1u},
+                         {"V_FFBH_I32 v15, v14", 1u}};
+  return test;
+}
+
 TestCase Vop1SdwaFfblCapturedHighWordSource() {
   using O = ShaderOpcode;
 
@@ -20492,6 +20523,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
+  AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop2SdwaSubNcExactByte2Destination);

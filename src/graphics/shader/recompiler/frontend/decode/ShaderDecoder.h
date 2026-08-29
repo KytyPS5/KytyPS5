@@ -185,6 +185,7 @@ enum class Opcode {
 	V_BFREV_B32,
 	V_FFBH_U32,
 	V_FFBL_B32,
+	V_FFBH_I32,
 	V_ADD_F32,
 	V_SUB_F32,
 	V_SUBREV_F32,

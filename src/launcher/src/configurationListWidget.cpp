@@ -21,7 +21,6 @@
 #include <QDialog>
 #include <QDir>
 #include <QFile>
-#include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QIcon>
@@ -235,11 +234,6 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
 	m_ui->edit_button->setIcon(QIcon(QStringLiteral(":/icons/edit-configuration.svg")));
 	m_ui->delete_button->setIcon(QIcon(QStringLiteral(":/icons/remove-configuration.svg")));
-	m_ui->import_button->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
-	m_ui->import_button->setStyleSheet(QStringLiteral(
-	    "QToolButton { background: rgba(32,118,210,90); border: 1px solid rgba(80,160,255,120); "
-	    "border-radius: 5px; padding: 3px 8px; color: #eef4ff; }"
-	    "QToolButton:hover { background: rgba(32,118,210,140); border-color: rgba(80,160,255,180); }"));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
@@ -265,8 +259,6 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::edit_configuration);
 	connect(m_ui->delete_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::delete_configuartion);
-	connect(m_ui->import_button, &QToolButton::clicked, this,
-	        &ConfigurationListWidget::import_game);
 	connect(m_ui->cfgs_list, &QTreeWidget::currentItemChanged, this,
 	        &ConfigurationListWidget::list_currentItemChanged);
 	connect(m_ui->cfgs_list, &QTreeWidget::itemDoubleClicked, this,
@@ -736,80 +728,6 @@ void ConfigurationListWidget::edit_input_mapping() {
 	if (dialog.exec() == QDialog::Accepted) {
 		m_global_info.host_input_mapping = dialog.Mapping();
 		WriteSettings();
-	}
-}
-
-void ConfigurationListWidget::import_game() {
-	const QString selected = QFileDialog::getExistingDirectory(
-	    this, tr("Select game folder (containing eboot.bin) or folder containing games"),
-	    QDir::homePath(), QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
-
-	if (selected.isEmpty()) {
-		return;
-	}
-
-	QDir dir(selected);
-	QString dir_to_add;
-	QString expected_game_path;
-
-	if (dir.exists(QStringLiteral("eboot.bin"))) {
-		// Selected a single game folder — add its parent so Scan finds it
-		// (Scan only searches subdirectories of game_dirs, not the dirs themselves)
-		dir_to_add           = QDir::cleanPath(dir.absolutePath() + QStringLiteral("/.."));
-		expected_game_path   = QDir::cleanPath(dir.absolutePath());
-	} else {
-		dir_to_add = QDir::cleanPath(dir.absolutePath());
-	}
-
-	const QString normalized = NormalizeGameDirectory(dir_to_add);
-	if (normalized.isEmpty()) {
-		return;
-	}
-
-	const QString key           = PathKey(normalized);
-	bool          already_exists = false;
-	for (const auto& existing: m_game_dirs) {
-		if (PathKey(existing) == key) {
-			already_exists = true;
-			break;
-		}
-	}
-
-	if (!already_exists) {
-		m_game_dirs.append(normalized);
-		m_game_dirs = NormalizeGameDirectories(m_game_dirs);
-		WriteSettings();
-	}
-
-	const int before_count = m_ui->cfgs_list->topLevelItemCount();
-	ScanGameDirectory();
-
-	if (!expected_game_path.isEmpty()) {
-		const QString expected_key = PathKey(expected_game_path);
-		for (int i = 0; i < m_ui->cfgs_list->topLevelItemCount(); ++i) {
-			auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(i));
-			if (PathKey(item->GetInfo().game_path) == expected_key) {
-				m_ui->cfgs_list->setCurrentItem(item);
-				SelectItem(item);
-				break;
-			}
-		}
-	}
-
-	if (m_ui->cfgs_list->topLevelItemCount() == 0) {
-		QMessageBox::information(this, tr("Import game"),
-		                         tr("No games found in the selected folder.\n\n"
-		                            "Make sure the folder contains a game with eboot.bin "
-		                            "or subfolders with games."));
-	} else if (!expected_game_path.isEmpty() && m_ui->cfgs_list->topLevelItemCount() == before_count) {
-		// Single game import didn't appear
-		const int after_count = m_ui->cfgs_list->topLevelItemCount();
-		if (after_count == before_count) {
-			QMessageBox::warning(this, tr("Import game"),
-			                     tr("The selected game folder was added, but no game was detected.\n\n"
-			                        "Expected eboot.bin at: %1")
-			                         .arg(expected_game_path));
-		}
 	}
 }
 

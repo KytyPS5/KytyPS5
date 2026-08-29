@@ -4099,6 +4099,15 @@ void TestNewShaderDecoderArchitecture() {
   Check(boot.opcode == Opcode::DS_SWIZZLE_B32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
 
+  const uint32_t d16_hi_ds[] = {0xda9c0000u, 0x05000006u};
+  Instruction d16_hi;
+  Check(DecodeInstruction(d16_hi_ds, 0u, d16_hi, &error), error.c_str());
+  Check(d16_hi.opcode == Opcode::DS_READ_U16_D16_HI &&
+            d16_hi.src_count == 1u && d16_hi.data_bits == 16u &&
+            d16_hi.dst.reg == 5u && d16_hi.dst.sdwa_sel == 5u &&
+            d16_hi.dst.sdwa_dst_unused == 2u && d16_hi.src0.reg == 6u,
+        "DS decoder rejected the captured high-half D16 read");
+
   constexpr uint32_t packed_source_selectors[][2] = {
       {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
       {0xcc0e0000u, 0x140a0300u}, // Source 1: instruction bit 60.

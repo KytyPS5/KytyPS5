@@ -137,6 +137,7 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x5cu, Opcode::V_CEIL_F16},
     {0x5du, Opcode::V_TRUNC_F16},
     {0x5eu, Opcode::V_RNDNE_F16},
+    {0x60u, Opcode::V_SIN_F16},
     {0x61u, Opcode::V_COS_F16},
 };
 
@@ -189,6 +190,7 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x5cu, Opcode::V_CEIL_F16},
     {0x5du, Opcode::V_TRUNC_F16},
     {0x5eu, Opcode::V_RNDNE_F16},
+    {0x60u, Opcode::V_SIN_F16},
     {0x61u, Opcode::V_COS_F16},
 };
 
@@ -484,6 +486,7 @@ bool IsVop1FloatSourceOpcode(Opcode opcode) {
 		case Opcode::V_CEIL_F16:
 		case Opcode::V_TRUNC_F16:
 		case Opcode::V_RNDNE_F16:
+		case Opcode::V_SIN_F16:
 		case Opcode::V_COS_F16:
 		case Opcode::V_SIN_F32:
 		case Opcode::V_COS_F32: return true;
@@ -551,6 +554,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
      SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_RNDNE_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::V_SIN_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
+     SdwaSelWords() | SdwaSelFull(), true},
     {Opcode::V_COS_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
     {Opcode::V_CVT_U32_F32, SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(), SdwaSelFull(), false},
@@ -837,6 +842,7 @@ bool IsVop1FloatResultOpcode(Opcode opcode) {
 		case Opcode::V_RSQ_F16:
 		case Opcode::V_LOG_F16:
 		case Opcode::V_EXP_F16:
+		case Opcode::V_SIN_F16:
 		case Opcode::V_COS_F16:
 		case Opcode::V_SIN_F32:
 		case Opcode::V_COS_F32: return true;

@@ -63,6 +63,7 @@ protected slots:
 	void edit_global_settings();
 	void edit_input_mapping();
 	void run_configuration();
+	void import_game();
 	void list_currentItemChanged(QTreeWidgetItem* current, QTreeWidgetItem* previous);
 	void list_itemDoubleClicked(QTreeWidgetItem* witem, int column);
 	void show_context_menu(const QPoint& pos);

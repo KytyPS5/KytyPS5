@@ -610,9 +610,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
 			return true;
 		}
-		const auto coord =
-		    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			const auto coord =
+			    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
 			const auto            sampled = MakeSampledImage(state, mem, pc, view);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words =
@@ -653,49 +653,75 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto opcode = explicit_lod
 		                        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
 		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
-		const auto result_type =
-		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
-		const auto dref_value =
-		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
-		                                            : ZeroF32(state))
-		         : 0u;
-		uint32_t              operand_mask = 0;
-		std::vector<uint32_t> operands;
-		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
-			operand_mask |= ImageOperandsGradMask;
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, ImageViewSpatialComponents(view)));
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, ImageViewSpatialComponents(view)));
-		} else if (explicit_lod) {
-			operand_mask |= ImageOperandsLodMask;
-			operands.push_back(HasFlag(mem, Decoder::ImageSampleFlagLod) &&
-			                           layout.lod != NoImageComponent
-			                       ? AddressF32(ctx, mem, *address, layout.lod)
-			                       : ZeroF32(state));
-		} else if (layout.bias != NoImageComponent) {
-			operand_mask |= ImageOperandsBiasMask;
-			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
-		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto            sampled = MakeSampledImage(state, mem, pc, view, resource);
-			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
-			if (dref) {
-				words.push_back(dref_value);
+			auto selected             = mem;
+			selected.resource         = resource;
+			const auto& image         = state.program.info.images[resource];
+			if (image.conversion_format != Prospero::BufferFormat::kInvalid &&
+			    mem.point_sampler != UINT32_MAX) {
+				selected.sampler = mem.point_sampler;
 			}
-			if (operand_mask != 0u) {
-				words.push_back(operand_mask);
-				words.insert(words.end(), operands.begin(), operands.end());
+			selected.kind            = image.kind;
+			selected.image_dimension = image.dimension;
+			selected.image_cube      = image.cube;
+			const bool selected_integer = selected.kind == IR::ResourceKind::ImageUint;
+
+			const auto selected_view   = SampledImageViewKind(state, selected, pc);
+			const auto selected_layout = Layout(selected, selected_view);
+			const auto selected_coord  =
+			    CoordF32(ctx, selected, *address, selected_layout.coord,
+			             ImageViewCoordinateComponents(selected_view));
+			const auto selected_dref =
+			    dref ? (selected_layout.dref != NoImageComponent
+			                ? AddressF32(ctx, selected, *address, selected_layout.dref)
+			                : ZeroF32(state))
+			         : 0u;
+			uint32_t              selected_operand_mask = 0;
+			std::vector<uint32_t> selected_operands;
+			if (HasFlag(selected, Decoder::ImageSampleFlagDerivative)) {
+				selected_operand_mask |= ImageOperandsGradMask;
+				selected_operands.push_back(CoordF32(ctx, selected, *address,
+				                                     selected_layout.grad_x,
+				                                     ImageViewSpatialComponents(selected_view)));
+				selected_operands.push_back(CoordF32(ctx, selected, *address,
+				                                     selected_layout.grad_y,
+				                                     ImageViewSpatialComponents(selected_view)));
+			} else if (explicit_lod) {
+				selected_operand_mask |= ImageOperandsLodMask;
+				selected_operands.push_back(
+				    HasFlag(selected, Decoder::ImageSampleFlagLod) &&
+				            selected_layout.lod != NoImageComponent
+				        ? AddressF32(ctx, selected, *address, selected_layout.lod)
+				        : ZeroF32(state));
+			} else if (selected_layout.bias != NoImageComponent) {
+				selected_operand_mask |= ImageOperandsBiasMask;
+				selected_operands.push_back(
+				    AddressF32(ctx, selected, *address, selected_layout.bias));
+			}
+
+			const auto sampled = MakeSampledImage(state, selected, pc, selected_view);
+			const auto sample  = state.builder.AllocateId();
+			const auto selected_result_type =
+			    dref ? TypeF32(state)
+			         : (selected_integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
+			std::vector<uint32_t> words {opcode, selected_result_type, sample, sampled,
+			                             selected_coord};
+			if (dref) {
+				words.push_back(selected_dref);
+			}
+			if (selected_operand_mask != 0u) {
+				words.push_back(selected_operand_mask);
+				words.insert(words.end(), selected_operands.begin(), selected_operands.end());
 			}
 			state.builder.AddFunction(words);
-			return sample;
+			// Normalize every branch to guest-visible u32x4 bits so candidates with different
+			// SPIR-V image result types can meet at one OpPhi.
+			return ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, selected, sample),
+			                    selected_integer, dref, selected);
 		};
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
-			const auto sample = EmitSample(mem.resource);
-			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
-			                              integer, dref, mem));
+			ctx.Define(inst, EmitSample(mem.resource));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -773,7 +799,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 		state.builder.AddFunction(switch_words);
-		std::vector<uint32_t> phi_words {OpPhi, result_type, state.builder.AllocateId()};
+		std::vector<uint32_t> phi_words {OpPhi, TypeU32Vector(state, 4),
+		                                 state.builder.AllocateId()};
 		EmitLabel(state, default_label);
 		phi_words.push_back(EmitSample(image.indirect_resources[0]));
 		phi_words.push_back(default_label);
@@ -786,9 +813,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
-		                        integer, dref, mem));
+		ctx.Define(inst, phi_words[2]);
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

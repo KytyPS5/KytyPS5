@@ -10,6 +10,7 @@
 #include "SDL_pixels.h"
 #include "SDL_rwops.h"
 #include "SDL_stdinc.h"
+#include "SDL_filesystem.h"
 #include "SDL_surface.h"
 #include "SDL_thread.h"
 #include "SDL_touch.h"
@@ -40,6 +41,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -874,6 +876,26 @@ void WindowContext::CreateVulkan() {
 	EXIT_IF(graphic_ctx.physical_device != nullptr);
 	EXIT_IF(graphic_ctx.device != nullptr);
 	EXIT_IF(surface != nullptr);
+
+#if defined(__APPLE__)
+	// On macOS the Vulkan loader comes from MoltenVK. SDL's default
+	// probe only searches system library paths, so a bundled
+	// libMoltenVK.dylib next to the executable is invisible under the
+	// hardened runtime. Probe it explicitly before falling back.
+	if (const char* sdl_vulkan_library = std::getenv("SDL_VULKAN_LIBRARY");
+	    sdl_vulkan_library != nullptr) {
+		LOGF("Vulkan loader override: SDL_VULKAN_LIBRARY=%s\n", sdl_vulkan_library);
+	} else if (char* base_path = SDL_GetBasePath(); base_path != nullptr) {
+		const std::string moltenvk_path = std::string(base_path) + "libMoltenVK.dylib";
+		SDL_free(base_path);
+		if (SDL_Vulkan_LoadLibrary(moltenvk_path.c_str()) == 0) {
+			LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
+		} else {
+			LOGF("Bundled Vulkan loader not found at %s (%s); trying system loader\n",
+			     moltenvk_path.c_str(), SDL_GetError());
+		}
+	}
+#endif
 
 	auto get_instance_proc_addr =
 	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());

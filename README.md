@@ -288,12 +288,17 @@ The emulator can also be started directly with a legally obtained game directory
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
 ```
 
-On macOS, point SDL at the MoltenVK library explicitly; the hardened runtime prevents it from
-being picked up from the executable's directory:
+On macOS, a bundled `libMoltenVK.dylib` next to `kyty_emulator` is found automatically; no
+environment variable is required:
 
 ```bash
-cd _Build/macos/install
-SDL_VULKAN_LIBRARY="$PWD/libMoltenVK.dylib" ./kyty_emulator --game "/games/ExampleGame"
+./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
+```
+
+To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
+
+```bash
+SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
 ```
 
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and

@@ -1289,6 +1289,9 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	Relocate(program);
+	if (!GamePatch::ApplyPending(program)) {
+		EXIT("Failed to apply pending game cheat\n");
+	}
 }
 
 void RuntimeLinker::UnloadProgram(Program* program) {
@@ -1412,7 +1415,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	RelocateAll();
 
 	if (!game_patch.empty()) {
-		GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front());
+		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
+		                      m_programs)) {
+			EXIT("Failed to apply game cheat\n");
+		}
 	}
 	StartAllModules();
 
@@ -1436,6 +1442,7 @@ void RuntimeLinker::Clear() {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
 	Common::LockGuard lock(m_mutex);
+	GamePatch::Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);

@@ -889,11 +889,9 @@ void CreatePipelineInternal(
 	};
 	auto dynamic_states_count =
 	    static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
-#if !defined(__APPLE__)
 	if (static_params.color_count == 0) {
 		dynamic_states_count--;
 	}
-#endif
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};
 	dynamic_state.sType             = vk::StructureType::ePipelineDynamicStateCreateInfo;

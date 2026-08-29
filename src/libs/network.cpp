@@ -101,6 +101,7 @@ public:
 	int  PoolCreate(const char* name, int size);
 	bool PoolDestroy(int memid);
 	int  ResolverCreate(const char* name, int memid);
+	bool ResolverDestroy(int rid);
 	bool ResolverValid(int rid);
 
 	Id   SslInit(uint64_t pool_size);
@@ -289,6 +290,17 @@ int Network::ResolverCreate(const char* name, int memid) {
 	}
 
 	return -1;
+}
+
+bool Network::ResolverDestroy(int rid) {
+	Common::LockGuard lock(m_mutex);
+
+	if (rid >= 0 && rid < RESOLVERS_MAX && m_resolvers[rid].used) {
+		m_resolvers[rid] = {};
+		return true;
+	}
+
+	return false;
 }
 
 bool Network::ResolverValid(int rid) {
@@ -1229,6 +1241,19 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	}
 
 	return id;
+}
+
+int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
+	PRINT_NAME();
+
+	LOGF("\t rid = %d\n", rid);
+
+	EXIT_IF(g_net == nullptr);
+	if (!g_net->ResolverDestroy(rid)) {
+		return NET_ERROR_EBADF;
+	}
+
+	return OK;
 }
 
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,

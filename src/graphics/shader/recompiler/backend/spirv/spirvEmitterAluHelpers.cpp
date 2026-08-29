@@ -381,6 +381,43 @@ uint32_t EmitFAbsValue(EmitterState& state, uint32_t value) {
 	return ret;
 }
 
+// The sRGB electro-optical transfer function, gamma to linear:
+//     v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+// Emitted for texels the host image cannot decode by itself - see
+// Prospero::IsShaderDecodedSrgbTextureFormat for which formats those are and why.
+//
+// pow is spelled exp2(2.4 * log2(x)) rather than GLSL.std.450 Pow because Log2 and Exp2 are
+// already in the extended-instruction enum and Pow is not: this needs no new opcode number.
+//
+// Both arms are evaluated because OpSelect is not a branch. That is safe here: the log2
+// argument is (v + 0.055) * 0.94787, which is at least 0.052 for any v >= 0, and v is sampled
+// from an 8-bit unorm image so it cannot be negative.
+uint32_t EmitSrgbToLinearF32(EmitterState& state, uint32_t value) {
+	const auto FMul = [&state](uint32_t lhs, uint32_t rhs) {
+		const auto ret = state.builder.AllocateId();
+		state.builder.AddFunction({OpFMul, TypeF32(state), ret, lhs, rhs});
+		return ret;
+	};
+	const auto low    = FMul(value, ConstantF32Value(state, 1.0f / 12.92f));
+	const auto biased = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFAdd, TypeF32(state), biased, value, ConstantF32Value(state, 0.055f)});
+	const auto scaled = FMul(biased, ConstantF32Value(state, 1.0f / 1.055f));
+	const auto log    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, TypeF32(state), log, GlslStd450(state), GlslLog2, scaled});
+	const auto exponent = FMul(log, ConstantF32Value(state, 2.4f));
+	const auto high     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, TypeF32(state), high, GlslStd450(state), GlslExp2, exponent});
+	const auto is_low = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFOrdLessThanEqual, TypeBool(state), is_low, value, ConstantF32Value(state, 0.04045f)});
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeF32(state), ret, is_low, low, high});
+	return ret;
+}
+
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
 	const auto unpacked = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();

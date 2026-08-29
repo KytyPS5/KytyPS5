@@ -418,6 +418,7 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				    program.info.images[root].mip_count != image.mip_count ||
 				    program.info.images[root].conversion_format != image.conversion_format ||
 				    program.info.images[root].shader_swizzle != image.shader_swizzle ||
+				    program.info.images[root].srgb_decode != image.srgb_decode ||
 				    program.info.images[root].cube != image.cube) {
 					if (error != nullptr) {
 						*error = fmt::format(
@@ -432,8 +433,10 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			if (image.atomic) {
 				canonical_kind = image.kind == ResourceKind::StorageImageUint;
 			}
+			// srgb_decode is part of the null check too: a program specialized to decode sRGB
+			// must not be handed a null descriptor, which carries no format at all.
 			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
-			    !canonical_kind) {
+			    !canonical_kind || image.srgb_decode) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "image descriptor {} no longer matches canonical null specialization", i);
@@ -499,6 +502,20 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 					    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
 					    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
 					    descriptor.dwords[6], descriptor.dwords[7]);
+				}
+				return false;
+			}
+			// A permutation is reused only if this validation accepts the descriptor, so this is
+			// the only thing stopping a draw that samples an sRGB plane from picking up a
+			// permutation compiled without the decode - or the reverse. The uint check above
+			// cannot stand in for it: k8UNorm and k8Srgb are both non-uint and so are
+			// indistinguishable to it.
+			const bool srgb_descriptor = image.kind == ResourceKind::Image &&
+			                             Prospero::IsShaderDecodedSrgbTextureFormat(format);
+			if (srgb_descriptor != image.srgb_decode) {
+				if (error != nullptr) {
+					*error = fmt::format(
+					    "image descriptor {} no longer matches specialized sRGB decode", i);
 				}
 				return false;
 			}
@@ -793,6 +810,10 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				default: break;
 			}
 		}
+		// After the promotion, so kind is final. Restricted to plain sampled images: storage
+		// images are written as well as read, and uint images carry no transfer function.
+		image.srgb_decode =
+		    image.kind == ResourceKind::Image && Prospero::IsShaderDecodedSrgbTextureFormat(format);
 	}
 	for (uint32_t root_index = 0; root_index < next.images.size(); root_index++) {
 		auto& root = next.images[root_index];
@@ -840,13 +861,17 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.mip_count         = image_class.mip_count;
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
+				image.srgb_decode       = image_class.srgb_decode;
 				image.cube              = image_class.cube;
 			}
+			// srgb_decode joins the binding class: one module is compiled for the whole table,
+			// so candidates that disagree about the decode cannot share it.
 			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
 			    image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
+			    image.srgb_decode != image_class.srgb_decode ||
 			    image.depth_compare != image_class.depth_compare ||
 			    image.cube != image_class.cube) {
 				if (error != nullptr) {

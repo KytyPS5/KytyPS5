@@ -146,6 +146,15 @@ struct ImageResource {
 	uint32_t                mip_count                 = 1;
 	Prospero::BufferFormat  conversion_format         = Prospero::BufferFormat::kInvalid;
 	uint32_t                shader_swizzle            = ShaderImageIdentitySwizzle;
+	// Set when the bound descriptor names a guest sRGB format the host image cannot carry, so
+	// the emitter has to decode the sampled texels itself. It is a specialisation fact rather
+	// than a tracking fact: the resource-tracking pass leaves it false and SpecializeResources
+	// fills it in from the runtime descriptor. The defaulted operator== below does NOT carry it
+	// into any cache key - nothing calls that operator. Two permutations that differ only in
+	// the decode produce different SPIR-V and must not be swapped for one another, and the only
+	// thing stopping that is ValidateResourceSpecialization, which the program cache runs
+	// before it reuses a permutation. Change one and you must change the other.
+	bool                    srgb_decode               = false;
 	bool                    read                      = false;
 	bool                    written                   = false;
 	bool                    atomic                    = false;

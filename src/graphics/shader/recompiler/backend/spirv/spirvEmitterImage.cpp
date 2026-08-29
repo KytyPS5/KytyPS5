@@ -439,6 +439,51 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	return result;
 }
 
+// Decode the texels of an image the host cannot decode by itself, gamma to linear. Applied
+// to the sampled vector before ResultVector turns it into the four result dwords, since that
+// bitcasts each float to the integer bit pattern the VGPRs hold and decoding after the
+// bitcast would corrupt the value. Alpha is never decoded, matching Vulkan's own sRGB
+// sampling semantics. float_texels is false for a uint image, which carries no transfer
+// function, and for the depth-comparison forms, which yield comparison results not texels.
+uint32_t DecodeImageSrgb(ValueEmitContext& ctx, const IR::MemoryInfo& mem, bool float_texels,
+                         uint32_t texel) {
+	if (!float_texels || !ctx.state.program.info.images[mem.resource].srgb_decode) {
+		return texel;
+	}
+	uint32_t components[4] {};
+	for (uint32_t index = 0; index < 4u; index++) {
+		const auto component = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpCompositeExtract, TypeF32(ctx.state), component, texel, index});
+		components[index] = index < 3u ? EmitSrgbToLinearF32(ctx.state, component) : component;
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(ctx.state, 4), result,
+	                               components[0], components[1], components[2], components[3]});
+	return result;
+}
+
+// Gather4 returns one channel of four neighbouring texels, so the decode applies to all of
+// them and the alpha exclusion is decided once, on that chosen channel.
+uint32_t DecodeImageGatherSrgb(ValueEmitContext& ctx, const IR::MemoryInfo& mem, bool float_texels,
+                               uint32_t gathered) {
+	if (!float_texels || !ctx.state.program.info.images[mem.resource].srgb_decode ||
+	    ImageGatherComponent(mem.dmask) >= 3u) {
+		return gathered;
+	}
+	uint32_t lanes[4] {};
+	for (uint32_t lane = 0; lane < 4u; lane++) {
+		const auto value = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpCompositeExtract, TypeF32(ctx.state), value, gathered, lane});
+		lanes[lane] = EmitSrgbToLinearF32(ctx.state, value);
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(ctx.state, 4), result,
+	                               lanes[0], lanes[1], lanes[2], lanes[3]});
+	return result;
+}
+
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
@@ -581,8 +626,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
 				             image, coord, ImageOperandsLodMask, LodU32(ctx, mem, *address, view)});
 			        }
-			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), integer, false,
-			                            mem);
+			        return ResultVector(
+			            ctx, DecodeImageSrgb(ctx, mem, !integer, UnpackImageTexel(ctx, mem, color)),
+			            integer, false, mem);
 		        }));
 		return true;
 	}
@@ -642,8 +688,11 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
 			}
 			state.builder.AddFunction(words);
-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-			                              integer && !dref, false, mem, true));
+			ctx.Define(inst,
+			           ResultVector(ctx,
+			                        DecodeImageGatherSrgb(ctx, mem, !integer && !dref,
+			                                              UnpackImageGather(ctx, mem, sample)),
+			                        integer && !dref, false, mem, true));
 			return true;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
@@ -694,8 +743,12 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
-			                              integer, dref, mem));
+			ctx.Define(inst,
+			           ResultVector(ctx,
+			                        dref ? sample
+			                             : DecodeImageSrgb(ctx, mem, !integer,
+			                                               UnpackImageTexel(ctx, mem, sample)),
+			                        integer, dref, mem));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -787,7 +840,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
 		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
+		           ResultVector(ctx,
+		                        dref ? phi_words[2]
+		                             : DecodeImageSrgb(ctx, mem, !integer,
+		                                               UnpackImageTexel(ctx, mem, phi_words[2])),
 		                        integer, dref, mem));
 		return true;
 	}

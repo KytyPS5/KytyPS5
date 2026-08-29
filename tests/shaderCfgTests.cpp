@@ -4059,6 +4059,24 @@ void TestNewShaderDecoderArchitecture() {
             byte_shift.src1.value == 8u,
         "decoder rejected or misdecoded captured V_LSHRREV_B32 byte shift");
 
+  const uint32_t vop2_sdwa_byte_left_shift[] = {
+      0x340d02f9u,
+      0x86030607u, // v_lshlrev_b32 v6, v7.byte3, 1
+  };
+  Instruction byte_left_shift;
+  Check(DecodeInstruction(vop2_sdwa_byte_left_shift, 0u, byte_left_shift,
+                          &error),
+        error.c_str());
+  Check(byte_left_shift.family == Family::VOP2 &&
+            byte_left_shift.opcode == Opcode::V_LSHLREV_B32 &&
+            byte_left_shift.word_count == 2u && byte_left_shift.dst.reg == 6u &&
+            byte_left_shift.src0.kind == OperandKind::Vgpr &&
+            byte_left_shift.src0.reg == 7u &&
+            byte_left_shift.src0.sdwa_sel == 3u &&
+            byte_left_shift.src1.kind == OperandKind::IntegerInlineConstant &&
+            byte_left_shift.src1.value == 1u,
+        "decoder rejected or misdecoded captured V_LSHLREV_B32 byte shift");
+
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,
                                0x07060504u, 0x0b0a0908u};

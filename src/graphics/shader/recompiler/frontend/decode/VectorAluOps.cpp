@@ -941,7 +941,7 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelWords() | SdwaSelFull(), false, false},
-    {SdwaSelFull(), SdwaSelFull(), SdwaSelAll(), false, false},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==

@@ -11896,6 +11896,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_RSQ_F16:
   case Opcode::V_LOG_F16:
   case Opcode::V_EXP_F16:
+  case Opcode::V_COS_F16:
   case Opcode::V_MAD_MIXLO_F16:
   case Opcode::V_MAD_MIXHI_F16:
   case Opcode::DS_MIN_F32:
@@ -14487,6 +14488,45 @@ TestCase VectorSpecialF16Ops() {
            0x00000000u, 0x00000000u},
           {O::V_MOV_B32, O::V_RCP_F16, O::V_RSQ_F16, O::V_LOG_F16, O::V_EXP_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorCosF16CapturedSdwaAndEdges() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 4, 0x34001234u); // high=+0.25h, low sentinel
+  code.push_back(0x7e08c2f9u);
+  code.push_back(0x00051504u); // captured v_cos_f16 v4.word1, v4.word1
+  AppendVMovLiteral(&code, 5, 0x00008000u); // -0.0h
+  code.push_back(EncodeVop1(0x61, 6, Vgpr(5)));
+  AppendVMovLiteral(&code, 7, 0x00007bffu); // max finite
+  code.push_back(EncodeVop1(0x61, 8, Vgpr(7)));
+  AppendVMovLiteral(&code, 9, 0x00007c00u); // +inf
+  code.push_back(EncodeVop1(0x61, 10, Vgpr(9)));
+  AppendVMovLiteral(&code, 11, 0x00000001u); // minimum positive denormal
+  code.push_back(EncodeVop1(0x61, 12, Vgpr(11)));
+  AppendVMovLiteral(&code, 13, 0x00003800u); // +0.5h
+  code.push_back(EncodeVop1(0x61, 14, Vgpr(13)));
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 4 + i * 2, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test{"VectorCosF16CapturedSdwaAndEdges",
+                code,
+                {},
+                {0x00001234u, 0x00003c00u, 0x00003c00u, 0x0000fe00u,
+                 0x00003c00u, 0x0000bc00u},
+                {O::V_MOV_B32, O::V_COS_F16, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_COS_F16", 6},
+                         {"V_COS_F16 v4.sdwa(sel=5,sext=0), "
+                          "v4.sdwa(sel=5,sext=0)",
+                          1}};
+  test.ir_counts = {{" = FPCos ", 6}};
+  test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
+  test.forbidden_spirv = {"OpCapability Float16"};
+  return test;
 }
 
 TestCase VectorWritelaneIgnoresExecMask() {
@@ -20688,6 +20728,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
+  AddCase(VectorCosF16CapturedSdwaAndEdges);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);

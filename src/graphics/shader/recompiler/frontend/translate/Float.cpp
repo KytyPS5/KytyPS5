@@ -63,6 +63,30 @@ bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
 	return true;
 }
 
+bool Translator::V_COS_F16(const Decoder::Instruction& inst) {
+	const auto argument = ReadF16AsF32(inst.src0);
+	auto       result   = IR::F32(ir.Emit(IR::ValueOpcode::FPCos, {argument}));
+
+	// The architectural quarter-cycle result is exactly zero. Evaluating cos(pi/2) with a
+	// rounded F32 PI can otherwise produce a half-precision subnormal instead.
+	const auto fraction = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
+	const auto quarter = IR::U1(
+	    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.25f)}));
+	const auto three_quarters = IR::U1(
+	    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.75f)}));
+	result = IR::F32(ir.Emit(IR::ValueOpcode::SelectF32,
+	                        {ir.LogicalOr(quarter, three_quarters), IR::Value::F32(0.0f), result}));
+
+	const auto magnitude =
+	    ir.BitwiseAnd(ir.BitCastU32(argument), IR::U32(IR::Value(0x7fffffffu)));
+	const auto infinite = ir.IEqual(magnitude, IR::U32(IR::Value(0x7f800000u)));
+	result              = ApplyF32ResultModifiers(inst.dst, result);
+	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
+	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
+	WriteU16(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
+	return true;
+}
+
 bool Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
 	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);

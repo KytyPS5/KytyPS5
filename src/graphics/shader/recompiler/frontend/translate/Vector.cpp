@@ -365,6 +365,7 @@ bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error
 		case O::V_CEIL_F16: return Float16Unary(inst, IR::ValueOpcode::FPCeil32, false);
 		case O::V_TRUNC_F16: return Float16Unary(inst, IR::ValueOpcode::FPTrunc32, false);
 		case O::V_RNDNE_F16: return Float16Unary(inst, IR::ValueOpcode::FPRoundEven32, false);
+		case O::V_COS_F16: return V_COS_F16(inst);
 		case O::V_MIN3_F16: return Float16Ternary(inst, IR::ValueOpcode::FPMinTri32, false, false);
 		case O::V_MAX3_F16: return Float16Ternary(inst, IR::ValueOpcode::FPMaxTri32, false, false);
 		case O::V_MED3_F16: return Float16Ternary(inst, IR::ValueOpcode::FPMedTri32, false, false);

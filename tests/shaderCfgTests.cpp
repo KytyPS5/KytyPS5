@@ -4031,6 +4031,22 @@ void TestNewShaderDecoderArchitecture() {
             ffbh_i32.src0.reg == 14u,
         "decoder rejected the captured VOP1 V_FFBH_I32 instruction");
 
+  const uint32_t cos_f16_code[] = {0x7e08c2f9u, 0x00051504u};
+  Instruction cos_f16;
+  Check(DecodeInstruction(cos_f16_code, 0u, cos_f16, &error), error.c_str());
+  Check(cos_f16.family == Family::VOP1 &&
+            cos_f16.opcode == Opcode::V_COS_F16 &&
+            cos_f16.word_count == 2u && cos_f16.src_count == 1u &&
+            cos_f16.dst.kind == OperandKind::Vgpr && cos_f16.dst.reg == 4u &&
+            cos_f16.dst.sdwa_sel == 5u &&
+            cos_f16.dst.sdwa_dst_unused == 2u && !cos_f16.dst.clamp &&
+            cos_f16.dst.omod == 0u &&
+            cos_f16.src0.kind == OperandKind::Vgpr &&
+            cos_f16.src0.reg == 4u && cos_f16.src0.sdwa_sel == 5u &&
+            !cos_f16.src0.sdwa_sext && !cos_f16.src0.negate &&
+            !cos_f16.src0.absolute,
+        "decoder rejected the captured VOP1 SDWA V_COS_F16 instruction");
+
   const uint32_t literal_code[] = {EncodeVop1(0x01, 2, 255u), 0x12345678u};
   Instruction literal;
   Check(DecodeInstruction(literal_code, 0u, literal, &error), error.c_str());

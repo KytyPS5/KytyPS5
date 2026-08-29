@@ -149,6 +149,7 @@ private:
 	                   bool quiet_snan);
 	bool Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                  bool invalid_negative);
+	bool V_COS_F16(const Decoder::Instruction& inst);
 	bool Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse);
 	bool Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                    bool mix);

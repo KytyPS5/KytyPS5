@@ -107,6 +107,10 @@ bool SpirvDebugPrintfEnabled() {
 	return g_config->spirv_debug_printf_enabled;
 }
 
+std::filesystem::path GetErrorLogFile() {
+	return g_config->error_log_file;
+}
+
 bool GpuAssistedValidationEnabled() {
 	return g_config->gpu_assisted_validation_enabled && g_config->vulkan_validation_enabled;
 }

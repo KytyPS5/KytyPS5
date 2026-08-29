@@ -67,6 +67,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
+	std::filesystem::path  error_log_file;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -101,6 +102,8 @@ std::filesystem::path GetPrintfOutputFile();
 ProfilerDirection GetProfilerDirection();
 
 bool SpirvDebugPrintfEnabled();
+
+std::filesystem::path GetErrorLogFile();
 
 bool GpuAssistedValidationEnabled();
 

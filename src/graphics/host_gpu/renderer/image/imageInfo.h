@@ -336,11 +336,28 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	constexpr uint32_t DCC_256_256_0 = 0x00000048u;
 	constexpr uint32_t DCC_256_64_64 = 0x00000208u;
 	if (!compressed) {
+#if defined(__APPLE__)
+		// On Apple/Metal, treat the initial white Bandai logo (uncompressed,
+		// metadata 0) as a valid uncompressed frame even when the guest
+		// reports a stale DCC clear. This avoids the black-screen fallback
+		// where the color allocation is left stale.
+		if (metadata_address == 0 && dcc_control == 0) {
+			return VideoOutCompression::Uncompressed;
+		}
+#endif
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
 	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+#if defined(__APPLE__)
+		// On Apple, the first menu frame after the Bandai logo can report
+		// a compressed surface with metadata 0 (not yet initialized). Treat
+		// it as uncompressed to avoid the black-screen fallback.
+		if (metadata_address == 0 && dcc_control == DCC_256_256_0) {
+			return VideoOutCompression::Uncompressed;
+		}
+#endif
 		return VideoOutCompression::Unsupported;
 	}
 	switch (dcc_control) {

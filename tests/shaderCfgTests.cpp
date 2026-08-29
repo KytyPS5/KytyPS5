@@ -4065,6 +4065,27 @@ void TestNewShaderDecoderArchitecture() {
   Check(boot.opcode == Opcode::DS_SWIZZLE_B32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
 
+  const uint32_t write_b16_d16_hi_ds[] = {0xda840000u, 0x00000214u};
+  Instruction write_b16_d16_hi;
+  Check(DecodeInstruction(write_b16_d16_hi_ds, 0u, write_b16_d16_hi, &error),
+        error.c_str());
+  Check(write_b16_d16_hi.opcode == Opcode::DS_WRITE_B16_D16_HI &&
+            write_b16_d16_hi.src_count == 2u &&
+            write_b16_d16_hi.data_bits == 16u &&
+            write_b16_d16_hi.src0.reg == 20u &&
+            write_b16_d16_hi.src1.reg == 2u &&
+            write_b16_d16_hi.src1.sdwa_sel == 5u,
+        "DS decoder misidentified the captured high-half D16 write");
+
+  const uint32_t bpermute_ds[] = {EncodeDs0(0xb3u), EncodeDs1(0, 2, 20)};
+  Instruction bpermute;
+  Check(DecodeInstruction(bpermute_ds, 0u, bpermute, &error), error.c_str());
+  Check(bpermute.opcode == Opcode::DS_BPERMUTE_B32 &&
+            bpermute.src_count == 2u && bpermute.offset == 0u &&
+            bpermute.dst.reg == 0u && bpermute.src0.reg == 20u &&
+            bpermute.src1.reg == 2u,
+        "DS decoder rejected the captured bpermute instruction");
+
   constexpr uint32_t packed_source_selectors[][2] = {
       {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
       {0xcc0e0000u, 0x140a0300u}, // Source 1: instruction bit 60.
@@ -6685,6 +6706,7 @@ void TestNewShaderRecompilerDsSubDwordTranslation() {
       EncodeDs0(0x3a, 4), EncodeDs1(43, 0, 1), // ds_read_u8 v43, v1
       EncodeDs0(0x3b, 6), EncodeDs1(44, 0, 1), // ds_read_i16 v44, v1
       EncodeDs0(0x3c, 8), EncodeDs1(45, 0, 1), // ds_read_u16 v45, v1
+      EncodeDs0(0xa1, 10), EncodeDs1(0, 46, 1), // ds_write_b16_d16_hi v46, v1
       0xda980000u, 0x07000007u, // ds_read_u16_d16 v7, v7
       0xbf810000u,
   };
@@ -6700,6 +6722,8 @@ void TestNewShaderRecompilerDsSubDwordTranslation() {
         "new decoder did not decode DS byte write");
   Check(Common::ContainsStr(result.decoded_dump, "ds_write_b16"),
         "new decoder did not decode DS short write");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_WRITE_B16_D16_HI"),
+        "new decoder did not decode the high-half DS short write");
   Check(Common::ContainsStr(result.decoded_dump, "ds_read_i8"),
         "new decoder did not decode DS signed byte read");
   Check(Common::ContainsStr(result.decoded_dump, "ds_read_u8"),

@@ -257,6 +257,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
+			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B32:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
@@ -877,6 +878,16 @@ bool Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 	return true;
 }
 
+bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
+	// The address is a byte offset inside the current 32-lane group. Keep the data and address
+	// operands distinct so the SPIR-V backend can select the source lane without touching LDS.
+	WriteOperand(inst.dst,
+	             ir.Emit(IR::ValueOpcode::BpermuteU32,
+	                     {ReadU32(inst.src1), ReadU32(inst.src0), IR::Value(inst.offset & 0xffffu),
+	                      ir.GetExec()}));
+	return true;
+}
+
 bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::S_LOAD_DWORD:
@@ -1035,6 +1046,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_MAX_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMax32);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
+		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_BPERMUTE_B32(inst);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:
@@ -1060,6 +1072,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_WRITE2ST64_B64: return DS_WRITE2(inst);
 		case Decoder::Opcode::DS_WRITE_B8:
 		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B32:
 		case Decoder::Opcode::DS_WRITE_B64:
 		case Decoder::Opcode::DS_WRITE_B96:

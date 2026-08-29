@@ -661,6 +661,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
+		case Opcode::DS_BPERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:
 		case Opcode::DS_READ_I16:
@@ -675,6 +676,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_B128:
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:

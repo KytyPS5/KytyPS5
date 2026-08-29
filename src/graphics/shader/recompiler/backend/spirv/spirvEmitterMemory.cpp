@@ -1201,6 +1201,31 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0)));
 		return true;
 	}
+	if (op == IR::ValueOpcode::BpermuteU32) {
+		// DS_BPERMUTE_B32 addresses bytes within a 32-lane row. Convert the byte address to a
+		// lane, preserve the current row for wave64, and return zero for an inactive source lane.
+		const auto address = Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+		                            ctx.Arg(inst, 2));
+		const auto local = Binary(
+		    state, OpBitwiseAnd, TypeU32(state),
+		    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2)),
+		    ConstantU32(state, 31));
+		const auto base = Binary(state, OpBitwiseAnd, TypeU32(state),
+		                         EmitSubgroupLocalInvocationId(state),
+		                         ConstantU32(state, 0xffffffe0u));
+		const auto target   = Binary(state, OpBitwiseOr, TypeU32(state), base, local);
+		const auto shuffled = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+		                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), target});
+		const auto source_exec = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+		                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3), target});
+		const auto source_active =
+		    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
+		ctx.Define(inst,
+		           Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0)));
+		return true;
+	}
 	return false;
 }
 

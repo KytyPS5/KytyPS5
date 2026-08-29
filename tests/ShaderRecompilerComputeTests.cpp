@@ -12013,6 +12013,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_XOR_RTN_B32:
   case Opcode::DS_WRXCHG_RTN_B32:
   case Opcode::DS_SWIZZLE_B32:
+  case Opcode::DS_BPERMUTE_B32:
   case Opcode::DS_READ_I8:
   case Opcode::DS_READ_U8:
   case Opcode::DS_READ_I16:
@@ -12026,6 +12027,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_READ_B128:
   case Opcode::DS_WRITE_B8:
   case Opcode::DS_WRITE_B16:
+  case Opcode::DS_WRITE_B16_D16_HI:
   case Opcode::DS_WRITE2_B32:
   case Opcode::DS_WRITE2ST64_B32:
   case Opcode::DS_WRITE_B32:
@@ -17992,6 +17994,29 @@ TestCase DsReadU16D16CapturedPreservesHighHalf() {
   return test;
 }
 
+TestCase DsWriteB16D16HiCapturedUsesHighHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 2, 0x1234abcdu);
+  code.push_back(0xda840000u);
+  code.push_back(0x00000214u); // captured ds_write_b16_d16_hi v2, v20
+  code.push_back(EncodeDs0(0x3c));
+  code.push_back(EncodeDs1(3, 0, 20)); // ds_read_u16 v3, v20
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test{"DsWriteB16D16HiCapturedUsesHighHalf",
+                code,
+                std::vector<u32>(1, 0),
+                {0x1234u},
+                {O::V_MOV_B32, O::DS_WRITE_B16_D16_HI, O::DS_READ_U16,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_WRITE_B16_D16_HI", 1}};
+  return test;
+}
+
 TestCase DsReadWrite2Variants() {
   using O = ShaderOpcode;
 
@@ -18374,6 +18399,35 @@ TestCase DsSwizzleInvalidSourceLaneZero() {
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsBpermuteSelectsLaneWithinRow() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 2, 100);
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(0), 2)); // v2 = lane + 100
+  AppendVMovU32(&code, 20,
+                3u * sizeof(u32)); // Select lane 3 by byte address.
+  code.push_back(EncodeDs0(0xb3));
+  code.push_back(EncodeDs1(1, 2, 20));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name     = "DsBpermuteSelectsLaneWithinRow";
+  test.code     = std::move(code);
+  test.expected = std::vector<u32>(32, 103u);
+  test.opcodes  = {O::V_MOV_B32, O::V_ADD_NC_U32, O::DS_BPERMUTE_B32,
+                   O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size      = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info            = true;
+  test.required_spirv              = {"OpGroupNonUniformShuffle"};
   return test;
 }
 
@@ -20508,6 +20562,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatStoreVariants);
   AddCase(DsReadWriteVariants);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
+  AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);
@@ -20521,6 +20576,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
+  AddCase(DsBpermuteSelectsLaneWithinRow);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
   AddCase(BufferAtomicFMinExactRawGlcModes);

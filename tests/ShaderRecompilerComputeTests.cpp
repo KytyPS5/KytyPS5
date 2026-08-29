@@ -13355,6 +13355,52 @@ TestCase VectorIntegerOps() {
            O::S_ENDPGM}};
 }
 
+TestCase Vop1SdwaFfblCapturedHighWordSource() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(0x7e2074f9u);
+  code.push_back(0x00050602u); // v_ffbl_b32 v16, v2.word1
+  AppendStoreVgpr(&code, 16, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaFfblCapturedHighWordSource";
+  test.code = std::move(code);
+  test.initial = {0x00400000u};
+  test.expected = {6u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_FFBL_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_FFBL_B32 v16, v2.sdwa(sel=5,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = FindILsb32 ", 1}};
+  test.required_spirv = {"OpBitFieldUExtract"};
+  return test;
+}
+
+TestCase Vop1SdwaNotCapturedByte0Source() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(0x7e046ef9u);
+  code.push_back(0x00000602u); // v_not_b32 v2, v2.byte0
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaNotCapturedByte0Source";
+  test.code = std::move(code);
+  test.initial = {0x12345678u};
+  test.expected = {0xffffff87u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_NOT_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_NOT_B32 v2, v2.sdwa(sel=0,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = BitwiseNot32 ", 1}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpNot"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcExactByte2Destination() {
   using O = ShaderOpcode;
 
@@ -20350,6 +20396,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
+  AddCase(Vop1SdwaFfblCapturedHighWordSource);
+  AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);

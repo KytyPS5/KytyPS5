@@ -12027,6 +12027,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_READ_B128:
   case Opcode::DS_WRITE_B8:
   case Opcode::DS_WRITE_B16:
+  case Opcode::DS_WRITE_B16_D16_HI:
   case Opcode::DS_WRITE2_B32:
   case Opcode::DS_WRITE2ST64_B32:
   case Opcode::DS_WRITE_B32:
@@ -18100,6 +18101,37 @@ TestCase DsReadU16D16CapturedPreservesHighHalf() {
   return test;
 }
 
+TestCase DsWriteB16D16HiCapturedUsesHighHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 3, 0xdeadbeefu);
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 3, 1)); // ds_write_b32 v1, v3
+
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovLiteral(&code, 2, 0x1234abcdu);
+  AppendVMovLiteral(&code, 0, 0x87654321u);
+  code.push_back(0xda840000u);
+  code.push_back(0x00000214u); // captured ds_write_b16_d16_hi v20, v2
+
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(4, 0, 1)); // ds_read_b32 v4, v1
+  AppendStoreVgpr(&code, 4, 0);
+  AppendStoreVgpr(&code, 0, 1);
+  AppendEnd(&code);
+
+  TestCase test{"DsWriteB16D16HiCapturedUsesHighHalf",
+                code,
+                std::vector<u32>(2, 0),
+                {0x1234beefu, 0x87654321u},
+                {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_WRITE_B16_D16_HI,
+                 O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_WRITE_B16_D16_HI", 1}};
+  return test;
+}
+
 TestCase DsReadU16D16HiCapturedPreservesLowHalf() {
   using O = ShaderOpcode;
 
@@ -20684,6 +20716,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScratchIsPrivatePerInvocation);
   AddCase(FlatStoreVariants);
   AddCase(DsReadWriteVariants);
+  AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
   AddCase(DsReadU16D16HiCapturedPreservesLowHalf);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);

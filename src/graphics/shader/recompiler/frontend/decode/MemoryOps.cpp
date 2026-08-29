@@ -103,6 +103,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
+    {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
     {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
     {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
@@ -148,6 +149,7 @@ bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
@@ -430,6 +432,9 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	DecodeVectorGpr(data0, inst.src1);
+	if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI) {
+		inst.src1.sdwa_sel = 5u;
+	}
 	DecodeVectorGpr(data1, inst.src2);
 	inst.src_count = DsSourceCount(inst.opcode);
 }

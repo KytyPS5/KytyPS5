@@ -257,6 +257,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
+			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B32:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
@@ -1061,6 +1062,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_WRITE2ST64_B64: return DS_WRITE2(inst);
 		case Decoder::Opcode::DS_WRITE_B8:
 		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B32:
 		case Decoder::Opcode::DS_WRITE_B64:
 		case Decoder::Opcode::DS_WRITE_B96:

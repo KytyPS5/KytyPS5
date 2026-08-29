@@ -4132,6 +4132,19 @@ void TestNewShaderDecoderArchitecture() {
             d16_hi.dst.sdwa_dst_unused == 2u && d16_hi.src0.reg == 6u,
         "DS decoder rejected the captured high-half D16 read");
 
+  const uint32_t d16_hi_write_ds[] = {0xda840000u, 0x00000214u};
+  Instruction d16_hi_write;
+  Check(DecodeInstruction(d16_hi_write_ds, 0u, d16_hi_write, &error),
+        error.c_str());
+  Check(d16_hi_write.family == Family::DS &&
+            d16_hi_write.opcode == Opcode::DS_WRITE_B16_D16_HI &&
+            d16_hi_write.word_count == 2u && d16_hi_write.src_count == 2u &&
+            d16_hi_write.data_dwords == 1u && d16_hi_write.data_bits == 16u &&
+            d16_hi_write.offset == 0u && !d16_hi_write.gds &&
+            d16_hi_write.src0.reg == 20u && d16_hi_write.src1.reg == 2u &&
+            d16_hi_write.src1.sdwa_sel == 5u,
+        "DS decoder rejected the captured high-half D16 write");
+
   constexpr uint32_t packed_source_selectors[][2] = {
       {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
       {0xcc0e0000u, 0x140a0300u}, // Source 1: instruction bit 60.

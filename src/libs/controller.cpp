@@ -1,5 +1,6 @@
 #include "libs/controller.h"
 
+#include "SDL.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -21,6 +22,9 @@ LIB_NAME("Pad", "Pad");
 
 constexpr int PAD_ERROR_INVALID_ARG    = -2137915391; /* 0x80920001 */
 constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389; /* 0x80920003 */
+
+// SDL limits rumble commands to 0xffff ms; zero strengths stop immediately.
+constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -59,6 +63,7 @@ public:
 	void Axis(int id, Axis axis, int value);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
+	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -267,6 +272,25 @@ void GameController::ResetInputState() {
 	m_states_num  = 0;
 	m_first_state = 0;
 	AddState(state);
+}
+
+void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
+	Common::LockGuard lock(m_mutex);
+
+	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
+		return;
+	}
+
+	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad == nullptr) {
+		return;
+	}
+
+	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
+	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
+	if (SDL_GameControllerRumble(pad, large, small, RUMBLE_DURATION_MS) != 0) {
+		LOGF("\t rumble failed: %s\n", SDL_GetError());
+	}
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -543,6 +567,9 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	LOGF("\t large_motor = %d\n"
 	     "\t small_motor = %d\n",
 	     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
+
+	EXIT_IF(g_controller == nullptr);
+	g_controller->SetVibration(param->large_motor, param->small_motor);
 
 	return OK;
 }

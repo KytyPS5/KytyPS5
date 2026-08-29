@@ -22,6 +22,7 @@ void Shutdown() {
 void Load(const ConfigOptions& cfg) {
 	EXIT_IF(g_config == nullptr);
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
+	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 
 	*g_config = cfg;
 }
@@ -36,6 +37,10 @@ uint32_t GetScreenHeight() {
 
 const std::string& GetUserName() {
 	return g_config->user_name;
+}
+
+int32_t GetUserId() {
+	return g_config->user_id;
 }
 
 PresentMode GetPresentMode() {

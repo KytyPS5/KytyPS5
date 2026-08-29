@@ -439,6 +439,49 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	return result;
 }
 
+uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t pc,
+	                                 uint32_t coord, bool integer) {
+	auto& state = ctx.state;
+	state.builder.RequireCapability(CapabilityImageQuery);
+	const auto image = LoadSampledImageDescriptor(state, mem, pc, ImageViewKind::Dim1D);
+	const auto width = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpImageQuerySizeLod, TypeU32(state), width, image, ConstantU32(state, 0)});
+	const auto width_f32 = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertUToF, TypeF32(state), width_f32, width});
+	const auto left = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, TypeF32(state), left, GlslStd450(state), GlslFloor,
+	     Binary(state, OpFSub, TypeF32(state),
+	            Binary(state, OpFMul, TypeF32(state), coord, width_f32),
+	            ConstantF32(state, 0x3f000000u))});
+
+	const auto sampled = MakeSampledImage(state, mem, pc, ImageViewKind::Dim1D);
+	const auto vector_type = integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+	const auto scalar_type = integer ? TypeU32(state) : TypeF32(state);
+	const auto component = ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
+	                           ? ImageGatherComponent(mem.dmask)
+	                           : 0u;
+	uint32_t values[2] {};
+	for (uint32_t index = 0; index < 2u; index++) {
+		const auto sample_coord = Binary(
+		    state, OpFDiv, TypeF32(state),
+		    Binary(state, OpFAdd, TypeF32(state), left,
+		           ConstantF32(state, index == 0u ? 0x3f000000u : 0x3fc00000u)),
+		    width_f32);
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction({OpImageSampleExplicitLod, vector_type, texel, sampled, sample_coord,
+		                           ImageOperandsLodMask, ZeroF32(state)});
+		values[index] = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpCompositeExtract, scalar_type, values[index], texel, component});
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, vector_type, result, values[0], values[1],
+	                           values[1], values[0]});
+	return result;
+}
+
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
@@ -613,6 +656,22 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			if (view == ImageViewKind::Dim1D) {
+				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
+				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					ctx.Fail(inst, "has an unsupported 1D gather variant");
+					return true;
+				}
+				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, pc, coord, integer);
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), integer,
+				                              false, mem, true));
+				return true;
+			}
+			if (view == ImageViewKind::Dim1DArray) {
+				ctx.Fail(inst, "has an unsupported 1D-array gather");
+				return true;
+			}
 			const auto            sampled = MakeSampledImage(state, mem, pc, view);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words =

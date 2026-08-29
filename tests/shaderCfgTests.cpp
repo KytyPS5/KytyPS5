@@ -5109,30 +5109,6 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
         "null image retained the decoded 1D descriptor binding");
 }
 
-void TestNewShaderRecompilerRejectsOneDimensionalGather() {
-  constexpr std::array cases{
-      std::pair{0u, Prospero::ImageType::kColor1D},
-      std::pair{4u, Prospero::ImageType::kColor1DArray},
-  };
-  for (const auto &[dimension, type] : cases) {
-    const uint32_t shader[] = {
-        EncodeMimg0(0x47, 0x1, false, dimension),
-        EncodeMimg1(0, 0, 1, 0),
-        0xbf810000u,
-    };
-    auto user_data = ImageTestUserData(type);
-    auto options = MakeCompileOptions(ShaderType::Compute);
-    options.user_data = user_data.data();
-
-    ShaderRecompiler::CompileResult result;
-    std::string error;
-    Check(!ShaderRecompiler::TryRecompile(shader, options, result, &error) &&
-              Common::ContainsStr(error,
-                                  "1D image gather is not supported by SPIR-V"),
-          "1D image gather escaped as invalid SPIR-V");
-  }
-}
-
 void TestNewShaderRecompilerImageGatherVariants() {
   const uint32_t shader[] = {
       EncodeMimg0(0x47, 0x1),

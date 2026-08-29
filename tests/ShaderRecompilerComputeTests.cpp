@@ -19040,6 +19040,44 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   return test;
 }
 
+TestCase ImageGather2DInstructionWith1DDescriptor() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u);
+  AppendVMovLiteral(&code, 21, 0x3f000000u);
+  code.push_back(EncodeMimg0(0x47, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 1);
+  SetRgbaPixel(&image, 4, 1, 0, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&image, 4, 2, 0, 0x40400000u, 0, 0, 0);
+
+  TestCase test;
+  test.name = "ImageGather2DInstructionWith1DDescriptor";
+  test.code = code;
+  test.expected = {0x40000000u, 0x40400000u, 0x40400000u, 0x40000000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.image_width = 4;
+  test.image_height = 1;
+  test.sampled_image_rgba = image;
+  test.sampled_image_type = vk::ImageType::e1D;
+  test.sampled_image_view_type = vk::ImageViewType::e1D;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+  test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
+                      << 28u;
+  test.has_user_data = true;
+  test.required_spirv = {"sampled_1d", "OpImageQuerySizeLod",
+                         "OpImageSampleExplicitLod", "Floor"};
+  test.forbidden_spirv = {"OpImageGather"};
+  return test;
+}
+
 TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   using O = ShaderOpcode;
 
@@ -20643,6 +20681,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
+  AddCase(ImageGather2DInstructionWith1DDescriptor);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);

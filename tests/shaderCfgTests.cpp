@@ -4047,6 +4047,22 @@ void TestNewShaderDecoderArchitecture() {
             !cos_f16.src0.absolute,
         "decoder rejected the captured VOP1 SDWA V_COS_F16 instruction");
 
+  const uint32_t sin_f16_code[] = {0x7e08c0f9u, 0x00051504u};
+  Instruction sin_f16;
+  Check(DecodeInstruction(sin_f16_code, 0u, sin_f16, &error), error.c_str());
+  Check(sin_f16.family == Family::VOP1 &&
+            sin_f16.opcode == Opcode::V_SIN_F16 &&
+            sin_f16.word_count == 2u && sin_f16.src_count == 1u &&
+            sin_f16.dst.kind == OperandKind::Vgpr && sin_f16.dst.reg == 4u &&
+            sin_f16.dst.sdwa_sel == 5u &&
+            sin_f16.dst.sdwa_dst_unused == 2u && !sin_f16.dst.clamp &&
+            sin_f16.dst.omod == 0u &&
+            sin_f16.src0.kind == OperandKind::Vgpr &&
+            sin_f16.src0.reg == 4u && sin_f16.src0.sdwa_sel == 5u &&
+            !sin_f16.src0.sdwa_sext && !sin_f16.src0.negate &&
+            !sin_f16.src0.absolute,
+        "decoder rejected the VOP1 SDWA V_SIN_F16 instruction");
+
   const uint32_t literal_code[] = {EncodeVop1(0x01, 2, 255u), 0x12345678u};
   Instruction literal;
   Check(DecodeInstruction(literal_code, 0u, literal, &error), error.c_str());

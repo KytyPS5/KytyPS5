@@ -11896,6 +11896,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_RSQ_F16:
   case Opcode::V_LOG_F16:
   case Opcode::V_EXP_F16:
+  case Opcode::V_SIN_F16:
   case Opcode::V_COS_F16:
   case Opcode::V_MAD_MIXLO_F16:
   case Opcode::V_MAD_MIXHI_F16:
@@ -14525,6 +14526,52 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
   test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
+  test.forbidden_spirv = {"OpCapability Float16"};
+  return test;
+}
+
+TestCase VectorSinF16SdwaAndEdges() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 4, 0x34001234u); // high=+0.25h, low sentinel
+  code.push_back(0x7e08c0f9u);
+  code.push_back(0x00051504u); // v_sin_f16 v4.word1, v4.word1
+  AppendVMovLiteral(&code, 5, 0x00008000u); // -0.0h
+  code.push_back(EncodeVop1(0x60, 6, Vgpr(5)));
+  AppendVMovLiteral(&code, 7, 0x00007bffu); // max finite
+  code.push_back(EncodeVop1(0x60, 8, Vgpr(7)));
+  AppendVMovLiteral(&code, 9, 0x0000fbffu); // minimum finite
+  code.push_back(EncodeVop1(0x60, 10, Vgpr(9)));
+  AppendVMovLiteral(&code, 11, 0x00007c00u); // +inf
+  code.push_back(EncodeVop1(0x60, 12, Vgpr(11)));
+  AppendVMovLiteral(&code, 13, 0x0000fc00u); // -inf
+  code.push_back(EncodeVop1(0x60, 14, Vgpr(13)));
+  AppendVMovLiteral(&code, 15, 0x00003800u); // +0.5h
+  code.push_back(EncodeVop1(0x60, 16, Vgpr(15)));
+  AppendVMovLiteral(&code, 17, 0x00003a00u); // +0.75h
+  code.push_back(EncodeVop1(0x60, 18, Vgpr(17)));
+  AppendVMovLiteral(&code, 19, 0x00003400u); // +0.25h
+  AppendVop3(&code, 0x1e0, 20, Vgpr(19), 0);
+  for (u32 i = 0; i < 9; i++) {
+    AppendStoreVgpr(&code, 4 + i * 2, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test{"VectorSinF16SdwaAndEdges",
+                code,
+                {},
+                {0x3c001234u, 0x00008000u, 0x00000000u, 0x00000000u,
+                 0x0000fe00u, 0x0000fe00u, 0x00000000u, 0x0000bc00u,
+                 0x00003c00u},
+                {O::V_MOV_B32, O::V_SIN_F16, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_SIN_F16", 9},
+                         {"V_SIN_F16 v4.sdwa(sel=5,sext=0), "
+                          "v4.sdwa(sel=5,sext=0)",
+                          1}};
+  test.ir_counts = {{" = FPSin ", 9}};
+  test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -20729,6 +20776,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorCosF16CapturedSdwaAndEdges);
+  AddCase(VectorSinF16SdwaAndEdges);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);

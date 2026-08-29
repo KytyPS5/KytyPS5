@@ -7283,26 +7283,30 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckRenderExecutorColorStandard4TileDiscovery() {
-    constexpr const char *name = "RenderExecutorColorStandard4Tile";
+  void CheckRenderExecutorColorStandardTileDiscovery() {
+    constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
-    constexpr uint64_t target_address = base + 0x4000;
-    constexpr uint64_t target_size = 0x180000;
-    constexpr uint64_t allocation_size = 0x184000;
-    constexpr uint64_t allocation_alignment = 0x4000;
+    constexpr uint64_t allocation_size = 0x190000;
+    constexpr uint64_t allocation_alignment = 0x10000;
     constexpr auto format = Prospero::BufferFormat::k32Float;
-    constexpr auto tile = Prospero::TileMode::kStandard4KB;
+    struct TileCase {
+      Prospero::TileMode tile;
+      uint64_t target_offset;
+      uint64_t alignment;
+    };
+    constexpr std::array cases{
+        TileCase{Prospero::TileMode::kStandard4KB, 0x4000, 0x1000},
+        TileCase{Prospero::TileMode::kStandard64KB, 0x10000, 0x10000},
+    };
     EnsureRuntimeContext();
 
-    const auto pitch = TileGetTexturePitch(format, 256, tile);
-    TileSizeAlign slice{};
-    TileGetTextureSize(format, 256, 256, 1, tile, &slice, nullptr, nullptr);
-    const auto odd_pitch = TileGetTexturePitch(format, 257, tile);
+    const auto odd_pitch =
+        TileGetTexturePitch(format, 257, Prospero::TileMode::kStandard4KB);
     TileSizeAlign odd_slice{};
-    TileGetTextureSize(format, 257, 131, 1, tile, &odd_slice, nullptr, nullptr);
+    TileGetTextureSize(format, 257, 131, 1, Prospero::TileMode::kStandard4KB,
+                       &odd_slice, nullptr, nullptr);
     Require(name, "tile layout",
-            pitch == 256 && slice.size == 0x40000 && slice.align == 0x1000 &&
-                odd_pitch == 288 && odd_slice.size == 0x2d000 &&
+            odd_pitch == 288 && odd_slice.size == 0x2d000 &&
                 odd_slice.align == 0x1000,
             "Standard4KB pitch, footprint, or block alignment is incorrect");
 
@@ -7311,17 +7315,29 @@ public:
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
                 0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
                 allocation_size, allocation_alignment, 0, &direct_offset) == 0,
-            "Standard4KB color allocation failed");
+            "standard-tiled color allocation failed");
     void *mapped = reinterpret_cast<void *>(base);
     Require(name, "direct mapping",
             Libs::LibKernel::Memory::KernelMapDirectMemory(
                 &mapped, allocation_size, 0x3, 0x10, direct_offset,
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
-            "Standard4KB color mapping failed");
+            "standard-tiled color mapping failed");
     std::memset(mapped, 0, allocation_size);
 
-    {
+    for (const auto &tile_case : cases) {
+      const auto pitch = TileGetTexturePitch(format, 256, tile_case.tile);
+      TileSizeAlign slice{};
+      TileGetTextureSize(format, 256, 256, 1, tile_case.tile, &slice, nullptr,
+                         nullptr);
+      Require(
+          name, "tile layout",
+          pitch == 256 && slice.size == 0x40000 &&
+              slice.align == tile_case.alignment,
+          "standard tile pitch, footprint, or block alignment is incorrect");
+
+      const auto target_address = base + tile_case.target_offset;
+      const auto target_size = slice.size * 6ull;
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
@@ -7335,7 +7351,7 @@ public:
       registers.SetColorView(
           0, {.base_array_slice_index = 5, .last_array_slice_index = 5});
       registers.SetColorAttrib2(0, {.height = 255, .width = 255});
-      registers.SetColorAttrib3(0, {.tile_mode = tile,
+      registers.SetColorAttrib3(0, {.tile_mode = tile_case.tile,
                                     .dimension = 1,
                                     .cmask_pipe_aligned = true,
                                     .dcc_pipe_aligned = true});
@@ -7358,7 +7374,7 @@ public:
                   color.base_array_layer == 5 &&
                   color.desc.info.data.address == target_address &&
                   color.desc.info.data.size == target_size &&
-                  color.desc.info.tile_mode == tile &&
+                  color.desc.info.tile_mode == tile_case.tile &&
                   color.desc.info.extent == vk::Extent3D{256, 256, 1} &&
                   color.desc.info.resources == ImageSubresources{1, 6} &&
                   color.desc.info.pitch == pitch &&
@@ -7367,9 +7383,9 @@ public:
                   color.desc.view_info.type == vk::ImageViewType::e2D &&
                   color.desc.view_info.base_layer == 5 &&
                   color.desc.view_info.layer_count == 1 &&
-                  (target_address & 0xffffu) == 0x4000 &&
+                  (target_address & (tile_case.alignment - 1)) == 0 &&
                   image.usage.render_target && image.IsGpuModified(),
-              "slice 5 Standard4KB render target was not resolved");
+              "slice 5 standard-tiled render target was not resolved");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
@@ -7378,11 +7394,11 @@ public:
 
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
-            "Standard4KB color mapping release failed");
+            "standard-tiled color mapping release failed");
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
-            "Standard4KB color allocation release failed");
+            "standard-tiled color allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -24603,9 +24619,9 @@ int main(int argc, char **argv) {
     CheckStandard64RenderTargetTileRoundTrip();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--standard4-rt-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--standard-tile-rt-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorColorStandard4TileDiscovery();
+    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
@@ -24726,7 +24742,7 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColor1DDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
-  vulkan.CheckRenderExecutorColorStandard4TileDiscovery();
+  vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();

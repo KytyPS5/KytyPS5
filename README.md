@@ -226,13 +226,14 @@ A flat `kyty_emulator` is kept for CLI usage.
 
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` (and, for
-the bundle, into `KytyPS5.app/Contents/MacOS/`) and ad-hoc sign it:
+`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
+(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
 # For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/MacOS/libMoltenVK.dylib
+codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
+codesign --force --sign - _Build/macos/install/KytyPS5.app
 ```
 
 Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
@@ -297,7 +298,7 @@ The emulator can also be started directly with a legally obtained game directory
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
 ```
 
-On macOS, a bundled `libMoltenVK.dylib` next to `kyty_emulator` is found automatically; no
+On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
 environment variable is required:
 
 ```bash

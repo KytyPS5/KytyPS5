@@ -10,7 +10,6 @@
 #include "SDL_pixels.h"
 #include "SDL_rwops.h"
 #include "SDL_stdinc.h"
-#include "SDL_filesystem.h"
 #include "SDL_surface.h"
 #include "SDL_thread.h"
 #include "SDL_touch.h"
@@ -41,7 +40,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -623,9 +621,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
-#if defined(__APPLE__)
-	LOGF("Vulkan device: MoltenVK — depthBounds, depthClipEnable, colorWriteEnable, fragmentShaderBarycentric disabled\n");
-#endif
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 
@@ -880,26 +875,6 @@ void WindowContext::CreateVulkan() {
 	EXIT_IF(graphic_ctx.device != nullptr);
 	EXIT_IF(surface != nullptr);
 
-#if defined(__APPLE__)
-	// On macOS the Vulkan loader comes from MoltenVK. SDL's default
-	// probe only searches system library paths, so a bundled
-	// libMoltenVK.dylib next to the executable is invisible under the
-	// hardened runtime. Probe it explicitly before falling back.
-	if (const char* sdl_vulkan_library = std::getenv("SDL_VULKAN_LIBRARY");
-	    sdl_vulkan_library != nullptr) {
-		LOGF("Vulkan loader override: SDL_VULKAN_LIBRARY=%s\n", sdl_vulkan_library);
-	} else if (char* base_path = SDL_GetBasePath(); base_path != nullptr) {
-		const std::string moltenvk_path = std::string(base_path) + "libMoltenVK.dylib";
-		SDL_free(base_path);
-		if (SDL_Vulkan_LoadLibrary(moltenvk_path.c_str()) == 0) {
-			LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
-		} else {
-			LOGF("Bundled Vulkan loader not found at %s (%s); trying system loader\n",
-			     moltenvk_path.c_str(), SDL_GetError());
-		}
-	}
-#endif
-
 	auto get_instance_proc_addr =
 	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
 	if (get_instance_proc_addr == nullptr) {
@@ -978,7 +953,6 @@ void WindowContext::CreateVulkan() {
 		inst_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
 		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 	}
-	LOGF("Vulkan instance: MoltenVK fallbacks — depthClipEnable/colorWriteEnable omitted, depthBounds disabled\n");
 #endif
 	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());

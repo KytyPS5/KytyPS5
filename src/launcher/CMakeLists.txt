@@ -65,10 +65,9 @@ if(WIN32)
 	)
 endif()
 
+set(launcher_name "launcher")
 if(APPLE)
 	set(launcher_name "KytyPS5")
-else()
-	set(launcher_name "launcher")
 endif()
 
 set_target_properties(launcher PROPERTIES OUTPUT_NAME ${launcher_name})
@@ -76,47 +75,36 @@ set_target_properties(launcher PROPERTIES OUTPUT_NAME ${launcher_name})
 if(APPLE)
 	# macOS bundle: KytyPS5.app with launcher as main executable and
 	# kyty_emulator as helper inside Contents/MacOS. MoltenVK is found
-	# via SDL_GetBasePath() + libMoltenVK.dylib, so placing it next to
-	# the executables (Contents/MacOS) is sufficient; no rpath fixup needed
-	# for the non-Qt case. Qt deployment (Frameworks + plugins) is handled
-	# by macdeployqt when a Qt installation is present.
+	# next to a flat executable or in the bundle's Contents/Frameworks;
+	# no rpath fixup is needed because SDL loads it by absolute path.
+	# Qt deployment (Frameworks + plugins) is handled by macdeployqt.
 	set_target_properties(launcher PROPERTIES
 		MACOSX_BUNDLE TRUE
 		MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
-		MACOSX_BUNDLE_BUNDLE_NAME "KytyPS5"
-		MACOSX_BUNDLE_GUI_IDENTIFIER "org.kytyps5.kytyps5"
-		MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
-		MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
 		INSTALL_RPATH "@executable_path/../Frameworks"
 		BUILD_WITH_INSTALL_RPATH TRUE
 	)
-	install(TARGETS launcher BUNDLE DESTINATION .)
+endif()
+
+install(TARGETS launcher
+	BUNDLE DESTINATION .
+	RUNTIME DESTINATION .)
+
+if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
-	# Ad-hoc sign the helper with JIT entitlements inside the bundle (mirrors
-	# the top-level kyty_emulator signing). The bundle itself will be
-	# re-signed after Qt/MoltenVK deployment.
+	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
+	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
+	if(NOT KYTY_MACDEPLOYQT)
+		message(FATAL_ERROR "Could not find macdeployqt")
+	endif()
 	install(CODE "
-		execute_process(COMMAND codesign -s - --force --options runtime
-			--entitlements \"${KYTY_SOURCE_DIR}/macos_jit.entitlements\"
-			\"\${CMAKE_INSTALL_PREFIX}/KytyPS5.app/Contents/MacOS/kyty_emulator\"
-			RESULT_VARIABLE _kyty_sign_result)
-		if(NOT _kyty_sign_result EQUAL 0)
-			message(WARNING \"Failed to codesign bundled kyty_emulator\")
+		execute_process(COMMAND \"${KYTY_MACDEPLOYQT}\" \"\${CMAKE_INSTALL_PREFIX}/KytyPS5.app\"
+			-codesign=-
+			RESULT_VARIABLE _kyty_deploy_result)
+		if(NOT _kyty_deploy_result EQUAL 0)
+			message(FATAL_ERROR \"macdeployqt failed with \${_kyty_deploy_result}\")
 		endif()
 	")
-	# Deploy Qt frameworks/plugins into the bundle when macdeployqt is available.
-	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
-	if(KYTY_MACDEPLOYQT)
-		install(CODE "
-			execute_process(COMMAND \"${KYTY_MACDEPLOYQT}\" \"\${CMAKE_INSTALL_PREFIX}/KytyPS5.app\"
-				RESULT_VARIABLE _kyty_deploy_result)
-			if(NOT _kyty_deploy_result EQUAL 0)
-				message(WARNING \"macdeployqt failed with \${_kyty_deploy_result}\")
-			endif()
-		")
-	endif()
-else()
-	install(TARGETS launcher DESTINATION .)
 endif()
 
 if(WIN32)

@@ -843,7 +843,8 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	return context.GetSamplerCache().GetSampler(descriptor,
+	                                            program.stage == ShaderType::Compute);
 }
 
 static BufferView NativeUpload(RenderContext& context, std::span<const uint32_t> data) {

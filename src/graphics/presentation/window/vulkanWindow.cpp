@@ -582,9 +582,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	}
 
+	const auto custom_border_color_ext_enabled =
+	    HasExtension(device_extensions, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+
+	vk::PhysicalDeviceCustomBorderColorFeaturesEXT supported_custom_border_color {};
+	supported_custom_border_color.sType =
+	    vk::StructureType::ePhysicalDeviceCustomBorderColorFeaturesEXT;
+	supported_custom_border_color.pNext = &supported_features13;
+
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-	supported_features2.pNext = &supported_features13;
+	supported_features2.pNext =
+	    (custom_border_color_ext_enabled ? static_cast<void*>(&supported_custom_border_color)
+	                                     : static_cast<void*>(&supported_features13));
 	physical_device.getFeatures2(&supported_features2);
 	const auto required_features13 = WindowContext::RequiredVulkan13Features();
 	EXIT_NOT_IMPLEMENTED(supported_features12.timelineSemaphore != VK_TRUE);
@@ -665,9 +675,21 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
 
+	vk::PhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color {};
+	custom_border_color.sType = vk::StructureType::ePhysicalDeviceCustomBorderColorFeaturesEXT;
+	custom_border_color.pNext = &features13;
+	custom_border_color.customBorderColors = supported_custom_border_color.customBorderColors;
+	custom_border_color.customBorderColorWithoutFormat =
+	    supported_custom_border_color.customBorderColorWithoutFormat;
+	graphics.custom_border_color_enabled =
+	    custom_border_color_ext_enabled && custom_border_color.customBorderColors == VK_TRUE &&
+	    custom_border_color.customBorderColorWithoutFormat == VK_TRUE;
+
 	vk::DeviceCreateInfo create_info {};
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
-	create_info.pNext                   = &features13;
+	create_info.pNext =
+	    (graphics.custom_border_color_enabled ? static_cast<void*>(&custom_border_color)
+	                                          : static_cast<void*>(&features13));
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1049,6 +1071,9 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
 		}
 	}
 

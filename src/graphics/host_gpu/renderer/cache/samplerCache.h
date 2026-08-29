@@ -24,10 +24,10 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	vk::Sampler GetSampler(const ShaderSamplerResource& r);
+	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool compute);
 
 private:
-	using SamplerKey = std::array<uint32_t, 4>;
+	using SamplerKey = std::array<uint32_t, 8>;
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

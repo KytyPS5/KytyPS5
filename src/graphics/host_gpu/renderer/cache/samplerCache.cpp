@@ -5,6 +5,10 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <array>
+#include <atomic>
+#include <bit>
+
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
@@ -14,13 +18,8 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool compute) {
 	Common::LockGuard lock(m_mutex);
-
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
-	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
-		return iter->second;
-	}
 
 	float      aniso_ratio = 1.0f;
 	const auto mag_filter  = r.XyMagFilter();
@@ -95,29 +94,60 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	vk::BorderColor                           border = vk::BorderColor::eFloatTransparentBlack;
+	std::array<float, 4>                      custom_color {0.0f, 0.0f, 0.0f, 0.0f};
+	vk::SamplerCustomBorderColorCreateInfoEXT custom_border {};
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = vk::BorderColor::eFloatTransparentBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border = vk::BorderColor::eFloatOpaqueBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border = vk::BorderColor::eFloatOpaqueWhite;
 			break;
-		case Prospero::SamplerBorderColor::kFromTable:
-			LOGF(
-			    "temporary: approximating table border color as transparent black, index = %" PRIu16
-			    "\n",
-			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
+		case Prospero::SamplerBorderColor::kFromTable: {
+			const auto table = GetBorderColorTableAddress(compute);
+			if (table != 0 && m_graphics.custom_border_color_enabled) {
+				const auto* entry =
+				    reinterpret_cast<const float*>(table) + (r.BorderColorPtr() * 4u);
+				custom_color = {entry[0], entry[1], entry[2], entry[3]};
+				border       = vk::BorderColor::eFloatCustomEXT;
+			} else {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					LOGF("temporary: approximating table border color as transparent black, index "
+					     "= %" PRIu16 ", table = 0x%016" PRIx64 "\n",
+					     r.BorderColorPtr(), table);
+				}
+				border = vk::BorderColor::eFloatTransparentBlack;
+			}
 			break;
+		}
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
 
-	sampler_info.sType     = vk::StructureType::eSamplerCreateInfo;
-	sampler_info.pNext     = nullptr;
+	const SamplerKey key {r.fields[0],
+	                      r.fields[1],
+	                      r.fields[2],
+	                      r.fields[3],
+	                      std::bit_cast<uint32_t>(custom_color[0]),
+	                      std::bit_cast<uint32_t>(custom_color[1]),
+	                      std::bit_cast<uint32_t>(custom_color[2]),
+	                      std::bit_cast<uint32_t>(custom_color[3])};
+	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
+		return iter->second;
+	}
+
+	if (border == vk::BorderColor::eFloatCustomEXT) {
+		custom_border.sType = vk::StructureType::eSamplerCustomBorderColorCreateInfoEXT;
+		custom_border.customBorderColor.float32 = custom_color;
+		custom_border.format                    = vk::Format::eUndefined;
+	}
+
+	sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
+	sampler_info.pNext = (border == vk::BorderColor::eFloatCustomEXT ? &custom_border : nullptr);
 	sampler_info.flags     = {};
 	sampler_info.magFilter = to_vk_filter(mag_filter);
 	sampler_info.minFilter = to_vk_filter(min_filter);

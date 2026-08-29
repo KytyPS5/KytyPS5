@@ -66,10 +66,46 @@ if(WIN32)
 endif()
 
 set(launcher_name "launcher")
+if(APPLE)
+	set(launcher_name "KytyPS5")
+endif()
 
 set_target_properties(launcher PROPERTIES OUTPUT_NAME ${launcher_name})
 
-install(TARGETS launcher DESTINATION .)
+if(APPLE)
+	# macOS bundle: KytyPS5.app with launcher as main executable and
+	# kyty_emulator as helper inside Contents/MacOS. MoltenVK is found
+	# next to a flat executable or in the bundle's Contents/Frameworks;
+	# no rpath fixup is needed because SDL loads it by absolute path.
+	# Qt deployment (Frameworks + plugins) is handled by macdeployqt.
+	set_target_properties(launcher PROPERTIES
+		MACOSX_BUNDLE TRUE
+		MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+		INSTALL_RPATH "@executable_path/../Frameworks"
+		BUILD_WITH_INSTALL_RPATH TRUE
+	)
+endif()
+
+install(TARGETS launcher
+	BUNDLE DESTINATION .
+	RUNTIME DESTINATION .)
+
+if(APPLE)
+	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
+	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
+	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
+	if(NOT KYTY_MACDEPLOYQT)
+		message(FATAL_ERROR "Could not find macdeployqt")
+	endif()
+	install(CODE "
+		execute_process(COMMAND \"${KYTY_MACDEPLOYQT}\" \"\${CMAKE_INSTALL_PREFIX}/KytyPS5.app\"
+			-codesign=-
+			RESULT_VARIABLE _kyty_deploy_result)
+		if(NOT _kyty_deploy_result EQUAL 0)
+			message(FATAL_ERROR \"macdeployqt failed with \${_kyty_deploy_result}\")
+		endif()
+	")
+endif()
 
 if(WIN32)
     install(CODE "

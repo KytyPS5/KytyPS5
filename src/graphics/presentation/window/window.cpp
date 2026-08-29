@@ -3,6 +3,7 @@
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
+#include "SDL_filesystem.h"
 #include "SDL_gamecontroller.h"
 #include "SDL_hints.h"
 #include "SDL_joystick.h"
@@ -40,12 +41,11 @@
 #include "loader/systemContent.h"
 
 #include <cstdlib>
+#include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-
-#include <fmt/format.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -812,6 +812,24 @@ static void WindowCreate(WindowContext& context) {
 
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
 #if defined(__APPLE__)
+	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
+	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
+	// override, and fall back to SDL's normal loader search when no bundle is present.
+	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
+		if (char* base_path = SDL_GetBasePath(); base_path != nullptr) {
+			const std::string base_path_str = base_path;
+			SDL_free(base_path);
+			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
+			if (!Common::File::IsFileExisting(moltenvk_path)) {
+				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
+			}
+			if (Common::File::IsFileExisting(moltenvk_path) &&
+			    SDL_setenv("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
+				LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
+			}
+		}
+	}
+
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
 	// borderless window skips that machinery entirely.

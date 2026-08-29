@@ -208,34 +208,66 @@ jobs:
         run: |
           archive="$RUNNER_TEMP/MoltenVK-macos.tar"
           package="$RUNNER_TEMP/MoltenVK"
+          install_dir="_Build/macos/install"
+          app_dir="$install_dir/KytyPS5.app"
+          moltenvk="$install_dir/libMoltenVK.dylib"
           curl --fail --location --retry 3 \
             --output "$archive" \
             "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
           echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
           tar -xf "$archive" -C "$RUNNER_TEMP"
+          test -d "$app_dir"
           install -m 755 \
             "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
-            _Build/macos/install/libMoltenVK.dylib
-          install -m 644 "$package/LICENSE" _Build/macos/install/LICENSE.MoltenVK
-          codesign --force --sign - --timestamp=none _Build/macos/install/libMoltenVK.dylib
+            "$moltenvk"
+          install -m 644 "$package/LICENSE" "$install_dir/LICENSE.MoltenVK"
+          codesign --force --sign - --timestamp=none "$moltenvk"
+          install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
+          install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
+          install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
+          codesign --force --sign - --timestamp=none "$app_dir"
 
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/macos/install/launcher
-          file _Build/macos/install/kyty_emulator
-          file _Build/macos/install/libMoltenVK.dylib
-          lipo _Build/macos/install/launcher -verify_arch x86_64
-          lipo _Build/macos/install/kyty_emulator -verify_arch x86_64
-          lipo _Build/macos/install/libMoltenVK.dylib -verify_arch x86_64
-          codesign --verify --strict _Build/macos/install/kyty_emulator
-          codesign --verify --strict _Build/macos/install/libMoltenVK.dylib
+          install_dir="_Build/macos/install"
+          app_dir="$install_dir/KytyPS5.app"
+          test -d "$app_dir"
+          for binary in \
+            "$install_dir/kyty_emulator" \
+            "$install_dir/libMoltenVK.dylib" \
+            "$app_dir/Contents/MacOS/KytyPS5" \
+            "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
+            file "$binary"
+            lipo "$binary" -verify_arch x86_64
+          done
+          for binary in \
+            "$install_dir/kyty_emulator" \
+            "$install_dir/libMoltenVK.dylib" \
+            "$app_dir/Contents/MacOS/KytyPS5" \
+            "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
+            codesign --verify --strict "$binary"
+          done
+          codesign --verify --deep --strict --verbose=2 "$app_dir"
+
+      - name: Package macOS artifacts
+        shell: bash
+        run: |
+          install_dir="_Build/macos/install"
+          archive="$RUNNER_TEMP/KytyPS5-macOS-x86_64.zip"
+          (
+            cd "$install_dir"
+            zip -qry "$archive" .
+          )
+          unzip -t "$archive"
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-macOS-x86_64
-          path: _Build/macos/install/**
+          path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
           if-no-files-found: error
 
   linux:
@@ -424,16 +456,9 @@ jobs:
         if: needs.macos.result == 'success'
         shell: bash
         run: |
-          macos_dir="artifacts/KytyPS5-macOS-x86_64"
-          test -d "$macos_dir"
-          chmod a+x \
-            "$macos_dir/launcher" \
-            "$macos_dir/kyty_emulator" \
-            "$macos_dir/libMoltenVK.dylib"
-          (
-            cd "$macos_dir"
-            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-macOS-x86_64.zip" .
-          )
+          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
+          test -f "$macos_archive"
+          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
 
       - name: Package Linux build
         if: needs.linux.result == 'success'

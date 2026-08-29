@@ -623,6 +623,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+#if defined(__APPLE__)
+	LOGF("Vulkan device: MoltenVK — depthBounds, depthClipEnable, colorWriteEnable, fragmentShaderBarycentric disabled\n");
+#endif
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 
@@ -964,6 +967,19 @@ void WindowContext::CreateVulkan() {
 	inst_info.sType                   = vk::StructureType::eInstanceCreateInfo;
 	inst_info.pNext                   = (r.enable_validation_layers ? &dbg_create_info : nullptr);
 	inst_info.flags                   = {};
+#if defined(__APPLE__)
+	// MoltenVK requires VK_KHR_portability_enumeration + flag to surface
+	// portability devices. Without this, enumeratePhysicalDevices hides the
+	// MoltenVK adapter on some driver versions.
+	if (HasExtension(r.available_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+		if (!HasExtension(r.required_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+			r.required_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+		}
+		inst_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+	}
+	LOGF("Vulkan instance: MoltenVK fallbacks — depthClipEnable/colorWriteEnable omitted, depthBounds disabled\n");
+#endif
 	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();

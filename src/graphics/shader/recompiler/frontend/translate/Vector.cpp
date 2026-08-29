@@ -96,6 +96,7 @@ bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, false, true);
 			return true;
 		case O::V_CMP_EQ_I64:
+		case O::V_CMP_EQ_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, false);
 			return true;
 		case O::V_CMP_GT_U64:

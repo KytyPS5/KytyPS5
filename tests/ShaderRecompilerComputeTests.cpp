@@ -15414,6 +15414,36 @@ TestCase VectorCompareOps() {
            O::V_CMP_T_U32,   O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorVop3CompareEqU64OnGpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+
+  code.push_back(EncodeSop1(0x04, 106, 126)); // s_mov_b64 vcc, exec
+  code.push_back(0xd4e2006au);
+  code.push_back(0x0000d47eu); // v_cmp_eq_u64 vcc, exec, vcc
+  code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 2, 0);
+
+  AppendSMovLiteral(&code, 107, 1); // high-dword mismatch
+  code.push_back(0xd4e2006au);
+  code.push_back(0x0000d47eu); // v_cmp_eq_u64 vcc, exec, vcc
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+  AppendStoreVgpr(&code, 3, 1);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVop3CompareEqU64OnGpu",
+                code,
+                {},
+                {1, 0},
+                {O::V_MOV_B32, O::S_MOV_B64, O::V_CMP_EQ_U64,
+                 O::V_CNDMASK_B32, O::S_MOV_B32, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMP_EQ_U64 vcc_lo, exec_lo, vcc_lo", 2}};
+  return test;
+}
+
 TestCase VectorVop3CompareNeU64OnGpu() {
   using O = ShaderOpcode;
 
@@ -20487,6 +20517,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSinCosMaxFiniteSpecialCases);
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
+  AddCase(VectorVop3CompareEqU64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
   AddCase(VectorVopcCmpxNeU64CapturedExecMask);

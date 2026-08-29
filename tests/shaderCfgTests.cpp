@@ -4007,6 +4007,18 @@ void TestNewShaderDecoderArchitecture() {
                 program_direct.word_count,
         "program decoder diverged from the single-instruction decoder");
 
+  const uint32_t cmp_eq_u64_code[] = {0xd4e2006au, 0x0000d47eu};
+  Instruction cmp_eq_u64;
+  Check(DecodeInstruction(cmp_eq_u64_code, 0u, cmp_eq_u64, &error),
+        error.c_str());
+  Check(cmp_eq_u64.family == Family::VOP3 &&
+            cmp_eq_u64.opcode == Opcode::V_CMP_EQ_U64 &&
+            cmp_eq_u64.dst.kind == OperandKind::VccLo &&
+            cmp_eq_u64.src_count == 2u &&
+            cmp_eq_u64.src0.kind == OperandKind::ExecLo &&
+            cmp_eq_u64.src1.kind == OperandKind::VccLo,
+        "decoder rejected the captured VOP3 V_CMP_EQ_U64 instruction");
+
   const uint32_t literal_code[] = {EncodeVop1(0x01, 2, 255u), 0x12345678u};
   Instruction literal;
   Check(DecodeInstruction(literal_code, 0u, literal, &error), error.c_str());
@@ -4126,8 +4138,8 @@ void TestNewShaderDecoderArchitecture() {
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   const uint32_t opcodes[] = {
-      0xa2u, 0xb5u, 0xe4u, 0xe5u,
-      0xf5u}; // eq_i64, cmpx_ne_i64, gt_u64, ne_u64, cmpx_ne_u64
+      0xa2u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
+      0xf5u}; // eq_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
   for (const auto opcode : opcodes) {
     const uint32_t shader[] = {
         EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0

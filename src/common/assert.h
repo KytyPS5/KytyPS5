@@ -27,6 +27,10 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// Records a fault that nothing else handled, so a crash leaves the same kind of report in the log
+// that EXIT() leaves. Safe to call once at startup; a platform without a hook does nothing.
+void InstallCrashReporter();
+
 } // namespace Common
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX

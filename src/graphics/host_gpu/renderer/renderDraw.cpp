@@ -639,8 +639,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (depth.htile && depth.depth_clear_enable && !cache.ClearMeta(depth.htile_buffer_vaddr)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
+		// A pass with depth writes disabled only tests against depth, so materializing the HTile
+		// fast clear on it would discard the depth earlier passes wrote and make every later
+		// test fail. Leave the clear armed for the next pass that writes depth.
 		depth.depth_meta_clear_enable =
-		    depth.htile &&
+		    depth.htile && depth.depth_write_enable &&
 		    cache.IsMetaCleared(depth.htile_buffer_vaddr, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
 		if (depth.depth_meta_clear_enable &&

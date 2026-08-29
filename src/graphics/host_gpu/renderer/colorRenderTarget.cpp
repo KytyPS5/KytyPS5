@@ -219,8 +219,9 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		     rt.attrib.num_fragments, bytes_per_element, rt.cmask.addr, rt.fmask.addr,
 		     rt.dcc_addr.addr);
 	}
-	if ((standard64 || depth_tile) && (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 ||
-	                                   view.base_layer != 0 || view.image_layers != 1)) {
+	if ((standard64 || depth_tile) &&
+	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 ||
+	     (depth_tile && (view.base_layer != 0 || view.image_layers != 1)))) {
 		EXIT("unsupported 64KB texture-tiled render-target view: dimension=%u depth=%u"
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);

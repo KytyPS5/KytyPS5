@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -358,13 +359,12 @@ int KYTY_SYSV_ABI PadInit() {
 }
 
 static bool PadOpenArgsAreValid(int user_id, int type, int index) {
-	constexpr int user_id_initial    = 1000;
 	constexpr int user_id_system     = 0xff;
 	constexpr int port_type_standard = 0;
 	constexpr int port_type_special  = 2;
 	constexpr int port_type_remote   = 16;
 	const bool    personal_port =
-	    user_id == user_id_initial && (type == port_type_standard || type == port_type_special);
+	    user_id == Config::GetUserId() && (type == port_type_standard || type == port_type_special);
 	const bool system_remote_control = user_id == user_id_system && type == port_type_remote;
 	return index == 0 && (personal_port || system_remote_control);
 }

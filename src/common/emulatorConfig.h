@@ -34,11 +34,19 @@ using Keymap = std::vector<std::string>;
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
+constexpr int32_t DEFAULT_USER_ID           = 1000;
+
+constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
+	constexpr int32_t USER_ID_EVERYONE = 0xfe;
+	constexpr int32_t USER_ID_SYSTEM   = 0xff;
+	return user_id >= 0 && user_id != USER_ID_EVERYONE && user_id != USER_ID_SYSTEM;
+}
 
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
 	std::string            user_name                   = "Kyty";
+	int32_t                user_id                     = DEFAULT_USER_ID;
 	PresentMode            present_mode                = PresentMode::Fifo;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
@@ -70,6 +78,7 @@ void Load(const ConfigOptions& cfg);
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 const std::string& GetUserName();
+int32_t  GetUserId();
 PresentMode GetPresentMode();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();

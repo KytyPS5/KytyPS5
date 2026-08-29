@@ -49,6 +49,8 @@ static void PrintUsage() {
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
+	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
+	         Config::DEFAULT_USER_ID);
 	::printf("  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Fifo.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -122,6 +124,17 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = language;
+	return true;
+}
+
+static bool ParseUserId(const std::string& value, int32_t& out) {
+	int32_t user_id   = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), user_id);
+	if (error != std::errc {} || end != value.data() + value.size() ||
+	    !Config::IsConfiguredUserIdValid(user_id)) {
+		return false;
+	}
+	out = user_id;
 	return true;
 }
 
@@ -211,6 +224,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.user_name = value;
+		} else if (arg == "--user-id") {
+			if (!ParseUserId(value, options.config.user_id)) {
+				::printf("invalid user ID: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());

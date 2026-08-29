@@ -156,6 +156,7 @@ static void ListInit(QComboBox* combo, T value) {
 void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
+	m_ui->spinBox_user_id->setValue(info.user_id);
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
@@ -289,6 +290,7 @@ void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
+	info.user_id   = ui.spinBox_user_id->value();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
@@ -337,6 +339,11 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 	m_ui->lineEdit_user_name->setText(user_name);
+	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
+		return;
+	}
 
 	update_info();
 

@@ -19514,6 +19514,11 @@ void CheckIndirectImageKeySwitch() {
   root.indirect_mapping_capacity = mapping_capacity;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
+  candidate.kind = ResourceKind::ImageUint;
+  candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  candidate.conversion_format = Prospero::BufferFormat::k11_11_10UInt;
+  candidate.shader_swizzle = DstSel(5, 4, 1, 0);
+  candidate.cube = true;
   candidate.indirect_mapping_capacity = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
@@ -19521,7 +19526,12 @@ void CheckIndirectImageKeySwitch() {
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
   std::string error;
-  Require(name, "binding layout", AllocateBindings(program, 0, &error),
+  Require(name, "binding layout",
+          AllocateBindings(program, 0, &error) &&
+              FindBinding(program.bindings, DescriptorBindingKind::Sampled2D) !=
+                  nullptr &&
+              FindBinding(program.bindings,
+                          DescriptorBindingKind::SampledUint2DArray) != nullptr,
           error.c_str());
   ResourceSnapshot snapshot{};
   DescriptorValue descriptor{};
@@ -19535,6 +19545,11 @@ void CheckIndirectImageKeySwitch() {
       (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
   snapshot.images = {descriptor, descriptor};
   snapshot.images[1].dwords[0] = 0x40u;
+  snapshot.images[1].dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10UInt) << 20u;
+  snapshot.images[1].dwords[3] =
+      candidate.shader_swizzle |
+      (static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u);
   snapshot.flattened_srt.resize(1u + mapping_capacity * 2u);
   snapshot.flattened_srt[0] = 2u;
   snapshot.flattened_srt[1] = 0u;
@@ -19544,6 +19559,7 @@ void CheckIndirectImageKeySwitch() {
   DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   snapshot.samplers.push_back(sampler_descriptor);
+  program.memory_info[0].point_sampler = 0;
 
   ShaderComputeInputInfo compute{};
   std::vector<u32> spirv;
@@ -19563,8 +19579,10 @@ void CheckIndirectImageKeySwitch() {
           text.find("OpSwitch") != std::string::npos &&
               text.find("OpPhi") != std::string::npos &&
               CountText(text, "OpImageSampleExplicitLod") == 2 &&
+              text.find("OpBitFieldUExtract") != std::string::npos &&
               CountText(text, "OpIEqual") == 11,
-          "dynamic image key did not use a compact two-sample switch");
+          "mixed float-2D/converted-uint-cube image key did not use a compact "
+          "two-sample switch");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

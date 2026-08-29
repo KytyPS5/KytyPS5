@@ -441,6 +441,70 @@ void TestInvariantIndirectImageMaterialization() {
         "wrapped scalar immediate entered the invariant image proof");
 }
 
+void TestMixedDimensionIndirectImageSpecialization() {
+  auto fixture = MakeIndirectImageFixture(false);
+  fixture->PlanAndTrack();
+  EliminateDeadCode(fixture->program.blocks);
+
+  std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
+                                    16u << 16u, 4u,          0u, 7u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+                      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                  << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube)
+       << 28u);
+  for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] = descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] = descriptor[dword];
+  }
+  memory.words[(0x2020u - memory.base) / 4u] = 0x40u;
+  memory.words[(0x2020u - memory.base) / 4u + 1u] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)
+      << 20u;
+  memory.words[(0x2020u - memory.base) / 4u + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  std::string error;
+  Check(MaterializeResources(fixture->program, runtime, snapshot, &error) &&
+            snapshot.indirect_images.size() == 1 &&
+            SpecializeResources(fixture->program, snapshot, &error) &&
+            fixture->program.info.images.size() == 2 &&
+            fixture->program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2DArray &&
+            fixture->program.info.images[0].cube &&
+            fixture->program.info.images[1].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            fixture->program.info.images[1].kind == ResourceKind::ImageUint &&
+            !fixture->program.info.images[1].cube,
+        error.empty()
+            ? "mixed float-cube/uint-2D indirect image table was rejected"
+            : error.c_str());
+
+  ShaderComputeInputInfo compute{};
+  Check(CollectShaderInfo(fixture->program, {.compute = &compute}, &error) &&
+            AllocateBindings(fixture->program, 0, &error) &&
+            FindBinding(fixture->program.bindings,
+                        DescriptorBindingKind::Sampled2DArray) != nullptr &&
+            FindBinding(fixture->program.bindings,
+                        DescriptorBindingKind::SampledUint2D) != nullptr,
+        error.empty() ? "mixed float-cube/uint-2D bindings were not allocated"
+                      : error.c_str());
+}
+
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -1375,6 +1439,8 @@ int main() {
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("mixed-dimension indirect images",
+        TestMixedDimensionIndirectImageSpecialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);

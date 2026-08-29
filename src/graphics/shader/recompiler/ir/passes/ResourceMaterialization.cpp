@@ -87,6 +87,18 @@ bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	       Prospero::ImageType::kCube;
 }
 
+bool CompatibleIndirectImageKinds(const ImageResource& lhs, const ImageResource& rhs) {
+	if (lhs.kind == rhs.kind) {
+		return true;
+	}
+	const auto sampled = [](ResourceKind kind) {
+		return kind == ResourceKind::Image || kind == ResourceKind::ImageUint;
+	};
+	// Sampled float and integer candidates can share the dynamic table because the backend emits
+	// a separately typed image operation for every candidate before merging guest-visible bits.
+	return !lhs.depth_compare && !rhs.depth_compare && sampled(lhs.kind) && sampled(rhs.kind);
+}
+
 uint32_t StorageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
 	if (image.mip_mode != ImageMipMode::DynamicStorage || NullImageDescriptor(descriptor)) {
 		return 1;
@@ -842,17 +854,34 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
+			if (!CompatibleIndirectImageKinds(image_class, image) ||
 			    image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.depth_compare != image_class.depth_compare ||
-			    image.cube != image_class.cube) {
+			    image.depth_compare != image_class.depth_compare) {
 				if (error != nullptr) {
 					*error = fmt::format(
-					    "indirect image table at pc 0x{:08x} has incompatible candidates",
-					    root.first_use_pc);
+					    "indirect image table at pc 0x{:08x} has incompatible candidates: "
+					    "exemplar={} candidate={} kind={}/{} dimension={}/{} mip_mode={}/{} "
+					    "mip_count={}/{} conversion_format={}/{} shader_swizzle=0x{:08x}/"
+					    "0x{:08x} depth_compare={}/{} cube={}/{} descriptor=[{:08x},"
+					    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}]",
+					    root.first_use_pc, exemplar, candidate,
+					    static_cast<uint32_t>(image_class.kind), static_cast<uint32_t>(image.kind),
+					    static_cast<uint32_t>(image_class.dimension),
+					    static_cast<uint32_t>(image.dimension),
+					    static_cast<uint32_t>(image_class.mip_mode),
+					    static_cast<uint32_t>(image.mip_mode), image_class.mip_count,
+					    image.mip_count, static_cast<uint32_t>(image_class.conversion_format),
+					    static_cast<uint32_t>(image.conversion_format), image_class.shader_swizzle,
+					    image.shader_swizzle, image_class.depth_compare, image.depth_compare,
+					    image_class.cube, image.cube, next_snapshot.images[candidate].dwords[0],
+					    next_snapshot.images[candidate].dwords[1],
+					    next_snapshot.images[candidate].dwords[2],
+					    next_snapshot.images[candidate].dwords[3],
+					    next_snapshot.images[candidate].dwords[4],
+					    next_snapshot.images[candidate].dwords[5],
+					    next_snapshot.images[candidate].dwords[6],
+					    next_snapshot.images[candidate].dwords[7]);
 				}
 				return false;
 			}
@@ -864,6 +893,30 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		bool native     = false;
 		bool point_only = false;
 	};
+	const auto ImageSamplerUsage = [&](uint32_t image_index) {
+		SamplerUsage usage;
+		if (image_index >= next.images.size()) {
+			return usage;
+		}
+		const auto& image = next.images[image_index];
+		const auto AddImage = [&](uint32_t resource) {
+			if (resource >= next.images.size()) {
+				return;
+			}
+			const bool converted =
+			    next.images[resource].conversion_format != Prospero::BufferFormat::kInvalid;
+			usage.point_only |= converted;
+			usage.native |= !converted;
+		};
+		if (image.indirect_root == image_index && !image.indirect_resources.empty()) {
+			for (const auto resource: image.indirect_resources) {
+				AddImage(resource);
+			}
+		} else {
+			AddImage(image_index);
+		}
+		return usage;
+	};
 	std::vector<SamplerUsage> sampler_usage(next.samplers.size());
 	for (const auto& pair: next.sampled_pairs) {
 		if (pair.image >= next.images.size() || pair.sampler >= next.samplers.size()) {
@@ -874,11 +927,9 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			return false;
 		}
 		auto& usage = sampler_usage[pair.sampler];
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
-			usage.point_only = true;
-		} else {
-			usage.native = true;
-		}
+		const auto image_usage = ImageSamplerUsage(pair.image);
+		usage.point_only |= image_usage.point_only;
+		usage.native |= image_usage.native;
 	}
 	std::vector<uint32_t> point_sampler(next.samplers.size(), UINT32_MAX);
 	for (uint32_t i = 0; i < sampler_usage.size(); i++) {
@@ -903,7 +954,8 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		next_snapshot.samplers.push_back(next_snapshot.samplers[i]);
 	}
 	for (auto& pair: next.sampled_pairs) {
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
+		const auto usage = ImageSamplerUsage(pair.image);
+		if (usage.point_only && !usage.native) {
 			pair.sampler = point_sampler[pair.sampler];
 		}
 	}
@@ -930,10 +982,13 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				return false;
 			}
 			const auto& image = next.images[memory.resource];
-			if (image_opcode.needs_sampler &&
-			    image.conversion_format != Prospero::BufferFormat::kInvalid &&
-			    memory.sampler < point_sampler.size()) {
-				memory.sampler = point_sampler[memory.sampler];
+			if (image_opcode.needs_sampler && memory.sampler < point_sampler.size()) {
+				const auto usage = ImageSamplerUsage(memory.resource);
+				if (usage.point_only && usage.native) {
+					memory.point_sampler = point_sampler[memory.sampler];
+				} else if (usage.point_only) {
+					memory.sampler = point_sampler[memory.sampler];
+				}
 			}
 			if (image.indirect_root == memory.resource &&
 			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {

@@ -58,6 +58,9 @@ struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
 	uint32_t                sampler                  = 0;
+	// Mixed indirect tables can contain both native and format-converted images. Keep the
+	// point-filtered sampler variant separate so each runtime candidate uses the correct sampler.
+	uint32_t                point_sampler            = UINT32_MAX;
 	uint32_t                offset                   = 0;
 	uint32_t                secondary_offset         = 0;
 	uint32_t                dmask                    = 0;

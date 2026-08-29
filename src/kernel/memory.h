@@ -47,13 +47,13 @@ struct VirtualQueryInfo {
 static_assert(sizeof(VirtualQueryInfo) == 72, "VirtualQueryInfo struct size is incorrect");
 
 struct KernelBatchMapEntry {
-	void*    start;
-	uint64_t offset;
-	uint64_t length;
-	char     protection;
-	char     type;
-	int16_t  reserved;
-	int32_t  operation;
+	void*         start;
+	uint64_t      offset;
+	uint64_t      length;
+	unsigned char protection;
+	unsigned char type;
+	int16_t       reserved;
+	int32_t       operation;
 };
 
 static_assert(sizeof(KernelBatchMapEntry) == 32, "KernelBatchMapEntry struct size is incorrect");

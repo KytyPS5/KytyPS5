@@ -3804,8 +3804,8 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
 		     ", prot = 0x%02" PRIx32 ", type = 0x%02" PRIx32 ", op = %d\n",
 		     i, entry->start, entry->offset, entry->length,
-		     static_cast<uint32_t>(static_cast<unsigned char>(entry->protection)),
-		     static_cast<uint32_t>(static_cast<unsigned char>(entry->type)), entry->operation);
+		     static_cast<uint32_t>(entry->protection), static_cast<uint32_t>(entry->type),
+		     entry->operation);
 
 		if (entry->length == 0 || entry->operation < MAP_OP_MAP_DIRECT ||
 		    entry->operation > MAP_OP_TYPE_PROTECT) {

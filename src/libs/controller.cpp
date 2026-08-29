@@ -61,6 +61,7 @@ public:
 	void Disconnect(int id);
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
+	void RightStick(int id, int x, int y);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
@@ -265,6 +266,18 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 	}
 }
 
+void GameController::RightStick(int id, int x, int y) {
+	Common::LockGuard lock(m_mutex);
+
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		auto state                                 = GetLastState();
+		state.time                                 = LibKernel::KernelGetProcessTime();
+		state.axes[static_cast<int>(Axis::RightX)] = x;
+		state.axes[static_cast<int>(Axis::RightY)] = y;
+		AddState(state);
+	}
+}
+
 void GameController::ResetInputState() {
 	Common::LockGuard lock(m_mutex);
 	ControllerState   state {};
@@ -369,6 +382,12 @@ void ControllerAxis(int id, Axis axis, int value) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->Axis(id, axis, value);
+}
+
+void ControllerRightStick(int id, int x, int y) {
+	EXIT_IF(g_controller == nullptr);
+
+	g_controller->RightStick(id, x, y);
 }
 
 void ControllerResetInputState() {

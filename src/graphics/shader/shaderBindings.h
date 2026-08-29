@@ -94,7 +94,11 @@ struct ShaderTextureResource {
 	[[nodiscard]] uint64_t Base40() const {
 		return ((fields[0] | (static_cast<uint64_t>(fields[1]) << 32u)) & 0xFFFFFFFFFFu) << 8u;
 	}
-	[[nodiscard]] bool                   IsNull() const { return Base40() == 0; }
+	[[nodiscard]] bool IsNull() const {
+		const uint64_t address =
+		    (fields[0] | (static_cast<uint64_t>(fields[1]) << 32u)) & 0xFFFFFFFFFFu;
+		return address == 0 || address == 0xFFFFFFFFFFu;
+	}
 	[[nodiscard]] Prospero::BufferFormat Format() const {
 		return static_cast<Prospero::BufferFormat>((fields[1] >> 20u) & 0x1FFu);
 	}

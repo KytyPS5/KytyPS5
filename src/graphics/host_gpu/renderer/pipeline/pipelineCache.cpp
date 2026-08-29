@@ -327,7 +327,7 @@ void PipelineCache::Save() {
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::MoveFile(temp_path, m_driver_cache_path)) {
+	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;

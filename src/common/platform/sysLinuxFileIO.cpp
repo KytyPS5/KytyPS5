@@ -693,7 +693,7 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 	       !error;
 }
 
-bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto real_src = get_internal_name(src);
 	auto real_dst = get_internal_name(dst);
 

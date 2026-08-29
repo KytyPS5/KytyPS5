@@ -1066,7 +1066,7 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 		Common::File::DeleteFile(real_to);
 	}
 
-	if (!Common::File::MoveFile(real_from, real_to)) {
+	if (!Common::File::RenameFile(real_from, real_to)) {
 		return KERNEL_ERROR_EIO;
 	}
 

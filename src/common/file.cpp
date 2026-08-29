@@ -25,9 +25,6 @@
 #ifdef CopyFile
 #undef CopyFile
 #endif
-#ifdef MoveFile
-#undef MoveFile
-#endif
 #endif
 
 namespace Common {
@@ -544,14 +541,14 @@ bool File::CopyFile(const std::filesystem::path& src,
 	return SysFileCopyFile(src, dst);
 }
 
-bool File::MoveFile(const std::filesystem::path& src,
-                    const std::filesystem::path& dst) // @suppress("Member declaration not found")
+bool File::RenameFile(const std::filesystem::path& src,
+                      const std::filesystem::path& dst) // @suppress("Member declaration not found")
 {
 	if (IsFileExisting(dst)) {
 		DeleteFile(dst); // @suppress("Invalid arguments")
 	}
 
-	return SysFileMoveFile(src, dst);
+	return SysFileRenameFile(src, dst);
 }
 
 void File::RemoveReadonly(const std::filesystem::path& name) {

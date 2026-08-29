@@ -84,17 +84,8 @@ void uc_print(const char* func, const HW::UserConfig& uc) {
 }
 
 void uc_check(const HW::UserConfig& uc) {
-	const auto& ge_cntl = uc.GetGeControl();
 	const auto& user_en = uc.GetGeUserVgprEn();
 
-	if (ge_cntl.primitive_group_size > 0x0040) {
-		LOGF("\t warning: unsupported GE_CNTL primitive_group_size = 0x%04" PRIx16 "\n",
-		     ge_cntl.primitive_group_size);
-	}
-	if (ge_cntl.vertex_group_size > 0x0040) {
-		LOGF("\t warning: unsupported GE_CNTL vertex_group_size = 0x%04" PRIx16 "\n",
-		     ge_cntl.vertex_group_size);
-	}
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr1 != false);
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr2 != false);
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr3 != false);

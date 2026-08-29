@@ -659,7 +659,16 @@ public:
 #endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
-		EXIT_IF(!m_backing->IsAvailable());
+		if (!m_backing->IsAvailable()) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
+			     "this up front, so the paging file is usually what needs to be larger.\n",
+			     backing_size / (1024U * 1024U));
+#else
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",
+			     backing_size / (1024U * 1024U));
+#endif
+		}
 	}
 
 	~GuestAddressSpace() {

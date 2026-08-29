@@ -28,6 +28,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/imeOverlay.h"
@@ -858,6 +859,7 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+	g_window->render_context->GetPipelineCache().Save();
 }
 
 void WindowShutdown() {

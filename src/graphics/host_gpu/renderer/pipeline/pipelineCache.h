@@ -10,6 +10,7 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -109,6 +110,7 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	void Save();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -214,12 +216,16 @@ private:
 
 	GraphicContext&                m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	vk::PipelineCache             m_driver_cache = nullptr;
+	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
 	                   GraphicsPipelineKeyHash>
 	    m_graphics_pipelines;
 	std::unordered_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>, ComputePipelineKeyHash>
 	              m_compute_pipelines;
 	Common::Mutex m_mutex;
+
+	void InitializeDriverCache();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -227,10 +233,11 @@ void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
     const PipelineRenderingState& rendering, const ShaderVertexInputInfo& vs_input_info,
     vk::ShaderModule vertex_module, const ShaderPixelInputInfo* ps_input_info,
-	vk::ShaderModule pixel_module, const PipelineStaticParameters& static_params);
+	vk::ShaderModule pixel_module, const PipelineStaticParameters& static_params,
+	vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule              compute_module);
+	vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
 
 } // namespace Libs::Graphics
 

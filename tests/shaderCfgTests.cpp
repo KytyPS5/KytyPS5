@@ -4065,6 +4065,15 @@ void TestNewShaderDecoderArchitecture() {
   Check(boot.opcode == Opcode::DS_SWIZZLE_B32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
 
+  const uint32_t bpermute_ds[] = {0xda840000u, 0x00000214u};
+  Instruction bpermute;
+  Check(DecodeInstruction(bpermute_ds, 0u, bpermute, &error), error.c_str());
+  Check(bpermute.opcode == Opcode::DS_BPERMUTE_B32 &&
+            bpermute.src_count == 2u && bpermute.offset == 0u &&
+            bpermute.dst.reg == 0u && bpermute.src0.reg == 20u &&
+            bpermute.src1.reg == 2u,
+        "DS decoder rejected the captured bpermute instruction");
+
   constexpr uint32_t packed_source_selectors[][2] = {
       {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
       {0xcc0e0000u, 0x140a0300u}, // Source 1: instruction bit 60.

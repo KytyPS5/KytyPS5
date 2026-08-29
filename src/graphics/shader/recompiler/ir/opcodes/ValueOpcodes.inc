@@ -260,6 +260,7 @@ VALUE_OPCODE(SharedAtomicXor32, U32, U32, U32, U1)
 VALUE_OPCODE(DataAppend, U32, U32, U1, U32, U32)
 VALUE_OPCODE(DataConsume, U32, U32, U1, U32, U32)
 VALUE_OPCODE(SwizzleU32, U32, U32, U32, U1)
+VALUE_OPCODE(BpermuteU32, U32, U32, U32, U32, U1)
 
 VALUE_OPCODE(ImageQueryDimensions, U32x4, ImageResource, ImageAddress)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)

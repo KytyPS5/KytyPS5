@@ -878,6 +878,13 @@ bool Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 	return true;
 }
 
+bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
+	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
+	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::BpermuteU32,
+	                               {ReadU32(inst.src1), address, ir.GetExec()}));
+	return true;
+}
+
 bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::S_LOAD_DWORD:
@@ -1036,6 +1043,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_MAX_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMax32);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
+		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_BPERMUTE_B32(inst);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:

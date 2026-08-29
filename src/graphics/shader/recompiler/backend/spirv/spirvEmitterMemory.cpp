@@ -30,6 +30,19 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
+uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
+                              uint32_t exec) {
+	const auto shuffled = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+	                           ConstantU32(state, ScopeSubgroup), source, target});
+	const auto source_exec = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+	                           ConstantU32(state, ScopeSubgroup), exec, target});
+	const auto source_active =
+	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
+	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
+}
+
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                            uint32_t index, uint32_t offset, uint32_t soffset) {
 	auto&          state   = ctx.state;
@@ -1181,24 +1194,27 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, AppendConsume(ctx, inst, op == IR::ValueOpcode::DataAppend));
 		return true;
 	}
-	if (op == IR::ValueOpcode::SwizzleU32) {
-		ctx.state.builder.AddFunction({OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 0)});
-		const auto source = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(
-		    {OpLoad, TypeU32(ctx.state), source, ctx.scratch_u32_variable});
-		const auto target =
-		    EmitDsSwizzleTargetLane(state, EmitSubgroupLocalInvocationId(state),
-		                            inst.Arg(1).IsImmediate() ? inst.Arg(1).U32() : 0);
-		const auto shuffled = state.builder.AllocateId();
-		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-		                           ConstantU32(state, ScopeSubgroup), source, target});
-		const auto source_exec = state.builder.AllocateId();
-		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-		                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 2), target});
-		const auto source_active =
-		    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
-		ctx.Define(inst,
-		           Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0)));
+	if (op == IR::ValueOpcode::SwizzleU32 || op == IR::ValueOpcode::BpermuteU32) {
+		uint32_t source = ctx.Arg(inst, 0);
+		uint32_t target = 0;
+		if (op == IR::ValueOpcode::SwizzleU32) {
+			state.builder.AddFunction({OpStore, ctx.scratch_u32_variable, source});
+			source = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, TypeU32(state), source, ctx.scratch_u32_variable});
+			target = EmitDsSwizzleTargetLane(state, EmitSubgroupLocalInvocationId(state),
+			                                 inst.Arg(1).IsImmediate() ? inst.Arg(1).U32() : 0);
+		} else {
+			const auto index = Binary(
+			    state, OpBitwiseAnd, TypeU32(state),
+			    Binary(state, OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
+			           ConstantU32(state, 2)),
+			    ConstantU32(state, 31));
+			const auto base =
+			    Binary(state, OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
+			           ConstantU32(state, ~31u));
+			target = Binary(state, OpBitwiseOr, TypeU32(state), base, index);
+		}
+		ctx.Define(inst, EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2)));
 		return true;
 	}
 	return false;

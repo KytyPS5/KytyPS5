@@ -266,7 +266,8 @@ bool AnalyzeProgramRequirements(IR::Program& program, std::string* error) {
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
-				case IR::ValueOpcode::SwizzleU32: {
+				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::BpermuteU32: {
 					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;

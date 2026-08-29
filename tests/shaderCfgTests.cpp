@@ -4123,6 +4123,18 @@ void TestNewShaderDecoderArchitecture() {
   Check(boot.opcode == Opcode::DS_SWIZZLE_B32 && boot.offset == 0xc480u,
         "DS decoder rejected a captured boot-shader instruction");
 
+  const uint32_t bpermute_ds[] = {0xdacc0000u, 0x01000311u};
+  Instruction bpermute;
+  Check(DecodeInstruction(bpermute_ds, 0u, bpermute, &error), error.c_str());
+  Check(bpermute.family == Family::DS &&
+            bpermute.opcode == Opcode::DS_BPERMUTE_B32 &&
+            bpermute.word_count == 2u && bpermute.src_count == 2u &&
+            bpermute.data_dwords == 1u && bpermute.data_bits == 32u &&
+            bpermute.offset == 0u && !bpermute.gds &&
+            bpermute.dst.reg == 1u && bpermute.src0.reg == 17u &&
+            bpermute.src1.reg == 3u,
+        "DS decoder rejected or misdecoded captured DS_BPERMUTE_B32");
+
   const uint32_t d16_hi_ds[] = {0xda9c0000u, 0x05000006u};
   Instruction d16_hi;
   Check(DecodeInstruction(d16_hi_ds, 0u, d16_hi, &error), error.c_str());
@@ -12083,6 +12095,12 @@ void TestNewShaderRecompilerUnsupportedMemoryDecode() {
   CheckNewDecoderUnsupported(mtbuf_unknown,
                              static_cast<uint32_t>(std::size(mtbuf_unknown)),
                              "MTBUF", "opcode=0x08");
+
+  const uint32_t bpermute_gds[] = {
+      EncodeDs0(0xb3) | (1u << 17u), EncodeDs1(1, 3, 17), 0xbf810000u};
+  CheckNewDecoderUnsupported(bpermute_gds,
+                             static_cast<uint32_t>(std::size(bpermute_gds)),
+                             "DS", "available only for LDS");
 }
 
 void TestNewShaderRecompilerFlatUserPointerUsesDma() {

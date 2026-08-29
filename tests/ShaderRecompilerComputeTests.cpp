@@ -12029,6 +12029,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_XOR_RTN_B32:
   case Opcode::DS_WRXCHG_RTN_B32:
   case Opcode::DS_SWIZZLE_B32:
+  case Opcode::DS_BPERMUTE_B32:
   case Opcode::DS_READ_I8:
   case Opcode::DS_READ_U8:
   case Opcode::DS_READ_I16:
@@ -18558,6 +18559,89 @@ TestCase DsSwizzleInvalidSourceLaneZero() {
   return test;
 }
 
+TestCase DsBpermuteCapturedExecOffsetAndWrap() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 17, 30);
+  AppendVMovLiteral(&code, 1, 0xdeadbeefu);
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeVop2(0x1b, 18, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(1), 18));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(0xdacc0000u);
+  code.push_back(0x01000311u); // ds_bpermute_b32 v1, v17, v3
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 4);
+
+  AppendVMovU32(&code, 17, 124);
+  code.push_back(EncodeDs0(0xb3, 4));
+  code.push_back(EncodeDs1(2, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 8);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsBpermuteCapturedExecOffsetAndWrap";
+  test.code = code;
+  test.initial = {0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 0, 0};
+  test.expected = {0,          0, 12,         4,
+                   0xdeadbeefu, 0, 0xdeadbeefu, 101,
+                   100,        100, 100,        100};
+  test.opcodes = {O::V_LSHLREV_B32,     O::BUFFER_LOAD_DWORD,
+                  O::V_MOV_B32,         O::V_ADD_NC_U32,
+                  O::V_AND_B32,         O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,
+                  O::DS_BPERMUTE_B32,   O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle",
+                         "OpGroupNonUniformBallot"};
+  test.forbidden_spirv = {" Workgroup", "OpControlBarrier",
+                          "OpMemoryBarrier"};
+  test.decoded_counts = {{"DS_BPERMUTE_B32", 2}};
+  test.ir_counts = {{"BpermuteU32", 2}};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsBpermuteWave64UsesIndependentHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  AppendVMovU32(&code, 17, 128);
+  code.push_back(0xdacc0000u);
+  code.push_back(0x01000311u); // ds_bpermute_b32 v1, v17, v3
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsBpermuteWave64UsesIndependentHalves";
+  test.code = code;
+  test.initial = std::vector<u32>(64, 0);
+  test.expected = std::vector<u32>(32, 100);
+  test.expected.insert(test.expected.end(), 32, 132);
+  test.opcodes = {O::V_MOV_B32,       O::V_ADD_NC_U32,
+                  O::DS_BPERMUTE_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferAtomicVariants() {
   using O = ShaderOpcode;
 
@@ -20746,6 +20830,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
+  AddCase(DsBpermuteCapturedExecOffsetAndWrap);
+  AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
   AddCase(BufferAtomicFMinExactRawGlcModes);

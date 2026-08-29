@@ -801,10 +801,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
-	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
-	     " access=%u address=0x%016" PRIx64 "\n",
-	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
-	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+	{
+		const auto* pc_bytes = reinterpret_cast<const uint8_t*>(info->exception_address);
+		char hex[64] = {};
+		for (int i = 0; i < 16; i++) {
+			snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02x ", pc_bytes[i]);
+		}
+		EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
+		     " access=%u address=0x%016" PRIx64 " bytes: %s\n",
+		     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
+		     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr, hex);
+	}
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {

@@ -350,9 +350,29 @@ struct Presenter::Impl {
 
 		auto&      cache      = renderer.GetTextureCache();
 		const auto image_id   = cache.FindImage(desc);
+
+		if (!image_id){
+			LOGF("DEBUG WARNING: ResolveSurface failed! FindImage returned invalid ID for addr=0x%016", PRIx64, desc.info.data.address);
+		}
+
 		auto&      image      = cache.GetImage(image_id);
-		image.usage.video_out = true;
-		cache.UpdateImage(image_id);
+		if (image_id)
+		{
+			image.usage.video_out = true;
+			cache.UpdateImage(image_id);
+		}
+		
+
+		if (Config::GetPrintfDirection() != Config::OutputDirection::Silent) {
+			LOGF("ResolveSurface: VideoOut addr=0x%016" PRIx64 " size=0x%016" PRIx64 " fmt=%d (%s) vk_image=%p is_rt=%d gpu_modified=%d\n",
+         desc.info.data.address, 
+         desc.info.data.size, 
+         static_cast<int>(desc.info.pixel_format),
+         VulkanToString(desc.info.pixel_format).c_str(), 
+         static_cast<void*>(image.backing.image),
+         IsTiledRenderTarget(image.info) ? 1 : 0, // <-- CRITICAL: Proves if it's the real game buffer
+         image.IsGpuModified() ? 1 : 0);
+		}
 		return image;
 	}
 
@@ -410,6 +430,11 @@ void Swapchain::Create() {
 		format = *it;
 	}
 	m_format                      = format.format;
+	if (Config::GetPrintfDirection() != Config::OutputDirection::Silent) {
+		LOGF("Swapchain: chosen format=%d (%s) colorSpace=%d extent=%ux%u\n",
+		     static_cast<int>(format.format), VulkanToString(format.format).c_str(),
+		     static_cast<int>(format.colorSpace), m_extent.width, m_extent.height);
+	}
 	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
@@ -716,11 +741,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	EXIT_IF(buffer.IsInvalid());
 	auto*             frame = m_impl->frames.Acquire();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-	auto&             image = m_impl->ResolveSurface(info);
+	auto& image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
-
 	auto frame_format = info.pixel_format;
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;

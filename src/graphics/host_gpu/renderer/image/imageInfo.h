@@ -388,10 +388,17 @@ struct VideoOutFormatPolicy {
 };
 
 inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {{
+#if defined(__APPLE__)
+    {0x8000000022000000ull,
+     {vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm, 4, false}},
+    {0x8000000000000000ull,
+     {vk::Format::eB8G8R8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm, 4, false}},
+#else
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
      {vk::Format::eB8G8R8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
+#endif
     {0x8100000022000000ull,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,

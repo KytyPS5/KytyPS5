@@ -119,6 +119,17 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format)) {
 		return false;
 	}
+	if (cached.pixel_format != requested.pixel_format) {
+		// On Apple, disallow Srgb↔Unorm alias for same Bit32 guest memory (makes copyImage black
+		// on MoltenVK). Allow R↔B within same Srgb/Unorm family to share via view swizzle.
+		const bool cached_srgb = cached.pixel_format == vk::Format::eR8G8B8A8Srgb ||
+		                         cached.pixel_format == vk::Format::eB8G8R8A8Srgb;
+		const bool requested_srgb = requested.pixel_format == vk::Format::eR8G8B8A8Srgb ||
+		                            requested.pixel_format == vk::Format::eB8G8R8A8Srgb;
+		if (cached_srgb != requested_srgb) {
+			return false; // Srgb↔Unorm must not share
+		}
+	}
 	if (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1}) {
 		return false;
 	}
@@ -1233,6 +1244,36 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		}
 	}
 	return selected;
+}
+
+ImageId TextureCache::FindExistingImageForVideoOut(uint64_t address, uint64_t size,
+                                                      ImageId exclude) {
+	if (!GuestRange {address, size}.Valid()) {
+		return {};
+	}
+	std::scoped_lock lock {m_lock};
+	ImageId candidate {};
+	for (const auto id : FindImagesInRegion(address, size, false)) {
+		if (id == exclude) {
+			continue;
+		}
+		auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->info.data.address != address) {
+			continue;
+		}
+		if (owner->info.extent.width != 3840 || owner->info.extent.height != 2160 ||
+		    owner->info.data.size != size) {
+			continue;
+		}
+		// Prefer GpuModified RenderTarget for VideoOut alias
+		if (owner->IsGpuModified() && owner->usage.render_target) {
+			return id;
+		}
+		if (!candidate) {
+			candidate = id;
+		}
+	}
+	return candidate;
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {

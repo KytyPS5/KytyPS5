@@ -630,6 +630,14 @@ void Validate(const ImageInfo& info) {
 				EXIT("invalid HTILE metadata\n");
 			}
 			break;
+		case ImageMetadataKind::Cmask:
+			if (info.metadata.range.address == 0 ||
+			    info.metadata.range.address >= TRACKER_ADDRESS_SIZE ||
+			    (info.metadata.range.size != 0 &&
+			     info.metadata.range.size > TRACKER_ADDRESS_SIZE - info.metadata.range.address)) {
+				EXIT("invalid CMask metadata\n");
+			}
+			break;
 		case ImageMetadataKind::Dcc:
 			if (info.metadata.range.address == 0 ||
 			    info.metadata.range.address >= TRACKER_ADDRESS_SIZE ||

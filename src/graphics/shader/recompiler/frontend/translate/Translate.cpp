@@ -421,13 +421,13 @@ IR::U32 Translator::PackHalf2x16(IR::F32 low, IR::F32 high) {
 
 void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
 	auto destination = operand;
-	// Native GFX10 16-bit results preserve the unselected half. Plain/DPP destinations use the
-	// low half; native VOP3 may already select either half. Explicit SDWA retains encoded DST_U.
+	// A native 16-bit result zero-extends into the dword; only a selected half merges.
 	if (!destination.explicit_sdwa_dst) {
-		if (destination.sdwa_sel == 6u) {
-			destination.sdwa_sel = 4u;
+		if (destination.sdwa_sel == 4u || destination.sdwa_sel == 5u) {
+			destination.sdwa_dst_unused = 2u;
+		} else {
+			destination.sdwa_sel = 6u;
 		}
-		destination.sdwa_dst_unused = 2u;
 	}
 	destination.omod   = 0u;
 	destination.op_sel = false;

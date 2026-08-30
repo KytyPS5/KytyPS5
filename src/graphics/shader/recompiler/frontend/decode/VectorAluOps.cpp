@@ -418,6 +418,20 @@ bool IsPermlaneOpcode(Opcode opcode) {
 	return opcode == Opcode::V_PERMLANE16_B32 || opcode == Opcode::V_PERMLANEX16_B32;
 }
 
+bool IsVop2LowHalfF16Opcode(Opcode opcode) {
+	return opcode == Opcode::V_ADD_F16 || opcode == Opcode::V_SUB_F16 ||
+	       opcode == Opcode::V_SUBREV_F16 || opcode == Opcode::V_MUL_F16 ||
+	       opcode == Opcode::V_FMAC_F16 || opcode == Opcode::V_FMAMK_F16 ||
+	       opcode == Opcode::V_FMAAK_F16 || opcode == Opcode::V_MAX_F16 ||
+	       opcode == Opcode::V_MIN_F16;
+}
+
+void ApplyDefaultVop2F16Destination(Instruction& inst) {
+	if (IsVop2LowHalfF16Opcode(inst.opcode)) {
+		inst.dst.sdwa_sel = 4;
+	}
+}
+
 bool IsNativeVop3F16TernaryOpcode(Opcode opcode) {
 	return opcode == Opcode::V_MIN3_F16 || opcode == Opcode::V_MAX3_F16 ||
 	       opcode == Opcode::V_MED3_F16 || opcode == Opcode::V_FMA_F16;
@@ -1116,6 +1130,7 @@ bool DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	ApplyDppModifier(inst.src0, modifier);
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
+	ApplyDefaultVop2F16Destination(inst);
 	const bool packed_fmac = inst.opcode == Opcode::V_PK_FMAC_F16;
 	if (packed_fmac) {
 		inst.src0.negate_hi = inst.src0.negate;
@@ -1593,6 +1608,7 @@ bool DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (!DecodeScalarSource(src0, pc, inst.src0, error)) {
 		return false;
 	}
+	ApplyDefaultVop2F16Destination(inst);
 	return FinalizeVop2Instruction(pc, code, word_index, inst, error);
 }
 

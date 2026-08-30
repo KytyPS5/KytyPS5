@@ -827,7 +827,12 @@ static void EqaaPrint(const char* func, const HW::EqaaControl& c) {
 	     c.static_anchor_associations ? "true" : "false");
 }
 
-static void EqaaCheck(const HW::EqaaControl& c) {
+static void EqaaCheck(const HW::EqaaControl& c, const HW::AaConfig& cf) {
+	// The EQAA controls only take effect while multisampling is on, so a single-sample
+	// target leaves them inert and has nothing to warn about.
+	if (cf.msaa_num_samples == 0) {
+		return;
+	}
 	if (c.max_anchor_samples != 0 || c.ps_iter_samples != 0 || c.mask_export_num_samples != 0 ||
 	    c.alpha_to_mask_num_samples != 0 || c.high_quality_intersections ||
 	    c.incoherent_eqaa_reads || c.interpolate_comp_z || c.static_anchor_associations) {
@@ -1192,7 +1197,7 @@ void hw_check(const CommandBuffer& buffer) {
 	log_phase("blend");
 	BcCheck(bc, bclr, cc);
 	log_phase("eqaa");
-	EqaaCheck(eqaa);
+	EqaaCheck(eqaa, ac);
 	log_phase("aa");
 	AaCheck(aa, ac);
 	log_phase("done");

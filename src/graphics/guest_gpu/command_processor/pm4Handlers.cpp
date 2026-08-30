@@ -2434,10 +2434,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 
 		// Not sure if this is correct
 		if (raw_cmd_offset != cmd_offset) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
-			           " -> 0x%08" PRIx32 "\n",
-			           raw_cmd_offset, cmd_offset);
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
+				           " -> 0x%08" PRIx32 "\n",
+				           raw_cmd_offset, cmd_offset);
+			}
 		}
 
 		// Not sure if this is correct
@@ -2495,10 +2498,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 
 		// Not sure if this is correct
 		if (raw_cmd_offset != cmd_offset) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
-			           " -> 0x%08" PRIx32 "\n",
-			           raw_cmd_offset, cmd_offset);
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
+				           " -> 0x%08" PRIx32 "\n",
+				           raw_cmd_offset, cmd_offset);
+			}
 		}
 		if (HwUcTrySetFakeRegister(cmd_offset, value)) {
 			continue;
@@ -2856,10 +2862,13 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	}
 
 	if (raw_cmd_offset != cmd_offset) {
-		LOGF_COLOR(Log::Color::Red,
-		           "\t temporary: normalized UC register offset 0x%08" PRIx32 " -> 0x%08" PRIx32
-		           "\n",
-		           raw_cmd_offset, cmd_offset);
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t temporary: normalized UC register offset 0x%08" PRIx32 " -> 0x%08" PRIx32
+			           "\n",
+			           raw_cmd_offset, cmd_offset);
+		}
 	}
 	if (HwUcTrySetFakeRegisterRange(cmd_offset, buffer + 1, KYTY_PM4_LEN(cmd_id) - 2u)) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;

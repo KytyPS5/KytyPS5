@@ -19,6 +19,14 @@ public:
 	bool AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info, std::string* error);
 
 private:
+	struct ScalarU64 {
+		std::array<IR::U32, 2> raw;
+		// Raw words and Kyty's per-invocation mask model remain independent.
+		// mask_valid selects invocation for logical consumers and SCC.
+		IR::U1 invocation;
+		IR::U1 mask_valid;
+	};
+
 	Decoder::Operand SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);
@@ -48,14 +56,25 @@ private:
 	IR::U32 ReadU16AsU32(const Decoder::Operand& operand, bool sign_extend);
 	IR::U32 ReadF16LaneBits(const Decoder::Operand& operand, bool high_lane);
 	std::array<IR::U32, 2> ExtractU64(IR::U64 value);
-	void    WriteU32Pair(const Decoder::Operand& operand, const std::array<IR::U32, 2>& value);
-	IR::U1  ReadCondition(const Decoder::Operand& operand);
-	IR::U32 ConditionBit(const Decoder::Operand& operand);
-	IR::U1  ReadMask(const Decoder::Operand& operand);
-	IR::U1  ReadMaskValid(const Decoder::Operand& operand);
-	void    WriteMask(const Decoder::Operand& operand, IR::U1 value);
-	void    WriteMask64(const Decoder::Operand& operand, IR::U1 value);
-	void    WriteCompareResult(const Decoder::Operand& operand, IR::U1 value);
+	void      WriteU32Pair(const Decoder::Operand& operand, const std::array<IR::U32, 2>& value);
+	ScalarU64 ReadScalarU64(const Decoder::Operand& operand);
+	ScalarU64 MakeScalarU64Mask(IR::U1 value);
+	ScalarU64 MakeScalarU64Result(const std::array<IR::U32, 2>& raw, IR::U1 invocation,
+	                              IR::U1 mask_valid);
+	ScalarU64 SelectScalarU64(IR::U1 condition, const ScalarU64& lhs, const ScalarU64& rhs);
+	ScalarU64 NotScalarU64(const ScalarU64& value);
+	ScalarU64 BinaryScalarU64(const ScalarU64& lhs, const ScalarU64& rhs,
+	                          IR::ValueOpcode logical_opcode, IR::ValueOpcode bit_opcode,
+	                          bool negate_lhs, bool negate_rhs, bool negate_result);
+	void      WriteScalarU64(const Decoder::Operand& operand, const ScalarU64& value);
+	IR::U1    ScalarU64NonZero(const ScalarU64& value);
+	IR::U1    ReadCondition(const Decoder::Operand& operand);
+	IR::U32   ConditionBit(const Decoder::Operand& operand);
+	IR::U1    ReadMask(const Decoder::Operand& operand);
+	IR::U1    ReadMaskValid(const Decoder::Operand& operand);
+	void      WriteMask(const Decoder::Operand& operand, IR::U1 value);
+	void      WriteMask64(const Decoder::Operand& operand, IR::U1 value);
+	void      WriteCompareResult(const Decoder::Operand& operand, IR::U1 value);
 
 	IR::MemoryFlags AddMemoryInfo(const IR::MemoryInfo& memory, uint32_t pc);
 	IR::ExportFlags AddExportInfo(const Decoder::Instruction& inst);
@@ -73,7 +92,7 @@ private:
 	IR::U32         GetResourceDword(uint32_t index, uint32_t dword);
 	IR::Value       GetBufferResource(const IR::MemoryInfo& memory);
 	IR::Value       GetAddressResource(IR::Value low, IR::Value high);
-	IR::Value       GetScalarAddressResource(uint32_t base);
+	IR::Value       GetScalarAddressResource(const Decoder::Operand& base);
 	IR::Value       GetImageResource(const IR::MemoryInfo& memory);
 	IR::Value       GetSamplerResource(const IR::MemoryInfo& memory);
 	IR::Value     MakeImageAddress(const Decoder::Instruction& inst, const Decoder::Operand& base);
@@ -175,8 +194,6 @@ private:
 	bool PackedInteger16MinMax(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	bool S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode logical_opcode,
 	                IR::ValueOpcode bit_opcode, bool negate_rhs, bool negate_result, bool unary);
-	IR::U1  U64MaskBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool negate_rhs,
-	                      bool negate_result);
 	bool    SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
 	                      bool reverse, bool mask_shift_count, bool update_scc);
 	bool    ComposedIntegerBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

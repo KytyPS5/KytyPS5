@@ -54,13 +54,6 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// Off by default. Windows dispatches every exception by building its frame on the faulting
-	// thread's own stack, reaching to within sixteen bytes of rsp, and guest code is System V
-	// and keeps live data in the 128 bytes below rsp — so a GPU page-tracking fault taken at
-	// the guest's own stack pointer destroys that data. Measured: a fault at 0x90267ba56 with
-	// rsp=0x7ec2a2e88 zeroed [rsp-0x10], and the next instruction to reload that slot
-	// dereferenced the resulting null. The patcher below fixes that, but it rewrites tens of
-	// thousands of guest instructions, so it stays opt-in via --redzone.
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;

@@ -52,6 +52,8 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Fifo.\n");
+	::printf(
+	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -234,6 +236,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu") {
+			options.config.gpu_index = Common::ToInt32(value);
 		} else if (arg == "--vblank-frequency") {
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =

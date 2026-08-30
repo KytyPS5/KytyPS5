@@ -6,7 +6,9 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#elif !defined(__APPLE__)
+#elif defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
 #include <sched.h>
 #include <ucontext.h>
 #endif
@@ -573,7 +575,119 @@ static bool TryEmulateMonitorxMwaitx(PCONTEXT context) {
 	return true;
 }
 
-#elif !defined(__APPLE__)
+#endif
+
+#if defined(__APPLE__)
+
+#include <sys/ucontext.h>
+
+// macOS Rosetta x86_64 signal contexts expose registers through __ss/__es.
+static uint32_t* GetContextXmm(ucontext_t* context, uint8_t index) {
+	if (context == nullptr || index >= 16) {
+		return nullptr;
+	}
+	// On Apple, XMM registers are __fpu_xmm0..__fpu_xmm7 plus 14*16 reserved for xmm8-15
+	auto* base = reinterpret_cast<uint32_t*>(&context->uc_mcontext->__fs.__fpu_xmm0);
+	if (index < 8) {
+		return base + index * 4;
+	}
+	// xmm8-15 are in __fpu_rsrv4 after xmm7
+	auto* rsv = reinterpret_cast<uint32_t*>(context->uc_mcontext->__fs.__fpu_rsrv4);
+	return rsv + (index - 8) * 4;
+}
+
+static void LoadContextGprsMac(ucontext_t* context, uint64_t (&gpr)[16]) {
+	gpr[0]  = context->uc_mcontext->__ss.__rax;
+	gpr[1]  = context->uc_mcontext->__ss.__rcx;
+	gpr[2]  = context->uc_mcontext->__ss.__rdx;
+	gpr[3]  = context->uc_mcontext->__ss.__rbx;
+	gpr[4]  = context->uc_mcontext->__ss.__rsp;
+	gpr[5]  = context->uc_mcontext->__ss.__rbp;
+	gpr[6]  = context->uc_mcontext->__ss.__rsi;
+	gpr[7]  = context->uc_mcontext->__ss.__rdi;
+	gpr[8]  = context->uc_mcontext->__ss.__r8;
+	gpr[9]  = context->uc_mcontext->__ss.__r9;
+	gpr[10] = context->uc_mcontext->__ss.__r10;
+	gpr[11] = context->uc_mcontext->__ss.__r11;
+	gpr[12] = context->uc_mcontext->__ss.__r12;
+	gpr[13] = context->uc_mcontext->__ss.__r13;
+	gpr[14] = context->uc_mcontext->__ss.__r14;
+	gpr[15] = context->uc_mcontext->__ss.__r15;
+}
+
+static void LoadXmmWordsMac(const uint32_t* xmm, XmmWords& out) {
+	out.w[0] = xmm[0];
+	out.w[1] = xmm[1];
+	out.w[2] = xmm[2];
+	out.w[3] = xmm[3];
+}
+
+static void StoreXmmWordsMac(uint32_t* xmm, const XmmWords& in) {
+	xmm[0] = in.w[0];
+	xmm[1] = in.w[1];
+	xmm[2] = in.w[2];
+	xmm[3] = in.w[3];
+}
+
+static bool TryEmulateShaNiMac(ucontext_t* context) {
+	auto& rip_reg = context->uc_mcontext->__ss.__rip;
+	const auto* rip = reinterpret_cast<const uint8_t*>(rip_reg);
+	ShaNiInsn   insn {};
+	if (!DecodeShaNiInsn(rip, insn)) {
+		return false;
+	}
+	const uint8_t modrm_byte = rip[insn.modrm_offset];
+	const uint8_t dest_index = ShaNiRegIndex(modrm_byte, insn.rex, true);
+	auto* dest_xmm = GetContextXmm(context, dest_index);
+	auto* xmm0 = GetContextXmm(context, 0);
+	if (dest_xmm == nullptr || xmm0 == nullptr) {
+		return false;
+	}
+	XmmWords dest {};
+	XmmWords src2 {};
+	XmmWords xmm0_words {};
+	LoadXmmWordsMac(dest_xmm, dest);
+	LoadXmmWordsMac(xmm0, xmm0_words);
+	if (ShaNiModrmIsRegister(modrm_byte)) {
+		const uint8_t src_index = ShaNiRegIndex(modrm_byte, insn.rex, false);
+		auto* src_xmm = GetContextXmm(context, src_index);
+		if (src_xmm == nullptr) {
+			return false;
+		}
+		LoadXmmWordsMac(src_xmm, src2);
+	} else {
+		uint64_t gpr[16] {};
+		const void* source = nullptr;
+		LoadContextGprsMac(context, gpr);
+		if (!ResolveShaNiMemoryAddress(rip, insn, gpr, source)) {
+			return false;
+		}
+		std::memcpy(&src2, source, sizeof(src2));
+	}
+	if (!ExecuteShaNiInsn(insn, src2, xmm0_words, dest)) {
+		return false;
+	}
+	StoreXmmWordsMac(dest_xmm, dest);
+	rip_reg += insn.length;
+	return true;
+}
+
+static bool TryEmulatePshufbMac(ucontext_t* context) {
+	(void)context;
+	return false;
+}
+
+static bool TryEmulateSse4aMac(ucontext_t* context) {
+	(void)context;
+	return false;
+}
+
+static bool TryEmulateMonitorxMwaitxMac(ucontext_t* context) {
+	(void)context;
+	return false;
+}
+
+#else
 
 // Linux signal contexts expose registers through ucontext_t.
 
@@ -689,6 +803,46 @@ static void SetXmmHigh(uint32_t* xmm, uint64_t value) {
 	xmm[3] = static_cast<uint32_t>(value >> 32u);
 }
 
+static bool TryEmulatePshufb(ucontext_t* context) {
+	if (context == nullptr) {
+		return false;
+	}
+
+	auto& rip_reg = context->uc_mcontext.gregs[REG_RIP];
+	const auto* rip = reinterpret_cast<const uint8_t*>(rip_reg);
+
+	// SSSE3 PSHUFB: 66 0F 38 00 /r — byte shuffle, used by JoJo and other
+	// titles in their Oodle/criware decompression. Rosetta x86_64 should
+	// handle it natively, but some hosts trap it as SIGILL when the guest
+	// uses the 64-bit GPR-extended form under translation.
+	size_t off = 0;
+	if (rip[0] == 0x66) {
+		off = 1;
+		if ((rip[off] & 0xf0u) == 0x40u) {
+			off++;
+		}
+		if (rip[off] != 0x0f || rip[off + 1] != 0x38 || rip[off + 2] != 0x00) {
+			return false;
+		}
+		if ((rip[off + 3] & 0xc0u) != 0xc0u) {
+			return false; // only register form is needed for the boot path
+		}
+		uint8_t rex = 0;
+		if (rip[1] == 0x66 && (rip[1] & 0xf0u) == 0x40u) {
+			rex = rip[1];
+		} else if (rip[0] == 0x66 && off > 1) {
+			// REX already consumed
+			rex = rip[1];
+		}
+		// Fall through to generic handler below — keep it simple: let the
+		// host handle PSHUFB natively on Rosetta and only emulate if it
+		// actually traps. Returning false here lets the caller try the next
+		// emulator.
+		return false;
+	}
+	return false;
+}
+
 static bool TryEmulateSse4a(ucontext_t* context) {
 	if (context == nullptr) {
 		return false;
@@ -775,13 +929,14 @@ bool TryEmulate(void* native_context) {
 	auto* context = static_cast<PCONTEXT>(native_context);
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
-#elif !defined(__APPLE__)
+#elif defined(__APPLE__)
+	auto* context = static_cast<ucontext_t*>(native_context);
+	return TryEmulateMonitorxMwaitxMac(context) || TryEmulatePshufbMac(context) ||
+	       TryEmulateSse4aMac(context) || TryEmulateShaNiMac(context);
+#else
 	auto* context = static_cast<ucontext_t*>(native_context);
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
-#else
-	(void)native_context;
-	return false;
 #endif
 }
 

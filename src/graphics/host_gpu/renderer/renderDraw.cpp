@@ -503,7 +503,7 @@ struct DrawCallInfo {
 };
 
 static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
-                                      const ImageViewInfo& view, vk::ClearColorValue& clear_value) {
+                                       const ImageViewInfo& view, vk::ClearColorValue& clear_value) {
 	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return false;
 	}

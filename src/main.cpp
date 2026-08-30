@@ -71,6 +71,7 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --error-log-file <path>            File to write only errors (for debugging).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
@@ -141,6 +142,20 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
 
+	// Pre-scan for --error-log-file so early errors (e.g. bad --game) are
+	// captured even when the flag appears after --game on the command line.
+	for (int i = 1; i + 1 < argc; i++) {
+		if (std::string(argv[i]) == "--error-log-file") {
+			options.config.error_log_file = Common::FixFilenameSlash(argv[i + 1]);
+			// Truncate/create early so the first error can append
+			FILE* ef = std::fopen(options.config.error_log_file.string().c_str(), "w");
+			if (ef != nullptr) {
+				std::fclose(ef);
+			}
+			break;
+		}
+	}
+
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);
 		std::string value;
@@ -185,6 +200,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		if (arg == "--game") {
 			if (!options.app0_dir.empty()) {
 				::printf("--game can only be specified once\n");
+				if (!options.config.error_log_file.empty()) {
+					FILE* ef = std::fopen(options.config.error_log_file.string().c_str(), "a");
+					if (ef != nullptr) {
+						std::fprintf(ef, "--game can only be specified once\n");
+						std::fclose(ef);
+					}
+				}
 				return false;
 			}
 
@@ -200,6 +222,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				options.elf = "/app0/" + Common::FilenameWithoutDirectory(value);
 			} else {
 				::printf("--game must point to an existing directory or ELF: %s\n", value.c_str());
+				if (!options.config.error_log_file.empty()) {
+					FILE* ef = std::fopen(options.config.error_log_file.string().c_str(), "a");
+					if (ef != nullptr) {
+						std::fprintf(ef, "--game must point to an existing directory or ELF: %s\n",
+						             value.c_str());
+						std::fclose(ef);
+					}
+				}
 				return false;
 			}
 		} else if (arg == "--game-patch") {
@@ -304,6 +334,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--error-log-file") {
+			options.config.error_log_file = value;
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

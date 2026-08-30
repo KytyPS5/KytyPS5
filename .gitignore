@@ -6,3 +6,5 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+# Added by code-review-graph
+.code-review-graph/

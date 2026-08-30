@@ -521,9 +521,23 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
+#if defined(__APPLE__)
+	// On Apple/Metal the menu's compressed VideoOut (PPSA04220) can report
+	// is_linear=0 with metadata 0, which ClassifyVideoOutCompression treats
+	// as Unsupported and leads to a black window. Force it to uncompressed
+	// on Apple so the swapchain presents.
+	bool is_compressed = category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED;
+	if (is_compressed && buffer.metadata_address == 0) {
+		is_compressed = false;
+	}
+	const auto compression = Graphics::ClassifyVideoOutCompression(
+	    is_compressed, buffer.metadata_address, attribute.dcc_control,
+	    attribute.dcc_cb_register_clear_color);
+#else
 	const auto compression = Graphics::ClassifyVideoOutCompression(
 	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
 	    attribute.dcc_control, attribute.dcc_cb_register_clear_color);
+#endif
 	if (attribute.reserved0 != 0 || attribute.aspect_ratio != 0 || attribute.width == 0 ||
 	    attribute.height == 0 || attribute.width > 16384 || attribute.height > 16384 ||
 	    attribute.pitch_in_pixel != 0 ||

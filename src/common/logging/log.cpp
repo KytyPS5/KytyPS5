@@ -71,12 +71,17 @@ namespace Log {
 static bool                            g_initialized = false;
 static Direction                       g_direction   = Direction::Console;
 static std::filesystem::path           g_output_file;
+static std::filesystem::path           g_error_file;
 static std::mutex                      g_logger_mutex;
 static std::shared_ptr<spdlog::logger> g_logger;
+static std::shared_ptr<spdlog::logger> g_error_logger;
 
 void Flush() {
 	if (g_logger != nullptr) {
 		g_logger->flush();
+	}
+	if (g_error_logger != nullptr) {
+		g_error_logger->flush();
 	}
 }
 
@@ -84,6 +89,7 @@ static void SetupLogger() {
 	std::lock_guard lock(g_logger_mutex);
 	Flush();
 	g_logger.reset();
+	g_error_logger.reset();
 
 	switch (g_direction) {
 		case Direction::Silent:
@@ -97,6 +103,9 @@ static void SetupLogger() {
 				g_logger = MakeFileLogger("kyty", g_output_file);
 			}
 			break;
+	}
+	if (!g_error_file.empty()) {
+		g_error_logger = MakeFileLogger("kyty_error", g_error_file);
 	}
 }
 
@@ -136,6 +145,17 @@ void WriteFatal(std::string_view text) {
 		WriteStdout(text);
 		WriteImpl(text);
 	}
+	if (g_error_logger != nullptr) {
+		g_error_logger->log(spdlog::level::err, spdlog::string_view_t(text.data(), text.size()));
+		g_error_logger->flush();
+	} else if (!g_error_file.empty()) {
+		// Fallback: append directly if logger not yet set up (early errors)
+		FILE* f = std::fopen(Common::PathToString(g_error_file).c_str(), "a");
+		if (f != nullptr) {
+			std::fwrite(text.data(), 1, text.size(), f);
+			std::fclose(f);
+		}
+	}
 	Flush();
 }
 
@@ -145,6 +165,17 @@ void WriteFatal(fmt::text_style style, std::string_view text) {
 	} else {
 		WriteStdout(text, style);
 		WriteImpl(text, style);
+	}
+	if (g_error_logger != nullptr) {
+		// Strip ANSI color codes for file output
+		g_error_logger->log(spdlog::level::err, spdlog::string_view_t(text.data(), text.size()));
+		g_error_logger->flush();
+	} else if (!g_error_file.empty()) {
+		FILE* f = std::fopen(Common::PathToString(g_error_file).c_str(), "a");
+		if (f != nullptr) {
+			std::fwrite(text.data(), 1, text.size(), f);
+			std::fclose(f);
+		}
 	}
 	Flush();
 }
@@ -158,6 +189,14 @@ void Initialize() {
 	}
 	g_output_file =
 	    (g_direction == Direction::File ? Config::GetPrintfOutputFile() : std::filesystem::path {});
+	g_error_file = Config::GetErrorLogFile();
+	if (!g_error_file.empty()) {
+		// Truncate/create the error file at startup
+		FILE* f = std::fopen(Common::PathToString(g_error_file).c_str(), "w");
+		if (f != nullptr) {
+			std::fclose(f);
+		}
+	}
 	SetupLogger();
 }
 
@@ -165,6 +204,7 @@ void Shutdown() {
 	Flush();
 	std::lock_guard lock(g_logger_mutex);
 	g_logger.reset();
+	g_error_logger.reset();
 }
 
 Direction GetDirection() {

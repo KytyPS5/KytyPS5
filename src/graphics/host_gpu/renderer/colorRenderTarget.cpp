@@ -208,7 +208,10 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	     (rt.base.addr & (texture_tile_layout.block.block_size - 1u)) != 0 ||
 	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
 	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
-	     rt.info.dcc_compression_enable || rt.info.cmask_is_linear != 0 ||
+	     rt.info.dcc_compression_enable ||
+#if !defined(__APPLE__)
+	     rt.info.cmask_is_linear != 0 ||
+#endif
 	     rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode || rt.cmask.addr != 0 ||
 	     rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
 		EXIT("unsupported texture-tiled render target: addr=0x%016" PRIx64 " tile=%u"

@@ -77,68 +77,15 @@ bool Translator::PackedInteger16MinMax(const Decoder::Instruction& inst, IR::Val
 	return true;
 }
 
-IR::U1 Translator::U64MaskBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
-                                 bool negate_rhs, bool negate_result) {
-	const auto lhs = ReadMask(inst.src0);
-	auto       rhs = ReadMask(inst.src1);
-	if (negate_rhs) {
-		rhs = ir.LogicalNot(rhs);
-	}
-	auto result = IR::U1(ir.Emit(opcode, {lhs, rhs}));
-	return negate_result ? ir.LogicalNot(result) : result;
-}
-
 bool Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode logical_opcode,
                             IR::ValueOpcode bit_opcode, bool negate_rhs, bool negate_result,
                             bool unary) {
-	const auto invocation_result =
-	    unary ? ir.LogicalNot(ReadMask(inst.src0))
-	          : U64MaskBinary(inst, logical_opcode, negate_rhs, negate_result);
-	const auto is_exec_or_vcc = [](const Decoder::Operand& operand) {
-		switch (operand.kind) {
-			case Decoder::OperandKind::ExecLo:
-			case Decoder::OperandKind::ExecHi:
-			case Decoder::OperandKind::VccLo:
-			case Decoder::OperandKind::VccHi: return true;
-			default: return false;
-		}
-	};
-	if (is_exec_or_vcc(inst.dst) || is_exec_or_vcc(inst.src0) ||
-	    (inst.src_count > 1u && is_exec_or_vcc(inst.src1))) {
-		WriteMask64(inst.dst, invocation_result);
-		ir.SetScc(invocation_result);
-		return true;
-	}
-
-	const auto lhs        = ReadU32Pair(inst.src0);
-	auto       mask_valid = ReadMaskValid(inst.src0);
-	if (inst.src_count > 1u) {
-		mask_valid = ir.LogicalAnd(mask_valid, ReadMaskValid(inst.src1));
-	}
-	std::array<IR::U32, 2> result;
-	if (unary) {
-		result = {ir.BitwiseNot(lhs[0]), ir.BitwiseNot(lhs[1])};
-	} else {
-		const auto rhs = ReadU32Pair(inst.src1);
-		for (uint32_t component = 0; component < 2u; component++) {
-			auto value = ir.Emit(
-			    bit_opcode, {lhs[component], negate_rhs ? IR::Value(ir.BitwiseNot(rhs[component]))
-			                                            : IR::Value(rhs[component])});
-			result[component] = negate_result ? ir.BitwiseNot(IR::U32(value)) : IR::U32(value);
-		}
-	}
-	WriteU32Pair(inst.dst, result);
-	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
-		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
-		ir.SetThreadBitScalarReg(dst, invocation_result);
-		ir.SetScalarMaskTag(dst, mask_valid);
-		const auto raw_nonzero =
-		    ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u)));
-		ir.SetScc(IR::U1(
-		    ir.Emit(IR::ValueOpcode::SelectU1, {mask_valid, invocation_result, raw_nonzero})));
-	} else {
-		ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u))));
-	}
+	const auto lhs    = ReadScalarU64(inst.src0);
+	const auto result = unary ? NotScalarU64(lhs)
+	                          : BinaryScalarU64(lhs, ReadScalarU64(inst.src1), logical_opcode,
+	                                            bit_opcode, false, negate_rhs, negate_result);
+	WriteScalarU64(inst.dst, result);
+	ir.SetScc(ScalarU64NonZero(result));
 	return true;
 }
 

@@ -57,11 +57,14 @@ uint32_t ResourceIndexFromOperand(const Decoder::Operand& operand) {
 	}
 }
 
-uint32_t RawScalarLoadBase(const Decoder::Operand& operand) {
-	if (operand.kind == Decoder::OperandKind::Sgpr) {
-		return operand.reg;
+Decoder::Operand RawScalarLoadBase(const Decoder::Operand& operand) {
+	if (operand.kind != Decoder::OperandKind::M0) {
+		return operand;
 	}
-	return operand.kind == Decoder::OperandKind::VccLo ? 106u : 0u;
+	auto result = operand;
+	// The compressed SBASE value 62 decodes as code 124, but means NULL for S_LOAD.
+	result.kind = Decoder::OperandKind::Null;
+	return result;
 }
 
 ResourceKind FlatSegmentResourceKind(uint32_t segment) {
@@ -321,8 +324,9 @@ Translator::AddressOperands Translator::ReadAddressOperands(const Decoder::Instr
 	return {GetAddressResource(low, high), low, high};
 }
 
-IR::Value Translator::GetScalarAddressResource(uint32_t base) {
-	return GetAddressResource(ReadScalarCode(base), ReadScalarCode(base + 1u));
+IR::Value Translator::GetScalarAddressResource(const Decoder::Operand& base) {
+	const auto raw = ReadU32Pair(base);
+	return GetAddressResource(raw[0], raw[1]);
 }
 
 IR::Value Translator::GetImageResource(const IR::MemoryInfo& memory) {

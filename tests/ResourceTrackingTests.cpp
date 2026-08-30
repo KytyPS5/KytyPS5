@@ -1149,6 +1149,74 @@ void TestBufferSwizzleSpecialization() {
         "buffer swizzle change did not invalidate specialization");
 }
 
+void TestNarrowSrgbImageDecode() {
+  // VK_FORMAT_R8_SRGB and VK_FORMAT_R8G8_SRGB are optional and commonly missing, so narrow sRGB
+  // textures are stored as UNORM and the shader has to apply the transfer function itself.
+  const auto BuildSampler = [](Fixture &fixture) {
+    std::array<Value, 8> image_words;
+    for (uint32_t index = 0; index < image_words.size(); index++) {
+      image_words[index] = fixture.UserData(index);
+    }
+    const auto image_address = fixture.ImageAddress();
+    const auto image = fixture.Image(image_words, 4);
+    const auto sampler =
+        fixture.Sampler({Value(0u), Value(1u), Value(2u), Value(0u)}, 4);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, image_address},
+                 fixture.AddMemory(memory, 4));
+    fixture.PlanAndTrack();
+  };
+  const auto Descriptor = [](Libs::Graphics::Prospero::BufferFormat format) {
+    DescriptorValue descriptor{};
+    descriptor.dwords[0] = 0x1000u;
+    descriptor.dwords[1] = static_cast<uint32_t>(format) << 20u;
+    descriptor.dwords[2] = 3u | (3u << 14u);
+    descriptor.dwords[3] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+         << 28u);
+    descriptor.dword_count = 8;
+    return descriptor;
+  };
+
+  Fixture narrow;
+  BuildSampler(narrow);
+  ResourceSnapshot narrow_snapshot;
+  narrow_snapshot.images.assign(
+      narrow.program.info.images.size(),
+      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8_8Srgb));
+  std::string error;
+  Check(SpecializeResources(narrow.program, narrow_snapshot, &error) &&
+            narrow.program.info.images[0].srgb_decode &&
+            ValidateResourceSpecialization(narrow.program, narrow_snapshot,
+                                           &error),
+        "narrow sRGB image was not specialized to decode in the shader");
+
+  // The decode is baked into the shader, so a descriptor that swaps to a format the sampler
+  // decodes itself has to invalidate the specialization instead of reusing this code.
+  ResourceSnapshot swapped;
+  swapped.images.assign(
+      narrow.program.info.images.size(),
+      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8Srgb));
+  Check(!ValidateResourceSpecialization(narrow.program, swapped, &error),
+        "leaving a narrow sRGB format did not invalidate specialization");
+
+  // Four-channel sRGB maps to a real host sRGB format, so the sampler still applies the curve
+  // and the shader must not apply it a second time.
+  Fixture wide;
+  BuildSampler(wide);
+  ResourceSnapshot wide_snapshot;
+  wide_snapshot.images.assign(
+      wide.program.info.images.size(),
+      Descriptor(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8Srgb));
+  Check(SpecializeResources(wide.program, wide_snapshot, &error) &&
+            !wide.program.info.images[0].srgb_decode &&
+            ValidateResourceSpecialization(wide.program, wide_snapshot, &error),
+        "sampler-decoded sRGB image was given a redundant shader decode");
+}
+
 void TestShaderInfoAndBindingLayout() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
@@ -1383,6 +1451,7 @@ int main() {
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
+    Run("narrow sRGB image decode", TestNarrowSrgbImageDecode);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);

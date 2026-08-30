@@ -45,6 +45,9 @@ bool                       IsFmaskTextureFormat(BufferFormat format);
 bool                       IsSampledTextureFormat(BufferFormat format);
 bool                       IsUintTextureFormat(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
+// True for sRGB texture formats that have no dependable host equivalent, so the sRGB transfer
+// function has to be applied by the shader after sampling instead of by the sampler.
+bool                       TextureNeedsShaderSrgbDecode(BufferFormat format);
 
 } // namespace Libs::Graphics::Prospero
 

@@ -372,6 +372,48 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	return info;
 }
 
+// Narrow-channel sRGB textures are stored as UNORM because the matching host formats are
+// optional and commonly missing, so the sampler cannot apply the transfer function. Undo the
+// gamma here instead; guest shaders sample these expecting linear values.
+uint32_t DecodeImageSrgb(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel,
+                         bool gather) {
+	auto& state = ctx.state;
+	if (!state.program.info.images[mem.resource].srgb_decode) return texel;
+
+	const auto f32       = TypeF32(state);
+	const auto boolean   = TypeBool(state);
+	const auto threshold = ConstantF32Value(state, 0.04045F);
+	const auto inv_slope = ConstantF32Value(state, 1.0F / 12.92F);
+	const auto offset    = ConstantF32Value(state, 0.055F);
+	const auto inv_scale = ConstantF32Value(state, 1.0F / 1.055F);
+	const auto gamma     = ConstantF32Value(state, 2.4F);
+
+	// A gather returns one channel from four texels, so every component is colour there. A plain
+	// sample returns rgba, and alpha is always linear.
+	const auto decoded_components = gather ? 4u : 3u;
+	uint32_t   components[4] {};
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, f32, value, texel, component});
+		if (component >= decoded_components) {
+			components[component] = value;
+			continue;
+		}
+		const auto low = Binary(state, OpFMul, f32, value, inv_slope);
+		const auto biased =
+		    Binary(state, OpFMul, f32, Binary(state, OpFAdd, f32, value, offset), inv_scale);
+		const auto high = state.builder.AllocateId();
+		state.builder.AddFunction({OpExtInst, f32, high, GlslStd450(state), GlslPow, biased, gamma});
+		const auto use_low    = Binary(state, OpFOrdLessThanEqual, boolean, value, threshold);
+		components[component] = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, f32, components[component], use_low, low, high});
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 4), result, components[0],
+	                           components[1], components[2], components[3]});
+	return result;
+}
+
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
@@ -664,7 +706,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					return true;
 				}
 				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, pc, coord, integer);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), integer,
+				ctx.Define(inst, ResultVector(ctx, DecodeImageSrgb(ctx, mem, UnpackImageGather(ctx, mem, sample), true),
+			                              integer,
 				                              false, mem, true));
 				return true;
 			}
@@ -701,7 +744,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
 			}
 			state.builder.AddFunction(words);
-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+			ctx.Define(inst, ResultVector(ctx,
+			                              DecodeImageSrgb(ctx, mem,
+			                                              UnpackImageGather(ctx, mem, sample), true),
 			                              integer && !dref, false, mem, true));
 			return true;
 		}
@@ -753,7 +798,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
+			ctx.Define(inst, ResultVector(ctx,
+			                              dref ? sample
+			                                   : DecodeImageSrgb(
+			                                         ctx, mem, UnpackImageTexel(ctx, mem, sample), false),
 			                              integer, dref, mem));
 			return true;
 		}
@@ -846,7 +894,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
 		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
+		           ResultVector(ctx,
+		                        dref ? phi_words[2]
+		                             : DecodeImageSrgb(
+		                                   ctx, mem, UnpackImageTexel(ctx, mem, phi_words[2]), false),
 		                        integer, dref, mem));
 		return true;
 	}

@@ -146,6 +146,7 @@ struct ImageResource {
 	uint32_t                mip_count                 = 1;
 	Prospero::BufferFormat  conversion_format         = Prospero::BufferFormat::kInvalid;
 	uint32_t                shader_swizzle            = ShaderImageIdentitySwizzle;
+	bool                    srgb_decode               = false;
 	bool                    read                      = false;
 	bool                    written                   = false;
 	bool                    atomic                    = false;

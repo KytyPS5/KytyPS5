@@ -157,22 +157,16 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	    });
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
-	int32_t gpu_index = Config::GetGpuIndex();
-	if (gpu_index >= 0 && gpu_index >= static_cast<int32_t>(devices.size())) {
-		// Out-of-range index: explicit message + fallback to automatic selection.
-		LOGF(
-		    "Vulkan GPU index %d out of range (%zu devices), falling back to automatic selection\n",
-		    gpu_index, devices.size());
-		gpu_index = -1;
+	if (Config::GetGpuIndex() >= 0) {
+		devices = {devices[Config::GetGpuIndex()]};
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;
 	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
 	SurfaceCapabilities best_capabilities;
 
-	for (size_t device_index = 0; device_index < devices.size(); device_index++) {
-		const auto& device      = devices[device_index];
-		bool        skip_device = false;
+	for (const auto& device: devices) {
+		bool skip_device = false;
 
 		vk::PhysicalDeviceProperties device_properties {};
 		device.getProperties(&device_properties);
@@ -452,20 +446,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		if (skip_device) {
-			if (gpu_index >= 0 && static_cast<int32_t>(device_index) == gpu_index) {
-				// Device requested via --gpu but incompatible: automatic fallback.
-				LOGF("Vulkan GPU %d is incompatible, falling back to automatic selection\n",
-				     gpu_index);
-			}
 			continue;
-		}
-
-		if (gpu_index >= 0 && static_cast<int32_t>(device_index) == gpu_index) {
-			// Device explicitly requested via --gpu: direct selection.
-			best_device       = device;
-			best_queue_family = queue_family;
-			best_capabilities = std::move(candidate_capabilities);
-			break;
 		}
 
 		if (best_device == nullptr ||
@@ -480,9 +461,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
 		out_capabilities = std::move(best_capabilities);
-		vk::PhysicalDeviceProperties selected_properties {};
-		best_device.getProperties(&selected_properties);
-		LOGF("Vulkan selected device: %s\n", selected_properties.deviceName.data());
 	}
 }
 
@@ -521,7 +499,8 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	graphics.compute_subgroup_size_control_enabled =
 	    features13.subgroupSizeControl == VK_TRUE &&
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
-	    subgroup_size_control.minSubgroupSize <= 64 && subgroup_size_control.maxSubgroupSize >= 64;
+	    subgroup_size_control.minSubgroupSize <= 64 &&
+	    subgroup_size_control.maxSubgroupSize >= 64;
 	graphics.compute_wave64_supported =
 	    graphics.subgroup_size == 64u || graphics.compute_subgroup_size_control_enabled;
 
@@ -625,8 +604,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
-	features12.timelineSemaphore   = VK_TRUE;
-	features12.shaderOutputLayer   = VK_TRUE;
+	features12.timelineSemaphore = VK_TRUE;
+	features12.shaderOutputLayer = VK_TRUE;
 	features12.bufferDeviceAddress = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
@@ -647,7 +626,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.largePoints                          = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
-	device_features.shaderInt64                          = VK_TRUE;
+	device_features.shaderInt64 = VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -667,8 +646,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	const bool subgroup_size_control_enabled = graphics.compute_subgroup_size_control_enabled &&
-	                                           supported_features13.subgroupSizeControl == VK_TRUE;
+	const bool subgroup_size_control_enabled =
+	    graphics.compute_subgroup_size_control_enabled &&
+	    supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
 #if defined(__APPLE__)
@@ -963,9 +943,9 @@ void WindowContext::CreateVulkan() {
 	dbg_create_info.pUserData       = nullptr;
 
 	vk::InstanceCreateInfo inst_info {};
-	inst_info.sType = vk::StructureType::eInstanceCreateInfo;
-	inst_info.pNext = (r.enable_validation_layers ? &dbg_create_info : nullptr);
-	inst_info.flags = {};
+	inst_info.sType                   = vk::StructureType::eInstanceCreateInfo;
+	inst_info.pNext                   = (r.enable_validation_layers ? &dbg_create_info : nullptr);
+	inst_info.flags                   = {};
 #if defined(__APPLE__)
 	// MoltenVK requires VK_KHR_portability_enumeration + flag to surface
 	// portability devices. Without this, enumeratePhysicalDevices hides the

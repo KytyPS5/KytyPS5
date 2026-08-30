@@ -1,4 +1,4 @@
-// No-feature, non-0x840f00 AgcGetRegisterDefaults2 dispatch, versions 0..12.
+// No-feature, non-0x840f00 AgcGetRegisterDefaults2 dispatch, versions 0..13.
 // Type entries keep the pointer index in bits 0..9; higher bits are AGC flags.
 
 // g_agc_internal_reg_defaults_v0: regs=(1, 12, 0, 4), ptrs=(1, 12, 0, 2), types=15.
@@ -183,6 +183,45 @@ static CompactRegisterDefaults g_agc_internal_reg_defaults_v11 = {
     g_agc_internal_reg_defaults_v11_tbl2_regs, 1,  g_agc_internal_reg_defaults_v11_tbl2_ptrs, 1,
     g_agc_internal_reg_defaults_v11_tbl3_regs, 6,  g_agc_internal_reg_defaults_v11_tbl3_ptrs, 3,
     g_agc_internal_reg_defaults_v11_types,     24,
+};
+
+// Version 13 takes the version-11 fallback and selects the >=13 state-0 lookup bank.
+// Only two internal table-1 values differ in that bank.
+static auto g_agc_internal_reg_defaults_v13_tbl1_regs = [] {
+	constexpr auto                    count = sizeof(g_agc_internal_reg_defaults_v11_tbl1_regs) /
+	                                          sizeof(g_agc_internal_reg_defaults_v11_tbl1_regs[0]);
+	std::array<ShaderRegister, count> regs {};
+	std::copy_n(g_agc_internal_reg_defaults_v11_tbl1_regs, count, regs.begin());
+
+	for (auto& reg: regs) {
+		if (reg.offset == 0x0081) {
+			reg.value = 0x00000001;
+		} else if (reg.offset == 0x0101) {
+			reg.value = 0x00000003;
+		}
+	}
+	return regs;
+}();
+
+static CompactRegisterDefaults g_agc_internal_reg_defaults_v13 = {
+    g_agc_internal_reg_defaults_v11_tbl0_regs,
+    8,
+    g_agc_internal_reg_defaults_v11_tbl0_ptrs,
+    8,
+    g_agc_internal_reg_defaults_v13_tbl1_regs.data(),
+    12,
+    g_agc_internal_reg_defaults_v11_tbl1_ptrs,
+    12,
+    g_agc_internal_reg_defaults_v11_tbl2_regs,
+    1,
+    g_agc_internal_reg_defaults_v11_tbl2_ptrs,
+    1,
+    g_agc_internal_reg_defaults_v11_tbl3_regs,
+    6,
+    g_agc_internal_reg_defaults_v11_tbl3_ptrs,
+    3,
+    g_agc_internal_reg_defaults_v11_types,
+    24,
 };
 
 // g_agc_internal_reg_defaults_v4: regs=(2, 15, 0, 4), ptrs=(2, 15, 0, 2), types=19.
@@ -1366,8 +1405,28 @@ static uint32_t g_agc_public_reg_defaults_v11_types[] = {
     0x036ac8a6, 0x000c0452, 0x00000000,
 };
 
+template <std::size_t Size>
+static std::array<ShaderRegister, Size>
+make_v11_plus_public_tbl0(const ShaderRegister (&source)[Size]) {
+	std::array<ShaderRegister, Size> regs {};
+	std::copy_n(source, Size, regs.begin());
+
+	for (auto& reg: regs) {
+		if (reg.offset == 0x0201) {
+			reg.value |= 0x00010000;
+		}
+	}
+	return regs;
+}
+
+// The common setup helper forces this table-0 patch for every version >= 11.
+static auto g_agc_public_reg_defaults_v11_tbl0_effective =
+    make_v11_plus_public_tbl0(g_agc_public_reg_defaults_v11_tbl0_regs);
+static auto g_agc_public_reg_defaults_v12_tbl0_effective =
+    make_v11_plus_public_tbl0(g_agc_public_reg_defaults_v10_tbl0_regs);
+
 static CompactRegisterDefaults g_agc_public_reg_defaults_v11 = {
-    g_agc_public_reg_defaults_v11_tbl0_regs,
+    g_agc_public_reg_defaults_v11_tbl0_effective.data(),
     488,
     g_agc_public_reg_defaults_v11_tbl0_ptrs,
     84,
@@ -1385,6 +1444,27 @@ static CompactRegisterDefaults g_agc_public_reg_defaults_v11 = {
     0,
     g_agc_public_reg_defaults_v11_types,
     137,
+};
+
+static CompactRegisterDefaults g_agc_public_reg_defaults_v12 = {
+    g_agc_public_reg_defaults_v12_tbl0_effective.data(),
+    482,
+    g_agc_public_reg_defaults_v10_tbl0_ptrs,
+    79,
+    g_agc_public_reg_defaults_v10_tbl1_regs,
+    159,
+    g_agc_public_reg_defaults_v10_tbl1_ptrs,
+    29,
+    g_agc_public_reg_defaults_v10_tbl2_regs,
+    55,
+    g_agc_public_reg_defaults_v10_tbl2_ptrs,
+    20,
+    nullptr,
+    0,
+    nullptr,
+    0,
+    g_agc_public_reg_defaults_v10_types,
+    128,
 };
 
 // g_agc_public_reg_defaults_v4: regs=(488, 158, 43, 0), ptrs=(80, 28, 42, 0), types=150.
@@ -2825,7 +2905,8 @@ static CompactRegisterDefaults* g_agc_public_reg_defaults_by_version[] = {
     &g_agc_public_reg_defaults_v9,  // version 9
     &g_agc_public_reg_defaults_v10, // version 10
     &g_agc_public_reg_defaults_v11, // version 11
-    &g_agc_public_reg_defaults_v10, // version 12
+    &g_agc_public_reg_defaults_v12, // version 12
+    &g_agc_public_reg_defaults_v11, // version 13: v11 fallback with the >=13 state-0 bank
 };
 
 static CompactRegisterDefaults* g_agc_internal_reg_defaults_by_version[] = {
@@ -2842,4 +2923,5 @@ static CompactRegisterDefaults* g_agc_internal_reg_defaults_by_version[] = {
     &g_agc_internal_reg_defaults_v10, // version 10
     &g_agc_internal_reg_defaults_v11, // version 11
     &g_agc_internal_reg_defaults_v10, // version 12
+    &g_agc_internal_reg_defaults_v13, // version 13
 };

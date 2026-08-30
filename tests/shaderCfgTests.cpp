@@ -4231,6 +4231,67 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   }
 }
 
+void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d30d4f9u, 0x8606000du, // v_cmpx_class_f32 exec, v13, vcc_lo (SDWA)
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  std::string error;
+  Check(Decoder::DecodeInstruction(shader, 0u, decoded, &error),
+        error.c_str());
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_CLASS_F32 &&
+            decoded.opcode_id == 0x98u && decoded.word_count == 2u &&
+            decoded.raw_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src0.reg == 13u && decoded.src0.sdwa_sel == 6u &&
+            decoded.src1.kind == Decoder::OperandKind::VccLo &&
+            decoded.src1.sdwa_sel == 6u,
+        "decoder rejected captured SDWA V_CMPX_CLASS_F32 fields");
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderPixelInputInfo pixel{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Pixel;
+  translate_options.wave_size = 64u;
+  translate_options.pixel = &pixel;
+  Check(Decoder::DecodeProgram(shader, program, &error) &&
+            CFG::BuildGraph(program, graph, &error) &&
+            Frontend::TranslateProgram(program, graph, translate_options, ir,
+                                       &error),
+        error.c_str());
+  uint32_t class_compares = 0u;
+  uint32_t dynamic_exec_writes = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      class_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::FPCmpClass32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        dynamic_exec_writes++;
+      }
+    }
+  }
+  Check(class_compares == 1u && dynamic_exec_writes == 1u,
+        "captured V_CMPX_CLASS_F32 did not lower to class compare plus EXEC update");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  CompileResult result;
+  Check(TryRecompile(shader, options, result, &error), error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo"),
+        "captured SDWA V_CMPX_CLASS_F32 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   ShaderRecompiler::Decoder::Program decoded;
   ShaderRecompiler::Decoder::Instruction missing;
@@ -12476,6 +12537,7 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
+  TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestPsInputCountRegisterDecode();

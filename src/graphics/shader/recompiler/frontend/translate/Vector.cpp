@@ -271,7 +271,8 @@ bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error
 			return true;
 		case O::V_CMP_O_F32: EmitFloatOrderedCompare(inst, true); return true;
 		case O::V_CMP_U_F32: EmitFloatOrderedCompare(inst, false); return true;
-		case O::V_CMP_CLASS_F32: V_CMP_CLASS_F32(inst); return true;
+		case O::V_CMP_CLASS_F32: EmitFloatClassCompare(inst, false); return true;
+		case O::V_CMPX_CLASS_F32: EmitFloatClassCompare(inst, true); return true;
 
 		case O::V_CVT_F32_UBYTE0: V_CVT_F32_UBYTE(inst, 0); return true;
 		case O::V_CVT_F32_UBYTE1: V_CVT_F32_UBYTE(inst, 1); return true;

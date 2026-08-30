@@ -55,11 +55,11 @@ void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool 
 	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, false);
 }
 
-void Translator::V_CMP_CLASS_F32(const Decoder::Instruction& inst) {
+void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx) {
 	const auto value = ReadOperand(inst.src0, IR::Type::F32);
 	const auto mask  = ReadOperand(inst.src1, IR::Type::U32);
 	EmitCompareResult(inst, IR::U1(ir.Emit(IR::ValueOpcode::FPCmpClass32, {value, mask})), false,
-	                  false);
+	                  cmpx);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

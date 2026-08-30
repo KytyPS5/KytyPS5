@@ -351,6 +351,7 @@ enum class Opcode {
 	V_CMP_GE_I32,
 	V_CMP_T_I32,
 	V_CMP_CLASS_F32,
+	V_CMPX_CLASS_F32,
 	V_CMP_LT_I16,
 	V_CMP_EQ_I16,
 	V_CMP_LE_I16,

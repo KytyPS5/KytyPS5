@@ -11931,6 +11931,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_NEQ_F32:
   case Opcode::V_CMPX_NLT_F32:
   case Opcode::V_CMP_CLASS_F32:
+  case Opcode::V_CMPX_CLASS_F32:
   case Opcode::V_CMP_LT_F16:
   case Opcode::V_CMP_EQ_F16:
   case Opcode::V_CMP_LE_F16:
@@ -15783,6 +15784,38 @@ TestCase VectorCompareClassF32() {
           expected,
           {O::V_MOV_B32, O::V_CMP_CLASS_F32, O::V_CNDMASK_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorVopcSdwaCmpxClassF32CapturedExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 13, 0x7fc00000u); // Quiet NaN.
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovU32(&code, 31, 0);
+  code.push_back(EncodeSMovB32(106, InlineU32(2))); // qNaN class mask.
+  code.insert(code.end(), {0x7d30d4f9u, 0x8606000du});
+  AppendBufferStoreDword(&code, 3, 31);
+
+  code.push_back(EncodeSMovB32(126, InlineU32(1))); // Restore lane-zero EXEC.
+  AppendVMovLiteral(&code, 13, 0x3f800000u);        // Positive normal.
+  AppendVMovU32(&code, 3, 9);
+  AppendVMovU32(&code, 31, 4);
+  code.push_back(EncodeSMovB32(106, InlineU32(2))); // qNaN class mask.
+  code.insert(code.end(), {0x7d30d4f9u, 0x8606000du});
+  AppendBufferStoreDword(&code, 3, 31);
+  AppendEnd(&code);
+
+  TestCase test{
+      "VectorVopcSdwaCmpxClassF32CapturedExecMask",
+      code,
+      {0x11111111u, 0x22222222u},
+      {7u, 0x22222222u},
+      {O::S_MOV_B32, O::V_MOV_B32, O::V_CMPX_CLASS_F32,
+       O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {
+      {"V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo", 2}};
+  return test;
 }
 
 TestCase VectorCompareF16Ops() {
@@ -20812,6 +20845,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpxNeU64CapturedExecMask);
   AddCase(VectorVop3CmpxNeI64CapturedExecMask);
   AddCase(VectorCompareClassF32);
+  AddCase(VectorVopcSdwaCmpxClassF32CapturedExecMask);
   AddCase(VectorCompareF16Ops);
   AddCase(Vop2SdwaCndmaskSourceModifier);
   AddCase(Vop2SdwaCndmaskCapturedByte3Source);

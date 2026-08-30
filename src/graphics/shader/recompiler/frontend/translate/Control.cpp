@@ -229,7 +229,18 @@ void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modi
 
 void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 	if (IsExecOrVcc(inst.dst) || IsExecOrVcc(inst.src0)) {
-		WriteMask64(inst.dst, ReadMask(inst.src0));
+		// EXEC and VCC are aliases for ordinary scalar register pairs.  Keep the raw
+		// bits when either alias is used as data; reducing the source to a lane mask
+		// corrupts shaders which temporarily store numeric constants in VCC.
+		const auto source_mask = ReadMask(inst.src0);
+		WriteU32Pair(inst.dst, ReadU32Pair(inst.src0));
+		if (inst.dst.kind == Decoder::OperandKind::ExecLo ||
+		    inst.dst.kind == Decoder::OperandKind::ExecHi) {
+			ir.SetExec(source_mask);
+		} else if (inst.dst.kind == Decoder::OperandKind::VccLo ||
+		           inst.dst.kind == Decoder::OperandKind::VccHi) {
+			ir.SetVcc(source_mask);
+		}
 		return;
 	}
 	const bool scalar_copy =

@@ -204,6 +204,8 @@ uint32_t KYTY_SYSV_ABI  AgcAcbAcquireMemGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbCondExecGetSize();
+uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
+                                   const uint32_t* target, uint32_t size_in_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbJumpGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,

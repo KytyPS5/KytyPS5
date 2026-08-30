@@ -3241,6 +3241,27 @@ uint32_t KYTY_SYSV_ABI AgcAcbCondExecGetSize() {
 	return AgcDcbCondExecGetSize();
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
+                                   const uint32_t* target, uint32_t size_in_dwords) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(4);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	auto target_address = reinterpret_cast<uint64_t>(target);
+	cmd[0]              = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0u);
+	cmd[1]              = static_cast<uint32_t>(target_address) & ~0x3u;
+	cmd[2]              = static_cast<uint32_t>(target_address >> 32u);
+	cmd[3] = 0x0f900000u | ((static_cast<uint32_t>(cache_policy) & 0x3u) << 28u) |
+	         (size_in_dwords & 0xfffffu);
+
+	return cmd;
+}
+
 uint32_t KYTY_SYSV_ABI AgcAcbJumpGetSize() {
 	return 0x10u;
 }

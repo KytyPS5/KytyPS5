@@ -1836,6 +1836,15 @@ uint64_t KYTY_SYSV_ABI KernelGetGPI() {
 	return bits;
 }
 
+int KYTY_SYSV_ABI KernelGetOperationMode(int* mode) {
+	PRINT_NAME();
+	if (mode == nullptr) {
+		return -1;
+	}
+	*mode = 1; // SCE_KERNEL_OPERATION_MODE_GAME
+	return 0;
+}
+
 } // namespace LibKernel
 
 namespace LibKernelWriteThrottling {
@@ -3333,6 +3342,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("bnZxYgAFeA0", LibKernel::KernelGetSanitizerNewReplaceExternal);
 	LIB_FUNC("ca7v6Cxulzs", LibKernel::KernelSetGPO);
 	LIB_FUNC("4oXYe9Xmk0Q", LibKernel::KernelGetGPI);
+	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode); // SpongeBob PPSA26893
 	LIB_FUNC("DRuBt2pvICk", LibKernel::read);
 	LIB_FUNC("AqBioC2vF3I", LibKernel::read);
 	LIB_FUNC("f7KBOafysXo", LibKernel::KernelGetModuleInfoFromAddr);

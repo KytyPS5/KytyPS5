@@ -141,7 +141,7 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 }
 
 static bool ParseGpuIndex(const std::string& value, int32_t& out) {
-	int32_t index = 0;
+	int32_t index     = 0;
 	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), index);
 	if (error != std::errc {} || end != value.data() + value.size() || index < 0) {
 		return false;
@@ -248,10 +248,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu") {
 			if (!ParseGpuIndex(value, options.config.gpu_index)) {
-				// Index invalide : message clair + repli sur la sélection automatique.
-				::printf("invalid GPU index: %s, falling back to automatic selection\n",
-				         value.c_str());
-				options.config.gpu_index = -1;
+				::printf("invalid GPU index: %s\n", value.c_str());
+				return false;
 			}
 		} else if (arg == "--vblank-frequency") {
 			const int32_t vblank_frequency = Common::ToInt32(value);

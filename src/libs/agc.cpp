@@ -257,12 +257,11 @@ struct CommandBuffer {
 	}
 
 	[[nodiscard]] KYTY_SYSV_ABI uint32_t GetAvailableSizeDW() const {
-		auto* end = cursor_down != nullptr ? cursor_down : top;
-		if (cursor_up == nullptr || end == nullptr || end <= cursor_up) {
+		if (cursor_up == nullptr || cursor_down == nullptr || cursor_down <= cursor_up) {
 			return 0;
 		}
 
-		auto available = static_cast<uint64_t>(end - cursor_up);
+		auto available = static_cast<uint64_t>(cursor_down - cursor_up);
 		if (available <= reserved_dw) {
 			return 0;
 		}

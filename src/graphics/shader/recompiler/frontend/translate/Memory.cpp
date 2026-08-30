@@ -37,6 +37,7 @@ Decoder::Operand OffsetDecodedRegister(const Decoder::Operand& operand, uint32_t
 	result.dpp_ctrl           = 0;
 	result.dpp_row_mask       = 0xf;
 	result.dpp_bank_mask      = 0xf;
+	result.explicit_sdwa_dst  = false;
 	result.dpp_fetch_inactive = false;
 	result.dpp_bound_ctrl     = false;
 	result.dpp                = false;

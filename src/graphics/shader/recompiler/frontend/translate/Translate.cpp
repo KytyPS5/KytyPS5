@@ -104,6 +104,7 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	result.dpp_ctrl           = 0;
 	result.dpp_row_mask       = 0xf;
 	result.dpp_bank_mask      = 0xf;
+	result.explicit_sdwa_dst  = false;
 	result.dpp_fetch_inactive = false;
 	result.dpp_bound_ctrl     = false;
 	result.dpp                = false;
@@ -392,12 +393,13 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		}
 	}
 	if (type == IR::Type::U16) {
-		WriteRawU32(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {IR::U16(value)})));
+		Write16Bits(operand,
+		            IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {IR::U16(value)})));
 		return;
 	}
 	if (type == IR::Type::F16) {
 		const auto bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {value}));
-		WriteRawU32(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
+		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
 	}
 	if (type == IR::Type::U64) {
@@ -417,38 +419,32 @@ IR::U32 Translator::PackHalf2x16(IR::F32 low, IR::F32 high) {
 	return IR::U32(ir.Emit(IR::ValueOpcode::PackHalf2x16, {pair}));
 }
 
+void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
+	auto destination = operand;
+	// Native GFX10 16-bit results preserve the unselected half. Plain/DPP destinations use the
+	// low half; native VOP3 may already select either half. Explicit SDWA retains encoded DST_U.
+	if (!destination.explicit_sdwa_dst) {
+		if (destination.sdwa_sel == 6u) {
+			destination.sdwa_sel = 4u;
+		}
+		destination.sdwa_dst_unused = 2u;
+	}
+	destination.omod   = 0u;
+	destination.op_sel = false;
+	destination.clamp  = false;
+	WriteRawU32(destination, ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu))));
+}
+
 void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
 	value           = ApplyF32ResultModifiers(operand, value);
 	const auto half = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
 	const auto bits = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,
 	                                  {IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}))}));
-	auto       merged = bits;
-	if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		merged = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
-		                         {ReadRawU32(PlainOperand(operand)), bits,
-		                          IR::Value(operand.sdwa_sel == 5u ? 16u : 0u), IR::Value(16u)}));
-	}
-	auto raw     = operand;
-	raw.sdwa_sel = 6u;
-	raw.omod     = 0u;
-	raw.op_sel   = false;
-	raw.clamp    = false;
-	WriteRawU32(raw, merged);
+	Write16Bits(operand, bits);
 }
 
 void Translator::WriteU16(const Decoder::Operand& operand, IR::U32 value) {
-	auto merged = ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
-	if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		merged = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
-		                         {ReadRawU32(PlainOperand(operand)), merged,
-		                          IR::Value(operand.sdwa_sel == 5u ? 16u : 0u), IR::Value(16u)}));
-	}
-	auto raw     = operand;
-	raw.sdwa_sel = 6u;
-	raw.omod     = 0u;
-	raw.op_sel   = false;
-	raw.clamp    = false;
-	WriteRawU32(raw, merged);
+	Write16Bits(operand, value);
 }
 
 IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {

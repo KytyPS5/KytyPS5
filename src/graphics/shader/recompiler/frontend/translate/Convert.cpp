@@ -141,8 +141,10 @@ void Translator::V_CVT_OFF_F32_I4(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_CVT_PKRTZ_F16_F32(const Decoder::Instruction& inst) {
-	const auto lhs = ReadOperand(SourceAt(inst, 0), IR::Type::F32);
-	const auto rhs = ReadOperand(SourceAt(inst, 1), IR::Type::F32);
+	const auto lhs = ApplyF32ResultModifiers(
+	    inst.dst, IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32)));
+	const auto rhs = ApplyF32ResultModifiers(
+	    inst.dst, IR::F32(ReadOperand(SourceAt(inst, 1), IR::Type::F32)));
 	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::PackFloat2x16Rtz, {lhs, rhs}));
 }
 

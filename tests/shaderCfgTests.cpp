@@ -3169,16 +3169,16 @@ void TestNewShaderRecompilerStagedShaderOps() {
         "new decoder did not decode RDNA2 S_SUBB_U32");
   Check(Common::ContainsStr(result.decoded_dump, "s_bitset0_b32 s3, s1"),
         "new decoder did not decode RDNA2 S_BITSET0_B32");
-  Check(Common::ContainsStr(result.decoded_dump, "v_fmac_f16 v70.sdwa(sel=4"),
+  Check(Common::ContainsStr(result.decoded_dump, "v_fmac_f16 v70, v5, v6"),
         "new decoder did not decode RDNA2 V_FMAC_F16");
   Check(
       Common::ContainsStr(
           result.decoded_dump,
-          "v_fmamk_f16 v71.sdwa(sel=4,sext=0), v7, 0x3c003c00, v8"),
+          "v_fmamk_f16 v71, v7, 0x3c003c00, v8"),
       "new decoder did not consume V_FMAMK_F16 literal as the multiply source");
   Check(Common::ContainsStr(
             result.decoded_dump,
-            "v_fmaak_f16 v72.sdwa(sel=4,sext=0), v9, v10, 0x40004000"),
+            "v_fmaak_f16 v72, v9, v10, 0x40004000"),
         "new decoder did not consume V_FMAAK_F16 literal as the add source");
   Check(Common::ContainsStr(result.ir_dump,
                             "ScalarSubBorrowCarryU32 s2, s0, s1, scc"),
@@ -3189,15 +3189,15 @@ void TestNewShaderRecompilerStagedShaderOps() {
   Check(
       Common::ContainsStr(
           result.ir_dump,
-          "FmaF16 v70.sdwa(sel=4,sext=0), v5, v6, v70.sdwa(sel=4,sext=0)"),
+          "FmaF16 v70, v5, v6, v70"),
       "V_FMAC_F16 did not lower using the destination as the FMA accumulator");
   Check(
       Common::ContainsStr(result.ir_dump,
-                          "FmaF16 v71.sdwa(sel=4,sext=0), v7, 0x3c003c00, v8"),
+                          "FmaF16 v71, v7, 0x3c003c00, v8"),
       "V_FMAMK_F16 did not lower with the literal in source 1");
   Check(
       Common::ContainsStr(result.ir_dump,
-                          "FmaF16 v72.sdwa(sel=4,sext=0), v9, v10, 0x40004000"),
+                          "FmaF16 v72, v9, v10, 0x40004000"),
       "V_FMAAK_F16 did not lower with the literal in source 2");
   Check(SpirvContainsOpcode(result.spirv, 130),
         "SPIR-V binary does not contain OpISub for S_SUBB_U32");

@@ -14250,6 +14250,53 @@ TestCase VectorLaneAndPackedOps() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop2PkFmacF16AccumulatesPackedHalvesIndependently() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x50004c00u); // low=16.0h, high=32.0h
+  AppendVMovLiteral(&code, 1, 0x42003c00u); // low=1.0h, high=3.0h
+  AppendVMovLiteral(&code, 2, 0x48004400u); // low=4.0h, high=8.0h
+
+  code.push_back(EncodeVop2(0x3c, 0, Vgpr(1), 2));
+  AppendStoreVgpr(&code, 0, 0);
+  code.push_back(EncodeVop2(0x3c, 0, Vgpr(1), 2));
+  AppendStoreVgpr(&code, 0, 1);
+
+  AppendVMovLiteral(&code, 3, 0x50004c00u);
+  code.push_back(EncodeVop2(0x3c, 3, 242, 2)); // Inline 1.0h is {1.0h, 0.0h}.
+  AppendStoreVgpr(&code, 3, 2);
+  AppendEnd(&code);
+
+  return {"Vop2PkFmacF16AccumulatesPackedHalvesIndependently",
+          code,
+          {},
+          {0x53004d00u, 0x55004e00u, 0x50004d00u},
+          {O::V_MOV_B32, O::V_PK_FMAC_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
+TestCase Vop2PkFmacF16DppNegatesBothPackedHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x50004c00u); // low=16.0h, high=32.0h
+  AppendVMovLiteral(&code, 1, 0x42003c00u); // low=1.0h, high=3.0h
+  AppendVMovLiteral(&code, 2, 0x48004400u); // low=4.0h, high=8.0h
+
+  code.push_back(EncodeVop2(0x3c, 0, 250, 2));
+  code.push_back(EncodeVop2Dpp(1, 0, 0xf, 0xf, 1));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  return {"Vop2PkFmacF16DppNegatesBothPackedHalves",
+          code,
+          {},
+          {0x48004a00u},
+          {O::V_MOV_B32, O::V_PK_FMAC_F16, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
 TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
   using O = ShaderOpcode;
 
@@ -20800,6 +20847,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
   AddCase(VectorLaneAndPackedOps);
+  AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
+  AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);

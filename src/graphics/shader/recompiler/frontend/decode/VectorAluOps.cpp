@@ -1059,6 +1059,13 @@ bool FinalizeVop2Instruction(uint32_t pc, std::span<const uint32_t> code, uint32
 			inst.src2.kind = OperandKind::VccLo;
 			inst.src_count = 3;
 			break;
+		case Opcode::V_PK_FMAC_F16:
+			// VOP2 has no OP_SEL fields, so the high operation implicitly reads high halves.
+			inst.src0.op_sel_hi = true;
+			inst.src1.op_sel_hi = true;
+			inst.dst.op_sel_hi  = true;
+			inst.src_count      = 2;
+			break;
 		default: inst.src_count = 2; break;
 	}
 	ReadLiteralOperands(code, word_index, inst);
@@ -1107,12 +1114,17 @@ bool DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
 		return false;
 	}
-	ApplyDefaultVop2F16Destination(inst);
 	ApplyDppModifier(inst.src0, modifier);
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
+	ApplyDefaultVop2F16Destination(inst);
+	const bool packed_fmac = inst.opcode == Opcode::V_PK_FMAC_F16;
+	if (packed_fmac) {
+		inst.src0.negate_hi = inst.src0.negate;
+		inst.src1.negate_hi = inst.src1.negate;
+	}
 
-	if (!IsVop2FloatSourceOpcode(inst.opcode) &&
+	if (!IsVop2FloatSourceOpcode(inst.opcode) && !packed_fmac &&
 	    (inst.src0.negate || inst.src0.absolute || inst.src1.negate || inst.src1.absolute)) {
 		SetUnsupported(inst, Family::VOP2, opcode,
 		               "VOP2 DPP integer source modifiers are not supported");

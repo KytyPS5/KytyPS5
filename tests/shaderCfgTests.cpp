@@ -4203,6 +4203,17 @@ void TestNewShaderDecoderArchitecture() {
               packed_inst.src2.op_sel_hi == (source == 2u),
           "VOP3P OPSEL_HI source bit mapping is incorrect");
   }
+
+  const uint32_t packed_fmac_dpp[] = {0x780402fau, 0xff500000u};
+  Instruction packed_fmac;
+  Check(DecodeInstruction(packed_fmac_dpp, 0u, packed_fmac, &error),
+        error.c_str());
+  Check(packed_fmac.opcode == Opcode::V_PK_FMAC_F16 &&
+            packed_fmac.src0.dpp && packed_fmac.src0.op_sel_hi &&
+            packed_fmac.src1.op_sel_hi && packed_fmac.dst.op_sel_hi &&
+            packed_fmac.src0.negate && packed_fmac.src0.negate_hi &&
+            packed_fmac.src1.negate && packed_fmac.src1.negate_hi,
+        "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {

@@ -3440,6 +3440,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
 	return cmd;
 }
 
+uint64_t KYTY_SYSV_ABI AgcDcbCopyDataGetSize() {
+	PRINT_NAME();
+
+	return 6 * sizeof(uint32_t);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,
                                       uint8_t dst_cache_policy, uint64_t dst_address_or_offset,
                                       uint8_t src, uint8_t src_cache_policy,

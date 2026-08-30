@@ -233,6 +233,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
                                        uint8_t write_confirm);
+uint64_t KYTY_SYSV_ABI  AgcDcbCopyDataGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,
                                       uint8_t dst_cache_policy, uint64_t dst_address_or_offset,
                                       uint8_t src, uint8_t src_cache_policy,

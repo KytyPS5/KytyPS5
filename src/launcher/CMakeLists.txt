@@ -146,20 +146,41 @@ elseif(LINUX)
 	if(kyty_qt_plugins_dir)
 		message(STATUS "Qt plugins for launcher deployment: ${kyty_qt_plugins_dir}")
 		set(kyty_qt_plugin_files "")
-		foreach(kyty_qt_plugin platforms tls imageformats xcbglintegrations wayland-shell-integration)
+		foreach(kyty_qt_plugin platforms tls iconengines imageformats xcbglintegrations wayland-shell-integration)
 			if(IS_DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}")
-				file(GLOB kyty_qt_plugin_group
-					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so"
-					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so.*")
-				list(APPEND kyty_qt_plugin_files ${kyty_qt_plugin_group})
-				install(DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}" DESTINATION "plugins")
+				# Distribution plugin directories can also contain unrelated third-party
+				# modules (for example KDE image format plugins on Arch Linux). Deploy
+				# Qt-owned modules only, so an optional system plugin cannot make the
+				# portable install fail because one of its own dependencies is absent.
+				file(GLOB kyty_qt_plugin_group LIST_DIRECTORIES FALSE
+					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libq*.so"
+					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libq*.so.*")
+				if(kyty_qt_plugin STREQUAL "wayland-shell-integration")
+					# Qt's Wayland shell modules predate its libq* plugin naming convention.
+					file(GLOB kyty_qt_wayland_shell_plugins LIST_DIRECTORIES FALSE
+						"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libfullscreen-shell-v1.so*"
+						"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libivi-shell.so*"
+						"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libqt-shell.so*"
+						"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libwl-shell-plugin.so*"
+						"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/libxdg-shell.so*")
+					list(APPEND kyty_qt_plugin_group ${kyty_qt_wayland_shell_plugins})
+				endif()
+				if(kyty_qt_plugin_group)
+					list(REMOVE_DUPLICATES kyty_qt_plugin_group)
+					list(APPEND kyty_qt_plugin_files ${kyty_qt_plugin_group})
+					install(FILES ${kyty_qt_plugin_group}
+						DESTINATION "plugins/${kyty_qt_plugin}")
+				endif()
 			endif()
 		endforeach()
 		install(CODE "
+			if(POLICY CMP0207)
+				cmake_policy(SET CMP0207 NEW)
+			endif()
 			set(kyty_plugin_files \"${kyty_qt_plugin_files}\")
 			file(GET_RUNTIME_DEPENDENCIES
 				EXECUTABLES \"${CMAKE_CURRENT_BINARY_DIR}/${launcher_name}\"
-				LIBRARIES \${kyty_plugin_files}
+				MODULES \${kyty_plugin_files}
 				RESOLVED_DEPENDENCIES_VAR kyty_resolved
 				POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
 				POST_EXCLUDE_REGEXES \".*\")

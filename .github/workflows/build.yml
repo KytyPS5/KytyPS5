@@ -403,6 +403,136 @@ jobs:
           path: _Build/linux/install/**
           if-no-files-found: error
 
+  arch_linux:
+    name: Build KytyPS5 (Arch Linux)
+    needs: metadata
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          pacman -Syu --noconfirm --needed \
+            alsa-lib \
+            bzip2 \
+            clang \
+            cmake \
+            dbus \
+            git \
+            glslang \
+            libpulse \
+            libx11 \
+            libxcursor \
+            libxext \
+            libxfixes \
+            libxi \
+            libxkbcommon \
+            libxrandr \
+            libxss \
+            lld \
+            mesa \
+            ninja \
+            qt6-base \
+            qt6-svg \
+            systemd-libs \
+            vulkan-icd-loader \
+            wayland \
+            wayland-protocols \
+            xz \
+            zlib
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          git --version
+          cmake --version
+          ninja --version
+          clang++ --version
+          ld.lld --version
+          glslangValidator --version
+          qmake6 -query QT_VERSION QT_INSTALL_PREFIX
+
+      - name: Configure
+        shell: bash
+        run: |
+          mkdir -p _Build
+          cmake -S . -B _Build/arch \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
+            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ 2>&1 | tee _Build/configure.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Verify SDL2 backends
+        shell: bash
+        run: |
+          status=0
+          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
+            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
+              echo "ok   ${feature}"
+            else
+              echo "FAIL ${feature} is not enabled"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build _Build/arch \
+            --target launcher page_manager_tests memory_tracker_tests \
+              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --parallel
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir _Build/arch --output-on-failure \
+            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+
+      - name: Install
+        shell: bash
+        run: cmake --install _Build/arch --prefix _Build/arch/install
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          file _Build/arch/install/launcher
+          file _Build/arch/install/kyty_emulator
+          file _Build/arch/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
+          for binary in launcher kyty_emulator; do
+            ldd_output="$(ldd "_Build/arch/install/$binary")"
+            if grep -q "not found" <<< "$ldd_output"; then
+              echo "$binary has unresolved runtime dependencies"
+              printf '%s\n' "$ldd_output"
+              exit 1
+            fi
+          done
+          readelf -d _Build/arch/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          while IFS= read -r -d '' binary; do
+            while read -r dependency; do
+              test -e "_Build/arch/install/lib/$dependency"
+            done < <(
+              readelf -d "$binary" |
+                sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
+            )
+          done < <(
+            find _Build/arch/install/launcher _Build/arch/install/plugins \
+              -type f \( -name launcher -o -name '*.so' \) -print0
+          )
+          _Build/arch/install/kyty_emulator --help > /dev/null
+
   release:
     name: Release KytyPS5
     if: >-

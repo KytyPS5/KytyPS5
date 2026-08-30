@@ -3252,6 +3252,12 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	                        poll_cycles);
 }
 
+uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
+	PRINT_NAME();
+
+	return AgcDcbWaitOnAddressGetSize(size);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,
@@ -3321,6 +3327,12 @@ uint32_t* KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
 	cmd[5] = static_cast<uint32_t>((dst_address >> 32u) & 0xffffffffu);
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
+	PRINT_NAME();
+
+	return AgcDcbCopyDataGetSize();
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,

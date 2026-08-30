@@ -467,7 +467,9 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			descriptor.dwords.fill(0);
 		}
 	}
-	next.flattened_srt.assign(flattened_srt.begin(), flattened_srt.end());
+	// Swapped, not moved or copied: `next` takes the data and `flattened_srt` gets a buffer back
+	// to fill on the next call, so neither side has to allocate.
+	next.flattened_srt.swap(flattened_srt);
 	next.flattened_srt.resize(FlattenedRuntimeDwords(program));
 	next.images.resize(program.info.images.size());
 	thread_local std::vector<uint8_t> image_written;
@@ -548,7 +550,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	if (!ValidateResourceSnapshot(program, next)) {
 		return false;
 	}
-	snapshot = std::move(next);
+	snapshot.Swap(next);
 	return true;
 }
 

@@ -800,6 +800,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
+		// A MAP_FIXED replacement leaves the range unbacked until the new view lands.
+		if (Libs::LibKernel::Memory::WaitForFixedRemap(info->access_violation_vaddr)) {
+			return true;
+		}
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -818,6 +819,51 @@ static void                               MemoryPoolSubtractCommitted(uint64_t l
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+struct FixedRemapWindow {
+	std::atomic<uint64_t> start {0};
+	std::atomic<uint64_t> end {0};
+};
+static std::array<FixedRemapWindow, 8> g_fixed_remap_windows;
+
+class FixedRemapGuard {
+public:
+	FixedRemapGuard() = default;
+	~FixedRemapGuard() {
+		if (m_window != nullptr) {
+			m_window->start.store(0, std::memory_order_release);
+			m_window->end.store(0, std::memory_order_relaxed);
+		}
+	}
+	KYTY_CLASS_NO_COPY(FixedRemapGuard);
+
+	void Arm(uint64_t start, uint64_t size) {
+		if (m_window != nullptr || start == 0 || size == 0) {
+			return;
+		}
+		for (auto& window: g_fixed_remap_windows) {
+			if (window.start.load(std::memory_order_relaxed) == 0) {
+				window.end.store(start + size, std::memory_order_relaxed);
+				window.start.store(start, std::memory_order_release);
+				m_window = &window;
+				return;
+			}
+		}
+	}
+
+private:
+	FixedRemapWindow* m_window = nullptr;
+};
+
+static bool IsInFixedRemapWindow(uint64_t vaddr) noexcept {
+	for (const auto& window: g_fixed_remap_windows) {
+		const auto start = window.start.load(std::memory_order_acquire);
+		if (start != 0 && vaddr >= start && vaddr < window.end.load(std::memory_order_relaxed)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
@@ -917,6 +963,20 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+}
+
+bool WaitForFixedRemap(uint64_t fault_vaddr) noexcept {
+	constexpr uint32_t MAX_ATTEMPTS = 200000;
+	if (!IsInFixedRemapWindow(fault_vaddr)) {
+		return false;
+	}
+	for (uint32_t attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+		if (!IsInFixedRemapWindow(fault_vaddr)) {
+			return true;
+		}
+		std::this_thread::yield();
+	}
+	return false;
 }
 
 struct PrtAperture {
@@ -2966,6 +3026,10 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 				consumed_reservation = true;
 				map_consumed_reserved_fixed();
 			}
+		}
+		FixedRemapGuard remap_guard;
+		if (!consumed_reservation) {
+			remap_guard.Arm(in_addr, len);
 		}
 		if (!consumed_reservation && ReplaceFixedRangeWithReserved(in_addr, len) &&
 		    g_virtual_ranges->ConsumeReservedSpan(in_addr, len, &consumed_range)) {

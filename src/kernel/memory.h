@@ -116,6 +116,7 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+[[nodiscard]] bool     WaitForFixedRemap(uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

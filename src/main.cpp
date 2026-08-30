@@ -52,6 +52,8 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Fifo.\n");
+	::printf(
+	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -135,6 +137,16 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 		return false;
 	}
 	out = user_id;
+	return true;
+}
+
+static bool ParseGpuIndex(const std::string& value, int32_t& out) {
+	int32_t index = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), index);
+	if (error != std::errc {} || end != value.data() + value.size() || index < 0) {
+		return false;
+	}
+	out = index;
 	return true;
 }
 
@@ -233,6 +245,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
+			}
+		} else if (arg == "--gpu") {
+			if (!ParseGpuIndex(value, options.config.gpu_index)) {
+				// Index invalide : message clair + repli sur la sélection automatique.
+				::printf("invalid GPU index: %s, falling back to automatic selection\n",
+				         value.c_str());
+				options.config.gpu_index = -1;
 			}
 		} else if (arg == "--vblank-frequency") {
 			const int32_t vblank_frequency = Common::ToInt32(value);

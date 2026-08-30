@@ -47,6 +47,10 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
+int32_t GetGpuIndex() {
+	return g_config->gpu_index;
+}
+
 bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }

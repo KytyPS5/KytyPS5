@@ -157,11 +157,20 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	    });
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
+	int32_t gpu_index = Config::GetGpuIndex();
+	if (gpu_index >= 0 && gpu_index >= static_cast<int32_t>(devices.size())) {
+		// Index hors plage : message explicite + repli sur la sélection automatique.
+		LOGF("Vulkan GPU index %d out of range (%zu devices), falling back to automatic selection\n",
+		     gpu_index, devices.size());
+		gpu_index = -1;
+	}
+
 	vk::PhysicalDevice  best_device       = nullptr;
 	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
 	SurfaceCapabilities best_capabilities;
 
-	for (const auto& device: devices) {
+	for (size_t device_index = 0; device_index < devices.size(); device_index++) {
+		const auto& device = devices[device_index];
 		bool skip_device = false;
 
 		vk::PhysicalDeviceProperties device_properties {};
@@ -442,7 +451,20 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		if (skip_device) {
+			if (gpu_index >= 0 && static_cast<int32_t>(device_index) == gpu_index) {
+				// Appareil demandé via --gpu mais incompatible : repli automatique.
+				LOGF("Vulkan GPU %d is incompatible, falling back to automatic selection\n",
+				     gpu_index);
+			}
 			continue;
+		}
+
+		if (gpu_index >= 0 && static_cast<int32_t>(device_index) == gpu_index) {
+			// Appareil demandé explicitement via --gpu : sélection directe.
+			best_device       = device;
+			best_queue_family = queue_family;
+			best_capabilities = std::move(candidate_capabilities);
+			break;
 		}
 
 		if (best_device == nullptr ||
@@ -457,6 +479,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
 		out_capabilities = std::move(best_capabilities);
+		vk::PhysicalDeviceProperties selected_properties {};
+		best_device.getProperties(&selected_properties);
+		LOGF("Vulkan selected device: %s\n", selected_properties.deviceName.data());
 	}
 }
 

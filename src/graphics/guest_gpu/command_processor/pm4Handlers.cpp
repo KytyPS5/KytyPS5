@@ -2433,15 +2433,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto value          = indirect_buffer[1];
 
 		// Not sure if this is correct
-		if (raw_cmd_offset != cmd_offset) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF_COLOR(Log::Color::Red,
-				           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
-				           " -> 0x%08" PRIx32 "\n",
-				           raw_cmd_offset, cmd_offset);
-			}
-		}
+		// if (raw_cmd_offset != cmd_offset) {
+		// 	LOGF_COLOR(Log::Color::Red,
+		// 	           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
+		// 	           " -> 0x%08" PRIx32 "\n",
+		// 	           raw_cmd_offset, cmd_offset);
+		// }
 
 		// Not sure if this is correct
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
@@ -2497,15 +2494,12 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto value          = indirect_buffer[1];
 
 		// Not sure if this is correct
-		if (raw_cmd_offset != cmd_offset) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF_COLOR(Log::Color::Red,
-				           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
-				           " -> 0x%08" PRIx32 "\n",
-				           raw_cmd_offset, cmd_offset);
-			}
-		}
+		// if (raw_cmd_offset != cmd_offset) {
+		// 	LOGF_COLOR(Log::Color::Red,
+		// 	           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
+		// 	           " -> 0x%08" PRIx32 "\n",
+		// 	           raw_cmd_offset, cmd_offset);
+		// }
 		if (HwUcTrySetFakeRegister(cmd_offset, value)) {
 			continue;
 		}
@@ -2861,15 +2855,12 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		cmd_offset = raw_cmd_offset & 0x0fffffffu;
 	}
 
-	if (raw_cmd_offset != cmd_offset) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t temporary: normalized UC register offset 0x%08" PRIx32 " -> 0x%08" PRIx32
-			           "\n",
-			           raw_cmd_offset, cmd_offset);
-		}
-	}
+	// if (raw_cmd_offset != cmd_offset) {
+	// 	LOGF_COLOR(Log::Color::Red,
+	// 	           "\t temporary: normalized UC register offset 0x%08" PRIx32 " -> 0x%08" PRIx32
+	// 	           "\n",
+	// 	           raw_cmd_offset, cmd_offset);
+	// }
 	if (HwUcTrySetFakeRegisterRange(cmd_offset, buffer + 1, KYTY_PM4_LEN(cmd_id) - 2u)) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}

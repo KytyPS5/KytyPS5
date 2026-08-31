@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <fmt/format.h>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <vulkan/vulkan.hpp>
@@ -44,8 +45,13 @@ void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<A
 	vk::DebugUtilsObjectNameInfoEXT info {};
 	info.sType        = vk::StructureType::eDebugUtilsObjectNameInfoEXT;
 	info.objectType   = Handle::objectType;
-	info.objectHandle = static_cast<uint64_t>(
-	    reinterpret_cast<uintptr_t>(static_cast<typename Handle::CType>(handle)));
+	using CType = typename Handle::CType;
+	if constexpr (std::is_pointer_v<CType>) {
+		info.objectHandle =
+		    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<CType>(handle)));
+	} else {
+		info.objectHandle = static_cast<uint64_t>(static_cast<CType>(handle));
+	}
 	info.pObjectName = name.c_str();
 	(void)device.setDebugUtilsObjectNameEXT(&info);
 }

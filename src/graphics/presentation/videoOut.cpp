@@ -207,6 +207,7 @@ public:
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
+	void DumpState();
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -261,6 +262,7 @@ public:
 	void VblankBegin();
 	void VblankEnd();
 	void PresentThread(std::stop_token token);
+	void DumpVideoOutState();
 
 private:
 	Common::Mutex            m_mutex;
@@ -591,6 +593,10 @@ VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height, Graphics::Presente
 
 void VideoOutShutdown() {
 	g_video_out_driver.reset();
+}
+
+VideoOutDriver* VideoOutGetDriver() {
+	return g_video_out_driver.get();
 }
 
 VideoOutDriver::Impl::~Impl() {
@@ -1164,6 +1170,41 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 	out = cfg.flip_status;
 }
 
+void FlipQueue::DumpState() {
+	const auto state_name = [](RequestState state) {
+		switch (state) {
+			case RequestState::Reserved: return "Reserved";
+			case RequestState::Recording: return "Recording";
+			case RequestState::Ready: return "Ready";
+			case RequestState::Presenting: return "Presenting";
+		}
+		return "?";
+	};
+	Common::LockGuard lock(m_mutex);
+	for (const auto* queue: {&m_requests, &m_cpu_requests, &m_cancelled_requests}) {
+		const char* which = queue == &m_requests       ? "gpu"
+		                    : queue == &m_cpu_requests ? "cpu"
+		                                               : "cancelled";
+		for (const auto& r: *queue) {
+		}
+	}
+}
+
+void VideoOutDriver::Impl::DumpVideoOutState() {
+	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+		auto* cfg = Get(handle);
+		if (cfg == nullptr) {
+			continue;
+		}
+		Common::LockGuard lock(cfg->mutex);
+	}
+}
+
+void VideoOutDriver::DumpFlipState() {
+	m_impl->GetFlipQueue().DumpState();
+	m_impl->DumpVideoOutState();
+}
+
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
 	PRINT_NAME();
 
@@ -1449,8 +1490,22 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 	return OK;
 }
 
+namespace {
+std::atomic<int> g_flip_thread {0};
+} // namespace
+
+void VideoOutSetFlipThread(int thread_id) {
+	g_flip_thread.store(thread_id, std::memory_order_relaxed);
+}
+
+int VideoOutGetFlipThread() {
+	return g_flip_thread.load(std::memory_order_relaxed);
+}
+
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+
+	VideoOutSetFlipThread(Common::Thread::GetThreadIdUnique());
 
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,

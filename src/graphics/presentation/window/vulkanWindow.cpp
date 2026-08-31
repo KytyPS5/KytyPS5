@@ -86,23 +86,37 @@ static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char*
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
 }
 
-static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
-                                   SurfaceCapabilities& r) {
-	RequireVulkanSuccess(physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities),
-	                     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+static bool TryGetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
+                                      SurfaceCapabilities& r) {
+	const auto result = physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities);
+	if (result != vk::Result::eSuccess) {
+		return false;
+	}
 
 	r.formats = EnumerateVulkan<vk::SurfaceFormatKHR>( // @suppress("Ambiguous problem")
 	    "vkGetPhysicalDeviceSurfaceFormatsKHR", [&](uint32_t* count, vk::SurfaceFormatKHR* values) {
 		    return physical_device.getSurfaceFormatsKHR(surface, count, values);
 	    });
-	EXIT_NOT_IMPLEMENTED(r.formats.empty());
+	if (r.formats.empty()) {
+		return false;
+	}
 
 	r.present_modes = EnumerateVulkan<vk::PresentModeKHR>( // @suppress("Ambiguous problem")
 	    "vkGetPhysicalDeviceSurfacePresentModesKHR",
 	    [&](uint32_t* count, vk::PresentModeKHR* values) {
 		    return physical_device.getSurfacePresentModesKHR(surface, count, values);
 	    });
-	EXIT_NOT_IMPLEMENTED(r.present_modes.empty());
+	if (r.present_modes.empty()) {
+		return false;
+	}
+	return true;
+}
+
+static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
+                                   SurfaceCapabilities& r) {
+	if (!TryGetSurfaceCapabilities(physical_device, surface, r)) {
+		EXIT("cannot query surface capabilities for the selected device\n");
+	}
 }
 
 static bool CheckFormat(vk::PhysicalDevice device, vk::Format format, bool tile,
@@ -359,7 +373,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		SurfaceCapabilities candidate_capabilities;
 		if (!skip_device) {
-			GetSurfaceCapabilities(device, surface, candidate_capabilities);
+			if (!TryGetSurfaceCapabilities(device, surface, candidate_capabilities)) {
+				continue;
+			}
 
 			if (!(candidate_capabilities.capabilities.supportedUsageFlags &
 			      vk::ImageUsageFlagBits::eTransferDst)) {
@@ -449,8 +465,18 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		const std::string pinned_name;
+		const bool pinned_match =
+		    !pinned_name.empty() &&
+		    Common::ToLower(std::string(device_properties.deviceName.data()))
+		            .find(pinned_name) != std::string::npos;
+		if (!pinned_name.empty() && !pinned_match) {
+			continue;
+		}
+
+		if (best_device == nullptr || pinned_match ||
+		    (pinned_name.empty() &&
+		     device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu)) {
 			best_device       = device;
 			best_queue_family = queue_family;
 			best_capabilities = std::move(candidate_capabilities);
@@ -606,6 +632,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	features12.timelineSemaphore = VK_TRUE;
 	features12.shaderOutputLayer = VK_TRUE;
+	if (HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+		if (supported_features12.descriptorIndexing != VK_TRUE) {
+			EXIT("RayQuery: acceleration structures need descriptorIndexing, unsupported here\n");
+		}
+		features12.descriptorIndexing = VK_TRUE;
+	}
+
+	if (supported_features12.bufferDeviceAddress != VK_TRUE) {
+		EXIT("Vulkan buffer device address is required by the BDA buffer cache, unsupported by "
+		     "this device\n");
+	}
 	features12.bufferDeviceAddress = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
@@ -632,6 +669,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 #if defined(__APPLE__)
 	robustness2.pNext = &features12;
+	void* base_feature_chain = &features12;
 #else
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
 	fragment_barycentric.sType =
@@ -639,6 +677,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	fragment_barycentric.pNext                     = &features12;
 	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
 	robustness2.pNext                              = &fragment_barycentric;
+	void* base_feature_chain                       = &fragment_barycentric;
 #endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
@@ -650,14 +689,35 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	    graphics.compute_subgroup_size_control_enabled &&
 	    supported_features13.subgroupSizeControl == VK_TRUE;
 
+	const auto device_fault_ext_enabled =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+
+	const auto shader_clock_ext_enabled =
+	    HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	fault_features.sType = vk::StructureType::ePhysicalDeviceFaultFeaturesEXT;
+	fault_features.pNext =
+	    robustness2_ext_enabled ? &robustness2 : const_cast<void*>(base_feature_chain);
+	fault_features.deviceFault = VK_TRUE;
+
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features {};
+	shader_clock_features.sType = vk::StructureType::ePhysicalDeviceShaderClockFeaturesKHR;
+	shader_clock_features.pNext =
+	    device_fault_ext_enabled
+	        ? static_cast<void*>(&fault_features)
+	        : (robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                   : const_cast<void*>(base_feature_chain));
+	shader_clock_features.shaderDeviceClock = VK_TRUE;
+
 	auto features13 = required_features13;
-#if defined(__APPLE__)
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&features12);
-#else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
-#endif
+	features13.pNext =
+	    shader_clock_ext_enabled
+	        ? static_cast<void*>(&shader_clock_features)
+	        : (device_fault_ext_enabled
+	               ? static_cast<void*>(&fault_features)
+	               : (robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                          : const_cast<void*>(base_feature_chain)));
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
@@ -665,9 +725,26 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
 
+	const bool ray_query_enabled =
+	    HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+	const bool ray_query_ext_enabled =
+	    HasExtension(device_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+	vk::PhysicalDeviceRayQueryFeaturesKHR             ray_query_features {};
+	vk::PhysicalDeviceAccelerationStructureFeaturesKHR accel_features {};
+	const void*                                       features_head = &features13;
+	if (ray_query_enabled) {
+		ray_query_features.sType     = vk::StructureType::ePhysicalDeviceRayQueryFeaturesKHR;
+		ray_query_features.rayQuery  = ray_query_ext_enabled ? VK_TRUE : VK_FALSE;
+		ray_query_features.pNext     = const_cast<void*>(features_head);
+		accel_features.sType         = vk::StructureType::ePhysicalDeviceAccelerationStructureFeaturesKHR;
+		accel_features.accelerationStructure = VK_TRUE;
+		accel_features.pNext                 = &ray_query_features;
+		features_head                        = &accel_features;
+	}
+
 	vk::DeviceCreateInfo create_info {};
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
-	create_info.pNext                   = &features13;
+	create_info.pNext                   = features_head;
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -903,7 +980,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[4]    = {};
 	uint32_t                       enabled_features_count = 0;
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
@@ -1043,12 +1120,40 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		{
+			const std::array chain = {VK_KHR_RAY_QUERY_EXTENSION_NAME,
+			                          VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+			                          VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+			                          VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+			                          VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME};
+			bool             all = true;
+			for (const char* name: chain) {
+				const bool have = HasExtension(available_extensions, name);
+				all             = all && have;
+			}
+			if (all && true) {
+				device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+				device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+				device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+			}
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			graphic_ctx.diagnostic_checkpoints_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			graphic_ctx.device_fault_enabled = true;
 		}
 	}
 

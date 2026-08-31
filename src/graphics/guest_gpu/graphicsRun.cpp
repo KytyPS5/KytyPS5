@@ -1,6 +1,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include <utility>
+#include <cstdlib>
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -413,6 +415,13 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
+
+	if (!dst_gds) {
+		static const auto watch = [] {
+			std::pair<uint64_t, uint64_t> range {0, 0};
+			return range;
+		}();
+	}
 	auto& buffer_cache = GetGpuResources().GetBufferCache();
 	if (src_sel == 2) {
 		buffer_cache.FillBuffer(
@@ -453,6 +462,9 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#endif
 
 	for (;;) {
 		Submission                   submission;
@@ -546,6 +558,17 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
+	if (first_slice) {
+		constexpr uint32_t capture_at = 0u;
+		if (capture_at != 0) {
+			static bool requested = false;
+			const auto  frame     = static_cast<uint32_t>(m_renderer.GetGpu().GetFrameNum());
+			if (!requested && frame >= capture_at) {
+				requested = true;
+				RenderDocRequestCapture();
+			}
+		}
+	}
 	if (first_slice && RenderDocCaptureRequested()) {
 		Common::LockGuard render_lock(m_renderer.GetMutex());
 		RenderDocStartCapture();
@@ -910,12 +933,14 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
 
 	if (!indexed) {
 		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
+		if (!Libs::LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
+			static std::atomic<uint32_t> unmapped_log {0};
+			return;
+		}
 		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
 		    args.start_instance_location != 0u) {
 			static std::atomic<uint32_t> log_count {0};
@@ -934,7 +959,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
+	if (!Libs::LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
+		static std::atomic<uint32_t> unmapped_log {0};
+		return;
+	}
 	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 64) {
@@ -1158,9 +1186,14 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+	DispatchIndirectArgs args {};
+	if (!Libs::LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
+		static std::atomic<uint32_t> unmapped_log {0};
+		return;
+	}
+
+	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 }
 
 void CommandProcessor::DrawIndexAuto(uint32_t index_count, uint32_t flags,
@@ -1381,7 +1414,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
-						    (eop_event_type == 0x28 && event_index == 0x00)) {
+						    ((eop_event_type == 0x14 || eop_event_type == 0x28) &&
+						     event_index == 0x00)) {
 							if (with_interrupt) {
 								Sync::WriteAtEndOfPipeWithInterrupt64(
 								    m_submit_id, CurrentBuffer(), dst, clock, m_interrupt_event_id,
@@ -1396,7 +1430,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					case 0x38:
 						if ((eop_event_type == 0x04 &&
 						     (event_index == 0x00 || event_index == 0x05)) ||
-						    (eop_event_type == 0x28 && event_index == 0x00)) {
+						    ((eop_event_type == 0x14 || eop_event_type == 0x28) &&
+						     event_index == 0x00)) {
 							if (with_interrupt) {
 								Sync::WriteAtEndOfPipeWithInterruptWriteBack64(
 								    m_submit_id, CurrentBuffer(), dst, clock, m_interrupt_event_id,

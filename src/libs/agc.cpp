@@ -1569,15 +1569,6 @@ int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t ad
 	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
-int KYTY_SYSV_ABI AgcUnknownJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
-                                               uint32_t size_in_dwords) {
-	PRINT_NAME();
-
-	LOGF("Calling unknown stub");
-
-	return AgcJumpPatchSetTarget(cmd, target, size_in_dwords);
-}
-
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
                                         uint32_t size_in_dwords) {
 	PRINT_NAME();

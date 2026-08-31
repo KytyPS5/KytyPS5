@@ -37,7 +37,6 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("V++UgBtQhn0", Gen5::AgcGetDataPacketPayloadAddress);
 	LIB_FUNC("s+VGAMDQ0AQ", Gen5::AgcGetDataPacketPayloadRange);
 	LIB_FUNC("fPSCdQxgpSw", Gen5::AgcWriteDataPatchSetAddressOrOffset);
-	LIB_FUNC("bxca0BK4FNg", Gen5::AgcUnknownJumpPatchSetTarget);
 	LIB_FUNC("2BS4EtAaF28", Gen5::AgcJumpPatchSetTarget);
 	LIB_FUNC("h9z6+0hEydk", Gen5::AgcSuspendPoint);
 	LIB_FUNC("qj7QZpgr9Uw", Gen5::AgcDcbContextStateOp);

@@ -212,14 +212,22 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 	}
 }
 
-void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& info) {
+void CollectComputeInputs(const Program& program, const ShaderComputeInputInfo* compute,
+                          ShaderInfo& info) {
+	const bool uses_lane_id = std::any_of(
+	    program.blocks.begin(), program.blocks.end(), [](const auto* block) {
+		    return std::any_of(block->begin(), block->end(), [](const auto& inst) {
+			    return inst.GetOpcode() == ValueOpcode::LaneId;
+		    });
+	    });
 	if (compute->group_id[0] || compute->group_id[1] || compute->group_id[2]) {
 		AddInput(info, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
 	}
 	if (compute->thread_ids_num > 0) {
 		AddInput(info, StageInputKind::LocalInvocationId, 0, 3, "gl_LocalInvocationID");
 	}
-	if (compute->thread_ids_num > 0 || compute->tg_size_en) {
+	if (compute->thread_ids_num > 0 || compute->tg_size_en ||
+	    (program.wave_size == 64u && uses_lane_id)) {
 		AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
 	}
 	if (compute->dispatch_thread_dimensions) {
@@ -379,7 +387,7 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
-		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
+		case ShaderType::Compute: CollectComputeInputs(program, options.compute, next); break;
 		default: return false;
 	}
 	CollectBuiltinInputs(program, next);

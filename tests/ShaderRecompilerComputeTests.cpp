@@ -14084,6 +14084,18 @@ TestCase VectorMbcntUsesThreadMask() {
   return test;
 }
 
+TestCase VectorMbcntWave64UsesLogicalLaneId() {
+  auto test = VectorMbcntUsesThreadMask();
+  test.name = "VectorMbcntWave64UsesLogicalLaneId";
+  test.expected.resize(64);
+  std::iota(test.expected.begin(), test.expected.end(), 0u);
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.wave_size = 64;
+  test.dispatch_x = 1;
+  test.required_spirv = {"BuiltIn LocalInvocationIndex", "OpBitwiseAnd"};
+  return test;
+}
+
 TestCase VectorAddcUsesPerLaneCarryIn() {
   using O = ShaderOpcode;
 
@@ -21165,6 +21177,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorAlignByteUsesFiveBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
+  AddCase(VectorMbcntWave64UsesLogicalLaneId);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
   AddCase(VectorSubrevCoCiU32ExactRawOnGpu);

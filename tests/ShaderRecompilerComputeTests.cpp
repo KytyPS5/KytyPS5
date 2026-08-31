@@ -993,6 +993,7 @@ struct GraphicsCase {
   std::vector<u32> pixel_interpolator_settings;
   bool pixel_no_perspective = false;
   std::vector<u32> vertices;
+  bool fp16_overflow = false;
 };
 
 struct CompiledShader {
@@ -1323,6 +1324,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           ? 1u
           : static_cast<u32>(test.pixel_interpolator_settings.size());
   pixel_info.ps_no_perspective = test.pixel_no_perspective;
+  pixel_info.fp16_overflow = test.fp16_overflow;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -14604,6 +14606,52 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ComputeFp16OverflowMode(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7bff7bffu); // packed +MAX_FP16
+  AppendVMovLiteral(&code, 1, 0x40004000u); // packed +2.0h
+  AppendVMovLiteral(&code, 2, 0x7c007c00u); // packed +Inf
+  AppendVMovLiteral(&code, 3, 0x12347bffu); // scalar +MAX_FP16
+  AppendVMovLiteral(&code, 4, 0x00004000u); // scalar +2.0h
+  AppendVMovLiteral(&code, 5, 0x4788b800u); // +70000.0f
+  AppendVMovLiteral(&code, 6, 0xc788b800u); // -70000.0f
+  AppendVMovLiteral(&code, 7, 0x7f800000u); // +Inf
+
+  AppendVop3p(&code, 0x10, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x10, 11, Vgpr(2), Vgpr(1), 0, 0x3);
+  code.push_back(EncodeVop2(0x35, 3, Vgpr(3), 4));
+  code.push_back(EncodeVop1(0x0a, 12, Vgpr(5)));
+  code.push_back(EncodeVop1(0x0a, 13, Vgpr(6)));
+  code.push_back(EncodeVop1(0x0a, 14, Vgpr(7)));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreVgpr(&code, 3, 2);
+  AppendStoreVgpr(&code, 12, 3);
+  AppendStoreVgpr(&code, 13, 4);
+  AppendStoreVgpr(&code, 14, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeFp16OverflowEnabled"
+                      : "ComputeFp16OverflowDisabled";
+  test.code = std::move(code);
+  test.expected = enabled
+                      ? std::vector<u32>{0x7bff7bffu, 0x7c007c00u,
+                                         0x12347bffu, 0x00007bffu,
+                                         0x0000fbffu, 0x00007c00u}
+                      : std::vector<u32>{0x7c007c00u, 0x7c007c00u,
+                                         0x12347c00u, 0x00007c00u,
+                                         0x0000fc00u, 0x00007c00u};
+  test.opcodes = {O::V_MOV_B32, O::V_PK_MUL_F16, O::V_MUL_F16,
+                  O::V_CVT_F16_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.fp16_overflow = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorMinMaxF16Ops() {
   using O = ShaderOpcode;
 
@@ -20822,6 +20870,38 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   return test;
 }
 
+GraphicsCase GraphicsFp16OverflowMode(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7bff7bffu); // packed +MAX_FP16
+  AppendVMovLiteral(&code, 1, 0x40004000u); // packed +2.0h
+  AppendVMovLiteral(&code, 2, 0x7c007c00u); // packed +Inf
+  AppendVMovLiteral(&code, 3, 0x12347bffu); // scalar +MAX_FP16
+  AppendVMovLiteral(&code, 4, 0x00004000u); // scalar +2.0h
+  AppendVMovLiteral(&code, 5, 0x3f800000u); // +1.0f
+  AppendVop3p(&code, 0x10, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x10, 11, Vgpr(2), Vgpr(1), 0, 0x3);
+  code.push_back(EncodeVop2(0x35, 3, Vgpr(3), 4));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(10, 11, 3, 5));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = enabled ? "GraphicsFp16OverflowEnabled"
+                      : "GraphicsFp16OverflowDisabled";
+  test.fragment_code = std::move(code);
+  test.expected_pixel = enabled
+                            ? std::vector<u32>{0x7bff7bffu, 0x7c007c00u,
+                                               0x12347bffu, 0x3f800000u}
+                            : std::vector<u32>{0x7c007c00u, 0x7c007c00u,
+                                               0x12347c00u, 0x3f800000u};
+  test.opcodes = {O::V_MOV_B32, O::V_PK_MUL_F16, O::V_MUL_F16, O::EXP,
+                  O::S_ENDPGM};
+  test.fp16_overflow = enabled;
+  return test;
+}
+
 GraphicsCase GraphicsInterpolationExport() {
   using O = ShaderOpcode;
 
@@ -21181,6 +21261,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
+  cases.push_back(ComputeFp16OverflowMode(false));
+  cases.push_back(ComputeFp16OverflowMode(true));
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
@@ -21388,6 +21470,8 @@ std::vector<TestCase> MakeCases() {
 
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
+      GraphicsFp16OverflowMode(false),
+      GraphicsFp16OverflowMode(true),
       GraphicsInterpolationExport(),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
@@ -23775,6 +23859,46 @@ void CheckNativeMsaaState() {
   std::printf("[host]    %-32s ok\n", "NativeMsaaState");
 }
 
+void CheckComputeFp16OverflowStaticKey() {
+  ShaderComputeInputInfo disabled{};
+  ShaderComputeInputInfo enabled{};
+  enabled.fp16_overflow = true;
+  std::vector<u32> disabled_key;
+  std::vector<u32> enabled_key;
+  BuildStageStaticKey(disabled, disabled_key);
+  BuildStageStaticKey(enabled, enabled_key);
+  Require("ComputeFp16OverflowStaticKey", "pipeline cache separation",
+          disabled_key.size() == enabled_key.size() && disabled_key != enabled_key,
+          "FP16_OVFL did not specialize the compute program cache key");
+  std::printf("[host]    %-32s ok\n", "ComputeFp16OverflowStaticKey");
+}
+
+void CheckGraphicsFp16OverflowStaticKeys() {
+  ShaderVertexInputInfo vertex_disabled{};
+  ShaderVertexInputInfo vertex_enabled{};
+  ShaderPixelInputInfo pixel_disabled{};
+  ShaderPixelInputInfo pixel_enabled{};
+  vertex_enabled.fp16_overflow = true;
+  pixel_enabled.fp16_overflow = true;
+
+  std::vector<u32> vertex_disabled_key;
+  std::vector<u32> vertex_enabled_key;
+  std::vector<u32> pixel_disabled_key;
+  std::vector<u32> pixel_enabled_key;
+  BuildStageStaticKey(vertex_disabled, vertex_disabled_key);
+  BuildStageStaticKey(vertex_enabled, vertex_enabled_key);
+  BuildStageStaticKey(pixel_disabled, pixel_disabled_key);
+  BuildStageStaticKey(pixel_enabled, pixel_enabled_key);
+
+  Require("GraphicsFp16OverflowStaticKeys", "program cache separation",
+          vertex_disabled_key.size() == vertex_enabled_key.size() &&
+              vertex_disabled_key != vertex_enabled_key &&
+              pixel_disabled_key.size() == pixel_enabled_key.size() &&
+              pixel_disabled_key != pixel_enabled_key,
+          "FP16_OVERFLOW did not specialize the vertex and pixel program keys");
+  std::printf("[host]    %-32s ok\n", "GraphicsFp16OverflowStaticKeys");
+}
+
 void CheckDepthHtileStencilCompatibility() {
   Require("DepthHtileStencilCompatibility", "disabled acceleration",
           depth_htile_stencil_acceleration_compatible(false, false, true),
@@ -25245,6 +25369,16 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--fp16-overflow-only") == 0) {
+    VulkanHarness vulkan;
+    CheckComputeFp16OverflowStaticKey();
+    CheckGraphicsFp16OverflowStaticKeys();
+    RunCase(&vulkan, ComputeFp16OverflowMode(false));
+    RunCase(&vulkan, ComputeFp16OverflowMode(true));
+    RunGraphicsCase(&vulkan, GraphicsFp16OverflowMode(false));
+    RunGraphicsCase(&vulkan, GraphicsFp16OverflowMode(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -25289,6 +25423,8 @@ int main(int argc, char **argv) {
   CheckStorageTextureVolumeMipRegions();
   CheckStorageTextureGpuOwnedRebindState();
   CheckNativeMsaaState();
+  CheckComputeFp16OverflowStaticKey();
+  CheckGraphicsFp16OverflowStaticKeys();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
   CheckStencilAttachmentAccess();

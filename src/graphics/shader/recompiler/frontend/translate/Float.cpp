@@ -8,17 +8,24 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
-		const auto rhs = ReadF16LaneAsF32(inst.src1, high, true);
-		IR::F32    result;
+		std::array<IR::F32, 3> args;
+		args[0] = ReadF16LaneAsF32(inst.src0, high, true);
+		args[1] = ReadF16LaneAsF32(inst.src1, high, true);
+		uint32_t arg_count = 2u;
+		IR::F32 result;
 		if (accumulator) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high, true)}));
+			args[2] = ReadF16LaneAsF32(inst.dst, high, true);
+			arg_count = 3u;
+			result = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]}));
 		} else if (inst.src_count == 3u) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high, true)}));
+			args[2] = ReadF16LaneAsF32(inst.src2, high, true);
+			arg_count = 3u;
+			result = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]}));
 		} else {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
+			result = IR::F32(ir.Emit(opcode, {args[0], args[1]}));
 		}
-		return ApplyF32ResultModifiers(inst.dst, result);
+		result = ApplyF32ResultModifiers(inst.dst, result);
+		return ApplyF16Overflow(inst.opcode, result, args, arg_count);
 	};
 	auto raw    = DestinationOperand(inst);
 	raw.omod    = 0u;
@@ -50,13 +57,19 @@ bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
                               bool invalid_negative) {
 	const auto argument = ReadF16AsF32(inst.src0);
 	auto       result   = IR::F32(ir.Emit(opcode, {argument}));
+	result = ApplyF32ResultModifiers(inst.dst, result);
+	const std::array<IR::F32, 3> args {argument, IR::F32(IR::Value::F32(0.0f)),
+	                                      IR::F32(IR::Value::F32(0.0f))};
+	result = ApplyF16Overflow(inst.opcode, result, args, 1u);
 	if (!invalid_negative) {
-		WriteF16(DestinationOperand(inst), result);
+		auto raw  = DestinationOperand(inst);
+		raw.omod  = 0u;
+		raw.clamp = false;
+		WriteF16(raw, result);
 		return true;
 	}
 	const auto negative =
 	    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {argument, IR::Value::F32(0.0f)}));
-	result             = ApplyF32ResultModifiers(inst.dst, result);
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	WriteU16(DestinationOperand(inst), ir.Select(negative, invalid, bits));
@@ -103,18 +116,31 @@ bool Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode
                                bool reverse) {
 	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
 	const auto rhs = ReadF16AsF32(reverse ? inst.src0 : inst.src1);
-	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {lhs, rhs})));
+	const std::array<IR::F32, 3> args {lhs, rhs, IR::F32(IR::Value::F32(0.0f))};
+	auto result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
+	result = ApplyF32ResultModifiers(inst.dst, result);
+	result = ApplyF16Overflow(inst.opcode, result, args, 2u);
+	auto raw  = DestinationOperand(inst);
+	raw.omod  = 0u;
+	raw.clamp = false;
+	WriteF16(raw, result);
 	return true;
 }
 
 bool Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
-	std::array<IR::Value, 3> args;
+	std::array<IR::F32, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
-		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
+		args[index] = mix ? ReadMixF32(operand) : ReadF16AsF32(operand);
 	}
-	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
+	auto result = IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]}));
+	result = ApplyF32ResultModifiers(inst.dst, result);
+	result = ApplyF16Overflow(inst.opcode, result, args, 3u);
+	auto raw  = DestinationOperand(inst);
+	raw.omod  = 0u;
+	raw.clamp = false;
+	WriteF16(raw, result);
 	return true;
 }
 

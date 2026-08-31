@@ -70,7 +70,15 @@ void Translator::V_CVT_I32_F32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_CVT_F16_F32(const Decoder::Instruction& inst) {
-	WriteF16(DestinationOperand(inst), IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32)));
+	const auto source = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
+	auto       result = ApplyF32ResultModifiers(inst.dst, source);
+	const std::array<IR::F32, 3> args {source, IR::F32(IR::Value::F32(0.0f)),
+	                                      IR::F32(IR::Value::F32(0.0f))};
+	result = ApplyF16Overflow(inst.opcode, result, args, 1u);
+	auto raw  = DestinationOperand(inst);
+	raw.omod  = 0u;
+	raw.clamp = false;
+	WriteF16(raw, result);
 }
 
 void Translator::V_CVT_F32_F16(const Decoder::Instruction& inst) {

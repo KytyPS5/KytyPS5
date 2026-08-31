@@ -355,6 +355,45 @@ IR::F32 Translator::ApplyF32ResultModifiers(const Decoder::Operand& operand, IR:
 	return value;
 }
 
+IR::F32 Translator::ApplyF16Overflow(Decoder::Opcode opcode, IR::F32 value,
+                                     const std::array<IR::F32, 3>& args,
+                                     uint32_t arg_count) {
+	if (!current_fp16_overflow) {
+		return value;
+	}
+
+	const auto magnitude_bits = [&](IR::F32 input) {
+		return ir.BitwiseAnd(ir.BitCastU32(input), IR::U32(IR::Value(0x7fffffffu)));
+	};
+	const auto is_infinity = [&](IR::F32 input) {
+		return ir.IEqual(magnitude_bits(input), IR::U32(IR::Value(0x7f800000u)));
+	};
+
+	// FP16_OVFL saturates arithmetic overflow, while infinities inherited from an operand and
+	// architectural reciprocal/logarithm poles remain infinite. Ordered comparison leaves NaNs
+	// unchanged and payload-preserving conversion stays in the existing half packing path.
+	IR::U1 genuine_infinity(IR::Value(false));
+	for (uint32_t index = 0; index < arg_count; index++) {
+		genuine_infinity = ir.LogicalOr(genuine_infinity, is_infinity(args[index]));
+	}
+	if (arg_count != 0u &&
+	    (opcode == Decoder::Opcode::V_RCP_F16 || opcode == Decoder::Opcode::V_RSQ_F16 ||
+	     opcode == Decoder::Opcode::V_LOG_F16)) {
+		const auto zero = ir.IEqual(magnitude_bits(args[0]), IR::U32(IR::Value(0u)));
+		genuine_infinity = ir.LogicalOr(genuine_infinity, zero);
+	}
+
+	const auto magnitude = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+	const auto overflow = IR::U1(ir.Emit(
+	    IR::ValueOpcode::FPOrdGreaterThan32, {magnitude, IR::Value::F32(65504.0f)}));
+	const auto should_clamp = ir.LogicalAnd(overflow, ir.LogicalNot(genuine_infinity));
+	const auto negative = IR::U1(
+	    ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {value, IR::Value::F32(0.0f)}));
+	const auto maximum = SelectF32(negative, IR::F32(IR::Value::F32(-65504.0f)),
+	                              IR::F32(IR::Value::F32(65504.0f)));
+	return SelectF32(should_clamp, maximum, value);
+}
+
 void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) {
 	if (operand.kind == Decoder::OperandKind::Null) {
 		return;
@@ -1183,7 +1222,13 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto         typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size);
+		const bool fp16_overflow = options.compute != nullptr
+		                                 ? options.compute->fp16_overflow
+		                             : options.pixel != nullptr ? options.pixel->fp16_overflow
+		                             : options.vertex != nullptr ? options.vertex->fp16_overflow
+		                                                          : false;
+		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size,
+		                      fp16_overflow);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

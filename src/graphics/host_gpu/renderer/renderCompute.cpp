@@ -54,7 +54,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if (!resource.written && cache.IsMeta(descriptor.Base48())) {
+		// A dispatch that also reads the metadata it writes is a read-modify-write, not a fill:
+		// it keeps every tile that already holds depth, so it cannot arm a full-surface clear.
+		if (cache.IsMeta(descriptor.Base48()) && (!resource.written || resource.read)) {
 			return false;
 		}
 	}

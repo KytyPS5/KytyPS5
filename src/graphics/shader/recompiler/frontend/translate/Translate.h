@@ -38,7 +38,7 @@ struct TranslateOptions {
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
 };
 
-bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
-                      const TranslateOptions& options, IR::Program& result, std::string* error);
+IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
+                             const TranslateOptions& options);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

@@ -1,6 +1,5 @@
+#include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-
-#include "graphics/shader/shader.h"
 
 #include <fmt/format.h>
 #include <map>
@@ -11,9 +10,12 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-using ShaderError::Fail;
-
 namespace {
+
+[[noreturn]] void Fail(std::string_view message) {
+	EXIT("shader IR validation failed: %s", std::string(message).c_str());
+	std::abort();
+}
 
 bool IsRegisterStatePseudo(ValueOpcode opcode) {
 	switch (opcode) {
@@ -153,10 +155,10 @@ Value ResolveInvariantPhi(const Program& program, Value value) {
 	return invariant;
 }
 
-bool ValidateProgram(const Program& program, bool require_ssa, std::string* error) {
+void ValidateProgram(const Program& program, bool require_ssa) {
 	if (program.blocks.size() != program.block_info.size() ||
 	    program.blocks.size() != program.block_storage.size()) {
-		return Fail(error, "value IR block storage is inconsistent");
+		return Fail("value IR block storage is inconsistent");
 	}
 	std::unordered_set<const Block*>           blocks;
 	std::unordered_map<const Block*, size_t>   block_indices;
@@ -166,26 +168,26 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 		const auto* block = program.blocks[block_index];
 		if (block == nullptr || program.block_storage[block_index] == nullptr ||
 		    block != program.block_storage[block_index].get()) {
-			return Fail(error, "value IR block pointer is inconsistent");
+			return Fail("value IR block pointer is inconsistent");
 		}
 		if (!blocks.insert(block).second) {
-			return Fail(error, "value IR block pointer is duplicated");
+			return Fail("value IR block pointer is duplicated");
 		}
 		block_indices.emplace(block, block_index);
 		if (program.block_info[block_index].id == UINT32_MAX) {
-			return Fail(error, "value IR block uses the reserved exit id");
+			return Fail("value IR block uses the reserved exit id");
 		}
 		if (!blocks_by_id.emplace(program.block_info[block_index].id, block).second) {
-			return Fail(error, "value IR block id is duplicated");
+			return Fail("value IR block id is duplicated");
 		}
 		for (const auto& inst: *block) {
 			if (!instructions.insert(&inst).second) {
-				return Fail(error, "value IR instruction is duplicated");
+				return Fail("value IR instruction is duplicated");
 			}
 		}
 	}
 	if (!program.blocks.empty() && !program.blocks.front()->ImmPredecessors().empty()) {
-		return Fail(error, "value IR entry block has a predecessor");
+		return Fail("value IR entry block has a predecessor");
 	}
 
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
@@ -193,28 +195,28 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 		std::unordered_set<const Block*> predecessors;
 		for (const auto* predecessor: block->ImmPredecessors()) {
 			if (predecessor == nullptr || !blocks.contains(predecessor)) {
-				return Fail(error, "value IR block has a foreign predecessor");
+				return Fail("value IR block has a foreign predecessor");
 			}
 			if (!predecessors.insert(predecessor).second) {
-				return Fail(error, "value IR block predecessor is duplicated");
+				return Fail("value IR block predecessor is duplicated");
 			}
 			if (std::ranges::find(predecessor->ImmSuccessors(), block) ==
 			    predecessor->ImmSuccessors().end()) {
-				return Fail(error, "value IR predecessor edge is not reciprocal");
+				return Fail("value IR predecessor edge is not reciprocal");
 			}
 		}
 
 		std::unordered_set<const Block*> successors;
 		for (const auto* successor: block->ImmSuccessors()) {
 			if (successor == nullptr || !blocks.contains(successor)) {
-				return Fail(error, "value IR block has a foreign successor");
+				return Fail("value IR block has a foreign successor");
 			}
 			if (!successors.insert(successor).second) {
-				return Fail(error, "value IR block successor is duplicated");
+				return Fail("value IR block successor is duplicated");
 			}
 			if (std::ranges::find(successor->ImmPredecessors(), block) ==
 			    successor->ImmPredecessors().end()) {
-				return Fail(error, "value IR successor edge is not reciprocal");
+				return Fail("value IR successor edge is not reciprocal");
 			}
 		}
 
@@ -238,41 +240,40 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 		switch (terminator.kind) {
 			case CFG::TerminatorKind::Branch:
 				if (!add_target(terminator.true_block)) {
-					return Fail(error, "value IR branch target is missing");
+					return Fail("value IR branch target is missing");
 				}
 				break;
 			case CFG::TerminatorKind::ConditionalBranch:
 				if (!add_target(terminator.true_block) || !add_target(terminator.false_block)) {
-					return Fail(error, "value IR conditional branch target is missing");
+					return Fail("value IR conditional branch target is missing");
 				}
 				if (!validate_control_value(program.block_info[block_index].condition, Type::U1)) {
-					return Fail(error, "value IR conditional branch condition is invalid");
+					return Fail("value IR conditional branch condition is invalid");
 				}
 				break;
 			case CFG::TerminatorKind::IndirectBranch: {
 				if (!validate_control_value(program.block_info[block_index].indirect_target,
 				                            Type::U32)) {
-					return Fail(error, "value IR indirect branch selector is invalid");
+					return Fail("value IR indirect branch selector is invalid");
 				}
 				std::unordered_set<uint32_t> indirect_targets;
 				for (const auto target: terminator.indirect_targets) {
 					if (!indirect_targets.insert(target).second) {
-						return Fail(error, "value IR indirect branch target is duplicated");
+						return Fail("value IR indirect branch target is duplicated");
 					}
 					if (!add_target(target)) {
-						return Fail(error, "value IR indirect branch target is missing");
+						return Fail("value IR indirect branch target is missing");
 					}
 				}
 				if (terminator.indirect_selector_values.size() !=
 				    terminator.indirect_selector_targets.size()) {
-					return Fail(error, "value IR indirect selector table is inconsistent");
+					return Fail("value IR indirect selector table is inconsistent");
 				}
 				for (const auto target: terminator.indirect_selector_targets) {
 					const auto found = blocks_by_id.find(target);
 					if (found == blocks_by_id.end() ||
 					    !expected_successors.contains(found->second)) {
-						return Fail(error,
-						            "value IR indirect selector target is not a CFG successor");
+						return Fail("value IR indirect selector target is not a CFG successor");
 					}
 				}
 				break;
@@ -284,73 +285,73 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 		     !blocks_by_id.contains(terminator.merge_block)) ||
 		    (terminator.continue_block != UINT32_MAX &&
 		     !blocks_by_id.contains(terminator.continue_block))) {
-			return Fail(error, "value IR structured control target is missing");
+			return Fail("value IR structured control target is missing");
 		}
 		if (successors != expected_successors) {
-			return Fail(error, "value IR terminator and successor graph disagree");
+			return Fail("value IR terminator and successor graph disagree");
 		}
 
 		bool saw_non_phi = false;
 		for (const auto& inst: *block) {
 			if (inst.Parent() != block) {
-				return Fail(error, "value IR instruction has the wrong parent block");
+				return Fail("value IR instruction has the wrong parent block");
 			}
 			if (inst.GetOpcode() == ValueOpcode::Phi) {
 				if (saw_non_phi) {
-					return Fail(error, "value IR Phi appears after a non-Phi instruction");
+					return Fail("value IR Phi appears after a non-Phi instruction");
 				}
 				if (inst.NumPhiBlocks() != inst.NumArgs()) {
-					return Fail(error, "value IR Phi parent table is inconsistent");
+					return Fail("value IR Phi parent table is inconsistent");
 				}
 				if (inst.NumArgs() == 0) {
-					return Fail(error, "value IR Phi has no incoming values");
+					return Fail("value IR Phi has no incoming values");
 				}
 				std::unordered_set<const Block*> incoming_blocks;
 				for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
 					const auto* predecessor = inst.PhiBlock(arg_index);
 					if (predecessor == nullptr || !blocks.contains(predecessor) ||
 					    !predecessors.contains(predecessor)) {
-						return Fail(error, "value IR Phi has a foreign or non-predecessor parent");
+						return Fail("value IR Phi has a foreign or non-predecessor parent");
 					}
 					if (!incoming_blocks.insert(predecessor).second) {
-						return Fail(error, "value IR Phi parent is duplicated");
+						return Fail("value IR Phi parent is duplicated");
 					}
 					if (inst.Arg(arg_index).GetType() != inst.GetType()) {
-						return Fail(error, "value IR Phi incoming type does not match its result");
+						return Fail("value IR Phi incoming type does not match its result");
 					}
 				}
 				if (incoming_blocks != predecessors) {
-					return Fail(error, "value IR Phi does not cover every predecessor");
+					return Fail("value IR Phi does not cover every predecessor");
 				}
 			} else {
 				saw_non_phi = true;
 			}
 			if (require_ssa && IsRegisterStatePseudo(inst.GetOpcode())) {
-				return Fail(error, fmt::format("register-state pseudo {} survived SSA rewrite",
-				                               ValueOpcodeName(inst.GetOpcode())));
+				return Fail(fmt::format("register-state pseudo {} survived SSA rewrite",
+				                        ValueOpcodeName(inst.GetOpcode())));
 			}
 			if (inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity &&
 			    inst.GetType() == Type::Opaque) {
-				return Fail(error, fmt::format("untyped opcode {} survived translation",
-				                               ValueOpcodeName(inst.GetOpcode())));
+				return Fail(fmt::format("untyped opcode {} survived translation",
+				                        ValueOpcodeName(inst.GetOpcode())));
 			}
 			const bool fixed_signature =
 			    inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity;
 			if (fixed_signature && inst.NumArgs() != NumArgsOf(inst.GetOpcode())) {
-				return Fail(error, fmt::format("{} has {} arguments, expected {}",
-				                               ValueOpcodeName(inst.GetOpcode()), inst.NumArgs(),
-				                               NumArgsOf(inst.GetOpcode())));
+				return Fail(fmt::format("{} has {} arguments, expected {}",
+				                        ValueOpcodeName(inst.GetOpcode()), inst.NumArgs(),
+				                        NumArgsOf(inst.GetOpcode())));
 			}
 			if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
-					return Fail(error, fmt::format("{} has an invalid memory-info index",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid memory-info index",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if (memory.kind != ResourceKind::ScalarBuffer) {
-					return Fail(error, fmt::format("{} has an invalid scalar-memory resource kind",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid scalar-memory resource kind",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const bool valid_group_width =
 				    memory.component_count == 1u || memory.component_count == 2u ||
@@ -358,23 +359,23 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 				    memory.component_count == 16u;
 				if (memory.data_bits != 32u || memory.data_dwords != 1u || !valid_group_width ||
 				    memory.component_index >= memory.component_count) {
-					return Fail(error, fmt::format("{} has inconsistent scalar-memory metadata",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has inconsistent scalar-memory metadata",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
 			const auto address_info = AddressOpcodeInfoOf(inst.GetOpcode());
 			if (address_info.access != AddressAccess::None) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
-					return Fail(error, fmt::format("{} has an invalid memory-info index",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid memory-info index",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if (!IsAddressResourceKind(memory.kind) ||
 				    (memory.kind == ResourceKind::ScalarAddress &&
 				     inst.GetOpcode() != ValueOpcode::LoadAddressU32)) {
-					return Fail(error, fmt::format("{} has an invalid address resource kind",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid address resource kind",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const bool scalar_address = memory.kind == ResourceKind::ScalarAddress;
 				const bool valid_group_width =
@@ -386,50 +387,50 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 				if (memory.data_bits != address_info.data_bits || memory.data_dwords != 1u ||
 				    !valid_group_width || memory.component_index >= memory.component_count ||
 				    memory.sampler != 0u) {
-					return Fail(error, fmt::format("{} has inconsistent address-memory metadata",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has inconsistent address-memory metadata",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
 			const auto buffer_components = BufferComponentCount(inst.GetOpcode());
 			if (buffer_components != 0u) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
-					return Fail(error, fmt::format("{} has an invalid memory-info index",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid memory-info index",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if (memory.kind != ResourceKind::Buffer &&
 				    memory.kind != ResourceKind::ScalarBuffer) {
-					return Fail(error, fmt::format("{} has a non-buffer resource kind",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has a non-buffer resource kind",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (buffer_components > 1u &&
 				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
-					return Fail(error, fmt::format("{} has inconsistent native-wide metadata",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has inconsistent native-wide metadata",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (buffer_components == 1u &&
 				    (inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
 				     inst.GetOpcode() == ValueOpcode::StoreBufferU32) &&
 				    memory.data_dwords != 1u) {
-					return Fail(error, fmt::format("{} retains scalar-sibling width metadata",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} retains scalar-sibling width metadata",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
 			const auto shared_components = SharedComponentCount(inst.GetOpcode());
 			if (shared_components != 0u) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
-					return Fail(error, fmt::format("{} has an invalid memory-info index",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid memory-info index",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if ((memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) ||
 				    memory.resource != 0u || memory.sampler != 0u || memory.component_count == 0u ||
 				    memory.component_index >= memory.component_count) {
-					return Fail(error, fmt::format("{} has invalid shared-memory metadata",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has invalid shared-memory metadata",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				uint32_t expected_bits = 32u;
 				if (inst.GetOpcode() == ValueOpcode::LoadSharedU8 ||
@@ -441,26 +442,26 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 				}
 				if (memory.data_bits != expected_bits || memory.data_dwords != shared_components ||
 				    (shared_components > 1u && memory.component_index != 0u)) {
-					return Fail(error, fmt::format("{} has inconsistent shared-memory width",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has inconsistent shared-memory width",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
 			const auto image_info = ImageOpcodeInfoOf(inst.GetOpcode());
 			if (image_info.access != ImageAccess::None) {
 				const auto memory_index = inst.Flags<MemoryFlags>().index;
 				if (memory_index >= program.memory_info.size()) {
-					return Fail(error, fmt::format("{} has an invalid memory-info index",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has an invalid memory-info index",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if (!ImageResourceKindMatches(memory.kind, image_info.resource_class)) {
-					return Fail(error, fmt::format("{} has invalid image-memory metadata",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(fmt::format("{} has invalid image-memory metadata",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 			}
 			if (inst.GetOpcode() == ValueOpcode::SetAttribute &&
 			    inst.Flags<ExportFlags>().index >= program.export_info.size()) {
-				return Fail(error, "SetAttribute has an invalid export-info index");
+				return Fail("SetAttribute has an invalid export-info index");
 			}
 			uint32_t composite_components = 0u;
 			switch (inst.GetOpcode()) {
@@ -473,25 +474,24 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 			if (composite_components != 0u &&
 			    (!inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32 ||
 			     inst.Arg(1).U32() >= composite_components)) {
-				return Fail(error, fmt::format("{} has an invalid component index",
-				                               ValueOpcodeName(inst.GetOpcode())));
+				return Fail(fmt::format("{} has an invalid component index",
+				                        ValueOpcodeName(inst.GetOpcode())));
 			}
 			for (size_t arg_index = 0; arg_index < inst.NumArgs(); arg_index++) {
 				const auto arg = inst.Arg(arg_index);
 				if (arg.IsEmpty()) {
-					return Fail(error, fmt::format("{} has an empty argument",
-					                               ValueOpcodeName(inst.GetOpcode())));
+					return Fail(
+					    fmt::format("{} has an empty argument", ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (fixed_signature && arg.GetType() != ArgTypeOf(inst.GetOpcode(), arg_index)) {
-					return Fail(error,
-					            fmt::format("{} argument {} has type {}, expected {}",
+					return Fail(fmt::format("{} argument {} has type {}, expected {}",
 					                        ValueOpcodeName(inst.GetOpcode()), arg_index,
 					                        TypeName(arg.GetType()),
 					                        TypeName(ArgTypeOf(inst.GetOpcode(), arg_index))));
 				}
 				if (const auto* definition = arg.TryInstruction();
 				    definition != nullptr && !instructions.contains(definition)) {
-					return Fail(error, "value IR argument has a foreign definition");
+					return Fail("value IR argument has a foreign definition");
 				}
 				if (const auto* definition = arg.TryInstruction(); definition != nullptr) {
 					const auto& uses = definition->Uses();
@@ -499,8 +499,7 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 						return candidate.user == &inst && candidate.operand == arg_index;
 					});
 					if (use == uses.end()) {
-						return Fail(error,
-						            fmt::format("{} argument {} is absent from {} reverse uses",
+						return Fail(fmt::format("{} argument {} is absent from {} reverse uses",
 						                        ValueOpcodeName(inst.GetOpcode()), arg_index,
 						                        ValueOpcodeName(definition->GetOpcode())));
 					}
@@ -510,7 +509,7 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 	}
 
 	if (program.blocks.empty()) {
-		return true;
+		return;
 	}
 
 	std::vector<bool>   reachable(program.blocks.size(), false);
@@ -527,7 +526,7 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 		}
 	}
 	if (!std::ranges::all_of(reachable, [](bool value) { return value; })) {
-		return Fail(error, "value IR contains an unreachable block");
+		return Fail("value IR contains an unreachable block");
 	}
 
 	std::vector<std::vector<bool>> dominators(program.blocks.size(),
@@ -581,28 +580,25 @@ bool ValidateProgram(const Program& program, bool require_ssa, std::string* erro
 					const auto* predecessor = inst.PhiBlock(arg_index);
 					if (definition->Parent() != predecessor &&
 					    !dominates(definition->Parent(), predecessor)) {
-						return Fail(error,
-						            "value IR Phi incoming definition does not dominate its edge");
+						return Fail("value IR Phi incoming definition does not dominate its edge");
 					}
 				} else if (definition->Parent() == block) {
 					if (instruction_positions.at(definition) >= instruction_positions.at(&inst)) {
-						return Fail(error,
-						            "value IR instruction uses a same-block definition before it");
+						return Fail("value IR instruction uses a same-block definition before it");
 					}
 				} else if (!dominates(definition->Parent(), block)) {
-					return Fail(error, "value IR instruction definition does not dominate its use");
+					return Fail("value IR instruction definition does not dominate its use");
 				}
 			}
 		}
 		const auto& info = program.block_info[block_index];
 		if (!info.condition.IsEmpty() && !control_dominates(info.condition, block)) {
-			return Fail(error, "value IR branch condition definition does not dominate its use");
+			return Fail("value IR branch condition definition does not dominate its use");
 		}
 		if (!info.indirect_target.IsEmpty() && !control_dominates(info.indirect_target, block)) {
-			return Fail(error, "value IR indirect selector definition does not dominate its use");
+			return Fail("value IR indirect selector definition does not dominate its use");
 		}
 	}
-	return true;
 }
 
 void ResolveControlFlowIdentities(Program& program) {

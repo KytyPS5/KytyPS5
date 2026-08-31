@@ -20,6 +20,19 @@ void Check(bool condition, const char *message) {
   }
 }
 
+template <typename F>
+void CheckFatal(F &&function, std::string_view expected, const char *message) {
+  try {
+    function();
+  } catch (const std::runtime_error &error) {
+    Check(std::string_view(error.what()).find(expected) !=
+              std::string_view::npos,
+          message);
+    return;
+  }
+  Check(false, message);
+}
+
 struct Fixture {
   Program program;
 
@@ -58,10 +71,7 @@ struct Fixture {
     return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() {
-    std::string error;
-    Check(BuildSrtPlan(program, &error), error.c_str());
-  }
+  void Plan() { BuildSrtPlan(program); }
 };
 
 struct TestMemory {
@@ -112,8 +122,7 @@ void TestImmediateFlatteningAndGvn() {
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
+  Check(WalkSrt(fixture.program, runtime, flat), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
 }
@@ -130,8 +139,7 @@ void TestRawScalarComponentAlignment() {
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
+  Check(WalkSrt(fixture.program, runtime, flat), "raw scalar SRT walk failed");
   Check(
       flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
       "raw scalar base, immediate, and offset were not aligned independently");
@@ -141,11 +149,9 @@ void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
   RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u), raw_memory);
-  std::string error;
-  Check(!BuildSrtPlan(raw.program, &error) &&
-            error.find("incompatible scalar memory metadata") !=
-                std::string::npos,
-        "raw scalar load accepted descriptor-buffer metadata");
+  CheckFatal([&] { BuildSrtPlan(raw.program); },
+             "incompatible scalar memory metadata",
+             "raw scalar load accepted descriptor-buffer metadata");
 
   Fixture buffer;
   const auto buffer_memory = buffer.AddMemory(ResourceKind::ScalarAddress);
@@ -154,11 +160,9 @@ void TestScalarMemoryDomainMismatchFails() {
                   {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
   buffer.EmitMemory(ValueOpcode::ReadConstBuffer, {resource, Value(0u)},
                     buffer_memory);
-  error.clear();
-  Check(!BuildSrtPlan(buffer.program, &error) &&
-            error.find("incompatible scalar memory metadata") !=
-                std::string::npos,
-        "descriptor scalar load accepted raw-address metadata");
+  CheckFatal([&] { BuildSrtPlan(buffer.program); },
+             "incompatible scalar memory metadata",
+             "descriptor scalar load accepted raw-address metadata");
 }
 
 void TestDynamicReadRemainsTyped() {
@@ -191,8 +195,7 @@ void TestNestedSrtWalk() {
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
+  Check(WalkSrt(fixture.program, runtime, flat), "nested SRT walk failed");
   Check(flat == std::vector<uint32_t>({0x2000u, 0xabcdef01u}),
         "nested typed SRT reads were not evaluated in dependency order");
 }
@@ -215,10 +218,8 @@ void TestShaderBaseAndUserData() {
   SrtRuntime runtime{.user_data = user_data,
                      .shader_base = 0x12345678abcdef00ull};
   DescriptorValue result;
-  std::string error;
-  Check(EvaluateDescriptorSource(fixture.program, 0, 0x90, runtime, result,
-                                 &error),
-        error.c_str());
+  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result),
+        "shader-relative descriptor evaluation failed");
   Check(result.dword_count == 3 && result.dwords[0] == 0xabcdef00u &&
             result.dwords[1] == 0x12345678u && result.dwords[2] == 0x24u,
         "shader-relative typed descriptor expression evaluated incorrectly");
@@ -242,9 +243,8 @@ void TestCarryAndBitFields() {
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
   DescriptorValue result;
-  std::string error;
-  Check(EvaluateDescriptorSource(fixture.program, 0, 0, {}, result, &error),
-        error.c_str());
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result),
+        "carry and bit-field descriptor evaluation failed");
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
         "typed carry or bit-field runtime evaluation is incorrect");
@@ -267,17 +267,13 @@ void TestInvariantAndDivergentPhi() {
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
   DescriptorValue result;
-  std::string error;
-  Check(
-      EvaluateDescriptorSource(fixture.program, 0, 0x100, {}, result, &error) &&
-          result.dwords[0] == 7u,
-      "loop-invariant typed phi was rejected");
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+            result.dwords[0] == 7u,
+        "loop-invariant typed phi was rejected");
   result.dword_count = 4;
   result.dwords[0] = 0xdeadbeefu;
-  Check(!EvaluateDescriptorSource(fixture.program, 1, 0x104, {}, result,
-                                  &error) &&
-            result.dword_count == 4 && result.dwords[0] == 0xdeadbeefu &&
-            error.find("runtime-dependent") != std::string::npos,
+  Check(!EvaluateDescriptorSource(fixture.program, 1, {}, result) &&
+            result.dword_count == 4 && result.dwords[0] == 0xdeadbeefu,
         "divergent phi did not fail transactionally");
 }
 
@@ -318,8 +314,7 @@ void TestRuntime64BitDescriptorOps() {
       {.dwords = {low, high}, .dword_count = 2});
 
   DescriptorValue result;
-  std::string error;
-  Check(EvaluateDescriptorSource(fixture.program, 0, 0, {}, result, &error) &&
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
             result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
         "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
@@ -339,10 +334,9 @@ void TestConstantBufferBounds() {
   TestMemory memory_image{{{0x300cu, 0xa5a5a5a5u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error) &&
+  Check(WalkSrt(fixture.program, runtime, flat) &&
             flat == std::vector<uint32_t>{0xa5a5a5a5u},
-        error.c_str());
+        "constant-buffer SRT walk failed");
 
   Fixture overflow;
   const auto overflow_memory = overflow.AddMemory(ResourceKind::ScalarBuffer);
@@ -356,9 +350,8 @@ void TestConstantBufferBounds() {
                 {overflow_read, Value(0u), Value(16u), Value(0u)});
   overflow.Plan();
   flat = {0x55u};
-  Check(!WalkSrt(overflow.program, runtime, flat, &error) &&
-            flat == std::vector<uint32_t>{0x55u} &&
-            error.find("exceeds size") != std::string::npos,
+  Check(!WalkSrt(overflow.program, runtime, flat) &&
+            flat == std::vector<uint32_t>{0x55u},
         "out-of-bounds constant-buffer walk was not transactional");
 }
 
@@ -420,10 +413,9 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
 
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
-  const auto write = fixture.Emit(
-      ValueOpcode::WriteLane, {undef, Value(42u), Value(5u)});
-  const auto read =
-      fixture.Emit(ValueOpcode::ReadLane, {write, Value(5u)});
+  const auto write =
+      fixture.Emit(ValueOpcode::WriteLane, {undef, Value(42u), Value(5u)});
+  const auto read = fixture.Emit(ValueOpcode::ReadLane, {write, Value(5u)});
   entry_info.condition =
       fixture.Emit(ValueOpcode::IEqual32, {read, Value(42u)});
   fixture.Emit(ValueOpcode::Reference, {entry_info.condition});
@@ -435,11 +427,9 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   RemoveIdentities(fixture.program.blocks);
   EliminateDeadCode(fixture.program.blocks);
 
-  std::string error;
-  Check(entry_info.condition == Value(true) &&
-            ValidateProgram(fixture.program, true, &error),
-        error.empty() ? "folded branch condition did not survive identity removal"
-                      : error.c_str());
+  Check(entry_info.condition == Value(true),
+        "folded branch condition did not survive identity removal");
+  ValidateProgram(fixture.program, true);
 }
 
 void TestUndefinedRuntimeValueFails() {
@@ -450,11 +440,8 @@ void TestUndefinedRuntimeValueFails() {
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
   result.dword_count = 3;
-  std::string error;
-  Check(!EvaluateDescriptorSource(fixture.program, 0, 0x200, {}, result,
-                                  &error) &&
-            result.dword_count == 3 &&
-            error.find("undefined typed runtime value") != std::string::npos,
+  Check(!EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+            result.dword_count == 3,
         "undefined typed descriptor source did not fail transactionally");
 }
 
@@ -463,6 +450,14 @@ void TestUndefinedRuntimeValueFails() {
 namespace Common {
 
 int DbgExitIfHandler(const char *, const char *, int) { return 1; }
+
+int DbgExitHandler(const char *, int, std::string_view text) {
+  throw std::runtime_error(std::string(text));
+}
+
+int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
+  throw std::runtime_error(std::string(text));
+}
 
 void DbgExit(int) { std::abort(); }
 
@@ -496,9 +491,9 @@ int main() {
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.
 #include "../src/graphics/shader/recompiler/ir/Block.cpp"
+#include "../src/graphics/shader/recompiler/ir/Program.cpp"
 #include "../src/graphics/shader/recompiler/ir/Type.cpp"
 #include "../src/graphics/shader/recompiler/ir/Value.cpp"
-#include "../src/graphics/shader/recompiler/ir/Program.cpp"
 #include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"

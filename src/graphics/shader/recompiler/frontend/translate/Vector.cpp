@@ -2,7 +2,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error) {
+bool Translator::EmitVector(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
 	switch (inst.opcode) {
 		case O::V_NOP: return true;
@@ -13,8 +13,8 @@ bool Translator::EmitVector(const Decoder::Instruction& inst, std::string* error
 		case O::V_SUBREV_CO_CI_U32: SUBB_U32(inst, true); return true;
 
 		case O::V_MOV_B32: MOV_B32(inst, true); return true;
-		case O::V_MOVRELS_B32: return V_MOVRELS_B32(inst, error);
-		case O::V_MOVRELD_B32: return V_MOVRELD_B32(inst, error);
+		case O::V_MOVRELS_B32: V_MOVRELS_B32(inst); return true;
+		case O::V_MOVRELD_B32: V_MOVRELD_B32(inst); return true;
 		case O::V_READFIRSTLANE_B32: V_READFIRSTLANE_B32(inst); return true;
 		case O::V_READLANE_B32: V_READLANE_B32(inst); return true;
 		case O::V_WRITELANE_B32: V_WRITELANE_B32(inst); return true;

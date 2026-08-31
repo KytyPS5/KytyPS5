@@ -439,7 +439,8 @@ struct ValueEmitContext {
 	const IR::MemoryInfo& Memory(const IR::Inst& inst) const;
 	const IR::ExportInfo& Export(const IR::Inst& inst) const;
 	uint32_t              Label(const IR::Block* block) const;
-	void                  Fail(const IR::Inst& inst, const char* reason);
+	[[noreturn]] void     Fail(const char* reason) const;
+	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
 	const IR::Program&                                            program;
@@ -449,8 +450,6 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	const IR::Block*                                                   current_block = nullptr;
 	uint32_t                                                           scratch_u32_variable = 0;
-	bool                                                               failed               = false;
-	std::string                                                        error;
 };
 
 enum class VertexInputScalarKind { Float, Sint, Uint };
@@ -612,8 +611,6 @@ uint32_t VertexParameterVectorOrScalarType(EmitterState& state, VertexInputScala
 
 uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);
-
-void SetError(std::string* error, const char* message);
 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
 
@@ -864,7 +861,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
-bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* error);
+void EmitProgram(EmitterState& state, const IR::Program& program);
 
 void DefineGetBdaPointer(EmitterState& state);
 

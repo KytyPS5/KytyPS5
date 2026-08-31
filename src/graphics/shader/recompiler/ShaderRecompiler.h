@@ -39,8 +39,8 @@ struct CompileResult {
 	IR::ResourceSnapshot  resources;
 };
 
-bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
-                  CompileResult& result, std::string* error);
+[[nodiscard]] CompileResult Recompile(std::span<const uint32_t> code,
+                                      const CompileOptions& options);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

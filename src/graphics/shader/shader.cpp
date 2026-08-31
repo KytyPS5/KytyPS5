@@ -841,23 +841,22 @@ static void ApplyPixelOutputs(ShaderPixelInputInfo&                info,
 	}
 }
 
-static bool LogPermutationMismatch(const ShaderRecompiler::IR::Program& program,
-                                   const char* stage, const std::string& error) {
+static bool LogPermutationMismatch(const ShaderRecompiler::IR::Program* program,
+                                   const char* stage) {
 	static std::atomic<uint32_t> log_count {0};
 	if (Config::GraphicsDebugDumpEnabled() &&
 	    log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-		LOGF("ShaderProgramCache native runtime mismatch %s shader=0x%016" PRIx64 ": %s\n",
-		     stage, program.shader_hash, error.c_str());
+		LOGF("ShaderProgramCache native runtime mismatch %s shader=0x%016" PRIx64 "\n",
+		     stage, program != nullptr ? program->shader_hash : 0);
 	}
 	return false;
 }
 
 bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
                         const ShaderParams& params, ShaderVertexInputInfo& info) {
-	std::string error;
-	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage, &error,
+	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage,
 	                                   ReadShaderGuestMemory)) {
-		return LogPermutationMismatch(*program, "VS", error);
+		return LogPermutationMismatch(program.get(), "VS");
 	}
 	ApplyVertexOutputs(info, *program);
 	return true;
@@ -865,10 +864,9 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
 
 bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
                         const ShaderParams& params, ShaderPixelInputInfo& info) {
-	std::string error;
-	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage, &error,
+	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage,
 	                                   ReadShaderGuestMemory)) {
-		return LogPermutationMismatch(*program, "PS", error);
+		return LogPermutationMismatch(program.get(), "PS");
 	}
 	ApplyPixelOutputs(info, *program);
 	return true;
@@ -876,10 +874,9 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
 
 bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
                         const ShaderParams& params, ShaderComputeInputInfo& info) {
-	std::string error;
-	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage, &error,
+	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage,
 	                                   ReadShaderGuestMemory)) {
-		return LogPermutationMismatch(*program, "CS", error);
+		return LogPermutationMismatch(program.get(), "CS");
 	}
 	return true;
 }
@@ -1252,11 +1249,7 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
                                       ShaderStageRuntime& stage) {
 	const auto* stage_name = ShaderStageName(options.stage);
 	const auto* label      = ShaderStageLabel(options.stage);
-	ShaderRecompiler::CompileResult result;
-	std::string                     error;
-	if (!ShaderRecompiler::TryRecompile(params.code, options, result, &error)) {
-		ExitShaderRecompilerFailure(label, options.shader_hash, error.c_str());
-	}
+	auto result = ShaderRecompiler::Recompile(params.code, options);
 
 	DumpShaderRecompilerOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 	if (!SpirvValidateBinary(label, options.shader_hash, result.spirv)) {

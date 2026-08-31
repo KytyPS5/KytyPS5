@@ -477,7 +477,6 @@ struct DescriptorSource {
 struct SrtRead {
 	Value    value;
 	uint32_t flat_offset = 0;
-	uint32_t use_pc      = 0;
 
 	bool operator==(const SrtRead& other) const = default;
 };
@@ -523,7 +522,7 @@ struct Program {
 
 std::string ProgramToString(const Program& program);
 
-bool  ValidateProgram(const Program& program, bool require_ssa, std::string* error);
+void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const Program& program, Value left, Value right);
 Value ResolveInvariantPhi(const Program& program, Value value);

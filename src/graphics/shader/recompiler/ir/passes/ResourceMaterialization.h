@@ -22,19 +22,17 @@ struct ResourceSnapshot {
 	std::vector<IndirectImage>   indirect_images;
 };
 
-bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& snapshot,
-                              std::string* error);
-bool ValidateResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot,
-                                    std::string* error);
+bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& snapshot);
+bool ValidateResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot);
 
 // Resolves the immutable dense resource topology against one runtime user-data/SRT snapshot.
 // On failure the destination is unchanged.
 bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, std::string* error);
+                          ResourceSnapshot& snapshot);
 
 // Applies runtime descriptor shape/format facts to a copied dense topology before layout and
-// emission. On failure the program is unchanged.
-bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::string* error);
+// emission. Invalid specializations are fatal.
+void SpecializeResources(Program& program, ResourceSnapshot& snapshot);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

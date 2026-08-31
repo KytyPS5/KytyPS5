@@ -9,10 +9,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-bool AnalyzeProgramRequirements(IR::Program& program, std::string* error);
+void AnalyzeProgramRequirements(IR::Program& program);
 
-bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
-                 ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv, std::string* error);
+std::vector<uint32_t> EmitProgram(const IR::Program& program,
+                                  const IR::ResourceSnapshot& resources,
+                                  ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

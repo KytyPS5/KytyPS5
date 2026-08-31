@@ -895,9 +895,9 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
-	std::string error;
-	if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot, &error)) {
-		EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
+	if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot)) {
+		EXIT("invalid native shader runtime snapshot: hash=0x%016" PRIx64 " stage=%u\n",
+		     program.shader_hash, static_cast<unsigned>(program.stage));
 	}
 
 	PreparedBindings prepared;

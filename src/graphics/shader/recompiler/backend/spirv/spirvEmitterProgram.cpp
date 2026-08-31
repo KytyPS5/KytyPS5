@@ -1,8 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "common/assert.h"
+
 #include <algorithm>
 #include <bit>
-#include <fmt/format.h>
 #include <functional>
 #include <optional>
 #include <unordered_set>
@@ -196,57 +197,50 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 	}
 }
 
-bool EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (EmitValueFlow(ctx, inst) || EmitValueAlu(ctx, inst) || EmitValueMemory(ctx, inst) ||
 	    EmitValueImage(ctx, inst)) {
-		return true;
+		return;
 	}
 	ctx.Fail(inst, "has no direct SPIR-V emitter");
-	return false;
 }
 
-bool EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
+void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
                                const IR::Inst& inst) {
 	if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 		const auto type = ctx.TypeId(inst.GetType());
 		if (type == 0 || inst.NumArgs() == 0) {
 			ctx.Fail(inst, "has no native SPIR-V representation");
-			return false;
 		}
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			const auto* predecessor = inst.PhiBlock(index);
 			if (predecessor == nullptr || !ctx.labels.contains(predecessor)) {
 				ctx.Fail(inst, "has a predecessor outside the structured function");
-				return false;
 			}
 		}
 		structured.deferred_phis.push_back(
 		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst});
-		return true;
+		return;
 	}
-	return EmitDirectInstruction(ctx, inst);
+	EmitDirectInstruction(ctx, inst);
 }
 
-bool EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                                const IR::Inst& inst) {
 	if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 		const auto type = ctx.TypeId(inst.GetType());
 		if (type == 0) {
 			ctx.Fail(inst, "cannot be loaded by the dispatcher");
-			return false;
 		}
 		ctx.state.builder.AddFunction(
 		    {OpLoad, type, ctx.Result(inst), dispatcher.spills.at(&inst)});
-		return true;
+		return;
 	}
-	if (!EmitDirectInstruction(ctx, inst)) {
-		return false;
-	}
+	EmitDirectInstruction(ctx, inst);
 	if (const auto found = dispatcher.spills.find(&inst); found != dispatcher.spills.end()) {
 		ctx.state.builder.AddFunction(
 		    {OpStore, found->second, ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)))});
 	}
-	return true;
 }
 
 template <typename EmitInstruction>
@@ -258,14 +252,11 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
 				ctx.Fail(inst, "appears after a non-Phi instruction");
-				return;
 			}
 		} else {
 			emitted_non_phi = true;
 		}
-		if (!emit_instruction(inst)) {
-			return;
-		}
+		emit_instruction(inst);
 	}
 }
 
@@ -275,15 +266,10 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 			const auto* predecessor = deferred.instruction->PhiBlock(index);
 			const auto  found       = structured.block_exit_labels.find(predecessor);
 			if (found == structured.block_exit_labels.end()) {
-				ctx.failed = true;
-				ctx.error  = "typed Phi predecessor was not emitted";
-				return;
+				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
 			ctx.state.builder.PatchDeferredPhi(
 			    deferred.phi, index, ctx.Def(deferred.instruction->Arg(index)), found->second);
-			if (ctx.failed) {
-				return;
-			}
 		}
 	}
 }
@@ -291,20 +277,15 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction({OpBranch, ctx.Label(ctx.program.blocks.front())});
-	for (size_t index = 0; index < ctx.program.blocks.size() && !ctx.failed; index++) {
+	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
 		const auto* block = ctx.program.blocks[index];
 		EmitBlock(ctx, block, [&](const IR::Inst& inst) {
-			return EmitStructuredInstruction(ctx, structured, inst);
+			EmitStructuredInstruction(ctx, structured, inst);
 		});
-		if (ctx.failed) {
-			break;
-		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, ctx.program.block_info[index]);
 	}
-	if (!ctx.failed) {
-		PatchStructuredPhis(ctx, structured);
-	}
+	PatchStructuredPhis(ctx, structured);
 }
 
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
@@ -312,11 +293,8 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto* entry = ctx.program.blocks.front();
 	state.builder.AddFunction({OpBranch, ctx.Label(entry)});
 	EmitBlock(ctx, entry, [&](const IR::Inst& inst) {
-		return EmitDispatcherInstruction(ctx, dispatcher, inst);
+		EmitDispatcherInstruction(ctx, dispatcher, inst);
 	});
-	if (ctx.failed) {
-		return;
-	}
 	const auto initial_pc =
 	    EmitDispatcherNextPc(ctx, dispatcher, entry, ctx.program.block_info.front());
 	const auto initial_parent = state.current_label;
@@ -347,21 +325,15 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	std::vector<uint32_t> next_pc_words {OpPhi, TypeU32(state), next_pc,
 	                                     ConstantU32(state, UINT32_MAX), dispatcher.select_label};
 
-	for (size_t index = 1; index < ctx.program.blocks.size() && !ctx.failed; index++) {
+	for (size_t index = 1; index < ctx.program.blocks.size(); index++) {
 		EmitBlock(ctx, ctx.program.blocks[index], [&](const IR::Inst& inst) {
-			return EmitDispatcherInstruction(ctx, dispatcher, inst);
+			EmitDispatcherInstruction(ctx, dispatcher, inst);
 		});
-		if (ctx.failed) {
-			break;
-		}
 		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, ctx.program.blocks[index],
 		                                           ctx.program.block_info[index]);
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction({OpBranch, dispatcher.after_switch_label});
-	}
-	if (ctx.failed) {
-		return;
 	}
 	EmitLabel(state, dispatcher.after_switch_label);
 	state.builder.AddFunction(next_pc_words);
@@ -408,9 +380,7 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	}
 	const auto* inst = value.ResolveInstruction();
 	if (inst == nullptr) {
-		failed = true;
-		error  = "direct SPIR-V emitter received a non-value argument";
-		return ConstantU32(state, 0);
+		Fail("direct SPIR-V emitter received a non-value argument");
 	}
 	if (dispatcher_spills != nullptr && current_block != nullptr &&
 	    inst->Parent() != current_block) {
@@ -469,9 +439,7 @@ uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
 uint32_t ValueEmitContext::ResourceIndex(IR::Value value, IR::ValueOpcode opcode) {
 	const auto* inst = value.ResolveInstruction();
 	if (inst == nullptr || inst->GetOpcode() != opcode) {
-		failed = true;
-		error  = "typed resource handle has the wrong producer";
-		return 0;
+		Fail("typed resource handle has the wrong producer");
 	}
 	return inst->Flags<uint32_t>();
 }
@@ -479,9 +447,7 @@ uint32_t ValueEmitContext::ResourceIndex(IR::Value value, IR::ValueOpcode opcode
 const IR::Inst* ValueEmitContext::ImageAddress(IR::Value value) {
 	const auto* inst = value.ResolveInstruction();
 	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::MakeImageAddress) {
-		failed = true;
-		error  = "typed image address was not constructed by MakeImageAddress";
-		return nullptr;
+		Fail("typed image address was not constructed by MakeImageAddress");
 	}
 	return inst;
 }
@@ -498,12 +464,20 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 	return labels.at(block);
 }
 
-void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) {
-	failed = true;
-	error  = fmt::format("typed opcode {} {}", IR::ValueOpcodeName(inst.GetOpcode()), reason);
+[[noreturn]] void ValueEmitContext::Fail(const char* reason) const {
+	EXIT("SPIR-V emission failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
+	     program.shader_hash, static_cast<unsigned>(program.stage), reason);
+	std::abort();
 }
 
-bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* error) {
+[[noreturn]] void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) const {
+	EXIT("SPIR-V emission failed: hash=0x%016" PRIx64 " stage=%u opcode=%s reason=%s\n",
+	     program.shader_hash, static_cast<unsigned>(program.stage),
+	     IR::ValueOpcodeName(inst.GetOpcode()), reason);
+	std::abort();
+}
+
+void EmitProgram(EmitterState& state, const IR::Program& program) {
 	ValueEmitContext                       ctx(state, program);
 	std::optional<DispatcherFunctionState> dispatcher;
 	if (state.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
@@ -561,10 +535,6 @@ bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* e
 		dispatch.continue_label     = state.builder.AllocateId();
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills;
-	}
-	if (ctx.failed) {
-		SetError(error, ctx.error.c_str());
-		return false;
 	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {
@@ -630,11 +600,6 @@ bool EmitProgram(EmitterState& state, const IR::Program& program, std::string* e
 		EmitStructuredFunction(ctx);
 	}
 	state.builder.AddFunction({OpFunctionEnd});
-	if (ctx.failed) {
-		SetError(error, ctx.error.c_str());
-		return false;
-	}
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

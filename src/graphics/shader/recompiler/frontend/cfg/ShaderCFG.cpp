@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
+#include "common/assert.h"
+
 #include <algorithm>
 #include <fmt/format.h>
 #include <iterator>
@@ -24,19 +26,18 @@ struct SetpcTargetInfo {
 	std::vector<uint32_t> selector_target_pcs;
 };
 
-void SetError(std::string* error, const std::string& message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-}
-
-void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::string& message,
-                std::string* error) {
+void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::string& message) {
 	graph.unsupported        = true;
 	graph.failure_kind       = kind;
 	graph.failure_block      = block_id;
 	graph.unsupported_reason = message;
-	SetError(error, message);
+}
+
+[[noreturn]] void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
+                                   const std::string& message) {
+	SetFailure(graph, kind, block_id, message);
+	EXIT("shader CFG build failed: %s", message.c_str());
+	std::abort();
 }
 
 uint32_t InstructionEndPc(const Instruction& inst) {
@@ -1267,7 +1268,7 @@ bool MergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t mer
 	return false;
 }
 
-bool CanonicalizeNaturalLoops(Graph& graph, std::string* error) {
+bool CanonicalizeNaturalLoops(Graph& graph) {
 	const auto rewrite_budget = graph.blocks.size() * 2u + 16u;
 	for (size_t rewrite = 0; rewrite < rewrite_budget; rewrite++) {
 		bool changed = false;
@@ -1322,19 +1323,18 @@ bool CanonicalizeNaturalLoops(Graph& graph, std::string* error) {
 	}
 
 	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
-	           "CFG loop canonicalization exceeded rewrite budget", error);
+	           "CFG loop canonicalization exceeded rewrite budget");
 	return false;
 }
 
-bool IsolateSemanticLoopHeaders(Graph& graph, std::string* error) {
+bool IsolateSemanticLoopHeaders(Graph& graph) {
 	const auto isolation_budget = graph.natural_loops.size() + 1u;
 	for (size_t isolation = 0; isolation < isolation_budget; isolation++) {
-		const auto loop = std::find_if(graph.natural_loops.begin(), graph.natural_loops.end(),
-		                               [&](const auto& value) {
-			                               const auto* header = graph.FindBlock(value.header);
-			                               return header != nullptr &&
-			                                      header->inst_begin != header->inst_end;
-		                               });
+		const auto loop = std::find_if(
+		    graph.natural_loops.begin(), graph.natural_loops.end(), [&](const auto& value) {
+			    const auto* header = graph.FindBlock(value.header);
+			    return header != nullptr && header->inst_begin != header->inst_end;
+		    });
 		if (loop == graph.natural_loops.end()) {
 			return true;
 		}
@@ -1346,14 +1346,13 @@ bool IsolateSemanticLoopHeaders(Graph& graph, std::string* error) {
 		// displacing OpLoopMerge into a helper-created block.
 		if (!IsolateSemanticLoopHeader(graph, loop->header)) {
 			SetFailure(graph, FailureKind::StructuredControlFlow, loop->header,
-			           fmt::format("failed to isolate semantic loop header {}", loop->header),
-			           error);
+			           fmt::format("failed to isolate semantic loop header {}", loop->header));
 			return false;
 		}
 	}
 
 	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
-	           "CFG semantic loop-header isolation exceeded rewrite budget", error);
+	           "CFG semantic loop-header isolation exceeded rewrite budget");
 	return false;
 }
 
@@ -1453,7 +1452,7 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
-bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
+bool SplitOneSelectionMerge(Graph& graph) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
 	for (const auto& loop: graph.natural_loops) {
@@ -1501,8 +1500,7 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 			    graph, FailureKind::StructuredControlFlow, block_id,
 			    fmt::format("selection header block {} has externally entered region block {}; "
 			                "semantic block cloning is disabled",
-			                block_id, *external),
-			    error);
+			                block_id, *external));
 			return false;
 		}
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
@@ -1514,11 +1512,11 @@ bool SplitOneSelectionMerge(Graph& graph, std::string* error) {
 	return false;
 }
 
-bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
+bool SplitSharedMergeBlocks(Graph& graph) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph, error)) {
+		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
 			return !graph.unsupported;
 		}
 		RebuildPredecessors(graph);
@@ -1528,8 +1526,7 @@ bool SplitSharedMergeBlocks(Graph& graph, std::string* error) {
 	           fmt::format("CFG shared merge splitting exceeded budget: original_blocks={} "
 	                       "current_blocks={} split_budget={}",
 	                       original_block_count, static_cast<uint64_t>(graph.blocks.size()),
-	                       split_budget),
-	           error);
+	                       split_budget));
 	return false;
 }
 
@@ -1890,12 +1887,11 @@ bool RouteSharedSelectionArm(Graph& graph, uint32_t route_variable) {
 
 } // namespace
 
-bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* error) {
-	graph = {};
-
+Graph BuildGraph(const Decoder::Program& program) {
+	Graph graph;
 	if (program.instructions.empty()) {
-		SetError(error, "cannot build CFG for empty shader");
-		return false;
+		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
+		                 "cannot build CFG for empty shader");
 	}
 
 	const auto first_pc = program.instructions.front().pc;
@@ -1905,11 +1901,10 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 	for (const auto& inst: program.instructions) {
 		instruction_pcs.insert(inst.pc);
 		if (inst.opcode == Opcode::UNSUPPORTED) {
-			SetFailure(graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
-			           fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}",
-			                       inst.pc, Decoder::InstructionToString(inst).c_str()),
-			           error);
-			return false;
+			ExitBuildFailure(
+			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
+			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
+			                Decoder::InstructionToString(inst).c_str()));
 		}
 	}
 
@@ -1923,11 +1918,9 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 		const auto  next_pc = InstructionEndPc(inst);
 		if (IsBranch(inst.opcode)) {
 			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
-				SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				           fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}", inst.pc,
-				                       inst.branch_target),
-				           error);
-				return false;
+				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
+				                             inst.pc, inst.branch_target));
 			}
 			labels.insert(inst.branch_target);
 			if (next_pc <= end_pc) {
@@ -1936,21 +1929,19 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
-				SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				           fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc),
-				           error);
-				return false;
+				ExitBuildFailure(
+				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
 			const auto& target_pcs = target_info.indirect
 			                             ? target_info.target_pcs
 			                             : std::vector<uint32_t> {target_info.target};
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
-					SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-					           fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
-					                       inst.pc, target),
-					           error);
-					return false;
+					ExitBuildFailure(
+					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
+					                inst.pc, target));
 				}
 				labels.insert(target);
 			}
@@ -1971,10 +1962,9 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			continue;
 		}
 		if (start != end_pc && !instruction_pcs.contains(start)) {
-			SetFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
-			           fmt::format("CFG label does not start on an instruction: 0x{:08x}", start),
-			           error);
-			return false;
+			ExitBuildFailure(
+			    graph, FailureKind::InvalidLabel, UINT32_MAX,
+			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
 		}
 
 		BasicBlock block;
@@ -2046,11 +2036,10 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
 			const auto fallthrough      = pc_to_block.find(next_pc);
 			if (fallthrough == pc_to_block.end()) {
-				SetFailure(graph, FailureKind::MissingFallthrough, block.id,
-				           fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
-				                       last.pc),
-				           error);
-				return false;
+				ExitBuildFailure(
+				    graph, FailureKind::MissingFallthrough, block.id,
+				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
+				                last.pc));
 			}
 			block.terminator.false_block = fallthrough->second;
 		} else {
@@ -2131,27 +2120,26 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 		graph.unsupported = false;
 	}
 
-	return true;
+	return graph;
 }
 
 namespace {
 
-bool StructurizeImpl(Graph& graph, std::string* error) {
+bool StructurizeImpl(Graph& graph) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
 			graph.unsupported_reason = "unsupported CFG";
 		}
-		SetError(error, graph.unsupported_reason);
 		return false;
 	}
 
-	if (!CanonicalizeNaturalLoops(graph, error)) {
+	if (!CanonicalizeNaturalLoops(graph)) {
 		return false;
 	}
-	if (!SplitSharedMergeBlocks(graph, error)) {
+	if (!SplitSharedMergeBlocks(graph)) {
 		return false;
 	}
-	if (!IsolateSemanticLoopHeaders(graph, error)) {
+	if (!IsolateSemanticLoopHeaders(graph)) {
 		return false;
 	}
 	ClearStructuredTerminators(graph);
@@ -2164,8 +2152,7 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 			    graph, FailureKind::StructuredControlFlow, header,
 			    fmt::format(
 			        "duplicate structured merge block {} for header {} (already used by header {})",
-			        merge, header, it->second),
-			    error);
+			        merge, header, it->second));
 			return false;
 		}
 		return true;
@@ -2176,16 +2163,14 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 		if (header == nullptr || loop.merge == UINT32_MAX || loop.continue_block == UINT32_MAX) {
 			SetFailure(
 			    graph, FailureKind::StructuredControlFlow, loop.header,
-			    fmt::format("loop at block {} has no structured merge/continue", loop.header),
-			    error);
+			    fmt::format("loop at block {} has no structured merge/continue", loop.header));
 			return false;
 		}
 		if (header->inst_begin != header->inst_end ||
 		    header->terminator.kind != TerminatorKind::Branch) {
-			SetFailure(graph, FailureKind::StructuredControlFlow, loop.header,
-			           fmt::format("loop header {} is not a dedicated empty control block",
-			                       loop.header),
-			           error);
+			SetFailure(
+			    graph, FailureKind::StructuredControlFlow, loop.header,
+			    fmt::format("loop header {} is not a dedicated empty control block", loop.header));
 			return false;
 		}
 		if (!reserve_merge_block(loop.header, loop.merge)) {
@@ -2208,8 +2193,7 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 		const auto merge = FindSelectionMerge(graph, block);
 		if (merge == UINT32_MAX) {
 			SetFailure(graph, FailureKind::StructuredControlFlow, block.id,
-			           fmt::format("conditional block {} has no structured merge", block.id),
-			           error);
+			           fmt::format("conditional block {} has no structured merge", block.id));
 			return false;
 		}
 
@@ -2224,16 +2208,15 @@ bool StructurizeImpl(Graph& graph, std::string* error) {
 
 } // namespace
 
-bool Structurize(Graph& graph, std::string* error) {
+bool Structurize(Graph& graph) {
 	Graph original = graph;
-	if (StructurizeImpl(graph, error)) {
+	if (StructurizeImpl(graph)) {
 		return true;
 	}
 
-	Graph       failed_graph = std::move(graph);
-	std::string failed_error = error != nullptr ? *error : std::string {};
-	graph                    = std::move(original);
-	const auto route_budget  = static_cast<uint32_t>(graph.blocks.size());
+	Graph failed_graph      = std::move(graph);
+	graph                   = std::move(original);
+	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
 	// Apply one route at a time and retry. Eagerly routing every matching diamond can
 	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
@@ -2241,18 +2224,12 @@ bool Structurize(Graph& graph, std::string* error) {
 			break;
 		}
 		Graph routed = graph;
-		if (error != nullptr) {
-			error->clear();
-		}
-		if (StructurizeImpl(routed, error)) {
+		if (StructurizeImpl(routed)) {
 			graph = std::move(routed);
 			return true;
 		}
 	}
 	graph = std::move(failed_graph);
-	if (error != nullptr) {
-		*error = std::move(failed_error);
-	}
 	return false;
 }
 

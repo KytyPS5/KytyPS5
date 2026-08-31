@@ -52,7 +52,7 @@ SrtProgram(uint64_t address) {
       ValueOpcode::LoadAddressU32,
       {Value(&handle), Value(0u), Value(0u), Value(true)});
   raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
-  program.srt_reads.push_back({Value(&raw), 0, 0x40});
+  program.srt_reads.push_back({Value(&raw), 0});
 
   auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
   auto &flat = value_block.AppendNewInst(ValueOpcode::ReadConst,
@@ -77,17 +77,38 @@ UnbasedFlatProgram() {
   return std::make_shared<const Program>(std::move(program));
 }
 
+std::shared_ptr<const Libs::Graphics::ShaderRecompiler::IR::Program>
+UserDataBufferProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &value_block = AddValueBlock(program);
+
+  auto &user_data = value_block.AppendNewInst(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  DescriptorSource source;
+  source.dwords[0] = Value(&user_data);
+  source.dwords[1] = Value(0u);
+  source.dwords[2] = Value(0u);
+  source.dwords[3] = Value(0u);
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return std::make_shared<const Program>(std::move(program));
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics;
   const uint32_t dword = 0x12345678;
   auto cached_program = SrtProgram(reinterpret_cast<uint64_t>(&dword));
   ShaderStageRuntime stage;
-  std::string error;
   uint32_t specialization_reads = 0;
-  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error,
+  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage,
                                       RejectSpecializationRead,
                                       &specialization_reads),
-        error.c_str());
+        "mapped SRT stage materialization failed");
   Check(specialization_reads == 0,
         "ordinary SRT read used the specialization reader");
   Check(stage.program == cached_program && stage.resources != nullptr,
@@ -104,15 +125,35 @@ void TestUnbasedFlatCacheHitMaterializes() {
   auto prior_resources =
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
   ShaderStageRuntime stage{prior_program, prior_resources};
-  std::string error;
-  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error), error.c_str());
+  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage),
+        "unbased FLAT stage materialization failed");
   Check(stage.program == cached_program && stage.resources != prior_resources,
         "unbased FLAT cache hit did not publish its BDA stage snapshot");
+}
+
+void TestFailedMaterializationPreservesPriorStage() {
+  using namespace Libs::Graphics;
+  auto cached_program = UserDataBufferProgram();
+  auto prior_program = std::make_shared<const ShaderRecompiler::IR::Program>();
+  auto prior_resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
+  ShaderStageRuntime stage{prior_program, prior_resources};
+
+  Check(!ShaderMaterializeStageRuntime(cached_program, {}, 0, stage),
+        "missing runtime user data did not reject the cached stage");
+  Check(stage.program == prior_program && stage.resources == prior_resources,
+        "failed cache materialization replaced the prior stage");
 }
 
 } // namespace
 
 namespace Common {
+
+int DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
+
+int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
+  std::abort();
+}
 
 int DbgExitIfHandler(const char *, const char *, int) { return 1; }
 
@@ -123,6 +164,7 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestUnbasedFlatCacheHitMaterializes();
+  TestFailedMaterializationPreservesPriorStage();
   std::puts("ShaderStageRuntimeTests: all cases passed");
   return 0;
 }
@@ -130,7 +172,7 @@ int main() {
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.
 #include "graphics/shader/recompiler/ir/Block.cpp"
+#include "graphics/shader/recompiler/ir/Program.cpp"
 #include "graphics/shader/recompiler/ir/Type.cpp"
 #include "graphics/shader/recompiler/ir/Value.cpp"
-#include "graphics/shader/recompiler/ir/Program.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"

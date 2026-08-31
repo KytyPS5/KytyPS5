@@ -1,9 +1,7 @@
-#include "common/magicEnum.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
 #include <array>
-#include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -890,7 +888,7 @@ bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
 	return true;
 }
 
-bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error) {
+bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::S_LOAD_DWORD:
 		case Decoder::Opcode::S_LOAD_DWORDX2:
@@ -1080,12 +1078,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_WRITE_B64:
 		case Decoder::Opcode::DS_WRITE_B96:
 		case Decoder::Opcode::DS_WRITE_B128: return DS_WRITE(inst);
-		default:
-			if (error != nullptr) {
-				*error = fmt::format("memory-family opcode has no specialized IR translation: {}",
-				                     magic_enum::enum_name(inst.opcode));
-			}
-			return false;
+		default: return false;
 	}
 }
 

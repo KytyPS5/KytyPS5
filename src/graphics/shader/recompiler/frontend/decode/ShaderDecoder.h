@@ -704,12 +704,11 @@ struct Program {
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
-bool DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                       std::string* error);
-bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error);
+void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
+void DecodeProgram(std::span<const uint32_t> code, Program& program);
 
-bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
-bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
+void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
+void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeVectorGpr(uint32_t reg, Operand& operand);
 void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,

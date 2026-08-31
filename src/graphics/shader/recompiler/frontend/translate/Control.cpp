@@ -1,3 +1,4 @@
+#include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -163,12 +164,12 @@ void Translator::S_INST_PREFETCH() {
 	ir.Emit(IR::ValueOpcode::InstPrefetch);
 }
 
-bool Translator::S_GETPC_B64(const Decoder::Instruction& inst, std::string* error) {
+void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
 	const auto address = IR::U64(
 	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
-		return true;
+		return;
 	}
 	auto high = PlainOperand(inst.dst);
 	switch (inst.dst.kind) {
@@ -179,25 +180,19 @@ bool Translator::S_GETPC_B64(const Decoder::Instruction& inst, std::string* erro
 				high.kind = Decoder::OperandKind::VccLo;
 				high.reg  = 0u;
 			} else {
-				if (error != nullptr) {
-					*error = "S_GETPC_B64 destination does not name a valid scalar pair";
-				}
-				return false;
+				EXIT("S_GETPC_B64 destination does not name a valid scalar pair at pc 0x%08x",
+				     inst.pc);
 			}
 			break;
 		case Decoder::OperandKind::VccLo: high.kind = Decoder::OperandKind::VccHi; break;
 		case Decoder::OperandKind::M0: high.kind = Decoder::OperandKind::Null; break;
 		case Decoder::OperandKind::ExecLo: high.kind = Decoder::OperandKind::ExecHi; break;
 		default:
-			if (error != nullptr) {
-				*error = "S_GETPC_B64 destination does not name a valid scalar pair";
-			}
-			return false;
+			EXIT("S_GETPC_B64 destination does not name a valid scalar pair at pc 0x%08x", inst.pc);
 	}
 	const auto words = ExtractU64(address);
 	WriteOperand(inst.dst, words[0]);
 	WriteOperand(high, words[1]);
-	return true;
 }
 
 void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
@@ -213,8 +208,8 @@ void Translator::S_CSELECT_B64(const Decoder::Instruction& inst) {
 }
 
 void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers) {
-	if (inst.src0.kind == Decoder::OperandKind::Sgpr && inst.dst.kind == Decoder::OperandKind::Sgpr &&
-	    inst.src0.reg == inst.dst.reg) {
+	if (inst.src0.kind == Decoder::OperandKind::Sgpr &&
+	    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.src0.reg == inst.dst.reg) {
 		return;
 	}
 	if (IsExecOrVcc(inst.src0) && IsExecOrVcc(inst.dst)) {
@@ -242,21 +237,15 @@ void Translator::S_WQM_B64(const Decoder::Instruction& inst) {
 	ir.SetScc(ScalarU64NonZero(result));
 }
 
-bool Translator::V_MOVRELS_B32(const Decoder::Instruction& inst, std::string* error) {
+void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	if (inst.dst.kind != Decoder::OperandKind::Vgpr ||
 	    inst.src0.kind != Decoder::OperandKind::Vgpr) {
-		if (error != nullptr) {
-			*error = "V_MOVRELS_B32 requires VGPR source and destination";
-		}
-		return false;
+		EXIT("V_MOVRELS_B32 requires VGPR source and destination at pc 0x%08x", inst.pc);
 	}
 	if (inst.dst.sdwa_sel != 6u || inst.dst.omod != 0u || inst.dst.clamp ||
 	    inst.src0.sdwa_sel != 6u || inst.src0.sdwa_sext || inst.src0.negate || inst.src0.absolute ||
 	    inst.src0.dpp) {
-		if (error != nullptr) {
-			*error = "V_MOVRELS_B32 modifiers are not implemented";
-		}
-		return false;
+		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
 	const auto base     = inst.src0.reg;
 	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
@@ -267,23 +256,16 @@ bool Translator::V_MOVRELS_B32(const Decoder::Instruction& inst, std::string* er
 		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
 	}
 	WriteOperand(DestinationOperand(inst), selected);
-	return true;
 }
 
-bool Translator::V_MOVRELD_B32(const Decoder::Instruction& inst, std::string* error) {
+void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	if (inst.dst.kind != Decoder::OperandKind::Vgpr) {
-		if (error != nullptr) {
-			*error = "V_MOVRELD_B32 requires VGPR destination";
-		}
-		return false;
+		EXIT("V_MOVRELD_B32 requires VGPR destination at pc 0x%08x", inst.pc);
 	}
 	if (inst.dst.sdwa_sel != 6u || inst.dst.omod != 0u || inst.dst.clamp ||
 	    inst.src0.sdwa_sel != 6u || inst.src0.sdwa_sext || inst.src0.negate || inst.src0.absolute ||
 	    inst.src0.dpp) {
-		if (error != nullptr) {
-			*error = "V_MOVRELD_B32 modifiers are not implemented";
-		}
-		return false;
+		EXIT("V_MOVRELD_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
 	const auto base  = inst.dst.reg;
 	const auto value = ReadU32(inst.src0);
@@ -295,7 +277,6 @@ bool Translator::V_MOVRELD_B32(const Decoder::Instruction& inst, std::string* er
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
 		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
 	}
-	return true;
 }
 
 void Translator::V_READFIRSTLANE_B32(const Decoder::Instruction& inst) {

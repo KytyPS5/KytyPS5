@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
+#include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -7,6 +8,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+[[noreturn]] void Fail(std::string_view message) {
+	EXIT("shader info collection failed: %s", std::string(message).c_str());
+	std::abort();
+}
 
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
               std::string name, bool per_vertex = false) {
@@ -34,38 +40,38 @@ void AddOutput(ShaderInfo& info, StageOutputKind kind, uint32_t index, uint32_t 
 	}
 }
 
-bool ValidateOptions(const Program& program, const ShaderInfoOptions& options, std::string* error) {
-	auto Fail = [&](const char* message) {
-		if (error != nullptr) {
-			*error = message;
-		}
-		return false;
-	};
+void ValidateOptions(const Program& program, const ShaderInfoOptions& options) {
 	switch (program.stage) {
 		case ShaderType::Vertex:
+			if (options.vertex == nullptr) {
+				return Fail("vertex shader has no input metadata");
+			}
 			if (options.vertex->resources_num < 0 ||
 			    options.vertex->resources_num > ShaderVertexInputInfo::RES_MAX) {
 				return Fail("vertex resource count is out of range");
 			}
-			return true;
+			return;
 		case ShaderType::Pixel:
-			return options.pixel->input_num <= std::size(options.pixel->interpolator_settings) ||
-			       Fail("pixel input count is out of range");
+			if (options.pixel == nullptr) {
+				return Fail("pixel shader has no input metadata");
+			}
+			if (options.pixel->input_num > std::size(options.pixel->interpolator_settings)) {
+				return Fail("pixel input count is out of range");
+			}
+			return;
 		case ShaderType::Compute:
-			return (options.compute->thread_ids_num >= 0 && options.compute->thread_ids_num <= 3) ||
-			       Fail("compute thread ID count is out of range");
+			if (options.compute == nullptr) {
+				return Fail("compute shader has no input metadata");
+			}
+			if (options.compute->thread_ids_num < 0 || options.compute->thread_ids_num > 3) {
+				return Fail("compute thread ID count is out of range");
+			}
+			return;
 		default: return Fail("unsupported shader stage for info collection");
 	}
 }
 
-bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& options,
-                             std::string* error) {
-	const auto Fail = [&](const char* message) {
-		if (error != nullptr) {
-			*error = message;
-		}
-		return false;
-	};
+void ValidateValueReferences(const Program& program, const ShaderInfoOptions& options) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			switch (inst.GetOpcode()) {
@@ -148,7 +154,6 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 			}
 		}
 	}
-	return true;
 }
 
 void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* vertex,
@@ -269,14 +274,8 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 	}
 }
 
-bool CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
-	                const ShaderPixelInputInfo* pixel, ShaderInfo& info, std::string* error) {
-	auto Fail = [&](std::string message) {
-		if (error != nullptr) {
-			*error = std::move(message);
-		}
-		return false;
-	};
+void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
+                    const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
@@ -347,31 +346,23 @@ bool CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 			}
 		}
 	}
-	return true;
 }
 
 } // namespace
 
-bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::string* error) {
+void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
-		if (error != nullptr) {
-			*error = !program.resource_tracking_complete ? "shader resources were not tracked"
-			                                             : "shader info already collected";
-		}
-		return false;
+		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
+		                                                : "shader info already collected");
 	}
-	if (!ValidateOptions(program, options, error)) {
-		return false;
-	}
-	if (!ValidateValueReferences(program, options, error)) {
-		return false;
-	}
+	ValidateOptions(program, options);
+	ValidateValueReferences(program, options);
 
 	auto next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
-	next.has_bitwise_xor = std::any_of(
-	    program.blocks.begin(), program.blocks.end(), [](const auto* block) {
+	next.has_bitwise_xor =
+	    std::any_of(program.blocks.begin(), program.blocks.end(), [](const auto* block) {
 		    return std::any_of(block->begin(), block->end(), [](const auto& inst) {
 			    return inst.GetOpcode() == ValueOpcode::BitwiseXor32;
 		    });
@@ -380,15 +371,12 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
-		default: return false;
+		default: return Fail("unsupported shader stage for info collection");
 	}
 	CollectBuiltinInputs(program, next);
-	if (!CollectOutputs(program, options.vertex, options.pixel, next, error)) {
-		return false;
-	}
+	CollectOutputs(program, options.vertex, options.pixel, next);
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

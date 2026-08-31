@@ -472,20 +472,14 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 
 } // namespace
 
-bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
-                  CompileResult& result, std::string* error) {
+CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
-		if (error != nullptr) {
-			*error = "invalid shader recompiler input";
-		}
-		return false;
+		EXIT("shader recompiler input is empty\n");
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
 	    options.stage != ShaderType::Pixel) {
-		if (error != nullptr) {
-			*error = "shader recompiler supports compute, vertex, and pixel stages";
-		}
-		return false;
+		EXIT("shader recompiler received unsupported stage %u\n",
+		     static_cast<unsigned>(options.stage));
 	}
 
 	const auto compile_begin = std::chrono::steady_clock::now();
@@ -500,9 +494,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     static_cast<uint64_t>(code.size()));
 
 	Decoder::Program decoded;
-	if (!Decoder::DecodeProgram(code, decoded, error)) {
-		return false;
-	}
+	Decoder::DecodeProgram(code, decoded);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -516,12 +508,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 	}
 
-	CFG::Graph cfg;
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	if (!CFG::BuildGraph(decoded, cfg, error)) {
-		return false;
-	}
+	auto cfg = CFG::BuildGraph(decoded);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -534,13 +523,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		dispatcher_reason   = cfg.unsupported_reason;
 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
 	} else {
-		std::string structure_error;
-		const auto  unstructured_cfg = cfg;
+		const auto unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-		if (!CFG::Structurize(cfg, &structure_error)) {
+		if (!CFG::Structurize(cfg)) {
 			dispatcher_fallback      = true;
-			dispatcher_reason        = structure_error;
+			dispatcher_reason        = cfg.unsupported_reason;
 			const auto failure_kind  = cfg.failure_kind;
 			const auto failure_block = cfg.failure_block;
 			LogDispatcherFallback(options, cfg, "structurize", dispatcher_reason);
@@ -548,7 +536,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			cfg.unsupported        = true;
 			cfg.failure_kind       = failure_kind;
 			cfg.failure_block      = failure_block;
-			cfg.unsupported_reason = structure_error;
+			cfg.unsupported_reason = dispatcher_reason;
 		} else {
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
@@ -560,14 +548,28 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
 	}
 
-	IR::Program ir;
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
 	const ShaderComputeInputInfo* compute = nullptr;
 	switch (options.stage) {
-		case ShaderType::Vertex: vertex = options.input_info.vertex; break;
-		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
-		case ShaderType::Compute: compute = options.input_info.compute; break;
+		case ShaderType::Vertex:
+			vertex = options.input_info.vertex;
+			if (vertex == nullptr) {
+				EXIT("vertex shader recompilation has no input metadata\n");
+			}
+			break;
+		case ShaderType::Pixel:
+			pixel = options.input_info.pixel;
+			if (pixel == nullptr) {
+				EXIT("pixel shader recompilation has no input metadata\n");
+			}
+			break;
+		case ShaderType::Compute:
+			compute = options.input_info.compute;
+			if (compute == nullptr) {
+				EXIT("compute shader recompilation has no input metadata\n");
+			}
+			break;
 		default: break;
 	}
 	EmbeddedFetchData embedded_fetch;
@@ -597,9 +599,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	if (!Frontend::TranslateProgram(decoded, cfg, translate_options, ir, error)) {
-		return false;
-	}
+	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -626,18 +626,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			     lds_barriers.inserted_barriers);
 		}
 	}
-	std::string srt_error;
-	if (!IR::BuildSrtPlan(ir, &srt_error)) {
-		LOGF("%s SRT planning failed: %s\n", GetDumpLabel(options), srt_error.c_str());
-		if (error != nullptr) {
-			*error = std::move(srt_error);
-		}
-		return false;
-	}
+	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
-	if (!IR::TrackResources(ir, error)) {
-		return false;
-	}
+	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
@@ -665,27 +656,20 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			runtime.read_memory = ReadZeroMemory;
 		}
 		runtime.userdata         = options.read_memory_data;
-		if (!IR::MaterializeResources(ir, runtime, resources, error)) {
-			return false;
+		if (!IR::MaterializeResources(ir, runtime, resources)) {
+			EXIT("shader resource materialization failed: stage=%s hash=0x%016" PRIx64 "\n",
+			     StageName(options.stage), options.shader_hash);
 		}
 	}
-	if (!IR::SpecializeResources(ir, resources, error)) {
-		return false;
-	}
+	IR::SpecializeResources(ir, resources);
 
 	IR::ShaderInfoOptions info_options;
 	info_options.vertex  = vertex;
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
-	if (!IR::CollectShaderInfo(ir, info_options, error)) {
-		return false;
-	}
-	if (!IR::AllocateBindings(ir, options.push_constant_offset, error)) {
-		return false;
-	}
-	if (!Spirv::AnalyzeProgramRequirements(ir, error)) {
-		return false;
-	}
+	IR::CollectShaderInfo(ir, info_options);
+	IR::AllocateBindings(ir, options.push_constant_offset);
+	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(cfg, ir);
@@ -694,36 +678,22 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 	}
 
-	std::vector<uint32_t> spirv;
-	std::string           emit_error;
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	if (!Spirv::EmitProgram(ir, resources, options.input_info, spirv, &emit_error)) {
-		LOGF("%s typed SPIR-V emit failed: %s\n", GetDumpLabel(options), emit_error.c_str());
-		if (dispatcher_fallback && error != nullptr) {
-			*error = fmt::format("dispatcher fallback failed after {}: {}",
-			                     dispatcher_reason.c_str(), emit_error.c_str());
-			LOGF("%s dispatcher fallback emit failed: %s\n", GetDumpLabel(options), error->c_str());
-		} else if (error != nullptr) {
-			*error = emit_error;
-		}
-		return false;
-	}
+	auto spirv = Spirv::EmitProgram(ir, resources, options.input_info);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(spirv.size()), phase_ms());
+	CompileResult result;
 	result.spirv     = std::move(spirv);
 	result.program   = std::move(ir);
 	result.resources = std::move(resources);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.ir_dump      = std::move(ir_dump);
-	} else {
-		result.decoded_dump.clear();
-		result.ir_dump.clear();
 	}
-	return true;
+	return result;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

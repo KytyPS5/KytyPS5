@@ -57,7 +57,7 @@ using ShaderSpecializationMemoryReader = bool (*)(void* userdata, uint64_t addre
 bool ShaderMaterializeStageRuntime(
     std::shared_ptr<const ShaderRecompiler::IR::Program> program,
     std::span<const uint32_t> user_data, uint64_t shader_base, ShaderStageRuntime& stage,
-    std::string* error, ShaderSpecializationMemoryReader read_specialization_memory = nullptr,
+    ShaderSpecializationMemoryReader read_specialization_memory = nullptr,
     void* read_memory_data = nullptr);
 
 constexpr uint32_t DstSel(uint32_t x, uint32_t y = 0, uint32_t z = 0, uint32_t w = 0) {

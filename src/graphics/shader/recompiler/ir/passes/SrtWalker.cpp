@@ -1,7 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <bit>
@@ -120,10 +120,10 @@ class RuntimeValidator {
 public:
 	explicit RuntimeValidator(const Program& program): m_program(program) {}
 
-	bool Run(Value value, std::string& reason) { return Validate(value, reason); }
+	bool Run(Value value) { return Validate(value); }
 
 private:
-	bool Validate(Value value, std::string& reason) {
+	bool Validate(Value value) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
@@ -133,14 +133,10 @@ private:
 				case Type::U16:
 				case Type::U32:
 				case Type::U64: return true;
-				default:
-					reason = fmt::format("contains a non-integer immediate of type {}",
-					                     TypeName(value.GetType()));
-					return false;
+				default: return false;
 			}
 		}
 		if (!m_visiting.insert(inst).second) {
-			reason = fmt::format("contains a cyclic {} value", ValueOpcodeName(inst->GetOpcode()));
 			return false;
 		}
 		const auto finish = [&](bool valid) {
@@ -151,25 +147,21 @@ private:
 		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
 		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
 		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
-			reason = fmt::format("contains {}", ValueOpcodeName(op));
 			return finish(false);
 		}
 		if (op == ValueOpcode::GetUserData) {
 			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::ScalarReg) {
-				reason = "contains a malformed GetUserData";
 				return finish(false);
 			}
 			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
 			if (reg < m_program.user_data_base ||
 			    reg - m_program.user_data_base >= m_program.user_data_count) {
-				reason = fmt::format("references unavailable user SGPR {}", reg);
 				return finish(false);
 			}
 			return finish(true);
 		}
 		if (op == ValueOpcode::GetShaderBase) {
 			if (inst->NumArgs() != 0) {
-				reason = "contains a malformed GetShaderBase";
 				return finish(false);
 			}
 			return finish(true);
@@ -177,14 +169,12 @@ private:
 		if (op == ValueOpcode::Phi) {
 			const auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
-				reason = "contains a control-dependent phi";
 				return finish(false);
 			}
-			return finish(Validate(invariant, reason));
+			return finish(Validate(invariant));
 		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
-				reason = "contains a malformed GetSrtResource";
 				return finish(false);
 			}
 			return finish(true);
@@ -196,7 +186,6 @@ private:
 			        ValueOpcode::GetSrtResource ||
 			    !slot.IsImmediate() || slot.GetType() != Type::U32 ||
 			    slot.U32() >= m_program.srt_reads.size()) {
-				reason = "contains a malformed flattened SRT read";
 				return finish(false);
 			}
 		} else if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
@@ -206,13 +195,11 @@ private:
 			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			if (!IsRawRead(m_program, *inst) || handle == nullptr ||
 			    handle->GetOpcode() != expected) {
-				reason = fmt::format("contains a non-scalar {}", ValueOpcodeName(op));
 				return finish(false);
 			}
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
-				reason = "contains an invalid U64 component index";
 				return finish(false);
 			}
 		} else if (op == ValueOpcode::CompositeExtractU32x2) {
@@ -222,7 +209,6 @@ private:
 			    index.U32() >= 2u ||
 			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
 			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
-				reason = "contains an unsupported composite runtime source";
 				return finish(false);
 			}
 		}
@@ -233,17 +219,14 @@ private:
 			                        : op == ValueOpcode::GetSamplerResource ? 4u
 			                                                                : 2u;
 			if (inst->NumArgs() != expected) {
-				reason = fmt::format("contains a malformed {}", ValueOpcodeName(op));
 				return finish(false);
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
 		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeIntegerOp(op)) {
-			reason =
-			    fmt::format("contains unsupported or control-dependent {}", ValueOpcodeName(op));
 			return finish(false);
 		}
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			if (!Validate(inst->Arg(index), reason)) {
+			if (!Validate(inst->Arg(index))) {
 				return finish(false);
 			}
 		}
@@ -258,7 +241,7 @@ class PlanBuilder {
 public:
 	explicit PlanBuilder(Program& program): m_program(program) {}
 
-	bool Run(std::string* error) {
+	void Run() {
 		m_program.srt_reads.clear();
 		m_program.dynamic_reads.clear();
 		for (auto* block: m_program.blocks) {
@@ -273,34 +256,29 @@ public:
 						                        (op == ValueOpcode::ReadConstBuffer &&
 						                         kind == ResourceKind::ScalarAddress);
 						if (crosswired) {
-							return Fail(flags.pc, error,
-							            fmt::format("{} has incompatible scalar memory metadata",
-							                        ValueOpcodeName(op)));
+							Fail(flags.pc,
+							     fmt::format("{} has incompatible scalar memory metadata",
+							                 ValueOpcodeName(op)));
 						}
 					}
 				}
 				if (IsDescriptorHandle(inst.GetOpcode())) {
 					for (size_t index = 0; index < inst.NumArgs(); index++) {
-						if (!Collect(inst.Arg(index), 0, error)) {
-							return false;
-						}
+						Collect(inst.Arg(index), 0);
 					}
 				}
 			}
 		}
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
-				std::string reason;
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
 				    inst.Arg(1).Resolve().IsImmediate() &&
-				    ValidateRuntimeValue(m_program, Value(&inst), reason) &&
-				    !Collect(Value(&inst), inst.Flags<MemoryFlags>().pc, error)) {
-					return false;
+				    ValidateRuntimeValue(m_program, Value(&inst))) {
+					Collect(Value(&inst), inst.Flags<MemoryFlags>().pc);
 				}
 			}
 		}
 		PatchReads();
-		return true;
 	}
 
 private:
@@ -310,18 +288,20 @@ private:
 		bool     keep = false;
 	};
 
-	bool Fail(uint32_t pc, std::string* error, const std::string& message) const {
-		return ShaderError::Fail(error, Diagnostic(m_program, pc, message));
+	[[noreturn]] void Fail(uint32_t pc, const std::string& message) const {
+		const auto diagnostic = Diagnostic(m_program, pc, message);
+		EXIT("shader SRT planning failed: %s", diagnostic.c_str());
+		std::abort();
 	}
 
-	bool Collect(Value value, uint32_t use_pc, std::string* error) {
+	void Collect(Value value, uint32_t use_pc) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
-			return true;
+			return;
 		}
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
-			return Fail(use_pc, error, "invalid typed planning value");
+			Fail(use_pc, "invalid typed planning value");
 		}
 		const auto cycle = std::ranges::find(m_visiting, inst);
 		if (cycle != m_visiting.end()) {
@@ -329,44 +309,40 @@ private:
 				return value->GetOpcode() == ValueOpcode::Phi;
 			});
 			if (contains_phi) {
-				return true;
+				return;
 			}
-			return Fail(use_pc, error,
-			            fmt::format("cyclic typed planning value {} without a phi",
-			                        ValueOpcodeName(inst->GetOpcode())));
+			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+			                         ValueOpcodeName(inst->GetOpcode())));
 		}
 		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return true;
+			return;
 		}
 		m_visiting.push_back(inst);
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			if (!Collect(inst->Arg(index), use_pc, error)) {
-				return false;
-			}
+			Collect(inst->Arg(index), use_pc);
 		}
 		m_visiting.pop_back();
 		m_visited.push_back(inst);
 		if (!IsRawRead(m_program, *inst)) {
-			return true;
+			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
-			if (std::ranges::find(m_program.dynamic_reads, value) == m_program.dynamic_reads.end()) {
+			if (std::ranges::find(m_program.dynamic_reads, value) ==
+			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);
 			}
-			return true;
+			return;
 		}
-		use_pc = inst->Flags<MemoryFlags>().pc;
 		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
 				m_patches.push_back({inst, slot, false});
-				return true;
+				return;
 			}
 		}
 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
-		m_program.srt_reads.push_back({value, slot, use_pc});
+		m_program.srt_reads.push_back({value, slot});
 		m_patches.push_back({inst, slot, true});
-		return true;
 	}
 
 	void PatchReads() {
@@ -411,14 +387,12 @@ class Evaluator {
 public:
 	Evaluator(const Program& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr)
-	    : m_program(program), m_runtime(runtime),
-	      m_clean_flat_slots(clean_flat_slots), m_clean_evaluator(clean_evaluator) {}
+	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
+	      m_clean_evaluator(clean_evaluator) {}
 
-	void SetUsePc(uint32_t pc) { m_use_pc = pc; }
-
-	bool Evaluate(Value value, uint32_t& result, std::string* error) {
+	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
-		if (!EvaluateWide(value, wide, error)) {
+		if (!EvaluateWide(value, wide)) {
 			return false;
 		}
 		result = static_cast<uint32_t>(wide);
@@ -426,11 +400,7 @@ public:
 	}
 
 private:
-	bool Fail(std::string* error, const std::string& message) const {
-		return ShaderError::Fail(error, Diagnostic(m_program, m_use_pc, message));
-	}
-
-	bool EvaluateWide(Value value, uint64_t& result, std::string* error) {
+	bool EvaluateWide(Value value, uint64_t& result) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
 			switch (value.GetType()) {
@@ -439,23 +409,23 @@ private:
 				case Type::U16: result = value.U16(); return true;
 				case Type::U32: result = value.U32(); return true;
 				case Type::U64: result = value.U64(); return true;
-				default: return Fail(error, "non-integer immediate in runtime expression");
+				default: return false;
 			}
 		}
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
-			return Fail(error, "invalid typed runtime value");
+			return false;
 		}
 		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
 			result = found->second;
 			return true;
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
-			return Fail(error, "cyclic typed runtime value");
+			return false;
 		}
 		m_visiting.push_back(inst);
 		uint64_t out = 0;
-		if (!EvaluateInst(*inst, out, error)) {
+		if (!EvaluateInst(*inst, out)) {
 			return false;
 		}
 		m_visiting.pop_back();
@@ -464,28 +434,27 @@ private:
 		return true;
 	}
 
-	bool Arg(const Inst& inst, size_t index, uint64_t& result, std::string* error) {
-		return EvaluateWide(inst.Arg(index), result, error);
+	bool Arg(const Inst& inst, size_t index, uint64_t& result) {
+		return EvaluateWide(inst.Arg(index), result);
 	}
 
-	bool EvaluatePhi(const Inst& inst, uint64_t& result, std::string* error) {
+	bool EvaluatePhi(const Inst& inst, uint64_t& result) {
 		const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-		return !value.IsEmpty() ? EvaluateWide(value, result, error)
-		                        : Fail(error, "typed phi has runtime-dependent values");
+		return !value.IsEmpty() && EvaluateWide(value, result);
 	}
 
-	bool EvaluateExtract(const Inst& inst, uint64_t& result, std::string* error) {
+	bool EvaluateExtract(const Inst& inst, uint64_t& result) {
 		const auto index = inst.Arg(1).Resolve();
 		if (!index.IsImmediate() || index.GetType() != Type::U32) {
-			return Fail(error, "dynamic composite extract in runtime expression");
+			return false;
 		}
 		const auto component = index.U32();
 		if (component >= 2u) {
-			return Fail(error, "unsupported composite runtime source");
+			return false;
 		}
 		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
 			uint64_t packed = 0;
-			if (!Arg(inst, 0, packed, error)) {
+			if (!Arg(inst, 0, packed)) {
 				return false;
 			}
 			result = static_cast<uint32_t>(packed >> (component * 32u));
@@ -493,15 +462,15 @@ private:
 		}
 		const auto* source = inst.Arg(0).ResolveInstruction();
 		if (source == nullptr) {
-			return Fail(error, "unsupported composite runtime source");
+			return false;
 		}
 		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-			return EvaluateWide(source->Arg(component), result, error);
+			return EvaluateWide(source->Arg(component), result);
 		}
 		if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
 			uint64_t lhs = 0;
 			uint64_t rhs = 0;
-			if (!Arg(*source, 0, lhs, error) || !Arg(*source, 1, rhs, error)) {
+			if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
 				return false;
 			}
 			const auto sum =
@@ -510,24 +479,23 @@ private:
 			    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
 			return true;
 		}
-		return Fail(error, "unsupported composite runtime source");
+		return false;
 	}
 
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result, std::string* error) {
+	bool EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
-			return Fail(error, "raw scalar read has invalid metadata");
+			return false;
 		}
 		const auto& mem    = m_program.memory_info[flags.index];
 		const auto* handle = inst.Arg(0).ResolveInstruction();
 		if (handle == nullptr) {
-			return Fail(error, "raw scalar read has no descriptor handle");
+			return false;
 		}
 		uint64_t low    = 0;
 		uint64_t high   = 0;
 		uint64_t offset = 0;
-		if (!Arg(*handle, 0, low, error) || !Arg(*handle, 1, high, error) ||
-		    !Arg(inst, 1, offset, error)) {
+		if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 			return false;
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
@@ -536,12 +504,11 @@ private:
 		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 			uint64_t records = 0;
 			uint64_t word3   = 0;
-			if (handle->NumArgs() != 4u || !Arg(*handle, 2, records, error) ||
-			    !Arg(*handle, 3, word3, error)) {
-				return Fail(error, "constant-buffer descriptor has invalid width");
+			if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+				return false;
 			}
 			if (immediate < 0) {
-				return Fail(error, "constant-buffer read has a negative immediate offset");
+				return false;
 			}
 			const auto byte_offset =
 			    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
@@ -551,21 +518,20 @@ private:
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return Fail(
-				    error, fmt::format("constant-buffer offset {} exceeds size {}", aligned, size));
+				return false;
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
 			const auto relative = (immediate & ~int64_t {3}) +
 			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 			if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-				return Fail(error, "raw scalar read is outside the 48-bit address space");
+				return false;
 			}
 		}
 		uint32_t word = 0;
 		if (m_runtime.read_memory != nullptr) {
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
-				return Fail(error, fmt::format("constant read failed at 0x{:016x}", address));
+				return false;
 			}
 		} else {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
@@ -574,28 +540,28 @@ private:
 		return true;
 	}
 
-	bool EvaluateInst(const Inst& inst, uint64_t& result, std::string* error) {
+	bool EvaluateInst(const Inst& inst, uint64_t& result) {
 		uint64_t   a       = 0;
 		uint64_t   b       = 0;
 		uint64_t   c       = 0;
-		const auto binary  = [&]() { return Arg(inst, 0, a, error) && Arg(inst, 1, b, error); };
+		const auto binary  = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
 		const auto ternary = [&]() {
-			return Arg(inst, 0, a, error) && Arg(inst, 1, b, error) && Arg(inst, 2, c, error);
+			return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 		};
 		switch (inst.GetOpcode()) {
 			case ValueOpcode::GetUserData: {
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 				if (reg < m_program.user_data_base ||
 				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
-					return Fail(error, fmt::format("user SGPR {} is unavailable", reg));
+					return false;
 				}
 				result = m_runtime.user_data[reg - m_program.user_data_base];
 				return true;
 			}
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
-			case ValueOpcode::Phi: return EvaluatePhi(inst, result, error);
+			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::CompositeExtractU64:
-			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result, error);
+			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
 			case ValueOpcode::CompositeConstructU64:
 				if (!binary()) {
 					return false;
@@ -607,20 +573,19 @@ private:
 				const auto slot = inst.Arg(1).Resolve();
 				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 				    slot.U32() >= m_program.srt_reads.size()) {
-					return Fail(error, "invalid flattened SRT index");
+					return false;
 				}
 				if (slot.U32() < m_clean_flat_slots.size() &&
 				    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
-					m_clean_evaluator->SetUsePc(m_use_pc);
 					return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
-					                                       result, error);
+					                                       result);
 				}
-				return EvaluateWide(m_program.srt_reads[slot.U32()].value, result, error);
+				return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
 			}
 			case ValueOpcode::LoadAddressU32:
 			case ValueOpcode::ReadConstBuffer:
 				if (IsRawRead(m_program, inst)) {
-					return EvaluateRawRead(inst, result, error);
+					return EvaluateRawRead(inst, result);
 				}
 				break;
 			case ValueOpcode::IAdd32:
@@ -690,7 +655,7 @@ private:
 				}
 				return false;
 			case ValueOpcode::BitwiseNot32:
-				if (Arg(inst, 0, a, error)) {
+				if (Arg(inst, 0, a)) {
 					result = ~static_cast<uint32_t>(a);
 					return true;
 				}
@@ -737,7 +702,7 @@ private:
 					const auto offset = static_cast<uint32_t>(b);
 					const auto width  = static_cast<uint32_t>(c);
 					if (offset > 32u || width > 32u - offset) {
-						return Fail(error, "invalid unsigned bit-field range");
+						return false;
 					}
 					const auto mask = width == 32u  ? UINT32_MAX
 					                  : width == 0u ? 0u
@@ -751,7 +716,7 @@ private:
 					const auto offset = static_cast<uint32_t>(b);
 					const auto width  = static_cast<uint32_t>(c);
 					if (offset > 32u || width > 32u - offset) {
-						return Fail(error, "invalid signed bit-field range");
+						return false;
 					}
 					if (width == 0u) {
 						result = 0;
@@ -768,13 +733,13 @@ private:
 				return false;
 			case ValueOpcode::BitFieldInsert: {
 				uint64_t d = 0;
-				if (!ternary() || !Arg(inst, 3, d, error)) {
+				if (!ternary() || !Arg(inst, 3, d)) {
 					return false;
 				}
 				const auto offset = static_cast<uint32_t>(c);
 				const auto width  = static_cast<uint32_t>(d);
 				if (offset > 32u || width > 32u - offset) {
-					return Fail(error, "invalid inserted bit-field range");
+					return false;
 				}
 				if (width == 0u) {
 					result = static_cast<uint32_t>(a);
@@ -836,7 +801,7 @@ private:
 				}
 				return false;
 			case ValueOpcode::LogicalNot:
-				if (Arg(inst, 0, a, error)) {
+				if (Arg(inst, 0, a)) {
 					result = a == 0u;
 					return true;
 				}
@@ -845,18 +810,16 @@ private:
 			case ValueOpcode::UndefU8:
 			case ValueOpcode::UndefU16:
 			case ValueOpcode::UndefU32:
-			case ValueOpcode::UndefU64: return Fail(error, "undefined typed runtime value");
+			case ValueOpcode::UndefU64: return false;
 			default: break;
 		}
-		return Fail(error, fmt::format("unsupported typed runtime opcode {}",
-		                               ValueOpcodeName(inst.GetOpcode())));
+		return false;
 	}
 
 	const Program&                            m_program;
 	const SrtRuntime&                         m_runtime;
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
-	uint32_t                                  m_use_pc          = 0;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 };
@@ -872,18 +835,12 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
                                 std::span<const DescriptorSourceRequest> requests,
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
-                                std::span<const uint8_t> clean_flat_slots, std::string* error) {
+                                std::span<const uint8_t> clean_flat_slots) {
 	if (!program.srt_plan_complete) {
-		if (error != nullptr) {
-			*error = Diagnostic(program, 0, "typed SRT plan is not ready");
-		}
 		return false;
 	}
 	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
 	    runtime.read_specialization_memory == nullptr) {
-		if (error != nullptr) {
-			*error = Diagnostic(program, 0, "clean flattened SRT read has no memory reader");
-		}
 		return false;
 	}
 	SrtRuntime clean_runtime  = runtime;
@@ -895,17 +852,12 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 	for (const auto& request: requests) {
 		const auto* source = Source(program, request.source);
 		if (source == nullptr) {
-			if (error != nullptr) {
-				*error = Diagnostic(program, request.use_pc,
-				                    fmt::format("invalid descriptor source {}", request.source));
-			}
 			return false;
 		}
-		evaluator.SetUsePc(request.use_pc);
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
 		for (uint32_t index = 0; index < source->dword_count; index++) {
-			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index], error)) {
+			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
 				return false;
 			}
 		}
@@ -918,9 +870,8 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
-			selected.SetUsePc(read.use_pc);
 			if (read.flat_offset >= flattened.size() ||
-			    !selected.Evaluate(read.value, flattened[read.flat_offset], error)) {
+			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
 				return false;
 			}
 		}
@@ -934,31 +885,24 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 
 } // namespace
 
-bool ValidateRuntimeValue(const Program& program, Value value, std::string& reason) {
-	return RuntimeValidator(program).Run(value, reason);
+bool ValidateRuntimeValue(const Program& program, Value value) {
+	return RuntimeValidator(program).Run(value);
 }
 
-bool BuildSrtPlan(Program& program, std::string* error) {
+void BuildSrtPlan(Program& program) {
 	if (program.resource_tracking_complete) {
-		if (error != nullptr) {
-			*error = "cannot rebuild SRT after resource tracking";
-		}
-		return false;
+		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");
 	}
 	program.srt_plan_complete = false;
-	if (!PlanBuilder(program).Run(error)) {
-		return false;
-	}
+	PlanBuilder(program).Run();
 	program.srt_plan_complete = true;
-	return true;
 }
 
-bool EvaluateDescriptorSource(const Program& program, uint32_t source, uint32_t use_pc,
-                              const SrtRuntime& runtime, DescriptorValue& result,
-                              std::string* error) {
-	const DescriptorSourceRequest request {source, use_pc};
+bool EvaluateDescriptorSource(const Program& program, uint32_t source, const SrtRuntime& runtime,
+                              DescriptorValue& result) {
+	const DescriptorSourceRequest request {source};
 	std::vector<DescriptorValue>  results;
-	if (!EvaluateDescriptorSources(program, std::span {&request, 1}, runtime, results, error)) {
+	if (!EvaluateDescriptorSources(program, std::span {&request, 1}, runtime, results)) {
 		return false;
 	}
 	result = results.front();
@@ -967,26 +911,23 @@ bool EvaluateDescriptorSource(const Program& program, uint32_t source, uint32_t 
 
 bool EvaluateDescriptorSources(const Program&                           program,
                                std::span<const DescriptorSourceRequest> requests,
-                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                               std::string* error) {
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results) {
 	std::vector<uint32_t> ignored;
-	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, ignored, false, {},
-	                                  error);
+	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, ignored, false, {});
 }
 
 bool EvaluateRuntimeSources(const Program&                           program,
                             std::span<const DescriptorSourceRequest> requests,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::string* error) {
+                            std::vector<uint32_t>&   flat,
+                            std::span<const uint8_t> clean_flat_slots) {
 	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, flat, true,
-	                                  clean_flat_slots, error);
+	                                  clean_flat_slots);
 }
 
-bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::string* error) {
+bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat) {
 	std::vector<DescriptorValue> ignored;
-	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, {}, error);
+	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, {});
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

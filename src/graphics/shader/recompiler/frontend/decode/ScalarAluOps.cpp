@@ -105,21 +105,18 @@ constexpr auto SOPK_OPS = Detail::MakeOpcodeTable<0x20>(SOPK_OPCODE_LIST);
 constexpr auto SOPC_OPS = Detail::MakeOpcodeTable<0x80>(SOPC_OPCODE_LIST);
 constexpr auto SOPP_OPS = Detail::MakeOpcodeTable<0x80>(SOPP_OPCODE_LIST);
 
-bool DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                         Instruction& inst, uint32_t ssrc0, uint32_t ssrc1, std::string* error) {
-	if (!DecodeScalarSource(ssrc0, pc, inst.src0, error) ||
-	    !DecodeScalarSource(ssrc1, pc, inst.src1, error)) {
-		return false;
-	}
+void DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                         Instruction& inst, uint32_t ssrc0, uint32_t ssrc1) {
+	DecodeScalarSource(ssrc0, pc, inst.src0);
+	DecodeScalarSource(ssrc1, pc, inst.src1);
 	inst.src_count = 2;
 	ReadLiteralOperands(code, word_index, inst);
-	return true;
 }
 
 } // namespace
 
-bool DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
+void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 8u) & 0xffu;
 	const uint32_t ssrc0  = word & 0xffu;
@@ -134,35 +131,31 @@ bool DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::SOP1, opcode, "SOP1 opcode is not implemented");
-		return true;
+		return;
 	}
 
 	switch (inst.opcode) {
 		case Opcode::S_GETPC_B64:
 			inst.src_count = 0;
-			return DecodeScalarDestination(sdst, pc, inst.dst, error);
+			DecodeScalarDestination(sdst, pc, inst.dst);
+			return;
 		case Opcode::S_SETPC_B64:
 			inst.src_count = 1;
 			inst.dst.kind  = OperandKind::Null;
-			if (!DecodeScalarSource(ssrc0, pc, inst.src0, error)) {
-				return false;
-			}
+			DecodeScalarSource(ssrc0, pc, inst.src0);
 			ReadLiteralOperands(code, word_index, inst);
-			return true;
+			return;
 		default: break;
 	}
 
-	if (!DecodeScalarSource(ssrc0, pc, inst.src0, error) ||
-	    !DecodeScalarDestination(sdst, pc, inst.dst, error)) {
-		return false;
-	}
+	DecodeScalarSource(ssrc0, pc, inst.src0);
+	DecodeScalarDestination(sdst, pc, inst.dst);
 	inst.src_count = 1;
 	ReadLiteralOperands(code, word_index, inst);
-	return true;
 }
 
-bool DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
+void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 23u) & 0x7fu;
 	const uint32_t ssrc1  = (word >> 8u) & 0xffu;
@@ -178,17 +171,15 @@ bool DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::SOP2, opcode, "SOP2 opcode is not implemented");
-		return true;
+		return;
 	}
 
-	if (!DecodeScalarDestination(sdst, pc, inst.dst, error)) {
-		return false;
-	}
-	return DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1, error);
+	DecodeScalarDestination(sdst, pc, inst.dst);
+	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
 }
 
-bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
+void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 23u) & 0x1fu;
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
@@ -207,18 +198,18 @@ bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::SOPK, opcode, "SOPK opcode is not implemented");
-		return true;
+		return;
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_MOVK_I32: return DecodeScalarDestination(sdst, pc, inst.dst, error);
+		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
 		case Opcode::S_WAITCNT: {
 			const uint32_t waitcnt = word & 0xffffu;
 			inst.dst.kind          = OperandKind::Null;
 			inst.src0.signed_val   = static_cast<int32_t>(waitcnt);
 			inst.src0.value        = waitcnt;
 			inst.src_count         = 1;
-			return true;
+			return;
 		}
 		case Opcode::S_SETREG_B32:
 			inst.dst.kind        = OperandKind::Null;
@@ -226,26 +217,25 @@ bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			inst.src1.value      = word & 0xffffu;
 			inst.src1.signed_val = static_cast<int32_t>(imm);
 			inst.src_count       = 2;
-			return DecodeScalarSource(sdst, pc, inst.src0, error);
+			DecodeScalarSource(sdst, pc, inst.src0);
+			return;
 		default: break;
 	}
 
 	inst.src1 = inst.src0;
-	if (!DecodeScalarSource(sdst, pc, inst.src0, error)) {
-		return false;
-	}
+	DecodeScalarSource(sdst, pc, inst.src0);
 	if (inst.opcode == Opcode::S_ADD_I32 || inst.opcode == Opcode::S_MULK_I32) {
 		inst.src_count = 2;
-		return DecodeScalarDestination(sdst, pc, inst.dst, error);
+		DecodeScalarDestination(sdst, pc, inst.dst);
+		return;
 	}
 
 	inst.dst.kind  = OperandKind::Scc;
 	inst.src_count = 2;
-	return true;
 }
 
-bool DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error) {
+void DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst) {
 	const uint32_t word   = code[word_index];
 	const uint32_t ssrc1  = (word >> 8u) & 0xffu;
 	const uint32_t ssrc0  = word & 0xffu;
@@ -261,10 +251,10 @@ bool DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::SOPC, opcode, "SOPC opcode is not implemented");
-		return true;
+		return;
 	}
 
-	return DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1, error);
+	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
 }
 
 void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,

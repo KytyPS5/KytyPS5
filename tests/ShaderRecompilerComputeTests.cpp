@@ -85,6 +85,12 @@
 #include <string>
 #include <vector>
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -907,6 +913,31 @@ void Require(const char *shader_name, const char *stage, bool value,
   }
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+template <typename Function>
+void ExpectFatal(const char *name, Function function) {
+  const pid_t pid = ::fork();
+  Require(name, "fatal subprocess", pid >= 0,
+          "fork failed while starting fatal shader test");
+  if (pid == 0) {
+    function();
+    ::_exit(0);
+  }
+
+  int status = 0;
+  pid_t waited = -1;
+  do {
+    waited = ::waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  Require(name, "fatal subprocess", waited == pid,
+          "waitpid failed while collecting fatal shader test");
+  Require(name, "fatal exit",
+          WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff),
+          "fatal shader path did not terminate with status 321");
+  std::printf("[host]    %-32s ok\n", name);
+}
+#endif
+
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
   const auto first = cache.Insert(1, 1);
@@ -979,7 +1010,6 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
-  std::string expected_compile_error;
 };
 
 struct GraphicsCase {
@@ -1187,17 +1217,7 @@ CompiledShader CompileCase(const TestCase &test) {
     options.wave_size = test.compute_info.wave_size;
   }
 
-  ShaderRecompiler::CompileResult result;
-  std::string error;
-  if (!ShaderRecompiler::TryRecompile(test.code, options, result, &error)) {
-    if (!test.expected_compile_error.empty() &&
-        error.find(test.expected_compile_error) != std::string::npos) {
-      return {};
-    }
-    Fail(test.name, "decode/IR", error.c_str());
-  }
-  Require(test.name, "decode/IR", test.expected_compile_error.empty(),
-          "shader unexpectedly compiled despite the required rejection");
+  auto result = ShaderRecompiler::Recompile(test.code, options);
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -1245,9 +1265,7 @@ CompiledShader CompileCase(const TestCase &test) {
     }
     result.program.bindings = {};
     result.program.binding_layout_complete = false;
-    if (!ShaderRecompiler::IR::AllocateBindings(result.program, 0, &error)) {
-      Fail(test.name, "binding layout", error.c_str());
-    }
+    ShaderRecompiler::IR::AllocateBindings(result.program, 0);
     const auto *shader_data = ShaderRecompiler::IR::FindBinding(
         result.program.bindings,
         ShaderRecompiler::IR::DescriptorBindingKind::UserData);
@@ -1256,13 +1274,8 @@ CompiledShader CompileCase(const TestCase &test) {
                 result.program.bindings.push_constant_size == 0 &&
                 shader_data != nullptr,
             "oversized shader data did not use its storage fallback");
-    std::vector<u32> storage_spirv;
-    if (!ShaderRecompiler::Spirv::EmitProgram(result.program, result.resources,
-                                              options.input_info, storage_spirv,
-                                              &error)) {
-      Fail(test.name, "SPIR-V emit", error.c_str());
-    }
-    result.spirv = std::move(storage_spirv);
+    result.spirv = ShaderRecompiler::Spirv::EmitProgram(
+        result.program, result.resources, options.input_info);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
@@ -1338,12 +1351,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data.data();
 
-  ShaderRecompiler::CompileResult result;
-  std::string error;
-  if (!ShaderRecompiler::TryRecompile(test.fragment_code, options, result,
-                                      &error)) {
-    Fail(test.name, "decode/IR", error.c_str());
-  }
+  auto result = ShaderRecompiler::Recompile(test.fragment_code, options);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -7579,10 +7587,7 @@ public:
       const auto allocate_bindings =
           [&](ShaderRecompiler::IR::Program &program) {
             program.shader_info_complete = true;
-            std::string error;
-            Require(name, "binding layout",
-                    ShaderRecompiler::IR::AllocateBindings(program, 0, &error),
-                    error.c_str());
+            ShaderRecompiler::IR::AllocateBindings(program, 0);
           };
 
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
@@ -7616,11 +7621,7 @@ public:
       ShaderRecompiler::IR::DescriptorValue null_descriptor{};
       null_descriptor.dword_count = 8;
       null_snapshot.images.assign(3, null_descriptor);
-      std::string null_error;
-      Require(name, "null specialization",
-              ShaderRecompiler::IR::SpecializeResources(
-                  null_program, null_snapshot, &null_error),
-              null_error.c_str());
+      ShaderRecompiler::IR::SpecializeResources(null_program, null_snapshot);
       allocate_bindings(null_program);
       ShaderStageRuntime null_runtime{
           std::make_shared<const ShaderRecompiler::IR::Program>(
@@ -11657,10 +11658,6 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto compiled = CompileCase(test);
-  if (!test.expected_compile_error.empty()) {
-    std::printf("[compute] %-32s ok\n", test.name);
-    return;
-  }
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
     Require(test.name, "resource specialization",
             !compiled.program.info.images.empty() &&
@@ -18506,8 +18503,6 @@ TestCase FlatStoreVariants() {
                 {O::V_MOV_B32, O::FLAT_STORE_BYTE, O::FLAT_STORE_SHORT,
                  O::FLAT_STORE_DWORD, O::FLAT_STORE_DWORDX2,
                  O::FLAT_STORE_DWORDX3, O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
-  test.expected_compile_error =
-      "writable FLAT/GLOBAL addresses require GPU ownership tracking";
   return test;
 }
 
@@ -20314,9 +20309,7 @@ void CheckIndirectImageKeySwitch() {
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
-  std::string error;
-  Require(name, "binding layout", AllocateBindings(program, 0, &error),
-          error.c_str());
+  AllocateBindings(program, 0);
   ResourceSnapshot snapshot{};
   DescriptorValue descriptor{};
   descriptor.dword_count = 8;
@@ -20340,14 +20333,9 @@ void CheckIndirectImageKeySwitch() {
   snapshot.samplers.push_back(sampler_descriptor);
 
   ShaderComputeInputInfo compute{};
-  std::vector<u32> spirv;
-  Require(name, "SPIR-V requirements",
-          ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program, &error),
-          error.c_str());
-  Require(name, "SPIR-V emit",
-          ShaderRecompiler::Spirv::EmitProgram(
-              program, snapshot, {.compute = &compute}, spirv, &error),
-          error.c_str());
+  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, snapshot,
+                                                    {.compute = &compute});
   ValidateSpirv(name, spirv);
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string text;
@@ -21314,7 +21302,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
-  AddCase(FlatStoreVariants);
   AddCase(DsReadWriteVariants);
   AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
@@ -21433,7 +21420,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   compute.thread_ids_num = 1;
   compute.workgroup_register = 8;
 
-  const auto Compile = [&](const char *stage, const std::vector<u32> &code) {
+  const auto Compile = [&](const std::vector<u32> &code) {
     ShaderRecompiler::CompileOptions options;
     options.stage = ShaderType::Compute;
     options.wave_size = 64;
@@ -21442,17 +21429,13 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     options.user_data = user_data.data();
     options.input_info.compute = &compute;
     options.dump_ir = false;
-    ShaderRecompiler::CompileResult result;
-    std::string error;
-    Require("Ps5GameExampleImageClear", stage,
-            ShaderRecompiler::TryRecompile(code, options, result, &error),
-            error);
+    auto result = ShaderRecompiler::Recompile(code, options);
     ValidateSpirv("Ps5GameExampleImageClear", result.spirv);
     return result;
   };
 
   const auto code = MakeCode();
-  auto positive = Compile("exact Prospero kernel", code);
+  auto positive = Compile(code);
 
   compute.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
       std::move(positive.program));
@@ -21543,11 +21526,7 @@ void CheckEmbeddedFetchVertexOffset() {
     options.user_data = user_data.data();
     options.input_info.vertex = &vertex;
 
-    ShaderRecompiler::CompileResult result;
-    std::string error;
-    Require(name, "compile",
-            ShaderRecompiler::TryRecompile(code, options, result, &error),
-            error);
+    auto result = ShaderRecompiler::Recompile(code, options);
     Require(name, "fetch rewrite",
             result.program.info.vertex_fetch_components[0] == 4,
             "encoded fetch sequence was not recognized and rewritten");
@@ -23477,12 +23456,8 @@ void CheckImageSamplerSpecialization() {
   ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
-  std::string specialization_error;
-  Require("ImageSamplerSpecialization", "mixed sampler specialization",
-          ShaderRecompiler::IR::SpecializeResources(mixed_sampler_program,
-                                                    mixed_sampler_snapshot,
-                                                    &specialization_error),
-          specialization_error);
+  ShaderRecompiler::IR::SpecializeResources(mixed_sampler_program,
+                                            mixed_sampler_snapshot);
   Require("ImageSamplerSpecialization", "mixed sampler variant",
           mixed_sampler_program.info.samplers.size() == 2u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
@@ -23493,24 +23468,44 @@ void CheckImageSamplerSpecialization() {
           "a shared native/bit-packed sampler was not split into point and "
           "native variants");
 
-  ShaderRecompiler::IR::Program packed_atomic_program;
-  packed_atomic_program.resource_tracking_complete = true;
-  auto packed_atomic_image = sampled_image;
-  packed_atomic_image.kind =
-      ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-  packed_atomic_image.written = true;
-  packed_atomic_image.atomic = true;
-  packed_atomic_program.info.images.push_back(packed_atomic_image);
-  ShaderRecompiler::IR::ResourceSnapshot packed_atomic_snapshot;
-  packed_atomic_snapshot.images.push_back(packed_image_descriptor);
-  std::string atomic_error;
-  Require("ImageSamplerSpecialization", "packed atomic rejection",
-          !ShaderRecompiler::IR::SpecializeResources(
-              packed_atomic_program, packed_atomic_snapshot, &atomic_error) &&
-              atomic_error.find("unsupported format 34") != std::string::npos,
-          "a non-atomic PS5 packed format entered the typed atomic path");
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void CheckShaderRecompilerFatalContracts() {
+  ExpectFatal("WritableFlatStoreRejection", [] {
+    const auto test = FlatStoreVariants();
+    (void)CompileCase(test);
+  });
+
+  ExpectFatal("PackedAtomicImageRejection", [] {
+    ShaderRecompiler::IR::Program program;
+    program.resource_tracking_complete = true;
+
+    ShaderRecompiler::IR::ImageResource image;
+    image.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+    image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    image.read = true;
+    image.written = true;
+    image.atomic = true;
+    program.info.images.push_back(image);
+
+    ShaderRecompiler::IR::DescriptorValue descriptor{};
+    descriptor.dword_count = 8;
+    descriptor.dwords[0] = 0x2000u;
+    descriptor.dwords[1] =
+        static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10UInt) << 20u;
+    descriptor.dwords[2] = 3u | (3u << 14u);
+    descriptor.dwords[3] =
+        DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.images.push_back(descriptor);
+    ShaderRecompiler::IR::SpecializeResources(program, snapshot);
+  });
+}
+#endif
 
 void CheckStorageTextureVolumeUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
@@ -24232,10 +24227,7 @@ void CheckEmbeddedFetchLaneSpill() {
   options.user_data = user_data.data();
   options.input_info.vertex = &vertex;
 
-  ShaderRecompiler::CompileResult result;
-  std::string error;
-  Require("EmbeddedFetchLaneSpill", "compile",
-          ShaderRecompiler::TryRecompile(code, options, result, &error), error);
+  auto result = ShaderRecompiler::Recompile(code, options);
   Require("EmbeddedFetchLaneSpill", "fetch rewrite",
           result.program.info.vertex_fetch_components[0] == 4,
           "lane-spilled fetch descriptor was not recognized and rewritten");
@@ -25041,6 +25033,12 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--shader-fatal-only") == 0) {
+    CheckShaderRecompilerFatalContracts();
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;
@@ -25301,6 +25299,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);
     return 2;
   }
+  CheckShaderRecompilerFatalContracts();
   VulkanHarness vulkan;
 #endif
   CheckClipControlDepthClipState();

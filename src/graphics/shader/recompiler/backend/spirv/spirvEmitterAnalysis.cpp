@@ -37,12 +37,6 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
-void SetError(std::string* error, const char* message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-}
-
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind,
                uint32_t index) {
 	return std::any_of(outputs.begin(), outputs.end(), [kind, index](const OutputBinding& binding) {

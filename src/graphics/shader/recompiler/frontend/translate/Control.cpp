@@ -22,6 +22,33 @@ Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 
 } // namespace
 
+namespace {
+bool IsMaskOperand(const Decoder::Operand& operand) {
+	return operand.kind == Decoder::OperandKind::VccLo ||
+	       operand.kind == Decoder::OperandKind::ExecLo || operand.kind == Decoder::OperandKind::Sgpr;
+}
+
+bool IsZeroConstant(const Decoder::Operand& operand) {
+	return (operand.kind == Decoder::OperandKind::LiteralConstant ||
+	        operand.kind == Decoder::OperandKind::IntegerInlineConstant) &&
+	       operand.value == 0;
+}
+} // namespace
+
+bool Translator::S_CMP_MASK_ANY(const Decoder::Instruction& inst, bool not_equal) {
+	if (!IsMaskOperand(inst.src0) || !IsZeroConstant(inst.src1)) {
+		return false;
+	}
+	const auto predicate = ReadMask(inst.src0);
+	const auto ballot    = ir.Emit(IR::ValueOpcode::Ballot, {predicate});
+	const auto lo        = ir.CompositeExtract(ballot, 0);
+	const auto hi        = ir.CompositeExtract(ballot, 1);
+	const auto any =
+	    ir.INotEqual(ir.BitwiseOr(lo, hi), IR::U32(IR::Value(0u)));
+	ir.SetScc(not_equal ? any : ir.LogicalNot(any));
+	return true;
+}
+
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
 	if (write_64) {

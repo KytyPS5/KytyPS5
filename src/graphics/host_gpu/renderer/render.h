@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <vector>
@@ -74,6 +75,56 @@ struct SubmitInfo {
 	}
 };
 
+struct GpuCheckpoint {
+	uint32_t phase      = 0; // 0 = command buffer begin, 1 = command buffer end
+	uint32_t slot       = 0;
+	uint32_t debug_op   = 0;
+	uint64_t submit_id  = 0;
+	uint64_t submit_seq = 0;
+	uint32_t arg0       = 0;
+	uint32_t arg1       = 0;
+	uint32_t arg2       = 0;
+	uint32_t arg3       = 0;
+	uint64_t arg4       = 0;
+};
+
+void GpuCrashDiagnosticsDump(GraphicContext& graphics, const char* context_text);
+
+namespace GraphicsWorkCounters {
+inline std::atomic<uint64_t> draws {0};
+inline std::atomic<uint64_t> dispatches {0};
+
+inline constexpr size_t                     MaxTrackedTargets = 64;
+inline std::atomic<uint64_t>                targets[MaxTrackedTargets] {};
+inline std::atomic<uint64_t>                target_ids[MaxTrackedTargets] {};
+inline std::atomic<size_t>                  target_count {0};
+
+inline std::atomic<uint64_t>                present_index {0};
+
+inline std::atomic<uint64_t> watch_seq {0};
+
+inline constexpr uint64_t PackImageId(uint32_t index, uint32_t generation) {
+	return (static_cast<uint64_t>(generation) << 32u) | index;
+}
+
+inline void NoteTarget(uint64_t address, uint64_t packed_image_id = 0) {
+	if (address == 0) {
+		return;
+	}
+	const auto count = target_count.load(std::memory_order_relaxed);
+	for (size_t i = 0; i < count && i < MaxTrackedTargets; i++) {
+		if (targets[i].load(std::memory_order_relaxed) == address) {
+			return;
+		}
+	}
+	if (count < MaxTrackedTargets) {
+		targets[count].store(address, std::memory_order_relaxed);
+		target_ids[count].store(packed_image_id, std::memory_order_relaxed);
+		target_count.store(count + 1, std::memory_order_relaxed);
+	}
+}
+} // namespace GraphicsWorkCounters
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -115,6 +166,8 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
+	mutable GpuCheckpoint* m_checkpoint_begin = nullptr;
+	mutable GpuCheckpoint* m_checkpoint_end   = nullptr;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;

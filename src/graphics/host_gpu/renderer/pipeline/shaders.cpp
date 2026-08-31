@@ -913,7 +913,7 @@ void CreatePipelineInternal(
 	pipeline_info.pInputAssemblyState      = &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.sType              = vk::StructureType::ePipelineTessellationStateCreateInfo;
-	tessellation_state.patchControlPoints = 3;
+	tessellation_state.patchControlPoints = static_params.patch_control_points;
 	pipeline_info.pTessellationState      = (rect_list ? &tessellation_state : nullptr);
 	pipeline_info.pViewportState          = &viewport_state;
 	pipeline_info.pRasterizationState     = &rasterizer;
@@ -976,6 +976,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
+	{
+	}
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.sType =

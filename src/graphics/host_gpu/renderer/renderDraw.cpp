@@ -34,6 +34,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -183,12 +184,27 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
 	if (color.type == RenderColorType::NoColorOutput) {
+		constexpr uint64_t no_color_from = 0ull;
+		if (no_color_from != 0) {
+			const auto present =
+			    GraphicsWorkCounters::present_index.load(std::memory_order_relaxed);
+		}
 		return;
 	}
 
-	auto log_id = g_draw_state_log_count.fetch_add(1);
-	if (log_id >= 192) {
-		return;
+	constexpr uint64_t log_from = 0ull;
+	uint64_t log_id = 0;
+	if (log_from != 0) {
+		const auto present = GraphicsWorkCounters::present_index.load(std::memory_order_relaxed);
+		if (present < log_from || present > log_from + 1) {
+			return;
+		}
+		log_id = g_draw_state_log_count.fetch_add(1);
+	} else {
+		log_id = g_draw_state_log_count.fetch_add(1);
+		if (log_id >= 192) {
+			return;
+		}
 	}
 
 	const auto& cc             = ctx.GetColorControl();
@@ -429,6 +445,13 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	const auto& ge_cntl     = ucfg.GetGeControl();
 	const auto& vertex_info = sh_ctx.GetVs();
 	const auto  stages      = ctx.GetShaderStages();
+
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		static std::atomic<uint32_t> patch_log {0};
+		if (patch_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+			const auto cfg = sh_regs.m_vgtLsHsConfig;
+		}
+	}
 
 	const auto is_known_gs_out_prim_type = [](uint32_t value) {
 		switch (static_cast<Prospero::GsOutputPrimitiveType>(value)) {
@@ -901,6 +924,13 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 		case Prospero::PrimitiveType::kRectList:
 			topology = vk::PrimitiveTopology::ePatchList;
 			break;
+		case Prospero::PrimitiveType::kPatch:
+			if (true) {
+				EXIT("unknown primitive type: %u (kPatch needs tessellation)\n",
+				     static_cast<uint32_t>(ucfg.GetPrimType()));
+			}
+			topology = vk::PrimitiveTopology::ePatchList;
+			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
 			if (!auto_draw) {
 				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
@@ -1025,6 +1055,10 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	state.pixel_program =
 	    pipeline_cache.GetPixelProgram(pixel_shader_info, shader_regs, state.vs_input_info,
 	                                   target_export_mapping, state.ps_input_info);
+	if (!state.pixel_program && ShaderFailureNonFatal()) {
+		static std::atomic<uint32_t> skip_log {0};
+		state.ps_active = false;
+	}
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
@@ -1097,7 +1131,13 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 		return;
 	}
 
-	if (!always_log && !force_legacy_rect_log) {
+	bool window_log = false;
+	constexpr uint64_t log_from = 0ull;
+	if (log_from != 0) {
+		const auto present = GraphicsWorkCounters::present_index.load(std::memory_order_relaxed);
+		window_log = present >= log_from && present <= log_from + 1;
+	}
+	if (!always_log && !force_legacy_rect_log && !window_log) {
 		return;
 	}
 
@@ -1123,6 +1163,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kPatch:
 			if (emit.indexed) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      draw.first_instance);
@@ -1162,6 +1203,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug) {
 	EXIT_IF(draw.name == nullptr);
+	GraphicsWorkCounters::draws.fetch_add(1, std::memory_order_relaxed);
+	for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+		GraphicsWorkCounters::NoteTarget(
+		    state.color_info[i].base_addr,
+		    GraphicsWorkCounters::PackImageId(state.color_info[i].image_id.index,
+		                                      state.color_info[i].image_id.generation));
+	}
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
@@ -1175,9 +1223,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
+	if (!state.vertex_program) {
+		static std::atomic<uint32_t> skip_log {0};
+		return;
+	}
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch
+	        ? std::max<uint32_t>(
+	              (buffer.GetRegisters().GetShaderRegisters().m_vgtLsHsConfig >> 8u) & 0x3fu, 1u)
+	        : 3u,
 	    state.vertex_program, state.pixel_program);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this

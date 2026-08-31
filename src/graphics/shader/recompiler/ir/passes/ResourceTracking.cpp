@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
@@ -109,9 +110,15 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		if (m_failed) {
+			return;
+		}
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
+				if (m_failed) {
+					return;
+				}
 			}
 		}
 		LinkImageAliases();
@@ -140,7 +147,7 @@ public:
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-			                   [&](const IndirectImagePlan& plan) {
+							   [&](const IndirectImagePlan& plan) {
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
 		});
@@ -171,13 +178,22 @@ private:
 		std::array<const Inst*, 8> reads {};
 	};
 
-	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
+	void Fail(uint32_t pc, const std::string& reason) const {
+		if (Frontend::TranslationNonFatal()) {
+			m_failed = true;
+			return;
+		}
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		EXIT("%s", message.c_str());
-		std::abort();
 	}
+
+	mutable bool m_failed = false;
+
+public:
+	[[nodiscard]] bool Failed() const { return m_failed; }
+private:
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                DescriptorSource& descriptor, uint32_t pc) const {
@@ -206,7 +222,8 @@ private:
 			if (descriptor.dwords[i].Resolve().GetType() != Type::U32) {
 				return false;
 			}
-			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i])) {
+			const bool allow_read_first_lane = descriptor.dword_count != 8;
+			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i], allow_read_first_lane)) {
 				return false;
 			}
 		}
@@ -328,6 +345,46 @@ private:
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
 	}
 
+	bool TryDetectIndirectBuffer(const Inst& handle, uint32_t pc, uint32_t& stride_out,
+	                             uint32_t& offset_out) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		const Inst* table_handle = nullptr;
+		Value       table_offset;
+		for (uint32_t dword = 0; dword < 4u; dword++) {
+			const auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr || memory->offset != dword * sizeof(uint32_t) ||
+			    !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || (table_handle != nullptr && current != table_handle)) {
+				return false;
+			}
+			table_handle = current;
+			if (dword == 0u) {
+				table_offset = read->Arg(1).Resolve();
+			} else if (!EquivalentValue(m_program, table_offset, read->Arg(1))) {
+				return false;
+			}
+		}
+		Value    selector;
+		uint32_t stride = 0;
+		uint32_t offset = 0;
+		if (!MatchMaterialOffset(table_offset, selector, stride, offset)) {
+			return false;
+		}
+		stride_out = stride;
+		offset_out = offset;
+		return true;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -434,7 +491,7 @@ private:
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
-		                 [&](const IndirectImagePlan& plan) {
+						     [&](const IndirectImagePlan& plan) {
 			    return plan.handle == &handle;
 		    });
 		return found == m_indirect_images.end() ? nullptr : &*found;
@@ -442,7 +499,7 @@ private:
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-		                   [&](const IndirectImagePlan& plan) {
+							   [&](const IndirectImagePlan& plan) {
 			return std::ranges::find(plan.memory, index) != plan.memory.end();
 		});
 	}
@@ -756,8 +813,10 @@ private:
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+bool TrackResources(Program& program) {
+	Tracker tracker(program);
+	tracker.Run();
+	return !tracker.Failed();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

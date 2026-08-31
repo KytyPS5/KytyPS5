@@ -13677,6 +13677,32 @@ TestCase Vop2SdwaAshrrevCapturedWord0SignExtends() {
   return test;
 }
 
+TestCase Vop2SdwaLshrrevCapturedByte1Source() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 106, 4);
+  AppendBufferLoadDword(&code, 8, 30);
+  code.push_back(0x2c1210f9u);
+  code.push_back(0x0186066au); // v_lshrrev_b32 v9, vcc_lo, v8.byte1
+  AppendStoreVgpr(&code, 9, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop2SdwaLshrrevCapturedByte1Source";
+  test.code = std::move(code);
+  test.initial = {0x12348678u, 0};
+  test.expected = {0x12348678u, 8};
+  test.opcodes = {O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_LSHRREV_B32,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {
+      {"V_LSHRREV_B32 v9, vcc_lo, v8.sdwa(sel=1,sext=0)", 1}};
+  test.ir_counts = {{" = BitFieldUExtract ", 1},
+                    {" = ShiftRightLogical32 ", 1}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpShiftRightLogical"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
   using O = ShaderOpcode;
 
@@ -21141,6 +21167,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
+  AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3Med3I16Captured);

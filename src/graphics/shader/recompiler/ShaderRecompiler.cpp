@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -465,6 +466,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 } // namespace
 
 CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& options) {
+	Frontend::SetTranslationNonFatal(options.non_fatal);
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -508,6 +510,11 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+	if (options.non_fatal && cfg.unsupported && !cfg.irreducible) {
+		CompileResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	bool        dispatcher_fallback = false;
 	std::string dispatcher_reason;
 	if (cfg.irreducible) {
@@ -584,6 +591,11 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	if (options.non_fatal && Frontend::TranslationUnsupported()) {
+		CompileResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -612,7 +624,11 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	}
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
+	if (!IR::TrackResources(ir) && options.non_fatal) {
+		CompileResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;

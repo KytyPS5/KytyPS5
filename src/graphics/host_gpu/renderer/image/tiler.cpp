@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdlib>
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/assert.h"
@@ -13,6 +15,7 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_swap_bgra16_spv.h"
+#include "graphics/host_gpu/deferralBlock.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -89,8 +92,19 @@ TileManager::~TileManager() {
 	}
 }
 
+namespace {
+std::atomic<uint64_t> g_scratch_live_bytes {0};
+constexpr uint64_t    SCRATCH_LIVE_BYTES_CAP = 192ull * 1024ull * 1024ull;
+} // namespace
+
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+
+	if (!CommandScheduler::InDeferredOperation() &&
+	    g_scratch_live_bytes.load(std::memory_order_relaxed) + size > SCRATCH_LIVE_BYTES_CAP) {
+		m_scheduler.FlushAndWait();
+		m_scheduler.PopPendingOperations();
+	}
 	vk::BufferCreateInfo create {};
 	create.sType = vk::StructureType::eBufferCreateInfo;
 	create.size  = size;
@@ -106,13 +120,16 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
 	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
 	                     "allocate TileManager scratch buffer");
+	g_scratch_live_bytes.fetch_add(size, std::memory_order_relaxed);
 	return {buffer, memory, size};
 }
 
 void TileManager::DeferDestroy(Scratch scratch) {
 	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+	m_scheduler.DeferOperation([allocator, scratch] {
+		vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation);
+		g_scratch_live_bytes.fetch_sub(scratch.size, std::memory_order_relaxed);
+	});
 }
 
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,

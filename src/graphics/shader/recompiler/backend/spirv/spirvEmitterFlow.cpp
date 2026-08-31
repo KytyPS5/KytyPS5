@@ -5,6 +5,103 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+bool WorkgroupBroadcastEnabled() {
+	static const bool enabled = true;
+	return enabled;
+}
+
+uint32_t EmitWorkgroupBallot(EmitterState& state, uint32_t predicate);
+uint32_t EmitWorkgroupShuffle(EmitterState& state, uint32_t value, uint32_t lane);
+bool     WaveLoweringActive(const EmitterState& state);
+uint32_t EmitWorkgroupShuffleBool(EmitterState& state, uint32_t value, uint32_t lane);
+
+void EnsureWaveBroadcastStorage(EmitterState& state) {
+	if (state.wave_broadcast_variable != 0) {
+		return;
+	}
+	state.wave_broadcast_variable = state.builder.DefineGlobalVariable(
+	    TypeU32ArrayPointer(state, StorageClassWorkgroup, 64u), StorageClassWorkgroup);
+	state.builder.AddName(state.wave_broadcast_variable, "wave_broadcast");
+}
+
+uint32_t EmitWorkgroupShuffle(EmitterState& state, uint32_t value, uint32_t lane) {
+	EnsureWaveBroadcastStorage(state);
+	const auto elem_ptr_type = TypePointer(state, StorageClassWorkgroup, TypeU32(state));
+	const auto semantics     = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	const auto barrier       = [&] {
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+	};
+	const auto slot   = state.builder.AllocateId();
+	const auto source = state.builder.AllocateId();
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, elem_ptr_type, slot, state.wave_broadcast_variable,
+	                           EmitLocalInvocationIndex(state)});
+	state.builder.AddFunction({OpStore, slot, value});
+	barrier();
+	state.builder.AddFunction({OpAccessChain, elem_ptr_type, source,
+	                           state.wave_broadcast_variable, lane});
+	state.builder.AddFunction({OpLoad, TypeU32(state), result, source});
+	barrier();
+	return result;
+}
+
+bool WaveLoweringActive(const EmitterState& state) {
+	return WorkgroupBroadcastEnabled() && state.wave_size == 64 &&
+	       state.stage == ShaderType::Compute;
+}
+
+uint32_t EmitWorkgroupShuffleBool(EmitterState& state, uint32_t value, uint32_t lane) {
+	const auto as_u32  = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeU32(state), as_u32, value,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+	const auto shuffled = EmitWorkgroupShuffle(state, as_u32, lane);
+	state.builder.AddFunction({OpINotEqual, TypeBool(state), result, shuffled,
+	                           ConstantU32(state, 0)});
+	return result;
+}
+
+uint32_t EmitWorkgroupBallot(EmitterState& state, uint32_t predicate) {
+	EnsureWaveBroadcastStorage(state);
+	const auto elem_ptr_type = TypePointer(state, StorageClassWorkgroup, TypeU32(state));
+	const auto semantics     = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	const auto barrier       = [&] {
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, semantics)});
+	};
+	const auto bit  = state.builder.AllocateId();
+	const auto slot = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeU32(state), bit, predicate,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+	state.builder.AddFunction({OpAccessChain, elem_ptr_type, slot, state.wave_broadcast_variable,
+	                           EmitLocalInvocationIndex(state)});
+	state.builder.AddFunction({OpStore, slot, bit});
+	barrier();
+	uint32_t words[2] = {ConstantU32(state, 0), ConstantU32(state, 0)};
+	for (uint32_t lane = 0; lane < 64u; lane++) {
+		const auto lane_ptr = state.builder.AllocateId();
+		const auto lane_bit = state.builder.AllocateId();
+		const auto shifted  = state.builder.AllocateId();
+		const auto merged   = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, elem_ptr_type, lane_ptr,
+		                           state.wave_broadcast_variable, ConstantU32(state, lane)});
+		state.builder.AddFunction({OpLoad, TypeU32(state), lane_bit, lane_ptr});
+		state.builder.AddFunction({OpShiftLeftLogical, TypeU32(state), shifted, lane_bit,
+		                           ConstantU32(state, lane % 32u)});
+		state.builder.AddFunction(
+		    {OpBitwiseOr, TypeU32(state), merged, words[lane / 32u], shifted});
+		words[lane / 32u] = merged;
+	}
+	barrier();
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(state, 4), result, words[0],
+	                           words[1], ConstantU32(state, 0), ConstantU32(state, 0)});
+	return result;
+}
+
 bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
 	const auto register_index = IR::RegIndex(reg);
 	const auto& registers = state.program.bindings.user_data_registers;
@@ -108,9 +205,14 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 
 uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 	auto&      state  = ctx.state;
-	const auto ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                           ConstantU32(state, ScopeSubgroup), active});
+	uint32_t ballot = 0;
+	if (WaveLoweringActive(state)) {
+		ballot = EmitWorkgroupBallot(state, active);
+	} else {
+		ballot = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                           ConstantU32(state, ScopeSubgroup), active});
+	}
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 	const auto wqm_low  = EmitWqmWordU32(state, low);
@@ -523,17 +625,27 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::DppMoveU32: {
 			const auto flags    = inst.Flags<IR::DppMoveFlags>();
 			const auto target   = EmitDppTargetLane(state, flags.control);
-			const auto shuffled = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
-			                           target.lane});
+			uint32_t shuffled = 0;
+			if (WaveLoweringActive(state)) {
+				shuffled = EmitWorkgroupShuffle(state, ctx.Arg(inst, 0), target.lane);
+			} else {
+				shuffled = state.builder.AllocateId();
+				state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+				                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
+				                           target.lane});
+			}
 			if (flags.fetch_inactive) {
 				ctx.Define(inst, shuffled);
 				return true;
 			}
-			const auto ballot = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 1)});
+			uint32_t ballot = 0;
+			if (WaveLoweringActive(state)) {
+				ballot = EmitWorkgroupBallot(state, ctx.Arg(inst, 1));
+			} else {
+				ballot = state.builder.AllocateId();
+				state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+				                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 1)});
+			}
 			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
 			const auto can_fetch     = state.builder.AllocateId();
 			state.builder.AddFunction(
@@ -557,10 +669,39 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
+			if (WorkgroupBroadcastEnabled() && state.wave_size == 64 &&
+			    state.stage == ShaderType::Compute) {
+				ctx.Define(inst, EmitWorkgroupBallot(state, ctx.Arg(inst, 0)));
+				return true;
+			}
 			ctx.Emit(inst, OpGroupNonUniformBallot, IR::Type::U32x4,
 			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0)});
 			return true;
 		case IR::ValueOpcode::ReadFirstLane: {
+			if (WorkgroupBroadcastEnabled() && state.wave_size == 64 &&
+			    state.stage == ShaderType::Compute) {
+				EnsureWaveBroadcastStorage(state);
+				const auto elem_ptr_type = TypePointer(state, StorageClassWorkgroup, TypeU32(state));
+				const auto slot_ptr      = state.builder.AllocateId();
+				const auto zero_ptr      = state.builder.AllocateId();
+				const auto value         = state.builder.AllocateId();
+				const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+				state.builder.AddFunction({OpAccessChain, elem_ptr_type, slot_ptr,
+				                           state.wave_broadcast_variable,
+				                           EmitLocalInvocationIndex(state)});
+				state.builder.AddFunction({OpStore, slot_ptr, ctx.Arg(inst, 0)});
+				state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+				                           ConstantU32(state, ScopeWorkgroup),
+				                           ConstantU32(state, semantics)});
+				state.builder.AddFunction({OpAccessChain, elem_ptr_type, zero_ptr,
+				                           state.wave_broadcast_variable, ConstantU32(state, 0)});
+				state.builder.AddFunction({OpLoad, TypeU32(state), value, zero_ptr});
+				state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+				                           ConstantU32(state, ScopeWorkgroup),
+				                           ConstantU32(state, semantics)});
+				ctx.Define(inst, value);
+				return true;
+			}
 			const auto ballot = state.builder.AllocateId();
 			const auto lane   = state.builder.AllocateId();
 			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
@@ -572,6 +713,11 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		case IR::ValueOpcode::ReadLane:
+			if (WorkgroupBroadcastEnabled() && state.wave_size == 64 &&
+			    state.stage == ShaderType::Compute) {
+				ctx.Define(inst, EmitWorkgroupShuffle(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
+				return true;
+			}
 			ctx.Emit(inst, OpGroupNonUniformShuffle, IR::Type::U32,
 			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
 			return true;
@@ -618,16 +764,26 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(
 			    {OpBitwiseAnd, TypeU32(state), index, shifted, ConstantU32(state, 15)});
 			state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row_value, index});
-			const auto shuffled = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
-			                           target});
+			uint32_t shuffled = 0;
+			if (WaveLoweringActive(state)) {
+				shuffled = EmitWorkgroupShuffle(state, ctx.Arg(inst, 0), target);
+			} else {
+				shuffled = state.builder.AllocateId();
+				state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+				                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
+				                           target});
+			}
 			uint32_t result = shuffled;
 			if (!flags.fetch_inactive) {
-				const auto source_exec = state.builder.AllocateId();
-				state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-				                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3),
-				                           target});
+				uint32_t source_exec = 0;
+				if (WaveLoweringActive(state)) {
+					source_exec = EmitWorkgroupShuffleBool(state, ctx.Arg(inst, 3), target);
+				} else {
+					source_exec = state.builder.AllocateId();
+					state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+					                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3),
+					                           target});
+				}
 				result = state.builder.AllocateId();
 				state.builder.AddFunction({OpSelect, TypeU32(state), result, source_exec, shuffled,
 				                           ConstantU32(state, 0)});

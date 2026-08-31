@@ -484,9 +484,14 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
                                                 const AudioOut2Attribute* attributes,
                                                 uint32_t                  num) {
-	PRINT_NAME();
-	LOGF("\t ctx = 0x%016" PRIx64 ", num = %" PRIu32 "\n", ctx, num);
+	static std::atomic<uint32_t> call_log {0};
+	if (call_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+		PRINT_NAME();
+	}
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
+	for (uint32_t i = 0; i < num; i++) {
+		const auto                   id = attributes[i].attribute_id;
+	}
 	return OK;
 }
 

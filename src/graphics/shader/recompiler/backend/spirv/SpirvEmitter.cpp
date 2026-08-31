@@ -245,6 +245,9 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::ReadClockRealtime64:
+					requirements.shader_clock = true;
+					break;
 				case IR::ValueOpcode::Ballot: MarkBallot(); break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:

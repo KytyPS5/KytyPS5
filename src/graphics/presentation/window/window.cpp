@@ -1,5 +1,7 @@
 #include "graphics/presentation/window.h"
 
+#include "graphics/presentation/videoOut.h"
+
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -27,6 +29,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/memory.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -40,10 +43,15 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -57,6 +65,170 @@
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
+
+static std::atomic<uint64_t> g_last_present_counter {0};
+static std::atomic<bool>     g_stall_watchdog_started {false};
+
+static bool StallProbeReadable(uint64_t addr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) == 0) {
+		return false;
+	}
+	if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+		return false;
+	}
+	const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+	return addr + size <= region_end;
+#else
+	(void)addr;
+	(void)size;
+	return false;
+#endif
+}
+
+struct KnownTable {
+	uint64_t manager;
+	uint64_t keys;
+	uint32_t cap;
+	uint32_t zeros;
+};
+static std::vector<KnownTable> g_known_tables;
+
+static void RecheckKnownTables() {
+	for (auto& e: g_known_tables) {
+		if (!StallProbeReadable(e.keys, static_cast<uint64_t>(e.cap) * 4u)) {
+			continue;
+		}
+		const auto* slots = reinterpret_cast<const uint32_t*>(e.keys);
+		uint32_t    zeros = 0;
+		for (uint32_t i = 0; i < e.cap; i++) {
+			zeros += (slots[i] == 0 ? 1u : 0u);
+		}
+		if (zeros != e.zeros) {
+			e.zeros = zeros;
+		}
+	}
+}
+
+constexpr uint32_t kMinTableCapacity = 8;
+
+static void CheckGuestHashTables(uint64_t region_start, uint64_t region_end) {
+	constexpr uint64_t GuestLow  = 0x1000000000ull;
+	constexpr uint64_t GuestHigh = 0x1030000000ull;
+	static std::vector<uint64_t> reported;
+
+	for (uint64_t addr = region_start; addr + 0x18 <= region_end; addr += 8) {
+		if (!StallProbeReadable(addr, 0x18)) {
+			continue;
+		}
+		const auto keys = *reinterpret_cast<const uint64_t*>(addr);
+		const auto cnt  = *reinterpret_cast<const uint32_t*>(addr + 0x10);
+		const auto cap  = *reinterpret_cast<const uint32_t*>(addr + 0x14);
+		if (keys < GuestLow || keys >= GuestHigh || cap < kMinTableCapacity || cap > 0x40000u ||
+		    (cap & (cap - 1u)) != 0 || cnt > cap) {
+			continue;
+		}
+		if (!StallProbeReadable(keys, static_cast<uint64_t>(cap) * 4u)) {
+			continue;
+		}
+		const auto* slots = reinterpret_cast<const uint32_t*>(keys);
+		uint32_t    zeros = 0;
+		for (uint32_t i = 0; i < cap; i++) {
+			zeros += (slots[i] == 0 ? 1u : 0u);
+		}
+		{
+			auto it = std::find_if(g_known_tables.begin(), g_known_tables.end(),
+			                       [addr](const KnownTable& e) { return e.manager == addr; });
+			if (it == g_known_tables.end()) {
+				g_known_tables.push_back({addr, keys, cap, zeros});
+			} else if (it->zeros != zeros) {
+				it->zeros = zeros;
+			} else if (it->keys != keys || it->cap != cap) {
+				it->keys = keys;
+				it->cap  = cap;
+			}
+		}
+
+		if (zeros != 0) {
+			continue;
+		}
+		if (std::find(reported.begin(), reported.end(), addr) != reported.end()) {
+			continue;
+		}
+		reported.push_back(addr);
+	}
+}
+
+static void DumpGuestHashTables(uint64_t region_start, uint64_t region_end) {
+	constexpr uint64_t GuestLow  = 0x1000000000ull;
+	constexpr uint64_t GuestHigh = 0x1030000000ull;
+	uint32_t           found     = 0;
+
+	for (uint64_t addr = region_start; addr + 0x18 <= region_end; addr += 8) {
+		if (!StallProbeReadable(addr, 0x18)) {
+			continue;
+		}
+		const auto keys = *reinterpret_cast<const uint64_t*>(addr);
+		const auto cnt  = *reinterpret_cast<const uint32_t*>(addr + 0x10);
+		const auto cap  = *reinterpret_cast<const uint32_t*>(addr + 0x14);
+		if (keys < GuestLow || keys >= GuestHigh || cap < kMinTableCapacity || cap > 0x40000u ||
+		    (cap & (cap - 1u)) != 0 || cnt > cap) {
+			continue;
+		}
+		if (!StallProbeReadable(keys, static_cast<uint64_t>(cap) * 4u)) {
+			continue;
+		}
+
+		const auto* slots = reinterpret_cast<const uint32_t*>(keys);
+		uint32_t    zeros = 0;
+		for (uint32_t i = 0; i < cap; i++) {
+			zeros += (slots[i] == 0 ? 1u : 0u);
+		}
+		found++;
+	}
+}
+
+static void StartStallWatchdog() {
+	if (g_stall_watchdog_started.exchange(true)) {
+		return;
+	}
+	std::thread([] {
+		constexpr uint64_t StallSeconds  = 20;
+		constexpr uint64_t RepeatSeconds = 60;
+		uint64_t           last_report   = 0;
+		for (;;) {
+			RecheckKnownTables();
+			static uint32_t scan_tick = 0;
+			if ((scan_tick++ % 40u) == 0u) {
+				CheckGuestHashTables(0x906880000ull, 0x906890000ull);
+			}
+			Common::Thread::Sleep(5);
+			static uint32_t tick = 0;
+			if ((tick++ % 400u) != 0u) {
+				continue;
+			}
+			const auto frequency = Common::Timer::QueryPerformanceFrequency();
+			const auto now       = Common::Timer::QueryPerformanceCounter();
+			const auto last      = g_last_present_counter.load(std::memory_order_relaxed);
+			if (last == 0 || frequency == 0) {
+				continue;
+			}
+			const auto idle_seconds = (now - last) / frequency;
+			if (idle_seconds < StallSeconds) {
+				continue;
+			}
+			if (last_report != 0 && (now - last_report) / frequency < RepeatSeconds) {
+				continue;
+			}
+			last_report = now;
+			if (auto* video_out = Libs::VideoOut::VideoOutGetDriver(); video_out != nullptr) {
+				video_out->DumpFlipState();
+			}
+			DumpGuestHashTables(0x906880000ull, 0x906890000ull);
+		}
+	}).detach();
+}
 
 struct EventKeyboard {
 	bool     down;
@@ -817,6 +989,8 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
+	StartStallWatchdog();
+
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
@@ -996,6 +1170,7 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	g_last_present_counter.store(now, std::memory_order_relaxed);
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/timer.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -13,8 +14,13 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
@@ -27,6 +33,90 @@ bool CommandBuffer::IsInvalid() const {
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
 	return m_buffer;
+}
+
+static constexpr size_t                      CHECKPOINT_RING_SIZE = 4096;
+static std::array<GpuCheckpoint, CHECKPOINT_RING_SIZE> g_checkpoints {};
+static std::atomic<uint64_t>                 g_checkpoint_next {0};
+
+static GpuCheckpoint* AllocateCheckpoint(uint32_t phase) {
+	const auto index = g_checkpoint_next.fetch_add(1, std::memory_order_relaxed);
+	auto*      entry = &g_checkpoints[index % CHECKPOINT_RING_SIZE];
+	*entry           = GpuCheckpoint {};
+	entry->phase     = phase;
+	return entry;
+}
+
+static void DumpDeviceFaultInfo(GraphicContext& graphics) {
+	vk::DeviceFaultCountsEXT counts {};
+	counts.sType = vk::StructureType::eDeviceFaultCountsEXT;
+	auto result  = graphics.device.getFaultInfoEXT(&counts, nullptr);
+	if (result != vk::Result::eSuccess) {
+		return;
+	}
+
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+
+	vk::DeviceFaultInfoEXT info {};
+	info.sType           = vk::StructureType::eDeviceFaultInfoEXT;
+	info.pAddressInfos   = addresses.empty() ? nullptr : addresses.data();
+	info.pVendorInfos    = vendors.empty() ? nullptr : vendors.data();
+	counts.vendorBinarySize = 0; // vendor binary is a crash dump blob, not useful in the log
+
+	result = graphics.device.getFaultInfoEXT(&counts, &info);
+	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+		return;
+	}
+
+	for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+		const auto& a = addresses[i];
+		const uint64_t precision = a.addressPrecision != 0 ? a.addressPrecision : 1;
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+		const auto& v = vendors[i];
+	}
+}
+
+void GpuCrashDiagnosticsDump(GraphicContext& graphics, const char* context_text) {
+	if (!graphics.diagnostic_checkpoints_enabled && !graphics.device_fault_enabled) {
+		return;
+	}
+
+	if (graphics.diagnostic_checkpoints_enabled) {
+		Common::LockGuard lock(graphics.queue_mutex);
+
+		auto checkpoints2 = graphics.queue.getCheckpointData2NV();
+		for (const auto& data: checkpoints2) {
+			const auto* entry = static_cast<const GpuCheckpoint*>(data.pCheckpointMarker);
+			const bool  ours =
+			    entry >= g_checkpoints.data() && entry < g_checkpoints.data() + CHECKPOINT_RING_SIZE;
+			if (!ours) {
+				continue;
+			}
+		}
+
+		const auto recorded = g_checkpoint_next.load(std::memory_order_relaxed);
+		const auto show     = std::min<uint64_t>(recorded, 12);
+		for (uint64_t i = recorded - show; i < recorded; i++) {
+			const auto& entry = g_checkpoints[i % CHECKPOINT_RING_SIZE];
+		}
+
+		auto checkpoints = graphics.queue.getCheckpointDataNV();
+		for (const auto& data: checkpoints) {
+			const auto* entry = static_cast<const GpuCheckpoint*>(data.pCheckpointMarker);
+			if (entry < g_checkpoints.data() || entry >= g_checkpoints.data() + CHECKPOINT_RING_SIZE ||
+			    (reinterpret_cast<uintptr_t>(entry) - reinterpret_cast<uintptr_t>(g_checkpoints.data())) %
+			            sizeof(GpuCheckpoint) !=
+			        0) {
+				continue;
+			}
+		}
+	}
+
+	if (graphics.device_fault_enabled) {
+		DumpDeviceFaultInfo(graphics);
+	}
 }
 
 void CommandBuffer::Begin() {
@@ -42,11 +132,22 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	if (m_graphics.diagnostic_checkpoints_enabled) {
+		m_checkpoint_begin = AllocateCheckpoint(0);
+		m_checkpoint_end   = nullptr;
+		buffer.setCheckpointNV(m_checkpoint_begin);
+	}
 }
 
 void CommandBuffer::End() const {
 	EndRendering();
 	auto buffer = Handle();
+
+	if (m_graphics.diagnostic_checkpoints_enabled) {
+		m_checkpoint_end = AllocateCheckpoint(1);
+		buffer.setCheckpointNV(m_checkpoint_end);
+	}
 
 	auto result = buffer.end();
 
@@ -62,6 +163,18 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+
+	if (m_graphics.diagnostic_checkpoints_enabled && !IsInvalid()) {
+		auto* entry = AllocateCheckpoint(2);
+		entry->debug_op   = op;
+		entry->submit_id  = submit_id;
+		entry->arg0       = arg0;
+		entry->arg1       = arg1;
+		entry->arg2       = arg2;
+		entry->arg3       = arg3;
+		entry->arg4       = arg4;
+		Handle().setCheckpointNV(entry);
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

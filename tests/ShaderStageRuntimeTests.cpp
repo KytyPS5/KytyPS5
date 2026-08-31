@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string_view>
 
 namespace {
 
@@ -160,6 +161,13 @@ int DbgExitIfHandler(const char *, const char *, int) { return 1; }
 void DbgExit(int) { std::abort(); }
 
 } // namespace Common
+
+namespace Log {
+bool IsSilent() {
+	return true;
+}
+void Write(std::string_view) {}
+} // namespace Log
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();

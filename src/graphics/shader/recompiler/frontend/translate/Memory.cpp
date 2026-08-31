@@ -470,14 +470,17 @@ bool Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto loaded =
 	    ir.Emit(opcode, {resource, address.index, address.offset, address.soffset, ir.GetExec()},
 	            AddMemoryInfo(memory, inst.pc));
+	const auto exec_mask = ir.GetExec();
+	const auto keep      = [&](const Decoder::Operand& dst, const IR::Value& value) {
+		WriteOperand(dst, ir.Select(exec_mask, IR::U32(value), ReadU32(dst)));
+	};
 	if (bits != 32u) {
-		WriteOperand(inst.dst, WidenSubdword(loaded, bits, sign));
+		keep(inst.dst, WidenSubdword(loaded, bits, sign));
 	} else if (memory.data_dwords == 1u) {
-		WriteOperand(inst.dst, loaded);
+		keep(inst.dst, loaded);
 	} else {
 		for (uint32_t component = 0; component < memory.data_dwords; component++) {
-			WriteOperand(OffsetOperand(inst.dst, component),
-			             ir.CompositeExtract(loaded, component));
+			keep(OffsetOperand(inst.dst, component), ir.CompositeExtract(loaded, component));
 		}
 	}
 	return true;
@@ -900,6 +903,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
+
+		case Decoder::Opcode::S_MEMREALTIME:
+			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ReadClockRealtime64));
+			return true;
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:

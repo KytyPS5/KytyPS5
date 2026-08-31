@@ -231,6 +231,7 @@ private:
 	bool    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	bool    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
+	bool S_CMP_MASK_ANY(const Decoder::Instruction& inst, bool not_equal);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
 	                bool negate_source, bool write_64);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
@@ -275,5 +276,28 @@ private:
 	uint32_t        current_vector_limit = 1;
 	uint32_t        current_wave_size    = 64;
 };
+
+inline bool& TranslationNonFatalFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+inline bool& TranslationUnsupportedFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+inline void SetTranslationNonFatal(bool enabled) {
+	TranslationNonFatalFlag()    = enabled;
+	TranslationUnsupportedFlag() = false;
+}
+
+inline bool TranslationUnsupported() {
+	return TranslationUnsupportedFlag();
+}
+
+inline bool TranslationNonFatal() {
+	return TranslationNonFatalFlag();
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

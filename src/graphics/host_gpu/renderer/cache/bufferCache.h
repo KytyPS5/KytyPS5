@@ -29,9 +29,16 @@ class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
+	static constexpr uint32_t CACHING_ADDRESS_BITS = 39;
+	static constexpr uint64_t CACHING_NUMPAGES  =
+	    uint64_t {1} << (CACHING_ADDRESS_BITS - CACHING_PAGEBITS);
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+
+	static constexpr uint64_t UPLOAD_BUFFER_SIZE       = 512ull * 1024ull * 1024ull;
+	static constexpr uint64_t STREAM_BUFFER_SIZE       = 64ull * 1024ull * 1024ull;
+	static constexpr uint64_t DOWNLOAD_BUFFER_SIZE     = 128ull * 1024ull * 1024ull;
+	static constexpr uint64_t DEVICE_LOCAL_BUFFER_SIZE = 128ull * 1024ull * 1024ull;
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);

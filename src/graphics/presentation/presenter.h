@@ -28,6 +28,7 @@ public:
 	[[nodiscard]] bool           NeedsImeRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	void                         Present(Frame& frame, bool reuse = false);
+	void                         CaptureFrame(Frame& frame);
 	void                         Discard(Frame& frame);
 
 private:

@@ -26,7 +26,8 @@ struct DescriptorSourceRequest {
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
-bool ValidateRuntimeValue(const Program& program, Value value);
+bool ValidateRuntimeValue(const Program& program, Value value,
+                          bool allow_read_first_lane = false);
 
 bool EvaluateDescriptorSource(const Program& program, uint32_t source, const SrtRuntime& runtime,
                               DescriptorValue& result);

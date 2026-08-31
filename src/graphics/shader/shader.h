@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_H_
 
+#include <cstdlib>
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -244,6 +245,11 @@ void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
 bool ShaderAddressValid(uint64_t addr);
+
+inline bool ShaderFailureNonFatal() {
+	static const bool value = true;
+	return value;
+}
 
 } // namespace Libs::Graphics
 

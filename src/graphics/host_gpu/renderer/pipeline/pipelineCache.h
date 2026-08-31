@@ -38,6 +38,7 @@ struct PipelineStaticParameters {
 	bool                       depth_clip_enable        = true;
 	int                        scissor_ltrb[4]          = {0};
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
+	uint32_t                   patch_control_points     = 3;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
@@ -80,7 +81,8 @@ static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
 static_assert(sizeof(PipelineStaticParameters) ==
               sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 2 + sizeof(int[4]) +
-                  sizeof(vk::PrimitiveTopology) + sizeof(bool) + sizeof(uint32_t) +
+                  sizeof(vk::PrimitiveTopology) + sizeof(uint32_t) + sizeof(bool) +
+                  sizeof(uint32_t) +
                   sizeof(bool) * 4 + sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 +
                   sizeof(bool) + sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
                   sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
@@ -144,7 +146,8 @@ public:
 	    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-	    bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	    bool primitive_restart_enable, uint32_t patch_control_points,
+	    const ShaderProgram& vertex_program,
 	    const ShaderProgram& pixel_program);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	                                       const ShaderProgram&    compute_program);

@@ -3,6 +3,8 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/timer.h"
+#include "common/threads.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -10,11 +12,18 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <memory>
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -64,6 +73,31 @@ static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) 
 		return true;
 	}
 	return addr != 0 && addr <= std::numeric_limits<uint64_t>::max() - size;
+}
+
+static bool IsGuestRangeCommitted(uint64_t addr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t checked = 0;
+	while (checked < size) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(addr + checked), &mbi, sizeof(mbi)) == 0) {
+			return false;
+		}
+		if (mbi.State != MEM_COMMIT) {
+			return false;
+		}
+		const auto region_end =
+		    reinterpret_cast<uint64_t>(mbi.BaseAddress) + static_cast<uint64_t>(mbi.RegionSize);
+		if (region_end <= addr + checked) {
+			return false;
+		}
+		checked = region_end - addr;
+	}
+#else
+	(void)addr;
+	(void)size;
+#endif
+	return true;
 }
 
 static bool ReadGuestBytes(uint64_t addr, void* out, uint64_t size) {
@@ -667,6 +701,11 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, prefix_buf, results));
 }
 
+static uint64_t AprTracedAddr() {
+	constexpr uint64_t traced = 0ull;
+	return traced;
+}
+
 static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffer, uint64_t,
                                                          void*     result,
                                                          uint32_t* out_submission_id) {
@@ -731,7 +770,7 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void*     command_buffer, u
 	}
 	AprShared::SetSubmissionResult(id, execution_result, error_offset);
 
-	if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
+		if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
@@ -816,7 +855,7 @@ constexpr int      PROT_AMPR_READ                = 0x40;
 constexpr int      PROT_AMPR_WRITE               = 0x80;
 constexpr int      PROT_ACP_READ                 = 0x100;
 constexpr int      PROT_ACP_WRITE                = 0x200;
-constexpr uint64_t AMM_VA_START                  = 0x0000001000000000ull;
+constexpr uint64_t AMM_VA_START                  = 0x0000004000000000ull;
 constexpr uint64_t AMM_VA_SIZE                   = 0x0000001000000000ull;
 constexpr uint64_t APR_MAX_READ_LENGTH           = 0x0000000100000000ull;
 constexpr uint64_t APR_MAX_FILE_OFFSET           = 0x0000010000000000ull;
@@ -824,6 +863,14 @@ constexpr uint64_t APR_MAX_APP_ADDRESS           = 0x0000f00000000000ull;
 constexpr uint64_t APR_HOST_READ_CHUNK_SIZE      = 4 * 1024 * 1024;
 constexpr uint32_t APR_TYPE_GATHER_SCATTER_VALID = 0x00010000;
 constexpr uint32_t APR_TYPE_MAP_ACTIVE           = 0x00020000;
+
+constexpr uint32_t AMPR_WAIT_COMPARE_EQUAL                         = 0;
+constexpr uint32_t AMPR_WAIT_COMPARE_GREATER_THAN_UNSIGNED         = 1;
+constexpr uint32_t AMPR_WAIT_COMPARE_LESS_THAN_UNSIGNED            = 2;
+constexpr uint32_t AMPR_WAIT_COMPARE_NOT_EQUAL                     = 3;
+constexpr uint32_t AMPR_WAIT_COMPARE_GREATER_THAN_OR_EQUAL_WRAPPED = 4;
+constexpr uint32_t AMPR_WAIT_COMPARE_GREATER_THAN_SIGNED           = 5;
+constexpr uint32_t AMPR_WAIT_COMPARE_LESS_THAN_SIGNED              = 6;
 
 enum class AmmCommandKind : uint32_t {
 	MapAuto,
@@ -855,6 +902,12 @@ struct CommandBufferState {
 		uint64_t address       = 0;
 		uint64_t value         = 0;
 	};
+	struct WaitAddressCommand {
+		uint64_t record_offset = 0;
+		uint64_t address       = 0;
+		uint64_t ref_value     = 0;
+		uint32_t compare       = 0;
+	};
 	struct AmmMapCommand {
 		uint64_t       record_offset = 0;
 		AmmCommandKind kind          = AmmCommandKind::MapAuto;
@@ -868,6 +921,7 @@ struct CommandBufferState {
 	std::vector<ReadFileCommand>     read_file_commands;
 	std::vector<KernelEventCommand>  kernel_event_commands;
 	std::vector<WriteAddressCommand> write_address_commands;
+	std::vector<WaitAddressCommand>  wait_address_commands;
 	std::vector<AmmMapCommand>       amm_map_commands;
 	bool                             gather_scatter_valid       = false;
 	uint32_t                         gather_scatter_file_id     = 0;
@@ -907,7 +961,8 @@ using CommandBufferIterator = std::unordered_map<uint64_t, CommandBufferState>::
 
 static bool HasQueuedCommands(const CommandBufferState& state) {
 	return !state.read_file_commands.empty() || !state.kernel_event_commands.empty() ||
-	       !state.write_address_commands.empty() || !state.amm_map_commands.empty();
+	       !state.write_address_commands.empty() || !state.wait_address_commands.empty() ||
+	       !state.amm_map_commands.empty();
 }
 
 static void RegisterCommandBufferAliasLocked(uint64_t command_buffer, uint64_t buffer) {
@@ -1150,6 +1205,7 @@ static bool WriteCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
 	state.read_file_commands.clear();
 	state.kernel_event_commands.clear();
 	state.write_address_commands.clear();
+	state.wait_address_commands.clear();
 	state.amm_map_commands.clear();
 	state.gather_scatter_valid       = false;
 	state.gather_scatter_file_id     = 0;
@@ -1317,6 +1373,26 @@ static bool AppendWriteAddressRecord(uint64_t command_buffer, uint64_t address, 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+static bool AppendWaitAddressRecord(uint64_t command_buffer, uint64_t address, uint64_t ref_value,
+                                    uint32_t compare, uint64_t record_size = 0x20) {
+	std::scoped_lock      lock(g_command_buffer_mutex);
+	CommandBufferIterator it;
+	if (!GetOrCreateCommandBufferStateLocked(command_buffer, &it)) {
+		return false;
+	}
+
+	auto& state = it->second;
+	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
+		return false;
+	}
+
+	const auto record_offset = state.write_offset;
+	std::memset(reinterpret_cast<void*>(state.buffer + record_offset), 0,
+	            static_cast<size_t>(record_size));
+	state.wait_address_commands.push_back({record_offset, address, ref_value, compare});
+	return CommitCommandBufferRecord(command_buffer, &state, record_size);
+}
+
 static bool ValidateAmmMapArgs(uint64_t va, uint64_t size) {
 	return va != 0 && size != 0 && (va & (AMM_PAGE_SIZE - 1u)) == 0 &&
 	       (size & (AMM_PAGE_SIZE - 1u)) == 0 && va + size >= va;
@@ -1444,6 +1520,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		ReadFile,
 		KernelEvent,
 		WriteAddress,
+		WaitAddress,
 		AmmMap,
 	};
 
@@ -1455,7 +1532,8 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 
 	std::vector<OrderedCommand> ordered;
 	ordered.reserve(state.read_file_commands.size() + state.kernel_event_commands.size() +
-	                state.write_address_commands.size() + state.amm_map_commands.size());
+	                state.write_address_commands.size() + state.wait_address_commands.size() +
+	                state.amm_map_commands.size());
 	for (size_t i = 0; i < state.read_file_commands.size(); i++) {
 		if (state.read_file_commands[i].record_offset < state.write_offset) {
 			ordered.push_back(
@@ -1474,6 +1552,12 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 			    {state.write_address_commands[i].record_offset, CommandKind::WriteAddress, i});
 		}
 	}
+	for (size_t i = 0; i < state.wait_address_commands.size(); i++) {
+		if (state.wait_address_commands[i].record_offset < state.write_offset) {
+			ordered.push_back(
+			    {state.wait_address_commands[i].record_offset, CommandKind::WaitAddress, i});
+		}
+	}
 	for (size_t i = 0; i < state.amm_map_commands.size(); i++) {
 		if (state.amm_map_commands[i].record_offset < state.write_offset) {
 			ordered.push_back({state.amm_map_commands[i].record_offset, CommandKind::AmmMap, i});
@@ -1483,6 +1567,16 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	std::sort(ordered.begin(), ordered.end(), [](const OrderedCommand& a, const OrderedCommand& b) {
 		return a.record_offset < b.record_offset;
 	});
+
+	static std::mutex g_apr_execution_mutex;
+	std::unique_lock  execution_lock(g_apr_execution_mutex);
+
+	static std::atomic<int32_t> in_flight {0};
+	const auto                  depth = in_flight.fetch_add(1, std::memory_order_relaxed) + 1;
+	struct DepthGuard {
+		std::atomic<int32_t>* counter;
+		~DepthGuard() { counter->fetch_sub(1, std::memory_order_relaxed); }
+	} depth_guard {&in_flight};
 
 	for (const auto& entry: ordered) {
 		switch (entry.kind) {
@@ -1495,6 +1589,9 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					*execution_result = LibKernel::KERNEL_ERROR_ENOENT;
 					*error_offset     = static_cast<uint32_t>(command.record_offset);
 					return OK;
+				}
+
+				{
 				}
 
 				uint64_t bytes_read = 0;
@@ -1523,8 +1620,66 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					return OK;
 				}
 			} break;
+			case CommandKind::WaitAddress: {
+				const auto& command = state.wait_address_commands[entry.index];
+
+				const auto satisfied = [&command](uint64_t observed) {
+					const auto ref    = command.ref_value;
+					const auto signed_observed = static_cast<int64_t>(observed);
+					const auto signed_ref      = static_cast<int64_t>(ref);
+					switch (command.compare) {
+						case AMPR_WAIT_COMPARE_EQUAL: return observed == ref;
+						case AMPR_WAIT_COMPARE_GREATER_THAN_UNSIGNED: return observed > ref;
+						case AMPR_WAIT_COMPARE_LESS_THAN_UNSIGNED: return observed < ref;
+						case AMPR_WAIT_COMPARE_NOT_EQUAL: return observed != ref;
+						case AMPR_WAIT_COMPARE_GREATER_THAN_OR_EQUAL_WRAPPED:
+							return static_cast<int64_t>(observed - ref) >= 0;
+						case AMPR_WAIT_COMPARE_GREATER_THAN_SIGNED:
+							return signed_observed > signed_ref;
+						case AMPR_WAIT_COMPARE_LESS_THAN_SIGNED: return signed_observed < signed_ref;
+						default: return true;
+					}
+				};
+
+				constexpr uint32_t WaitPollMicros    = 50;
+				constexpr double   WaitSpinSeconds   = 0.0002;
+				constexpr double WaitTimeoutSecond = 0.1;
+				Common::Timer      wait_timer;
+				wait_timer.Start();
+				execution_lock.unlock();
+				uint64_t observed = 0;
+				bool     done     = false;
+				for (;;) {
+					if (!AprShared::ReadGuest(command.address, &observed)) {
+						break;
+					}
+					if (satisfied(observed)) {
+						done = true;
+						break;
+					}
+					if (wait_timer.GetTimeS() >= WaitTimeoutSecond) {
+						break;
+					}
+					if (wait_timer.GetTimeS() < WaitSpinSeconds) {
+						Common::Thread::SleepNano(0);
+					} else {
+						Common::Thread::SleepMicro(WaitPollMicros);
+					}
+				}
+				execution_lock.lock();
+				if (!done) {
+					static const bool abort_on_timeout =
+					    false;
+					if (abort_on_timeout) {
+						*execution_result = LibKernel::KERNEL_ERROR_ETIMEDOUT;
+						*error_offset     = static_cast<uint32_t>(command.record_offset);
+						return OK;
+					}
+				}
+			} break;
 			case CommandKind::WriteAddress: {
 				const auto& command = state.write_address_commands[entry.index];
+				constexpr uint64_t traced_addr = 0ull;
 				if (!AprShared::WriteGuest(command.address, command.value)) {
 					LOGF("\tAMPR submit write-address failed: address=0x%016" PRIx64
 					     " value=0x%016" PRIx64 "\n",
@@ -1588,46 +1743,65 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	if (size == 0) {
 		return OK;
 	}
-	if (!AprShared::IsValidGuestRange(destination, size, true)) {
+	if (!AprShared::IsValidGuestRange(destination, size, true) ||
+	    !AprShared::IsGuestRangeCommitted(destination, size)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	Common::File file;
-	if (!file.Open(host_path, Common::File::Mode::Read)) {
-		LOGF("\tAPR read missing host file: %s\n", host_path.c_str());
-		return LibKernel::KERNEL_ERROR_ENOENT;
+	struct CachedFile {
+		std::string  path;
+		Common::File file;
+		uint64_t     size = 0;
+	};
+	static thread_local std::vector<std::unique_ptr<CachedFile>> cache;
+
+	CachedFile* entry = nullptr;
+	for (auto& candidate: cache) {
+		if (candidate->path == host_path) {
+			entry = candidate.get();
+			break;
+		}
 	}
-	const auto file_size = file.Size();
+	if (entry == nullptr) {
+		if (cache.size() >= 16) {
+			cache.front()->file.Close();
+			cache.erase(cache.begin());
+		}
+		auto opened  = std::make_unique<CachedFile>();
+		opened->path = host_path;
+		if (!opened->file.Open(host_path, Common::File::Mode::Read)) {
+			return LibKernel::KERNEL_ERROR_ENOENT;
+		}
+		opened->size = opened->file.Size();
+		cache.push_back(std::move(opened));
+		entry = cache.back().get();
+	}
+
+	auto&      file      = entry->file;
+	const auto file_size = entry->size;
 	if (file_offset >= file_size) {
-		file.Close();
 		return OK;
 	}
 	if (!file.Seek(file_offset)) {
-		file.Close();
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		file.Close();
 		return OK;
 	}
 
-	std::vector<uint8_t> buffer(
-	    static_cast<size_t>(std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable)));
 	while (*bytes_read < readable) {
-		const auto request =
-		    static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), readable - *bytes_read));
+		const auto request = static_cast<uint32_t>(
+		    std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable - *bytes_read));
 		uint32_t read = 0;
-		file.Read(buffer.data(), request, &read);
+		file.Read(reinterpret_cast<void*>(destination + *bytes_read), request, &read);
 		if (read == 0) {
 			break;
 		}
-		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), read);
 		*bytes_read += read;
 	}
 
-	file.Close();
 	return OK;
 }
 
@@ -2111,11 +2285,22 @@ static int KYTY_SYSV_ABI CommandBufferPopMarker(void* command_buffer) {
 	return AppendNoOpCommand(command_buffer, sizeof(uint32_t));
 }
 
-static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void* command_buffer, volatile uint64_t*,
-                                                    uint64_t, uint8_t, uint8_t) {
+static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void* command_buffer,
+                                                    volatile uint64_t* address, uint64_t ref_value,
+                                                    uint8_t compare, uint8_t flush) {
 	PRINT_NAME();
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+	(void)flush;
+	if (command_buffer == nullptr || address == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (compare > AMPR_WAIT_COMPARE_LESS_THAN_SIGNED) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	return AppendWaitAddressRecord(reinterpret_cast<uint64_t>(command_buffer),
+	                               reinterpret_cast<uint64_t>(address), ref_value, compare)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
 static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t, uint8_t,
@@ -2589,7 +2774,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_bas
 	}
 	AprShared::SetSubmissionResult(id, execution_result, error_offset);
 
-	if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
+		if (!AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
@@ -2665,6 +2850,7 @@ LIB_DEFINE(InitAmpr_1_Ampr) {
 	LIB_FUNC("dXPaz65HNmk", Ampr::CommandBufferPushMarker);
 	LIB_FUNC("mv0O8Zg0woU", Ampr::CommandBufferPopMarker);
 	LIB_FUNC("DLfoNxTFNVk", Ampr::CommandBufferWaitOnAddress);
+	LIB_FUNC("V7GQTEeUfhw", Ampr::CommandBufferWaitOnAddress);
 	LIB_FUNC("cQb8Zr8Q0Y0", Ampr::CommandBufferWaitOnCounter);
 	LIB_FUNC("j0+3uJMxYJY", Ampr::CommandBufferWriteAddress);
 	LIB_FUNC("sJXyWHjP-F8", Ampr::CommandBufferWriteAddressOnCompletion);

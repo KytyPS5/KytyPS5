@@ -141,7 +141,12 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto module = CompileProgram(device, params, input_info);
-		EXIT_IF(module == nullptr || !input_info.stage);
+		if (module == nullptr || !input_info.stage) {
+			if (ShaderFailureNonFatal()) {
+				return ShaderProgram {};
+			}
+			EXIT("shader program compilation produced no module\n");
+		}
 		uint64_t id = MixId(MixId(params.hash, static_cast<uint64_t>(stage)), permutations.size());
 		if (id == 0) {
 			id = 1;
@@ -373,7 +378,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const ShaderProgram& vertex_program,
+    bool primitive_restart_enable, uint32_t patch_control_points,
+    const ShaderProgram& vertex_program,
     const ShaderProgram& pixel_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
@@ -453,6 +459,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
 	static_params.topology                 = topology;
+	static_params.patch_control_points     = patch_control_points;
 	static_params.primitive_restart_enable = primitive_restart_enable;
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =

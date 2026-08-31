@@ -1,3 +1,4 @@
+#include <atomic>
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
@@ -48,6 +49,30 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	}
 	result = base + magnitude;
 	return true;
+}
+
+void CollectPhiLeaves(Value value, std::vector<Value>& out) {
+	std::vector<Value>              pending {value};
+	std::unordered_set<const Inst*> seen;
+	while (!pending.empty()) {
+		const auto current = pending.back().Resolve();
+		pending.pop_back();
+		const auto* inst = current.TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+			if (!seen.insert(inst).second) {
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+			continue;
+		}
+		if (current.IsImmediate() && current.TryInstruction() == nullptr &&
+		    current.GetType() == Type::U32 && current.U32() == 0u) {
+			continue;
+		}
+		out.push_back(current);
+	}
 }
 
 bool IsRawRead(const Program& values, const Inst& inst) {
@@ -118,7 +143,8 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const Program& program): m_program(program) {}
+	RuntimeValidator(const Program& program, bool allow_read_first_lane)
+	    : m_program(program), m_allow_read_first_lane(allow_read_first_lane) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -222,7 +248,8 @@ private:
 				return finish(false);
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeIntegerOp(op)) {
+		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeIntegerOp(op) &&
+		           !(m_allow_read_first_lane && op == ValueOpcode::ReadFirstLane)) {
 			return finish(false);
 		}
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
@@ -234,6 +261,7 @@ private:
 	}
 
 	const Program&                  m_program;
+	bool                            m_allow_read_first_lane = false;
 	std::unordered_set<const Inst*> m_visiting;
 };
 
@@ -440,7 +468,44 @@ private:
 
 	bool EvaluatePhi(const Inst& inst, uint64_t& result) {
 		const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-		return !value.IsEmpty() && EvaluateWide(value, result);
+		if (!value.IsEmpty()) {
+			return EvaluateWide(value, result);
+		}
+		std::vector<Value> leaves;
+		CollectPhiLeaves(Value(const_cast<Inst*>(&inst)), leaves);
+		std::vector<uint64_t> values;
+		for (const auto& leaf: leaves) {
+			uint64_t leaf_value = 0;
+			if (EvaluateWide(leaf, leaf_value)) {
+				values.push_back(leaf_value);
+			}
+		}
+		if (values.empty()) {
+			return false;
+		}
+		bool all_same = true;
+		for (const auto v: values) {
+			all_same = all_same && v == values.front();
+		}
+		if (all_same) {
+			result = values.front();
+			return true;
+		}
+		uint64_t only_real  = 0;
+		uint32_t real_count = 0;
+		for (const auto v: values) {
+			if (v != 0 && static_cast<uint32_t>(v) != 0xffffffffu) {
+				if (real_count == 0 || v != only_real) {
+					real_count++;
+				}
+				only_real = v;
+			}
+		}
+		if (real_count != 1u) {
+			return false;
+		}
+		result = only_real;
+		return true;
 	}
 
 	bool EvaluateExtract(const Inst& inst, uint64_t& result) {
@@ -885,8 +950,8 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 
 } // namespace
 
-bool ValidateRuntimeValue(const Program& program, Value value) {
-	return RuntimeValidator(program).Run(value);
+bool ValidateRuntimeValue(const Program& program, Value value, bool allow_read_first_lane) {
+	return RuntimeValidator(program, allow_read_first_lane).Run(value);
 }
 
 void BuildSrtPlan(Program& program) {

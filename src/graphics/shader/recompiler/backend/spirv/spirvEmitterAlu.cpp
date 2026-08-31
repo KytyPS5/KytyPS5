@@ -75,6 +75,28 @@ uint32_t EmitAdd64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) 
 	return MakePair(state, low, high);
 }
 
+uint32_t EmitReadClockRealtime64(EmitterState& state) {
+	const auto clock = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpReadClockKHR, TypeU32Vector(state, 2), clock, ConstantU32(state, ScopeDevice)});
+
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, clock, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, clock, 1});
+
+	constexpr uint32_t ClockShift = 3;
+
+	const auto low_shifted  = NewBinary(state, OpShiftRightLogical, TypeU32(state), low,
+	                                    ConstantU32(state, ClockShift));
+	const auto high_carried = NewBinary(state, OpShiftLeftLogical, TypeU32(state), high,
+	                                    ConstantU32(state, 32u - ClockShift));
+	const auto low_result   = NewBinary(state, OpBitwiseOr, TypeU32(state), low_shifted, high_carried);
+	const auto high_result  = NewBinary(state, OpShiftRightLogical, TypeU32(state), high,
+	                                    ConstantU32(state, ClockShift));
+	return MakePair(state, low_result, high_result);
+}
+
 uint32_t EmitSub64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value) {
 	const auto lhs    = ExtractPair(state, lhs_value);
 	const auto rhs    = ExtractPair(state, rhs_value);
@@ -438,6 +460,9 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::ISub32: return binary(OpISub, IR::Type::U32);
 		case IR::ValueOpcode::IMul32: return binary(OpIMul, IR::Type::U32);
 		case IR::ValueOpcode::UDiv32: return binary(OpUDiv, IR::Type::U32);
+		case IR::ValueOpcode::ReadClockRealtime64:
+			ctx.Define(inst, EmitReadClockRealtime64(state));
+			return true;
 		case IR::ValueOpcode::IAdd64:
 			ctx.Define(inst, EmitAdd64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
 			return true;

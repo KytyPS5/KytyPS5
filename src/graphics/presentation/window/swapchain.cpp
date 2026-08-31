@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -335,6 +336,28 @@ struct Presenter::Impl {
 		frames.SetFormat(swapchain.Format());
 	}
 
+	static uint32_t TexelBytes(vk::Format format) {
+		switch (format) {
+			case vk::Format::eR8Unorm: return 1;
+			case vk::Format::eR8G8Unorm:
+			case vk::Format::eR16Sfloat:
+			case vk::Format::eR16Unorm: return 2;
+			case vk::Format::eR8G8B8A8Unorm:
+			case vk::Format::eR8G8B8A8Srgb:
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb:
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32:
+			case vk::Format::eB10G11R11UfloatPack32:
+			case vk::Format::eR16G16Sfloat:
+			case vk::Format::eR32Sfloat: return 4;
+			case vk::Format::eR16G16B16A16Sfloat:
+			case vk::Format::eR32G32Sfloat: return 8;
+			case vk::Format::eR32G32B32A32Sfloat: return 16;
+			default: return 0;
+		}
+	}
+
 	Image& ResolveSurface(const ImageInfo& info) {
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
@@ -350,12 +373,14 @@ struct Presenter::Impl {
 
 		auto&      cache      = renderer.GetTextureCache();
 		const auto image_id   = cache.FindImage(desc);
+		last_flip_id          = image_id;
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
 		return image;
 	}
 
+	ImageId               last_flip_id {};
 	RenderContext&        renderer;
 	WindowContext&        window;
 	Swapchain             swapchain;
@@ -721,6 +746,25 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
+	{
+		static uint64_t resolve_index = 0;
+		std::string targets;
+		const auto  count = GraphicsWorkCounters::target_count.load(std::memory_order_relaxed);
+		for (size_t i = 0; i < count && i < GraphicsWorkCounters::MaxTrackedTargets; i++) {
+			targets += fmt::format("{}0x{:012x}", i == 0 ? "" : ",",
+			                       GraphicsWorkCounters::targets[i].load(std::memory_order_relaxed));
+		}
+		bool flip_in_targets = false;
+		for (size_t i = 0; i < count && i < GraphicsWorkCounters::MaxTrackedTargets; i++) {
+			if (GraphicsWorkCounters::targets[i].load(std::memory_order_relaxed) ==
+			    info.data.address) {
+				flip_in_targets = true;
+				break;
+			}
+		}
+		GraphicsWorkCounters::target_count.store(0, std::memory_order_relaxed);
+	}
+
 	auto frame_format = info.pixel_format;
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
@@ -771,9 +815,157 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
+namespace {
+
+struct FrameCaptureConfig {
+	uint32_t    every = 0;
+	uint32_t    first = 0;
+	uint32_t    max   = 32;
+	std::string dir   = "_Frames";
+};
+
+const FrameCaptureConfig& GetFrameCaptureConfig() {
+	static const FrameCaptureConfig config = [] {
+		FrameCaptureConfig c;
+		return c;
+	}();
+	return config;
+}
+
+bool WriteBmp32(const std::string& path, const uint8_t* bgra, uint32_t width, uint32_t height) {
+	FILE* f = std::fopen(path.c_str(), "wb");
+	if (f == nullptr) {
+		return false;
+	}
+	const uint32_t pixel_bytes = width * height * 4u;
+	const uint32_t file_bytes  = 54u + pixel_bytes;
+	uint8_t        header[54]  = {};
+	auto           put16       = [&header](size_t at, uint16_t v) {
+        header[at]     = static_cast<uint8_t>(v & 0xffu);
+        header[at + 1] = static_cast<uint8_t>((v >> 8u) & 0xffu);
+	};
+	auto put32 = [&header](size_t at, uint32_t v) {
+		header[at]     = static_cast<uint8_t>(v & 0xffu);
+		header[at + 1] = static_cast<uint8_t>((v >> 8u) & 0xffu);
+		header[at + 2] = static_cast<uint8_t>((v >> 16u) & 0xffu);
+		header[at + 3] = static_cast<uint8_t>((v >> 24u) & 0xffu);
+	};
+	header[0] = 'B';
+	header[1] = 'M';
+	put32(2, file_bytes);
+	put32(10, 54);
+	put32(14, 40);
+	put32(18, width);
+	put32(22, static_cast<uint32_t>(-static_cast<int32_t>(height)));
+	put16(26, 1);
+	put16(28, 32);
+	put32(34, pixel_bytes);
+	const bool ok = std::fwrite(header, 1, sizeof(header), f) == sizeof(header) &&
+	                std::fwrite(bgra, 1, pixel_bytes, f) == pixel_bytes;
+	std::fclose(f);
+	return ok;
+}
+
+} // namespace
+
+void Presenter::CaptureFrame(Frame& frame) {
+	const auto& config = GetFrameCaptureConfig();
+	if (config.every == 0) {
+		return;
+	}
+	static uint64_t seen     = 0;
+	static uint32_t captured = 0;
+	const auto      index    = seen++;
+	if (index < config.first || ((index - config.first) % config.every) != 0 ||
+	    captured >= config.max) {
+		return;
+	}
+
+	const uint32_t width  = frame.image.extent.width;
+	const uint32_t height = frame.image.extent.height;
+	if (width == 0 || height == 0 || frame.image.image == nullptr) {
+		return;
+	}
+	const uint64_t size = static_cast<uint64_t>(width) * height * 4u;
+
+	auto& graphics = m_impl->window.graphic_ctx;
+	VulkanBuffer staging;
+	staging.usage           = vk::BufferUsageFlagBits::eTransferDst;
+	staging.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
+	                          vk::MemoryPropertyFlagBits::eHostCoherent;
+	graphics.CreateBuffer(size, staging);
+
+	{
+		auto& command    = m_impl->present_scheduler.BeginCommand();
+		auto  vk_command = command.Handle();
+		frame.Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
+		              vk::AccessFlagBits2::eTransferRead);
+		vk::BufferImageCopy region {};
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.imageExtent      = {width, height, 1};
+		vk_command.copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                             staging.buffer, 1, &region);
+		const auto capture_tick = m_impl->present_scheduler.Submit();
+		m_impl->present_scheduler.Wait(capture_tick);
+	}
+
+	void* mapped = nullptr;
+	graphics.MapMemory(staging.memory, mapped);
+	if (mapped != nullptr) {
+		auto* pixels = static_cast<uint8_t*>(mapped);
+		switch (frame.image.format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb:
+				break; // already BGRA
+			case vk::Format::eR8G8B8A8Unorm:
+			case vk::Format::eR8G8B8A8Srgb:
+				for (uint64_t i = 0; i < size; i += 4) {
+					std::swap(pixels[i], pixels[i + 2]);
+				}
+				break;
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32: {
+				const bool low_is_red = frame.image.format == vk::Format::eA2B10G10R10UnormPack32;
+				for (uint64_t i = 0; i < size; i += 4) {
+					uint32_t packed = 0;
+					std::memcpy(&packed, pixels + i, sizeof(packed));
+					const auto low  = static_cast<uint8_t>((packed >> 2u) & 0xffu);
+					const auto mid  = static_cast<uint8_t>((packed >> 12u) & 0xffu);
+					const auto high = static_cast<uint8_t>((packed >> 22u) & 0xffu);
+					pixels[i]       = low_is_red ? high : low;  // blue
+					pixels[i + 1]   = mid;                      // green
+					pixels[i + 2]   = low_is_red ? low : high;  // red
+					pixels[i + 3]   = 0xffu;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+		Common::File::CreateDirectories(config.dir);
+		const auto path =
+		    fmt::format("{}/frame_{:06}.bmp", config.dir, static_cast<uint32_t>(index));
+		if (WriteBmp32(path, pixels, width, height)) {
+			captured++;
+		}
+		graphics.UnmapMemory(staging.memory);
+	}
+	vmaDestroyBuffer(graphics.allocator, staging.buffer, staging.memory.allocation);
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	{
+		static uint64_t present_index = 0;
+		static uint64_t last_draws = 0;
+		static uint64_t last_dispatches = 0;
+		const auto      draws      = GraphicsWorkCounters::draws.load(std::memory_order_relaxed);
+		const auto      dispatches = GraphicsWorkCounters::dispatches.load(std::memory_order_relaxed);
+		GraphicsWorkCounters::present_index.store(present_index, std::memory_order_relaxed);
+		last_draws      = draws;
+		last_dispatches = dispatches;
+	}
 
 	const auto ime_visual = GetImeVisualState();
 	auto&      swapchain  = m_impl->swapchain;
@@ -789,6 +981,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			const bool        draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			m_impl->present_scheduler.Wait(frame.present_tick);
+			CaptureFrame(frame);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

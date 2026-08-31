@@ -212,7 +212,12 @@ TextureUploadLayout TextureCalcUploadLayout(Prospero::BufferFormat format, uint3
 		     levels);
 	}
 
-	switch (tile_mode) {
+	auto effective_tile_mode = tile_mode;
+	if (static_cast<uint32_t>(tile_mode) == 0x10u) {
+		effective_tile_mode = Prospero::TileMode::kLinear;
+	}
+
+	switch (effective_tile_mode) {
 		case Prospero::TileMode::kLinear:
 			if (!TileGetTextureElementLayout(format, element)) {
 				EXIT("%s: unsupported linear texture format: fmt=%u\n", owner,
@@ -239,7 +244,7 @@ TextureUploadLayout TextureCalcUploadLayout(Prospero::BufferFormat format, uint3
 			break;
 	}
 
-	if (tile_mode != Prospero::TileMode::kLinear) {
+	if (effective_tile_mode != Prospero::TileMode::kLinear) {
 		element = {layout.surface.texture.block.bytes_per_element,
 		           layout.surface.texture.texel_width, layout.surface.texture.texel_height};
 	}

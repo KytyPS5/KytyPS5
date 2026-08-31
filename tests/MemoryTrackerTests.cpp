@@ -25,7 +25,14 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
 #endif
+
+namespace Libs::LibKernel::Memory {
+bool IsHandlingGpuFault() noexcept {
+	return false;
+}
+} // namespace Libs::LibKernel::Memory
 
 namespace {
 

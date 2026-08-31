@@ -219,9 +219,12 @@ uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& m
                                     ImageViewKind view) {
 	(void)use_pc;
 	const bool integer      = mem.kind == IR::ResourceKind::ImageUint;
-	const auto kind         = SampledBindingKind(integer, view);
+	const bool depth        = mem.resource < state.program.info.images.size() &&
+	                          state.program.info.images[mem.resource].depth_compare;
+	const auto kind         = SampledBindingKind(integer, view, depth);
 	const auto binding      = ResourceForDescriptor(state, kind, mem.resource);
-	const auto variable     = state.sampled_image_variables[SampledImageIndex(integer, view)];
+	const auto variable =
+	    state.sampled_image_variables[SampledImageIndex(integer, view, depth)];
 	const auto pointer_type = state.builder.Type(
 	    OpTypePointer, {StorageClassUniformConstant, ImageViewImageType(state, view, integer)});
 	const auto pointer =
@@ -252,7 +255,11 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 	const auto sampler = LoadSamplerDescriptor(state, mem.sampler, use_pc);
 	if (image == 0 || sampler == 0) {
 		ExitDescriptorBindingFailure(
-		    state, SampledBindingKind(mem.kind == IR::ResourceKind::ImageUint, view), mem.resource,
+		    state,
+		    SampledBindingKind(mem.kind == IR::ResourceKind::ImageUint, view,
+		                       mem.resource < state.program.info.images.size() &&
+		                           state.program.info.images[mem.resource].depth_compare),
+		    mem.resource,
 		    "sampled image or sampler descriptor load failed");
 	}
 	const auto sampled_image = state.builder.AllocateId();

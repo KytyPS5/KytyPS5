@@ -283,6 +283,7 @@ enum class DescriptorBindingKind {
 	Sampled2DMsaa,
 	Sampled2DMsaaArray,
 	Sampled3D,
+	SampledDepth2D,
 	SampledUint1D,
 	SampledUint1DArray,
 	SampledUint2D,
@@ -328,6 +329,9 @@ DescriptorBindingForImage(const ImageResource& image) {
 
 	switch (image.kind) {
 		case ResourceKind::Image:
+			if (image.depth_compare && image.dimension == Dimension::Dim2D) {
+				return Kind::SampledDepth2D;
+			}
 			switch (image.dimension) {
 				case Dimension::Dim1D: return Kind::Sampled1D;
 				case Dimension::Dim1DArray: return Kind::Sampled1DArray;
@@ -417,7 +421,8 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
+	static constexpr uint32_t MaxBuffers      = 64;
+	static constexpr uint32_t MaxAddresses    = 32;
 	static constexpr uint32_t MaxImages       = 32;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -445,6 +450,7 @@ struct SpirvRequirements {
 	bool function_lds                 = false;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
+	bool shader_clock                 = false;
 };
 
 struct BlockInfo {

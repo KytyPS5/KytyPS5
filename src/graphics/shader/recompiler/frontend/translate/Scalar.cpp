@@ -89,9 +89,15 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, true, false);
 			return true;
 		case O::S_CMP_EQ_U64:
+			if (S_CMP_MASK_ANY(inst, false)) {
+				return true;
+			}
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, true, false);
 			return true;
 		case O::S_CMP_LG_U64:
+			if (S_CMP_MASK_ANY(inst, true)) {
+				return true;
+			}
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, true, false);
 			return true;
 

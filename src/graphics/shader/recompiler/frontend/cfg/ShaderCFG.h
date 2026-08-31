@@ -93,6 +93,7 @@ struct Graph {
 	std::vector<StronglyConnectedComponent> components;
 	std::vector<uint32_t>                   code_table_load_pcs;
 	uint32_t                                entry_block   = UINT32_MAX;
+	bool                                    strict_break_merges = false;
 	bool                                    irreducible   = false;
 	bool                                    unsupported   = false;
 	FailureKind                             failure_kind  = FailureKind::None;

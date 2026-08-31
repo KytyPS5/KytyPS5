@@ -94,9 +94,17 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction({OpReturn});
 }
 
+constexpr uint32_t kMaxLoopIterations = 0u;
+
+constexpr size_t kLoopBoundMaxBlocks = 200ULL;
+
+constexpr size_t kUnmergedLogMinBlocks = 100ULL;
+constexpr uint32_t kUnmergedLogLimit = 24u;
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& term       = info.terminator;
+	bool        merged     = false;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
 			const auto* merge = TargetBlock(ctx.program, term.merge_block);
@@ -104,12 +112,14 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			if (merge != nullptr && cont != nullptr) {
 				ctx.state.builder.AddFunction(
 				    {OpLoopMerge, ctx.Label(merge), ctx.Label(cont), LoopControlNone});
+				merged = true;
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
 		           term.merge_block != UINT32_MAX) {
 			if (const auto* merge = TargetBlock(ctx.program, term.merge_block); merge != nullptr) {
 				ctx.state.builder.AddFunction(
 				    {OpSelectionMerge, ctx.Label(merge), SelectionControlNone});
+				merged = true;
 			}
 		}
 	};
@@ -305,13 +315,34 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction({OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                           dispatcher.continue_label});
+	const bool bound_loop =
+	    kMaxLoopIterations != 0 && ctx.program.blocks.size() <= kLoopBoundMaxBlocks;
+	const auto iter      = bound_loop ? state.builder.AllocateId() : 0;
+	const auto next_iter = bound_loop ? state.builder.AllocateId() : 0;
+	if (bound_loop) {
+		state.builder.AddFunction({OpPhi, TypeU32(state), iter, ConstantU32(state, 0),
+		                           initial_parent, next_iter, dispatcher.continue_label});
+	}
 	const auto done = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpIEqual, TypeBool(state), done, pc, ConstantU32(ctx.state, UINT32_MAX)});
+	auto stop = done;
+	if (bound_loop) {
+		const auto under   = state.builder.AllocateId();
+		const auto over    = state.builder.AllocateId();
+		const auto stopped = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpIAdd, TypeU32(state), next_iter, iter, ConstantU32(state, 1)});
+		state.builder.AddFunction({OpULessThan, TypeBool(state), under, next_iter,
+		                           ConstantU32(state, kMaxLoopIterations)});
+		state.builder.AddFunction({OpLogicalNot, TypeBool(state), over, under});
+		state.builder.AddFunction({OpLogicalOr, TypeBool(state), stopped, done, over});
+		stop = stopped;
+	}
 	state.builder.AddFunction(
 	    {OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label, LoopControlNone});
 	state.builder.AddFunction(
-	    {OpBranchConditional, done, dispatcher.merge_label, dispatcher.select_label});
+	    {OpBranchConditional, stop, dispatcher.merge_label, dispatcher.select_label});
 
 	EmitLabel(state, dispatcher.select_label);
 	state.builder.AddFunction(

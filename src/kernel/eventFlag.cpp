@@ -23,6 +23,7 @@ public:
 
 	KernelEventFlagPrivate(const std::string& name, bool single, bool /*fifo*/, uint64_t bits)
 	    : m_name(name), m_single_thread(single), m_bits(bits) {}
+
 	virtual ~KernelEventFlagPrivate();
 
 	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
@@ -108,6 +109,24 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 	if (ptr_micros != nullptr) {
 		micros     = *ptr_micros;
 		infinitely = false;
+	}
+
+	if (!infinitely && micros == 0) {
+		const bool satisfied = (wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
+		                       (wait_mode == WaitMode::Or && (m_bits & bits) != 0);
+		if (result != nullptr) {
+			*result = m_bits;
+		}
+		*ptr_micros = 0;
+		if (!satisfied) {
+			return Result::TimedOut;
+		}
+		switch (clear_mode) {
+			case ClearMode::All: m_bits = 0; break;
+			case ClearMode::Bits: m_bits &= ~bits; break;
+			case ClearMode::None: break;
+		}
+		return Result::Ok;
 	}
 
 	uint32_t      elapsed = 0;
@@ -284,6 +303,17 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 	return OK;
 }
 
+static int EventFlagResultToErrno(KernelEventFlagPrivate::Result result) {
+	switch (result) {
+		case KernelEventFlagPrivate::Result::Ok: return OK;
+		case KernelEventFlagPrivate::Result::AlreadyWaiting: return KERNEL_ERROR_EPERM;
+		case KernelEventFlagPrivate::Result::TimedOut: return KERNEL_ERROR_ETIMEDOUT;
+		case KernelEventFlagPrivate::Result::Canceled: return KERNEL_ERROR_ECANCELED;
+		case KernelEventFlagPrivate::Result::Deleted: return KERNEL_ERROR_EACCES;
+	}
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
 	PRINT_NAME();
@@ -296,8 +326,14 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	const auto mode = DecodeEventFlagWaitMode(wait_mode);
+
+	const bool polling = timeout != nullptr && *timeout == 0;
+	if (polling) {
+		return EventFlagResultToErrno(ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout));
+	}
+
+	auto result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;
 

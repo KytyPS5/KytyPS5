@@ -2855,11 +2855,11 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 	bool notify = false;
 	{
 		std::lock_guard lock((*cond)->m);
+		(*cond)->sequence++;
 		if (!(*cond)->waiters.empty()) {
-			(*cond)->sequence++;
 			CondClearWaiters(*cond);
-			notify = true;
 		}
+		notify = true;
 	}
 	if (notify) {
 		(*cond)->cv.notify_all();
@@ -3179,6 +3179,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 }
 
+thread_local uint64_t g_guest_wait_caller = 0;
+thread_local uint64_t g_guest_wait_r13    = 0;
+
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
 
@@ -3373,6 +3376,8 @@ static void* RunThread(void* arg) {
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
 	g_pthread_self = thread;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#endif
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -4445,6 +4450,10 @@ int KYTY_SYSV_ABI pthread_condattr_destroy(LibKernel::PthreadCondattr* attr) {
 int KYTY_SYSV_ABI pthread_cond_wait(LibKernel::PthreadCond* cond, LibKernel::PthreadMutex* mutex) {
 	// PRINT_NAME();
 
+	uint64_t guest_r13 = 0;
+	__asm__ volatile("movq %%r13, %0" : "=r"(guest_r13));
+	LibKernel::g_guest_wait_r13 = guest_r13;
+	LibKernel::g_guest_wait_caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadCondWait(cond, mutex));
 }
 

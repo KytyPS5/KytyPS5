@@ -60,6 +60,7 @@ public:
 		TouchImage(image);
 		return image;
 	}
+	[[nodiscard]] bool          IsLiveId(ImageId id) const;
 	void MarkGpuWritten(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

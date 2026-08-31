@@ -17,8 +17,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -76,10 +78,15 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		const auto        budget =
 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
 		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+		const bool retain    = false;
 		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+		    retain ? std::max<int64_t>(budget - GiB, GiB + GiB / 2)
+		           : std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB),
+		                               GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+		    retain ? std::max<int64_t>(budget - GiB / 2, 3 * GiB)
+		           : std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2),
+		                               3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
 }
@@ -147,6 +154,10 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	}
 	const auto range = image.info.data;
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
+}
+
+bool TextureCache::IsLiveId(ImageId id) const {
+	return m_slot_images.is_allocated(id);
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
@@ -942,14 +953,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 	if (desc.type != BindingType::DepthTarget) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
 		if (!plan.valid) {
-			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
-			     "pitch=%u levels=%u layers=%u samples=%u\n",
-			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
-			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
-			     static_cast<uint32_t>(plan.layout.surface.texture.block.family), info.extent.width,
-			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
-			     info.resources.layers, info.samples);
+			return;
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
@@ -1075,6 +1079,7 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 		}
 		return;
 	}
+	constexpr uint64_t watch = 0ull;
 	if (!cpu_dirty) {
 		return;
 	}
@@ -1670,12 +1675,16 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	if (!plan.valid || !SafeToDownload(image)) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	const auto range     = image.info.data;
+	auto&      download  = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto alignment = std::max<uint64_t>(image.info.bytes_per_block, 4);
+	auto [mapped, offset] = download.Map(range.size, alignment);
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		EXIT("TextureCache: failed to map reusable download buffer, size=0x%" PRIx64
+		     " alignment=0x%" PRIx64 " download_buffer=0x%" PRIx64 " (%s)\n",
+		     range.size, alignment, download.Size(),
+		     range.size > download.Size() ? "request exceeds the buffer"
+		                                  : "buffer could not be drained");
 	}
 	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
@@ -1743,7 +1752,16 @@ TextureCache::RegionInfo TextureCache::QueryRegion(uint64_t address, uint64_t si
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	const auto found_images = FindImagesInRegion(address, size, true);
+	static const bool            log_fault_addr = false;
+	static std::atomic<uint64_t> last_vaddr {0};
+	static std::atomic<uint64_t> repeat_count {0};
+	if (log_fault_addr) {
+		const auto previous = last_vaddr.exchange(address);
+		const auto repeat   = (previous == address) ? repeat_count.fetch_add(1) + 1
+		                                            : (repeat_count.store(0), uint64_t {0});
+	}
+	for (const auto id: found_images) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || owner->depth_id) {
 			continue;
@@ -1883,6 +1901,13 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+static std::atomic<uint64_t> g_gc_skip_unresolved {0};
+static std::atomic<uint64_t> g_gc_skip_tiled {0};
+static std::atomic<uint64_t> g_gc_skip_unpressured {0};
+static std::atomic<uint64_t> g_gc_skip_download {0};
+static std::atomic<uint64_t> g_gc_deleted {0};
+static std::atomic<uint64_t> g_gc_candidates {0};
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
@@ -1893,15 +1918,22 @@ void TextureCache::RunGarbageCollector() {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		const uint64_t device_used =
+		    m_graphics.CanReportMemoryUsage() ? m_graphics.GetDeviceMemoryUsage() : 0;
+		const uint64_t used_memory = std::max(m_total_used_memory, device_used);
+		bool           pressured   = used_memory >= m_pressure_gc_memory;
+		static const bool force_aggressive =
+		    false;
+		bool           aggressive  =
+		    allow_aggressive && (force_aggressive || used_memory >= m_critical_gc_memory);
+		const uint64_t age       = std::min<uint64_t>(aggressive ? 4 : pressured ? 8 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+			g_gc_candidates.fetch_add(1, std::memory_order_relaxed);
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});
@@ -1912,35 +1944,66 @@ void TextureCache::RunGarbageCollector() {
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				g_gc_skip_unresolved.fetch_add(1, std::memory_order_relaxed);
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
+				if (safe && owner->info.IsTiled() && !aggressive) {
+					g_gc_skip_tiled.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
 				if (safe && !pressured) {
+					g_gc_skip_unpressured.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {
+					g_gc_skip_download.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
 				owner->ClearGpuModified();
 			}
+			g_gc_deleted.fetch_add(1, std::memory_order_relaxed);
 			DeleteImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (used_memory < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
+	const auto before = m_total_used_memory;
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	static const bool force_aggressive_pass =
+	    false;
+	if (force_aggressive_pass || m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	if (m_graphics.CanReportMemoryUsage()) {
+		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	{
+		static std::atomic<uint64_t> gc_log_count {0};
+		if ((gc_log_count.fetch_add(1, std::memory_order_relaxed) % 256) == 0) {
+			{
+				uint64_t live = 0;
+				uint64_t live_bytes = 0;
+				uint64_t tiled = 0;
+				m_slot_images.ForEach([&](ImageId, Image& image) {
+					if (!image.registered) {
+						return;
+					}
+					live++;
+					live_bytes += image.info.data.size + image.info.stencil.size;
+					if (image.info.IsTiled()) {
+						tiled++;
+					}
+				});
+			}
+		}
 	}
 }
 

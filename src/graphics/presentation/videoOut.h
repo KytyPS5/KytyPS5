@@ -39,6 +39,7 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot();
 	void WaitFlipDone(int handle, int index);
+	void DumpFlipState();
 
 	[[nodiscard]] Impl& State() noexcept;
 
@@ -49,6 +50,9 @@ private:
 [[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
+[[nodiscard]] VideoOutDriver* VideoOutGetDriver();
+void     VideoOutSetFlipThread(int thread_id);
+int      VideoOutGetFlipThread();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);

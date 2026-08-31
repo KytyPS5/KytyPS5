@@ -84,9 +84,11 @@ ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
   static const ShaderVertexInputInfo vertex{};
   static const ShaderPixelInputInfo pixel{};
   static const ShaderComputeInputInfo compute{};
+  static const std::array<uint32_t, 64> user_data{};
 
   ShaderRecompiler::CompileOptions options;
   options.stage = stage;
+  options.user_data = user_data;
   switch (stage) {
   case ShaderType::Vertex:
     options.input_info.vertex = &vertex;
@@ -115,9 +117,7 @@ void CompilePixelRuntime(const ShaderParams &params,
                          ShaderPixelInputInfo &input_info) {
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.shader_hash = params.hash;
-  options.shader_base = params.Base();
-  options.user_data = params.user_data.data();
-  options.user_data_count = static_cast<uint32_t>(params.user_data.size());
+  options.user_data = params.user_data;
   options.scratch_dwords = input_info.scratch_size_dwords;
   options.push_constant_offset = input_info.push_constant_offset;
   options.read_specialization_memory = ReadHostTestMemory;
@@ -3696,7 +3696,6 @@ void TestNewShaderRecompilerScalarB64LaneTranslation() {
   const uint32_t user_data[] = {0x01234567u, 0x89abcdefu};
   auto options = MakeCompileOptions(ShaderType::Vertex);
   options.user_data = user_data;
-  options.user_data_count = static_cast<uint32_t>(std::size(user_data));
   options.dump_ir = true;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
@@ -4369,7 +4368,7 @@ void TestNewShaderRecompilerMemoryFamilyTranslation() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
   options.read_memory = ReadZeroTestMemory;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
@@ -4463,8 +4462,7 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   raw_user_data[8] = 0x1003u;
 
   auto raw_options = MakeCompileOptions(ShaderType::Pixel);
-  raw_options.user_data = raw_user_data.data();
-  raw_options.user_data_count = static_cast<uint32_t>(raw_user_data.size());
+  raw_options.user_data = raw_user_data;
 
   auto raw = ShaderRecompiler::Recompile(raw_shader, raw_options);
   const auto *address_binding = ShaderRecompiler::IR::FindBinding(
@@ -4508,9 +4506,7 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   buffer_user_data[10] = 4u;
 
   auto buffer_options = MakeCompileOptions(ShaderType::Pixel);
-  buffer_options.user_data = buffer_user_data.data();
-  buffer_options.user_data_count =
-      static_cast<uint32_t>(buffer_user_data.size());
+  buffer_options.user_data = buffer_user_data;
 
   auto buffer = ShaderRecompiler::Recompile(buffer_shader, buffer_options);
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
@@ -4548,7 +4544,7 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_get_lod"),
@@ -4592,7 +4588,7 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
 
   auto user_data = ImageTestUserData(Prospero::ImageType::kCube);
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(result.program.info.images.size() == 1 &&
@@ -4638,7 +4634,7 @@ void TestNewShaderRecompilerImageSampleVariants() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_sample_l"),
@@ -4726,7 +4722,7 @@ void TestNewShaderRecompilerImageSampleA16SamplerCoords() {
   auto user_data = ImageTestUserData(Prospero::ImageType::kColor3D);
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump,
@@ -4768,7 +4764,7 @@ void TestNewShaderRecompilerImageSampleOpcodeAliases() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_sample_a"),
@@ -4804,7 +4800,7 @@ void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
     auto user_data = ImageTestUserData();
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
-    options.user_data = user_data.data();
+    options.user_data = user_data;
 
     auto result = ShaderRecompiler::Recompile(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
@@ -4850,7 +4846,7 @@ void TestNewShaderRecompilerImageLoadA16UintCoords() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_load"),
@@ -4894,7 +4890,7 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.input_info.pixel = &ps_info;
     options.dump_ir = true;
-    options.user_data = user_data.data();
+    options.user_data = user_data;
 
     auto result = ShaderRecompiler::Recompile(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
@@ -5005,7 +5001,7 @@ void TestNewShaderRecompilerImageViewDimensions() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.input_info.pixel = &ps_info;
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_dim=2d_array"),
@@ -5082,7 +5078,7 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.ir_dump, "image_dim=1d"),
@@ -5113,7 +5109,7 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
   std::array<uint32_t, 64> user_data{};
 
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
@@ -5144,7 +5140,7 @@ void TestNewShaderRecompilerImageGatherVariants() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_gather4_lz"),
@@ -5230,7 +5226,7 @@ void TestNewShaderRecompilerImageLoadVariants() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_load"),
@@ -5276,7 +5272,7 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_dim=2d_msaa") &&
@@ -5317,7 +5313,7 @@ void TestNewShaderRecompilerImageStoreTranslation() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_store"),
@@ -5368,7 +5364,7 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.input_info.compute = &input_info;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_dim=3d"),
@@ -5422,7 +5418,7 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.input_info.compute = &input_info;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_dim=3d"),
@@ -5464,7 +5460,7 @@ void TestNewShaderRecompilerImageAtomicTranslation() {
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_atomic_add"),
@@ -6127,7 +6123,7 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(result.resources.buffers.size() == 1 &&
@@ -8946,7 +8942,7 @@ void TestDemandDrivenSpirvDeclarations() {
     auto user_data = ImageTestUserData();
     SetImageTestFormat(&user_data, 0, format);
     auto options = MakeCompileOptions(ShaderType::Compute);
-    options.user_data = user_data.data();
+    options.user_data = user_data;
     auto result = ShaderRecompiler::Recompile(shader, options);
     CheckSpirvBinaryValidates(result.spirv);
     return result.spirv;
@@ -8959,7 +8955,7 @@ void TestDemandDrivenSpirvDeclarations() {
   auto query_pixel_info = RegressionPixelInputInfo();
   auto query_options = MakeCompileOptions(ShaderType::Pixel);
   query_options.input_info.pixel = &query_pixel_info;
-  query_options.user_data = query_user_data.data();
+  query_options.user_data = query_user_data;
   auto query_result = ShaderRecompiler::Recompile(query, query_options);
   CheckSpirvBinaryValidates(query_result.spirv);
   const auto &query_spirv = query_result.spirv;
@@ -10320,7 +10316,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   SetImageTestFormat(&user_data, 6, Prospero::BufferFormat::k32UInt);
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   const auto *buffers = ShaderRecompiler::IR::FindBinding(
@@ -10703,7 +10699,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
 
   auto user_data = ImageTestUserData();
   auto options = MakeCompileOptions(ShaderType::Pixel);
-  options.user_data = user_data.data();
+  options.user_data = user_data;
   auto result = ShaderRecompiler::Recompile(inline_sampler_shader, options);
 }
 
@@ -11189,9 +11185,7 @@ void TestComputeLdsAllocationIdentity() {
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.shader_hash = params.hash;
-    options.shader_base = params.Base();
-    options.user_data = params.user_data.data();
-    options.user_data_count = static_cast<uint32_t>(params.user_data.size());
+    options.user_data = params.user_data;
     options.input_info.compute = &input_info;
     options.wave_size = input_info.wave_size;
     options.scratch_dwords = input_info.scratch_size_dwords;
@@ -11257,10 +11251,7 @@ void TestComputeLdsAllocationIdentity() {
         "AGC per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
   scratch_options.shader_hash = scratch_params.hash;
-  scratch_options.shader_base = scratch_params.Base();
-  scratch_options.user_data = scratch_params.user_data.data();
-  scratch_options.user_data_count =
-      static_cast<uint32_t>(scratch_params.user_data.size());
+  scratch_options.user_data = scratch_params.user_data;
   scratch_options.input_info.compute = &scratch_info;
   scratch_options.wave_size = scratch_info.wave_size;
   scratch_options.scratch_dwords = scratch_info.scratch_size_dwords;
@@ -11537,8 +11528,7 @@ void TestGraphicsPushConstantPlacement() {
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.input_info.pixel = &pixel_info;
-  options.user_data = user_data.data();
-  options.user_data_count = static_cast<uint32_t>(user_data.size());
+  options.user_data = user_data;
   options.push_constant_offset = 36;
 
   auto placed = ShaderRecompiler::Recompile(shader, options);
@@ -11601,7 +11591,6 @@ void TestNewShaderRecompilerFlatUserPointerUsesDma() {
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data;
-  options.user_data_count = static_cast<uint32_t>(std::size(user_data));
 
   auto result = ShaderRecompiler::Recompile(shader, options);
   Check(result.program.info.uses_dma,
@@ -11623,7 +11612,6 @@ void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
-  options.user_data_count = static_cast<uint32_t>(std::size(user_data));
   options.scratch_dwords = 1;
   auto result = ShaderRecompiler::Recompile(segmented_shader, options);
   Check(result.program.info.uses_dma,

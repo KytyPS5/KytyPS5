@@ -1209,7 +1209,7 @@ CompiledShader CompileCase(const TestCase &test) {
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
   options.input_info.compute = &test.compute_info;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
   options.read_memory = ReadTestMemory;
   options.read_memory_data = const_cast<std::vector<u32> *>(&test.initial);
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
@@ -1349,7 +1349,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.stage = ShaderType::Pixel;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
-  options.user_data = user_data.data();
+  options.user_data = user_data;
 
   auto result = ShaderRecompiler::Recompile(test.fragment_code, options);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
@@ -21452,8 +21452,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     options.stage = ShaderType::Compute;
     options.wave_size = 64;
     options.user_data_base = 0;
-    options.user_data_count = static_cast<u32>(user_data.size());
-    options.user_data = user_data.data();
+    options.user_data = user_data;
     options.input_info.compute = &compute;
     options.dump_ir = false;
     auto result = ShaderRecompiler::Recompile(code, options);
@@ -21549,8 +21548,7 @@ void CheckEmbeddedFetchVertexOffset() {
     ShaderRecompiler::CompileOptions options;
     options.stage = ShaderType::Vertex;
     options.user_data_base = 8;
-    options.user_data_count = static_cast<u32>(user_data.size());
-    options.user_data = user_data.data();
+    options.user_data = user_data;
     options.input_info.vertex = &vertex;
 
     auto result = ShaderRecompiler::Recompile(code, options);
@@ -24250,8 +24248,7 @@ void CheckEmbeddedFetchLaneSpill() {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Vertex;
   options.user_data_base = 8;
-  options.user_data_count = static_cast<u32>(user_data.size());
-  options.user_data = user_data.data();
+  options.user_data = user_data;
   options.input_info.vertex = &vertex;
 
   auto result = ShaderRecompiler::Recompile(code, options);

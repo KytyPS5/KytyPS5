@@ -30,14 +30,6 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
 
-bool ReadZeroMemory(void*, uint64_t, uint32_t* value) {
-	if (value == nullptr) {
-		return false;
-	}
-	*value = 0;
-	return true;
-}
-
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
 }
@@ -575,7 +567,8 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	EmbeddedFetchData embedded_fetch;
 	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
 		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, options.user_data_base,
-		                                           options.user_data_count, options.wave_size);
+		                                           static_cast<uint32_t>(options.user_data.size()),
+		                                           options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
 			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(embedded_fetch.loads.size()));
@@ -586,7 +579,7 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	    .wave_size           = options.wave_size,
 	    .shader_hash         = options.shader_hash,
 	    .user_data_base      = options.user_data_base,
-	    .user_data_count     = options.user_data_count,
+	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
 	    .scratch_dwords      = options.scratch_dwords,
 	    .dispatcher_fallback = dispatcher_fallback,
 	    .cfg_failure_kind    = cfg.failure_kind,
@@ -634,32 +627,17 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
 
+	const IR::SrtRuntime runtime {
+	    .user_data                  = options.user_data,
+	    .shader_base                = reinterpret_cast<uint64_t>(code.data()),
+	    .read_memory                = options.read_memory,
+	    .userdata                   = options.read_memory_data,
+	    .read_specialization_memory = options.read_specialization_memory,
+	};
 	IR::ResourceSnapshot resources;
-	if (options.resource_snapshot != nullptr) {
-		resources = *options.resource_snapshot;
-	} else {
-		IR::SrtRuntime           runtime;
-		std::array<uint32_t, 64> zero_user_data {};
-		if (options.user_data == nullptr) {
-			for (uint32_t i = 2; i < zero_user_data.size(); i += 4) {
-				zero_user_data[i] = UINT32_MAX;
-			}
-		}
-		const auto* user_data =
-		    options.user_data != nullptr ? options.user_data : zero_user_data.data();
-		runtime.user_data   = std::span<const uint32_t>(user_data, options.user_data_count);
-		runtime.shader_base = options.shader_base != 0 ? options.shader_base
-		                                               : reinterpret_cast<uint64_t>(code.data());
-		runtime.read_memory = options.read_memory;
-		runtime.read_specialization_memory = options.read_specialization_memory;
-		if (runtime.read_memory == nullptr && options.user_data == nullptr) {
-			runtime.read_memory = ReadZeroMemory;
-		}
-		runtime.userdata         = options.read_memory_data;
-		if (!IR::MaterializeResources(ir, runtime, resources)) {
-			EXIT("shader resource materialization failed: stage=%s hash=0x%016" PRIx64 "\n",
-			     StageName(options.stage), options.shader_hash);
-		}
+	if (!IR::MaterializeResources(ir, runtime, resources)) {
+		EXIT("shader resource materialization failed: stage=%s hash=0x%016" PRIx64 "\n",
+		     StageName(options.stage), options.shader_hash);
 	}
 	IR::SpecializeResources(ir, resources);
 

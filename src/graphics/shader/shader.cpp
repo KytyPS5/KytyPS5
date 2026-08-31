@@ -1234,9 +1234,7 @@ static ShaderRecompiler::CompileOptions MakeCompileOptions(const ShaderParams& p
 	ShaderRecompiler::CompileOptions options;
 	options.stage                      = stage;
 	options.shader_hash                = params.hash;
-	options.shader_base                = params.Base();
-	options.user_data_count            = static_cast<uint32_t>(params.user_data.size());
-	options.user_data                  = params.user_data.data();
+	options.user_data                  = params.user_data;
 	options.read_specialization_memory = ReadShaderGuestMemory;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;

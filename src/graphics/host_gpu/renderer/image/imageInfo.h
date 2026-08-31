@@ -514,11 +514,18 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 			next.float32[1] = DecodeHalfFloat(packed >> 16u);
 			break;
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
-		case vk::Format::eR32G32B32A32Sfloat:
-			if (packed != 0 || packed_hi != 0) {
+		case vk::Format::eR32G32B32A32Sfloat: {
+			const auto rgb   = std::bit_cast<float>(packed);
+			const auto alpha = std::bit_cast<float>(packed_hi);
+			if (!std::isfinite(rgb) || !std::isfinite(alpha)) {
 				return false;
 			}
+			next.float32[0] = rgb;
+			next.float32[1] = rgb;
+			next.float32[2] = rgb;
+			next.float32[3] = alpha;
 			break;
+		}
 		default: return false;
 	}
 	for (const auto component: next.float32) {

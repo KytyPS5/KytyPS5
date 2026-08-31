@@ -51,6 +51,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
+	CapabilityShaderClockKHR                 = 5055,
 	CapabilityShaderViewportIndexLayerEXT    = 5254,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
@@ -71,6 +72,7 @@ enum : uint32_t {
 
 enum : uint32_t {
 	DecorationBlock         = 2,
+	DecorationCoherent      = 5,
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
@@ -268,6 +270,7 @@ enum : uint32_t {
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
+	OpReadClockKHR                 = 5056,
 };
 
 enum : uint32_t {
@@ -357,6 +360,7 @@ struct EmitterState {
 	const IR::SpirvRequirements& requirements;
 	ShaderType                   stage                   = ShaderType::Unknown;
 	uint32_t                     wave_size               = 64;
+	uint32_t                     wave_broadcast_variable = 0;
 	uint32_t                     storage_buffer_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers>      memory_byte_offsets {};
 	uint32_t                                             bda_pagetable_variable = 0;
@@ -369,7 +373,7 @@ struct EmitterState {
 	uint32_t                                             flattened_srt_variable  = 0;
 	uint32_t                                             lds_variable            = 0;
 	uint32_t                                             scratch_variable        = 0;
-	std::array<uint32_t, 2u * SampledImageViewKindCount> sampled_image_variables {};
+	std::array<uint32_t, 2u * SampledImageViewKindCount + 1u> sampled_image_variables {};
 	std::array<uint32_t,
 	           static_cast<uint32_t>(StorageImageClass::Count) * StorageImageViewKindCount>
 	                           storage_image_variables {};
@@ -471,7 +475,12 @@ struct ImageSampleLayout {
 	uint32_t grad_y = NoImageComponent;
 };
 
-constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
+constexpr uint32_t SampledDepthImageIndex = 2u * SampledImageViewKindCount;
+
+constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view, bool depth = false) {
+	if (depth && !integer && view == ImageViewKind::Dim2D) {
+		return SampledDepthImageIndex;
+	}
 	return static_cast<uint32_t>(view) + (integer ? SampledImageViewKindCount : 0u);
 }
 
@@ -490,7 +499,11 @@ constexpr uint32_t StorageImageIndex(StorageImageClass image_class, ImageViewKin
 	       static_cast<uint32_t>(image_class) * StorageImageViewKindCount;
 }
 
-constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
+constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view,
+                                                       bool depth = false) {
+	if (depth && !integer && view == ImageViewKind::Dim2D) {
+		return IR::DescriptorBindingKind::SampledDepth2D;
+	}
 	if (integer) {
 		switch (view) {
 			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::SampledUint1D;
@@ -621,6 +634,7 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+uint32_t EmitRawSubgroupInvocationId(EmitterState& state);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

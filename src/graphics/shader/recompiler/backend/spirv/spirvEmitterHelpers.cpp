@@ -113,7 +113,21 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	return {subid, EmitTrueBool(state)};
 }
 
+uint32_t EmitRawSubgroupInvocationId(EmitterState& state) {
+	if (state.subgroup_local_invocation_id_variable == 0) {
+		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLoad, TypeU32(state), value, state.subgroup_local_invocation_id_variable});
+	return value;
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (true && state.wave_size == 64 &&
+	    state.stage == ShaderType::Compute) {
+		return EmitLocalInvocationIndex(state);
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}

@@ -7060,8 +7060,7 @@ public:
       registers.SetColorAttrib3(0,
                                 {.tile_mode = Prospero::TileMode::kRenderTarget,
                                  .dimension = 0,
-                                 .cmask_pipe_aligned = true,
-                                 .dcc_pipe_aligned = true});
+                                 .metadata_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
@@ -7094,7 +7093,7 @@ public:
                   rendering.width == width && rendering.height == height &&
                   rendering.num_layers == 1 &&
                   rendering.num_color_attachments == 1,
-              "SDK dimension=0 did not create a 512x1 Vulkan attachment");
+              "dimension=0 did not create a 512x1 Vulkan attachment");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
@@ -7153,8 +7152,7 @@ public:
                                 {.depth = 31,
                                  .tile_mode = Prospero::TileMode::kRenderTarget,
                                  .dimension = 2,
-                                 .cmask_pipe_aligned = true,
-                                 .dcc_pipe_aligned = true});
+                                 .metadata_pipe_aligned = true});
       constexpr uint64_t dcc_address = base + allocation_size - 0x1000;
       registers.SetColorDccAddr(0, {.addr = dcc_address});
       registers.SetColorClearWord0(0, {.word0 = 0});
@@ -7198,7 +7196,7 @@ public:
               static_cast<bool>(image.backing.flags &
                                 vk::ImageCreateFlagBits::e2DArrayCompatible) &&
               image.usage.render_target && image.IsGpuModified(),
-          "dimension=2/depth=31 did not create the SDK-defined 32x32x32 "
+          "dimension=2/depth=31 did not create the expected 32x32x32 "
           "backing and 2D "
           "attachment slice");
 
@@ -7367,8 +7365,7 @@ public:
       registers.SetColorAttrib2(0, {.height = 255, .width = 255});
       registers.SetColorAttrib3(0, {.tile_mode = tile_case.tile,
                                     .dimension = 1,
-                                    .cmask_pipe_aligned = true,
-                                    .dcc_pipe_aligned = true});
+                                    .metadata_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
@@ -7477,8 +7474,7 @@ public:
       registers.SetColorAttrib2(0, {.height = 63, .width = 63});
       registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kDepth,
                                     .dimension = 1,
-                                    .cmask_pipe_aligned = true,
-                                    .dcc_pipe_aligned = true});
+                                    .metadata_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
@@ -24394,6 +24390,147 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
 }
 
+void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor packet(renderer, 0);
+  CommandProcessor indirect(renderer, 0);
+
+  const auto write_context = [](CommandProcessor &processor, uint32_t offset,
+                                uint32_t value) {
+    std::array<uint32_t, 3> command{
+        KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), offset, value};
+    Pm4Execution execution;
+    return processor.Process(execution, command) == Pm4ProcessResult::Complete;
+  };
+
+  constexpr uint32_t color_slot = 7;
+  constexpr uint32_t width_minus_one = 1919;
+  constexpr uint32_t height_minus_one = 1079;
+  constexpr uint32_t depth_minus_one = 5;
+  constexpr uint32_t max_mip = 3;
+  constexpr uint32_t dimension_3d = 2;
+  constexpr uint32_t attrib2_value =
+      height_minus_one | (width_minus_one << 14u) | (max_mip << 28u);
+  constexpr uint32_t attrib3_value =
+      depth_minus_one |
+      (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 14u) |
+      (dimension_3d << 24u) | (1u << 26u) | (1u << 30u);
+
+  const bool color_packets_complete =
+      write_context(packet, Pm4::CB_COLOR7_ATTRIB2, attrib2_value) &&
+      write_context(packet, Pm4::CB_COLOR7_ATTRIB3, attrib3_value);
+  g_hw_ctx_indirect_func[Pm4::CB_COLOR7_ATTRIB2](
+      indirect, Pm4::CB_COLOR7_ATTRIB2, attrib2_value);
+  g_hw_ctx_indirect_func[Pm4::CB_COLOR7_ATTRIB3](
+      indirect, Pm4::CB_COLOR7_ATTRIB3, attrib3_value);
+
+  const auto color_matches = [](const HW::RenderTarget &target) {
+    return target.attrib2.width == width_minus_one &&
+           target.attrib2.height == height_minus_one &&
+           target.attrib2.num_mip_levels == max_mip &&
+           target.attrib3.depth == depth_minus_one &&
+           target.attrib3.tile_mode == Prospero::TileMode::kStandard64KB &&
+           target.attrib3.dimension == dimension_3d &&
+           target.attrib3.metadata_pipe_aligned;
+  };
+  Require("Pm4NativeTargetGeometry", "sparse color geometry",
+          color_packets_complete &&
+              color_matches(packet.GetCtx().GetRenderTarget(color_slot)) &&
+              color_matches(indirect.GetCtx().GetRenderTarget(color_slot)) &&
+              !color_matches(packet.GetCtx().GetRenderTarget(0)) &&
+              !color_matches(indirect.GetCtx().GetRenderTarget(0)),
+          "ATTRIB2/ATTRIB3 did not provide native color extent and layout");
+
+  constexpr uint32_t depth_size_value =
+      width_minus_one | (height_minus_one << 16u);
+  const bool depth_packet_complete =
+      write_context(packet, Pm4::DB_DEPTH_SIZE_XY, depth_size_value);
+  g_hw_ctx_indirect_func[Pm4::DB_DEPTH_SIZE_XY](indirect, Pm4::DB_DEPTH_SIZE_XY,
+                                                depth_size_value);
+  const auto depth_matches = [](const HW::DepthRenderTarget &target) {
+    return target.size.valid && target.size.x_max == width_minus_one &&
+           target.size.y_max == height_minus_one;
+  };
+  Require("Pm4NativeTargetGeometry", "native depth geometry",
+          depth_packet_complete &&
+              depth_matches(packet.GetCtx().GetDepthRenderTarget()) &&
+              depth_matches(indirect.GetCtx().GetDepthRenderTarget()),
+          "DB_DEPTH_SIZE_XY did not provide the native depth extent");
+
+  bool legacy_slots_are_unhandled = true;
+  for (uint32_t slot = 0; slot < 8; slot++) {
+    const auto stride = slot * 15u;
+    const std::array legacy_color_slots{
+        Pm4::CB_COLOR0_BASE + stride + 1u,
+        Pm4::CB_COLOR0_BASE + stride + 2u,
+        Pm4::CB_COLOR0_CMASK + stride + 1u,
+        Pm4::CB_COLOR0_FMASK + stride + 1u,
+    };
+    for (const auto offset : legacy_color_slots) {
+      legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
+                                    g_hw_ctx_indirect_func[offset] == nullptr;
+    }
+  }
+  // These offsets are the removed GCN DB_DEPTH_INFO, DB_DEPTH_SIZE, and
+  // DB_DEPTH_SLICE holes. Keep them numeric so deleting their legacy PM4 names
+  // does not weaken this dispatch-table regression check.
+  constexpr std::array<uint32_t, 3> legacy_depth_slots{0x000fu, 0x0016u,
+                                                       0x0017u};
+  for (const auto offset : legacy_depth_slots) {
+    legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
+                                  g_hw_ctx_indirect_func[offset] == nullptr;
+  }
+  // Removed GCN PA_SC_NGG_MODE_CNTL.
+  legacy_slots_are_unhandled &= g_hw_ctx_func[0x0314u] == nullptr &&
+                                g_hw_ctx_indirect_func[0x0314u] == nullptr;
+
+  // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
+  // this check independent of the deleted legacy names.
+  constexpr std::array<uint32_t, 22> legacy_shader_slots{
+      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x081u, 0x0b0u, 0x0bcu,
+      0x100u, 0x101u, 0x130u, 0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u,
+      0x211u, 0x216u, 0x217u, 0x219u, 0x21au, 0x27du,
+  };
+  for (const auto offset : legacy_shader_slots) {
+    legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
+                                  g_hw_sh_indirect_func[offset] == nullptr;
+  }
+  for (uint32_t offset = 0x0cau; offset <= 0x0ebu; offset++) {
+    legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
+                                  g_hw_sh_indirect_func[offset] == nullptr;
+  }
+
+  constexpr std::array<uint32_t, 1> legacy_uconfig_slots{0x0260u};
+  for (const auto offset : legacy_uconfig_slots) {
+    legacy_slots_are_unhandled &= g_hw_uc_func[offset] == nullptr &&
+                                  g_hw_uc_indirect_func[offset] == nullptr;
+  }
+
+  std::array<uint32_t, 3> index_size_packet{
+      KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG_INDEX, Pm4::R_ZERO),
+      0x20000000u | Pm4::VGT_INDEX_TYPE,
+      0x441u,
+  };
+  Pm4Execution index_size_execution;
+  const bool native_index_size_packet_complete =
+      packet.Process(index_size_execution, index_size_packet) ==
+          Pm4ProcessResult::Complete &&
+      g_hw_uc_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
+      g_hw_uc_indirect_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
+      g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr &&
+      g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr;
+
+  const bool native_pace_slots_are_handled =
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] != nullptr;
+  Require("Pm4NativeTargetGeometry", "legacy register holes",
+          legacy_slots_are_unhandled && native_pace_slots_are_handled &&
+              native_index_size_packet_complete,
+          "a removed GCN register has a handler or a native packet is not handled");
+  std::printf("[host]    %-32s ok\n", "Pm4NativeTargetGeometry");
+}
+
 void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -25153,6 +25290,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
     VulkanHarness vulkan;
+    CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
@@ -25332,6 +25470,7 @@ int main(int argc, char **argv) {
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+  CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());

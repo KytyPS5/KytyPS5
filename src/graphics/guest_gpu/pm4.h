@@ -98,6 +98,10 @@ constexpr uint32_t DB_RENDER_CONTROL_DEPTH_CLEAR_ENABLE_SHIFT       = 0;
 constexpr uint32_t DB_RENDER_CONTROL_DEPTH_CLEAR_ENABLE_MASK        = 0x1;
 constexpr uint32_t DB_RENDER_CONTROL_STENCIL_CLEAR_ENABLE_SHIFT     = 1;
 constexpr uint32_t DB_RENDER_CONTROL_STENCIL_CLEAR_ENABLE_MASK      = 0x1;
+constexpr uint32_t DB_RENDER_CONTROL_COPY_DEPTH_TO_COLOR_SHIFT      = 2;
+constexpr uint32_t DB_RENDER_CONTROL_COPY_DEPTH_TO_COLOR_MASK       = 0x1;
+constexpr uint32_t DB_RENDER_CONTROL_COPY_STENCIL_TO_COLOR_SHIFT    = 3;
+constexpr uint32_t DB_RENDER_CONTROL_COPY_STENCIL_TO_COLOR_MASK     = 0x1;
 constexpr uint32_t DB_RENDER_CONTROL_RESUMMARIZE_ENABLE_SHIFT       = 4;
 constexpr uint32_t DB_RENDER_CONTROL_RESUMMARIZE_ENABLE_MASK        = 0x1;
 constexpr uint32_t DB_RENDER_CONTROL_STENCIL_COMPRESS_DISABLE_SHIFT = 5;
@@ -163,22 +167,6 @@ constexpr uint32_t PA_SC_SCREEN_SCISSOR_BR_BR_Y_MASK  = 0xFFFF;
 
 constexpr uint32_t DB_DFSM_CONTROL = 0xE;
 
-constexpr uint32_t DB_DEPTH_INFO                          = 0xF;
-constexpr uint32_t DB_DEPTH_INFO_ADDR5_SWIZZLE_MASK_SHIFT = 0;
-constexpr uint32_t DB_DEPTH_INFO_ADDR5_SWIZZLE_MASK_MASK  = 0xF;
-constexpr uint32_t DB_DEPTH_INFO_ARRAY_MODE_SHIFT         = 4;
-constexpr uint32_t DB_DEPTH_INFO_ARRAY_MODE_MASK          = 0xF;
-constexpr uint32_t DB_DEPTH_INFO_PIPE_CONFIG_SHIFT        = 8;
-constexpr uint32_t DB_DEPTH_INFO_PIPE_CONFIG_MASK         = 0x1F;
-constexpr uint32_t DB_DEPTH_INFO_BANK_WIDTH_SHIFT         = 13;
-constexpr uint32_t DB_DEPTH_INFO_BANK_WIDTH_MASK          = 0x3;
-constexpr uint32_t DB_DEPTH_INFO_BANK_HEIGHT_SHIFT        = 15;
-constexpr uint32_t DB_DEPTH_INFO_BANK_HEIGHT_MASK         = 0x3;
-constexpr uint32_t DB_DEPTH_INFO_MACRO_TILE_ASPECT_SHIFT  = 17;
-constexpr uint32_t DB_DEPTH_INFO_MACRO_TILE_ASPECT_MASK   = 0x3;
-constexpr uint32_t DB_DEPTH_INFO_NUM_BANKS_SHIFT          = 19;
-constexpr uint32_t DB_DEPTH_INFO_NUM_BANKS_MASK           = 0x3;
-
 constexpr uint32_t DB_Z_INFO                               = 0x10;
 constexpr uint32_t DB_Z_INFO_FORMAT_SHIFT                  = 0;
 constexpr uint32_t DB_Z_INFO_FORMAT_MASK                   = 0x3;
@@ -221,16 +209,6 @@ constexpr uint32_t DB_Z_READ_BASE        = 0x12;
 constexpr uint32_t DB_STENCIL_READ_BASE  = 0x13;
 constexpr uint32_t DB_Z_WRITE_BASE       = 0x14;
 constexpr uint32_t DB_STENCIL_WRITE_BASE = 0x15;
-
-constexpr uint32_t DB_DEPTH_SIZE                       = 0x16;
-constexpr uint32_t DB_DEPTH_SIZE_PITCH_TILE_MAX_SHIFT  = 0;
-constexpr uint32_t DB_DEPTH_SIZE_PITCH_TILE_MAX_MASK   = 0x7FF;
-constexpr uint32_t DB_DEPTH_SIZE_HEIGHT_TILE_MAX_SHIFT = 11;
-constexpr uint32_t DB_DEPTH_SIZE_HEIGHT_TILE_MAX_MASK  = 0x7FF;
-
-constexpr uint32_t DB_DEPTH_SLICE                      = 0x17;
-constexpr uint32_t DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT = 0;
-constexpr uint32_t DB_DEPTH_SLICE_SLICE_TILE_MAX_MASK  = 0x3FFFFF;
 
 constexpr uint32_t DB_Z_READ_BASE_HI                  = 0x1A;
 constexpr uint32_t DB_STENCIL_READ_BASE_HI            = 0x1B;
@@ -424,11 +402,6 @@ constexpr uint32_t DB_DEPTH_CONTROL_STENCILFUNC_SHIFT                        = 8
 constexpr uint32_t DB_DEPTH_CONTROL_STENCILFUNC_MASK                         = 0x7;
 constexpr uint32_t DB_DEPTH_CONTROL_STENCILFUNC_BF_SHIFT                     = 20;
 constexpr uint32_t DB_DEPTH_CONTROL_STENCILFUNC_BF_MASK                      = 0x7;
-constexpr uint32_t DB_DEPTH_CONTROL_ENABLE_COLOR_WRITES_ON_DEPTH_FAIL_SHIFT  = 30;
-constexpr uint32_t DB_DEPTH_CONTROL_ENABLE_COLOR_WRITES_ON_DEPTH_FAIL_MASK   = 0x1;
-constexpr uint32_t DB_DEPTH_CONTROL_DISABLE_COLOR_WRITES_ON_DEPTH_PASS_SHIFT = 31;
-constexpr uint32_t DB_DEPTH_CONTROL_DISABLE_COLOR_WRITES_ON_DEPTH_PASS_MASK  = 0x1;
-
 constexpr uint32_t DB_EQAA                                  = 0x201;
 constexpr uint32_t DB_EQAA_MAX_ANCHOR_SAMPLES_SHIFT         = 0;
 constexpr uint32_t DB_EQAA_MAX_ANCHOR_SAMPLES_MASK          = 0x7;
@@ -560,21 +533,9 @@ constexpr uint32_t VGT_DRAW_PAYLOAD_CNTL  = 0x2A6;
 constexpr uint32_t VGT_ESGS_RING_ITEMSIZE = 0x2AB;
 constexpr uint32_t VGT_REUSE_OFF          = 0x2AD;
 
-constexpr uint32_t DB_HTILE_SURFACE                               = 0x2AF;
-constexpr uint32_t DB_HTILE_SURFACE_LINEAR_SHIFT                  = 0;
-constexpr uint32_t DB_HTILE_SURFACE_LINEAR_MASK                   = 0x1;
-constexpr uint32_t DB_HTILE_SURFACE_FULL_CACHE_SHIFT              = 1;
-constexpr uint32_t DB_HTILE_SURFACE_FULL_CACHE_MASK               = 0x1;
-constexpr uint32_t DB_HTILE_SURFACE_HTILE_USES_PRELOAD_WIN_SHIFT  = 2;
-constexpr uint32_t DB_HTILE_SURFACE_HTILE_USES_PRELOAD_WIN_MASK   = 0x1;
-constexpr uint32_t DB_HTILE_SURFACE_PRELOAD_SHIFT                 = 3;
-constexpr uint32_t DB_HTILE_SURFACE_PRELOAD_MASK                  = 0x1;
-constexpr uint32_t DB_HTILE_SURFACE_PREFETCH_WIDTH_SHIFT          = 4;
-constexpr uint32_t DB_HTILE_SURFACE_PREFETCH_WIDTH_MASK           = 0x3F;
-constexpr uint32_t DB_HTILE_SURFACE_PREFETCH_HEIGHT_SHIFT         = 10;
-constexpr uint32_t DB_HTILE_SURFACE_PREFETCH_HEIGHT_MASK          = 0x3F;
-constexpr uint32_t DB_HTILE_SURFACE_DST_OUTSIDE_ZERO_TO_ONE_SHIFT = 16;
-constexpr uint32_t DB_HTILE_SURFACE_DST_OUTSIDE_ZERO_TO_ONE_MASK  = 0x1;
+constexpr uint32_t DB_SHADING_RATE_ENCODING                             = 0x2AF;
+constexpr uint32_t DB_SHADING_RATE_ENCODING_SHADING_RATE_ENCODING_SHIFT = 19;
+constexpr uint32_t DB_SHADING_RATE_ENCODING_SHADING_RATE_ENCODING_MASK  = 0x3;
 
 constexpr uint32_t DB_SRESULTS_COMPARE_STATE0                          = 0x2B0;
 constexpr uint32_t DB_SRESULTS_COMPARE_STATE1                          = 0x2B1;
@@ -621,7 +582,6 @@ constexpr uint32_t PA_SC_SHADER_CONTROL                  = 0x310;
 constexpr uint32_t PA_SC_BINNER_CNTL_0                   = 0x311;
 constexpr uint32_t PA_SC_BINNER_CNTL_1                   = 0x312;
 constexpr uint32_t PA_SC_CONSERVATIVE_RASTERIZATION_CNTL = 0x313;
-constexpr uint32_t PA_SC_NGG_MODE_CNTL                   = 0x314;
 constexpr uint32_t CB_COLOR0_BASE                        = 0x318;
 
 constexpr uint32_t CB_COLOR0_VIEW                   = 0x31B;
@@ -649,24 +609,13 @@ constexpr uint32_t CB_COLOR0_INFO_BLEND_BYPASS_SHIFT              = 16;
 constexpr uint32_t CB_COLOR0_INFO_BLEND_BYPASS_MASK               = 0x1;
 constexpr uint32_t CB_COLOR0_INFO_ROUND_MODE_SHIFT                = 18;
 constexpr uint32_t CB_COLOR0_INFO_ROUND_MODE_MASK                 = 0x1;
-constexpr uint32_t CB_COLOR0_INFO_CMASK_IS_LINEAR_SHIFT           = 19;
-constexpr uint32_t CB_COLOR0_INFO_CMASK_IS_LINEAR_MASK            = 0x1;
 constexpr uint32_t CB_COLOR0_INFO_FMASK_COMPRESSION_DISABLE_SHIFT = 26;
 constexpr uint32_t CB_COLOR0_INFO_FMASK_COMPRESSION_DISABLE_MASK  = 0x1;
 constexpr uint32_t CB_COLOR0_INFO_FMASK_COMPRESS_1FRAG_ONLY_SHIFT = 27;
 constexpr uint32_t CB_COLOR0_INFO_FMASK_COMPRESS_1FRAG_ONLY_MASK  = 0x1;
 constexpr uint32_t CB_COLOR0_INFO_DCC_ENABLE_SHIFT                = 28;
 constexpr uint32_t CB_COLOR0_INFO_DCC_ENABLE_MASK                 = 0x1;
-constexpr uint32_t CB_COLOR0_INFO_CMASK_ADDR_TYPE_SHIFT           = 29;
-constexpr uint32_t CB_COLOR0_INFO_CMASK_ADDR_TYPE_MASK            = 0x3;
-constexpr uint32_t CB_COLOR0_INFO_ALT_TILE_MODE_SHIFT             = 31;
-constexpr uint32_t CB_COLOR0_INFO_ALT_TILE_MODE_MASK              = 0x1;
-
 constexpr uint32_t CB_COLOR0_ATTRIB                             = 0x31D;
-constexpr uint32_t CB_COLOR0_ATTRIB_TILE_MODE_INDEX_SHIFT       = 0;
-constexpr uint32_t CB_COLOR0_ATTRIB_TILE_MODE_INDEX_MASK        = 0x1F;
-constexpr uint32_t CB_COLOR0_ATTRIB_FMASK_TILE_MODE_INDEX_SHIFT = 5;
-constexpr uint32_t CB_COLOR0_ATTRIB_FMASK_TILE_MODE_INDEX_MASK  = 0x1F;
 constexpr uint32_t CB_COLOR0_ATTRIB_NUM_SAMPLES_SHIFT           = 12;
 constexpr uint32_t CB_COLOR0_ATTRIB_NUM_SAMPLES_MASK            = 0x7;
 constexpr uint32_t CB_COLOR0_ATTRIB_NUM_FRAGMENTS_SHIFT         = 15;
@@ -681,8 +630,6 @@ constexpr uint32_t CB_COLOR0_DCC_CONTROL_KEY_CLEAR_ENABLE_SHIFT                 
 constexpr uint32_t CB_COLOR0_DCC_CONTROL_KEY_CLEAR_ENABLE_MASK                  = 0x1;
 constexpr uint32_t CB_COLOR0_DCC_CONTROL_MAX_UNCOMPRESSED_BLOCK_SIZE_SHIFT      = 2;
 constexpr uint32_t CB_COLOR0_DCC_CONTROL_MAX_UNCOMPRESSED_BLOCK_SIZE_MASK       = 0x3;
-constexpr uint32_t CB_COLOR0_DCC_CONTROL_MIN_COMPRESSED_BLOCK_SIZE_SHIFT        = 4;
-constexpr uint32_t CB_COLOR0_DCC_CONTROL_MIN_COMPRESSED_BLOCK_SIZE_MASK         = 0x1;
 constexpr uint32_t CB_COLOR0_DCC_CONTROL_MAX_COMPRESSED_BLOCK_SIZE_SHIFT        = 5;
 constexpr uint32_t CB_COLOR0_DCC_CONTROL_MAX_COMPRESSED_BLOCK_SIZE_MASK         = 0x3;
 constexpr uint32_t CB_COLOR0_DCC_CONTROL_COLOR_TRANSFORM_SHIFT                  = 7;
@@ -739,31 +686,25 @@ constexpr uint32_t CB_COLOR0_ATTRIB3_CMASK_PIPE_ALIGNED_SHIFT = 26;
 constexpr uint32_t CB_COLOR0_ATTRIB3_CMASK_PIPE_ALIGNED_MASK  = 0x1;
 constexpr uint32_t CB_COLOR0_ATTRIB3_DCC_PIPE_ALIGNED_SHIFT   = 30;
 constexpr uint32_t CB_COLOR0_ATTRIB3_DCC_PIPE_ALIGNED_MASK    = 0x1;
+constexpr uint32_t CB_COLOR0_ATTRIB3_WRITE_VRS_RATE_HINT_TO_CMASK_SHIFT = 31;
+constexpr uint32_t CB_COLOR0_ATTRIB3_WRITE_VRS_RATE_HINT_TO_CMASK_MASK  = 0x1;
 
 constexpr uint32_t CB_COLOR7_ATTRIB3 = 0x3BF;
 
-/* Fake codes. Don't exist on real HW */
-
-constexpr uint32_t CX_NOP = 0x800003FF;
+constexpr uint32_t CX_NOP = 0xDB;
 
 constexpr uint32_t CX_NUM = 0x3FF + 1;
 
 /* Shader registers */
 
-constexpr uint32_t SPI_SHADER_TBA_LO_PS     = 0x0;
-constexpr uint32_t SPI_SHADER_PGM_RSRC4_PS  = 0x1;
-constexpr uint32_t SPI_SHADER_TMA_LO_PS     = 0x2;
-constexpr uint32_t SPI_SHADER_TMA_HI_PS     = 0x3;
-constexpr uint32_t SPI_SHADER_PGM_CHKSUM_PS = 0x6;
-constexpr uint32_t SPI_SHADER_PGM_RSRC3_PS  = 0x7;
-constexpr uint32_t SPI_SHADER_PGM_LO_PS     = 0x8;
-constexpr uint32_t SPI_SHADER_PGM_HI_PS     = 0x9;
+constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;
+constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_PS    = 0x7;
+constexpr uint32_t SPI_SHADER_PGM_LO_PS              = 0x8;
+constexpr uint32_t SPI_SHADER_PGM_HI_PS              = 0x9;
 
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS                        = 0xA;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_VGPRS_SHIFT            = 0;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_VGPRS_MASK             = 0x3F;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_SGPRS_SHIFT            = 6;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_SGPRS_MASK             = 0xF;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_PRIORITY_SHIFT         = 10;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_PRIORITY_MASK          = 0x3;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_PS_FLOAT_MODE_SHIFT       = 12;
@@ -800,14 +741,11 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_PS_SHARED_VGPR_CNT_MASK         = 0xF;
 constexpr uint32_t SPI_SHADER_USER_DATA_PS_0  = 0xC;
 constexpr uint32_t SPI_SHADER_USER_DATA_PS_15 = 0x1B;
 constexpr uint32_t SPI_SHADER_USER_DATA_PS_31 = 0x2B;
-constexpr uint32_t SPI_SHADER_REQ_CTRL_PS     = 0x30;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_PS_0 = 0x32;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_PS_3 = 0x35;
 
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_VGPRS_SHIFT           = 0;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_VGPRS_MASK            = 0x3F;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_SGPRS_SHIFT           = 6;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_SGPRS_MASK            = 0xF;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_PRIORITY_SHIFT        = 10;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_PRIORITY_MASK         = 0x3;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_VS_FLOAT_MODE_SHIFT      = 12;
@@ -838,19 +776,20 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_VS_USER_SGPR_MSB_MASK    = 0x1;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_VS_SHARED_VGPR_CNT_SHIFT = 28;
 constexpr uint32_t SPI_SHADER_PGM_RSRC2_VS_SHARED_VGPR_CNT_MASK  = 0xF;
 
-constexpr uint32_t SPI_SHADER_PGM_CHKSUM_GS        = 0x80;
+constexpr uint32_t SPI_SHADER_PACE_ID_GS           = 0x80;
+// AGC compiler records use this numeric tag as opaque metadata. It is not a shader checksum
+// register and intentionally has no checksum-state consumer in HardwareContext.
+constexpr uint32_t SPI_SHADER_PGM_CHKSUM_GS        = SPI_SHADER_PACE_ID_GS;
 constexpr uint32_t SPI_SHADER_PGM_RSRC4_GS         = 0x81;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_GS = 0x82;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_GS = 0x83;
-constexpr uint32_t SPI_SHADER_PGM_RSRC3_GS         = 0x87;
+constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_GS  = 0x87;
 constexpr uint32_t SPI_SHADER_PGM_LO_GS            = 0x88;
 constexpr uint32_t SPI_SHADER_PGM_HI_GS            = 0x89;
 
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS                        = 0x8A;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_VGPRS_SHIFT            = 0;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_VGPRS_MASK             = 0x3F;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_SGPRS_SHIFT            = 6;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_SGPRS_MASK             = 0xF;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_PRIORITY_SHIFT         = 10;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_PRIORITY_MASK          = 0x3;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_FLOAT_MODE_SHIFT       = 12;
@@ -891,22 +830,15 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_GS_SHARED_VGPR_CNT_MASK   = 0xF;
 constexpr uint32_t SPI_SHADER_USER_DATA_GS_0                      = 0x8C;
 constexpr uint32_t SPI_SHADER_USER_DATA_GS_15                     = 0x9B;
 constexpr uint32_t SPI_SHADER_USER_DATA_GS_31                     = 0xAB;
-constexpr uint32_t SPI_SHADER_REQ_CTRL_ESGS                       = 0xB0;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0                   = 0xB2;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_3                   = 0xB5;
-constexpr uint32_t SPI_SHADER_PGM_RSRC2_ES_GS                     = 0xBC;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES                           = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES                           = 0xC9;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_ES                        = 0xCA;
-constexpr uint32_t SPI_SHADER_PGM_RSRC2_ES                        = 0xCB;
-constexpr uint32_t SPI_SHADER_USER_DATA_ES_0                      = 0xCC;
-constexpr uint32_t SPI_SHADER_USER_DATA_ES_15                     = 0xDB;
-constexpr uint32_t SPI_SHADER_USER_DATA_ES_31                     = 0xEB;
+// Retained only as an opaque AGC compiler-record tag; 0x100 is not a PS5 SH register.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_HS                       = 0x100;
-constexpr uint32_t SPI_SHADER_PGM_RSRC4_HS                        = 0x101;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_HS                = 0x102;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_HS                = 0x103;
-constexpr uint32_t SPI_SHADER_PGM_RSRC3_HS                        = 0x107;
+constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_HS                 = 0x107;
 constexpr uint32_t SPI_SHADER_PGM_LO_HS                           = 0x108;
 constexpr uint32_t SPI_SHADER_PGM_HI_HS                           = 0x109;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_HS                        = 0x10A;
@@ -944,13 +876,10 @@ constexpr uint32_t SPI_SHADER_PGM_RSRC2_HS_SHARED_VGPR_CNT_MASK   = 0xF;
 constexpr uint32_t SPI_SHADER_USER_DATA_HS_0                      = 0x10C;
 constexpr uint32_t SPI_SHADER_USER_DATA_HS_15                     = 0x11B;
 constexpr uint32_t SPI_SHADER_USER_DATA_HS_31                     = 0x12B;
-constexpr uint32_t SPI_SHADER_REQ_CTRL_LSHS                       = 0x130;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_0                   = 0x132;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_LSHS_3                   = 0x135;
 constexpr uint32_t SPI_SHADER_PGM_LO_LS                           = 0x148;
 constexpr uint32_t SPI_SHADER_PGM_HI_LS                           = 0x149;
-constexpr uint32_t SPI_SHADER_PGM_RSRC1_LS                        = 0x14A;
-constexpr uint32_t SPI_SHADER_PGM_RSRC2_LS                        = 0x14B;
 constexpr uint32_t COMPUTE_START_X                                = 0x204;
 constexpr uint32_t COMPUTE_START_Y                                = 0x205;
 constexpr uint32_t COMPUTE_START_Z                                = 0x206;
@@ -959,28 +888,26 @@ constexpr uint32_t COMPUTE_NUM_THREAD_Y                           = 0x208;
 constexpr uint32_t COMPUTE_NUM_THREAD_Z                           = 0x209;
 constexpr uint32_t COMPUTE_PGM_LO                                 = 0x20C;
 constexpr uint32_t COMPUTE_PGM_HI                                 = 0x20D;
-constexpr uint32_t COMPUTE_TBA_LO                                 = 0x20E;
-constexpr uint32_t COMPUTE_TBA_HI                                 = 0x20F;
-constexpr uint32_t COMPUTE_TMA_LO                                 = 0x210;
-constexpr uint32_t COMPUTE_TMA_HI                                 = 0x211;
 
 constexpr uint32_t COMPUTE_PGM_RSRC1                  = 0x212;
 constexpr uint32_t COMPUTE_PGM_RSRC1_VGPRS_SHIFT      = 0;
 constexpr uint32_t COMPUTE_PGM_RSRC1_VGPRS_MASK       = 0x3F;
-constexpr uint32_t COMPUTE_PGM_RSRC1_SGPRS_SHIFT      = 6;
-constexpr uint32_t COMPUTE_PGM_RSRC1_SGPRS_MASK       = 0xF;
+constexpr uint32_t COMPUTE_PGM_RSRC1_PRIORITY_SHIFT   = 10;
+constexpr uint32_t COMPUTE_PGM_RSRC1_PRIORITY_MASK    = 0x3;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT = 12;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK  = 0xFF;
 constexpr uint32_t COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT = 21;
 constexpr uint32_t COMPUTE_PGM_RSRC1_DX10_CLAMP_MASK  = 0x1;
+constexpr uint32_t COMPUTE_PGM_RSRC1_DEBUG_MODE_SHIFT = 22;
+constexpr uint32_t COMPUTE_PGM_RSRC1_DEBUG_MODE_MASK  = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_IEEE_MODE_SHIFT  = 23;
 constexpr uint32_t COMPUTE_PGM_RSRC1_IEEE_MODE_MASK   = 0x1;
-constexpr uint32_t COMPUTE_PGM_RSRC1_BULKY_SHIFT      = 24;
-constexpr uint32_t COMPUTE_PGM_RSRC1_BULKY_MASK       = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT  = 26;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FP16_OVFL_MASK   = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT   = 29;
 constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_MASK    = 0x1;
+constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT = 31;
+constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK  = 0x1;
 
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;
@@ -1011,21 +938,16 @@ constexpr uint32_t COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT       = 15;
 constexpr uint32_t COMPUTE_PGM_RSRC2_LDS_SIZE_MASK        = 0x1FF;
 
 constexpr uint32_t COMPUTE_RESOURCE_LIMITS    = 0x215;
-constexpr uint32_t COMPUTE_DESTINATION_EN_SE0 = 0x216;
-constexpr uint32_t COMPUTE_DESTINATION_EN_SE1 = 0x217;
 constexpr uint32_t COMPUTE_TMPRING_SIZE       = 0x218;
-constexpr uint32_t COMPUTE_DESTINATION_EN_SE2 = 0x219;
-constexpr uint32_t COMPUTE_DESTINATION_EN_SE3 = 0x21A;
 constexpr uint32_t COMPUTE_USER_ACCUM_0       = 0x224;
 constexpr uint32_t COMPUTE_PGM_RSRC3          = 0x228;
-constexpr uint32_t COMPUTE_SHADER_CHKSUM      = 0x22A;
+constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT = 0;
+constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK  = 0xF;
+constexpr uint32_t COMPUTE_PACE_ID             = 0x22A;
 constexpr uint32_t COMPUTE_USER_DATA_0        = 0x240;
 constexpr uint32_t COMPUTE_USER_DATA_15       = 0x24F;
-constexpr uint32_t COMPUTE_DISPATCH_TUNNEL    = 0x27D;
 
-/* Fake codes. Don't exist on real HW */
-
-constexpr uint32_t SH_NOP = 0x800002FF;
+constexpr uint32_t SH_NOP = 0x280;
 
 constexpr uint32_t SH_NUM = 0x2FF + 1;
 
@@ -1042,6 +964,7 @@ constexpr uint32_t GE_INDX_OFFSET            = 0x24A;
 constexpr uint32_t GE_MULTI_PRIM_IB_RESET_EN = 0x24B;
 constexpr uint32_t VGT_HS_OFFCHIP_PARAM      = 0x24F;
 constexpr uint32_t VGT_TF_MEMORY_BASE        = 0x250;
+constexpr uint32_t IA_MULTI_VGT_PARAM        = 0x258;
 
 constexpr uint32_t GE_CNTL                     = 0x25B;
 constexpr uint32_t GE_CNTL_PRIM_GRP_SIZE_SHIFT = 0;
@@ -1063,28 +986,15 @@ constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR2_MASK  = 0x1;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR3_SHIFT = 2;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR3_MASK  = 0x1;
 
-constexpr uint32_t IA_MULTI_VGT_PARAM       = 0x258;
 constexpr uint32_t TA_CS_BC_BASE_ADDR       = 0x380;
 constexpr uint32_t TA_CS_BC_BASE_ADDR_HI    = 0x381;
-constexpr uint32_t TEXTURE_GRADIENT_FACTORS = 0x382;
+constexpr uint32_t TEXTURE_GRADIENT_FACTORS = 0x383;
+constexpr uint32_t TEXTURE_GRADIENT_CONTROL = 0x384;
 constexpr uint32_t GDS_OA_CNTL              = 0x41D;
 constexpr uint32_t GDS_OA_COUNTER           = 0x41E;
 constexpr uint32_t GDS_OA_ADDRESS           = 0x41F;
 
-/* Fake codes. Don't exist on real HW */
-
-constexpr uint32_t FSR_EXTEND_SUBPIXEL_ROUNDING = 0x80003FF4;
-constexpr uint32_t FSR_ALPHA_VALUE0             = 0x80003FF5;
-constexpr uint32_t FSR_ALPHA_VALUE1             = 0x80003FF6;
-constexpr uint32_t FSR_CONTROL_POINT0           = 0x80003FF7;
-constexpr uint32_t FSR_CONTROL_POINT1           = 0x80003FF8;
-constexpr uint32_t FSR_CONTROL_POINT2           = 0x80003FF9;
-constexpr uint32_t FSR_CONTROL_POINT3           = 0x80003FFA;
-constexpr uint32_t FSR_WINDOW0                  = 0x80003FFB;
-constexpr uint32_t FSR_WINDOW1                  = 0x80003FFC;
-constexpr uint32_t TEXTURE_GRADIENT_CONTROL     = 0x80003FFD;
-constexpr uint32_t MEMORY_MAPPING_MASK          = 0x80003FFE;
-constexpr uint32_t UC_NOP                       = 0x80003FFF;
+constexpr uint32_t UC_NOP = 0xA2;
 
 constexpr uint32_t UC_NUM = 0x3FFF + 1;
 

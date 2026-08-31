@@ -11,15 +11,6 @@ struct ColorBase {
 	uint64_t addr = 0;
 };
 
-struct ColorPitch {
-	uint32_t pitch_div8_minus1       = 0;
-	uint32_t fmask_pitch_div8_minus1 = 0;
-};
-
-struct ColorSlice {
-	uint32_t slice_div64_minus1 = 0;
-};
-
 struct ColorView {
 	uint32_t base_array_slice_index = 0;
 	uint32_t last_array_slice_index = 0;
@@ -36,20 +27,15 @@ struct ColorInfo {
 	bool                    blend_clamp                    = false;
 	bool                    blend_bypass                   = false;
 	bool                    round_mode                     = false;
-	uint32_t                cmask_is_linear                = 0;
-	uint32_t                cmask_addr_type                = 0;
-	bool                    alt_tile_mode                  = false;
 	Prospero::ChannelLayout format                         = Prospero::ChannelLayout::kInvalid;
 	Prospero::ChannelType   channel_type                   = Prospero::ChannelType::kUNorm;
 	Prospero::ChannelOrder  channel_order                  = Prospero::ChannelOrder::kStandard;
 };
 
 struct ColorAttrib {
-	bool               force_dest_alpha_to_one = false;
-	Prospero::TileMode tile_mode               = Prospero::TileMode::kLinear;
-	Prospero::TileMode fmask_tile_mode         = Prospero::TileMode::kLinear;
-	uint32_t           num_samples             = 0;
-	uint32_t           num_fragments           = 0;
+	bool     force_dest_alpha_to_one = false;
+	uint32_t num_samples             = 0;
+	uint32_t num_fragments           = 0;
 };
 
 struct ColorAttrib2 {
@@ -59,39 +45,31 @@ struct ColorAttrib2 {
 };
 
 struct ColorAttrib3 {
-	uint32_t           depth              = 0;
-	Prospero::TileMode tile_mode          = Prospero::TileMode::kLinear;
-	uint32_t           dimension          = 0;
-	bool               cmask_pipe_aligned = false;
-	bool               dcc_pipe_aligned   = false;
+	uint32_t           depth                        = 0;
+	Prospero::TileMode tile_mode                    = Prospero::TileMode::kRenderTarget;
+	uint32_t           dimension                    = 0;
+	bool               metadata_pipe_aligned        = false;
+	bool               write_vrs_rate_hint_to_cmask = false;
 };
 
 struct ColorDccControl {
-	uint32_t max_uncompressed_block_size    = 0;
-	uint32_t max_compressed_block_size      = 0;
-	uint32_t min_compressed_block_size      = 0;
-	uint32_t color_transform                = 0;
-	bool     dcc_clear_key_enable           = false;
-	bool     overwrite_combiner_disable     = false;
-	bool     independent_64b_blocks         = false;
-	bool     independent_128b_blocks        = false;
-	bool     data_write_on_dcc_clear_to_reg = false;
+	enum class IndependentBlockSize : uint8_t { Disabled, Bytes64, Bytes128 };
+
+	uint32_t             max_uncompressed_block_size    = 2;
+	uint32_t             max_compressed_block_size      = 2;
+	uint32_t             color_transform                = 0;
+	bool                 dcc_clear_key_enable           = false;
+	bool                 overwrite_combiner_disable     = false;
+	IndependentBlockSize independent_block_size         = IndependentBlockSize::Disabled;
+	bool                 data_write_on_dcc_clear_to_reg = false;
 };
 
 struct ColorCmask {
 	uint64_t addr = 0;
 };
 
-struct ColorCmaskSlice {
-	uint32_t slice_minus1 = 0;
-};
-
 struct ColorFmask {
 	uint64_t addr = 0;
-};
-
-struct ColorFmaskSlice {
-	uint32_t slice_minus1 = 0;
 };
 
 struct ColorClearWord0 {
@@ -106,15 +84,8 @@ struct ColorDccAddr {
 	uint64_t addr = 0;
 };
 
-struct ColorSize {
-	uint32_t width  = 0;
-	uint32_t height = 0;
-};
-
 struct RenderTarget {
 	ColorBase       base;
-	ColorPitch      pitch;
-	ColorSlice      slice;
 	ColorView       view;
 	ColorInfo       info;
 	ColorAttrib     attrib;
@@ -122,13 +93,10 @@ struct RenderTarget {
 	ColorAttrib3    attrib3;
 	ColorDccControl dcc;
 	ColorCmask      cmask;
-	ColorCmaskSlice cmask_slice;
 	ColorFmask      fmask;
-	ColorFmaskSlice fmask_slice;
 	ColorClearWord0 clear_word0;
 	ColorClearWord1 clear_word1;
 	ColorDccAddr    dcc_addr;
-	ColorSize       size;
 };
 
 struct DepthZInfo {
@@ -136,7 +104,7 @@ struct DepthZInfo {
 	uint32_t                                    num_samples = 0;
 	Prospero::TextureCompatiblePlaneCompression texture_compatibility =
 	    Prospero::TextureCompatiblePlaneCompression::kDisable;
-	Prospero::ZCompareBase z_compare_base     = Prospero::ZCompareBase::kZMin;
+	Prospero::ZCompareBase z_compare_base     = Prospero::ZCompareBase::kZMax;
 	bool                   htile_acceleration = false;
 	bool                   expclear_enabled   = false;
 	bool                   partially_resident = false;
@@ -171,7 +139,7 @@ struct DepthStencilInfo {
 	Prospero::TextureCompatibleStencil texture_compatibility =
 	    Prospero::TextureCompatibleStencil::kDisable;
 	bool expclear_enabled       = false;
-	bool htile_stencil_disabled = false;
+	bool htile_stencil_disabled = true;
 	bool partially_resident     = false;
 
 	[[nodiscard]] static DepthStencilInfo Decode(uint32_t value) {
@@ -194,16 +162,6 @@ struct DepthStencilInfo {
 	}
 };
 
-struct DepthRenderTargetDepthInfo {
-	uint32_t addr5_swizzle_mask = 0;
-	uint32_t array_mode         = 0;
-	uint32_t pipe_config        = 0;
-	uint32_t bank_width         = 0;
-	uint32_t bank_height        = 0;
-	uint32_t macro_tile_aspect  = 0;
-	uint32_t num_banks          = 0;
-};
-
 struct DepthDepthView {
 	uint32_t slice_start           = 0;
 	uint32_t slice_max             = 0;
@@ -218,36 +176,18 @@ struct DepthDepthSizeXY {
 	bool     valid = false;
 };
 
-struct DepthRenderTargetHTileSurface {
-	uint32_t linear                  = 0;
-	uint32_t full_cache              = 0;
-	uint32_t htile_uses_preload_win  = 0;
-	uint32_t preload                 = 0;
-	uint32_t prefetch_width          = 0;
-	uint32_t prefetch_height         = 0;
-	uint32_t dst_outside_zero_to_one = 0;
-};
-
 struct DepthRenderTarget {
-	DepthZInfo                    z_info;
-	DepthStencilInfo              stencil_info;
-	DepthDepthView                depth_view;
-	DepthDepthSizeXY              size;
-	DepthRenderTargetDepthInfo    depth_info;
-	DepthRenderTargetHTileSurface htile_surface;
+	DepthZInfo       z_info;
+	DepthStencilInfo stencil_info;
+	DepthDepthView   depth_view;
+	DepthDepthSizeXY size;
 
 	uint64_t z_read_base_addr        = 0;
 	uint64_t stencil_read_base_addr  = 0;
 	uint64_t z_write_base_addr       = 0;
 	uint64_t stencil_write_base_addr = 0;
-	uint32_t pitch_div8_minus1       = 0;
-	uint32_t height_div8_minus1      = 0;
-	bool     pitch_height_valid      = false;
-	uint32_t slice_div64_minus1      = 0;
 	uint64_t htile_data_base_addr    = 0;
-	uint32_t width                   = 0;
-	uint32_t height                  = 0;
-	bool     width_height_valid      = false;
+	uint8_t  shading_rate_encoding   = 0;
 };
 
 struct RenderControl {
@@ -256,6 +196,8 @@ struct RenderControl {
 	bool    resummarize_enable       = false;
 	bool    stencil_compress_disable = false;
 	bool    depth_compress_disable   = false;
+	bool    copy_depth_to_color      = false;
+	bool    copy_stencil_to_color    = false;
 	bool    copy_centroid            = false;
 	uint8_t copy_sample              = 0;
 };
@@ -299,16 +241,14 @@ struct ClipControl {
 };
 
 struct DepthControl {
-	bool    stencil_enable                     = false;
-	bool    z_enable                           = false;
-	bool    z_write_enable                     = false;
-	bool    depth_bounds_enable                = false;
-	uint8_t zfunc                              = 0;
-	bool    backface_enable                    = false;
-	uint8_t stencilfunc                        = 0;
-	uint8_t stencilfunc_bf                     = 0;
-	bool    color_writes_on_depth_fail_enable  = false;
-	bool    color_writes_on_depth_pass_disable = false;
+	bool    stencil_enable      = false;
+	bool    z_enable            = false;
+	bool    z_write_enable      = false;
+	bool    depth_bounds_enable = false;
+	uint8_t zfunc               = 0;
+	bool    backface_enable     = false;
+	uint8_t stencilfunc         = 0;
+	uint8_t stencilfunc_bf      = 0;
 };
 
 struct StencilControl {
@@ -468,27 +408,6 @@ struct ScreenViewport {
 	bool     clip_rect_window_offset_enable[4]    = {};
 };
 
-struct VsShaderResource1 {
-	uint8_t vgprs                    = 0;
-	uint8_t sgprs                    = 0;
-	uint8_t priority                 = 0;
-	uint8_t float_mode               = 0;
-	bool    dx10_clamp               = false;
-	bool    ieee_mode                = false;
-	uint8_t vgpr_component_count     = 0;
-	bool    cu_group_enable          = false;
-	bool    require_forward_progress = false;
-	bool    fp16_overflow            = false;
-};
-
-struct VsShaderResource2 {
-	bool    scratch_en        = false;
-	uint8_t user_sgpr         = 0;
-	bool    offchip_lds       = false;
-	bool    streamout_enabled = false;
-	uint8_t shared_vgprs      = 0;
-};
-
 struct HsShaderResource1 {
 	uint8_t vgprs                     = 0;
 	uint8_t priority                  = 0;
@@ -511,7 +430,6 @@ struct HsShaderResource2 {
 
 struct PsShaderResource1 {
 	uint8_t vgprs                    = 0;
-	uint8_t sgprs                    = 0;
 	uint8_t priority                 = 0;
 	uint8_t float_mode               = 0;
 	bool    dx10_clamp               = false;
@@ -535,7 +453,6 @@ struct PsStageRegisters {
 	uint64_t          data_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
-	uint64_t          chksum = 0;
 };
 
 struct CsStageRegisters {
@@ -545,12 +462,13 @@ struct CsStageRegisters {
 	uint32_t num_thread_y              = 0;
 	uint32_t num_thread_z              = 0;
 	uint8_t  vgprs                     = 0;
-	uint8_t  sgprs                     = 0;
+	uint8_t  priority                  = 0;
 	uint8_t  float_mode                = 0;
 	bool     dx10_clamp                = false;
+	bool     debug_mode                = false;
 	bool     ieee_mode                 = false;
+	bool     require_forward_progress  = false;
 	bool     fp16_overflow             = false;
-	bool     bulky                     = false;
 	bool     threadgroup_configuration = false;
 	uint8_t  wave_size                 = 64;
 	bool     scratch_en                = false;
@@ -561,6 +479,7 @@ struct CsStageRegisters {
 	bool     tg_size_en                = false;
 	uint8_t  tidig_comp_cnt            = 0;
 	uint16_t lds_size                  = 0;
+	uint8_t  shared_vgprs              = 0;
 };
 
 struct EsStageRegisters {
@@ -568,21 +487,17 @@ struct EsStageRegisters {
 };
 
 struct LsStageRegisters {
-	uint64_t          data_addr = 0;
-	VsShaderResource1 rsrc1;
-	VsShaderResource2 rsrc2;
+	uint64_t data_addr = 0;
 };
 
 struct HsStageRegisters {
 	uint64_t          data_addr = 0;
 	HsShaderResource1 rsrc1;
 	HsShaderResource2 rsrc2;
-	uint64_t          chksum = 0;
 };
 
 struct GsShaderResource1 {
 	uint8_t vgprs                     = 0;
-	uint8_t sgprs                     = 0;
 	uint8_t priority                  = 0;
 	uint8_t float_mode                = 0;
 	bool    dx10_clamp                = false;
@@ -608,7 +523,6 @@ struct GsStageRegisters {
 	uint64_t          data_addr = 0;
 	GsShaderResource1 rsrc1;
 	GsShaderResource2 rsrc2;
-	uint64_t          chksum = 0;
 };
 
 struct ShaderRegisters {
@@ -664,8 +578,7 @@ struct ShaderRegisters {
 enum class UserSgprType { Unknown, Region, Vsharp };
 
 struct UserSgprInfo {
-	// Changed from 16 to 64
-	static constexpr int SGPRS_MAX = 64;
+	static constexpr int SGPRS_MAX = 32;
 
 	uint32_t     value[SGPRS_MAX] = {0};
 	UserSgprType type[SGPRS_MAX]  = {};
@@ -712,12 +625,6 @@ public:
 	void Reset() { *this = Context(); }
 
 	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
-	void SetColorPitch(uint32_t slot, const ColorPitch& pitch) {
-		m_render_targets[slot].pitch = pitch;
-	}
-	void SetColorSlice(uint32_t slot, const ColorSlice& slice) {
-		m_render_targets[slot].slice = slice;
-	}
 	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; }
 	void SetColorInfo(uint32_t slot, const ColorInfo& info) { m_render_targets[slot].info = info; }
 	void SetColorAttrib(uint32_t slot, const ColorAttrib& attrib) {
@@ -735,14 +642,8 @@ public:
 	void SetColorCmask(uint32_t slot, const ColorCmask& cmask) {
 		m_render_targets[slot].cmask = cmask;
 	}
-	void SetColorCmaskSlice(uint32_t slot, const ColorCmaskSlice& cmask_slice) {
-		m_render_targets[slot].cmask_slice = cmask_slice;
-	}
 	void SetColorFmask(uint32_t slot, const ColorFmask& fmask) {
 		m_render_targets[slot].fmask = fmask;
-	}
-	void SetColorFmaskSlice(uint32_t slot, const ColorFmaskSlice& fmask_slice) {
-		m_render_targets[slot].fmask_slice = fmask_slice;
 	}
 	void SetColorClearWord0(uint32_t slot, const ColorClearWord0& clear_word0) {
 		m_render_targets[slot].clear_word0 = clear_word0;
@@ -753,7 +654,6 @@ public:
 	void SetColorDccAddr(uint32_t slot, const ColorDccAddr& dcc_addr) {
 		m_render_targets[slot].dcc_addr = dcc_addr;
 	}
-	void SetColorSize(uint32_t slot, const ColorSize& size) { m_render_targets[slot].size = size; }
 	[[nodiscard]] const RenderTarget& GetRenderTarget(uint32_t slot) const {
 		return m_render_targets[slot];
 	}
@@ -1072,21 +972,16 @@ public:
 
 	void SetEsShaderBase(uint64_t addr) { m_vs.es_regs.data_addr = addr; }
 	void SetLsShaderBase(uint64_t addr) { m_vs.ls_regs.data_addr = addr; }
-	void SetLsShaderResource1(const VsShaderResource1& rsrc1) { m_vs.ls_regs.rsrc1 = rsrc1; }
-	void SetLsShaderResource2(const VsShaderResource2& rsrc2) { m_vs.ls_regs.rsrc2 = rsrc2; }
 	void SetHsShaderBase(uint64_t addr) { m_vs.hs_regs.data_addr = addr; }
 	void SetHsShaderResource1(const HsShaderResource1& rsrc1) { m_vs.hs_regs.rsrc1 = rsrc1; }
 	void SetHsShaderResource2(const HsShaderResource2& rsrc2) { m_vs.hs_regs.rsrc2 = rsrc2; }
-	void SetHsShaderChksum(uint32_t value) { m_vs.hs_regs.chksum = value; }
 	void SetGsShaderBase(uint64_t addr) { m_vs.gs_regs.data_addr = addr; }
 	void SetGsShaderResource1(const GsShaderResource1& rsrc1) { m_vs.gs_regs.rsrc1 = rsrc1; }
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
-	void SetGsShaderChksum(uint32_t value) { m_vs.gs_regs.chksum = value; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
-	void SetPsShaderChksum(uint32_t value) { m_ps.ps_regs.chksum = value; }
 
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
 	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }

@@ -411,7 +411,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
-	return vs.gs_regs.chksum != 0 && ShaderAddressValid(vs.es_regs.data_addr);
+	return ShaderAddressValid(vs.es_regs.data_addr);
 }
 
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
@@ -443,7 +443,6 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	};
 
 	const bool ps5_ngg_vertex_path = stages == 0x02002000 && vertex_info.es_regs.data_addr != 0 &&
-	                                 vertex_info.gs_regs.chksum != 0 &&
 	                                 sh_regs.m_vgtGsMaxVertOut == 0x00000000 &&
 	                                 is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType);
 
@@ -1450,7 +1449,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
 			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
-			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.chksum,
+			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
 		ResetBindings();

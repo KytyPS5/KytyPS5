@@ -97,17 +97,11 @@ void sh_print(const char* func, const HW::Shader& /*uc*/) {
 
 std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) {
 	std::vector<std::string> dst;
-	dst.reserve(53);
+	dst.reserve(40);
 
 	dst.push_back(fmt::format("{}\n", func));
 
 	dst.push_back(fmt::format("\t base.addr                       = 0x{:016x}\n", rt.base.addr));
-	dst.push_back(
-	    fmt::format("\t pitch.pitch_div8_minus1         = 0x{:08x}\n", rt.pitch.pitch_div8_minus1));
-	dst.push_back(fmt::format("\t pitch.fmask_pitch_div8_minus1   = 0x{:08x}\n",
-	                          rt.pitch.fmask_pitch_div8_minus1));
-	dst.push_back(fmt::format("\t slice.slice_div64_minus1        = 0x{:08x}\n",
-	                          rt.slice.slice_div64_minus1));
 	dst.push_back(fmt::format("\t view.base_array_slice_index     = 0x{:08x}\n",
 	                          rt.view.base_array_slice_index));
 	dst.push_back(fmt::format("\t view.last_array_slice_index     = 0x{:08x}\n",
@@ -128,12 +122,6 @@ std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) 
 	                          rt.info.cmask_fast_clear_enable ? "true" : "false"));
 	dst.push_back(fmt::format("\t info.dcc_compression_enable     = {}\n",
 	                          rt.info.dcc_compression_enable ? "true" : "false"));
-	dst.push_back(
-	    fmt::format("\t info.cmask_is_linear            = 0x{:08x}\n", rt.info.cmask_is_linear));
-	dst.push_back(
-	    fmt::format("\t info.cmask_addr_type            = 0x{:08x}\n", rt.info.cmask_addr_type));
-	dst.push_back(fmt::format("\t info.alt_tile_mode              = {}\n",
-	                          rt.info.alt_tile_mode ? "true" : "false"));
 	dst.push_back(fmt::format("\t info.format                     = 0x{:08x}\n",
 	                          static_cast<uint32_t>(rt.info.format)));
 	dst.push_back(fmt::format("\t info.channel_type               = 0x{:08x}\n",
@@ -148,10 +136,6 @@ std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) 
 	                          rt.info.round_mode ? "true" : "false"));
 	dst.push_back(fmt::format("\t attrib.force_dest_alpha_to_one  = {}\n",
 	                          rt.attrib.force_dest_alpha_to_one ? "true" : "false"));
-	dst.push_back(fmt::format("\t attrib.tile_mode                = 0x{:08x}\n",
-	                          static_cast<uint32_t>(rt.attrib.tile_mode)));
-	dst.push_back(fmt::format("\t attrib.fmask_tile_mode          = 0x{:08x}\n",
-	                          static_cast<uint32_t>(rt.attrib.fmask_tile_mode)));
 	dst.push_back(
 	    fmt::format("\t attrib.num_samples              = 0x{:08x}\n", rt.attrib.num_samples));
 	dst.push_back(
@@ -166,42 +150,32 @@ std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) 
 	                          static_cast<uint32_t>(rt.attrib3.tile_mode)));
 	dst.push_back(
 	    fmt::format("\t attrib3.dimension               = 0x{:08x}\n", rt.attrib3.dimension));
-	dst.push_back(fmt::format("\t attrib3.cmask_pipe_aligned      = {}\n",
-	                          rt.attrib3.cmask_pipe_aligned ? "true" : "false"));
-	dst.push_back(fmt::format("\t attrib3.dcc_pipe_aligned        = {}\n",
-	                          rt.attrib3.dcc_pipe_aligned ? "true" : "false"));
+	dst.push_back(fmt::format("\t attrib3.metadata_pipe_aligned   = {}\n",
+	                          rt.attrib3.metadata_pipe_aligned ? "true" : "false"));
+	dst.push_back(fmt::format("\t attrib3.write_vrs_rate_hint_to_cmask = {}\n",
+	                          rt.attrib3.write_vrs_rate_hint_to_cmask ? "true" : "false"));
 	dst.push_back(fmt::format("\t dcc.max_uncompressed_block_size = 0x{:08x}\n",
 	                          rt.dcc.max_uncompressed_block_size));
 	dst.push_back(fmt::format("\t dcc.max_compressed_block_size   = 0x{:08x}\n",
 	                          rt.dcc.max_compressed_block_size));
-	dst.push_back(fmt::format("\t dcc.min_compressed_block_size   = 0x{:08x}\n",
-	                          rt.dcc.min_compressed_block_size));
 	dst.push_back(
 	    fmt::format("\t dcc.color_transform             = 0x{:08x}\n", rt.dcc.color_transform));
 	dst.push_back(fmt::format("\t dcc.overwrite_combiner_disable  = {}\n",
 	                          rt.dcc.overwrite_combiner_disable ? "true" : "false"));
-	dst.push_back(fmt::format("\t dcc.independent_64b_blocks      = {}\n",
-	                          rt.dcc.independent_64b_blocks ? "true" : "false"));
-	dst.push_back(fmt::format("\t dcc.independent_128b_blocks     = {}\n",
-	                          rt.dcc.independent_128b_blocks ? "true" : "false"));
+	dst.push_back(fmt::format("\t dcc.independent_block_size      = 0x{:02x}\n",
+	                          static_cast<uint8_t>(rt.dcc.independent_block_size)));
 	dst.push_back(fmt::format("\t data_write_on_dcc_clear_to_reg  = {}\n",
 	                          rt.dcc.data_write_on_dcc_clear_to_reg ? "true" : "false"));
 	dst.push_back(fmt::format("\t dcc.dcc_clear_key_enable        = {}\n",
 	                          rt.dcc.dcc_clear_key_enable ? "true" : "false"));
 	dst.push_back(fmt::format("\t cmask.addr                      = 0x{:016x}\n", rt.cmask.addr));
-	dst.push_back(fmt::format("\t cmask_slice.slice_minus1        = 0x{:08x}\n",
-	                          rt.cmask_slice.slice_minus1));
 	dst.push_back(fmt::format("\t fmask.addr                      = 0x{:016x}\n", rt.fmask.addr));
-	dst.push_back(fmt::format("\t fmask_slice.slice_minus1        = 0x{:08x}\n",
-	                          rt.fmask_slice.slice_minus1));
 	dst.push_back(
 	    fmt::format("\t clear_word0.word0               = 0x{:08x}\n", rt.clear_word0.word0));
 	dst.push_back(
 	    fmt::format("\t clear_word1.word1               = 0x{:08x}\n", rt.clear_word1.word1));
 	dst.push_back(
 	    fmt::format("\t dcc_addr.addr                   = 0x{:016x}\n", rt.dcc_addr.addr));
-	dst.push_back(fmt::format("\t size.width                      = 0x{:08x}\n", rt.size.width));
-	dst.push_back(fmt::format("\t size.height                     = 0x{:08x}\n", rt.size.height));
 
 	return dst;
 }
@@ -231,12 +205,7 @@ static bool RenderIsColorDimension(uint32_t dimension) {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void RtCheck(const HW::RenderTarget& rt) {
 	if (rt.base.addr != 0) {
-		// bool render_to_texture = (rt.attrib.tile_mode == 0x0d);
 		//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
-
-		EXIT_NOT_IMPLEMENTED(rt.pitch.pitch_div8_minus1 != 0);
-		EXIT_NOT_IMPLEMENTED(rt.pitch.fmask_pitch_div8_minus1 != 0);
-		EXIT_NOT_IMPLEMENTED(rt.slice.slice_div64_minus1 != 0);
 
 		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
 		if (rt.view.base_array_slice_index != 0x00000000 ||
@@ -281,22 +250,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		if (rt.info.cmask_is_linear != 0x00000000 || rt.info.cmask_addr_type != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 CMASK metadata fields "
-				     "is_linear=%u addr_type=%u\n",
-				     rt.info.cmask_is_linear, rt.info.cmask_addr_type);
-				logged = true;
-			}
-		}
-		if (rt.info.alt_tile_mode) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring alternate tile mode flag\n");
-				logged = true;
-			}
-		}
 		if (rt.info.blend_bypass) {
 			static bool logged = false;
 			if (!logged) {
@@ -323,8 +276,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		// EXIT_NOT_IMPLEMENTED(rt.tile_mode != 0x0000000a);
-		// EXIT_NOT_IMPLEMENTED(rt.fmask_tile_mode != 0x0000000a);
 		if (rt.attrib.num_samples != 0x00000000 || rt.attrib.num_fragments != 0x00000000) {
 			static bool logged = false;
 			if (!logged) {
@@ -359,34 +310,22 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		if (!RenderIsColorDimension(rt.attrib3.dimension)) {
 			EXIT("unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);
 		}
-		if (!rt.attrib3.cmask_pipe_aligned) {
+		if (!rt.attrib3.metadata_pipe_aligned) {
 			static bool logged = false;
 			if (!logged) {
-				LOGF("RenderTarget: temporary: accepting unaligned PS5 CMASK pipe flag\n");
+				LOGF("RenderTarget: temporary: accepting unaligned PS5 metadata pipe flag\n");
 				logged = true;
 			}
 		}
-		if (!rt.attrib3.dcc_pipe_aligned) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: accepting unaligned PS5 DCC pipe flag\n");
-				logged = true;
-			}
-		}
+		EXIT_NOT_IMPLEMENTED(rt.attrib3.write_vrs_rate_hint_to_cmask);
 
 		// EXIT_NOT_IMPLEMENTED(rt.dcc_max_uncompressed_block_size != 0x00000002);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.max_compressed_block_size != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.min_compressed_block_size != 0x00000000);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.force_independent_blocks != false);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.independent_128b_blocks != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
-		if (rt.cmask.addr != 0x0000000000000000 || rt.cmask_slice.slice_minus1 != 0x00000000 ||
-		    rt.fmask.addr != 0x0000000000000000 ||
-		    (rt.fmask_slice.slice_minus1 != 0x00000000 &&
-		     rt.fmask_slice.slice_minus1 != rt.slice.slice_div64_minus1) ||
+		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
 		    rt.dcc_addr.addr != 0x0000000000000000) {
 			static bool logged = false;
 			if (!logged) {
@@ -396,9 +335,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-
-		EXIT_NOT_IMPLEMENTED(rt.size.width != 0);
-		EXIT_NOT_IMPLEMENTED(rt.size.height != 0);
 	}
 }
 
@@ -418,37 +354,20 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 	     "\t stencil_info.htile_stencil_disabled   = %s\n"
 	     "\t stencil_info.expclear_enabled         = %s\n"
 	     "\t stencil_info.partially_resident       = %s\n"
-	     "\t depth_info.addr5_swizzle_mask         = 0x%08" PRIx32 "\n"
-	     "\t depth_info.array_mode                 = 0x%08" PRIx32 "\n"
-	     "\t depth_info.pipe_config                = 0x%08" PRIx32 "\n"
-	     "\t depth_info.bank_width                 = 0x%08" PRIx32 "\n"
-	     "\t depth_info.bank_height                = 0x%08" PRIx32 "\n"
-	     "\t depth_info.macro_tile_aspect          = 0x%08" PRIx32 "\n"
-	     "\t depth_info.num_banks                  = 0x%08" PRIx32 "\n"
 	     "\t depth_view.slice_start                = 0x%08" PRIx32 "\n"
 	     "\t depth_view.slice_max                  = 0x%08" PRIx32 "\n"
 	     "\t depth_view.current_mip_level          = 0x%02" PRIx8 "\n"
 	     "\t depth_view.depth_write_disable        = %s\n"
 	     "\t depth_view.stencil_write_disable      = %s\n"
-	     "\t htile_surface.linear                  = 0x%08" PRIx32 "\n"
-	     "\t htile_surface.full_cache              = 0x%08" PRIx32 "\n"
-	     "\t htile_surface.htile_uses_preload_win  = 0x%08" PRIx32 "\n"
-	     "\t htile_surface.preload                 = 0x%08" PRIx32 "\n"
-	     "\t htile_surface.prefetch_width          = 0x%08" PRIx32 "\n"
-	     "\t htile_surface.prefetch_height         = 0x%08" PRIx32 "\n"
-	     "\t htile_surface.dst_outside_zero_to_one = 0x%08" PRIx32 "\n"
 	     "\t z_read_base_addr                      = 0x%016" PRIx64 "\n"
 	     "\t stencil_read_base_addr                = 0x%016" PRIx64 "\n"
 	     "\t z_write_base_addr                     = 0x%016" PRIx64 "\n"
 	     "\t stencil_write_base_addr               = 0x%016" PRIx64 "\n"
-	     "\t pitch_div8_minus1                     = 0x%08" PRIx32 "\n"
-	     "\t height_div8_minus1                    = 0x%08" PRIx32 "\n"
-	     "\t slice_div64_minus1                    = 0x%08" PRIx32 "\n"
 	     "\t htile_data_base_addr                  = 0x%016" PRIx64 "\n"
-	     "\t width                                 = 0x%08" PRIx32 "\n"
-	     "\t height                                = 0x%08" PRIx32 "\n"
+	     "\t shading_rate_encoding                 = 0x%02" PRIx8 "\n"
 	     "\t size.x_max                            = 0x%04" PRIx16 "\n"
-	     "\t size.y_max                            = 0x%04" PRIx16 "\n",
+	     "\t size.y_max                            = 0x%04" PRIx16 "\n"
+	     "\t size.valid                            = %s\n",
 	     static_cast<uint32_t>(z.z_info.format), z.z_info.num_samples,
 	     static_cast<uint32_t>(z.z_info.texture_compatibility),
 	     z.z_info.htile_acceleration ? "true" : "false",
@@ -459,30 +378,27 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 	     static_cast<uint32_t>(z.stencil_info.texture_compatibility),
 	     z.stencil_info.htile_stencil_disabled ? "true" : "false",
 	     z.stencil_info.expclear_enabled ? "true" : "false",
-	     z.stencil_info.partially_resident ? "true" : "false", z.depth_info.addr5_swizzle_mask,
-	     z.depth_info.array_mode, z.depth_info.pipe_config, z.depth_info.bank_width,
-	     z.depth_info.bank_height, z.depth_info.macro_tile_aspect, z.depth_info.num_banks,
-	     z.depth_view.slice_start, z.depth_view.slice_max, z.depth_view.current_mip_level,
+	     z.stencil_info.partially_resident ? "true" : "false", z.depth_view.slice_start,
+	     z.depth_view.slice_max, z.depth_view.current_mip_level,
 	     z.depth_view.depth_write_disable ? "true" : "false",
-	     z.depth_view.stencil_write_disable ? "true" : "false", z.htile_surface.linear,
-	     z.htile_surface.full_cache, z.htile_surface.htile_uses_preload_win,
-	     z.htile_surface.preload, z.htile_surface.prefetch_width, z.htile_surface.prefetch_height,
-	     z.htile_surface.dst_outside_zero_to_one, z.z_read_base_addr, z.stencil_read_base_addr,
-	     z.z_write_base_addr, z.stencil_write_base_addr, z.pitch_div8_minus1, z.height_div8_minus1,
-	     z.slice_div64_minus1, z.htile_data_base_addr, z.width, z.height, z.size.x_max,
-	     z.size.y_max);
+	     z.depth_view.stencil_write_disable ? "true" : "false", z.z_read_base_addr,
+	     z.stencil_read_base_addr, z.z_write_base_addr, z.stencil_write_base_addr,
+	     z.htile_data_base_addr, z.shading_rate_encoding, z.size.x_max, z.size.y_max,
+	     z.size.valid ? "true" : "false");
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
                    const HW::RenderControl& rc) {
-	const bool depth_active =
-	    dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || rc.depth_clear_enable;
-	const bool stencil_active = dc.stencil_enable || rc.stencil_clear_enable;
+	const bool depth_active = dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable ||
+	                          rc.depth_clear_enable || rc.copy_depth_to_color;
+	const bool stencil_active =
+	    dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color;
 	if (!depth_active && !stencil_active) {
 		return;
 	}
 
+	EXIT_NOT_IMPLEMENTED(rc.copy_depth_to_color || rc.copy_stencil_to_color);
 	EXIT_NOT_IMPLEMENTED(!z.z_info.HasValidTextureCompatibility());
 	EXIT_NOT_IMPLEMENTED(!z.stencil_info.HasValidTextureCompatibility());
 	if (z.z_info.format == Prospero::DepthFormat::kInvalid) {
@@ -519,21 +435,7 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 
 	if (z.z_info.format != Prospero::DepthFormat::kInvalid ||
 	    z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
-
-		EXIT_NOT_IMPLEMENTED(z.depth_info.addr5_swizzle_mask != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.depth_info.array_mode != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.depth_info.pipe_config != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.depth_info.bank_width != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.depth_info.bank_height != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.depth_info.macro_tile_aspect != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.depth_info.num_banks != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.linear != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.full_cache != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.htile_uses_preload_win != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.preload != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.prefetch_width != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.prefetch_height != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(z.htile_surface.dst_outside_zero_to_one != 0x00000000);
+		EXIT_NOT_IMPLEMENTED(z.shading_rate_encoding != 0);
 
 		if (z.depth_view.current_mip_level != 0x00000000) {
 			static std::atomic<uint32_t> log_count {0};
@@ -555,23 +457,8 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 		EXIT_NOT_IMPLEMENTED(!z.depth_view.stencil_write_disable &&
 		                     z.stencil_read_base_addr != z.stencil_write_base_addr);
 		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable && z.z_write_base_addr == 0);
-		// EXIT_NOT_IMPLEMENTED(z.pitch_div8_minus1 != 0x000000ff);
-		// EXIT_NOT_IMPLEMENTED(z.height_div8_minus1 != 0x0000008f);
-		// EXIT_NOT_IMPLEMENTED(z.slice_div64_minus1 != 0x00008fff);
 		// EXIT_NOT_IMPLEMENTED(z.htile_data_base_addr == 0);
-		// EXIT_NOT_IMPLEMENTED(z.width != 0x00000780);
-		// EXIT_NOT_IMPLEMENTED(z.height != 0x00000438);
-
-		EXIT_NOT_IMPLEMENTED(z.width != 0);
-		EXIT_NOT_IMPLEMENTED(z.height != 0);
-		if (z.size.x_max == 0 || z.size.y_max == 0) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 16) {
-				LOGF("DepthTarget: temporary: inferring PS5 default depth extent x_max=0x%04" PRIx16
-				     ", y_max=0x%04" PRIx16 "\n",
-				     z.size.x_max, z.size.y_max);
-			}
-		}
+		EXIT_NOT_IMPLEMENTED(!z.size.valid);
 	}
 }
 
@@ -754,8 +641,6 @@ static void DPrint(const char* func, const HW::DepthControl& c, const HW::Stenci
 	     "\t backface_enable      = %s\n"
 	     "\t stencilfunc          = %" PRIu8 "\n"
 	     "\t stencilfunc_bf       = %" PRIu8 "\n"
-	     "\t color_writes_on_depth_fail_enable  = %s\n"
-	     "\t color_writes_on_depth_pass_disable = %s\n"
 	     "\t stencil_fail         = %" PRIu8 "\n"
 	     "\t stencil_zpass        = %" PRIu8 "\n"
 	     "\t stencil_zfail        = %" PRIu8 "\n"
@@ -772,12 +657,11 @@ static void DPrint(const char* func, const HW::DepthControl& c, const HW::Stenci
 	     "\t stencil_opval_bf     = %" PRIu8 "\n",
 	     c.stencil_enable ? "true" : "false", c.z_enable ? "true" : "false",
 	     c.z_write_enable ? "true" : "false", c.depth_bounds_enable ? "true" : "false", c.zfunc,
-	     c.backface_enable ? "true" : "false", c.stencilfunc, c.stencilfunc_bf,
-	     c.color_writes_on_depth_fail_enable ? "true" : "false",
-	     c.color_writes_on_depth_pass_disable ? "true" : "false", s.stencil_fail, s.stencil_zpass,
-	     s.stencil_zfail, s.stencil_fail_bf, s.stencil_zpass_bf, s.stencil_zfail_bf,
-	     sm.stencil_testval, sm.stencil_mask, sm.stencil_writemask, sm.stencil_opval,
-	     sm.stencil_testval_bf, sm.stencil_mask_bf, sm.stencil_writemask_bf, sm.stencil_opval_bf);
+	     c.backface_enable ? "true" : "false", c.stencilfunc, c.stencilfunc_bf, s.stencil_fail,
+	     s.stencil_zpass, s.stencil_zfail, s.stencil_fail_bf, s.stencil_zpass_bf,
+	     s.stencil_zfail_bf, sm.stencil_testval, sm.stencil_mask, sm.stencil_writemask,
+	     sm.stencil_opval, sm.stencil_testval_bf, sm.stencil_mask_bf, sm.stencil_writemask_bf,
+	     sm.stencil_opval_bf);
 }
 
 static void DCheck(const HW::DepthControl& c, const HW::StencilControl& s,
@@ -789,8 +673,6 @@ static void DCheck(const HW::DepthControl& c, const HW::StencilControl& s,
 	// Back-face stencil state is handled separately when enabled.
 	// EXIT_NOT_IMPLEMENTED(c.stencilfunc != 0);
 	// EXIT_NOT_IMPLEMENTED(c.stencilfunc_bf != 0);
-	EXIT_NOT_IMPLEMENTED(c.color_writes_on_depth_fail_enable != false);
-	EXIT_NOT_IMPLEMENTED(c.color_writes_on_depth_pass_disable != false);
 	// EXIT_NOT_IMPLEMENTED(s.stencil_fail != 0);
 	// EXIT_NOT_IMPLEMENTED(s.stencil_zpass != 0);
 	// EXIT_NOT_IMPLEMENTED(s.stencil_zfail != 0);

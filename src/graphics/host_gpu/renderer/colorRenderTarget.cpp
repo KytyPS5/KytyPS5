@@ -204,13 +204,11 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	if (texture_tile &&
 	    (!TileGetTextureBlockLayout(transfer_format, rt.attrib3.tile_mode, volume,
 	                                texture_tile_layout) ||
-	     rt.pitch.pitch_div8_minus1 != 0 ||
 	     (rt.base.addr & (texture_tile_layout.block.block_size - 1u)) != 0 ||
 	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
 	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
-	     rt.info.dcc_compression_enable || rt.info.cmask_is_linear != 0 ||
-	     rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode || rt.cmask.addr != 0 ||
-	     rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
+	     rt.info.dcc_compression_enable || rt.cmask.addr != 0 || rt.fmask.addr != 0 ||
+	     rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
 		EXIT("unsupported texture-tiled render target: addr=0x%016" PRIx64 " tile=%u"
 		     " dimension=%u depth=%u levels=%u layer=%u/%u samples=%u fragments=%u bpe=%u"
 		     " cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
@@ -226,9 +224,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	if (rt.pitch.pitch_div8_minus1 != 0) {
-		pitch = (rt.pitch.pitch_div8_minus1 + 1u) << 3u;
-	} else if (tile) {
+	if (tile) {
 		if (volume) {
 			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 		} else if (texture_tile) {
@@ -293,12 +289,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		}
 		mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
 		mip_padded[0] = {pitch, height};
-	}
-	if (rt.slice.slice_div64_minus1 != 0 &&
-	    (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u != size) {
-		EXIT("render-target slice span mismatch: encoded=0x%016" PRIx64 " derived=0x%016" PRIx64
-		     "\n",
-		     (static_cast<uint64_t>(rt.slice.slice_div64_minus1) + 1u) * 64u, size);
 	}
 	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
 		EXIT("render-target memory footprint is invalid\n");

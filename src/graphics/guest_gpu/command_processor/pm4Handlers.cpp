@@ -136,6 +136,7 @@ static HW::ColorControl DecodeColorControl(uint32_t value) {
 
 static HW::DepthControl DecodeDepthControl(uint32_t value) {
 	HW::DepthControl r {};
+	EXIT_NOT_IMPLEMENTED((value & 0xc0000000u) != 0);
 
 	r.stencil_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
 	r.z_enable            = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_ENABLE) != 0;
@@ -145,10 +146,6 @@ static HW::DepthControl DecodeDepthControl(uint32_t value) {
 	r.backface_enable     = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, BACKFACE_ENABLE) != 0;
 	r.stencilfunc         = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCILFUNC);
 	r.stencilfunc_bf      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCILFUNC_BF);
-	r.color_writes_on_depth_fail_enable =
-	    KYTY_PM4_GET(value, DB_DEPTH_CONTROL, ENABLE_COLOR_WRITES_ON_DEPTH_FAIL) != 0;
-	r.color_writes_on_depth_pass_disable =
-	    KYTY_PM4_GET(value, DB_DEPTH_CONTROL, DISABLE_COLOR_WRITES_ON_DEPTH_PASS) != 0;
 
 	return r;
 }
@@ -183,8 +180,12 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	r.stencil_compress_disable =
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
 	r.depth_compress_disable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
+	r.copy_depth_to_color = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
+	r.copy_stencil_to_color =
+	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
+	EXIT_NOT_IMPLEMENTED(r.copy_depth_to_color || r.copy_stencil_to_color);
 
 	return r;
 }
@@ -355,8 +356,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetSpiTmpringSize) {
 
 static bool HwCtxIsFakeRegister(uint32_t cmd_offset) {
 	switch (cmd_offset) {
-		case 0x18:
-		case 0x19:
 		case Pm4::CX_NOP: return true;
 		default: return false;
 	}
@@ -551,19 +550,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetColorInfo) {
 	uint32_t param = (cmd_offset - Pm4::CB_COLOR0_INFO) / 15;
 
 	HW::ColorInfo r;
-
-	//	r.fmask_compression_enable = (buffer[4] & 0x4000u) != 0;
-	//	// r.fmask_compression_mode   = (buffer[4] >> 26u) & 0x3u;
-	//	r.fmask_data_compression_disable = ((buffer[4] >> 26u) & 0x1u) != 0;
-	//	r.fmask_one_frag_mode            = ((buffer[4] >> 27u) & 0x1u) != 0;
-	//	r.cmask_fast_clear_enable        = (buffer[4] & 0x2000u) != 0;
-	//	r.dcc_compression_enable         = (buffer[4] & 0x10000000u) != 0;
-	//	r.cmask_is_linear                = (buffer[4] >> 19u) & 0x1u;
-	//	r.cmask_addr_type                = (buffer[4] >> 29u) & 0x3u;
-	//	r.alt_tile_mode                  = ((buffer[4] >> 31u) & 0x1u) != 0;
-	//	r.format                         = (buffer[4] >> 2u) & 0x1fu;
-	//	r.channel_type                   = (buffer[4] >> 8u) & 0x7u;
-	//	r.channel_order                  = (buffer[4] >> 11u) & 0x3u;
 	r.format =
 	    static_cast<Prospero::ChannelLayout>(KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FORMAT));
 	r.channel_type =
@@ -575,13 +561,10 @@ KYTY_HW_CTX_PARSER(HwCtxSetColorInfo) {
 	r.blend_clamp              = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, BLEND_CLAMP) != 0;
 	r.blend_bypass             = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, BLEND_BYPASS) != 0;
 	r.round_mode               = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, ROUND_MODE) != 0;
-	r.cmask_is_linear          = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, CMASK_IS_LINEAR);
 	r.fmask_data_compression_disable =
 	    KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FMASK_COMPRESSION_DISABLE) != 0;
 	r.fmask_one_frag_mode = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, FMASK_COMPRESS_1FRAG_ONLY) != 0;
 	r.dcc_compression_enable = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, DCC_ENABLE) != 0;
-	r.cmask_addr_type        = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, CMASK_ADDR_TYPE);
-	r.alt_tile_mode          = KYTY_PM4_GET(buffer[0], CB_COLOR0_INFO, ALT_TILE_MODE) != 0;
 
 	cp.GetCtx().SetColorInfo(param, r);
 
@@ -606,122 +589,26 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthControl) {
 	return 1;
 }
 
-static HW::DepthRenderTargetHTileSurface ParseDepthHtileSurface(uint32_t value) {
-	HW::DepthRenderTargetHTileSurface r;
-	r.linear                  = KYTY_PM4_GET(value, DB_HTILE_SURFACE, LINEAR);
-	r.full_cache              = KYTY_PM4_GET(value, DB_HTILE_SURFACE, FULL_CACHE);
-	r.htile_uses_preload_win  = KYTY_PM4_GET(value, DB_HTILE_SURFACE, HTILE_USES_PRELOAD_WIN);
-	r.preload                 = KYTY_PM4_GET(value, DB_HTILE_SURFACE, PRELOAD);
-	r.prefetch_width          = KYTY_PM4_GET(value, DB_HTILE_SURFACE, PREFETCH_WIDTH);
-	r.prefetch_height         = KYTY_PM4_GET(value, DB_HTILE_SURFACE, PREFETCH_HEIGHT);
-	r.dst_outside_zero_to_one = KYTY_PM4_GET(value, DB_HTILE_SURFACE, DST_OUTSIDE_ZERO_TO_ONE);
-	return r;
-}
+static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint32_t value) {
+	const auto shading_rate_encoding =
+	    KYTY_PM4_GET(value, DB_SHADING_RATE_ENCODING, SHADING_RATE_ENCODING);
+	EXIT_NOT_IMPLEMENTED(shading_rate_encoding > 2u);
 
-static void HwCtxSetDepthHtileSurfaceRegister(CommandProcessor& cp, uint32_t value) {
-	auto& ctx            = cp.GetCtx();
-	auto  target         = ctx.GetDepthRenderTarget();
-	target.htile_surface = ParseDepthHtileSurface(value);
+	auto& ctx                       = cp.GetCtx();
+	auto  target                    = ctx.GetDepthRenderTarget();
+	target.shading_rate_encoding    = static_cast<uint8_t>(shading_rate_encoding);
 	ctx.SetDepthRenderTarget(target);
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetDepthHtileSurface) {
+KYTY_HW_CTX_PARSER(HwCtxSetDepthShadingRateEncoding) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	EXIT_NOT_IMPLEMENTED(num_values != 1);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_HTILE_SURFACE);
+	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_SHADING_RATE_ENCODING);
 
-	HwCtxSetDepthHtileSurfaceRegister(cp, buffer[0]);
+	HwCtxSetDepthShadingRateEncodingRegister(cp, buffer[0]);
 
 	return num_values;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetDepthRenderTarget) {
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_Z_INFO);
-
-	uint32_t count = 1;
-
-	if (cmd_id == 0xC0016900) {
-		cp.GetCtx().SetDepthZInfo(HW::DepthZInfo::Decode(buffer[0]));
-	} else if (cmd_id == 0xC0086900) {
-		if (dw >= 22 && buffer[8] == 0xC0016900 && buffer[9] == Pm4::DB_DEPTH_INFO &&
-		    buffer[11] == 0xC0016900 && buffer[12] == Pm4::DB_DEPTH_VIEW &&
-		    buffer[14] == 0xC0016900 && buffer[15] == Pm4::DB_HTILE_DATA_BASE &&
-		    buffer[17] == 0xC0016900 && buffer[18] == Pm4::DB_HTILE_SURFACE &&
-		    buffer[20] == 0xC0001000) {
-			count = 22;
-
-			HW::DepthRenderTarget z;
-
-			z.z_info       = HW::DepthZInfo::Decode(buffer[0]);
-			z.stencil_info = HW::DepthStencilInfo::Decode(buffer[1]);
-
-			z.z_read_base_addr        = static_cast<uint64_t>(buffer[2]) << 8u;
-			z.stencil_read_base_addr  = static_cast<uint64_t>(buffer[3]) << 8u;
-			z.z_write_base_addr       = static_cast<uint64_t>(buffer[4]) << 8u;
-			z.stencil_write_base_addr = static_cast<uint64_t>(buffer[5]) << 8u;
-
-			// DB_DEPTH_SIZE
-			z.pitch_div8_minus1  = (buffer[6] >> Pm4::DB_DEPTH_SIZE_PITCH_TILE_MAX_SHIFT) &
-			                       Pm4::DB_DEPTH_SIZE_PITCH_TILE_MAX_MASK;
-			z.height_div8_minus1 = (buffer[6] >> Pm4::DB_DEPTH_SIZE_HEIGHT_TILE_MAX_SHIFT) &
-			                       Pm4::DB_DEPTH_SIZE_HEIGHT_TILE_MAX_MASK;
-			z.pitch_height_valid = true;
-
-			// DB_DEPTH_SLICE
-			z.slice_div64_minus1 = (buffer[7] >> Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT) &
-			                       Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_MASK;
-
-			z.depth_info.addr5_swizzle_mask =
-			    KYTY_PM4_GET(buffer[10], DB_DEPTH_INFO, ADDR5_SWIZZLE_MASK);
-			z.depth_info.array_mode  = (buffer[10] >> Pm4::DB_DEPTH_INFO_ARRAY_MODE_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_ARRAY_MODE_MASK;
-			z.depth_info.pipe_config = (buffer[10] >> Pm4::DB_DEPTH_INFO_PIPE_CONFIG_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_PIPE_CONFIG_MASK;
-			z.depth_info.bank_width  = (buffer[10] >> Pm4::DB_DEPTH_INFO_BANK_WIDTH_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_BANK_WIDTH_MASK;
-			z.depth_info.bank_height = (buffer[10] >> Pm4::DB_DEPTH_INFO_BANK_HEIGHT_SHIFT) &
-			                           Pm4::DB_DEPTH_INFO_BANK_HEIGHT_MASK;
-			z.depth_info.macro_tile_aspect =
-			    KYTY_PM4_GET(buffer[10], DB_DEPTH_INFO, MACRO_TILE_ASPECT);
-			z.depth_info.num_banks = (buffer[10] >> Pm4::DB_DEPTH_INFO_NUM_BANKS_SHIFT) &
-			                         Pm4::DB_DEPTH_INFO_NUM_BANKS_MASK;
-
-			// z.depth_view.slice_start = (buffer[13] >> Pm4::DB_DEPTH_VIEW_SLICE_START_SHIFT) &
-			// Pm4::DB_DEPTH_VIEW_SLICE_START_MASK; z.depth_view.slice_max   = (buffer[13] >>
-			// Pm4::DB_DEPTH_VIEW_SLICE_MAX_SHIFT) & Pm4::DB_DEPTH_VIEW_SLICE_MAX_MASK;
-
-			z.depth_view.slice_start =
-			    KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_START) +
-			    (KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_START_HI) << 11u);
-			z.depth_view.slice_max = KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_MAX) +
-			                         (KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_MAX_HI) << 11u);
-			z.depth_view.depth_write_disable =
-			    KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, Z_READ_ONLY) != 0;
-			z.depth_view.stencil_write_disable =
-			    KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, STENCIL_READ_ONLY) != 0;
-			z.depth_view.current_mip_level = KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, MIPID);
-
-			z.htile_data_base_addr = static_cast<uint64_t>(buffer[16]) << 8u;
-
-			z.htile_surface = ParseDepthHtileSurface(buffer[19]);
-
-			if (buffer[21] != 0) {
-				// CxDepthRenderTarget stores width/height as value - 1 in register 13.
-				z.width              = ((buffer[21] >> 0u) & 0x3fffu) + 1u;
-				z.height             = ((buffer[21] >> 16u) & 0x3fffu) + 1u;
-				z.width_height_valid = true;
-			}
-
-			cp.GetCtx().SetDepthRenderTarget(z);
-		} else {
-			KYTY_NOT_IMPLEMENTED;
-		}
-	} else {
-		KYTY_NOT_IMPLEMENTED;
-	}
-
-	return count;
 }
 
 static HW::EqaaControl ParseEqaaControl(uint32_t value) {
@@ -962,181 +849,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetRenderControl) {
 	return 1;
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetRenderTarget) {
-	uint32_t count = (cmd_id >> 16u) & 0x3fffu;
-	if (count < 11 || count > 14) {
-		bool handled = (count > 0);
-		for (uint32_t i = 0; i < count; i++) {
-			if (cmd_offset + i >= Pm4::CX_NUM ||
-			    g_hw_ctx_indirect_func[(cmd_offset + i) & (Pm4::CX_NUM - 1)] == nullptr) {
-				handled = false;
-				break;
-			}
-		}
-		if (handled) {
-			for (uint32_t i = 0; i < count; i++) {
-				g_hw_ctx_indirect_func[(cmd_offset + i) & (Pm4::CX_NUM - 1)](cp, cmd_offset + i,
-				                                                             buffer[i]);
-			}
-			return count;
-		}
-
-		EXIT_NOT_IMPLEMENTED(count < 11 || count > 14);
-	}
-
-	uint32_t slot = (cmd_offset - Pm4::CB_COLOR0_BASE) / 15;
-
-	auto& ctx = cp.GetCtx();
-
-	HW::ColorBase       base;
-	HW::ColorPitch      pitch;
-	HW::ColorSlice      slice;
-	HW::ColorView       view;
-	HW::ColorInfo       info;
-	HW::ColorAttrib     attrib;
-	HW::ColorDccControl dcc;
-	HW::ColorCmask      cmask;
-	HW::ColorCmaskSlice cmask_slice;
-	HW::ColorFmask      fmask;
-	HW::ColorFmaskSlice fmask_slice;
-
-	base.addr                     = static_cast<uint64_t>(buffer[0]) << 8u;
-	pitch.pitch_div8_minus1       = buffer[1] & 0x7ffu;
-	pitch.fmask_pitch_div8_minus1 = (buffer[1] >> 20u) & 0x7ffu;
-	slice.slice_div64_minus1      = buffer[2] & 0x3fffffu;
-
-	// view.base_array_slice_index     = buffer[3] & 0x7ffu;
-	// view.last_array_slice_index     = (buffer[3] >> 13u) & 0x7ffu;
-	view.base_array_slice_index = KYTY_PM4_GET(buffer[3], CB_COLOR0_VIEW, SLICE_START);
-	view.last_array_slice_index = KYTY_PM4_GET(buffer[3], CB_COLOR0_VIEW, SLICE_MAX);
-	view.current_mip_level      = KYTY_PM4_GET(buffer[3], CB_COLOR0_VIEW, MIP_LEVEL);
-
-	//	info.fmask_compression_enable = (buffer[4] & 0x4000u) != 0;
-	//
-	//	// info.fmask_compression_mode   = (buffer[4] >> 26u) & 0x3u;
-	//	info.fmask_data_compression_disable = ((buffer[4] >> 26u) & 0x1u) != 0;
-	//	info.fmask_one_frag_mode            = ((buffer[4] >> 27u) & 0x1u) != 0;
-	//
-	//	info.cmask_fast_clear_enable = (buffer[4] & 0x2000u) != 0;
-	//	info.dcc_compression_enable  = (buffer[4] & 0x10000000u) != 0;
-	//	info.cmask_is_linear         = (buffer[4] >> 19u) & 0x1u;
-	//	info.cmask_addr_type         = (buffer[4] >> 29u) & 0x3u;
-	//	info.alt_tile_mode           = ((buffer[4] >> 31u) & 0x1u) != 0;
-	//	info.format                  = (buffer[4] >> 2u) & 0x1fu;
-	//	info.channel_type            = (buffer[4] >> 8u) & 0x7u;
-	//	info.channel_order           = (buffer[4] >> 11u) & 0x3u;
-	info.format =
-	    static_cast<Prospero::ChannelLayout>(KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FORMAT));
-	info.channel_type =
-	    static_cast<Prospero::ChannelType>(KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, NUMBER_TYPE));
-	info.channel_order =
-	    static_cast<Prospero::ChannelOrder>(KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, COMP_SWAP));
-	info.cmask_fast_clear_enable  = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FAST_CLEAR) != 0;
-	info.fmask_compression_enable = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, COMPRESSION) != 0;
-	info.blend_clamp              = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, BLEND_CLAMP) != 0;
-	info.blend_bypass             = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, BLEND_BYPASS) != 0;
-	info.round_mode               = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, ROUND_MODE) != 0;
-	info.cmask_is_linear          = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, CMASK_IS_LINEAR);
-	info.fmask_data_compression_disable =
-	    KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FMASK_COMPRESSION_DISABLE) != 0;
-	info.fmask_one_frag_mode =
-	    KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, FMASK_COMPRESS_1FRAG_ONLY) != 0;
-	info.dcc_compression_enable = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, DCC_ENABLE) != 0;
-	info.cmask_addr_type        = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, CMASK_ADDR_TYPE);
-	info.alt_tile_mode          = KYTY_PM4_GET(buffer[4], CB_COLOR0_INFO, ALT_TILE_MODE) != 0;
-
-	//	attrib.force_dest_alpha_to_one  = (buffer[5] & 0x20000u) != 0;
-	//	attrib.tile_mode                = buffer[5] & 0x1fu;
-	//	attrib.fmask_tile_mode          = (buffer[5] >> 5u) & 0x1fu;
-	//	attrib.num_samples              = (buffer[5] >> 12u) & 0x7u;
-	//	attrib.num_fragments            = (buffer[5] >> 15u) & 0x3u;
-	attrib.force_dest_alpha_to_one =
-	    KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, FORCE_DST_ALPHA_1) != 0;
-	attrib.tile_mode =
-	    static_cast<Prospero::TileMode>(KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, TILE_MODE_INDEX));
-	attrib.fmask_tile_mode = static_cast<Prospero::TileMode>(
-	    KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, FMASK_TILE_MODE_INDEX));
-	attrib.num_samples   = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, NUM_SAMPLES);
-	attrib.num_fragments = KYTY_PM4_GET(buffer[5], CB_COLOR0_ATTRIB, NUM_FRAGMENTS);
-
-	//	dcc.max_uncompressed_block_size = (buffer[6] >> 2u) & 0x3u;
-	//	dcc.max_compressed_block_size   = (buffer[6] >> 5u) & 0x3u;
-	//	dcc.min_compressed_block_size   = (buffer[6] >> 4u) & 0x1u;
-	//	dcc.color_transform             = (buffer[6] >> 7u) & 0x3u;
-	//	dcc.overwrite_combiner_disable   = (buffer[6] & 0x1u) != 0;
-	//	dcc.independent_64b_blocks    = (buffer[6] & 0x200u) != 0;
-	dcc.overwrite_combiner_disable =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, OVERWRITE_COMBINER_DISABLE) != 0;
-	dcc.dcc_clear_key_enable =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, KEY_CLEAR_ENABLE) != 0;
-	dcc.max_uncompressed_block_size =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, MAX_UNCOMPRESSED_BLOCK_SIZE);
-	dcc.min_compressed_block_size =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, MIN_COMPRESSED_BLOCK_SIZE);
-	dcc.max_compressed_block_size =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, MAX_COMPRESSED_BLOCK_SIZE);
-	dcc.color_transform = KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, COLOR_TRANSFORM);
-	dcc.independent_64b_blocks =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, INDEPENDENT_64B_BLOCKS) != 0;
-	dcc.data_write_on_dcc_clear_to_reg =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, ENABLE_CONSTANT_ENCODE_REG_WRITE) != 0;
-	dcc.independent_128b_blocks =
-	    KYTY_PM4_GET(buffer[6], CB_COLOR0_DCC_CONTROL, INDEPENDENT_128B_BLOCKS) != 0;
-
-	cmask.addr               = static_cast<uint64_t>(buffer[7]) << 8u;
-	cmask_slice.slice_minus1 = buffer[8] & 0x3fffu;
-
-	fmask.addr               = static_cast<uint64_t>(buffer[9]) << 8u;
-	fmask_slice.slice_minus1 = buffer[10] & 0x3fffffu;
-
-	ctx.SetColorBase(slot, base);
-	ctx.SetColorPitch(slot, pitch);
-	ctx.SetColorSlice(slot, slice);
-	ctx.SetColorView(slot, view);
-	ctx.SetColorInfo(slot, info);
-	ctx.SetColorAttrib(slot, attrib);
-	ctx.SetColorDccControl(slot, dcc);
-	ctx.SetColorCmask(slot, cmask);
-	ctx.SetColorCmaskSlice(slot, cmask_slice);
-	ctx.SetColorFmask(slot, fmask);
-	ctx.SetColorFmaskSlice(slot, fmask_slice);
-
-	if (count > 11) {
-		HW::ColorClearWord0 clear_word0;
-
-		clear_word0.word0 = buffer[11];
-
-		ctx.SetColorClearWord0(slot, clear_word0);
-	}
-	if (count > 12) {
-		HW::ColorClearWord1 clear_word1;
-
-		clear_word1.word1 = buffer[12];
-
-		ctx.SetColorClearWord1(slot, clear_word1);
-	}
-	if (count > 13) {
-		HW::ColorDccAddr dcc_addr;
-
-		dcc_addr.addr = static_cast<uint64_t>(buffer[13]) << 8u;
-
-		ctx.SetColorDccAddr(slot, dcc_addr);
-	}
-
-	if (dw >= count + 2 && buffer[count] == 0xC0001000) {
-		HW::ColorSize size;
-
-		size.width  = (buffer[count + 1] >> 0u) & 0xffffu;
-		size.height = (buffer[count + 1] >> 16u) & 0xffffu;
-
-		ctx.SetColorSize(slot, size);
-
-		count += 2;
-	}
-
-	return count;
-}
-
 KYTY_HW_CTX_PARSER(HwCtxSetRenderTargetMask) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::CB_TARGET_MASK);
@@ -1281,7 +993,16 @@ static void HwShIgnoreShaderRegister([[maybe_unused]] uint32_t cmd_offset,
                                      [[maybe_unused]] uint32_t value) {}
 
 KYTY_HW_SH_PARSER(HwShIgnoreRegisters) {
-	return (cmd_id >> 16u) & 0x3fffu;
+	const auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num == 0);
+
+	for (uint32_t i = 0; i < reg_num; i++) {
+		const auto offset = cmd_offset + i;
+		EXIT_NOT_IMPLEMENTED(offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[offset] == nullptr);
+		g_hw_sh_indirect_func[offset](cp, offset, buffer[i]);
+	}
+
+	return reg_num;
 }
 
 static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
@@ -1296,27 +1017,26 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			cs_regs.data_addr &= 0xFFFF00FFFFFFFFFFull;
 			cs_regs.data_addr |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
 			break;
-		case Pm4::COMPUTE_TBA_LO:
-		case Pm4::COMPUTE_TBA_HI:
-		case Pm4::COMPUTE_TMA_LO:
-		case Pm4::COMPUTE_TMA_HI: HwShIgnoreComputeRegister(cmd_offset, value); break;
 		case Pm4::COMPUTE_PGM_RSRC1:
 			cs_regs.vgprs =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_VGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_VGPRS_MASK;
-			cs_regs.sgprs =
-			    (value >> Pm4::COMPUTE_PGM_RSRC1_SGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_SGPRS_MASK;
+			cs_regs.priority = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
+			                   Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
 			cs_regs.float_mode    = (value >> Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT) &
 			                        Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK;
 			cs_regs.dx10_clamp    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_MASK) != 0u;
+			cs_regs.debug_mode    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DEBUG_MODE_SHIFT) &
+			                         Pm4::COMPUTE_PGM_RSRC1_DEBUG_MODE_MASK) != 0u;
 			cs_regs.ieee_mode     = ((value >> Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC1_IEEE_MODE_MASK) != 0u;
 			cs_regs.fp16_overflow = ((value >> Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC1_FP16_OVFL_MASK) != 0u;
-			cs_regs.bulky         = ((value >> Pm4::COMPUTE_PGM_RSRC1_BULKY_SHIFT) &
-			                         Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK) != 0u;
 			cs_regs.threadgroup_configuration = ((value >> Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT) &
 			                                     Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_MASK) != 0u;
+			cs_regs.require_forward_progress =
+			    ((value >> Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT) &
+			     Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK) != 0u;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
 			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
@@ -1336,6 +1056,11 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			cs_regs.lds_size       = (value >> Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT) &
 			                         Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK;
 			break;
+		case Pm4::COMPUTE_PGM_RSRC3:
+			cs_regs.shared_vgprs =
+			    (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
+			    Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
+			break;
 		case Pm4::COMPUTE_NUM_THREAD_X: cs_regs.num_thread_x = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Y: cs_regs.num_thread_y = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Z: cs_regs.num_thread_z = value; break;
@@ -1343,14 +1068,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_START_Y:
 		case Pm4::COMPUTE_START_Z:
 		case Pm4::COMPUTE_RESOURCE_LIMITS:
-		case Pm4::COMPUTE_DESTINATION_EN_SE0:
-		case Pm4::COMPUTE_DESTINATION_EN_SE1:
 		case Pm4::COMPUTE_TMPRING_SIZE:
-		case Pm4::COMPUTE_DESTINATION_EN_SE2:
-		case Pm4::COMPUTE_DESTINATION_EN_SE3:
-		case Pm4::COMPUTE_PGM_RSRC3:
-		case Pm4::COMPUTE_SHADER_CHKSUM:
-		case Pm4::COMPUTE_DISPATCH_TUNNEL: HwShIgnoreComputeRegister(cmd_offset, value); break;
+		case Pm4::COMPUTE_PACE_ID: HwShIgnoreComputeRegister(cmd_offset, value); break;
 		default:
 			EXIT("unsupported compute SH register 0x%08" PRIx32 " = 0x%08" PRIx32 "\n", cmd_offset,
 			     value);
@@ -1361,6 +1080,7 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 
 KYTY_HW_SH_PARSER(HwShSetCsRegisters) {
 	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	EXIT_NOT_IMPLEMENTED(reg_num == 0);
 
 	for (uint32_t i = 0; i < reg_num; i++) {
 		HwShSetCsRegister(cp, cmd_offset + i, buffer[i]);
@@ -1369,23 +1089,11 @@ KYTY_HW_SH_PARSER(HwShSetCsRegisters) {
 	return reg_num;
 }
 
-static uint32_t UserSgprWriteNum(uint32_t slot, uint32_t reg_num, const char* stage) {
+static uint32_t UserSgprWriteNum(uint32_t slot, uint32_t reg_num, uint32_t capacity,
+                                 const char* stage) {
 	EXIT_IF(stage == nullptr);
-
-	if (slot >= HW::UserSgprInfo::SGPRS_MAX) {
-		LOGF("\t %s user sgpr write starts out of range: slot = %" PRIu32 ", reg_num = %" PRIu32
-		     "\n",
-		     stage, slot, reg_num);
-		return 0;
-	}
-
-	const auto available = static_cast<uint32_t>(HW::UserSgprInfo::SGPRS_MAX) - slot;
-	if (reg_num > available) {
-		LOGF("\t %s user sgpr write truncated: slot = %" PRIu32 ", reg_num = %" PRIu32
-		     ", available = %" PRIu32 "\n",
-		     stage, slot, reg_num, available);
-		return available;
-	}
+	EXIT_NOT_IMPLEMENTED(capacity > HW::UserSgprInfo::SGPRS_MAX || slot >= capacity ||
+	                     reg_num > capacity - slot);
 
 	return reg_num;
 }
@@ -1397,23 +1105,7 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	uint32_t slot = (cmd_offset - Pm4::COMPUTE_USER_DATA_0) / 1;
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "cs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
-
-	return reg_num;
-}
-
-KYTY_HW_SH_PARSER(HwShSetCsUserAccumSgpr) {
-	EXIT_NOT_IMPLEMENTED(cmd_offset < Pm4::COMPUTE_USER_ACCUM_0);
-
-	uint32_t slot = 16u + (cmd_offset - Pm4::COMPUTE_USER_ACCUM_0);
-
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "cs accum");
+	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1430,24 +1122,7 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0) / 1;
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "ps");
-
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
-
-	return reg_num;
-}
-
-KYTY_HW_SH_PARSER(HwShSetPsUserAccumSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_ACCUM_PS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_ACCUM_PS_3));
-
-	uint32_t slot = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_PS_0);
-
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "ps accum");
+	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1464,24 +1139,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0) / 1;
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "gs");
-
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
-
-	return reg_num;
-}
-
-KYTY_HW_SH_PARSER(HwShSetGsUserAccumSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_ACCUM_ESGS_3));
-
-	uint32_t slot = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_ESGS_0);
-
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "gs accum");
+	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1498,7 +1156,7 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	uint32_t slot = (cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0) / 1;
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "hs");
+	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1508,18 +1166,27 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	return reg_num;
 }
 
-KYTY_HW_SH_PARSER(HwShSetHsUserAccumSgpr) {
-	EXIT_NOT_IMPLEMENTED(!(cmd_offset >= Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 &&
-	                       cmd_offset <= Pm4::SPI_SHADER_USER_ACCUM_LSHS_3));
-	uint32_t slot = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_LSHS_0);
+static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t base) {
+	return first >= base && first - base < 4u && count <= 4u - (first - base);
+}
 
-	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "hs accum");
+static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
+                                               uint32_t value) {
+	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
+}
 
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
+	const auto reg_num = (cmd_id >> 16u) & 0x3fffu;
+	const bool valid_range =
+	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_PS_0) ||
+	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0) ||
+	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::SPI_SHADER_USER_ACCUM_LSHS_0) ||
+	    HwShIsUserAccumulatorRange(cmd_offset, reg_num, Pm4::COMPUTE_USER_ACCUM_0);
+	EXIT_NOT_IMPLEMENTED(reg_num == 0 || !valid_range);
+
+	for (uint32_t i = 0; i < reg_num; i++) {
+		HwShIgnoreUserAccumulatorRegister(cmd_offset + i, buffer[i]);
 	}
-	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
 }
@@ -1536,6 +1203,7 @@ KYTY_HW_UC_PARSER(HwUcSetPrimitiveType) {
 }
 
 KYTY_HW_UC_PARSER(HwUcSetIndexType) {
+	EXIT_NOT_IMPLEMENTED(dw < KYTY_PM4_LEN(cmd_id));
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::VGT_INDEX_TYPE);
 	cp.SetIndexType(buffer[0] & 0x3u);
 
@@ -1553,6 +1221,8 @@ static void HwUcIgnoreTextureGradientFactors([[maybe_unused]] uint32_t value) {}
 
 KYTY_HW_UC_PARSER(HwUcSetTextureGradientFactors) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0 || cmd_offset < Pm4::TEXTURE_GRADIENT_FACTORS ||
+	                     cmd_offset + num_values - 1u > Pm4::TEXTURE_GRADIENT_CONTROL);
 
 	for (uint32_t i = 0; i < num_values; i++) {
 		HwUcIgnoreTextureGradientFactors(buffer[i]);
@@ -1584,6 +1254,8 @@ static void HwUcIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset,
 
 KYTY_HW_UC_PARSER(HwUcSetBorderColorTableAddr) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0 || cmd_offset < Pm4::TA_CS_BC_BASE_ADDR ||
+	                     cmd_offset + num_values - 1u > Pm4::TA_CS_BC_BASE_ADDR_HI);
 
 	for (uint32_t i = 0; i < num_values; i++) {
 		HwUcIgnoreBorderColorTableAddr(cmd_offset + i, buffer[i]);
@@ -1631,57 +1303,6 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 	}
 
 	return num_values;
-}
-
-static bool HwUcIsFakeRegister(uint32_t cmd_offset) {
-	switch (cmd_offset) {
-		case Pm4::FSR_EXTEND_SUBPIXEL_ROUNDING:
-		case Pm4::FSR_ALPHA_VALUE0:
-		case Pm4::FSR_ALPHA_VALUE1:
-		case Pm4::FSR_CONTROL_POINT0:
-		case Pm4::FSR_CONTROL_POINT1:
-		case Pm4::FSR_CONTROL_POINT2:
-		case Pm4::FSR_CONTROL_POINT3:
-		case Pm4::FSR_WINDOW0:
-		case Pm4::FSR_WINDOW1:
-		case Pm4::TEXTURE_GRADIENT_CONTROL:
-		case Pm4::MEMORY_MAPPING_MASK:
-		case Pm4::UC_NOP: return true;
-		default: return false;
-	}
-}
-
-static void HwUcIgnoreFakeRegister([[maybe_unused]] uint32_t cmd_offset,
-                                   [[maybe_unused]] uint32_t value) {}
-
-static bool HwUcTrySetFakeRegister(uint32_t cmd_offset, uint32_t value) {
-	if (!HwUcIsFakeRegister(cmd_offset)) {
-		return false;
-	}
-
-	if (cmd_offset != Pm4::UC_NOP) {
-		HwUcIgnoreFakeRegister(cmd_offset, value);
-	}
-
-	return true;
-}
-
-static bool HwUcTrySetFakeRegisterRange(uint32_t cmd_offset, const uint32_t* buffer,
-                                        uint32_t num_values) {
-	if (!HwUcIsFakeRegister(cmd_offset)) {
-		return false;
-	}
-
-	for (uint32_t i = 0; i < num_values; i++) {
-		auto reg = cmd_offset + i;
-		if (!HwUcTrySetFakeRegister(reg, buffer[i])) {
-			EXIT("unsupported fake UC register range at 0x%08" PRIx32 " + %" PRIu32
-			     ", value = 0x%08" PRIx32 "\n",
-			     cmd_offset, i, buffer[i]);
-		}
-	}
-
-	return true;
 }
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
@@ -2500,15 +2121,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		// 	           " -> 0x%08" PRIx32 "\n",
 		// 	           raw_cmd_offset, cmd_offset);
 		// }
-		if (HwUcTrySetFakeRegister(cmd_offset, value)) {
+		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
-		}
-		if (cmd_offset < Pm4::CX_NUM) {
-			auto ctx_func = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
-			if (ctx_func != nullptr) {
-				ctx_func(cp, cmd_offset, value);
-				continue;
-			}
 		}
 		if (cmd_offset >= Pm4::UC_NUM) {
 			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
@@ -2861,7 +2475,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	// 	           "\n",
 	// 	           raw_cmd_offset, cmd_offset);
 	// }
-	if (HwUcTrySetFakeRegisterRange(cmd_offset, buffer + 1, KYTY_PM4_LEN(cmd_id) - 2u)) {
+	if (cmd_offset == Pm4::UC_NOP) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 	if (cmd_offset >= Pm4::UC_NUM) {
@@ -3051,27 +2665,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 		};
 	}
 
-	for (auto cmd_offset = Pm4::CB_COLOR0_BASE + 1; cmd_offset <= Pm4::CB_COLOR7_BASE + 1;
-	     cmd_offset += 15) {
-		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			uint32_t       slot = (cmd_offset - (Pm4::CB_COLOR0_BASE + 1)) / 15;
-			HW::ColorPitch pitch;
-			pitch.pitch_div8_minus1       = value & 0x7ffu;
-			pitch.fmask_pitch_div8_minus1 = (value >> 20u) & 0x7ffu;
-			cp.GetCtx().SetColorPitch(slot, pitch);
-		};
-	}
-
-	for (auto cmd_offset = Pm4::CB_COLOR0_BASE + 2; cmd_offset <= Pm4::CB_COLOR7_BASE + 2;
-	     cmd_offset += 15) {
-		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			uint32_t       slot = (cmd_offset - (Pm4::CB_COLOR0_BASE + 2)) / 15;
-			HW::ColorSlice slice;
-			slice.slice_div64_minus1 = value & 0x3fffffu;
-			cp.GetCtx().SetColorSlice(slot, slice);
-		};
-	}
-
 	for (auto cmd_offset = Pm4::CB_COLOR0_BASE_EXT; cmd_offset <= Pm4::CB_COLOR7_BASE_EXT;
 	     cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3111,14 +2704,11 @@ void GraphicsInitJmpTablesCxIndirect() {
 			info.blend_clamp              = KYTY_PM4_GET(value, CB_COLOR0_INFO, BLEND_CLAMP) != 0;
 			info.blend_bypass             = KYTY_PM4_GET(value, CB_COLOR0_INFO, BLEND_BYPASS) != 0;
 			info.round_mode               = KYTY_PM4_GET(value, CB_COLOR0_INFO, ROUND_MODE) != 0;
-			info.cmask_is_linear          = KYTY_PM4_GET(value, CB_COLOR0_INFO, CMASK_IS_LINEAR);
 			info.fmask_data_compression_disable =
 			    KYTY_PM4_GET(value, CB_COLOR0_INFO, FMASK_COMPRESSION_DISABLE) != 0;
 			info.fmask_one_frag_mode =
 			    KYTY_PM4_GET(value, CB_COLOR0_INFO, FMASK_COMPRESS_1FRAG_ONLY) != 0;
 			info.dcc_compression_enable = KYTY_PM4_GET(value, CB_COLOR0_INFO, DCC_ENABLE) != 0;
-			info.cmask_addr_type        = KYTY_PM4_GET(value, CB_COLOR0_INFO, CMASK_ADDR_TYPE);
-			info.alt_tile_mode          = KYTY_PM4_GET(value, CB_COLOR0_INFO, ALT_TILE_MODE) != 0;
 			cp.GetCtx().SetColorInfo(slot, info);
 		};
 	}
@@ -3130,10 +2720,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 			HW::ColorAttrib attrib;
 			attrib.force_dest_alpha_to_one =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, FORCE_DST_ALPHA_1) != 0;
-			attrib.tile_mode = static_cast<Prospero::TileMode>(
-			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, TILE_MODE_INDEX));
-			attrib.fmask_tile_mode = static_cast<Prospero::TileMode>(
-			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, FMASK_TILE_MODE_INDEX));
 			attrib.num_samples   = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, NUM_SAMPLES);
 			attrib.num_fragments = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, NUM_FRAGMENTS);
 			cp.GetCtx().SetColorAttrib(slot, attrib);
@@ -3151,17 +2737,21 @@ void GraphicsInitJmpTablesCxIndirect() {
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, KEY_CLEAR_ENABLE) != 0;
 			dcc.max_uncompressed_block_size =
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, MAX_UNCOMPRESSED_BLOCK_SIZE);
-			dcc.min_compressed_block_size =
-			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, MIN_COMPRESSED_BLOCK_SIZE);
 			dcc.max_compressed_block_size =
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, MAX_COMPRESSED_BLOCK_SIZE);
 			dcc.color_transform = KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, COLOR_TRANSFORM);
-			dcc.independent_64b_blocks =
-			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_64B_BLOCKS) != 0;
 			dcc.data_write_on_dcc_clear_to_reg =
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, ENABLE_CONSTANT_ENCODE_REG_WRITE) != 0;
-			dcc.independent_128b_blocks =
+			const bool independent_64b =
+			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_64B_BLOCKS) != 0;
+			const bool independent_128b =
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_128B_BLOCKS) != 0;
+			EXIT_NOT_IMPLEMENTED(independent_64b && independent_128b);
+			dcc.independent_block_size =
+			    independent_64b
+			        ? HW::ColorDccControl::IndependentBlockSize::Bytes64
+			        : independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
+			                           : HW::ColorDccControl::IndependentBlockSize::Disabled;
 			cp.GetCtx().SetColorDccControl(slot, dcc);
 		};
 	}
@@ -3174,16 +2764,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 			base.addr &= 0xFFFFFF00000000FFull;
 			base.addr |= static_cast<uint64_t>(value) << 8u;
 			cp.GetCtx().SetColorCmask(slot, base);
-		};
-	}
-
-	for (auto cmd_offset = Pm4::CB_COLOR0_CMASK + 1; cmd_offset <= Pm4::CB_COLOR7_BASE + 8;
-	     cmd_offset += 15) {
-		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			uint32_t            slot = (cmd_offset - (Pm4::CB_COLOR0_CMASK + 1)) / 15;
-			HW::ColorCmaskSlice cmask_slice;
-			cmask_slice.slice_minus1 = value & 0x3fffu;
-			cp.GetCtx().SetColorCmaskSlice(slot, cmask_slice);
 		};
 	}
 
@@ -3206,16 +2786,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 			base.addr &= 0xFFFFFF00000000FFull;
 			base.addr |= static_cast<uint64_t>(value) << 8u;
 			cp.GetCtx().SetColorFmask(slot, base);
-		};
-	}
-
-	for (auto cmd_offset = Pm4::CB_COLOR0_FMASK + 1; cmd_offset <= Pm4::CB_COLOR7_BASE + 10;
-	     cmd_offset += 15) {
-		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			uint32_t            slot = (cmd_offset - (Pm4::CB_COLOR0_FMASK + 1)) / 15;
-			HW::ColorFmaskSlice fmask_slice;
-			fmask_slice.slice_minus1 = value & 0x3fffffu;
-			cp.GetCtx().SetColorFmaskSlice(slot, fmask_slice);
 		};
 	}
 
@@ -3292,9 +2862,15 @@ void GraphicsInitJmpTablesCxIndirect() {
 			attrib3.depth     = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, MIP0_DEPTH);
 			attrib3.tile_mode = static_cast<Prospero::TileMode>(
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, COLOR_SW_MODE));
-			attrib3.dimension          = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, RESOURCE_TYPE);
-			attrib3.cmask_pipe_aligned = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, CMASK_PIPE_ALIGNED);
-			attrib3.dcc_pipe_aligned   = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, DCC_PIPE_ALIGNED);
+			attrib3.dimension = KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, RESOURCE_TYPE);
+			const bool cmask_pipe_aligned =
+			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, CMASK_PIPE_ALIGNED) != 0;
+			const bool dcc_pipe_aligned =
+			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, DCC_PIPE_ALIGNED) != 0;
+			EXIT_NOT_IMPLEMENTED(cmask_pipe_aligned != dcc_pipe_aligned);
+			attrib3.metadata_pipe_aligned = cmask_pipe_aligned;
+			attrib3.write_vrs_rate_hint_to_cmask =
+			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, WRITE_VRS_RATE_HINT_TO_CMASK) != 0;
 			cp.GetCtx().SetColorAttrib3(slot, attrib3);
 		};
 	}
@@ -3722,23 +3298,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetDepthZInfo(HW::DepthZInfo::Decode(value));
 	};
 
-	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		auto z                          = cp.GetCtx().GetDepthRenderTarget();
-		z.depth_info.addr5_swizzle_mask = KYTY_PM4_GET(value, DB_DEPTH_INFO, ADDR5_SWIZZLE_MASK);
-		z.depth_info.array_mode =
-		    (value >> Pm4::DB_DEPTH_INFO_ARRAY_MODE_SHIFT) & Pm4::DB_DEPTH_INFO_ARRAY_MODE_MASK;
-		z.depth_info.pipe_config =
-		    (value >> Pm4::DB_DEPTH_INFO_PIPE_CONFIG_SHIFT) & Pm4::DB_DEPTH_INFO_PIPE_CONFIG_MASK;
-		z.depth_info.bank_width =
-		    (value >> Pm4::DB_DEPTH_INFO_BANK_WIDTH_SHIFT) & Pm4::DB_DEPTH_INFO_BANK_WIDTH_MASK;
-		z.depth_info.bank_height =
-		    (value >> Pm4::DB_DEPTH_INFO_BANK_HEIGHT_SHIFT) & Pm4::DB_DEPTH_INFO_BANK_HEIGHT_MASK;
-		z.depth_info.macro_tile_aspect = KYTY_PM4_GET(value, DB_DEPTH_INFO, MACRO_TILE_ASPECT);
-		z.depth_info.num_banks =
-		    (value >> Pm4::DB_DEPTH_INFO_NUM_BANKS_SHIFT) & Pm4::DB_DEPTH_INFO_NUM_BANKS_MASK;
-		cp.GetCtx().SetDepthRenderTarget(z);
-	};
-
 	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MIN] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxSetDepthBoundsRegister(cp, cmd_offset, value);
 	};
@@ -3820,8 +3379,8 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetDepthHTileDataBase(base);
 	};
 
-	g_hw_ctx_indirect_func[Pm4::DB_HTILE_SURFACE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxSetDepthHtileSurfaceRegister(cp, value);
+	g_hw_ctx_indirect_func[Pm4::DB_SHADING_RATE_ENCODING] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		HwCtxSetDepthShadingRateEncodingRegister(cp, value);
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_VIEW] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -3843,19 +3402,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 		r.valid = true;
 		cp.GetCtx().SetDepthDepthSizeXY(r);
 	};
-	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_SIZE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		auto target               = cp.GetCtx().GetDepthRenderTarget();
-		target.pitch_div8_minus1  = KYTY_PM4_GET(value, DB_DEPTH_SIZE, PITCH_TILE_MAX);
-		target.height_div8_minus1 = KYTY_PM4_GET(value, DB_DEPTH_SIZE, HEIGHT_TILE_MAX);
-		target.pitch_height_valid = true;
-		cp.GetCtx().SetDepthRenderTarget(target);
-	};
-	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_SLICE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		auto target               = cp.GetCtx().GetDepthRenderTarget();
-		target.slice_div64_minus1 = KYTY_PM4_GET(value, DB_DEPTH_SLICE, SLICE_TILE_MAX);
-		cp.GetCtx().SetDepthRenderTarget(target);
-	};
-
 	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_CLEAR] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetDepthClearValue(*reinterpret_cast<const float*>(&value));
 	};
@@ -3970,9 +3516,6 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] =
 	    [](KYTY_HW_CTX_INDIRECT_ARGS) { HwCtxIgnorePaScExtendedControl(cmd_offset, value); };
-	g_hw_ctx_indirect_func[Pm4::PA_SC_NGG_MODE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnorePaScExtendedControl(cmd_offset, value);
-	};
 	g_hw_ctx_indirect_func[Pm4::DB_ALPHA_TO_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreAlphaToMaskRegister(value);
 	};
@@ -3998,18 +3541,6 @@ void GraphicsInitJmpTablesShIndirect() {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_HI] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_TBA_LO] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_TBA_HI] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_TMA_LO] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_TMA_HI] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_RSRC1] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -4039,28 +3570,13 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::COMPUTE_RESOURCE_LIMITS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_DESTINATION_EN_SE0] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_DESTINATION_EN_SE1] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
 	g_hw_sh_indirect_func[Pm4::COMPUTE_TMPRING_SIZE] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_DESTINATION_EN_SE2] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_DESTINATION_EN_SE3] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_RSRC3] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_SHADER_CHKSUM] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShSetCsRegister(cp, cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::COMPUTE_DISPATCH_TUNNEL] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+	g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
 
@@ -4071,11 +3587,9 @@ void GraphicsInitJmpTablesShIndirect() {
 			cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		};
 	}
-	for (uint32_t slot = 0; Pm4::COMPUTE_USER_ACCUM_0 + slot < Pm4::COMPUTE_USER_DATA_0; slot++) {
+	for (uint32_t slot = 0; slot < 4; slot++) {
 		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_ACCUM_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			auto sgpr = 16u + (cmd_offset - Pm4::COMPUTE_USER_ACCUM_0);
-			cp.GetShCtx().SetCsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		};
 	}
 	for (uint32_t slot = 0; slot < 32; slot++) {
@@ -4101,45 +3615,27 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    auto sgpr = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_PS_0);
-			    cp.GetShCtx().SetPsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    auto sgpr = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_ESGS_0);
-			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    auto sgpr = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_LSHS_0);
-			    cp.GetShCtx().SetHsUserSgpr(sgpr, value, cp.GetUserDataMarker());
-			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
+			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		    };
 	}
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_TBA_LO_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC3_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_TMA_LO_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_TMA_HI_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_REQ_CTRL_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC3_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -4148,22 +3644,13 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_REQ_CTRL_ESGS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC3_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_REQ_CTRL_LSHS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -4178,10 +3665,6 @@ void GraphicsInitJmpTablesShIndirect() {
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
 		cp.GetShCtx().SetHsShaderBase(base);
-	};
-
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		cp.GetShCtx().SetHsShaderChksum(value);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -4224,32 +3707,6 @@ void GraphicsInitJmpTablesShIndirect() {
 		cp.GetShCtx().SetLsShaderBase(base);
 	};
 
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HW::VsShaderResource1 r1;
-		r1.vgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPRS);
-		r1.sgprs                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, SGPRS);
-		r1.priority             = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, PRIORITY);
-		r1.float_mode           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FLOAT_MODE);
-		r1.dx10_clamp           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, DX10_CLAMP) != 0;
-		r1.ieee_mode            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, IEEE_MODE) != 0;
-		r1.vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, VGPR_COMP_CNT);
-		r1.cu_group_enable = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, CU_GROUP_ENABLE) != 0;
-		r1.require_forward_progress =
-		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FWD_PROGRESS) != 0;
-		r1.fp16_overflow = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_VS, FP16_OVFL) != 0;
-		cp.GetShCtx().SetLsShaderResource1(r1);
-	};
-
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HW::VsShaderResource2 r2;
-		r2.scratch_en        = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SCRATCH_EN) != 0;
-		r2.user_sgpr         = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR) +
-		                       (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, USER_SGPR_MSB) << 5u);
-		r2.offchip_lds       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, OC_LDS_EN) != 0;
-		r2.streamout_enabled = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SO_EN) != 0;
-		r2.shared_vgprs      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_VS, SHARED_VGPR_CNT);
-		cp.GetShCtx().SetLsShaderResource2(r2);
-	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().es_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
@@ -4278,14 +3735,9 @@ void GraphicsInitJmpTablesShIndirect() {
 		cp.GetShCtx().SetGsShaderBase(base);
 	};
 
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		cp.GetShCtx().SetGsShaderChksum(value);
-	};
-
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HW::GsShaderResource1 r1;
 		r1.vgprs           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, VGPRS);
-		r1.sgprs           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, SGPRS);
 		r1.priority        = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, PRIORITY);
 		r1.float_mode      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, FLOAT_MODE);
 		r1.dx10_clamp      = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, DX10_CLAMP) != 0;
@@ -4326,14 +3778,9 @@ void GraphicsInitJmpTablesShIndirect() {
 		cp.GetShCtx().SetPsShaderBase(base);
 	};
 
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		cp.GetShCtx().SetPsShaderChksum(value);
-	};
-
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HW::PsShaderResource1 r1;
 		r1.vgprs            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, VGPRS);
-		r1.sgprs            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, SGPRS);
 		r1.priority         = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, PRIORITY);
 		r1.float_mode       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, FLOAT_MODE);
 		r1.dx10_clamp       = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, DX10_CLAMP) != 0;
@@ -4371,12 +3818,6 @@ void GraphicsInitJmpTablesUcIndirect() {
 		r.vertex_group_size    = KYTY_PM4_GET(value, GE_CNTL, VERT_GRP_SIZE);
 		cp.GetUcfg().SetGeControl(r);
 	};
-	g_hw_uc_indirect_func[Pm4::GE_PC_ALLOC] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		(void)cp;
-		(void)cmd_offset;
-		(void)value;
-	};
-
 	g_hw_uc_indirect_func[Pm4::GE_USER_VGPR_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeUserVgprEn r;
 		r.vgpr1 = KYTY_PM4_GET(value, GE_USER_VGPR_EN, EN_USER_VGPR1) != 0;
@@ -4396,6 +3837,9 @@ void GraphicsInitJmpTablesUcIndirect() {
 		cp.GetUcfg().SetObjectId(value);
 	};
 	g_hw_uc_indirect_func[Pm4::TEXTURE_GRADIENT_FACTORS] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+		HwUcIgnoreTextureGradientFactors(value);
+	};
+	g_hw_uc_indirect_func[Pm4::TEXTURE_GRADIENT_CONTROL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HwUcIgnoreTextureGradientFactors(value);
 	};
 	g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] = [](KYTY_HW_UC_INDIRECT_ARGS) {

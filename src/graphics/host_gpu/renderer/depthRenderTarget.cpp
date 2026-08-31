@@ -108,9 +108,10 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	const auto& sc          = hw.GetStencilControl();
 	const auto& sm          = hw.GetStencilMask();
 	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
-	const bool  depth_active =
-	    dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || rc.depth_clear_enable;
-	const bool stencil_active = has_stencil && (dc.stencil_enable || rc.stencil_clear_enable);
+	const bool depth_active = dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable ||
+	                          rc.depth_clear_enable || rc.copy_depth_to_color;
+	const bool stencil_active =
+	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
 	if (!depth_active && !stencil_active) {
 		return;
 	}
@@ -127,22 +128,14 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    !z.stencil_info.expclear_enabled && !z.stencil_info.partially_resident &&
 	    z.depth_view.slice_start == 0 && z.depth_view.slice_max == 0 &&
 	    z.depth_view.current_mip_level == 0 && !z.depth_view.depth_write_disable &&
-	    !z.depth_view.stencil_write_disable && z.depth_info.addr5_swizzle_mask == 0 &&
-	    z.depth_info.array_mode == 0 && z.depth_info.pipe_config == 0 &&
-	    z.depth_info.bank_width == 0 && z.depth_info.bank_height == 0 &&
-	    z.depth_info.macro_tile_aspect == 0 && z.depth_info.num_banks == 0 &&
-	    z.htile_surface.linear == 0 && z.htile_surface.full_cache == 0 &&
-	    z.htile_surface.htile_uses_preload_win == 0 && z.htile_surface.preload == 0 &&
-	    z.htile_surface.prefetch_width == 0 && z.htile_surface.prefetch_height == 0 &&
-	    z.htile_surface.dst_outside_zero_to_one == 0 && z.z_read_base_addr == 0 &&
-	    z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
-	    z.stencil_write_base_addr == 0 && z.htile_data_base_addr == 0 &&
+	    !z.depth_view.stencil_write_disable && z.z_read_base_addr == 0 && z.z_write_base_addr == 0 &&
+	    z.stencil_read_base_addr == 0 && z.stencil_write_base_addr == 0 &&
+	    z.htile_data_base_addr == 0 &&
 	    // DB_DEPTH_SIZE_XY is independent state and may remain programmed after the attachment
 	    // formats and addresses are unbound. A zero encoding is the valid 1x1 value, so its
 	    // presence alone must not manufacture a depth attachment.
-	    !z.z_info.htile_acceleration && !z.width_height_valid && !z.pitch_height_valid &&
-	    z.size.x_max == 0 && z.size.y_max == 0 && z.pitch_div8_minus1 == 0 &&
-	    z.height_div8_minus1 == 0 && z.slice_div64_minus1 == 0 && z.width == 0 && z.height == 0;
+	    !z.z_info.htile_acceleration && z.shading_rate_encoding == 0 && z.size.x_max == 0 &&
+	    z.size.y_max == 0;
 	if (attachment_unbound) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -165,17 +158,12 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
 			           z.depth_view.slice_max);
 	}
-	if (rc.copy_centroid || rc.copy_sample != 0 || z.z_info.expclear_enabled ||
+	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
+	    rc.copy_sample != 0 || z.z_info.expclear_enabled ||
 	    z.stencil_info.expclear_enabled || z.z_info.partially_resident ||
 	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
-	    z.depth_view.current_mip_level != 0 || z.depth_info.addr5_swizzle_mask != 0 ||
-	    z.depth_info.array_mode != 0 || z.depth_info.pipe_config != 0 ||
-	    z.depth_info.bank_width != 0 || z.depth_info.bank_height != 0 ||
-	    z.depth_info.macro_tile_aspect != 0 || z.depth_info.num_banks != 0 ||
-	    z.htile_surface.linear != 0 || z.htile_surface.full_cache != 0 ||
-	    z.htile_surface.htile_uses_preload_win != 0 || z.htile_surface.preload != 0 ||
-	    z.htile_surface.prefetch_width != 0 || z.htile_surface.prefetch_height != 0 ||
-	    z.htile_surface.dst_outside_zero_to_one != 0 || z.z_read_base_addr == 0 ||
+	    z.depth_view.current_mip_level != 0 || z.shading_rate_encoding != 0 ||
+	    z.z_read_base_addr == 0 ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (z.z_read_base_addr & 0xffffu) != 0 ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
@@ -203,18 +191,13 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 			DepthFatal("HTile clear tracking supports at most 32 slices");
 		}
 	}
-	const bool size_xy_valid = z.size.valid;
-	const bool wh_valid      = z.width_height_valid && z.width != 0 && z.height != 0;
-	if (!size_xy_valid && !wh_valid) {
+	if (!z.size.valid) {
 		DepthFatal("missing depth extent");
 	}
-	const uint32_t width  = size_xy_valid ? static_cast<uint32_t>(z.size.x_max) + 1u : z.width;
-	const uint32_t height = size_xy_valid ? static_cast<uint32_t>(z.size.y_max) + 1u : z.height;
-	if (width > 16384 || height > 16384 ||
-	    (size_xy_valid && wh_valid && (width != z.width || height != z.height)) ||
-	    (!z.pitch_height_valid &&
-	     (z.pitch_div8_minus1 != 0 || z.height_div8_minus1 != 0 || z.slice_div64_minus1 != 0))) {
-		DepthFatal("inconsistent depth extent or encoded layout");
+	const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
+	const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
+	if (width > 16384 || height > 16384) {
+		DepthFatal("invalid depth extent");
 	}
 	const auto* policy = FindDepthFormatPolicy(z.z_info.format);
 	if (policy == nullptr) {
@@ -229,11 +212,6 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	const auto     guest_format = policy->guest_format;
 	const uint32_t bytes        = policy->bytes_per_element;
 	const auto     pitch        = TileGetDepthPitch(width, bytes, z.z_info.num_samples);
-	if (z.pitch_height_valid && ((static_cast<uint64_t>(z.pitch_div8_minus1) + 1u) * 8u != pitch ||
-	                             (static_cast<uint64_t>(z.height_div8_minus1) + 1u) * 8u !=
-	                                 ((static_cast<uint64_t>(height) + 7u) & ~7ull))) {
-		DepthFatal("encoded depth pitch or height mismatch");
-	}
 	TileSizeAlign depth_size {};
 	TileSizeAlign stencil_size {};
 	TileSizeAlign htile_size {};
@@ -243,14 +221,6 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    (has_stencil != (stencil_size.align == 65536 && stencil_size.size != 0)) ||
 	    (has_htile != (htile_size.align == 32768 && htile_size.size != 0))) {
 		DepthFatal("unsupported depth/stencil/HTile footprint");
-	}
-	if (z.pitch_height_valid &&
-	    (static_cast<uint64_t>(z.slice_div64_minus1) + 1u) * 64u != depth_size.size) {
-		DepthFatal("depth footprint mismatch: extent=%ux%u pitch=%u expected=0x%016" PRIx64
-		           " align=0x%016" PRIx64 " encoded_valid=%u encoded=0x%016" PRIx64,
-		           width, height, pitch, depth_size.size, depth_size.align,
-		           z.pitch_height_valid ? 1u : 0u,
-		           (static_cast<uint64_t>(z.slice_div64_minus1) + 1u) * 64u);
 	}
 	if (depth_size.size > UINT64_MAX / view.image_layers ||
 	    stencil_size.size > UINT64_MAX / view.image_layers ||

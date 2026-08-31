@@ -44,11 +44,9 @@ uint32_t HwCtxSetBorderColorTableAddr(CommandProcessor&, uint32_t, uint32_t, con
 uint32_t HwCtxSetStencilClear(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetDepthClear(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetScreenScissor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetDepthRenderTarget(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
-                                   uint32_t);
 uint32_t HwCtxSetStencilInfo(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetDepthHtileSurface(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
-                                   uint32_t);
+uint32_t HwCtxSetDepthShadingRateEncoding(CommandProcessor&, uint32_t, uint32_t,
+                                          const uint32_t*, uint32_t);
 uint32_t HwCtxSetHardwareScreenOffset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                       uint32_t);
 uint32_t HwCtxSetWindowOffset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
@@ -89,7 +87,6 @@ uint32_t HwCtxSetDrawPayloadControl(CommandProcessor&, uint32_t, uint32_t, const
 uint32_t HwCtxSetPrimitiveIdReset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetObjprimIdControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetShaderStages(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetRenderTarget(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetColorInfo(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetBlendControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetViewportScissor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
@@ -100,10 +97,8 @@ uint32_t HwShSetPsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t
 uint32_t HwShSetGsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetHsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetCsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwShSetPsUserAccumSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwShSetGsUserAccumSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwShSetHsUserAccumSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwShSetCsUserAccumSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
+uint32_t HwShIgnoreUserAccumulator(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
+                                   uint32_t);
 uint32_t HwShSetCsRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShIgnoreRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetPrimitiveType(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

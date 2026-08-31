@@ -28,6 +28,7 @@
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
+#include "xxhash.h"
 
 #include <algorithm>
 #include <array>
@@ -8887,9 +8888,6 @@ void TestNewShaderRecompilerAuxPositionExports() {
           "compilation");
 #endif
 
-  HW::VertexShaderInfo regs{};
-  regs.es_regs.data_addr = 1;
-  regs.gs_regs.chksum = 1;
   ShaderVertexInputInfo key0{};
   ShaderVertexInputInfo key1{};
   key1.pa_cl_vs_out_cntl = 1;
@@ -10230,7 +10228,6 @@ void TestRenderTargetReverseExportMapping() {
         "pixel shader cache identity omitted the render-target export mapping");
 
   regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
-  regs.ps_regs.chksum = 0xf16ab6f000000001ull;
   ShaderMappedData mapped{};
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
@@ -11118,7 +11115,6 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
 
   HW::PixelShaderInfo regs{};
   regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
-  regs.ps_regs.chksum = 0x1234567800000001ull;
   ShaderMappedData mapped{};
   mapped.code_size_bytes = sizeof(shader);
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
@@ -11128,7 +11124,8 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   ShaderVertexInputInfo vertex_info{};
   ShaderPixelInputInfo input_info{};
   const auto params = PrepareProgram(regs, sh, vertex_info, mappings, input_info);
-  Check(params.hash == regs.ps_regs.chksum && params.code.data() == shader,
+  Check(params.hash == XXH3_64bits(params.code.data(), params.code.size_bytes()) &&
+            params.code.data() == shader,
         "pixel shader program parameters lost source identity");
 
   const uint32_t vcc_load_shader[] = {
@@ -11146,7 +11143,6 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
 
   HW::PixelShaderInfo vcc_regs{};
   vcc_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(vcc_load_shader);
-  vcc_regs.ps_regs.chksum = 0x6306606500000001ull;
   vcc_regs.ps_regs.rsrc2.user_sgpr = 29;
   vcc_regs.ps_user_sgpr.value[27] = static_cast<uint32_t>(table_address);
   vcc_regs.ps_user_sgpr.value[28] = static_cast<uint32_t>(table_address >> 32u);
@@ -11423,11 +11419,9 @@ void TestPixelProgramCacheBindingIdentity() {
   Check(MakeStageStaticKey(no_depth_export) != MakeStageStaticKey(shifted_push),
         "pixel shader identity omitted graphics push-bank placement");
 
-  auto check_program_identity = [&](const uint32_t *shader,
-                                    uint64_t checksum) {
+  auto check_program_identity = [&](const uint32_t *shader) {
     HW::PixelShaderInfo regs{};
     regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
-    regs.ps_regs.chksum = checksum;
     ShaderMappedData mapped{};
     mapped.code_size_bytes = sizeof(uint32_t);
     ShaderMapUserData(regs.ps_regs.data_addr, mapped);
@@ -11453,8 +11447,8 @@ void TestPixelProgramCacheBindingIdentity() {
     return std::pair {first_params.hash, first_key};
   };
 
-  const auto request_01 = check_program_identity(shader_01, 0);
-  const auto request_10 = check_program_identity(shader_10, 0);
+  const auto request_01 = check_program_identity(shader_01);
+  const auto request_10 = check_program_identity(shader_10);
   Check(request_01 == request_10,
         "relocated identical pixel programs did not share their source identity");
 
@@ -11465,7 +11459,6 @@ void TestPixelProgramCacheBindingIdentity() {
   };
   HW::PixelShaderInfo push_regs{};
   push_regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(push_shader);
-  push_regs.ps_regs.chksum = 0x91a27e6300000003ull;
   push_regs.ps_regs.rsrc2.user_sgpr = 4;
   ShaderMappedData push_mapped{};
   push_mapped.code_size_bytes = sizeof(push_shader);

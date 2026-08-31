@@ -173,6 +173,11 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	return nullptr;
 }
 
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
+	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
+}
+
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data) {
@@ -210,7 +215,6 @@ static void vs_check(const HW::VertexShaderInfo& vs, const HW::ShaderRegisters& 
 	};
 	const bool ps5_ngg_passthrough_triangle_path =
 	    vs.es_regs.data_addr != 0 && vs.gs_regs.data_addr == vs.es_regs.data_addr &&
-	    vs.gs_regs.chksum != 0 &&
 	    sh.m_geNggSubgrpCntl == 0x00000001 && sh.m_vgtGsMaxVertOut == 0x00000003 &&
 	    sh.m_vgtGsOutPrimType == 0x00000002 && sh.m_geMaxOutputPerSubgroup <= 0x000000c0;
 
@@ -275,7 +279,6 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	// EXIT_NOT_IMPLEMENTED(ps.m_spiShaderPgmRsrc1Ps != 0x002c0000);
 	// EXIT_NOT_IMPLEMENTED(ps.m_spiShaderPgmRsrc2Ps != 0x00000000);
 	// EXIT_NOT_IMPLEMENTED(ps.vgprs != 0x00 && ps.vgprs != 0x01);
-	// EXIT_NOT_IMPLEMENTED(ps.sgprs != 0x00 && ps.sgprs != 0x01);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc1.priority != 0);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc1.float_mode != 192);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc1.dx10_clamp != true);
@@ -365,8 +368,10 @@ static void cs_check(const HW::CsStageRegisters& cs, const HW::ShaderRegisters& 
 	// EXIT_NOT_IMPLEMENTED(cs.num_thread_y != 0x00000001);
 	// EXIT_NOT_IMPLEMENTED(cs.num_thread_z != 0x00000001);
 	// EXIT_NOT_IMPLEMENTED(cs.vgprs != 0x00 && cs.vgprs != 0x01);
-	// EXIT_NOT_IMPLEMENTED(cs.sgprs != 0x01 && cs.sgprs != 0x02);
-	EXIT_NOT_IMPLEMENTED(cs.bulky != 0x00);
+	EXIT_NOT_IMPLEMENTED(cs.priority != 0x00);
+	EXIT_NOT_IMPLEMENTED(cs.debug_mode != false);
+	EXIT_NOT_IMPLEMENTED(cs.require_forward_progress != false);
+	EXIT_NOT_IMPLEMENTED(cs.shared_vgprs != 0x00);
 	EXIT_NOT_IMPLEMENTED(cs.scratch_en != 0x00);
 	// EXIT_NOT_IMPLEMENTED(cs.user_sgpr != 0x0c);
 	if (cs.tgid_x_en == 0x00) {
@@ -689,7 +694,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	info.export_count      = static_cast<int>(sh.GetExportCount());
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
-	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0 || regs.gs_regs.chksum == 0);
+	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0);
 
 	uint64_t                shader_addr   = regs.es_regs.data_addr;
 	const HW::UserSgprInfo& user_sgpr     = regs.gs_user_sgpr;
@@ -698,8 +703,8 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 	if (data.user_data == nullptr) {
 		LOGF("ShaderGetInputInfoVS(): no AGC user data for shader=0x%016" PRIx64 " es=0x%016" PRIx64
-		     " gs=0x%016" PRIx64 " chksum=0x%016" PRIx64 " user_sgpr_num=%u\n",
-		     shader_addr, regs.es_regs.data_addr, regs.gs_regs.data_addr, regs.gs_regs.chksum,
+		     " gs=0x%016" PRIx64 " user_sgpr_num=%u\n",
+		     shader_addr, regs.es_regs.data_addr, regs.gs_regs.data_addr,
 		     static_cast<uint32_t>(user_sgpr_num));
 	}
 	ShaderVertexMetadata metadata;
@@ -979,7 +984,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRe
 		EXIT("failed to prepare vertex shader program\n");
 	}
 	return GetShaderParams(
-	    regs.es_regs.data_addr, "ShaderRecompiler VS", regs.gs_regs.chksum,
+	    regs.es_regs.data_addr, "ShaderRecompiler VS", GetDeclaredShaderHash(regs.es_regs.data_addr),
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data);
 }
 
@@ -991,7 +996,7 @@ ShaderParams PrepareProgram(
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, data, ps_info);
 	return GetShaderParams(
-	    regs.ps_regs.data_addr, "ShaderRecompiler PS", regs.ps_regs.chksum,
+	    regs.ps_regs.data_addr, "ShaderRecompiler PS", GetDeclaredShaderHash(regs.ps_regs.data_addr),
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
@@ -999,11 +1004,8 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
                             ShaderComputeInputInfo& info) {
 	const auto data = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
-	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(regs.cs_regs.data_addr));
-	const auto declared_hash =
-	    header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 	return GetShaderParams(
-	    regs.cs_regs.data_addr, "ShaderRecompiler CS", declared_hash,
+	    regs.cs_regs.data_addr, "ShaderRecompiler CS", GetDeclaredShaderHash(regs.cs_regs.data_addr),
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
 }
 

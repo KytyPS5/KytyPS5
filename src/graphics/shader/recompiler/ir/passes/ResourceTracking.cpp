@@ -139,7 +139,8 @@ public:
 		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
-			return std::ranges::any_of(m_indirect_images, [&](const IndirectImagePlan& plan) {
+			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+			                   [&](const IndirectImagePlan& plan) {
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
 		});
@@ -432,14 +433,16 @@ private:
 
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
-		    std::ranges::find_if(m_indirect_images, [&](const IndirectImagePlan& plan) {
+		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
+		                 [&](const IndirectImagePlan& plan) {
 			    return plan.handle == &handle;
 		    });
 		return found == m_indirect_images.end() ? nullptr : &*found;
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::ranges::any_of(m_indirect_images, [&](const IndirectImagePlan& plan) {
+		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+		                   [&](const IndirectImagePlan& plan) {
 			return std::ranges::find(plan.memory, index) != plan.memory.end();
 		});
 	}

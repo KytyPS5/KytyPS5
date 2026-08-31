@@ -145,7 +145,6 @@ struct RegisterDefaultsStorage {
 
 static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION      = 13;
 static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_FALLBACK_VERSION = 13;
-static constexpr uint32_t GRAPHICS_INIT_NO_FEATURE_STATE              = 0;
 
 static std::mutex g_register_defaults_mutex;
 
@@ -336,19 +335,11 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	     "\t ver   = %u\n",
 	     reinterpret_cast<uint64_t>(state), ver);
 
-	if (state == nullptr) {
-		LOGF_COLOR(Log::Color::Red, "\t state is null\n");
-		return OK;
-	}
-
 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
 		LOGF_COLOR(Log::Color::Red, "\t unsupported version %u\n", ver);
 	}
 
 	printf("version = %u\n", ver);
-
-	state[0] = ver;
-	state[1] = GRAPHICS_INIT_NO_FEATURE_STATE;
 
 	return OK;
 }

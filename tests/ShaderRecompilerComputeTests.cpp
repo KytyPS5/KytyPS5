@@ -1835,10 +1835,10 @@ public:
     GpuResourceManager resources(m_runtime_context, scheduler);
     auto &cache = resources.GetBufferCache();
     constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
-        {MemoryUsage::Upload, 512ull << 20},
-        {MemoryUsage::Stream, 64ull << 20},
-        {MemoryUsage::Download, 32ull << 20},
-        {MemoryUsage::DeviceLocal, 128ull << 20},
+        {MemoryUsage::Upload, BufferCache::UPLOAD_BUFFER_SIZE},
+        {MemoryUsage::Stream, BufferCache::STREAM_BUFFER_SIZE},
+        {MemoryUsage::Download, BufferCache::DOWNLOAD_BUFFER_SIZE},
+        {MemoryUsage::DeviceLocal, BufferCache::DEVICE_LOCAL_BUFFER_SIZE},
     }};
     std::array<vk::Buffer, utilities.size()> handles{};
     for (size_t i = 0; i < utilities.size(); i++) {
@@ -1868,7 +1868,7 @@ public:
                 download_probe != nullptr && download_probe_offset == 0 &&
                 &cache.GetUtilityBuffer(MemoryUsage::Download) ==
                     fixed_download &&
-                fixed_download->Size() == (32ull << 20) &&
+                fixed_download->Size() == BufferCache::DOWNLOAD_BUFFER_SIZE &&
                 fixed_download->Handle() == fixed_handle,
             "oversized download replaced or corrupted the fixed shared ring");
     fixed_download->Commit();
@@ -3318,7 +3318,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   download.Handle() == fixed_download_handle &&
-                  download.Size() == (32ull << 20),
+                  download.Size() == BufferCache::DOWNLOAD_BUFFER_SIZE,
               "wrapped fault batch published incorrect disjoint ranges");
 
       for (uint32_t tick = 0; tick < 160; tick++) {
@@ -3588,7 +3588,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   fixed_download->Handle() == fixed_download_handle &&
-                  fixed_download->Size() == (32ull << 20),
+                  fixed_download->Size() == BufferCache::DOWNLOAD_BUFFER_SIZE,
               "image acquisition replaced the shared Buffer download stream");
       uint32_t large_first = 0;
       uint32_t large_last = 0;

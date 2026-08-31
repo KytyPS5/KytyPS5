@@ -546,21 +546,12 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	switch (options.stage) {
 		case ShaderType::Vertex:
 			vertex = options.input_info.vertex;
-			if (vertex == nullptr) {
-				EXIT("vertex shader recompilation has no input metadata\n");
-			}
 			break;
 		case ShaderType::Pixel:
 			pixel = options.input_info.pixel;
-			if (pixel == nullptr) {
-				EXIT("pixel shader recompilation has no input metadata\n");
-			}
 			break;
 		case ShaderType::Compute:
 			compute = options.input_info.compute;
-			if (compute == nullptr) {
-				EXIT("compute shader recompilation has no input metadata\n");
-			}
 			break;
 		default: break;
 	}

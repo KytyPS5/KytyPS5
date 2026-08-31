@@ -8358,12 +8358,17 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
 
       constexpr uint64_t depth_only_address = base + 0x140000;
+      constexpr uint64_t depth_only_htile_address = base + 0x150000;
+      constexpr uint32_t captured_depth_only_z_info = 0x22900983u;
+      constexpr uint32_t captured_depth_only_stencil_info = 0x00100980u;
       HW::DepthRenderTarget depth_only_target{};
-      depth_only_target.z_info.format = Prospero::DepthFormat::kZ32F;
-      depth_only_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
-      depth_only_target.stencil_info.htile_stencil_disabled = true;
+      depth_only_target.z_info =
+          HW::DepthZInfo::Decode(captured_depth_only_z_info);
+      depth_only_target.stencil_info =
+          HW::DepthStencilInfo::Decode(captured_depth_only_stencil_info);
       depth_only_target.z_read_base_addr = depth_only_address;
       depth_only_target.z_write_base_addr = depth_only_address;
+      depth_only_target.htile_data_base_addr = depth_only_htile_address;
       depth_only_target.size = {63, 63, true};
       registers.SetDepthRenderTarget(depth_only_target);
       HW::DepthControl depth_only_control{};
@@ -8382,6 +8387,7 @@ public:
       Require(
           name, "depth-only target with stale stencil state",
           depth_only.image_id && depth_only.format == vk::Format::eD32Sfloat &&
+              depth_only.htile &&
               depth_only.depth_test_enable && depth_only.depth_write_enable &&
               depth_only.depth_clear_enable &&
               !depth_only.stencil_test_enable &&
@@ -8389,14 +8395,16 @@ public:
               depth_only.stencil_buffer_vaddr == 0 &&
               depth_only.stencil_buffer_size == 0 &&
               depth_only.desc.info.stencil.Empty() &&
+              depth_only.htile_buffer_vaddr == depth_only_htile_address &&
+              depth_only.desc.info.metadata.range.address ==
+                  depth_only_htile_address &&
               depth_only.depth_buffer_size != 0 &&
               depth_only_address + depth_only.depth_buffer_size <=
                   base + allocation_size &&
               depth_only.vaddr_num == 1 &&
               depth_only.AttachmentWriteAspects() ==
                   vk::ImageAspectFlagBits::eDepth,
-          "raw stencil test or clear state leaked into a depth-only "
-          "attachment");
+          "inactive stencil state changed a depth-only HTile attachment");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       const auto sampled_width = depth_only.desc.info.extent.width - 1u;
@@ -23792,18 +23800,18 @@ void CheckNativeMsaaState() {
 }
 
 void CheckDepthHtileStencilCompatibility() {
+  Require("DepthHtileStencilCompatibility", "inactive stencil plane",
+          depth_htile_stencil_acceleration_compatible(false, true, false),
+          "inactive Hi-Stencil state was treated as an attachment");
   Require("DepthHtileStencilCompatibility", "disabled acceleration",
-          depth_htile_stencil_acceleration_compatible(false, false, true),
+          depth_htile_stencil_acceleration_compatible(true, false, true),
           "disabled Hi-Stencil state was rejected");
   Require("DepthHtileStencilCompatibility", "PS5 stencil plus HTile",
           depth_htile_stencil_acceleration_compatible(true, true, false),
           "valid PS5 Hi-Stencil attachment was rejected");
-  Require("DepthHtileStencilCompatibility", "missing stencil plane",
-          !depth_htile_stencil_acceleration_compatible(false, true, false),
-          "Hi-Stencil without a stencil plane was silently admitted");
   Require("DepthHtileStencilCompatibility", "missing HTile metadata",
           !depth_htile_stencil_acceleration_compatible(true, false, false),
-          "Hi-Stencil without HTile metadata was silently admitted");
+          "active Hi-Stencil without HTile metadata was admitted");
   std::printf("[host]    %-32s ok\n", "DepthHtileStencilCompatibility");
 }
 

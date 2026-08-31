@@ -177,10 +177,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 		    (z.stencil_read_base_addr & 0xffffu) != 0) {
 			DepthFatal("unsupported stencil attachment state");
 		}
-	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0 ||
-	           !htile_stencil_compat ||
-	           z.stencil_info.texture_compatibility !=
-	               Prospero::TextureCompatibleStencil::kDisable) {
+	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
 		DepthFatal("stencil state without an active stencil attachment");
 	}
 	if (has_htile) {

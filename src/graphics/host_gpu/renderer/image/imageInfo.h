@@ -188,6 +188,27 @@ struct ImageInfo {
 	}
 };
 
+// Bounded pipe-aligned R_X layout: 4 KiB metadata blocks, one byte per 256 data
+// bytes. Dimensions follow AMD addrlib Gfx10 GetMetaBlkSize/HwlComputeDccInfo.
+// Other layouts must not use this estimate.
+[[nodiscard]] inline uint64_t SinglePlaneDccClearSize(const ImageInfo& info,
+                                                      bool attachment_pipe_aligned = false) {
+	const uint32_t control = info.metadata.control & ~((1u << 20u) | (1u << 22u) | (1u << 23u));
+	if (info.metadata.kind != ImageMetadataKind::Dcc ||
+	    (control != 0x002b0000u && !(attachment_pipe_aligned && control == 0)) ||
+	    info.type != Prospero::ImageType::kColor2D ||
+	    info.tile_mode != Prospero::TileMode::kRenderTarget ||
+	    info.resources != ImageSubresources {1, 1} || info.samples != 1 || info.extent.depth != 1 ||
+	    info.extent.width == 0 || info.extent.height == 0 || info.IsDepth() || info.IsBlock() ||
+	    (info.bytes_per_block != 4 && info.bytes_per_block != 8))
+		return 0;
+	const uint32_t texel_bits   = 20u - std::countr_zero(info.bytes_per_block);
+	const uint64_t block_width  = uint64_t {1} << ((texel_bits + 1) / 2);
+	const uint64_t block_height = uint64_t {1} << (texel_bits / 2);
+	return ((info.extent.width + block_width - 1) / block_width) *
+	       ((info.extent.height + block_height - 1) / block_height) * 4096;
+}
+
 struct ImageViewInfo {
 	vk::Format           format      = vk::Format::eUndefined;
 	vk::ImageViewType    type        = vk::ImageViewType::e2D;

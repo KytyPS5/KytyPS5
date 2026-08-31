@@ -2866,6 +2866,139 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuCommandLane");
   }
 
+  void CheckDccFloatAttachmentClear() {
+    constexpr const char *name = "DccFloatAttachmentClear";
+    constexpr uint64_t base = 0x0000000208000000ull;
+    constexpr uint64_t bytes = 0x200000;
+    constexpr uint64_t metadata = base + 0x100000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), bytes, bytes,
+                0, &direct_offset) == 0,
+            "direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, bytes, 0x3, 0x10, direct_offset, bytes) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, bytes);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.dcc_compression_enable = true,
+              .format = Prospero::ChannelLayout::k16_16_16_16,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 63, .width = 127});
+      registers.SetColorAttrib3(0,
+                                {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                 .dimension = 1,
+                                 .cmask_pipe_aligned = true,
+                                 .dcc_pipe_aligned = true});
+      registers.SetColorDccAddr(0, {.addr = metadata});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      resources.MapMemory(base, bytes);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      Require(name, "unknown metadata",
+              !cache.TrackFullDccAttachmentFill(metadata, 4096, 0x40404040),
+              "unknown metadata accepted");
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, 1, scheduler.Current(), color, 0);
+      (void)cache.FindRenderTarget(color.image_id, color.desc);
+      Require(name, "HDR layout",
+              color.metadata_fixed_clear_supported &&
+                  !color.metadata_clear_supported &&
+                  color.desc.info.metadata.range.size == 4096,
+              "fixed HDR clear layout was not recognized independently of "
+              "packed clear registers");
+      Require(name, "partial or unrelated fill",
+              !cache.TrackFullDccAttachmentFill(metadata, 2048, 0x40404040) &&
+                  !cache.TrackFullDccAttachmentFill(metadata + 4096, 4096,
+                                                    0x40404040) &&
+                  !cache.TrackFullDccAttachmentFill(metadata, 4096, 0xffffffff),
+              "unsupported fill accepted");
+      Require(name, "complete opaque black",
+              cache.TrackFullDccAttachmentFill(metadata, 4096, 0x40404040),
+              "known full HDR plane was not tracked");
+      RenderDepthInfo depth{};
+      auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, depth);
+      const vk::ClearColorValue opaque(std::array<float, 4>{0, 0, 0, 1});
+      Require(name, "attachment clear",
+              rendering.color_attachments[0].is_clear &&
+                  rendering.color_attachments[0].clear_value == opaque.uint32 &&
+                  !cache.IsMetaCleared(metadata, 0),
+              "opaque-black clear was wrong or not consumed");
+      scheduler.BeginRendering(rendering);
+      scheduler.EndRendering();
+      auto read = [&] {
+        auto &image = cache.GetImage(color.image_id);
+        auto output = CreateHostBuffer(
+            name, 8, vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                      vk::AccessFlagBits2::eTransferRead, {},
+                      scheduler.Current().Handle());
+        vk::BufferImageCopy copy{};
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        copy.imageExtent = {1, 1, 1};
+        scheduler.Current().Handle().copyImageToBuffer(
+            image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+            output.buffer, 1, &copy);
+        scheduler.Finish();
+        auto result = ReadBuffer(name, output, 2);
+        DestroyBuffer(&output);
+        return result;
+      };
+      Require(name, "native float pixels",
+              read() == std::vector<u32>{0, 0x3c000000},
+              "RGBA16 pixels are not (0,0,0,1)");
+      auto &image = cache.GetImage(color.image_id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      const vk::ClearColorValue later(
+          std::array<float, 4>{0.5f, 0.5f, 0.5f, 0.5f});
+      const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
+                                            1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(
+          image.backing.image, vk::ImageLayout::eTransferDstOptimal, &later, 1,
+          &range);
+      cache.MarkGpuWritten(color.image_id);
+      rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, depth);
+      Require(name, "consume once", !rendering.color_attachments[0].is_clear,
+              "old metadata clear replayed");
+      scheduler.BeginRendering(rendering);
+      scheduler.EndRendering();
+      Require(name, "later contents survive",
+              read() == std::vector<u32>{0x38003800, 0x38003800},
+              "a later valid write was erased");
+      resources.UnmapMemory(base, bytes);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, bytes) == 0,
+            "unmap failed");
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, bytes) == 0,
+        "release failed");
+    std::printf("[vulkan]  %-32s ok\n", name);
+  }
+
   void CheckUnifiedImageViewCache() {
     EnsureRuntimeContext();
     constexpr const char *name = "UnifiedImageViewCache";
@@ -21387,6 +21520,120 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   };
 }
 
+void CheckConstantBufferDccFillShape() {
+  constexpr const char *name = "ConstantBufferDccFill";
+  std::array<u32, 8> user_data{
+      0x10000u,
+      16u << 16u,
+      18432u,
+      (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32UInt) << 12u) |
+          0xfacu,
+      0x80000u,
+      16u << 16u,
+      1u,
+      (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32UInt) << 12u) |
+          0xfacu};
+  ShaderComputeInputInfo input{};
+  input.threads_num[0] = 64;
+  input.threads_num[1] = input.threads_num[2] = 1;
+  input.group_id[0] = true;
+  input.wave_size = 64;
+  input.thread_ids_num = 1;
+  input.workgroup_register = 8;
+  auto compile = [&](bool changed_index, bool changed_value) {
+    std::vector<u32> code;
+    AppendVop3(&code, 0x346u, 4, 8, InlineU32(changed_index ? 5 : 6), Vgpr(0));
+    code.push_back(
+        EncodeSmem0(0x0au, 12, 2)); // s_buffer_load_dwordx4 s[12:15], s[4:7]
+    code.push_back(EncodeSmem1(0, 125)); // null scalar offset, not s0
+    for (u32 i = 0; i < 4; ++i)
+      code.push_back(EncodeVop1(0x01u, i, 12u + i));
+    if (changed_value)
+      code.push_back(EncodeVop1(0x01u, 0, InlineU32(1)));
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 4));
+    AppendEnd(&code);
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 64;
+    options.user_data_base = 0;
+    options.user_data_count = user_data.size();
+    options.user_data = user_data.data();
+    options.input_info.compute = &input;
+    auto result = ShaderRecompiler::Recompile(code, options);
+    ValidateSpirv(name, result.spirv);
+    input.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+        std::move(result.program));
+    input.stage.resources =
+        std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+            result.resources);
+  };
+  ShaderBufferResource destination, constants;
+  compile(false, false);
+  Require(name, "full buffer",
+          ResolveComputeConstantBufferFill(input, 288, 1, 1, 0x41, destination,
+                                           constants) &&
+              destination.Base48() == 0x10000 && constants.Base48() == 0x80000,
+          "synthetic uint4 constant-buffer kernel was not recognized:\n" +
+              ShaderRecompiler::IR::ProgramToString(*input.stage.program));
+  Require(name, "partial dispatch",
+          !ResolveComputeConstantBufferFill(input, 287, 1, 1, 0x41, destination,
+                                            constants),
+          "partial dispatch accepted");
+  Require(name, "extra dimension",
+          !ResolveComputeConstantBufferFill(input, 288, 2, 1, 0x41, destination,
+                                            constants),
+          "nonlinear coverage accepted");
+  Require(name, "initiator flags",
+          !ResolveComputeConstantBufferFill(input, 288, 1, 1, 0x49, destination,
+                                            constants),
+          "unsupported initiator accepted");
+  input.dispatch_thread_dimensions = true;
+  Require(name, "thread dimensions",
+          ResolveComputeConstantBufferFill(input, 18432, 1, 1, 0x61,
+                                           destination, constants),
+          "full thread-sized dispatch rejected");
+  input.dispatch_thread_dimensions = false;
+  compile(true, false);
+  Require(name, "overlapping stores",
+          !ResolveComputeConstantBufferFill(input, 288, 1, 1, 0x41, destination,
+                                            constants),
+          "overlapping index was treated as a full fill");
+  compile(false, true);
+  Require(name, "different value",
+          !ResolveComputeConstantBufferFill(input, 288, 1, 1, 0x41, destination,
+                                            constants),
+          "transformed uint4 value accepted");
+  ImageInfo image{};
+  image.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+  image.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+  image.extent = {3840, 2160, 1};
+  image.bytes_per_block = 8;
+  image.tile_mode = Prospero::TileMode::kRenderTarget;
+  image.metadata.kind = ImageMetadataKind::Dcc;
+  image.metadata.control = 0x006b0000;
+  Require(name, "HDR DCC footprint", SinglePlaneDccClearSize(image) == 294912,
+          "HDR metadata size disagrees with synthetic full buffer");
+  image.extent = {960, 540, 1};
+  image.metadata.control = 0;
+  Require(
+      name, "HDR attachment footprint",
+      SinglePlaneDccClearSize(image, true) == 24576 &&
+          SinglePlaneDccClearSize(image) == 0,
+      "unknown layout accepted or synthetic pipe-aligned HDR plane rejected");
+  image.metadata.control = 0x006b0000;
+  image.extent = {3840, 2160, 1};
+  image.bytes_per_block = 4;
+  image.pixel_format = vk::Format::eR8G8B8A8Unorm;
+  image.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+  Require(name, "RGBA8 DCC footprint", SinglePlaneDccClearSize(image) == 163840,
+          "RGBA8 metadata size disagrees with synthetic full buffer");
+  image.resources.levels = 2;
+  Require(name, "mip chain", SinglePlaneDccClearSize(image) == 0,
+          "unsupported mip chain accepted");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -25032,6 +25279,15 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--dcc-fill-host-only") == 0) {
+    Libs::Graphics::CheckConstantBufferDccFillShape();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dcc-attachment-clear-only") == 0) {
+    Libs::Graphics::VulkanHarness vulkan;
+    vulkan.CheckDccFloatAttachmentClear();
+    return 0;
+  }
   CheckLeastRecentlyUsedCacheOrdering();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--shader-fatal-only") == 0) {

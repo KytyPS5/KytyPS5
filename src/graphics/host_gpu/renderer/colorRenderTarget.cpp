@@ -34,8 +34,7 @@ static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool h
 		case vk::Format::eB8G8R8A8Srgb:
 		case vk::Format::eA2B10G10R10UnormPack32:
 		case vk::Format::eA2R10G10B10UnormPack32:
-			info.metadata_fixed_clear_supported = has_dcc;
-			break;
+		case vk::Format::eR16G16B16A16Sfloat: info.metadata_fixed_clear_supported = has_dcc; break;
 		default: info.metadata_fixed_clear_supported = false; break;
 	}
 	if (!info.metadata_clear_supported) {
@@ -351,6 +350,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		// TextureCache can associate metadata fills observed before target registration.
 		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
 		desc.info.metadata.range.address = rt.dcc_addr.addr;
+		desc.info.metadata.range.size =
+		    SinglePlaneDccClearSize(desc.info, rt.attrib3.dcc_pipe_aligned);
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {

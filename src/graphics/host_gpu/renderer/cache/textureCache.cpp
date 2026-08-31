@@ -1361,6 +1361,37 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.MarkGpuModified();
 }
 
+bool TextureCache::TrackFullDccAttachmentFill(uint64_t address, uint64_t size, uint32_t value) {
+	if (!GuestRange {address, size}.Valid() || value != 0x40404040u) return false;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto       meta = m_surface_metas.find(address);
+		if (meta == m_surface_metas.end() || meta->second.type != MetaDataInfo::Type::Dcc)
+			return false;
+		const ImageInfo* first       = nullptr;
+		bool             unsupported = false;
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (!image.registered || image.info.metadata.kind != ImageMetadataKind::Dcc ||
+			    image.info.metadata.range.address != address)
+				return;
+			const auto& info = image.info;
+			if (image.depth_id || image.binding.needs_rebind || !image.usage.render_target ||
+			    info.metadata.range.size == 0 || info.metadata.range.size != size ||
+			    info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+			    info.type != Prospero::ImageType::kColor2D || info.samples != 1 ||
+			    info.resources != ImageSubresources {1, 1})
+				unsupported = true;
+			if (first && (info.data != first->data || info.extent != first->extent ||
+			              info.pixel_format != first->pixel_format))
+				unsupported = true;
+			first = &info;
+		});
+		if (!first || unsupported) return false;
+	}
+	// GPU-thread serialization protects the association between this check and the update.
+	return TryConsumeDccFill(address, size, value);
+}
+
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {

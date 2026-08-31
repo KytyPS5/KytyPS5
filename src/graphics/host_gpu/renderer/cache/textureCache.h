@@ -75,6 +75,8 @@ public:
 	// Returns true when registered DCC absorbed the fill and the caller may skip the dispatch.
 	// False may still record PendingDcc state, but the guest dispatch must execute.
 	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	// Only complete, registered single-plane HDR attachments are eligible.
+	[[nodiscard]] bool TrackFullDccAttachmentFill(uint64_t address, uint64_t size, uint32_t value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);

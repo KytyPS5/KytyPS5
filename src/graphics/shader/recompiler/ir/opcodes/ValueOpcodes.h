@@ -43,6 +43,13 @@ struct DppMoveFlags {
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);
 
+struct Dpp8MoveFlags {
+	uint32_t lane_selectors = 0;
+	bool     fetch_inactive = false;
+};
+static_assert(sizeof(Dpp8MoveFlags) <= sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<Dpp8MoveFlags>);
+
 struct PermlaneFlags {
 	bool x16            = false;
 	bool fetch_inactive = false;

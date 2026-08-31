@@ -537,6 +537,8 @@ enum class Opcode {
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
 	IMAGE_ATOMIC_XOR,
+	IMAGE_ATOMIC_FMIN,
+	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
 	IMAGE_GATHER4_LZ,
 	IMAGE_GATHER4_C,
@@ -643,6 +645,9 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	uint32_t dpp8_lane_selectors = 0;
+	bool     dpp8_fetch_inactive = false;
+	bool     dpp8                = false;
 };
 
 struct Instruction {

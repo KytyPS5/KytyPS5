@@ -871,6 +871,61 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           }));
 		return true;
 	}
+	if (op == IR::ValueOpcode::ImageAtomicFMin32 || op == IR::ValueOpcode::ImageAtomicFMax32) {
+		const auto is_max = op == IR::ValueOpcode::ImageAtomicFMax32;
+		const auto view   = StorageImageViewKind(mem);
+		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+			           const auto pointer = state.builder.AllocateId();
+			           const auto pointer_type =
+			               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
+			           state.builder.AddFunction(
+			               {OpImageTexelPointer, pointer_type, pointer,
+			                StorageImageDescriptorPointer(state, mem.resource, view),
+			                CoordU32(ctx, mem, *address, view), ConstantU32(state, 0)});
+			           const auto src_bits = ctx.Arg(inst, 2);
+			           const auto preheader = state.builder.AllocateId();
+			           const auto header    = state.builder.AllocateId();
+			           const auto cont      = state.builder.AllocateId();
+			           const auto merge     = state.builder.AllocateId();
+			           const auto initial   = state.builder.AllocateId();
+			           const auto observed  = state.builder.AllocateId();
+			           const auto exchanged = state.builder.AllocateId();
+			           state.builder.AddFunction({OpBranch, preheader});
+			           EmitLabel(state, preheader);
+			           state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
+			                                      ConstantU32(state, ScopeDevice),
+			                                      ConstantU32(state, MemorySemanticsNone)});
+			           state.builder.AddFunction({OpBranch, header});
+			           EmitLabel(state, header);
+			           state.builder.AddFunction({OpPhi, TypeU32(state), observed, initial,
+			                                      preheader, exchanged, cont});
+			           const auto old_f = Unary(state, OpBitcast, TypeF32(state), observed);
+			           const auto src_f = Unary(state, OpBitcast, TypeF32(state), src_bits);
+			           const auto pick_src =
+			               is_max
+			                   ? Binary(state, OpFOrdLessThan, TypeBool(state), old_f, src_f)
+			                   : Binary(state, OpFOrdLessThan, TypeBool(state), src_f, old_f);
+			           const auto chosen_f = state.builder.AllocateId();
+			           state.builder.AddFunction(
+			               {OpSelect, TypeF32(state), chosen_f, pick_src, src_f, old_f});
+			           const auto next = Unary(state, OpBitcast, TypeU32(state), chosen_f);
+			           state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged,
+			                                      pointer, ConstantU32(state, ScopeDevice),
+			                                      ConstantU32(state, MemorySemanticsNone),
+			                                      ConstantU32(state, MemorySemanticsNone), next,
+			                                      observed});
+			           const auto success =
+			               Binary(state, OpIEqual, TypeBool(state), exchanged, observed);
+			           state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
+			           state.builder.AddFunction({OpBranchConditional, success, merge, cont});
+			           EmitLabel(state, cont);
+			           state.builder.AddFunction({OpBranch, header});
+			           EmitLabel(state, merge);
+			           EmitDeviceAtomicMemoryBarrier(state);
+			           return observed;
+		           }));
+		return true;
+	}
 	return false;
 }
 

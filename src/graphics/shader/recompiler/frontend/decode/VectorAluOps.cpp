@@ -725,6 +725,46 @@ bool DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	return true;
 }
 
+void ApplyDpp8Modifier(Operand& operand, uint32_t modifier, bool fetch_inactive) {
+	operand.dpp8                = true;
+	operand.dpp8_lane_selectors = (modifier >> 8u) & 0xffffffu;
+	operand.dpp8_fetch_inactive = fetch_inactive;
+}
+
+bool DecodeVop1Dpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t vdst, Instruction& inst, bool fetch_inactive, std::string* error) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+
+	if (UsesScalarDestination(inst.opcode)) {
+		if (!DecodeScalarDestination(vdst, pc, inst.dst, error)) {
+			return false;
+		}
+	} else {
+		DecodeVectorGpr(vdst, inst.dst);
+	}
+	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
+		return false;
+	}
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	inst.src_count = 1;
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
+}
+
+bool DecodeVop1Dpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, uint32_t opcode,
+                    uint32_t vdst, Instruction& inst, std::string* error) {
+	(void)opcode;
+	return DecodeVop1Dpp8Impl(pc, code, word_index, vdst, inst, false, error);
+}
+
+bool DecodeVop1Dpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vdst, Instruction& inst, std::string* error) {
+	(void)opcode;
+	return DecodeVop1Dpp8Impl(pc, code, word_index, vdst, inst, true, error);
+}
+
 using Vop1ModifierDecodeFn = bool (*)(uint32_t pc, std::span<const uint32_t> code,
                                       uint32_t word_index, uint32_t opcode, uint32_t vdst,
                                       Instruction& inst, std::string* error);
@@ -735,6 +775,8 @@ struct Vop1ModifierDecoder {
 };
 
 constexpr Vop1ModifierDecoder VOP1_MODIFIER_DECODERS[] = {
+    {233u, DecodeVop1Dpp8},
+    {234u, DecodeVop1Dpp8Fi},
     {249u, DecodeVop1Sdwa},
     {250u, DecodeVop1Dpp},
 };
@@ -1131,6 +1173,36 @@ bool DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	return FinalizeVop2Instruction(pc, code, word_index, inst, error);
 }
 
+bool DecodeVop2Dpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t vdst, uint32_t vsrc1, Instruction& inst, bool fetch_inactive,
+                        std::string* error) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+
+	DecodeVectorGpr(vdst, inst.dst);
+	DecodeVectorGpr(vsrc1, inst.src1);
+	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
+		return false;
+	}
+	ApplyDefaultVop2F16Destination(inst);
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	return FinalizeVop2Instruction(pc, code, word_index, inst, error);
+}
+
+bool DecodeVop2Dpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, uint32_t opcode,
+                    uint32_t vdst, uint32_t vsrc1, Instruction& inst, std::string* error) {
+	(void)opcode;
+	return DecodeVop2Dpp8Impl(pc, code, word_index, vdst, vsrc1, inst, false, error);
+}
+
+bool DecodeVop2Dpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst,
+                      std::string* error) {
+	(void)opcode;
+	return DecodeVop2Dpp8Impl(pc, code, word_index, vdst, vsrc1, inst, true, error);
+}
+
 using Vop2ModifierDecodeFn = bool (*)(uint32_t pc, std::span<const uint32_t> code,
                                       uint32_t word_index, uint32_t opcode, uint32_t vdst,
                                       uint32_t vsrc1, Instruction& inst, std::string* error);
@@ -1141,6 +1213,8 @@ struct Vop2ModifierDecoder {
 };
 
 constexpr Vop2ModifierDecoder VOP2_MODIFIER_DECODERS[] = {
+    {233u, DecodeVop2Dpp8},
+    {234u, DecodeVop2Dpp8Fi},
     {249u, DecodeVop2Sdwa},
     {250u, DecodeVop2Dpp},
 };
@@ -1264,6 +1338,42 @@ bool DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	inst.src_count     = 2;
 	ReadLiteralOperands(code, word_index, inst);
 	return true;
+}
+
+bool DecodeVopcDpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t opcode, uint32_t vsrc1, Instruction& inst, bool fetch_inactive,
+                        std::string* error) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
+		return true;
+	}
+	const auto* info = Detail::FindOpcode(VOPC_OPS, opcode);
+	if (info == nullptr || !info->supports_dpp) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC DPP8 modifier is not supported for opcode");
+		return true;
+	}
+	DecodeVectorGpr(vsrc1, inst.src1);
+	if (!DecodeScalarSource(src0 + 256u, pc, inst.src0, error)) {
+		return false;
+	}
+	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	inst.src_count = 2;
+	ReadLiteralOperands(code, word_index, inst);
+	return true;
+}
+
+bool DecodeVopcDpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, uint32_t opcode,
+                    uint32_t vsrc1, Instruction& inst, std::string* error) {
+	return DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, false, error);
+}
+
+bool DecodeVopcDpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vsrc1, Instruction& inst, std::string* error) {
+	return DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, true, error);
 }
 
 uint32_t NativeVop3SourceCount(Opcode opcode) {
@@ -1659,6 +1769,8 @@ bool DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	SetRawWords(inst, code, word_index, 1);
 
 	switch (src0) {
+		case 233u: return DecodeVopcDpp8(pc, code, word_index, opcode, vsrc1, inst, error);
+		case 234u: return DecodeVopcDpp8Fi(pc, code, word_index, opcode, vsrc1, inst, error);
 		case 249u: return DecodeVopcSdwa(pc, code, word_index, opcode, vsrc1, inst, error);
 		case 250u: return DecodeVopcDpp(pc, code, word_index, opcode, vsrc1, inst, error);
 		default: break;

@@ -462,7 +462,9 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			                     image.kind == ResourceKind::StorageImageUint;
 			const auto format =
 			    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-			if (image.atomic && format != Prospero::BufferFormat::k32UInt) {
+			if (image.atomic && format != Prospero::BufferFormat::k32UInt &&
+			    format != Prospero::BufferFormat::k32SInt &&
+			    format != Prospero::BufferFormat::k32Float) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "atomic image descriptor {} changed to unsupported format {}", i,
@@ -770,7 +772,9 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (image.atomic && format != Prospero::BufferFormat::k32UInt) {
+		if (image.atomic && format != Prospero::BufferFormat::k32UInt &&
+		    format != Prospero::BufferFormat::k32SInt &&
+		    format != Prospero::BufferFormat::k32Float) {
 			if (error != nullptr) {
 				*error = fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 				                     static_cast<uint32_t>(format));

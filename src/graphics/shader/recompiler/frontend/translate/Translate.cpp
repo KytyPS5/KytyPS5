@@ -28,15 +28,18 @@ Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst
 	}
 	for (uint32_t index = 0; index < std::min(inst.src_count, 3u); index++) {
 		const auto source = SourceAt(inst, index);
-		if (!source.dpp) {
+		if (!source.dpp && !source.dpp8) {
 			continue;
 		}
-		destination.dpp                = true;
-		destination.dpp_ctrl           = source.dpp_ctrl;
-		destination.dpp_row_mask       = source.dpp_row_mask;
-		destination.dpp_bank_mask      = source.dpp_bank_mask;
-		destination.dpp_fetch_inactive = source.dpp_fetch_inactive;
-		destination.dpp_bound_ctrl     = source.dpp_bound_ctrl;
+		destination.dpp                 = source.dpp;
+		destination.dpp_ctrl            = source.dpp_ctrl;
+		destination.dpp_row_mask        = source.dpp_row_mask;
+		destination.dpp_bank_mask       = source.dpp_bank_mask;
+		destination.dpp_fetch_inactive  = source.dpp_fetch_inactive;
+		destination.dpp_bound_ctrl      = source.dpp_bound_ctrl;
+		destination.dpp8                = source.dpp8;
+		destination.dpp8_lane_selectors = source.dpp8_lane_selectors;
+		destination.dpp8_fetch_inactive = source.dpp8_fetch_inactive;
 		break;
 	}
 	return destination;
@@ -169,6 +172,13 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 		    .bound_control  = operand.dpp_bound_ctrl,
 		};
 		value = IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, flags));
+	}
+	if (operand.dpp8) {
+		const IR::Dpp8MoveFlags flags {
+		    .lane_selectors = operand.dpp8_lane_selectors,
+		    .fetch_inactive = operand.dpp8_fetch_inactive,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::Dpp8MoveU32, {value, ir.GetExec()}, flags));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
@@ -305,6 +315,13 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				};
 				value = IR::U32(
 				    ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()}, flags));
+			} else if (operand.dpp8) {
+				const IR::Dpp8MoveFlags flags {
+				    .lane_selectors = operand.dpp8_lane_selectors,
+				    .fetch_inactive = operand.dpp8_fetch_inactive,
+				};
+				value = IR::U32(
+				    ir.Emit(IR::ValueOpcode::Dpp8UpdateU32, {value, old, ir.GetExec()}, flags));
 			} else {
 				value = ir.Select(ir.GetExec(), value, old);
 			}

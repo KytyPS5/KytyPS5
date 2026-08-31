@@ -68,7 +68,19 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k5_5_5_1UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k1_5_5_5UNorm, 0, 0, 2, false, false},
 	{BufferFormat::k4_4_4_4UNorm, 2, 0, 2, true, false},
+	{BufferFormat::kFmask8_S2_F1, 1, 0, 1, true, false},
+	{BufferFormat::kFmask8_S4_F1, 1, 0, 1, true, false},
+	{BufferFormat::kFmask8_S8_F1, 1, 0, 1, true, false},
+	{BufferFormat::kFmask8_S2_F2, 1, 0, 1, true, false},
+	{BufferFormat::kFmask8_S4_F2, 1, 0, 1, true, false},
 	{BufferFormat::kFmask8_S4_F4, 1, 0, 1, true, false},
+	{BufferFormat::kFmask16_S16_F1, 2, 0, 2, true, false},
+	{BufferFormat::kFmask16_S8_F2, 2, 0, 2, true, false},
+	{BufferFormat::kFmask32_S16_F2, 4, 0, 4, true, false},
+	{BufferFormat::kFmask32_S8_F4, 4, 0, 4, true, false},
+	{BufferFormat::kFmask32_S8_F8, 4, 0, 4, true, false},
+	{BufferFormat::kFmask64_S16_F4, 8, 0, 8, true, false},
+	{BufferFormat::kFmask64_S16_F8, 8, 0, 8, true, false},
 	{BufferFormat::kBc1UNorm, 0, 8, 0, true, false},
 	{BufferFormat::kBc1Srgb, 0, 8, 0, true, false},
 	{BufferFormat::kBc2UNorm, 0, 16, 0, true, false},
@@ -203,7 +215,7 @@ uint32_t RenderTargetBytesPerElement(BufferFormat format) {
 }
 
 bool IsFmaskTextureFormat(BufferFormat format) {
-	return format == BufferFormat::kFmask8_S4_F4;
+	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
 bool IsSampledTextureFormat(BufferFormat format) {

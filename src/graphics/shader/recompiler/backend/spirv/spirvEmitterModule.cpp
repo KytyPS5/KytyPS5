@@ -188,9 +188,12 @@ void DefineDescriptorVariables(EmitterState& state) {
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view    = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		const bool integer = i >= SampledImageViewKindCount;
-		const auto kind    = SampledBindingKind(integer, view);
+		const bool depth   = i == SampledDepthImageIndex;
+		const auto view =
+		    depth ? ImageViewKind::Dim2D
+		          : static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		const bool integer = !depth && i >= SampledImageViewKindCount;
+		const auto kind    = SampledBindingKind(integer, view, depth);
 		if (DescriptorBinding(state, kind) == nullptr) {
 			continue;
 		}
@@ -607,11 +610,15 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "sampled_uint_2d_array",
 	                                        "sampled_uint_3d",
 	                                        "sampled_uint_2d_msaa",
-	                                        "sampled_uint_2d_msaa_array"};
+	                                        "sampled_uint_2d_msaa_array",
+	                                        "sampled_depth_2d"};
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		const bool depth = i == SampledDepthImageIndex;
+		const auto view =
+		    depth ? ImageViewKind::Dim2D
+		          : static_cast<ImageViewKind>(i % SampledImageViewKindCount);
 		Decorate(state.sampled_image_variables[i], SampledNames[i],
-		         SampledBindingKind(i >= SampledImageViewKindCount, view));
+		         SampledBindingKind(!depth && i >= SampledImageViewKindCount, view, depth));
 	}
 	constexpr const char* StorageNames[] = {"storage_1d",
 	                                        "storage_1d_array",
@@ -694,6 +701,10 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);
+	}
+	if (state.requirements.shader_clock) {
+		state.builder.RequireCapability(CapabilityShaderClockKHR);
+		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
 	if (state.requirements.subgroup_shuffle) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformShuffle);

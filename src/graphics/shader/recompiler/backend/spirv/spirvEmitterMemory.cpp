@@ -293,18 +293,37 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = EmitMemoryElementIndex(ctx.state, resource, raw_index)};
 }
 
+constexpr uint32_t MemoryAccessVolatile = 0x1;
+
+void AddLoad(ValueEmitContext& ctx, uint32_t type, uint32_t result, uint32_t pointer, bool glc) {
+	if (glc) {
+		ctx.state.builder.AddFunction({OpLoad, type, result, pointer, MemoryAccessVolatile});
+	} else {
+		ctx.state.builder.AddFunction({OpLoad, type, result, pointer});
+	}
+}
+
+void AddStore(ValueEmitContext& ctx, uint32_t pointer, uint32_t data, bool glc) {
+	if (glc) {
+		ctx.state.builder.AddFunction({OpStore, pointer, data, MemoryAccessVolatile});
+	} else {
+		ctx.state.builder.AddFunction({OpStore, pointer, data});
+	}
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                          uint32_t index);
+                          uint32_t index, bool glc);
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
+                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend,
+                             bool glc);
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
-	    [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+	    [&]() { return LoadWordInBounds(ctx, access.resource, access.index, mem.glc); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -324,21 +343,38 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
 		    return LoadSubwordInBounds(ctx, access.resource, address, access.index, bits,
-		                               sign_extend);
+		                               sign_extend, mem.glc);
 	    });
 }
 
+void EmitLoadPrintf(ValueEmitContext& ctx, uint32_t index, uint32_t value) {
+	constexpr uint64_t wanted = 0ull;
+	if (wanted == 0 || ctx.state.program.shader_hash != wanted) {
+		return;
+	}
+	auto&      state  = ctx.state;
+	state.builder.RequireExtension("SPV_KHR_non_semantic_info");
+	const auto set    = state.builder.Import("NonSemantic.DebugPrintf");
+	const auto fmt    = state.builder.DebugString("kyty glc load idx=%u val=%u");
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpExtInst, TypeVoid(state), result, set, 1u, fmt, index, value});
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                          uint32_t index) {
+                          uint32_t index, bool glc) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
+	AddLoad(ctx, TypeU32(ctx.state), value, pointer, glc);
+	if (glc) {
+		EmitLoadPrintf(ctx, index, value);
+	}
 	return value;
 }
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
-	const auto word = LoadWordInBounds(ctx, resource, index);
+                             uint32_t address, uint32_t index, uint32_t bits, bool sign_extend,
+                             bool glc) {
+	const auto word = LoadWordInBounds(ctx, resource, index, glc);
 	const auto byte =
 	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address, ConstantU32(ctx.state, 3));
 	const auto shift =
@@ -486,6 +522,7 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto scope     = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 	const auto memory    = kind == IR::ResourceKind::Lds ? MemorySemanticsWorkgroupMemory
 	                                                     : MemorySemanticsUniformMemory;
+
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();
 	const auto cont      = state.builder.AllocateId();
@@ -569,16 +606,14 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    ctx.state.builder.AddFunction(
-		        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-		         data});
+		    AddStore(ctx, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+		             data, mem.glc);
 	    });
 }
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
-                       uint32_t data) {
-	ctx.state.builder.AddFunction(
-	    {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
+                       uint32_t data, bool glc) {
+	AddStore(ctx, EmitMemoryElementPointer(ctx.state, resource, index), data, glc);
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -874,11 +909,11 @@ uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	return LoadFormattedComponent(
 	    ctx, mem, plan.format, plan.info, output_component,
 	    [&](uint32_t component) {
-		    return LoadWordInBounds(ctx, plan.resource, plan.indices[component]);
+		    return LoadWordInBounds(ctx, plan.resource, plan.indices[component], mem.glc);
 	    },
 	    [&](uint32_t component, uint32_t bits, bool sign_extend) {
 		    return LoadSubwordInBounds(ctx, plan.resource, plan.addresses[component],
-		                               plan.indices[component], bits, sign_extend);
+		                               plan.indices[component], bits, sign_extend, mem.glc);
 	    });
 }
 
@@ -910,7 +945,7 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {
-		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
+		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data, mem.glc);
 	}
 }
 
@@ -993,7 +1028,7 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 			    const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
 			    values[component]    = EmitValueOrZeroIfCondition(
 			        state, EmitMemoryElementInBounds(state, access.resource, access.index),
-			        [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+			        [&]() { return LoadWordInBounds(ctx, access.resource, access.index, mem.glc); });
 		    }
 		    return ConstructU32Composite(state, components, values);
 	    });
@@ -1015,7 +1050,7 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			EmitIfCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
 			                [&]() {
 				                StoreWordInBounds(ctx, access.resource, access.index,
-				                                  ctx.Arg(inst, component + 1u));
+				                                  ctx.Arg(inst, component + 1u), mem.glc);
 			                });
 		}
 	});
@@ -1124,9 +1159,8 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 			           const auto value = state.builder.AllocateId();
-			           state.builder.AddFunction(
-			               {OpLoad, TypeU32(state), value,
-			                EmitMemoryElementPointer(state, access, element)});
+			           AddLoad(ctx, TypeU32(state), value,
+			                        EmitMemoryElementPointer(state, access, element), mem.glc);
 			           return value;
 		           }));
 		return true;
@@ -1201,7 +1235,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction({OpStore, ctx.scratch_u32_variable, source});
 			source = state.builder.AllocateId();
 			state.builder.AddFunction({OpLoad, TypeU32(state), source, ctx.scratch_u32_variable});
-			target = EmitDsSwizzleTargetLane(state, EmitSubgroupLocalInvocationId(state),
+			target = EmitDsSwizzleTargetLane(state, EmitRawSubgroupInvocationId(state),
 			                                 inst.Arg(1).IsImmediate() ? inst.Arg(1).U32() : 0);
 		} else {
 			const auto index = Binary(
@@ -1210,7 +1244,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			           ConstantU32(state, 2)),
 			    ConstantU32(state, 31));
 			const auto base =
-			    Binary(state, OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
+			    Binary(state, OpBitwiseAnd, TypeU32(state), EmitRawSubgroupInvocationId(state),
 			           ConstantU32(state, ~31u));
 			target = Binary(state, OpBitwiseOr, TypeU32(state), base, index);
 		}

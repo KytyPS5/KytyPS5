@@ -234,6 +234,14 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.glc         = ((word0 >> 16u) & 1u) != 0;
 	inst.family      = Family::SMEM;
 	inst.opcode_id   = opcode;
+	if (opcode == 0x25u) {
+		inst.opcode = Opcode::S_MEMREALTIME;
+		SetRawWords(inst, code, word_index, 2);
+		DecodeScalarDestination(sdst, pc, inst.dst);
+		inst.src_count = 0;
+		return;
+	}
+
 	const auto* info = Detail::FindOpcode(SMEM_OPS, opcode);
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);

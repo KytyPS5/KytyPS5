@@ -31,6 +31,7 @@ public:
 	void     RequireCapability(uint32_t capability);
 	void     RequireExtension(const char* name);
 	uint32_t Import(const char* name);
+	uint32_t DebugString(const char* text);
 	uint32_t Type(uint32_t opcode, std::initializer_list<uint32_t> operands = {});
 	uint32_t Type(uint32_t opcode, const std::vector<uint32_t>& operands);
 	uint32_t DecoratedType(uint32_t opcode, std::initializer_list<uint32_t> operands,
@@ -73,6 +74,7 @@ private:
 	std::vector<uint32_t>                     m_memory_model;
 	std::vector<uint32_t>                     m_entry_points;
 	std::vector<uint32_t>                     m_execution_modes;
+	std::vector<uint32_t>                     m_debug_strings;
 	std::vector<uint32_t>                     m_debug;
 	std::vector<uint32_t>                     m_annotations;
 	std::vector<uint32_t>                     m_declarations;

@@ -1,3 +1,5 @@
+#include <cinttypes>
+#include <atomic>
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 

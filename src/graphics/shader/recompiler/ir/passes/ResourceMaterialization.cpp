@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -410,6 +411,21 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		}
 	}
 	return true;
+}
+
+std::optional<uint64_t> DeriveFlatWindowBase(const Program& program, const ResourceSnapshot& next) {
+	uint64_t lowest = 0;
+	for (uint32_t index = 0; index < program.info.buffers.size() && index < next.buffers.size();
+	     index++) {
+		ShaderBufferResource descriptor {};
+		if (!DecodeBufferDescriptor(next.buffers[index], descriptor)) {
+			continue;
+		}
+		if (const auto base = descriptor.Base48(); base != 0 && (lowest == 0 || base < lowest)) {
+			lowest = base;
+		}
+	}
+	return lowest != 0 ? std::optional<uint64_t> {lowest} : std::nullopt;
 }
 
 bool MaterializeResources(const Program& program, const SrtRuntime& runtime,

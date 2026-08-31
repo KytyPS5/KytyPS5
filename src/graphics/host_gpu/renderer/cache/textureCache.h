@@ -65,6 +65,9 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	[[nodiscard]] bool HasPendingCpuRead(uint64_t address, uint64_t size);
+	// GPU command lane only; publish image bytes before releasing CPU read protection.
+	void                     ReadMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
 
@@ -120,6 +123,7 @@ private:
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
 	void                      UntrackImage(ImageId id);
+	void                             UntrackCpuRead(Image& image);
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);

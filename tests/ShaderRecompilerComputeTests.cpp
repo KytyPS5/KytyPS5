@@ -146,6 +146,16 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  static uint64_t StagingCapacity(BufferCache &cache) {
+    return cache.m_staging_buffer.Size();
+  }
+
+  static vk::Buffer UploadCopies(BufferCache &cache, Buffer &buffer,
+                                 std::span<vk::BufferCopy> copies,
+                                 uint64_t size) {
+    return cache.UploadCopies(buffer, copies, size);
+  }
+
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
@@ -3062,6 +3072,286 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckPrivateBufferUpload() {
+    constexpr const char *name = "PrivateBufferUpload";
+    constexpr uint64_t base = 0x207000000ull;
+    constexpr uint64_t bytes = 0x4000;
+    EnsureRuntimeContext();
+    Require(name, "code allocation",
+            LibKernel::Memory::AllocateProgramMemory(
+                base, bytes, Common::VirtualMemory::Mode::ReadWrite,
+                "upload-code") == base,
+            "code allocation failed");
+    Require(name, "runtime allocation",
+            LibKernel::Memory::AllocateRuntimeMemory(
+                base + bytes, bytes, Common::VirtualMemory::Mode::ReadWrite,
+                "upload-runtime", true) == base + bytes,
+            "adjacent runtime allocation failed");
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), bytes, bytes,
+                0, &direct_offset) == 0,
+            "direct allocation failed");
+    void *direct = reinterpret_cast<void *>(base + bytes * 2);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &direct, bytes, 0x3, 0x10, direct_offset, bytes) == 0 &&
+                direct == reinterpret_cast<void *>(base + bytes * 2),
+            "adjacent direct map failed");
+    std::vector<uint32_t> expected(bytes * 3 / 4);
+    for (size_t i = 0; i < expected.size(); ++i)
+      expected[i] = 0xabc00000u + uint32_t(i);
+    std::memcpy(reinterpret_cast<void *>(base), expected.data(), bytes * 3);
+    LibKernel::Memory::SetProgramMemoryProtection(
+        base, bytes, Common::VirtualMemory::Mode::Read);
+    uint32_t probe = 0;
+    Require(name, "no backing alias",
+            !LibKernel::Memory::TryReadBacking(base, &probe, 4) &&
+                !LibKernel::Memory::TryReadPrtBacking(base, &probe, 4),
+            "test accidentally uses direct or PRT backing");
+    std::vector<uint32_t> observed(expected.size());
+    Require(name, "protect direct",
+            LibKernel::Memory::ProtectGuestHostMemory(
+                base + bytes * 2, bytes, Common::VirtualMemory::Mode::NoAccess),
+            "direct protection failed");
+    Require(name, "mixed private/protected alias",
+            LibKernel::Memory::TryReadGpuUploadMemory(base, observed.data(),
+                                                      bytes * 3) &&
+                observed == expected,
+            "mixed private/direct reads faulted or changed bytes");
+    Require(
+        name, "restore direct",
+        LibKernel::Memory::ProtectGuestHostMemory(
+            base + bytes * 2, bytes, Common::VirtualMemory::Mode::ReadWrite),
+        "direct restore failed");
+    Require(name, "protect private",
+            LibKernel::Memory::ProtectGuestHostMemory(
+                base + bytes, bytes, Common::VirtualMemory::Mode::NoAccess),
+            "private protection failed");
+    Require(name, "no recursive private fault",
+            !LibKernel::Memory::TryReadGpuUploadMemory(base + bytes, &probe, 4),
+            "protected private memory was read");
+    Require(name, "restore private",
+            LibKernel::Memory::ProtectGuestHostMemory(
+                base + bytes, bytes, Common::VirtualMemory::Mode::ReadWrite),
+            "private restore failed");
+    Require(
+        name, "unmapped rejected",
+        !LibKernel::Memory::TryReadGpuUploadMemory(base + bytes * 3, &probe, 4),
+        "unmapped memory was accepted");
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      resources.MapMemory(base, bytes * 3);
+      auto &cache = resources.GetBufferCache();
+      const auto read = [&](vk::Buffer source, uint64_t offset,
+                            uint64_t count) {
+        auto output = CreateHostBuffer(name, count * 4,
+                                       vk::BufferUsageFlagBits::eTransferDst,
+                                       std::vector<uint32_t>(count));
+        vk::BufferCopy copy{offset, 0, count * 4};
+        scheduler.Current().Handle().copyBuffer(source, output.buffer, 1,
+                                                &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = output.buffer;
+        barrier.size = count * 4;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+            nullptr);
+        scheduler.Finish();
+        auto result = ReadBuffer(name, output, count);
+        DestroyBuffer(&output);
+        return result;
+      };
+      // Exceeds the small-uniform fast path and crosses two private allocation
+      // kinds.
+      auto [buffer, offset] = cache.ObtainBuffer(base, bytes * 3, false, false);
+      Require(name, "staging upload",
+              read(buffer->Handle(), offset, expected.size()) == expected,
+              "private code/runtime bytes were not uploaded exactly");
+      // Oversize reservation forces the real temporary-buffer branch;
+      // only64bytes are copied.
+      std::array<vk::BufferCopy, 1> copies{
+          {{0, buffer->Offset(base + 32), 64}}};
+      auto temporary = BufferCacheTestAccess::UploadCopies(
+          cache, *buffer, copies,
+          BufferCacheTestAccess::StagingCapacity(cache) + 4);
+      Require(name, "temporary upload",
+              read(temporary, copies[0].srcOffset, 16) ==
+                  std::vector<uint32_t>(expected.begin() + 8,
+                                        expected.begin() + 24),
+              "temporary upload lost private memory bytes");
+      resources.UnmapMemory(base, bytes * 3);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "free code", LibKernel::Memory::FreeGuestMemory(base, bytes),
+            "code free failed");
+    Require(name, "free runtime",
+            LibKernel::Memory::FreeGuestMemory(base + bytes, bytes),
+            "runtime free failed");
+    Require(name, "unmap direct",
+            LibKernel::Memory::KernelMunmap(base + bytes * 2, bytes) == 0,
+            "direct unmap failed");
+    Require(
+        name, "release direct",
+        LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, bytes) == 0,
+        "direct release failed");
+    std::printf("[vulkan]  %-32s ok\n", name);
+  }
+
+  void CheckLinearImageCpuReadback() {
+    constexpr const char *name = "LinearImageCpuReadback";
+    constexpr uint64_t base = 0x206000000ull;
+    constexpr uint64_t bytes = 0x20000;
+    constexpr uint64_t pixels = base + 0x100;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), bytes, bytes,
+                0, &direct_offset) == 0,
+            "direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, bytes, 0x3, 0x10, direct_offset, bytes) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0x5a, bytes);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      resources.MapMemory(base, bytes);
+      auto &cache = resources.GetTextureCache();
+      TextureCacheTestAccess::SetLinearReadback(cache, false);
+      const auto create = [&](uint64_t address, uint32_t width, uint32_t height,
+                              uint64_t size) {
+        TextureCache::ImageDesc desc{};
+        desc.type = TextureCache::BindingType::Storage;
+        desc.info.data = {address, size};
+        desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+        desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+        desc.info.extent = {width, height, 1};
+        desc.info.pitch = width;
+        desc.info.bytes_per_block = 16;
+        desc.info.mip_layout[0] = {0, size, width, height};
+        desc.view_info.format = desc.info.pixel_format;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        const auto id = cache.FindImage(desc);
+        (void)cache.FindTexture(id, desc);
+        return id;
+      };
+      const auto large = create(pixels, 64, 64, 65536);
+      const auto small_image = create(base + 0x40, 1, 1, 32);
+      const std::array<float, 4> color{1, .179931640625f, .18994140625f,
+                                       .219970703125f};
+      const auto clear = [&](ImageId id, const std::array<float, 4> &value) {
+        auto &image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        const vk::ClearColorValue native(value);
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor,
+                                              0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &native,
+            1, &range);
+        cache.MarkGpuWritten(id);
+      };
+      clear(large, color);
+      clear(small_image, color);
+      auto [neighbor, neighbor_offset] =
+          resources.GetBufferCache().ObtainBuffer(base + 0x80, 4, true, true);
+      neighbor->Fill(neighbor_offset, 4, 0x12345678);
+      Require(name, "demand only",
+              cache.HasPendingCpuRead(base, 1) &&
+                  !TextureCacheTestAccess::PendingDownload(cache, large),
+              "read tracking requires the global eager readback option");
+      std::array<float, 4> before{};
+      LibKernel::Memory::TryReadBacking(pixels, before.data(), sizeof(before));
+      Require(name, "unpublished before fault", before != color,
+              "test did not retain stale CPU bytes before the fault");
+      // Fault outside either image, but on their shared head page.
+      Require(name, "read fault",
+              resources.HandleFault(PageFaultAccess::Read, base),
+              "shared-page read fault was not handled");
+      std::vector<std::array<float, 4>> values(4096);
+      LibKernel::Memory::TryReadBacking(pixels, values.data(), 65536);
+      std::array<float, 4> small_value{};
+      LibKernel::Memory::TryReadBacking(base + 0x40, small_value.data(),
+                                        sizeof(small_value));
+      Require(name, "completed publication",
+              small_value == color &&
+                  std::all_of(values.begin(), values.end(),
+                              [&](const auto &v) { return v == color; }) &&
+                  !cache.HasPendingCpuRead(pixels, 65536),
+              "CPU resumed before all finite GPU colors were published");
+      std::array<uint8_t, 16> padding{};
+      LibKernel::Memory::TryReadBacking(base + 0x50, padding.data(),
+                                        padding.size());
+      Require(name, "padding",
+              std::all_of(padding.begin(), padding.end(),
+                          [](uint8_t b) { return b == 0x5a; }) &&
+                  *reinterpret_cast<volatile uint8_t *>(base) == 0x5a &&
+                  *reinterpret_cast<volatile uint32_t *>(base + 0x80) ==
+                      0x12345678,
+              "readback overwrote padding or kept a shared page inaccessible");
+      // Re-arm on a later GPU write, then perform a partial CPU write.
+      const std::array<float, 4> next{1, .25f, .5f, .75f};
+      clear(large, next);
+      Require(name, "write fault",
+              resources.HandleFault(PageFaultAccess::Write, pixels + 4),
+              "partial CPU write fault was not handled");
+      *reinterpret_cast<volatile float *>(pixels + 4) = .125f;
+      std::array<float, 4> modified{};
+      LibKernel::Memory::TryReadBacking(pixels, modified.data(),
+                                        sizeof(modified));
+      Require(name, "partial write preservation",
+              modified == std::array<float, 4>{1, .125f, .5f, .75f},
+              "partial CPU write lost the other GPU-produced channels");
+      // Reacquiring uploads that CPU write and arms read tracking exactly once.
+      const auto again = create(pixels, 64, 64, 65536);
+      Require(name, "same owner", again == large,
+              "reacquisition replaced the owner");
+      Require(name, "repeat read",
+              resources.HandleFault(PageFaultAccess::Read, pixels),
+              "reacquired storage read failed");
+      LibKernel::Memory::TryReadBacking(pixels, before.data(), sizeof(before));
+      Require(name, "CPU upload preserved", before == modified,
+              "reacquisition restored stale buffer mirror contents");
+      clear(small_image, next);
+      resources.UnmapMemory(base, bytes);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, bytes) == 0,
+            "unmap failed");
+    Require(
+        name, "release",
+        LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, bytes) == 0,
+        "release failed");
+    std::printf("[vulkan]  %-32s ok\n", name);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -25050,6 +25340,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-cpu-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLinearImageCpuReadback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--private-buffer-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPrivateBufferUpload();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {

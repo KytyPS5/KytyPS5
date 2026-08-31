@@ -16,6 +16,8 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// A partial CPU write must first preserve the other GPU-authored pixels too.
+	SynchronizeCpuImages(fault_vaddr, fault_size);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -29,9 +31,25 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	SynchronizeCpuImages(vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
+}
+
+void GpuResourceManager::SynchronizeCpuImages(uint64_t vaddr, uint64_t size) {
+	if (!m_texture_cache.HasPendingCpuRead(vaddr, size)) {
+		return;
+	}
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported image readback from an asynchronous GPU completion\n");
+	}
+	const auto read = [this, vaddr, size] { m_texture_cache.ReadMemory(vaddr, size); };
+	if (m_gpu == nullptr) {
+		read();
+	} else {
+		m_gpu->SendCommandSync(read);
+	}
 }
 
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {

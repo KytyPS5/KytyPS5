@@ -557,6 +557,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	add_test(NAME shader_recompiler_image_cpu_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-cpu-readback-only)
+	add_test(NAME buffer_cache_private_upload
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --private-buffer-upload-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane

@@ -993,6 +993,7 @@ struct GraphicsCase {
   std::vector<u32> pixel_interpolator_settings;
   bool pixel_no_perspective = false;
   std::vector<u32> vertices;
+  bool dx10_clamp = false;
 };
 
 struct CompiledShader {
@@ -1323,6 +1324,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           ? 1u
           : static_cast<u32>(test.pixel_interpolator_settings.size());
   pixel_info.ps_no_perspective = test.pixel_no_perspective;
+  pixel_info.dx10_clamp = test.dx10_clamp;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -14604,6 +14606,64 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ComputeDx10ClampF16Nan(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7e007e00u); // packed qNaN
+  AppendVMovLiteral(&code, 1, 0x40004000u); // packed +2.0h
+  AppendVMovLiteral(&code, 2, 0x12347e00u); // scalar qNaN
+  AppendVMovLiteral(&code, 3, 0x00004000u); // scalar +2.0h
+
+  AppendVop3p(&code, 0x11, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+  AppendVop3p(&code, 0x12, 11, Vgpr(0), Vgpr(1), 0, 0x3);
+  code.push_back(EncodeVop2(0x3a, 2, Vgpr(2), 3));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreVgpr(&code, 2, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeDx10ClampF16NanEnabled"
+                      : "ComputeDx10ClampF16NanDisabled";
+  test.code = std::move(code);
+  test.expected = enabled
+                      ? std::vector<u32>{0x00000000u, 0x40004000u,
+                                         0x12340000u}
+                      : std::vector<u32>{0x40004000u, 0x40004000u,
+                                         0x12344000u};
+  test.opcodes = {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
+                  O::V_MIN_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.dx10_clamp = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ComputeDx10ClampF32Nan(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7fc00000u); // qNaN
+  AppendVMovLiteral(&code, 1, 0x40000000u); // +2.0f
+  code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+  code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = enabled ? "ComputeDx10ClampF32NanEnabled"
+                      : "ComputeDx10ClampF32NanDisabled";
+  test.code = std::move(code);
+  test.expected = enabled ? std::vector<u32>{0x00000000u, 0x40000000u}
+                          : std::vector<u32>{0x40000000u, 0x40000000u};
+  test.opcodes = {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.dx10_clamp = enabled;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorMinMaxF16Ops() {
   using O = ShaderOpcode;
 
@@ -20822,6 +20882,35 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   return test;
 }
 
+GraphicsCase GraphicsDx10ClampF32Nan(bool enabled) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7fc00000u); // qNaN
+  AppendVMovLiteral(&code, 1, 0x40000000u); // +2.0f
+  AppendVMovLiteral(&code, 2, 0x3f400000u); // +0.75f
+  AppendVMovLiteral(&code, 3, 0x3f800000u); // +1.0f
+  code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+  code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(10, 11, 2, 3));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = enabled ? "GraphicsDx10ClampF32NanEnabled"
+                      : "GraphicsDx10ClampF32NanDisabled";
+  test.fragment_code = std::move(code);
+  test.expected_pixel = enabled
+                            ? std::vector<u32>{0x00000000u, 0x40000000u,
+                                               0x3f400000u, 0x3f800000u}
+                            : std::vector<u32>{0x40000000u, 0x40000000u,
+                                               0x3f400000u, 0x3f800000u};
+  test.opcodes = {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::EXP,
+                  O::S_ENDPGM};
+  test.dx10_clamp = enabled;
+  return test;
+}
+
 GraphicsCase GraphicsInterpolationExport() {
   using O = ShaderOpcode;
 
@@ -21181,6 +21270,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
+  cases.push_back(ComputeDx10ClampF16Nan(false));
+  cases.push_back(ComputeDx10ClampF16Nan(true));
+  cases.push_back(ComputeDx10ClampF32Nan(false));
+  cases.push_back(ComputeDx10ClampF32Nan(true));
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
@@ -21388,6 +21481,8 @@ std::vector<TestCase> MakeCases() {
 
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
+      GraphicsDx10ClampF32Nan(false),
+      GraphicsDx10ClampF32Nan(true),
       GraphicsInterpolationExport(),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
@@ -23775,6 +23870,46 @@ void CheckNativeMsaaState() {
   std::printf("[host]    %-32s ok\n", "NativeMsaaState");
 }
 
+void CheckComputeDx10ClampStaticKey() {
+  ShaderComputeInputInfo disabled{};
+  ShaderComputeInputInfo enabled{};
+  enabled.dx10_clamp = true;
+  std::vector<u32> disabled_key;
+  std::vector<u32> enabled_key;
+  BuildStageStaticKey(disabled, disabled_key);
+  BuildStageStaticKey(enabled, enabled_key);
+  Require("ComputeDx10ClampStaticKey", "pipeline cache separation",
+          disabled_key.size() == enabled_key.size() && disabled_key != enabled_key,
+          "DX10_CLAMP did not specialize the compute program cache key");
+  std::printf("[host]    %-32s ok\n", "ComputeDx10ClampStaticKey");
+}
+
+void CheckGraphicsDx10ClampStaticKeys() {
+  ShaderVertexInputInfo vertex_disabled{};
+  ShaderVertexInputInfo vertex_enabled{};
+  ShaderPixelInputInfo pixel_disabled{};
+  ShaderPixelInputInfo pixel_enabled{};
+  vertex_enabled.dx10_clamp = true;
+  pixel_enabled.dx10_clamp = true;
+
+  std::vector<u32> vertex_disabled_key;
+  std::vector<u32> vertex_enabled_key;
+  std::vector<u32> pixel_disabled_key;
+  std::vector<u32> pixel_enabled_key;
+  BuildStageStaticKey(vertex_disabled, vertex_disabled_key);
+  BuildStageStaticKey(vertex_enabled, vertex_enabled_key);
+  BuildStageStaticKey(pixel_disabled, pixel_disabled_key);
+  BuildStageStaticKey(pixel_enabled, pixel_enabled_key);
+
+  Require("GraphicsDx10ClampStaticKeys", "program cache separation",
+          vertex_disabled_key.size() == vertex_enabled_key.size() &&
+              vertex_disabled_key != vertex_enabled_key &&
+              pixel_disabled_key.size() == pixel_enabled_key.size() &&
+              pixel_disabled_key != pixel_enabled_key,
+          "DX10_CLAMP did not specialize the vertex and pixel program keys");
+  std::printf("[host]    %-32s ok\n", "GraphicsDx10ClampStaticKeys");
+}
+
 void CheckDepthHtileStencilCompatibility() {
   Require("DepthHtileStencilCompatibility", "disabled acceleration",
           depth_htile_stencil_acceleration_compatible(false, false, true),
@@ -25245,6 +25380,18 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dx10-clamp-only") == 0) {
+    VulkanHarness vulkan;
+    CheckComputeDx10ClampStaticKey();
+    CheckGraphicsDx10ClampStaticKeys();
+    RunCase(&vulkan, ComputeDx10ClampF16Nan(false));
+    RunCase(&vulkan, ComputeDx10ClampF16Nan(true));
+    RunCase(&vulkan, ComputeDx10ClampF32Nan(false));
+    RunCase(&vulkan, ComputeDx10ClampF32Nan(true));
+    RunGraphicsCase(&vulkan, GraphicsDx10ClampF32Nan(false));
+    RunGraphicsCase(&vulkan, GraphicsDx10ClampF32Nan(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -25289,6 +25436,8 @@ int main(int argc, char **argv) {
   CheckStorageTextureVolumeMipRegions();
   CheckStorageTextureGpuOwnedRebindState();
   CheckNativeMsaaState();
+  CheckComputeDx10ClampStaticKey();
+  CheckGraphicsDx10ClampStaticKeys();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
   CheckStencilAttachmentAccess();

@@ -339,6 +339,18 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 	}
 }
 
+IR::F32 Translator::ApplyDx10Nan(IR::F32 value) {
+	if (!current_dx10_clamp) {
+		return value;
+	}
+	// Inspect the payload instead of relying on an unordered floating-point comparison, which a
+	// host compiler may contract under relaxed rules. DX10 mode maps every NaN sign/payload to +0.
+	const auto magnitude =
+	    ir.BitwiseAnd(ir.BitCastU32(value), IR::U32(IR::Value(0x7fffffffu)));
+	const auto nan = ir.UGreaterThan(magnitude, IR::U32(IR::Value(0x7f800000u)));
+	return SelectF32(nan, IR::F32(IR::Value::F32(0.0f)), value);
+}
+
 IR::F32 Translator::ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value) {
 	if (operand.omod != 0u) {
 		float multiplier = 0.5f;
@@ -350,6 +362,7 @@ IR::F32 Translator::ApplyF32ResultModifiers(const Decoder::Operand& operand, IR:
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(multiplier)}));
 	}
 	if (operand.clamp) {
+		value = ApplyDx10Nan(value);
 		value = IR::F32(ir.Emit(IR::ValueOpcode::FPSaturate32, {value}));
 	}
 	return value;
@@ -1183,7 +1196,13 @@ bool TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto         typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size);
+		const bool dx10_clamp = options.compute != nullptr
+		                              ? options.compute->dx10_clamp
+		                          : options.pixel != nullptr ? options.pixel->dx10_clamp
+		                          : options.vertex != nullptr ? options.vertex->dx10_clamp
+		                                                       : false;
+		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size,
+		                      dx10_clamp);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

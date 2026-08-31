@@ -8,8 +8,12 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
 	const auto translate_lane = [&](bool high) {
-		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
-		const auto rhs = ReadF16LaneAsF32(inst.src1, high, true);
+		auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
+		auto rhs = ReadF16LaneAsF32(inst.src1, high, true);
+		if (quiet_snan) {
+			lhs = ApplyDx10Nan(lhs);
+			rhs = ApplyDx10Nan(rhs);
+		}
 		IR::F32    result;
 		if (accumulator) {
 			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high, true)}));
@@ -24,7 +28,7 @@ bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 	raw.omod    = 0u;
 	raw.clamp   = false;
 	auto result = PackHalf2x16(translate_lane(false), translate_lane(true));
-	if (quiet_snan) {
+	if (quiet_snan && !current_dx10_clamp) {
 		const auto quiet_snan_lane = [&](const Decoder::Operand& operand, bool high) {
 			const auto bits     = ReadU16LaneAsU32(operand, high, false);
 			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7c00u)));
@@ -101,8 +105,12 @@ bool Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 
 bool Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
-	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
-	const auto rhs = ReadF16AsF32(reverse ? inst.src0 : inst.src1);
+	auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
+	auto rhs = ReadF16AsF32(reverse ? inst.src0 : inst.src1);
+	if (opcode == IR::ValueOpcode::FPMin32 || opcode == IR::ValueOpcode::FPMax32) {
+		lhs = ApplyDx10Nan(lhs);
+		rhs = ApplyDx10Nan(rhs);
+	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {lhs, rhs})));
 	return true;
 }
@@ -110,9 +118,15 @@ bool Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode
 bool Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
+	const bool dx10_min_max = opcode == IR::ValueOpcode::FPMinTri32 ||
+	                          opcode == IR::ValueOpcode::FPMaxTri32 ||
+	                          opcode == IR::ValueOpcode::FPMedTri32;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
+		if (dx10_min_max) {
+			args[index] = ApplyDx10Nan(IR::F32(args[index]));
+		}
 	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
 	return true;
@@ -127,9 +141,14 @@ bool Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode op
 bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                              bool reverse) {
 	std::array<IR::Value, 2> args;
+	const bool dx10_min_max =
+	    opcode == IR::ValueOpcode::FPMin32 || opcode == IR::ValueOpcode::FPMax32;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto operand = SourceAt(inst, reverse ? 1u - index : index);
 		args[index]        = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
+		if (dx10_min_max) {
+			args[index] = ApplyDx10Nan(IR::F32(args[index]));
+		}
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1]}));
 	return true;
@@ -138,11 +157,17 @@ bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode o
 bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                               bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
+	const bool dx10_min_max = opcode == IR::ValueOpcode::FPMinTri32 ||
+	                          opcode == IR::ValueOpcode::FPMaxTri32 ||
+	                          opcode == IR::ValueOpcode::FPMedTri32;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
 		const auto type    = IR::ArgTypeOf(opcode, index);
 		args[index]        = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
 		                                                  : ReadOperand(operand, type);
+		if (dx10_min_max && type == IR::Type::F32) {
+			args[index] = ApplyDx10Nan(IR::F32(args[index]));
+		}
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
 	return true;

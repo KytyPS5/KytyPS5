@@ -12960,6 +12960,36 @@ TestCase ScalarFlbitI32B64Gpu() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarFlbitI32B32Gpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 0, 0x00000000u);
+  code.push_back(EncodeSop1(0x15, 20, 0));
+
+  AppendSMovLiteral(&code, 0, 0x0000ccccu);
+  code.push_back(EncodeSop1(0x15, 21, 0));
+
+  AppendSMovLiteral(&code, 0, 0x80000000u);
+  code.push_back(EncodeSop1(0x15, 22, 0));
+
+  AppendSMovLiteral(&code, 0, 0x7fffffffu);
+  code.push_back(EncodeSop1(0x15, 23, 0));
+
+  AppendStoreSgpr(&code, 20, 0);
+  AppendStoreSgpr(&code, 21, 1);
+  AppendStoreSgpr(&code, 22, 2);
+  AppendStoreSgpr(&code, 23, 3);
+  AppendEnd(&code);
+
+  return {"ScalarFlbitI32B32Gpu",
+          code,
+          {},
+          {0xffffffffu, 16, 0, 1},
+          {O::S_MOV_B32, O::S_FLBIT_I32_B32, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarSaveExecOps() {
   using O = ShaderOpcode;
 
@@ -16088,6 +16118,36 @@ TestCase VectorVop3CompareGtU64OnGpu() {
   test.compute_info.wave_size = 32;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorVopcCompareLtU64OnGpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 0, 5);
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovU32(&code, 2, 1);
+
+  AppendSMovLiteral(&code, 4, 4);
+  AppendSMovLiteral(&code, 5, 0);
+  code.push_back(EncodeVopc(0xe1, 4, 0));
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 2));
+  AppendStoreVgpr(&code, 3, 0);
+
+  AppendSMovLiteral(&code, 4, 6);
+  code.push_back(EncodeVopc(0xe1, 4, 0));
+  code.push_back(EncodeVop2(0x01, 4, InlineU32(0), 2));
+  AppendStoreVgpr(&code, 4, 1);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCompareLtU64OnGpu",
+                code,
+                {},
+                {1, 0},
+                {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_LT_U64,
+                 O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMP_LT_U64 vcc_lo, s4, v0", 2}};
   return test;
 }
 
@@ -21148,6 +21208,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarMovB32SpecialAliases);
   AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
+  AddCase(ScalarFlbitI32B32Gpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   AddCase(ScalarGetpcWritesNextInstructionPc);
@@ -21238,6 +21299,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
+  AddCase(VectorVopcCompareLtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
   AddCase(VectorVopcCmpxNeU64CapturedExecMask);
   AddCase(VectorVop3CmpxNeI64CapturedExecMask);

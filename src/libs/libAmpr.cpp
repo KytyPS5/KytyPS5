@@ -2665,6 +2665,7 @@ LIB_DEFINE(InitAmpr_1_Ampr) {
 	LIB_FUNC("dXPaz65HNmk", Ampr::CommandBufferPushMarker);
 	LIB_FUNC("mv0O8Zg0woU", Ampr::CommandBufferPopMarker);
 	LIB_FUNC("DLfoNxTFNVk", Ampr::CommandBufferWaitOnAddress);
+	LIB_FUNC("V7GQTEeUfhw", Ampr::CommandBufferWaitOnAddress);
 	LIB_FUNC("cQb8Zr8Q0Y0", Ampr::CommandBufferWaitOnCounter);
 	LIB_FUNC("j0+3uJMxYJY", Ampr::CommandBufferWriteAddress);
 	LIB_FUNC("sJXyWHjP-F8", Ampr::CommandBufferWriteAddressOnCompletion);

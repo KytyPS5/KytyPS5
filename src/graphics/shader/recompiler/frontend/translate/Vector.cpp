@@ -99,6 +99,9 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_EQ_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, false);
 			return true;
+		case O::V_CMP_LT_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan64, IR::Type::U64, false, false);
+			return true;
 		case O::V_CMP_GT_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan64, IR::Type::U64, false, false);
 			return true;

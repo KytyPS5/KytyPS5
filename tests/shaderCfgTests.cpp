@@ -3969,6 +3969,37 @@ void TestNewShaderDecoderArchitecture() {
             cmp_eq_u64.src1.kind == OperandKind::VccLo,
         "decoder rejected the captured VOP3 V_CMP_EQ_U64 instruction");
 
+  const uint32_t completed_pr_opcodes[] = {
+      EncodeSop1(0x15, 0, 1),   // s_flbit_i32_b32 s0, s1
+      EncodeVopc(0xe1, 128, 0), // v_cmp_lt_u64 vcc, 0, v[0:1]
+      EncodeSopp(0x01, 0),
+  };
+  Instruction flbit_i32_b32;
+  ShaderRecompiler::Decoder::DecodeInstruction(completed_pr_opcodes, 0u,
+                                               flbit_i32_b32);
+  Instruction cmp_lt_u64;
+  ShaderRecompiler::Decoder::DecodeInstruction(completed_pr_opcodes, 1u,
+                                               cmp_lt_u64);
+  Check(flbit_i32_b32.family == Family::SOP1 &&
+            flbit_i32_b32.opcode == Opcode::S_FLBIT_I32_B32 &&
+            flbit_i32_b32.dst.kind == OperandKind::Sgpr &&
+            flbit_i32_b32.dst.reg == 0u &&
+            flbit_i32_b32.src0.kind == OperandKind::Sgpr &&
+            flbit_i32_b32.src0.reg == 1u &&
+            cmp_lt_u64.family == Family::VOPC &&
+            cmp_lt_u64.opcode == Opcode::V_CMP_LT_U64 &&
+            cmp_lt_u64.dst.kind == OperandKind::VccLo,
+        "decoder rejected completed PR #427 scalar/vector opcodes");
+
+  const auto completed_options = MakeCompileOptions(ShaderType::Compute);
+  const auto completed_result =
+      ShaderRecompiler::Recompile(completed_pr_opcodes, completed_options);
+  Check(Common::ContainsStr(completed_result.decoded_dump,
+                            "S_FLBIT_I32_B32 s0, s1") &&
+            Common::ContainsStr(completed_result.decoded_dump,
+                                "V_CMP_LT_U64 vcc_lo, 0, v0"),
+        "completed PR #427 opcodes were absent from the decoded shader");
+
   const uint32_t ffbh_i32_code[] = {0x7e1c770eu};
   Instruction ffbh_i32;
   ShaderRecompiler::Decoder::DecodeInstruction(ffbh_i32_code, 0u, ffbh_i32);

@@ -78,7 +78,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 int KYTY_SYSV_ABI AgcSuspendPoint();
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation);
 uint64_t KYTY_SYSV_ABI  AgcDcbContextStateOpGetSize(uint32_t operation);
-uint64_t KYTY_SYSV_ABI  AgcGetIsTrinityMode();
+void KYTY_SYSV_ABI      AgcGetIsTrinityMode(uint8_t* result);
 
 uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner();
 uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength();

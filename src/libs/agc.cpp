@@ -894,8 +894,12 @@ static bool is_native_reg_indirect_packet(const uint32_t* cmd, RegIndirectPacket
 	return ((cmd[0] >> 8u) & 0xffu) == reg_indirect_native_op(type);
 }
 
+static constexpr bool is_trinity_mode() {
+	return false;
+}
+
 static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
-	return (type == RegIndirectPacket::Uc && AgcGetIsTrinityMode() != 0 ? 1u : 0u);
+	return (type == RegIndirectPacket::Uc && is_trinity_mode() ? 1u : 0u);
 }
 
 static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t num_regs,
@@ -1681,9 +1685,8 @@ uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
 	return static_cast<uint64_t>(context_state_op_size_dw(operation)) * sizeof(uint32_t);
 }
 
-uint64_t KYTY_SYSV_ABI AgcGetIsTrinityMode() {
-	// PS5 Pro?
-	return 0;
+void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
+	*result = is_trinity_mode();
 }
 
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);

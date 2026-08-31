@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -799,6 +800,27 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
+		}
+
+		// Remapping guest memory is not atomic: MapBacking/UnmapBacking go through placeholders, so
+		// the pages are briefly absent and a guest thread touching them in that window faults on
+		// memory that is committed both before and after. Retry the instruction rather than abort,
+		// bounded per address so a genuinely bad access still fails.
+		Libs::LibKernel::Memory::VirtualQueryInfo guest {};
+		if (Libs::LibKernel::Memory::KernelVirtualQuery(
+		        reinterpret_cast<const void*>(info->access_violation_vaddr), 0, &guest,
+		        sizeof(guest)) == 0 &&
+		    guest.is_committed != 0) {
+			thread_local uint64_t last_vaddr = 0;
+			thread_local uint32_t retries    = 0;
+			if (info->access_violation_vaddr != last_vaddr) {
+				last_vaddr = info->access_violation_vaddr;
+				retries    = 0;
+			}
+			if (++retries <= 4096) {
+				std::this_thread::yield();
+				return true;
+			}
 		}
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

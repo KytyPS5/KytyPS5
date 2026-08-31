@@ -61,7 +61,8 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
+	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
+	    format > Prospero::BufferFormat::kBc7Srgb) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&

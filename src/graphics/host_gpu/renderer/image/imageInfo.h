@@ -433,15 +433,8 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 	switch (format) {
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
-		// contents. Reject non-finite bit patterns rather than materializing them.
-		case vk::Format::eR32Sfloat: {
-			const auto value = std::bit_cast<float>(packed);
-			if (!std::isfinite(value)) {
-				return false;
-			}
-			next.float32[0] = value;
-			break;
-		}
+		// contents.
+		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
 		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
 		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
 		case vk::Format::eR8G8B8A8Srgb:

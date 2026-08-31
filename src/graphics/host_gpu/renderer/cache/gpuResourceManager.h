@@ -33,6 +33,8 @@ public:
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
+	[[nodiscard]] uint64_t GetPageSize() const { return m_page_manager.GetPageSize(); }
+
 private:
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;

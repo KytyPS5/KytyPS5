@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/deferralBlock.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -96,6 +97,11 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 
 bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
+}
+
+size_t CommandScheduler::PendingOperationCount() const {
+	std::lock_guard lock(m_operation_mutex);
+	return m_pending_operations.size();
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
@@ -221,6 +227,9 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
+	if (DeferralBlocked()) {
+		return;
+	}
 	if (refresh_gpu_tick) {
 		m_master.Refresh();
 	}
@@ -402,6 +411,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuCrashDiagnosticsDump(graphics, "vkQueueSubmit");
+		}
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,

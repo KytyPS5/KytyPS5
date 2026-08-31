@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
+#include <source_location>
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -64,7 +65,8 @@ public:
 	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
+	                                                   vk::AccessFlagBits::eMemoryWrite,
+	              std::source_location where = std::source_location::current());
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.

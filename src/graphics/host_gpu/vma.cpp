@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -38,6 +39,8 @@ MemoryStats g_memory_stats;
 void TrackAllocationImpl(const VulkanMemory& memory) {
 	g_memory_stats.allocated[memory.type] += memory.requirements.size;
 	g_memory_stats.count[memory.type]++;
+
+	constexpr uint64_t big = 0ull;
 }
 
 void UntrackAllocationImpl(const VulkanMemory& memory) {
@@ -113,6 +116,18 @@ void GraphicContext::LogMemoryBudget() const {
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
 	}
+
+	VmaTotalStatistics stats {};
+	vmaCalculateStatistics(allocator, &stats);
+	for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+		const auto vma_bytes = static_cast<uint64_t>(stats.memoryType[i].statistics.allocationBytes);
+		const auto vma_count = static_cast<uint64_t>(stats.memoryType[i].statistics.allocationCount);
+		if (vma_bytes == 0 && vma_count == 0) {
+			continue;
+		}
+		const auto tracked       = g_memory_stats.allocated[i].load(std::memory_order_relaxed);
+		const auto tracked_count = g_memory_stats.count[i].load(std::memory_order_relaxed);
+	}
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
@@ -129,7 +144,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
 		                      vk::MemoryHeapFlagBits::eDeviceLocal);
 		if (!discrete || device_local) {
-			usage += budgets[heap].usage;
+			usage += budgets[heap].statistics.allocationBytes;
 		}
 	}
 	return usage;

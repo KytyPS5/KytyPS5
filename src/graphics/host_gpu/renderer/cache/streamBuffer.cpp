@@ -1,11 +1,14 @@
+#include <cinttypes>
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vma.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -73,12 +76,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 	buffer_info.sharingMode = vk::SharingMode::eExclusive;
 
-	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
-	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -188,10 +187,13 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
-                      vk::AccessFlags destination_after) {
+                      vk::AccessFlags destination_after, std::source_location where) {
 	if (size == 0 || source_offset > source.m_size || size > source.m_size - source_offset ||
 	    destination_offset > m_size || size > m_size - destination_offset) {
-		EXIT("Buffer: invalid copy range\n");
+		EXIT("Buffer: invalid copy range from %s:%u: src_size=0x%" PRIx64 " src_off=0x%" PRIx64
+		     " dst_size=0x%" PRIx64 " dst_off=0x%" PRIx64 " size=0x%" PRIx64 "\n",
+		     where.file_name(), where.line(), source.m_size, source_offset, m_size,
+		     destination_offset, size);
 	}
 	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
 	    destination_offset < source_offset + size) {
@@ -227,6 +229,11 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");
+	}
+	if (offset > m_size || size > m_size - offset) {
+		EXIT("Buffer: fill range outside the buffer, offset=0x%" PRIx64 " size=0x%" PRIx64
+		     " capacity=0x%" PRIx64 "\n",
+		     offset, size, m_size);
 	}
 	auto& command = Scheduler().Current();
 	command.EndRendering();

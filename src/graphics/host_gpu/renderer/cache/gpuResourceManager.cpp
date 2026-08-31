@@ -1,8 +1,14 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -14,6 +20,23 @@ GpuResourceManager::~GpuResourceManager() = default;
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	constexpr uint64_t fault_size = 8;
 	if (!IsMapped(fault_vaddr, fault_size)) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			uint64_t region_start = 0;
+			uint64_t region_size  = 0;
+			uint32_t protect      = 0;
+			uint32_t state        = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			MEMORY_BASIC_INFORMATION mbi {};
+			if (VirtualQuery(reinterpret_cast<const void*>(fault_vaddr), &mbi, sizeof(mbi)) != 0) {
+				region_start = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+				region_size  = static_cast<uint64_t>(mbi.RegionSize);
+				protect      = static_cast<uint32_t>(mbi.Protect);
+				state        = static_cast<uint32_t>(mbi.State);
+			}
+#endif
+			std::shared_lock lock(m_mapped_ranges_mutex);
+		}
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {

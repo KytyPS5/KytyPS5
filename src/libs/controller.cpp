@@ -45,15 +45,22 @@ struct PadVibrationParam {
 };
 
 struct ControllerState {
+	struct Touch {
+		uint8_t  id   = 0;
+		bool     down = false;
+		uint16_t x    = 0;
+		uint16_t y    = 0;
+	};
+
 	uint64_t time                                  = 0;
 	uint32_t buttons                               = 0;
 	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	Touch    touch[2];
 };
 
 class GameController {
 public:
-	GameController()          = default;
-	virtual ~GameController() = default;
+	GameController() = default;
 
 	KYTY_CLASS_NO_COPY(GameController);
 
@@ -62,6 +69,7 @@ public:
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
+	void TouchPad(int id, int finger, bool down, float x, float y);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
@@ -71,31 +79,23 @@ public:
 private:
 	static constexpr uint32_t STATES_MAX = 64;
 
-	struct StatePrivate {
-		bool obtained = false;
-	};
-
-	void                          CheckActive();
-	[[nodiscard]] ControllerState GetLastState() const;
-	void                          AddState(const ControllerState& state);
+	void CheckActive();
+	void AddState();
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
 	int              m_connected_count = 0;
+	ControllerState  m_state;
 	ControllerState  m_states[STATES_MAX];
-	StatePrivate     m_private[STATES_MAX];
-	ControllerState  m_last_state;
-	uint32_t         m_states_num  = 0;
-	uint32_t         m_first_state = 0;
+	bool             m_obtained[STATES_MAX] {};
+	uint32_t         m_states_num    = 0;
+	uint32_t         m_first_state   = 0;
+	uint8_t          m_next_touch_id = 1;
 };
 
 static GameController* g_controller = nullptr;
-
-static uint8_t pad_connected_count_to_u8(int connected_count) {
-	return static_cast<uint8_t>(connected_count > 255 ? 255 : connected_count);
-}
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
@@ -103,19 +103,25 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons                = state.buttons;
-	data->left_stick_x           = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y           = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x          = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y          = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2      = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2      = state.axes[static_cast<int>(Axis::TriggerRight)];
-	data->orientation_w          = 1.0f;
-	data->touch_data_touch0_id   = 1;
-	data->touch_data_touch1_id   = 2;
+	data->buttons           = state.buttons;
+	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->orientation_w     = 1.0f;
+	for (const auto& touch: state.touch) {
+		if (touch.down) {
+			auto& output = data->touch_data.touch[data->touch_data.touch_num++];
+			output.x     = touch.x;
+			output.y     = touch.y;
+			output.id    = touch.id;
+		}
+	}
 	data->connected              = connected;
 	data->timestamp              = state.time;
-	data->connected_count        = pad_connected_count_to_u8(connected_count);
+	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
 	data->device_unique_data_len = 0;
 }
 
@@ -155,7 +161,6 @@ void GameController::Disconnect(int id) {
 }
 
 void GameController::CheckActive() {
-	bool reset         = false;
 	int  new_active_id = -1;
 	bool new_connected = false;
 
@@ -170,46 +175,29 @@ void GameController::CheckActive() {
 		new_connected = true;
 	}
 
-	const bool was_connected = m_connected;
-
-	if (m_connected != new_connected || m_active_id != new_active_id) {
-		m_active_id = new_active_id;
-		m_connected = new_connected;
-		if (!was_connected && new_connected) {
-			m_connected_count++;
-		}
-		reset = true;
+	if (m_connected == new_connected && m_active_id == new_active_id) {
+		return;
 	}
-
-	if (reset) {
-		m_states_num = 0;
-		m_last_state = ControllerState();
+	if (!m_connected && new_connected) {
+		m_connected_count++;
 	}
+	m_active_id     = new_active_id;
+	m_connected     = new_connected;
+	m_state         = {};
+	m_states_num    = 0;
+	m_first_state   = 0;
+	m_next_touch_id = 1;
 }
 
-ControllerState GameController::GetLastState() const {
-	if (m_states_num == 0) {
-		return m_last_state;
-	}
-
-	auto last = (m_first_state + m_states_num - 1) % STATES_MAX;
-
-	return m_states[last];
-}
-
-void GameController::AddState(const ControllerState& state) {
+void GameController::AddState() {
 	if (m_states_num >= STATES_MAX) {
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;
 	}
 
-	auto index = (m_first_state + m_states_num) % STATES_MAX;
-
-	m_states[index] = state;
-	m_last_state    = state;
-
-	m_private[index].obtained = false;
-
+	const auto index  = (m_first_state + m_states_num) % STATES_MAX;
+	m_states[index]   = m_state;
+	m_obtained[index] = false;
 	m_states_num++;
 }
 
@@ -218,17 +206,11 @@ void GameController::Button(int id, uint32_t button, bool down) {
 
 	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
-		auto state = GetLastState();
+		m_state.time = LibKernel::KernelGetProcessTime();
 
-		state.time = LibKernel::KernelGetProcessTime();
+		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
 
-		if (down) {
-			state.buttons |= button;
-		} else {
-			state.buttons &= ~button;
-		}
-
-		AddState(state);
+		AddState();
 	}
 }
 
@@ -236,33 +218,25 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
-		auto state = GetLastState();
-
-		state.time = LibKernel::KernelGetProcessTime();
+		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
 
 		EXIT_IF(axis_id < 0 || axis_id >= static_cast<int>(Controller::Axis::AxisMax));
 
-		state.axes[axis_id] = value;
+		m_state.axes[axis_id] = value;
 
+		uint32_t trigger = 0;
 		if (axis == Controller::Axis::TriggerLeft) {
-			if (value > 0) {
-				state.buttons |= PAD_BUTTON_L2;
-			} else {
-				state.buttons &= ~PAD_BUTTON_L2;
-			}
+			trigger = PAD_BUTTON_L2;
+		} else if (axis == Controller::Axis::TriggerRight) {
+			trigger = PAD_BUTTON_R2;
+		}
+		if (trigger != 0) {
+			m_state.buttons = value > 0 ? m_state.buttons | trigger : m_state.buttons & ~trigger;
 		}
 
-		if (axis == Controller::Axis::TriggerRight) {
-			if (value > 0) {
-				state.buttons |= PAD_BUTTON_R2;
-			} else {
-				state.buttons &= ~PAD_BUTTON_R2;
-			}
-		}
-
-		AddState(state);
+		AddState();
 	}
 }
 
@@ -270,21 +244,45 @@ void GameController::RightStick(int id, int x, int y) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
-		auto state                                 = GetLastState();
-		state.time                                 = LibKernel::KernelGetProcessTime();
-		state.axes[static_cast<int>(Axis::RightX)] = x;
-		state.axes[static_cast<int>(Axis::RightY)] = y;
-		AddState(state);
+		m_state.time                                 = LibKernel::KernelGetProcessTime();
+		m_state.axes[static_cast<int>(Axis::RightX)] = x;
+		m_state.axes[static_cast<int>(Axis::RightY)] = y;
+		AddState();
+	}
+}
+
+void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
+	if (finger < 0 || finger >= 2) {
+		return;
+	}
+
+	Common::LockGuard lock(m_mutex);
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		auto& touch  = m_state.touch[finger];
+		m_state.time = LibKernel::KernelGetProcessTime();
+		if (down && !touch.down) {
+			touch.id        = m_next_touch_id;
+			m_next_touch_id = m_next_touch_id == 127 ? 1 : m_next_touch_id + 1;
+		}
+		touch.down = down;
+		touch.x    = static_cast<uint16_t>(std::clamp(x, 0.0f, 1.0f) * 1920.0f);
+		touch.y    = static_cast<uint16_t>(std::clamp(y, 0.0f, 1.0f) * 943.0f);
+		if (id == HOST_INPUT_CONTROLLER_ID) {
+			m_state.buttons = down ? m_state.buttons | PAD_BUTTON_TOUCH_PAD
+			                       : m_state.buttons & ~PAD_BUTTON_TOUCH_PAD;
+		}
+		AddState();
 	}
 }
 
 void GameController::ResetInputState() {
 	Common::LockGuard lock(m_mutex);
-	ControllerState   state {};
-	state.time    = LibKernel::KernelGetProcessTime();
-	m_states_num  = 0;
-	m_first_state = 0;
-	AddState(state);
+	m_state         = {};
+	m_state.time    = LibKernel::KernelGetProcessTime();
+	m_states_num    = 0;
+	m_first_state   = 0;
+	m_next_touch_id = 1;
+	AddState();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -325,7 +323,7 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 
 	*flag  = m_connected;
 	*count = m_connected_count;
-	*state = GetLastState();
+	*state = m_state;
 }
 
 int GameController::ReadStates(ControllerState* states, int states_num, bool* flag, int* count) {
@@ -348,8 +346,8 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 					break;
 				}
 				auto index = (m_first_state + i) % STATES_MAX;
-				if (!m_private[index].obtained) {
-					m_private[index].obtained = true;
+				if (!m_obtained[index]) {
+					m_obtained[index] = true;
 
 					states[ret_num++] = m_states[index];
 				}
@@ -388,6 +386,12 @@ void ControllerRightStick(int id, int x, int y) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->RightStick(id, x, y);
+}
+
+void ControllerTouchPad(int id, int finger, bool down, float x, float y) {
+	EXIT_IF(g_controller == nullptr);
+
+	g_controller->TouchPad(id, finger, down, x, y);
 }
 
 void ControllerResetInputState() {
@@ -508,7 +512,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 	info->stick_dead_zone_left  = controller_get_axis(-32768, 32767, 8000) - 128;
 	info->stick_dead_zone_right = controller_get_axis(-32768, 32767, 8000) - 128;
 	info->connection_type       = 0;
-	info->connected_count       = pad_connected_count_to_u8(connected_count);
+	info->connected_count       = static_cast<uint8_t>(std::min(connected_count, 255));
 	info->connected             = connected;
 	info->device_class          = 0;
 

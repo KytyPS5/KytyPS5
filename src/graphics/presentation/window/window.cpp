@@ -76,7 +76,6 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
 		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
 		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_CONTROLLER_BUTTON_BACK: return Controller::PAD_BUTTON_TOUCH_PAD;
 		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
 		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
 		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
@@ -86,6 +85,7 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
 	}
 }
@@ -704,6 +704,16 @@ void WindowContext::ProcessEvent(double time_s) {
 
 			break;
 		}
+
+		case SDL_CONTROLLERTOUCHPADDOWN:
+		case SDL_CONTROLLERTOUCHPADMOTION:
+		case SDL_CONTROLLERTOUCHPADUP:
+			if (event->ctouchpad.touchpad == 0) {
+				Controller::ControllerTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
+				                               event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
+				                               event->ctouchpad.x, event->ctouchpad.y);
+			}
+			break;
 
 		case SDL_CONTROLLERDEVICEADDED:
 		case SDL_CONTROLLERDEVICEREMOVED:

@@ -29,6 +29,7 @@ struct ControlInfo {
 	uint32_t         button   = 0;
 	Controller::Axis axis     = Controller::Axis::AxisMax;
 	bool             positive = false;
+	float            touch_x  = 0.0f;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -47,7 +48,10 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"Circle", Controller::PAD_BUTTON_CIRCLE},
     ControlInfo {"Cross", Controller::PAD_BUTTON_CROSS},
     ControlInfo {"Square", Controller::PAD_BUTTON_SQUARE},
-    ControlInfo {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD},
+    ControlInfo {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD, Controller::Axis::AxisMax, false,
+                 0.25f},
+    ControlInfo {"TouchPadRight", Controller::PAD_BUTTON_TOUCH_PAD, Controller::Axis::AxisMax,
+                 false, 0.75f},
     ControlInfo {"LeftStickLeft", 0, Controller::Axis::LeftX, false},
     ControlInfo {"LeftStickRight", 0, Controller::Axis::LeftX, true},
     ControlInfo {"LeftStickUp", 0, Controller::Axis::LeftY, false},
@@ -81,11 +85,6 @@ std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
 	                               [name](const auto& item) { return item.name == name; });
 	return static_cast<std::size_t>(std::distance(CONTROL_INFO.begin(), info));
-}
-
-const ControlInfo& Info(std::size_t control) {
-	EXIT_IF(control >= CONTROL_INFO.size());
-	return CONTROL_INFO[control];
 }
 
 SDL_Keycode NormalizeKey(SDL_Keycode key) {
@@ -205,6 +204,10 @@ void SetButton(uint32_t button, bool down) {
 	}
 }
 
+void SetTouchPad(float x, bool down) {
+	Controller::ControllerTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
+}
+
 uint32_t DefaultKeyboardButton(int key_code) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_UP: return Controller::PAD_BUTTON_UP;
@@ -221,8 +224,6 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
 		case SDLK_RETURN:
 		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
-		case SDLK_BACKSPACE:
-		case SDLK_TAB: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
 	}
 }
@@ -235,7 +236,12 @@ struct StickKeys {
 };
 
 void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
-	const int value = negative == positive ? 128 : negative ? 0 : 255;
+	int value = 128;
+	if (negative && !positive) {
+		value = 0;
+	} else if (positive && !negative) {
+		value = 255;
+	}
 	Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
@@ -244,7 +250,11 @@ void SetControl(std::size_t control, bool down) {
 		return;
 	}
 
-	const auto& info = Info(control);
+	const auto& info = CONTROL_INFO[control];
+	if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
+		SetTouchPad(info.touch_x, down);
+		return;
+	}
 	if (info.button != 0) {
 		SetButton(info.button, down);
 		return;
@@ -271,6 +281,8 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	static StickKeys right;
 
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
+		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
+		case SDLK_TAB: SetTouchPad(0.75f, down); return;
 		case SDLK_a:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);

@@ -51,7 +51,8 @@ constexpr PadControl PAD_CONTROLS[] = {
     {"L3", "L3", "Left Shift"},
     {"R3", "R3", "Left Ctrl"},
     {"Options", "Options", "Return"},
-    {"TouchPad", "Touch pad", "Backspace"},
+    {"TouchPad", "Touch pad left (SELECT)", "Backspace"},
+    {"TouchPadRight", "Touch pad right (START)", "Tab"},
 };
 
 QString KeypadName(int key) {

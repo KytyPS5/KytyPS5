@@ -51,7 +51,13 @@ struct PadLightBarParam;
 
 inline int controller_get_axis(int min, int max, int value) {
 	int v = (255 * (value - min)) / (max - min);
-	return (v < 0 ? 0 : (v > 255 ? 255 : v));
+	if (v < 0) {
+		return 0;
+	}
+	if (v > 255) {
+		return 255;
+	}
+	return v;
 }
 
 void ControllerConnect(int id);
@@ -59,6 +65,7 @@ void ControllerDisconnect(int id);
 void ControllerButton(int id, uint32_t button, bool down);
 void ControllerAxis(int id, Axis axis, int value);
 void ControllerRightStick(int id, int x, int y);
+void ControllerTouchPad(int id, int finger, bool down, float x, float y);
 void ControllerResetInputState();
 
 int KYTY_SYSV_ABI PadInit();

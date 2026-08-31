@@ -26,6 +26,7 @@ struct CompileOptions {
 	IR::SrtMemoryReader         read_specialization_memory = nullptr;
 	void*                       read_memory_data           = nullptr;
 	ShaderStageInputInfo        input_info;
+	bool                        non_fatal                  = false;
 };
 
 struct CompileResult {
@@ -34,6 +35,7 @@ struct CompileResult {
 	std::string           ir_dump;
 	IR::Program           program;
 	IR::ResourceSnapshot  resources;
+	bool                  unsupported = false;
 };
 
 [[nodiscard]] CompileResult Recompile(std::span<const uint32_t> code,

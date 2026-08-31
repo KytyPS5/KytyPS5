@@ -3,16 +3,23 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+
 void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 	current_opcode = inst.opcode;
 	current_pc     = inst.pc;
 
+	if (TranslationUnsupportedFlag()) {
+		return;
+	}
 	switch (inst.opcode) {
 		case Decoder::Opcode::UNKNOWN:
 		case Decoder::Opcode::COUNT:
-			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
 		case Decoder::Opcode::UNSUPPORTED:
-			EXIT("unsupported decoded instruction: %s", Decoder::InstructionToString(inst).c_str());
+			if (TranslationNonFatalFlag()) {
+				TranslationUnsupportedFlag() = true;
+				return;
+			}
+			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
 		default: break;
 	}
 
@@ -43,6 +50,10 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 	}
 
 	if (!translated) {
+		if (TranslationNonFatalFlag()) {
+			TranslationUnsupportedFlag() = true;
+			return;
+		}
 		EXIT("opcode %s at pc 0x%08x has no IR translation",
 		     Decoder::InstructionToString(inst).c_str(), inst.pc);
 	}

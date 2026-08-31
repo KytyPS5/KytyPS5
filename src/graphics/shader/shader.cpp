@@ -17,6 +17,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "graphics/shader/shaderCallTrace.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.h"
@@ -92,6 +93,16 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
+}
+
+static bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& out) {
+	EXIT_IF(g_shader_map == nullptr);
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		out = iter->second;
+		return true;
+	}
+	return false;
 }
 
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -1249,11 +1260,59 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
                                       ShaderStageRuntime& stage) {
 	const auto* stage_name = ShaderStageName(options.stage);
 	const auto* label      = ShaderStageLabel(options.stage);
-	auto result = ShaderRecompiler::Recompile(params.code, options);
+	auto compile_options      = options;
+	compile_options.non_fatal = ShaderFailureNonFatal();
+
+	auto result = ShaderRecompiler::Recompile(params.code, compile_options);
+	if (result.unsupported) {
+		bool recovered = false;
+		if (options.stage == ShaderType::Compute) {
+			const auto sites = ResolveIndirectCalls(params.code, params.user_data, params.Base());
+			if (!sites.empty()) {
+				std::vector<std::span<const uint32_t>> handlers;
+				handlers.reserve(sites.size());
+				for (const auto& site: sites) {
+					ShaderMappedData handler_data;
+					if (site.handler == 0 || !ShaderTryGetMappedData(site.handler, handler_data) ||
+					    handler_data.code_size_bytes == 0 ||
+					    handler_data.code_size_bytes % sizeof(uint32_t) != 0) {
+						handlers.clear();
+						break;
+					}
+					const auto trimmed = TrimToCode(
+					    std::span<const uint32_t> {reinterpret_cast<const uint32_t*>(site.handler),
+					                               handler_data.code_size_bytes / sizeof(uint32_t)},
+					    site.target_sgpr);
+					if (!EndsWithReturn(trimmed, site.target_sgpr)) {
+						handlers.clear();
+						break;
+					}
+					handlers.push_back(trimmed);
+				}
+				if (handlers.size() == sites.size()) {
+					const auto joined = SpliceIndirectCalls(params.code, sites, handlers);
+					if (!joined.empty()) {
+						auto spliced = ShaderRecompiler::Recompile(joined, compile_options);
+						if (!spliced.unsupported) {
+							result    = std::move(spliced);
+							recovered = true;
+						}
+					}
+				}
+			}
+		}
+		if (!recovered) {
+			DumpShaderRecompilerOriginal(stage_name, options.shader_hash, params.code, {});
+			return nullptr;
+		}
+	}
 
 	DumpShaderRecompilerOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 	if (!SpirvValidateBinary(label, options.shader_hash, result.spirv)) {
 		DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
+		if (compile_options.non_fatal) {
+			return nullptr;
+		}
 		ExitShaderRecompilerFailure(label, options.shader_hash, "SPIR-V validation failed");
 	}
 	DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);

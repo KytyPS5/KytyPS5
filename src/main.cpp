@@ -12,6 +12,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <fstream>
 #include <fmt/format.h>
 
 using namespace Common;

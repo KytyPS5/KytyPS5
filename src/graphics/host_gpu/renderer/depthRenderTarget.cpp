@@ -260,9 +260,9 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	const auto depth_backing_size   = depth_size.size * view.image_layers;
 	const auto stencil_backing_size = stencil_size.size * view.image_layers;
 	const auto htile_backing_size   = htile_size.size * view.image_layers;
-	if (depth_backing_size > TRACKER_ADDRESS_SIZE - z.z_read_base_addr ||
-	    (has_stencil && stencil_backing_size > TRACKER_ADDRESS_SIZE - z.stencil_read_base_addr) ||
-	    (has_htile && htile_backing_size > TRACKER_ADDRESS_SIZE - z.htile_data_base_addr)) {
+	if (!GuestRange {z.z_read_base_addr, depth_backing_size}.Valid() ||
+	    (has_stencil && !GuestRange {z.stencil_read_base_addr, stencil_backing_size}.Valid()) ||
+	    (has_htile && !GuestRange {z.htile_data_base_addr, htile_backing_size}.Valid())) {
 		DepthFatal("layered depth backing range is invalid");
 	}
 	r.htile                   = has_htile;

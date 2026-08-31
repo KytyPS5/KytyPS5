@@ -15,18 +15,6 @@
 
 namespace Libs::Graphics {
 
-struct GuestRange {
-	uint64_t address = 0;
-	uint64_t size    = 0;
-
-	[[nodiscard]] constexpr bool Empty() const noexcept { return address == 0 || size == 0; }
-	[[nodiscard]] constexpr bool Valid() const noexcept {
-		return !Empty() && address < TRACKER_ADDRESS_SIZE && size <= TRACKER_ADDRESS_SIZE - address;
-	}
-	[[nodiscard]] constexpr uint64_t End() const noexcept { return address + size; }
-	auto                             operator<=>(const GuestRange&) const = default;
-};
-
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };

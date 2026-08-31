@@ -73,10 +73,8 @@ namespace {
 	return usage;
 }
 
-void ValidateRange(GuestRange range, const char* name) {
-	if ((range.address == 0) != (range.size == 0) ||
-	    (range.address != 0 && (range.address >= TRACKER_ADDRESS_SIZE ||
-	                            range.size > TRACKER_ADDRESS_SIZE - range.address))) {
+void ValidateOptionalRange(GuestRange range, const char* name) {
+	if (!range.ValidOrEmpty()) {
 		EXIT("invalid %s image range: address=0x%016llx size=0x%016llx\n", name,
 		     static_cast<unsigned long long>(range.address),
 		     static_cast<unsigned long long>(range.size));
@@ -567,13 +565,13 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 namespace ImageOps {
 
 void Validate(const ImageInfo& info) {
-	ValidateRange(info.data, "data");
-	ValidateRange(info.stencil, "stencil");
+	ValidateOptionalRange(info.data, "data");
+	ValidateOptionalRange(info.stencil, "stencil");
 
 	if (info.pixel_format == vk::Format::eUndefined) {
 		const bool metadata_empty =
-		    info.metadata.range.address == 0 && info.metadata.range.size == 0 &&
-		    info.metadata.kind == ImageMetadataKind::None && info.metadata.control == 0 &&
+		    info.metadata.range.Empty() && info.metadata.kind == ImageMetadataKind::None &&
+		    info.metadata.control == 0 &&
 		    info.metadata.compression == VideoOutCompression::Uncompressed &&
 		    !info.metadata.stencil_compressed;
 		if (info.data.Empty() || info.HasStencil() || !metadata_empty || info.extent.width == 0 ||
@@ -620,16 +618,14 @@ void Validate(const ImageInfo& info) {
 	}
 	switch (info.metadata.kind) {
 		case ImageMetadataKind::None:
-			if (info.metadata.range.address != 0 || info.metadata.range.size != 0 ||
-			    info.metadata.control != 0 ||
+			if (!info.metadata.range.Empty() || info.metadata.control != 0 ||
 			    info.metadata.compression != VideoOutCompression::Uncompressed ||
 			    info.metadata.stencil_compressed) {
 				EXIT("metadata-free image has metadata state\n");
 			}
 			break;
 		case ImageMetadataKind::Htile:
-			ValidateRange(info.metadata.range, "HTILE");
-			if (info.metadata.range.Empty() ||
+			if (!info.metadata.range.Valid() ||
 			    info.metadata.compression != VideoOutCompression::Uncompressed) {
 				EXIT("invalid HTILE metadata\n");
 			}

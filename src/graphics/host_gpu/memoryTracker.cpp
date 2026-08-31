@@ -18,8 +18,8 @@ MemoryTracker::~MemoryTracker() = default;
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                           const char* operation) const noexcept {
-	if (vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
-	    (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 || (size & (TRACKER_PAGE_SIZE - 1)) != 0) {
+	if (!GuestRange {vaddr, size}.Valid() || (vaddr & (TRACKER_PAGE_SIZE - 1)) != 0 ||
+	    (size & (TRACKER_PAGE_SIZE - 1)) != 0) {
 		EXIT("MemoryTracker: invalid dirty-page validation range\n");
 	}
 	for (auto page = vaddr; page < vaddr + size; page += TRACKER_PAGE_SIZE) {
@@ -37,9 +37,6 @@ void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr,
 void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                               const char* operation) {
 	ValidateRange(vaddr, size);
-	if (vaddr + size > UINT64_MAX - (TRACKER_PAGE_SIZE - 1)) {
-		EXIT("MemoryTracker: dirty ownership range alignment overflow\n");
-	}
 	const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
@@ -56,8 +53,7 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 #endif
 
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("invalid memory tracker range\n");
 	}
 }

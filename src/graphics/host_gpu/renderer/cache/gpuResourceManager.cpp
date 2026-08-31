@@ -35,8 +35,7 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);

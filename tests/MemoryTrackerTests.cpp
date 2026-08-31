@@ -29,9 +29,11 @@
 
 namespace {
 
+using Libs::Graphics::GuestRange;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RangeSet;
+using Libs::Graphics::TRACKER_ADDRESS_SIZE;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -206,6 +208,27 @@ void TestRangeSet() {
             intersections[0].size == 0x40 &&
             intersections[1].address == 0x1220 && intersections[1].size == 0x20,
         "range set subtraction did not preserve both exact tails");
+}
+
+void TestGuestRange() {
+  constexpr GuestRange empty{};
+  constexpr GuestRange first_byte{1, 1};
+  constexpr GuestRange last_byte{TRACKER_ADDRESS_SIZE - 1, 1};
+
+  static_assert(empty.Empty() && !empty.Valid() && empty.ValidOrEmpty());
+  static_assert(!first_byte.Empty() && first_byte.Valid() &&
+                first_byte.ValidOrEmpty() && first_byte.End() == 2);
+  static_assert(last_byte.Valid() && last_byte.End() == TRACKER_ADDRESS_SIZE);
+
+  Check(!GuestRange{0, 1}.Empty() && !GuestRange{0, 1}.ValidOrEmpty(),
+        "zero-address nonempty guest range is rejected");
+  Check(!GuestRange{1, 0}.Empty() && !GuestRange{1, 0}.ValidOrEmpty(),
+        "nonzero-address empty guest range is rejected");
+  Check(!GuestRange{TRACKER_ADDRESS_SIZE, 1}.Valid(),
+        "first address beyond the guest range is rejected");
+  Check(!GuestRange{TRACKER_ADDRESS_SIZE - 1, 2}.Valid(),
+        "guest range crossing the address-space end is rejected");
+  Check(!GuestRange{UINT64_MAX, 2}.Valid(), "wrapping guest range is rejected");
 }
 
 void TestQueriesDoNotRequireMappedOwnership() {
@@ -829,6 +852,7 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+  TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();

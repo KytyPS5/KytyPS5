@@ -309,7 +309,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	if (backing_size == 0) {
 		EXIT("render-target backing is empty\n");
 	}
-	if (backing_size > TRACKER_ADDRESS_SIZE - rt.base.addr) {
+	if (!GuestRange {rt.base.addr, backing_size}.Valid()) {
 		EXIT("render-target backing range is invalid\n");
 	}
 

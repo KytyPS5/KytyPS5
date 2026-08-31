@@ -2891,6 +2891,18 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+static bool FixedMapMatchesExistingRange(uint64_t vaddr, uint64_t size, int64_t phys_offset,
+                                         int prot) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(vaddr, size, &ranges) || ranges.size() != 1) {
+		return false;
+	}
+	const auto& r = ranges.front();
+	return r.type == VirtualRangeType::Direct && r.start == vaddr && r.size == size &&
+	       r.offset == static_cast<uint64_t>(phys_offset) && r.protection == prot &&
+	       g_guest_address_space->BackingContains(vaddr, size);
+}
+
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
@@ -2953,6 +2965,11 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
+		}
+
+		if (FixedMapMatchesExistingRange(in_addr, len, direct_memory_start, prot)) {
+			*addr = reinterpret_cast<void*>(in_addr);
+			return OK;
 		}
 
 		std::vector<VirtualRanges::Range> reserved_ranges;

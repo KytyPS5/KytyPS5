@@ -13,6 +13,10 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 
+static constexpr uint64_t HOST_GUEST_RESERVE_MAX = 0x6000000000ull;
+static_assert(HOST_GUEST_RESERVE_MAX > HOST_USER_MIN);
+static_assert(HOST_GUEST_RESERVE_MAX <= HOST_USER_MAX + 1u);
+
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
 	if (UINT64_MAX - base < range_size || candidate < base) {
@@ -758,14 +762,26 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		LogBackingChange("Protect", vaddr, size, static_cast<uint64_t>(mode));
 
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	inline void LogBackingChange(const char* what, uint64_t vaddr, uint64_t size, uint64_t offset) {
+		static const auto watch = [] {
+			std::pair<uint64_t, uint64_t> range {0, 0};
+			return range;
+		}();
+		if (watch.second == 0 || vaddr >= watch.first + watch.second || watch.first >= vaddr + size) {
+			return;
+		}
+	}
+
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+		LogBackingChange("MapBacking", vaddr, size, backing_offset);
 		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			if (failure_reason != nullptr) {
@@ -786,6 +802,7 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		LogBackingChange("UnmapBacking", vaddr, size, 0);
 		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
@@ -1089,7 +1106,7 @@ private:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();
-		const auto         guest_end         = HOST_USER_MAX + 1u;
+		auto               guest_end         = HOST_GUEST_RESERVE_MAX;
 		auto               next_addr         = HOST_SYSTEM_MANAGED_MIN;
 
 		while (next_addr < guest_end) {

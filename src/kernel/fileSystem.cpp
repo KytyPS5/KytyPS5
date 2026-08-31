@@ -1,6 +1,8 @@
 #include "kernel/fileSystem.h"
 
 #include "common/assert.h"
+#include <utility>
+#include <cstdlib>
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
@@ -545,7 +547,18 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	return OK;
 }
 
+static void FileReadWatchCheck(const char* who, uint64_t dst, uint64_t size) {
+	static const auto watch = [] {
+		std::pair<uint64_t, uint64_t> range {0, 0};
+		return range;
+	}();
+	if (watch.second == 0 || dst >= watch.first + watch.second || watch.first >= dst + size) {
+		return;
+	}
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+	FileReadWatchCheck("read", reinterpret_cast<uint64_t>(buf), nbytes);
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
@@ -671,6 +684,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 }
 
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+	FileReadWatchCheck("pread", reinterpret_cast<uint64_t>(buf), nbytes);
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {

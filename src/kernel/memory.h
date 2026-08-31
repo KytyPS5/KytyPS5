@@ -117,6 +117,8 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
+[[nodiscard]] bool IsHandlingGpuFault() noexcept;
+
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);
@@ -147,6 +149,13 @@ int KYTY_SYSV_ABI KernelGetPrtAperture(int index, void** addr, size_t* len);
 int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled();
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot);
 int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size);
+bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr);
+bool KernelHandleTransientMappingFault(Graphics::PageFaultAccess access, uint64_t vaddr);
+
+
+void DumpVirtualRangeForAddress(uint64_t vaddr);
+uint64_t MappedExtentFrom(uint64_t vaddr, bool* known = nullptr);
+
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size);
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end);

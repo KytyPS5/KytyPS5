@@ -109,6 +109,12 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	return result;
 }
 
+// A scalar branch on EXEC or VCC is taken by the whole wave, so it tests every lane's bit.
+IR::U1 Translator::AnyLane(IR::U32 low, IR::U32 high) {
+	const auto word = current_wave_size == 32u ? low : ir.BitwiseOr(low, high);
+	return ir.INotEqual(word, IR::U32(IR::Value(0u)));
+}
+
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {value});
 	return {ir.CompositeExtract(ballot, 0), ir.CompositeExtract(ballot, 1)};
@@ -600,8 +606,8 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 }
 
 IR::U1 Translator::ThreadBit(IR::U32 low) {
-	const auto lane = ir.BitwiseAnd(IR::U32(ir.Emit(IR::ValueOpcode::LaneId, {})),
-	                                IR::U32(IR::Value(31u)));
+	const auto lane =
+	    ir.BitwiseAnd(IR::U32(ir.Emit(IR::ValueOpcode::LaneId, {})), IR::U32(IR::Value(31u)));
 	return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(low, lane), IR::U32(IR::Value(1u))),
 	                    IR::U32(IR::Value(0u)));
 }
@@ -637,8 +643,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::VccHi:
 			return current_wave_size == 32u ? ThreadBit(ir.GetVccHi()) : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
-		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+		case Decoder::OperandKind::VccZ:
+			return ir.LogicalNot(AnyLane(ir.GetVccLo(), ir.GetVccHi()));
+		case Decoder::OperandKind::ExecZ:
+			return ir.LogicalNot(AnyLane(ir.GetExecLo(), ir.GetExecHi()));
 		default: return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 }
@@ -780,17 +788,23 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero:
+			condition = ir.LogicalNot(AnyLane(ir.GetVccLo(), ir.GetVccHi()));
+			break;
+		case CFG::BranchCondition::VccNonZero:
+			condition = AnyLane(ir.GetVccLo(), ir.GetVccHi());
+			break;
+		case CFG::BranchCondition::ExecZero:
+			condition = ir.LogicalNot(AnyLane(ir.GetExecLo(), ir.GetExecHi()));
+			break;
+		case CFG::BranchCondition::ExecNonZero:
+			condition = AnyLane(ir.GetExecLo(), ir.GetExecHi());
+			break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				EXIT("block %u reads an invalid goto variable", source.id);
@@ -1044,8 +1058,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 		}
 		entry_ir.SetExec(IR::U1(IR::Value(true)));
-		entry_ir.SetExecLo(IR::U32(IR::Value(1u)));
-		entry_ir.SetExecHi(IR::U32(IR::Value(0u)));
+		const auto entry_exec = entry_ir.Emit(IR::ValueOpcode::Ballot, {IR::U1(IR::Value(true))});
+		entry_ir.SetExecLo(entry_ir.CompositeExtract(entry_exec, 0));
+		entry_ir.SetExecHi(entry_ir.CompositeExtract(entry_exec, 1));
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.compute;
 			const auto  thread_ids =

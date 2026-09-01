@@ -11862,8 +11862,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto wqm_result = compile("wqm", wqm,
-                                  {.words = 407,
-                                   .instructions = 98,
+                                  {.words = 411,
+                                   .instructions = 99,
                                    .variables = 4,
                                    .loads = 3,
                                    .stores = 1,
@@ -11871,7 +11871,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                    .selection_merges = 1,
                                    .branches = 4,
                                    .conditional_branches = 1,
-                                   .ballots = 1},
+                                   .ballots = 2},
                                   ShaderType::Vertex);
   Check(Common::ContainsStr(wqm_result.ir_dump, "WqmMask"),
         "WQM size fixture no longer reaches per-invocation WqmMask IR");

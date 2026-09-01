@@ -24,6 +24,7 @@ private:
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);
 	Decoder::Operand ScalarDestinationOperand(const Decoder::Operand& operand, uint32_t offset);
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
+	IR::U1                 AnyLane(IR::U32 low, IR::U32 high);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);

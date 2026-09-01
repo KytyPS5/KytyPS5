@@ -151,8 +151,11 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 106u: return ir.GetVccLo();
 		case 107u: return ir.GetVccHi();
 		case 124u: return ir.GetM0();
-		case 126u: return ir.GetExecLo();
-		case 127u: return ir.GetExecHi();
+		case 126u:
+		case 127u: {
+			const auto mask = BallotMask(ir.GetExec());
+			return mask[code - 126u];
+		}
 		default: return IR::U32(IR::Value(0u));
 	}
 }
@@ -312,23 +315,19 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::VccLo:
 			ir.SetVccLo(IR::U32(value));
 			ir.SetVcc(ThreadBit(IR::U32(value)));
-			ir.SetVccMaskValidTag(IR::U1(IR::Value(false)));
 			break;
 		case Decoder::OperandKind::VccHi:
 			ir.SetVccHi(IR::U32(value));
 			ir.SetVcc(ThreadBit(ir.GetVccLo()));
-			ir.SetVccMaskValidTag(IR::U1(IR::Value(false)));
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
 		case Decoder::OperandKind::ExecLo:
 			ir.SetExecLo(IR::U32(value));
 			ir.SetExec(ThreadBit(IR::U32(value)));
-			ir.SetExecMaskTag(IR::U1(IR::Value(false)));
 			break;
 		case Decoder::OperandKind::ExecHi:
 			ir.SetExecHi(IR::U32(value));
 			ir.SetExec(ThreadBit(ir.GetExecLo()));
-			ir.SetExecMaskTag(IR::U1(IR::Value(false)));
 			break;
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
@@ -373,7 +372,6 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 			case Decoder::OperandKind::ExecHi: {
 				const auto mask = BallotMask(IR::U1(value));
 				ir.SetExec(IR::U1(value));
-				ir.SetExecMaskTag(IR::U1(IR::Value(true)));
 				ir.SetExecLo(mask[0]);
 				ir.SetExecHi(mask[1]);
 				return;
@@ -382,7 +380,6 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 			case Decoder::OperandKind::VccHi: {
 				const auto mask = BallotMask(IR::U1(value));
 				ir.SetVcc(IR::U1(value));
-				ir.SetVccMaskValidTag(IR::U1(IR::Value(true)));
 				ir.SetVccLo(mask[0]);
 				ir.SetVccHi(mask[1]);
 				return;
@@ -583,13 +580,11 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	switch (operand.kind) {
 		case Decoder::OperandKind::ExecLo:
 			ir.SetExec(thread_bit);
-			ir.SetExecMaskTag(IR::U1(IR::Value(false)));
 			ir.SetExecLo(value[0]);
 			ir.SetExecHi(value[1]);
 			return;
 		case Decoder::OperandKind::VccLo:
 			ir.SetVcc(thread_bit);
-			ir.SetVccMaskValidTag(IR::U1(IR::Value(false)));
 			ir.SetVccLo(value[0]);
 			ir.SetVccHi(value[1]);
 			return;
@@ -598,87 +593,6 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	}
 	WriteRawU32(operand, value[0]);
 	WriteRawU32(OffsetOperand(operand, 1), value[1]);
-}
-
-Translator::ScalarU64 Translator::ReadScalarU64(const Decoder::Operand& operand) {
-	return {ReadU32Pair(operand), ReadMask(operand), ReadMaskValid(operand)};
-}
-
-Translator::ScalarU64 Translator::MakeScalarU64Mask(IR::U1 value) {
-	return {BallotMask(value), value, IR::U1(IR::Value(true))};
-}
-
-Translator::ScalarU64 Translator::MakeScalarU64Result(const std::array<IR::U32, 2>& raw,
-                                                      IR::U1 invocation, IR::U1 mask_valid) {
-	return {raw,
-	        IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {mask_valid, invocation, ThreadBit(raw[0])})),
-	        mask_valid};
-}
-
-Translator::ScalarU64 Translator::SelectScalarU64(IR::U1 condition, const ScalarU64& lhs,
-                                                  const ScalarU64& rhs) {
-	return {
-	    {ir.Select(condition, lhs.raw[0], rhs.raw[0]),
-	     ir.Select(condition, lhs.raw[1], rhs.raw[1])},
-	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {condition, lhs.invocation, rhs.invocation})),
-	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {condition, lhs.mask_valid, rhs.mask_valid}))};
-}
-
-Translator::ScalarU64 Translator::NotScalarU64(const ScalarU64& value) {
-	return MakeScalarU64Result({ir.BitwiseNot(value.raw[0]), ir.BitwiseNot(value.raw[1])},
-	                           ir.LogicalNot(value.invocation), value.mask_valid);
-}
-
-Translator::ScalarU64 Translator::BinaryScalarU64(const ScalarU64& lhs, const ScalarU64& rhs,
-                                                  IR::ValueOpcode logical_opcode,
-                                                  IR::ValueOpcode bit_opcode, bool negate_lhs,
-                                                  bool negate_rhs, bool negate_result) {
-	auto lhs_mask = negate_lhs ? ir.LogicalNot(lhs.invocation) : lhs.invocation;
-	auto rhs_mask = negate_rhs ? ir.LogicalNot(rhs.invocation) : rhs.invocation;
-	auto mask     = IR::U1(ir.Emit(logical_opcode, {lhs_mask, rhs_mask}));
-	if (negate_result) {
-		mask = ir.LogicalNot(mask);
-	}
-	std::array<IR::U32, 2> raw;
-	for (uint32_t component = 0; component < raw.size(); component++) {
-		auto lhs_raw   = negate_lhs ? ir.BitwiseNot(lhs.raw[component]) : lhs.raw[component];
-		auto rhs_raw   = negate_rhs ? ir.BitwiseNot(rhs.raw[component]) : rhs.raw[component];
-		raw[component] = IR::U32(ir.Emit(bit_opcode, {lhs_raw, rhs_raw}));
-		if (negate_result) {
-			raw[component] = ir.BitwiseNot(raw[component]);
-		}
-	}
-	return MakeScalarU64Result(raw, mask, ir.LogicalAnd(lhs.mask_valid, rhs.mask_valid));
-}
-
-void Translator::WriteScalarU64(const Decoder::Operand& operand, const ScalarU64& value) {
-	WriteU32Pair(operand, value.raw);
-	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi:
-			ir.SetExec(value.invocation);
-			ir.SetExecMaskTag(value.mask_valid);
-			break;
-		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi:
-			ir.SetVcc(value.invocation);
-			ir.SetVccMaskValidTag(value.mask_valid);
-			break;
-		case Decoder::OperandKind::Sgpr: {
-			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
-			ir.SetThreadBitScalarReg(reg, value.invocation);
-			ir.SetScalarMaskTag(reg, value.mask_valid);
-			break;
-		}
-		default: break;
-	}
-}
-
-IR::U1 Translator::ScalarU64NonZero(const ScalarU64& value) {
-	const auto raw_nonzero =
-	    ir.INotEqual(ir.BitwiseOr(value.raw[0], value.raw[1]), IR::U32(IR::Value(0u)));
-	return IR::U1(
-	    ir.Emit(IR::ValueOpcode::SelectU1, {value.mask_valid, value.invocation, raw_nonzero}));
 }
 
 IR::U1 Translator::ThreadBit(IR::U32 low) {
@@ -736,9 +650,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarMaskTag(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi: return ir.GetExecMaskTag();
+		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: return ir.GetVccMaskValidTag();
+		case Decoder::OperandKind::VccHi:
 		case Decoder::OperandKind::VccZ:
 		case Decoder::OperandKind::ExecZ:
 		case Decoder::OperandKind::Scc: return IR::U1(IR::Value(true));
@@ -771,7 +685,6 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value) {
 		case Decoder::OperandKind::ExecHi: {
 			const auto mask = BallotMask(value);
 			ir.SetExec(value);
-			ir.SetExecMaskTag(IR::U1(IR::Value(true)));
 			ir.SetExecLo(mask[0]);
 			ir.SetExecHi(mask[1]);
 			return;
@@ -780,7 +693,6 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value) {
 		case Decoder::OperandKind::VccHi: {
 			const auto mask = BallotMask(value);
 			ir.SetVcc(value);
-			ir.SetVccMaskValidTag(IR::U1(IR::Value(true)));
 			ir.SetVccLo(mask[0]);
 			ir.SetVccHi(mask[1]);
 			return;
@@ -794,7 +706,25 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value) {
 }
 
 void Translator::WriteMask64(const Decoder::Operand& operand, IR::U1 value) {
-	WriteScalarU64(operand, MakeScalarU64Mask(value));
+	if (operand.kind != Decoder::OperandKind::Sgpr) {
+		WriteMask(operand, value);
+		return;
+	}
+	const auto reg  = static_cast<IR::ScalarReg>(operand.reg);
+	const auto mask = BallotMask(value);
+	ir.SetThreadBitScalarReg(reg, value);
+	ir.SetScalarMaskTag(reg, IR::U1(IR::Value(true)));
+	if (IR::RegIndex(reg) > 0u) {
+		ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(IR::RegIndex(reg) - 1u),
+		                    IR::U1(IR::Value(false)));
+	}
+	ir.SetScalarReg(reg, mask[0]);
+	if (IR::RegIndex(reg) + 1u < IR::NumScalarRegs) {
+		const auto high = static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u);
+		ir.SetScalarReg(high, mask[1]);
+		ir.SetThreadBitScalarReg(high, IR::U1(IR::Value(false)));
+		ir.SetScalarMaskTag(high, IR::U1(IR::Value(false)));
+	}
 }
 
 void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 value) {
@@ -1095,7 +1025,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 		}
 		entry_ir.SetExec(IR::U1(IR::Value(true)));
-		entry_ir.SetExecMaskTag(IR::U1(IR::Value(true)));
 		entry_ir.SetExecLo(IR::U32(IR::Value(1u)));
 		entry_ir.SetExecHi(IR::U32(IR::Value(0u)));
 		if (options.stage == ShaderType::Compute) {

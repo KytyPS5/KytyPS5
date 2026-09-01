@@ -12840,160 +12840,6 @@ TestCase ScalarNotB64UpdatesScc() {
            O::S_ENDPGM}};
 }
 
-TestCase ScalarMovB64PreservesRawSpecialData() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendSMovLiteral(&code, 0, 0x09500000u);
-  AppendSMovLiteral(&code, 1, 0x81234567u);
-  code.push_back(EncodeSop1(0x04, 106, 0)); // s_mov_b64 vcc, s[0:1]
-  code.push_back(EncodeSop1(0x04, 2, 106)); // s_mov_b64 s[2:3], vcc
-  code.push_back(EncodeSop1(0x08, 4, 2));   // s_not_b64 s[4:5], s[2:3]
-  code.push_back(EncodeSop2(0x0a, 6, InlineU32(1), InlineU32(0)));
-
-  AppendStoreSgprPair(&code, 2, 0);
-  AppendStoreSgprPair(&code, 4, 2);
-  AppendStoreSgpr(&code, 6, 4);
-
-  AppendSMovLiteral(&code, 8, 0x09500001u);
-  AppendSMovLiteral(&code, 9, 0x81234567u);
-  code.push_back(EncodeSop1(0x04, 126, 8));  // s_mov_b64 exec, s[8:9]
-  code.push_back(EncodeSop1(0x04, 10, 126)); // s_mov_b64 s[10:11], exec
-  code.push_back(EncodeSop1(0x08, 12, 10));  // s_not_b64 s[12:13], s[10:11]
-  code.push_back(EncodeSop2(0x0a, 14, InlineU32(1), InlineU32(0)));
-
-  AppendStoreSgprPair(&code, 10, 5);
-  AppendStoreSgprPair(&code, 12, 7);
-  AppendStoreSgpr(&code, 14, 9);
-  AppendEnd(&code);
-
-  return {"ScalarMovB64PreservesRawSpecialData",
-          code,
-          {},
-          {0x09500000u, 0x81234567u, 0xf6afffffu, 0x7edcba98u, 1u,
-           0x09500001u, 0x81234567u, 0xf6affffeu, 0x7edcba98u, 1u},
-          {O::S_MOV_B32, O::S_MOV_B64, O::S_NOT_B64, O::S_CSELECT_B32,
-           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
-TestCase Scalar64RawSpecialOps() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  const auto capture_scc = [&](u32 dst) {
-    code.push_back(EncodeSop2(0x0a, dst, InlineU32(1), InlineU32(0)));
-  };
-
-  AppendSMovLiteral(&code, 0, 0x09500001u);
-  AppendSMovLiteral(&code, 1, 0x81234567u);
-  AppendSMovLiteral(&code, 2, 0xff00ff01u);
-  AppendSMovLiteral(&code, 3, 0x0f0f0f0fu);
-  code.push_back(EncodeSop1(0x04, 126, 0));
-  code.push_back(EncodeSop2(0x0f, 106, 126, 2));
-  code.push_back(EncodeSop1(0x04, 4, 106));
-  capture_scc(6);
-  code.push_back(EncodeSop1(0x08, 106, 106));
-  code.push_back(EncodeSop1(0x04, 8, 106));
-  capture_scc(10);
-
-  AppendSMovLiteral(&code, 12, 0x80000011u);
-  AppendSMovLiteral(&code, 13, 0x80000001u);
-  code.push_back(EncodeSop1(0x04, 106, 12));
-  code.push_back(EncodeSop1(0x0a, 106, 106));
-  code.push_back(EncodeSop1(0x04, 14, 106));
-  capture_scc(16);
-
-  code.push_back(EncodeSop1(0x0a, 26, 193u));
-  capture_scc(28);
-
-  code.push_back(EncodeSMovB32(18, InlineU32(1)));
-  code.push_back(EncodeSMovB32(19, InlineU32(0)));
-  code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
-  code.push_back(EncodeSop2(0x0b, 126, 0, 18));
-  code.push_back(EncodeSop1(0x04, 20, 126));
-  code.push_back(EncodeSop1(0x08, 106, 126));
-  code.push_back(EncodeSop1(0x04, 22, 106));
-  capture_scc(24);
-  code.push_back(EncodeSop1(0x04, 126, 18));
-
-  AppendStoreSgprPair(&code, 4, 0);
-  AppendStoreSgpr(&code, 6, 2);
-  AppendStoreSgprPair(&code, 8, 3);
-  AppendStoreSgpr(&code, 10, 5);
-  AppendStoreSgprPair(&code, 14, 6);
-  AppendStoreSgpr(&code, 16, 8);
-  AppendStoreSgprPair(&code, 26, 9);
-  AppendStoreSgpr(&code, 28, 11);
-  AppendStoreSgprPair(&code, 20, 12);
-  AppendStoreSgprPair(&code, 22, 14);
-  AppendStoreSgpr(&code, 24, 16);
-  AppendEnd(&code);
-
-  return {"Scalar64RawSpecialOps",
-          code,
-          {},
-          {0x09000001u, 0x01030507u, 1, 0xf6fffffeu, 0xfefcfaf8u, 1,
-           0xf00000ffu, 0xf000000fu, 1, 0xffffffffu, 0xffffffffu, 1,
-           0x09500001u, 0x81234567u, 0xf6affffeu, 0x7edcba98u, 1},
-          {O::S_MOV_B32, O::S_MOV_B64, O::S_AND_B64, O::S_NOT_B64,
-           O::S_CSELECT_B32, O::S_WQM_B64, O::S_CMP_EQ_U32, O::S_CSELECT_B64,
-           O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
-TestCase ScalarMovB32SpecialAliases() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  const auto capture_scc = [&](u32 dst) {
-    code.push_back(EncodeSop2(0x0a, dst, InlineU32(1), InlineU32(0)));
-  };
-
-  AppendSMovLiteral(&code, 0, 0x09500001u);
-  AppendSMovLiteral(&code, 1, 0x81234567u);
-  AppendSMovLiteral(&code, 2, 0xaaaaaaaau);
-  AppendSMovLiteral(&code, 3, 0xbbbbbbbbu);
-  code.push_back(EncodeSMovB32(4, InlineU32(1)));
-  code.push_back(EncodeSMovB32(5, InlineU32(0)));
-  code.push_back(EncodeSop1(0x04, 126, 0));
-  code.push_back(EncodeSop1(0x04, 106, 2));
-  code.push_back(EncodeSMovB32(107, 126));
-  code.push_back(EncodeSop1(0x04, 6, 106));
-  code.push_back(EncodeSop1(0x08, 8, 106));
-  capture_scc(10);
-
-  AppendSMovLiteral(&code, 12, 0x13579bdfu);
-  AppendSMovLiteral(&code, 13, 0x2468ace0u);
-  code.push_back(EncodeSop1(0x04, 106, 12));
-  code.push_back(EncodeSMovB32(126, 106));
-  code.push_back(EncodeSop1(0x04, 14, 126));
-  code.push_back(EncodeSop1(0x04, 126, 4));
-
-  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
-  code.push_back(EncodeSMovB32(106, 106));
-  code.push_back(EncodeSop1(0x08, 16, 106));
-  capture_scc(18);
-  code.push_back(EncodeSop1(0x04, 20, 106));
-  code.push_back(EncodeSMovB32(20, 20));
-  code.push_back(EncodeSop1(0x08, 22, 20));
-  capture_scc(24);
-
-  AppendStoreSgprPair(&code, 6, 0);
-  AppendStoreSgprPair(&code, 8, 2);
-  AppendStoreSgpr(&code, 10, 4);
-  AppendStoreSgprPair(&code, 14, 5);
-  AppendStoreSgpr(&code, 18, 7);
-  AppendStoreSgpr(&code, 24, 8);
-  AppendEnd(&code);
-
-  return {"ScalarMovB32SpecialAliases",
-          code,
-          {},
-          {0xaaaaaaaau, 0x09500001u, 0x55555555u, 0xf6affffeu, 1, 0x13579bdfu,
-           0x81234567u, 0, 0},
-          {O::S_MOV_B32, O::S_MOV_B64, O::S_NOT_B64, O::S_CSELECT_B32,
-           O::V_CMP_EQ_U32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
 TestCase ScalarQuadmaskB64() {
   using O = ShaderOpcode;
 
@@ -13122,7 +12968,8 @@ TestCase ScalarSaveExecOps() {
   return {"ScalarSaveExecOps",
           code,
           {},
-          {1, 0, 1, 0, 0xffffffffu, 0xffffffffu, 1, 1, 0, 1, 0, 0, 0},
+          // EXEC and saved EXEC values are invocation-local Booleans.
+          {1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0},
           {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
            O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
            O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
@@ -13149,7 +12996,7 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
   return {"ScalarOrn2SaveexecUsesSourceOrNotExec",
           code,
           {},
-          {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
+          {1, 0, 1, 0, 1},
           {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -16832,30 +16679,6 @@ TestCase ScalarMemoryLoadVariants() {
            O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
            O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
            O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
-TestCase ScalarLoadUsesRawExecAddress() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeSMovB32(0, InlineU32(0)));
-  code.push_back(EncodeSMovB32(1, InlineU32(0)));
-  code.push_back(EncodeSMovB32(2, InlineU32(4)));
-  code.push_back(EncodeSMovB32(3, InlineU32(0)));
-  code.push_back(EncodeSop1(0x04, 126, 2));
-  code.push_back(EncodeSmem0(0x00, 20, 63));
-  code.push_back(EncodeSmem1(0));
-  code.push_back(EncodeSMovB32(2, InlineU32(1)));
-  code.push_back(EncodeSop1(0x04, 126, 2));
-  AppendStoreSgpr(&code, 20, 0);
-  AppendEnd(&code);
-
-  return {"ScalarLoadUsesRawExecAddress",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x22222222u, 0x22222222u},
-          {O::S_MOV_B32, O::S_MOV_B64, O::S_LOAD_DWORD, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -21302,9 +21125,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarCompareOps);
   AddCase(ScalarShiftAddAndMaskOps);
   AddCase(ScalarNotB64UpdatesScc);
-  AddCase(ScalarMovB64PreservesRawSpecialData);
-  AddCase(Scalar64RawSpecialOps);
-  AddCase(ScalarMovB32SpecialAliases);
   AddCase(ScalarQuadmaskB64);
   AddCase(ScalarFlbitI32B64Gpu);
   AddCase(ScalarFlbitI32B32Gpu);
@@ -21421,7 +21241,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(BranchVccnzUsesInvocationMask);
   AddCase(BranchVccnzUsesCarryProducedInvocationMask);
   AddCase(ScalarMemoryLoadVariants);
-  AddCase(ScalarLoadUsesRawExecAddress);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(BufferLoadStore);

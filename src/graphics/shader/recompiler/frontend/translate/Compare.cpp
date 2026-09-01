@@ -12,7 +12,6 @@ void Translator::EmitCompareResult(const Decoder::Instruction& inst, IR::U1 valu
 	if (cmpx) {
 		const auto mask = BallotMask(masked);
 		ir.SetExec(masked);
-		ir.SetExecMaskTag(IR::U1(IR::Value(true)));
 		ir.SetExecLo(mask[0]);
 		ir.SetExecHi(mask[1]);
 		return;

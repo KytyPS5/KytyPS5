@@ -9059,12 +9059,10 @@ void TestTypedEntryStateIsMinimal() {
                                                           translate_options);
 
     uint32_t set_exec = 0;
-    uint32_t set_exec_mask_tag = 0;
     uint32_t set_exec_lo = 0;
     uint32_t set_exec_hi = 0;
     uint32_t ballots = 0;
     IR::Value exec;
-    IR::Value exec_mask_tag;
     IR::Value exec_lo;
     IR::Value exec_hi;
     for (const auto *block : values.blocks) {
@@ -9076,10 +9074,6 @@ void TestTypedEntryStateIsMinimal() {
         case IR::ValueOpcode::SetExec:
           set_exec++;
           exec = inst.Arg(0).Resolve();
-          break;
-        case IR::ValueOpcode::SetExecMaskTag:
-          set_exec_mask_tag++;
-          exec_mask_tag = inst.Arg(0).Resolve();
           break;
         case IR::ValueOpcode::SetExecLo:
           set_exec_lo++;
@@ -9095,7 +9089,6 @@ void TestTypedEntryStateIsMinimal() {
         case IR::ValueOpcode::SetVectorRegister:
         case IR::ValueOpcode::SetScc:
         case IR::ValueOpcode::SetVcc:
-        case IR::ValueOpcode::SetVccMaskValidTag:
         case IR::ValueOpcode::SetVccLo:
         case IR::ValueOpcode::SetVccHi:
         case IR::ValueOpcode::SetM0:
@@ -9106,9 +9099,8 @@ void TestTypedEntryStateIsMinimal() {
         }
       }
     }
-    Check(set_exec == 1u && set_exec_mask_tag == 1u && set_exec_lo == 1u &&
-              set_exec_hi == 1u && ballots == 0u && exec.IsImmediate() &&
-              exec.U1() && exec_mask_tag.IsImmediate() && exec_mask_tag.U1() &&
+    Check(set_exec == 1u && set_exec_lo == 1u && set_exec_hi == 1u &&
+              ballots == 0u && exec.IsImmediate() && exec.U1() &&
               exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
               exec_hi.IsImmediate() && exec_hi.U32() == 0u,
           "typed entry is not the local {1,0} invocation mask");
@@ -9937,16 +9929,18 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   result = ShaderRecompiler::Recompile(wqm_shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto wqm_source = DisassembleSpirvBinary(result.spirv);
-  Check(!Common::ContainsStr(wqm_source, "OpGroupNonUniformBallot"),
-        "raw scalar WQM reconstructed its source from invocation provenance");
+  Check(Common::ContainsStr(wqm_source, "OpCapability GroupNonUniformBallot") &&
+            Common::ContainsStr(wqm_source, "OpGroupNonUniformBallot"),
+        "per-invocation scalar WQM omitted its subgroup ballot capability");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 2u,
+        "wave64 WQM did not compact exactly two ballot words");
 
   auto wave32_options = options;
   wave32_options.wave_size = 32u;
   result = ShaderRecompiler::Recompile(wqm_shader, wave32_options);
   CheckSpirvBinaryValidates(result.spirv);
-  Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
-                             "OpGroupNonUniformBallot"),
-        "wave32 raw scalar WQM reconstructed invocation provenance");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
+        "wave32 WQM retained the unused high ballot-word expansion");
 
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
@@ -11868,8 +11862,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                    .conditional_branches = 1,
                                    .ballots = 1},
                                   ShaderType::Vertex);
-  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmU64"),
-        "WQM size fixture no longer reaches raw WqmU64 IR");
+  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmMask"),
+        "WQM size fixture no longer reaches per-invocation WqmMask IR");
 
   const uint32_t dispatcher[] = {
       EncodeSopp(0x05, 2),       // entry -> B, fallthrough A

@@ -33,16 +33,12 @@ bool IsRegisterStatePseudo(ValueOpcode opcode) {
 		case ValueOpcode::SetScc:
 		case ValueOpcode::GetExec:
 		case ValueOpcode::SetExec:
-		case ValueOpcode::GetExecMaskTag:
-		case ValueOpcode::SetExecMaskTag:
 		case ValueOpcode::GetExecLo:
 		case ValueOpcode::SetExecLo:
 		case ValueOpcode::GetExecHi:
 		case ValueOpcode::SetExecHi:
 		case ValueOpcode::GetVcc:
 		case ValueOpcode::SetVcc:
-		case ValueOpcode::GetVccMaskValidTag:
-		case ValueOpcode::SetVccMaskValidTag:
 		case ValueOpcode::GetVccLo:
 		case ValueOpcode::SetVccLo:
 		case ValueOpcode::GetVccHi:

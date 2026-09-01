@@ -22,9 +22,6 @@ struct ScalarMaskTag {
 struct ExecTag {
 	auto operator<=>(const ExecTag&) const = default;
 };
-struct ExecMaskTag {
-	auto operator<=>(const ExecMaskTag&) const = default;
-};
 struct ExecLoTag {
 	auto operator<=>(const ExecLoTag&) const = default;
 };
@@ -33,9 +30,6 @@ struct ExecHiTag {
 };
 struct VccTag {
 	auto operator<=>(const VccTag&) const = default;
-};
-struct VccMaskValidTag {
-	auto operator<=>(const VccMaskValidTag&) const = default;
 };
 struct VccLoTag {
 	auto operator<=>(const VccLoTag&) const = default;
@@ -51,9 +45,9 @@ struct GotoVariable {
 	auto     operator<=>(const GotoVariable&) const = default;
 };
 
-using Variable = std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable,
-                              SccTag, ExecTag, ExecMaskTag, ExecLoTag, ExecHiTag, VccTag,
-                              VccMaskValidTag, VccLoTag, VccHiTag, M0Tag>;
+using Variable =
+    std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable, SccTag,
+                 ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag, M0Tag>;
 using ValueMap = std::unordered_map<Block*, Value>;
 
 struct DefTable {
@@ -105,16 +99,12 @@ struct DefTable {
 	void         Set(Block* block, SccTag, Value value) { scc[block] = value; }
 	const Value& Get(Block* block, ExecTag) { return exec[block]; }
 	void         Set(Block* block, ExecTag, Value value) { exec[block] = value; }
-	const Value& Get(Block* block, ExecMaskTag) { return exec_mask_tag[block]; }
-	void         Set(Block* block, ExecMaskTag, Value value) { exec_mask_tag[block] = value; }
 	const Value& Get(Block* block, ExecLoTag) { return exec_lo[block]; }
 	void         Set(Block* block, ExecLoTag, Value value) { exec_lo[block] = value; }
 	const Value& Get(Block* block, ExecHiTag) { return exec_hi[block]; }
 	void         Set(Block* block, ExecHiTag, Value value) { exec_hi[block] = value; }
 	const Value& Get(Block* block, VccTag) { return vcc[block]; }
 	void         Set(Block* block, VccTag, Value value) { vcc[block] = value; }
-	const Value& Get(Block* block, VccMaskValidTag) { return vcc_mask_valid_tag[block]; }
-	void Set(Block* block, VccMaskValidTag, Value value) { vcc_mask_valid_tag[block] = value; }
 	const Value& Get(Block* block, VccLoTag) { return vcc_lo[block]; }
 	void         Set(Block* block, VccLoTag, Value value) { vcc_lo[block] = value; }
 	const Value& Get(Block* block, VccHiTag) { return vcc_hi[block]; }
@@ -124,11 +114,9 @@ struct DefTable {
 
 	ValueMap                               scc;
 	ValueMap                               exec;
-	ValueMap                               exec_mask_tag;
 	ValueMap                               exec_lo;
 	ValueMap                               exec_hi;
 	ValueMap                               vcc;
-	ValueMap                               vcc_mask_valid_tag;
 	ValueMap                               vcc_lo;
 	ValueMap                               vcc_hi;
 	ValueMap                               m0;
@@ -156,9 +144,6 @@ ValueOpcode UndefOpcode(SccTag) {
 ValueOpcode UndefOpcode(ExecTag) {
 	return ValueOpcode::UndefU1;
 }
-ValueOpcode UndefOpcode(ExecMaskTag) {
-	return ValueOpcode::UndefU1;
-}
 ValueOpcode UndefOpcode(ExecLoTag) {
 	return ValueOpcode::UndefU32;
 }
@@ -166,9 +151,6 @@ ValueOpcode UndefOpcode(ExecHiTag) {
 	return ValueOpcode::UndefU32;
 }
 ValueOpcode UndefOpcode(VccTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(VccMaskValidTag) {
 	return ValueOpcode::UndefU1;
 }
 ValueOpcode UndefOpcode(VccLoTag) {
@@ -202,9 +184,6 @@ Value InitialValue(SccTag) {
 Value InitialValue(ExecTag) {
 	return Value(false);
 }
-Value InitialValue(ExecMaskTag) {
-	return Value(false);
-}
 Value InitialValue(ExecLoTag) {
 	return Value(0u);
 }
@@ -212,9 +191,6 @@ Value InitialValue(ExecHiTag) {
 	return Value(0u);
 }
 Value InitialValue(VccTag) {
-	return Value(false);
-}
-Value InitialValue(VccMaskValidTag) {
 	return Value(false);
 }
 Value InitialValue(VccLoTag) {
@@ -375,15 +351,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 			break;
 		case ValueOpcode::SetScc: pass.Write(SccTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetExec: pass.Write(ExecTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetExecMaskTag:
-			pass.Write(ExecMaskTag {}, block, inst.Arg(0));
-			break;
 		case ValueOpcode::SetExecLo: pass.Write(ExecLoTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetExecHi: pass.Write(ExecHiTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetVcc: pass.Write(VccTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetVccMaskValidTag:
-			pass.Write(VccMaskValidTag {}, block, inst.Arg(0));
-			break;
 		case ValueOpcode::SetVccLo: pass.Write(VccLoTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetVccHi: pass.Write(VccHiTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetM0: pass.Write(M0Tag {}, block, inst.Arg(0)); break;
@@ -405,15 +375,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 			break;
 		case ValueOpcode::GetScc: inst.ReplaceUsesWith(pass.Read(SccTag {}, block)); break;
 		case ValueOpcode::GetExec: inst.ReplaceUsesWith(pass.Read(ExecTag {}, block)); break;
-		case ValueOpcode::GetExecMaskTag:
-			inst.ReplaceUsesWith(pass.Read(ExecMaskTag {}, block));
-			break;
 		case ValueOpcode::GetExecLo: inst.ReplaceUsesWith(pass.Read(ExecLoTag {}, block)); break;
 		case ValueOpcode::GetExecHi: inst.ReplaceUsesWith(pass.Read(ExecHiTag {}, block)); break;
 		case ValueOpcode::GetVcc: inst.ReplaceUsesWith(pass.Read(VccTag {}, block)); break;
-		case ValueOpcode::GetVccMaskValidTag:
-			inst.ReplaceUsesWith(pass.Read(VccMaskValidTag {}, block));
-			break;
 		case ValueOpcode::GetVccLo: inst.ReplaceUsesWith(pass.Read(VccLoTag {}, block)); break;
 		case ValueOpcode::GetVccHi: inst.ReplaceUsesWith(pass.Read(VccHiTag {}, block)); break;
 		case ValueOpcode::GetM0: inst.ReplaceUsesWith(pass.Read(M0Tag {}, block)); break;

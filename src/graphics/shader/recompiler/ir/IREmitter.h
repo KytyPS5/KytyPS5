@@ -39,16 +39,12 @@ public:
 	void SetScc(U1 value);
 	U1   GetExec();
 	void SetExec(U1 value);
-	U1   GetExecMaskTag();
-	void SetExecMaskTag(U1 value);
 	U32  GetExecLo();
 	void SetExecLo(U32 value);
 	U32  GetExecHi();
 	void SetExecHi(U32 value);
 	U1   GetVcc();
 	void SetVcc(U1 value);
-	U1   GetVccMaskValidTag();
-	void SetVccMaskValidTag(U1 value);
 	U32  GetVccLo();
 	void SetVccLo(U32 value);
 	U32  GetVccHi();

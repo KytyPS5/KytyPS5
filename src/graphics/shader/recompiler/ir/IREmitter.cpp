@@ -76,14 +76,6 @@ void IREmitter::SetExec(U1 value) {
 	Emit(ValueOpcode::SetExec, {value});
 }
 
-U1 IREmitter::GetExecMaskTag() {
-	return U1(Emit(ValueOpcode::GetExecMaskTag));
-}
-
-void IREmitter::SetExecMaskTag(U1 value) {
-	Emit(ValueOpcode::SetExecMaskTag, {value});
-}
-
 U32 IREmitter::GetExecLo() {
 	return U32(Emit(ValueOpcode::GetExecLo));
 }
@@ -106,14 +98,6 @@ U1 IREmitter::GetVcc() {
 
 void IREmitter::SetVcc(U1 value) {
 	Emit(ValueOpcode::SetVcc, {value});
-}
-
-U1 IREmitter::GetVccMaskValidTag() {
-	return U1(Emit(ValueOpcode::GetVccMaskValidTag));
-}
-
-void IREmitter::SetVccMaskValidTag(U1 value) {
-	Emit(ValueOpcode::SetVccMaskValidTag, {value});
 }
 
 U32 IREmitter::GetVccLo() {

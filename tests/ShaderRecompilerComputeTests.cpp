@@ -24723,6 +24723,54 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4PolygonOffset");
 }
 
+void CheckPm4DepthControlHighBits(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+
+  std::array<uint32_t, 3> direct{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::DB_DEPTH_CONTROL,
+      0x80000072u,
+  };
+  Pm4Execution direct_execution;
+  const bool direct_complete =
+      processor.Process(direct_execution, direct) == Pm4ProcessResult::Complete;
+  const auto &direct_control = processor.GetCtx().GetDepthControl();
+  const bool direct_decoded =
+      !direct_control.stencil_enable && direct_control.z_enable &&
+      !direct_control.z_write_enable && !direct_control.depth_bounds_enable &&
+      direct_control.zfunc == 7u && !direct_control.backface_enable &&
+      direct_control.stencilfunc == 0u && direct_control.stencilfunc_bf == 0u;
+
+  std::array<uint32_t, 2> registers{
+      Pm4::DB_DEPTH_CONTROL,
+      0x4070078du,
+  };
+  const auto address = reinterpret_cast<uint64_t>(registers.data());
+  std::array<uint32_t, 5> indirect{
+      KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::R_ZERO),
+      static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+      0x80000000u, 1u,
+  };
+  Pm4Execution indirect_execution;
+  const bool indirect_complete =
+      processor.Process(indirect_execution, indirect) ==
+      Pm4ProcessResult::Complete;
+  const auto &indirect_control = processor.GetCtx().GetDepthControl();
+  const bool indirect_decoded =
+      indirect_control.stencil_enable && !indirect_control.z_enable &&
+      indirect_control.z_write_enable && indirect_control.depth_bounds_enable &&
+      indirect_control.zfunc == 0u && indirect_control.backface_enable &&
+      indirect_control.stencilfunc == 7u &&
+      indirect_control.stencilfunc_bf == 7u;
+
+  Require("Pm4DepthControlHighBits", "preserved high bits",
+          direct_complete && direct_decoded && indirect_complete &&
+              indirect_decoded,
+          "DB_DEPTH_CONTROL high bits rejected or changed decoded PS5 state");
+  std::printf("[host]    %-32s ok\n", "Pm4DepthControlHighBits");
+}
+
 struct AgcCommandBufferLayout {
   using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
                                           void *);
@@ -25325,6 +25373,7 @@ int main(int argc, char **argv) {
     CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
+    CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -25514,6 +25563,7 @@ int main(int argc, char **argv) {
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
+  CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());

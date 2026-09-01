@@ -834,8 +834,9 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0                   = 0xB2;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_3                   = 0xB5;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES                           = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES                           = 0xC9;
-// Retained only as an opaque AGC compiler-record tag; 0x100 is not a PS5 SH register.
+// Private AGC registers used by shader binaries submitted through SET_SH_REG_INDIRECT.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_HS                       = 0x100;
+constexpr uint32_t SPI_SHADER_PGM_RSRC4_HS                        = 0x101;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_HS                = 0x102;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_HS                = 0x103;
 constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_HS                 = 0x107;
@@ -976,7 +977,7 @@ constexpr uint32_t GE_USER_VGPR1  = 0x25C;
 constexpr uint32_t GE_USER_VGPR2  = 0x25D;
 constexpr uint32_t GE_USER_VGPR3  = 0x25E;
 constexpr uint32_t GE_STEREO_CNTL = 0x25F;
-constexpr uint32_t GE_PC_ALLOC    = 0x260;
+constexpr uint32_t UC_PARAMETER_OVERSUBSCRIPTION = 0x260;
 
 constexpr uint32_t GE_USER_VGPR_EN                     = 0x262;
 constexpr uint32_t GE_USER_VGPR_EN_EN_USER_VGPR1_SHIFT = 0;

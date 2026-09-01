@@ -3635,6 +3635,9 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
@@ -3642,6 +3645,12 @@ void GraphicsInitJmpTablesShIndirect() {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3817,6 +3826,11 @@ void GraphicsInitJmpTablesUcIndirect() {
 		r.primitive_group_size = KYTY_PM4_GET(value, GE_CNTL, PRIM_GRP_SIZE);
 		r.vertex_group_size    = KYTY_PM4_GET(value, GE_CNTL, VERT_GRP_SIZE);
 		cp.GetUcfg().SetGeControl(r);
+	};
+	g_hw_uc_indirect_func[Pm4::UC_PARAMETER_OVERSUBSCRIPTION] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+		(void)cp;
+		(void)cmd_offset;
+		(void)value;
 	};
 	g_hw_uc_indirect_func[Pm4::GE_USER_VGPR_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeUserVgprEn r;

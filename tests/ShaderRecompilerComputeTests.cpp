@@ -24556,10 +24556,10 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 22> legacy_shader_slots{
-      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x081u, 0x0b0u, 0x0bcu,
-      0x100u, 0x101u, 0x130u, 0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u,
-      0x211u, 0x216u, 0x217u, 0x219u, 0x21au, 0x27du,
+  constexpr std::array<uint32_t, 19> legacy_shader_slots{
+      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
+      0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
+      0x219u, 0x21au, 0x27du,
   };
   for (const auto offset : legacy_shader_slots) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
@@ -24568,12 +24568,6 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   for (uint32_t offset = 0x0cau; offset <= 0x0ebu; offset++) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
                                   g_hw_sh_indirect_func[offset] == nullptr;
-  }
-
-  constexpr std::array<uint32_t, 1> legacy_uconfig_slots{0x0260u};
-  for (const auto offset : legacy_uconfig_slots) {
-    legacy_slots_are_unhandled &= g_hw_uc_func[offset] == nullptr &&
-                                  g_hw_uc_indirect_func[offset] == nullptr;
   }
 
   std::array<uint32_t, 3> index_size_packet{
@@ -24599,6 +24593,54 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
               native_index_size_packet_complete,
           "a removed GCN register has a handler or a native packet is not handled");
   std::printf("[host]    %-32s ok\n", "Pm4NativeTargetGeometry");
+}
+
+void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  std::array<uint32_t, 6> registers{
+      Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
+      Pm4::SPI_SHADER_PGM_CHKSUM_HS, 0x12345678u,
+      Pm4::SPI_SHADER_PGM_RSRC4_HS, 0x87654321u,
+  };
+  const auto address = reinterpret_cast<uint64_t>(registers.data());
+  std::array<uint32_t, 5> command{
+      KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
+      static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+      0x80000000u, 3u,
+  };
+  Pm4Execution execution;
+  const bool handlers_present =
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_HS] != nullptr;
+  Require("Pm4PrivateAgcShaderRegisters", "private shader register stream",
+          handlers_present &&
+              processor.Process(execution, command) == Pm4ProcessResult::Complete,
+          "private AGC shader registers were rejected by SET_SH_REG_INDIRECT");
+  std::printf("[host]    %-32s ok\n", "Pm4PrivateAgcShaderRegisters");
+}
+
+void CheckPm4PrivateAgcUconfigRegisters(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  std::array<uint32_t, 2> registers{
+      Pm4::UC_PARAMETER_OVERSUBSCRIPTION, 0x12345678u,
+  };
+  const auto address = reinterpret_cast<uint64_t>(registers.data());
+  std::array<uint32_t, 5> command{
+      KYTY_PM4(5, Pm4::IT_SET_UCONFIG_REG_INDIRECT, Pm4::R_ZERO),
+      static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+      0x80000000u, 1u,
+  };
+  Pm4Execution execution;
+  const bool handler_present =
+      g_hw_uc_indirect_func[Pm4::UC_PARAMETER_OVERSUBSCRIPTION] != nullptr;
+  Require("Pm4PrivateAgcUconfigRegisters", "private UCONFIG register stream",
+          handler_present &&
+              processor.Process(execution, command) == Pm4ProcessResult::Complete,
+          "private AGC UCONFIG register was rejected by SET_UCONFIG_REG_INDIRECT");
+  std::printf("[host]    %-32s ok\n", "Pm4PrivateAgcUconfigRegisters");
 }
 
 void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
@@ -25361,6 +25403,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
+    CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
+    CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
@@ -25541,6 +25585,8 @@ int main(int argc, char **argv) {
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
+  CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
+  CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());

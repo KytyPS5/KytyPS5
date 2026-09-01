@@ -1220,7 +1220,7 @@ int KYTY_SYSV_ABI AgcGetGsOversubscription(ShaderRegister* regs, const Shader* g
 	constexpr uint32_t FULL_PC_OVERSUBSCRIPTION = 0x7ffu;
 	constexpr uint32_t FULL_SH_OVERSUBSCRIPTION = 0x007f0000u;
 
-	regs[0] = {Pm4::GE_PC_ALLOC, 0u};
+	regs[0] = {Pm4::UC_PARAMETER_OVERSUBSCRIPTION, 0u};
 	regs[1] = {Pm4::SPI_SHADER_PGM_RSRC4_GS, 0u};
 
 	if (budget == 0u) {

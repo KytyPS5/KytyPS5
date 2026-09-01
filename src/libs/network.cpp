@@ -2818,6 +2818,27 @@ int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
 	return id.ToInt();
 }
 
+int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char* path,
+                                     uint64_t content_length) {
+	PRINT_NAME();
+
+	LOGF("\t conn_id        = %d\n"
+	     "\t method         = %s\n"
+	     "\t path           = %s\n"
+	     "\t content_length = %" PRIu64 "\n",
+	     conn_id, method, path, content_length);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (method == nullptr || path == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	auto id =
+	    g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method, path, content_length);
+	return id.IsValid() ? id.ToInt() : HTTP_ERROR_OUT_OF_MEMORY;
+}
+
 int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, const char* url,
                                             uint64_t content_length) {
 	PRINT_NAME();

@@ -1307,7 +1307,7 @@ CompiledShader CompileCase(const TestCase &test) {
     if (i < test.storage_buffer_offsets.size()) {
       offset = test.storage_buffer_offsets[i];
     }
-    Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
+    Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
@@ -17011,6 +17011,34 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   return test;
 }
 
+TestCase BufferStoreByteAppliesByteHostOffset() {
+  using O = ShaderOpcode;
+
+  // The binding's byte offset is 13, which is not a multiple of four. It has to reach both halves
+  // of the address: the element index and the byte within that element. Storing one byte at guest
+  // offset 0 must therefore land at byte 13, which is byte 1 of dword 3.
+  //
+  // Folding the offset in as a dword index instead loses the low two bits and puts the byte at
+  // byte 12, so this case distinguishes the two.
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xabu);
+  code.push_back(EncodeMubuf0(0x18u, 0, false, false));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreByteAppliesByteHostOffset";
+  test.code = code;
+  test.initial = {0, 0, 0, 0, 0};
+  test.expected = {0, 0, 0, 0x0000ab00u, 0};
+  test.storage_buffer_range_dwords = 1;
+  test.storage_buffer_offsets = {13};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(4, 1);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   using O = ShaderOpcode;
 
@@ -21420,6 +21448,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
+  AddCase(BufferStoreByteAppliesByteHostOffset);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);

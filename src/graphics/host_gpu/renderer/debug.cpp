@@ -1079,7 +1079,7 @@ void hw_check(const CommandBuffer& buffer) {
 	AaCheck(aa, ac);
 	log_phase("done");
 
-	if (RenderTargetMaskHasBoundMrt(buffer)) {
+	if (graphics_debug_dump_enabled() && RenderTargetMaskHasBoundMrt(buffer)) {
 		LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
 		for (uint32_t i = 0; i < 8; i++) {
 			const auto& mrt = hw.GetRenderTarget(i);

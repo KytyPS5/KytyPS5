@@ -136,7 +136,6 @@ static HW::ColorControl DecodeColorControl(uint32_t value) {
 
 static HW::DepthControl DecodeDepthControl(uint32_t value) {
 	HW::DepthControl r {};
-	EXIT_NOT_IMPLEMENTED((value & 0xc0000000u) != 0);
 
 	r.stencil_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
 	r.z_enable            = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_ENABLE) != 0;

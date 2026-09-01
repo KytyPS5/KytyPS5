@@ -110,6 +110,12 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
+	if (control >= 0x160u && control <= 0x16fu) {
+		const auto target = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpBitwiseXor, TypeU32(state), target, subid, ConstantU32(state, control & 0xfu)});
+		return {target, EmitTrueBool(state)};
+	}
 	return {subid, EmitTrueBool(state)};
 }
 

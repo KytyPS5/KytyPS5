@@ -1055,8 +1055,7 @@ static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_sto
 	return 0;
 }
 
-#if defined(_WIN32)
-static int ConvertHostSockaddr(const sockaddr_storage* addr, int addrlen, void* out,
+static int ConvertHostSockaddr(const sockaddr_storage* addr, SocketLength addrlen, void* out,
                                uint32_t* out_len) {
 	EXIT_IF(addr == nullptr);
 	EXIT_IF(out_len == nullptr);
@@ -1066,7 +1065,8 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, int addrlen, void* 
 		return -1;
 	}
 
-	if (addr->ss_family != AF_INET || addrlen < static_cast<int>(sizeof(sockaddr_in))) {
+	if (addr->ss_family != AF_INET ||
+	    addrlen < static_cast<SocketLength>(sizeof(sockaddr_in))) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
 		return -1;
 	}
@@ -1088,7 +1088,6 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, int addrlen, void* 
 	*out_len = guest_addrlen;
 	return 0;
 }
-#endif
 
 static bool GetSocketBackend(int guest_fd, NativeSocket* out) {
 	EXIT_IF(out == nullptr);
@@ -1851,19 +1850,13 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	sockaddr_storage host_addr {};
-	int              host_addrlen = sizeof(host_addr);
-	if (::getsockname(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) ==
-	    SOCKET_ERROR) {
+	SocketLength     host_addrlen = sizeof(host_addr);
+	if (::getsockname(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) != 0) {
 		return SetHostSocketError();
 	}
 
 	return ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen);
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
@@ -2816,6 +2809,27 @@ int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
 	}
 
 	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char* path,
+                                     uint64_t content_length) {
+	PRINT_NAME();
+
+	LOGF("\t conn_id        = %d\n"
+	     "\t method         = %s\n"
+	     "\t path           = %s\n"
+	     "\t content_length = %" PRIu64 "\n",
+	     conn_id, method, path, content_length);
+
+	EXIT_IF(g_net == nullptr);
+
+	if (method == nullptr || path == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	auto id =
+	    g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method, path, content_length);
+	return id.IsValid() ? id.ToInt() : HTTP_ERROR_OUT_OF_MEMORY;
 }
 
 int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, const char* url,

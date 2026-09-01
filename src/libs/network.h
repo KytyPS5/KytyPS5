@@ -106,6 +106,8 @@ int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int 
 int KYTY_SYSV_ABI HttpDeleteConnection(int conn_id);
 int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
                                     uint64_t content_length);
+int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char* path,
+                                     uint64_t content_length);
 int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, const char* url,
                                             uint64_t content_length);
 int KYTY_SYSV_ABI HttpSetRequestContentLength(int request_id, uint64_t content_length);

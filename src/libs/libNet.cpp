@@ -635,6 +635,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("P6A3ytpsiYc", Http::HttpDeleteConnection);
 	LIB_FUNC("tsGVru3hCe8", Http::HttpCreateRequest);
 	LIB_FUNC("Aeu5wVKkF9w", Http::HttpCreateRequest);
+	LIB_FUNC("rGNm+FjIXKk", Http::HttpCreateRequest2);
 	LIB_FUNC("Cnp77podkCU", Http::HttpCreateRequestWithURL2);
 	LIB_FUNC("qe7oZ+v4PWA", Http::HttpDeleteRequest);
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);

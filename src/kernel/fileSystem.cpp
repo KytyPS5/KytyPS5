@@ -444,7 +444,18 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return KERNEL_ERROR_EACCES;
 	}
 
-	bool dir_exist  = Common::File::IsDirectoryExisting(file->real_name);
+	bool dir_exist = Common::File::IsDirectoryExisting(file->real_name);
+	// Some callers open a mount point without O_DIRECTORY.
+	// GetRealFilename intentionally resolves the parent directory for regular
+	// files, so a mount point itself can otherwise be mistaken for a missing
+	// file. Retry using the directory resolver before reporting ENOENT.
+	if (!directory && !dir_exist) {
+		auto real_directory = g_mount_points->GetRealDirectory(file->name);
+		if (Common::File::IsDirectoryExisting(real_directory)) {
+			file->real_name = std::move(real_directory);
+			dir_exist       = true;
+		}
+	}
 	bool file_exist = Common::File::IsFileExisting(file->real_name);
 
 	// A missing path opened without O_CREAT is ENOENT

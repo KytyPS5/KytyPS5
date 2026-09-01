@@ -59,16 +59,8 @@ namespace {
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
 	}
-	if (info.samples == 1 &&
-	    HasFormatFeature(properties, vk::FormatFeatureFlagBits::eStorageImage)) {
+	if (info.samples == 1) {
 		usage |= vk::ImageUsageFlagBits::eStorage;
-	} else if (info.samples == 1) {
-		const auto compatible = SrgbStorageViewFormat(info.pixel_format);
-		if (compatible != vk::Format::eUndefined &&
-		    HasFormatFeature(graphics.GetFormatProperties(compatible),
-		                     vk::FormatFeatureFlagBits::eStorageImage)) {
-			usage |= vk::ImageUsageFlagBits::eStorage;
-		}
 	}
 	return usage;
 }

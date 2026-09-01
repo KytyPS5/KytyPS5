@@ -2950,6 +2950,28 @@ public:
             "dynamic view identity omitted mapping, format, mip, layer, type, "
             "or storage usage");
 
+    auto video_out_info = color_info;
+    video_out_info.pixel_format = vk::Format::eA2R10G10B10UnormPack32;
+    video_out_info.guest_format = Prospero::BufferFormat::k10_10_10_2UNorm;
+    Libs::Graphics::Image video_out(m_runtime_context, scheduler,
+                                    video_out_info);
+    auto video_out_view_info = sampled;
+    video_out_view_info.format = video_out_info.pixel_format;
+    video_out_view_info.usage = vk::ImageUsageFlagBits::eTransferSrc;
+    const auto video_out_view = video_out.FindView(video_out_view_info);
+    auto storage_alias_info = video_out_view_info;
+    storage_alias_info.format = vk::Format::eA2B10G10R10UnormPack32;
+    storage_alias_info.usage = vk::ImageUsageFlagBits::eStorage;
+    const auto storage_alias_view = video_out.FindView(storage_alias_info);
+    Require(
+        name, "video-out storage alias usage",
+        ImageViewOps::FormatsCompatible(video_out_info.pixel_format,
+                                        storage_alias_info.format) &&
+            static_cast<bool>(video_out.backing.usage &
+                              vk::ImageUsageFlagBits::eStorage) &&
+            video_out_view != nullptr && storage_alias_view != nullptr,
+        "compatible video-out backing was created without storage usage");
+
     ImageInfo depth_info{};
     depth_info.pixel_format = vk::Format::eD32Sfloat;
     depth_info.guest_format = Prospero::BufferFormat::k32Float;

@@ -506,63 +506,8 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return false;
 	}
-
-	// A DCC fast clear may update metadata only and leave the color allocation stale. Vulkan has
-	// no guest DCC state, so materialize the deferred value when the surface is next bound.
-	const auto metadata_address = target.desc.info.metadata.range.address;
-	uint32_t   metadata_value   = 0xffffffffu;
-	if (!cache.IsMetaCleared(metadata_address, view.base_layer, &metadata_value)) {
-		return false;
-	}
-
-	// Translate recognized constant and register-backed DCC states into a host clear value.
-	clear_value = {};
-	switch (static_cast<uint8_t>(metadata_value)) {
-		case 0x00: break;
-		case 0x20:
-			if (!target.metadata_clear_supported) {
-				return false;
-			}
-			clear_value = target.color_clear_value;
-			break;
-		case 0x40:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[3] = 1.0f;
-			break;
-		case 0x80:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			break;
-		case 0xc0:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			clear_value.float32[3] = 1.0f;
-			break;
-		default: return false;
-	}
-
-	for (uint32_t layer = 1; layer < view.layer_count; layer++) {
-		if (!cache.IsMetaCleared(metadata_address, view.base_layer + layer)) {
-			return false;
-		}
-	}
-	// Consume only after every layer in this Vulkan view can be materialized together.
-	for (uint32_t layer = 0; layer < view.layer_count; layer++) {
-		if (!cache.TouchMeta(metadata_address, view.base_layer + layer, false)) {
-			EXIT("failed to consume DCC clear state\n");
-		}
-	}
-	return true;
+	return cache.ResolveDccMetaClear(target.desc.info.metadata.range.address, view.base_layer,
+	                                 view.layer_count, clear_value);
 }
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,

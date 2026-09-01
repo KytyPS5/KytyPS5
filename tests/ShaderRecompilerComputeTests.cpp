@@ -7343,9 +7343,11 @@ public:
       Require(name, "storage alias reuse",
               storage_id == color.image_id && storage_view != nullptr &&
                   shared_image.IsGpuModified() &&
-                  shared_image.usage.render_target,
+                  shared_image.usage.render_target &&
+                  !texture_cache.IsMetaCleared(dcc_address, 0) &&
+                  texture_cache.IsMetaCleared(dcc_address, 7),
               "the matching 3D storage binding did not reuse the live "
-              "render-target image");
+              "render-target image or materialize its pending clear");
 
       Require(
           name, "volume readback queue",

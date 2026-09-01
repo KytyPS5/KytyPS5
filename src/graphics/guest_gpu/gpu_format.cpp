@@ -232,4 +232,11 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
 }
 
+bool TextureNeedsShaderSrgbDecode(BufferFormat format) {
+	// VK_FORMAT_R8_SRGB and VK_FORMAT_R8G8_SRGB are optional and are absent on common desktop
+	// drivers, so these are stored as UNORM and decoded in the shader. Four-channel sRGB maps
+	// to a real host sRGB format and is decoded by the sampler.
+	return format == BufferFormat::k8Srgb || format == BufferFormat::k8_8Srgb;
+}
+
 } // namespace Libs::Graphics::Prospero

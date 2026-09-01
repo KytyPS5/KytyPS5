@@ -356,6 +356,7 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				    program.info.images[root].mip_mode != image.mip_mode ||
 				    program.info.images[root].mip_count != image.mip_count ||
 				    program.info.images[root].conversion_format != image.conversion_format ||
+				    program.info.images[root].srgb_decode != image.srgb_decode ||
 				    program.info.images[root].shader_swizzle != image.shader_swizzle ||
 				    program.info.images[root].cube != image.cube) {
 					return false;
@@ -390,6 +391,12 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			}
 			const auto conversion_format = ImageConversionFormat(format);
 			if (image.conversion_format != conversion_format) {
+				return false;
+			}
+			if (image.srgb_decode != Prospero::TextureNeedsShaderSrgbDecode(format)) {
+				if (error != nullptr) {
+					*error = fmt::format("image descriptor {} changed sRGB decoding", i);
+				}
 				return false;
 			}
 			if ((storage || conversion_format != Prospero::BufferFormat::kInvalid) &&
@@ -644,6 +651,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 		const bool storage      = image.kind == ResourceKind::StorageImage ||
 		                          image.kind == ResourceKind::StorageImageUint;
 		image.conversion_format = ImageConversionFormat(format);
+		image.srgb_decode       = Prospero::TextureNeedsShaderSrgbDecode(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
@@ -694,6 +702,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 				image.dimension         = image_class.dimension;
 				image.mip_count         = image_class.mip_count;
 				image.conversion_format = image_class.conversion_format;
+				image.srgb_decode       = image_class.srgb_decode;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
@@ -701,6 +710,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 			    image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
+			    image.srgb_decode != image_class.srgb_decode ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
 			    image.depth_compare != image_class.depth_compare ||
 			    image.cube != image_class.cube) {

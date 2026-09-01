@@ -283,6 +283,7 @@ enum : uint32_t {
 	GlslFract           = 10,
 	GlslSin             = 13,
 	GlslCos             = 14,
+	GlslPow             = 26,
 	GlslExp2            = 29,
 	GlslLog2            = 30,
 	GlslSqrt            = 31,

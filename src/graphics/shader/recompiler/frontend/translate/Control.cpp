@@ -76,9 +76,9 @@ void Translator::SUB_U32(const Decoder::Instruction& inst, bool vector, bool rev
 	}
 }
 
-void Translator::SUBB_U32(const Decoder::Instruction& inst, bool vector) {
-	const auto lhs       = ReadU32(vector ? inst.src1 : inst.src0);
-	const auto rhs       = ReadU32(vector ? inst.src0 : inst.src1);
+void Translator::SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse) {
+	const auto lhs       = ReadU32(reverse ? inst.src1 : inst.src0);
+	const auto rhs       = ReadU32(reverse ? inst.src0 : inst.src1);
 	const auto borrow_in = vector ? ConditionBit(inst.src2)
 	                              : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc));
 	const auto partial   = ir.ISub(lhs, rhs);
@@ -92,6 +92,13 @@ void Translator::SUBB_U32(const Decoder::Instruction& inst, bool vector) {
 	} else {
 		ir.SetScc(borrow);
 	}
+}
+
+void Translator::S_ABSDIFF_I32(const Decoder::Instruction& inst) {
+	const auto difference = ir.ISub(ReadU32(inst.src0), ReadU32(inst.src1));
+	const auto result     = IR::U32(ir.Emit(IR::ValueOpcode::IAbs32, {difference}));
+	WriteOperand(DestinationOperand(inst), result);
+	ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 }
 
 void Translator::S_ADD_SUB_I32(const Decoder::Instruction& inst, bool subtract) {

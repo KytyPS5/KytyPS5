@@ -479,6 +479,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
 		case Opcode::S_FF1_I32_B64:
+		case Opcode::S_BITSET0_B64:
+		case Opcode::S_BITSET1_B64:
 		case Opcode::S_NOT_B64:
 		case Opcode::S_WQM_B64:
 		case Opcode::S_QUADMASK_B64:
@@ -505,6 +507,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
 		case Opcode::S_SLEEP:
+		case Opcode::S_SETPRIO:
 		case Opcode::S_TRAP:
 		case Opcode::S_SENDMSG:
 		case Opcode::S_TTRACEDATA:

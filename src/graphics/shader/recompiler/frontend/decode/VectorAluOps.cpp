@@ -61,6 +61,7 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x24u, Opcode::V_MBCNT_HI_U32_B32},
     {0x25u, Opcode::V_ADD_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x28u, Opcode::V_ADDC_U32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x29u, Opcode::V_SUB_CO_CI_U32},
     {0x2au, Opcode::V_SUBREV_CO_CI_U32},
     {0x26u, Opcode::V_SUB_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x27u, Opcode::V_SUBREV_NC_U32, Vop2SdwaProfile::IntegerFullDestination},
@@ -1033,6 +1034,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count = 3;
 			break;
 		case Opcode::V_ADDC_U32:
+		case Opcode::V_SUB_CO_CI_U32:
 		case Opcode::V_SUBREV_CO_CI_U32:
 			inst.dst2.kind = OperandKind::VccLo;
 			inst.src2.kind = OperandKind::VccLo;
@@ -1643,6 +1645,7 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	SetRawWords(inst, code, word_index, 2);
 
 	const bool carry_in_out    = (inst.opcode == Opcode::V_ADDC_U32 && opcode == 0x128u) ||
+	                             (inst.opcode == Opcode::V_SUB_CO_CI_U32 && opcode == 0x129u) ||
 	                             (inst.opcode == Opcode::V_SUBREV_CO_CI_U32 && opcode == 0x12au);
 	const bool vop3b_carry_out = IsVop3BCarryOutOpcode(inst.opcode);
 	const bool vop3b_mad_u64   = IsVop3BMadU64Opcode(inst.opcode);

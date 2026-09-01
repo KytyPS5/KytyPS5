@@ -34,7 +34,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_ADD_U32: ADD_U32(inst, false, false); return true;
 		case O::S_ADDC_U32: ADD_U32(inst, false, true); return true;
 		case O::S_SUB_U32: SUB_U32(inst, false, false); return true;
-		case O::S_SUBB_U32: SUBB_U32(inst, false); return true;
+		case O::S_SUBB_U32: SUBB_U32(inst, false, false); return true;
+		case O::S_ABSDIFF_I32: S_ABSDIFF_I32(inst); return true;
 		case O::S_ADD_I32: S_ADD_SUB_I32(inst, false); return true;
 		case O::S_SUB_I32: S_ADD_SUB_I32(inst, true); return true;
 		case O::S_LSHL1_ADD_U32: S_LSHL_ADD_U32(inst, 1u); return true;
@@ -186,6 +187,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_BITSET0_B32: return S_BITSET_B32(inst, false);
 		case O::S_BITSET1_B32: return S_BITSET_B32(inst, true);
+		case O::S_BITSET0_B64: return S_BITSET_B64(inst, false);
+		case O::S_BITSET1_B64: return S_BITSET_B64(inst, true);
 		case O::S_BITREPLICATE_B64_B32: return S_BITREPLICATE_B64_B32(inst);
 		case O::S_QUADMASK_B64: return S_QUADMASK_B64(inst);
 		case O::S_BFM_B32: return BFM_B32(inst);
@@ -201,6 +204,7 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_NOP:
 		case O::S_SLEEP:
+		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return true;
 		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return true;
 		case O::S_BARRIER: S_BARRIER(); return true;

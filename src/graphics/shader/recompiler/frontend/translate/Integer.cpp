@@ -312,6 +312,22 @@ bool Translator::S_BITSET_B32(const Decoder::Instruction& inst, bool set) {
 	return true;
 }
 
+bool Translator::S_BITSET_B64(const Decoder::Instruction& inst, bool set) {
+	const auto offset    = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(63u)));
+	const auto word_bit  = ir.BitwiseAnd(offset, IR::U32(IR::Value(31u)));
+	const auto bit       = ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), word_bit);
+	const auto old       = ReadU32Pair(inst.dst);
+	const auto low_value = set ? ir.BitwiseOr(old[0], bit)
+	                           : ir.BitwiseAnd(old[0], ir.BitwiseNot(bit));
+	const auto high_value = set ? ir.BitwiseOr(old[1], bit)
+	                            : ir.BitwiseAnd(old[1], ir.BitwiseNot(bit));
+	const auto high = IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32,
+	                                {offset, IR::Value(32u)}));
+	WriteU32Pair(inst.dst,
+	             {ir.Select(high, old[0], low_value), ir.Select(high, high_value, old[1])});
+	return true;
+}
+
 bool Translator::V_BCNT_U32_B32(const Decoder::Instruction& inst) {
 	const auto count = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {ReadU32(inst.src0)}));
 	WriteOperand(DestinationOperand(inst), ir.IAdd(count, ReadU32(inst.src1)));

@@ -204,6 +204,7 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
 		case ValueOpcode::ImageWrite:
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
+		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:

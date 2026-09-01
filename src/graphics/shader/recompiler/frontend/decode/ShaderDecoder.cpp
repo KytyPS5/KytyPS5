@@ -535,6 +535,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
 		case Opcode::IMAGE_STORE_MIP:
+		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_ADD:
 		case Opcode::IMAGE_ATOMIC_UMIN:
 		case Opcode::IMAGE_ATOMIC_UMAX:

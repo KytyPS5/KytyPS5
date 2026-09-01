@@ -576,6 +576,7 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
+		case IR::ValueOpcode::ImageAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicUMin32: return OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicUMax32: return OpAtomicUMax;

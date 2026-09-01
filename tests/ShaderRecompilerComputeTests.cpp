@@ -357,10 +357,23 @@ struct TextureCacheTestAccess {
     return cache.TryDownloadImage(id);
   }
 
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_lock);
+    auto &metadata = cache.m_surface_metas[address];
+    metadata.type = TextureCache::MetaDataInfo::Type::HTile;
+    metadata.clear_mask = 0;
+  }
+
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
 };
 
 struct RenderExecutorTestAccess {
+  static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
+                                         const ShaderComputeInputInfo &input,
+                                         const CommandBuffer &buffer) {
+    return executor.TryConsumeComputeMetaClear(input, buffer);
+  }
+
   static TextureBinding
   ResolveTexture(RenderExecutor &executor,
                  const ShaderRecompiler::IR::ImageResource &resource,
@@ -3775,6 +3788,92 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckComputeMetaClearClassification() {
+    constexpr const char *name = "ComputeMetaClearClassification";
+    constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
+    constexpr uint64_t read_write_meta = 0x0000000204202000ull;
+    constexpr uint64_t write_only_meta = 0x0000000204202100ull;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
+    Require(name, "HTile fixture",
+            texture_cache.IsMeta(read_only_meta) &&
+                texture_cache.IsMeta(read_write_meta) &&
+                texture_cache.IsMeta(write_only_meta) &&
+                !texture_cache.IsMetaCleared(read_only_meta, 0) &&
+                !texture_cache.IsMetaCleared(read_write_meta, 0) &&
+                !texture_cache.IsMetaCleared(write_only_meta, 0),
+            "test HTile entries were not registered in their initial state");
+
+    const auto MakeInput = [](uint64_t address, bool read, bool written) {
+      auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+      program->stage = ShaderType::Compute;
+      ShaderRecompiler::IR::BufferResource resource{};
+      resource.read = read;
+      resource.written = written;
+      resource.formatted = true;
+      program->info.buffers.push_back(resource);
+
+      ShaderBufferResource descriptor{};
+      descriptor.UpdateAddress48(address);
+      descriptor.fields[1] |= 16u << 16u;
+      descriptor.fields[2] = 8;
+      descriptor.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt)
+           << 12u);
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 4;
+      std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
+      auto snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      snapshot->buffers.push_back(value);
+
+      ShaderComputeInputInfo input{};
+      input.stage.program = std::move(program);
+      input.stage.resources = std::move(snapshot);
+      return input;
+    };
+    auto &executor = context.GetRenderExecutor();
+    auto &command = scheduler.Current();
+    const auto read_only_input = MakeInput(read_only_meta, true, false);
+    const bool read_only_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, read_only_input, command);
+    Require(name, "read-only dispatch preserved",
+            !read_only_consumed &&
+                !texture_cache.IsMetaCleared(read_only_meta, 0),
+            "a metadata read-only dispatch changed logical clear state");
+
+    const auto read_write_input = MakeInput(read_write_meta, true, true);
+    const bool read_write_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, read_write_input, command);
+    Require(name, "read/write dispatch preserved",
+            !read_write_consumed &&
+                !texture_cache.IsMetaCleared(read_write_meta, 0),
+            "a metadata read/modify/write dispatch was replaced by a clear");
+
+    const auto write_only_input = MakeInput(write_only_meta, false, true);
+    const bool write_only_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, write_only_input, command);
+    Require(name, "write-only fill consumed",
+            write_only_consumed &&
+                texture_cache.IsMetaCleared(write_only_meta, 0),
+            "a metadata write-only fill was not consumed as a clear");
+    scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -25441,6 +25540,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckComputeMetaClearClassification();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {

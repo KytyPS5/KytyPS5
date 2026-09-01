@@ -54,7 +54,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if (!resource.written && cache.IsMeta(descriptor.Base48())) {
+		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
+		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
+		if (cache.IsMeta(descriptor.Base48()) && (!resource.written || resource.read)) {
 			return false;
 		}
 	}

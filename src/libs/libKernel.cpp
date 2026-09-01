@@ -3074,6 +3074,7 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
+	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
 	// 6xx
 	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("cQke9UuBQOk", Memory::KernelMunmap);

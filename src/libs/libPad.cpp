@@ -1,3 +1,4 @@
+#include <atomic>
 #include "common/abi.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
@@ -42,6 +43,61 @@ static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                           
 	return 0;
 }
 
+// Sony sends a mode plus a small parameter block per trigger; a DualSense wants an 11-byte HID
+// block (effect type then ten parameters). Modes: 0 off, 1 feedback (position, strength),
+// 2 weapon (start, end, strength), 3 vibration (position, amplitude, frequency).
+static void trigger_effect_to_hid(uint32_t mode, const uint8_t* data, uint8_t* out) {
+	std::memset(out, 0, 11);
+	// Sony works in 0-9 positions and 0-8 strengths; a DualSense wants 0-255 for both. Passing the
+	// raw value through put a "position 9" effect at 9/255 - resistance from 3.5% of the pull, which
+	// feels permanently engaged instead of biting near the end.
+	const auto position = [](uint8_t v) {
+		const uint8_t clamped = v > 9 ? 9 : v;
+		const auto    scaled  = static_cast<uint32_t>((static_cast<float>(clamped) * 255.0f / 9.0f) *
+                                                   0.35f);
+		return static_cast<uint8_t>(scaled > 255u ? 255u : scaled);
+	};
+	const auto force = [](uint8_t v) {
+		const uint8_t clamped = v > 8 ? 8 : v;
+		const auto    scaled =
+		    static_cast<uint32_t>((static_cast<float>(clamped) * 255.0f / 8.0f) *
+		                          4.0f);
+		return static_cast<uint8_t>(scaled > 255u ? 255u : scaled);
+	};
+	switch (mode) {
+		case 1: { // feedback: constant resistance from a position
+			if (data[1] == 0) {
+				return;
+			}
+			out[0] = 0x01;
+			out[1] = position(data[0]);
+			out[2] = force(data[1]);
+			break;
+		}
+		case 2: { // weapon: resistance between two positions
+			if (data[2] == 0 || data[1] <= data[0]) {
+				return;
+			}
+			out[0] = 0x02;
+			out[1] = position(data[0]);
+			out[2] = position(data[1]);
+			out[3] = force(data[2]);
+			break;
+		}
+		case 3: { // vibration
+			if (data[1] == 0 || data[2] == 0) {
+				return;
+			}
+			out[0] = 0x06;
+			out[1] = position(data[0]);
+			out[2] = force(data[1]);
+			out[3] = data[2];
+			break;
+		}
+		default: break; // off
+	}
+}
+
 static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
 	PRINT_NAME();
 
@@ -54,6 +110,34 @@ static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
 	}
 	if (param == nullptr) {
 		return -2137915391; /* 0x80920001 */
+	}
+
+	// Log what the title actually asks for: the effect mode and parameter bytes per trigger are
+	// what a DualSense HID output report has to carry, and nothing is known about them yet.
+	static std::atomic<uint32_t> trig_log {0};
+	if (trig_log.fetch_add(1, std::memory_order_relaxed) < 40) {
+		const auto* raw = static_cast<const uint8_t*>(param);
+		char        hex[3 * 32 + 1] = {};
+		for (int k = 0; k < 32; k++) {
+			::snprintf(hex + k * 3, 4, "%02x ", raw[k]);
+		}
+	}
+	// mask, then a mode per trigger, then a data block per trigger.
+	{
+		const auto*   raw      = static_cast<const uint8_t*>(param);
+		const uint8_t mask     = raw[0];
+		uint32_t      modes[2] = {};
+		std::memcpy(&modes[0], raw + 4, sizeof(uint32_t));
+		std::memcpy(&modes[1], raw + 8, sizeof(uint32_t));
+		uint8_t left[11]  = {};
+		uint8_t right[11] = {};
+		if ((mask & 0x1u) != 0) {
+			trigger_effect_to_hid(modes[0], raw + 12, left);
+		}
+		if ((mask & 0x2u) != 0) {
+			trigger_effect_to_hid(modes[1], raw + 16, right);
+		}
+		Controller::ControllerTriggerEffect(left, right);
 	}
 
 	return OK;

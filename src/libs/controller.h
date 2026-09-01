@@ -66,6 +66,7 @@ void ControllerButton(int id, uint32_t button, bool down);
 void ControllerAxis(int id, Axis axis, int value);
 void ControllerRightStick(int id, int x, int y);
 void ControllerTouchPad(int id, int finger, bool down, float x, float y);
+void ControllerTriggerEffect(const uint8_t* left, const uint8_t* right);
 void ControllerResetInputState();
 
 int KYTY_SYSV_ABI PadInit();

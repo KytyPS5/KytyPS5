@@ -39,6 +39,13 @@ struct PadControllerInformation {
 	uint8_t  reserve[8];
 };
 
+struct PadLightBarParam {
+	uint8_t r       = 0;
+	uint8_t g       = 0;
+	uint8_t b       = 0;
+	uint8_t reserve = 0;
+};
+
 struct PadVibrationParam {
 	uint8_t large_motor;
 	uint8_t small_motor;
@@ -73,6 +80,8 @@ public:
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
+	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
+	void SetTriggerEffect(const uint8_t* left, const uint8_t* right);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -82,6 +91,11 @@ private:
 	void CheckActive();
 	void AddState();
 
+	SDL_hid_device*  m_hid              = nullptr;
+	bool             m_hid_tried        = false;
+	bool             m_hid_bluetooth    = false;
+	uint8_t          m_last_trigger[22] = {};
+	bool             m_trigger_sent     = false;
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
@@ -304,6 +318,76 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	}
 }
 
+void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
+	Common::LockGuard lock(m_mutex);
+	if (m_active_id < 0) {
+		return;
+	}
+	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad == nullptr) {
+		return;
+	}
+	// A pad without an LED reports failure; there is nothing to recover from.
+	(void)SDL_GameControllerSetLED(pad, r, g, b);
+}
+
+// SDL owns its own PS5 output report and rejects ours, so trigger effects go straight to the pad
+// over HID. USB is report 0x02 with the payload at offset 1; Bluetooth is 0x31 at offset 2 with a
+// CRC32 over an 0xA2 header byte plus the report. Right trigger sits at payload offset 10, left at
+// 21, and bits 2 and 3 of the first byte say which to apply - leaving rumble and LED state alone.
+void GameController::SetTriggerEffect(const uint8_t* left, const uint8_t* right) {
+	Common::LockGuard lock(m_mutex);
+	if (left == nullptr || right == nullptr) {
+		return;
+	}
+	if (!m_hid_tried) {
+		m_hid_tried = true;
+		for (const auto product: {0x0ce6, 0x0df2}) {
+			m_hid = SDL_hid_open(0x054c, static_cast<unsigned short>(product), nullptr);
+			if (m_hid != nullptr) {
+				uint8_t   probe[78] = {};
+				const int read      = SDL_hid_read_timeout(m_hid, probe, sizeof(probe), 50);
+				m_hid_bluetooth     = read > 64;
+				break;
+			}
+		}
+	}
+	if (m_hid == nullptr) {
+		return;
+	}
+	uint8_t combined[22] = {};
+	std::memcpy(combined, right, 11);
+	std::memcpy(combined + 11, left, 11);
+	if (m_trigger_sent && std::memcmp(combined, m_last_trigger, sizeof(combined)) == 0) {
+		return; // titles resend every frame; the pad holds the last effect
+	}
+	std::memcpy(m_last_trigger, combined, sizeof(combined));
+	m_trigger_sent = true;
+	uint8_t report[79] = {};
+	int     size       = 0;
+	int     offset     = 0;
+	if (m_hid_bluetooth) {
+		report[0] = 0x31;
+		report[1] = 0x02;
+		size      = 78;
+		offset    = 2;
+	} else {
+		report[0] = 0x02;
+		size      = 48;
+		offset    = 1;
+	}
+	report[offset + 0] = 0x0c;
+	std::memcpy(report + offset + 10, right, 11);
+	std::memcpy(report + offset + 21, left, 11);
+	if (m_hid_bluetooth) {
+		const uint8_t header = 0xa2;
+		uint32_t      crc    = SDL_crc32(0, &header, 1);
+		crc                  = SDL_crc32(crc, report, static_cast<size_t>(size) - sizeof(crc));
+		std::memcpy(report + size - sizeof(crc), &crc, sizeof(crc));
+	}
+	(void)SDL_hid_write(m_hid, report, static_cast<size_t>(size));
+}
+
 void GameController::GetConnectionInfo(bool* flag, int* count) {
 	EXIT_IF(flag == nullptr);
 	EXIT_IF(count == nullptr);
@@ -392,6 +476,11 @@ void ControllerTouchPad(int id, int finger, bool down, float x, float y) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->TouchPad(id, finger, down, x, y);
+}
+
+void ControllerTriggerEffect(const uint8_t* left, const uint8_t* right) {
+	EXIT_IF(g_controller == nullptr);
+	g_controller->SetTriggerEffect(left, right);
 }
 
 void ControllerResetInputState() {
@@ -616,6 +705,11 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	if (param == nullptr) {
 		return PAD_ERROR_INVALID_ARG;
 	}
+
+	// Accepted and dropped before: titles signal state through the light bar (police lights,
+	// health, player colour), so drive the real pad.
+	EXIT_IF(g_controller == nullptr);
+	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;
 }

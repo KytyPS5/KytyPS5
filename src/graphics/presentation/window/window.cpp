@@ -817,6 +817,12 @@ static void WindowCreate(WindowContext& context) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+	// Without the PS5 HIDAPI driver SDL opens a DualSense through the generic gamepad path, which
+	// exposes neither the light bar nor the touchpad: SDL_GameControllerHasLED and
+	// SDL_GameControllerGetNumTouchpads both report nothing, so touch events never arrive.
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 #endif
 
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {

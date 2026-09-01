@@ -15121,6 +15121,31 @@ TestCase VectorDppQuadPermuteReverse() {
   return test;
 }
 
+TestCase VectorDppRowXmask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x164));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppRowXmask";
+  test.code = code;
+  test.expected = {104, 105, 106, 107, 100, 101, 102, 103};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorDppBankMaskPreservesDestination() {
   using O = ShaderOpcode;
 
@@ -21194,6 +21219,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   AddCase(VectorDppQuadPermuteReverse);
+  AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3LdexpSourceModifier);

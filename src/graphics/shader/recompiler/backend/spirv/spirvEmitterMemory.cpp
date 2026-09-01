@@ -93,11 +93,22 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 
 	const auto soffset_value = inst.Arg(3).Resolve();
-	if (soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
-	    soffset_value.U32() == 0u) {
-		return address;
+	if (!(soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
+	      soffset_value.U32() == 0u)) {
+		address = Binary(state, OpIAdd, TypeU32(state), address, soffset);
 	}
-	return Binary(state, OpIAdd, TypeU32(state), address, soffset);
+
+	// The descriptor is bound at the guest base rounded down to minStorageBufferOffsetAlignment,
+	// and the bytes that were rounded off arrive as the binding's byte offset. Add them here,
+	// before the address is split into an element index and an intra-element byte, so a base that
+	// is not dword aligned stays exact in both halves.
+	if (state.storage_buffer_variable != 0) {
+		const auto binding =
+		    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+		address = Binary(state, OpIAdd, TypeU32(state), address,
+		                 state.memory_byte_offsets[binding.array_index]);
+	}
+	return address;
 }
 
 uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t add_low,

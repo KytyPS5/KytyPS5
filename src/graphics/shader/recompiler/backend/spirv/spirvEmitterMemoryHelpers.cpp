@@ -123,10 +123,20 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
 			                           access.object_pointer, state.storage_buffer_variable,
 			                           ConstantU32(state, binding.array_index)});
-			access.index_offset     = EmitBinaryU32(state, OpShiftRightLogical,
-			                                        state.memory_byte_offsets[binding.array_index],
-			                                        ConstantU32(state, 2u));
-			access.add_index_offset = true;
+			// A Buffer access derives its element index and its intra-element byte from one byte
+			// address, so BufferByteAddress folds the binding's byte offset in there instead and
+			// no index offset is needed. That keeps the low two bits of the offset, which a
+			// dword index cannot carry.
+			//
+			// ScalarBuffer has no byte address to fold into: ReadConstBuffer loads a whole dword
+			// at address >> 2, so it still takes the offset as a dword index and still requires
+			// the binding to be dword aligned.
+			if (mem.kind == IR::ResourceKind::ScalarBuffer) {
+				const auto byte_offset  = state.memory_byte_offsets[binding.array_index];
+				access.index_offset     = EmitBinaryU32(state, OpShiftRightLogical, byte_offset,
+				                                        ConstantU32(state, 2u));
+				access.add_index_offset = true;
+			}
 			break;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));

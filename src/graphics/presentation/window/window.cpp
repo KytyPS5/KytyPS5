@@ -351,26 +351,26 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		auto* pad = SDL_GameControllerOpen(f.id);
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
-		Controller::ControllerConnect(id);
+		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		Controller::ControllerDisconnect(f.id);
+		Controller::Disconnect(f.id);
 		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
 	}
 
 	if (f.down || f.up) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
-			Controller::ControllerButton(f.id, button, f.down);
+			Controller::SetButton(f.id, button, f.down);
 		}
 	}
 
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::ControllerAxis(f.id, axis,
-			                           ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis,
+			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -708,9 +708,9 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_CONTROLLERTOUCHPADMOTION:
 		case SDL_CONTROLLERTOUCHPADUP:
 			if (event->ctouchpad.touchpad == 0) {
-				Controller::ControllerTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
-				                               event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
-				                               event->ctouchpad.x, event->ctouchpad.y);
+				Controller::SetTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
+				                        event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
+				                        event->ctouchpad.x, event->ctouchpad.y);
 			}
 			break;
 

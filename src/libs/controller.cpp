@@ -515,44 +515,31 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	return ret_num;
 }
 
-void ControllerConnect(int id) {
-	EXIT_IF(g_controller == nullptr);
-
+void Connect(int id) {
 	g_controller->Connect(id);
 }
 
-void ControllerDisconnect(int id) {
-	EXIT_IF(g_controller == nullptr);
-
+void Disconnect(int id) {
 	g_controller->Disconnect(id);
 }
 
-void ControllerButton(int id, uint32_t button, bool down) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetButton(int id, uint32_t button, bool down) {
 	g_controller->Button(id, button, down);
 }
 
-void ControllerAxis(int id, Axis axis, int value) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetAxis(int id, Axis axis, int value) {
 	g_controller->Axis(id, axis, value);
 }
 
-void ControllerRightStick(int id, int x, int y) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetRightStick(int id, int x, int y) {
 	g_controller->RightStick(id, x, y);
 }
 
-void ControllerTouchPad(int id, int finger, bool down, float x, float y) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetTouchPad(int id, int finger, bool down, float x, float y) {
 	g_controller->TouchPad(id, finger, down, x, y);
 }
 
-void ControllerResetInputState() {
-	EXIT_IF(g_controller == nullptr);
+void ResetInputState() {
 	g_controller->ResetInputState();
 }
 
@@ -647,8 +634,6 @@ int KYTY_SYSV_ABI PadResetOrientation(int handle) {
 int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformation* info) {
 	PRINT_NAME();
 
-	EXIT_IF(g_controller == nullptr);
-
 	int  connected_count = 0;
 	bool connected       = false;
 
@@ -686,8 +671,6 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	EXIT_IF(g_controller == nullptr);
-
 	int             connected_count = 0;
 	bool            connected       = false;
 	ControllerState state;
@@ -711,8 +694,6 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	}
 
 	std::memset(data, 0, sizeof(PadData) * static_cast<size_t>(num));
-
-	EXIT_IF(g_controller == nullptr);
 
 	int             connected_count = 0;
 	bool            connected       = false;
@@ -748,7 +729,6 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	     "\t small_motor = %d\n",
 	     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
 
-	EXIT_IF(g_controller == nullptr);
 	g_controller->SetVibration(param->large_motor, param->small_motor);
 
 	return OK;
@@ -774,7 +754,6 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	EXIT_IF(g_controller == nullptr);
 	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;
@@ -790,7 +769,6 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	EXIT_IF(g_controller == nullptr);
 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
 }
 

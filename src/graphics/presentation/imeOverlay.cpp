@@ -209,7 +209,7 @@ void RefreshVisibility() {
 	}
 	const bool was_controller = std::exchange(g_controller_captured, capture_controller);
 	if (capture_controller || was_controller) {
-		Controller::ControllerResetInputState();
+		Controller::ResetInputState();
 	}
 	g_active = visible;
 
@@ -404,7 +404,7 @@ void ShutdownImeInput() {
 		g_input_lifecycle_active = false;
 		g_active                 = false;
 		if (std::exchange(g_controller_captured, false)) {
-			Controller::ControllerResetInputState();
+			Controller::ResetInputState();
 		}
 		g_visibility_event.store(static_cast<Uint32>(-1), std::memory_order_release);
 	}

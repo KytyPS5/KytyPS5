@@ -194,18 +194,18 @@ const InputMap& GetInputMap() {
 
 void SetButton(uint32_t button, bool down) {
 	if (button == Controller::PAD_BUTTON_L2) {
-		Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID,
-		                           Controller::Axis::TriggerLeft, down ? 255 : 0);
+		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerLeft,
+		                    down ? 255 : 0);
 	} else if (button == Controller::PAD_BUTTON_R2) {
-		Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID,
-		                           Controller::Axis::TriggerRight, down ? 255 : 0);
+		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerRight,
+		                    down ? 255 : 0);
 	} else if (button != 0) {
-		Controller::ControllerButton(Controller::HOST_INPUT_CONTROLLER_ID, button, down);
+		Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, button, down);
 	}
 }
 
 void SetTouchPad(float x, bool down) {
-	Controller::ControllerTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
 }
 
 uint32_t DefaultKeyboardButton(int key_code) {
@@ -242,7 +242,7 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	} else if (positive && !negative) {
 		value = 255;
 	}
-	Controller::ControllerAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
+	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
 void SetControl(std::size_t control, bool down) {
@@ -326,15 +326,15 @@ void MouseToJoystick(int delta_x, int delta_y) {
 	const auto map_axis = [scale](int delta) {
 		return std::clamp(128 + static_cast<int>(std::lround(delta * scale)), 0, 255);
 	};
-	Controller::ControllerRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(delta_x),
-	                                 map_axis(delta_y));
+	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(delta_x),
+	                          map_axis(delta_y));
 }
 
 void CenterMouseStick() {
 	if (!g_mouse.output) {
 		return;
 	}
-	Controller::ControllerRightStick(Controller::HOST_INPUT_CONTROLLER_ID, 128, 128);
+	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, 128, 128);
 	g_mouse.output = false;
 }
 

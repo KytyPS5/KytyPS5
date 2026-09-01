@@ -2028,6 +2028,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
+// The GCN ES/LS resource registers no longer exist; shader binaries still carry writes to them.
+static bool IsRemovedShaderRegister(uint32_t offset) {
+	return offset >= Pm4::SPI_SHADER_PGM_RSRC1_ES && offset <= Pm4::SPI_SHADER_PGM_LO_LS_END;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2069,6 +2074,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 			     "), value = 0x%08" PRIx32 "\n",
 			     cmd_offset, raw_cmd_offset, value);
+		}
+
+		if (IsRemovedShaderRegister(cmd_offset)) {
+			continue;
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
@@ -2433,6 +2442,9 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 		bool handled    = num_values != 0;
 		for (uint32_t i = 0; i < num_values; i++) {
+			if (IsRemovedShaderRegister(cmd_offset + i)) {
+				continue;
+			}
 			if (cmd_offset + i >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset + i] == nullptr) {
 				handled = false;
 				break;
@@ -2440,6 +2452,9 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		}
 		if (handled) {
 			for (uint32_t i = 0; i < num_values; i++) {
+				if (IsRemovedShaderRegister(cmd_offset + i)) {
+					continue;
+				}
 				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
 			}
 			return num_values + 1u;

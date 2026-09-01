@@ -96,6 +96,126 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	return vk::Format::eUndefined;
 }
 
+// The three reporters below name the term that rejected the draw. Each is called only from inside
+// a branch whose condition has already evaluated true, so the accepted path never runs any of this
+// and the deciding conditions themselves are left untouched. They re-test the terms in the order
+// the original condition evaluates them and report the first that holds.
+
+[[noreturn]] static void ReportDepthRegisterRejection(const HW::DepthRenderTarget& z,
+                                                      const HW::RenderControl&     rc,
+                                                      const HW::DepthControl&      dc) {
+	if (rc.copy_depth_to_color) {
+		DepthFatal("DB_RENDER_CONTROL.COPY_DEPTH_TO_COLOR is set");
+	}
+	if (rc.copy_stencil_to_color) {
+		DepthFatal("DB_RENDER_CONTROL.COPY_STENCIL_TO_COLOR is set");
+	}
+	if (rc.copy_centroid) {
+		DepthFatal("DB_RENDER_CONTROL.COPY_CENTROID is set");
+	}
+	if (rc.copy_sample != 0) {
+		DepthFatal("DB_RENDER_CONTROL.COPY_SAMPLE = %" PRIu8 ", expected 0", rc.copy_sample);
+	}
+	if (z.z_info.expclear_enabled) {
+		DepthFatal("DB_Z_INFO.ALLOW_EXPCLEAR is set");
+	}
+	if (z.stencil_info.expclear_enabled) {
+		DepthFatal("DB_STENCIL_INFO.ALLOW_EXPCLEAR is set");
+	}
+	if (z.z_info.partially_resident) {
+		DepthFatal("DB_Z_INFO reports a partially resident depth surface");
+	}
+	if (z.stencil_info.partially_resident) {
+		DepthFatal("DB_STENCIL_INFO reports a partially resident stencil surface");
+	}
+	if (z.z_info.max_mip_level != 0) {
+		DepthFatal("DB_Z_INFO.MAXMIP = %" PRIu8 ", expected 0", z.z_info.max_mip_level);
+	}
+	if (z.depth_view.current_mip_level != 0) {
+		DepthFatal("DB_DEPTH_VIEW.MIPID = %" PRIu8 ", expected 0", z.depth_view.current_mip_level);
+	}
+	if (z.shading_rate_encoding != 0) {
+		DepthFatal("DB_Z_INFO variable-rate shading encoding = 0x%02" PRIx8 ", expected 0",
+		           z.shading_rate_encoding);
+	}
+	if (z.z_read_base_addr == 0) {
+		DepthFatal("DB_Z_READ_BASE is 0 while depth or stencil is active");
+	}
+	if (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) {
+		DepthFatal("DB_Z_WRITE_BASE = 0x%016" PRIx64 " differs from DB_Z_READ_BASE = 0x%016" PRIx64
+		           " while depth writes are enabled",
+		           z.z_write_base_addr, z.z_read_base_addr);
+	}
+	if ((z.z_read_base_addr & 0xffffu) != 0) {
+		DepthFatal("DB_Z_READ_BASE = 0x%016" PRIx64 " is not 64 KiB aligned", z.z_read_base_addr);
+	}
+	if (dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
+		DepthFatal("DB_DEPTH_CONTROL.ZFUNC = %" PRIu8 ", expected at most %u", dc.zfunc,
+		           static_cast<unsigned>(vk::CompareOp::eAlways));
+	}
+	DepthFatal("unsupported depth register state");
+}
+
+[[noreturn]] static void ReportStencilAttachmentRejection(const HW::DepthRenderTarget& z,
+                                                          bool htile_stencil_compat) {
+	if (z.stencil_info.format != Prospero::StencilFormat::k8UInt) {
+		DepthFatal("DB_STENCIL_INFO.FORMAT = 0x%02" PRIx32 ", only 8-bit unsigned is supported",
+		           static_cast<uint32_t>(z.stencil_info.format));
+	}
+	if (!htile_stencil_compat) {
+		DepthFatal("DB_STENCIL_INFO.TILE_STENCIL_DISABLE = %s does not match HTile "
+		           "acceleration = %s",
+		           z.stencil_info.htile_stencil_disabled ? "true" : "false",
+		           z.z_info.htile_acceleration ? "true" : "false");
+	}
+	if (z.stencil_read_base_addr == 0) {
+		DepthFatal("DB_STENCIL_READ_BASE is 0 while a stencil attachment is bound");
+	}
+	if (!z.depth_view.stencil_write_disable &&
+	    z.stencil_write_base_addr != z.stencil_read_base_addr) {
+		DepthFatal("DB_STENCIL_WRITE_BASE = 0x%016" PRIx64
+		           " differs from DB_STENCIL_READ_BASE = 0x%016" PRIx64
+		           " while stencil writes are enabled",
+		           z.stencil_write_base_addr, z.stencil_read_base_addr);
+	}
+	if ((z.stencil_read_base_addr & 0xffffu) != 0) {
+		DepthFatal("DB_STENCIL_READ_BASE = 0x%016" PRIx64 " is not 64 KiB aligned",
+		           z.stencil_read_base_addr);
+	}
+	DepthFatal("unsupported stencil attachment state");
+}
+
+[[noreturn]] static void ReportStencilOpRejection(const HW::DepthControl&   dc,
+                                                  const HW::StencilControl& sc,
+                                                  const HW::StencilMask&    sm,
+                                                  uint8_t                   front_write_mask,
+                                                  uint8_t                   back_write_mask) {
+	constexpr auto always = static_cast<uint8_t>(vk::CompareOp::eAlways);
+	if (dc.stencilfunc > always) {
+		DepthFatal("DB_DEPTH_CONTROL.STENCILFUNC = %" PRIu8 ", expected at most %" PRIu8,
+		           dc.stencilfunc, always);
+	}
+	if (dc.backface_enable && dc.stencilfunc_bf > always) {
+		DepthFatal("DB_DEPTH_CONTROL.STENCILFUNC_BF = %" PRIu8 ", expected at most %" PRIu8,
+		           dc.stencilfunc_bf, always);
+	}
+	if (front_write_mask != 0 &&
+	    UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
+	    sm.stencil_opval != sm.stencil_testval) {
+		DepthFatal("front face replaces stencil with DB_STENCILREFMASK.STENCILOPVAL = 0x%02" PRIx8
+		           " while STENCILTESTVAL = 0x%02" PRIx8 "; only a matching pair is supported",
+		           sm.stencil_opval, sm.stencil_testval);
+	}
+	if (dc.backface_enable && back_write_mask != 0 &&
+	    UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
+	    sm.stencil_opval_bf != sm.stencil_testval_bf) {
+		DepthFatal("back face replaces stencil with DB_STENCILREFMASK_BF.STENCILOPVAL = 0x%02" PRIx8
+		           " while STENCILTESTVAL = 0x%02" PRIx8 "; only a matching pair is supported",
+		           sm.stencil_opval_bf, sm.stencil_testval_bf);
+	}
+	DepthFatal("unsupported stencil compare or replacement state");
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
                                               RenderDepthInfo& r) {
@@ -167,7 +287,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (z.z_read_base_addr & 0xffffu) != 0 ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
-		DepthFatal("unsupported depth register state");
+		ReportDepthRegisterRejection(z, rc, dc);
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
@@ -175,10 +295,12 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 		    (!z.depth_view.stencil_write_disable &&
 		     z.stencil_write_base_addr != z.stencil_read_base_addr) ||
 		    (z.stencil_read_base_addr & 0xffffu) != 0) {
-			DepthFatal("unsupported stencil attachment state");
+			ReportStencilAttachmentRejection(z, htile_stencil_compat);
 		}
 	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
-		DepthFatal("stencil state without an active stencil attachment");
+		DepthFatal("stencil state without an active stencil attachment: DB_STENCIL_READ_BASE = "
+		           "0x%016" PRIx64 ", DB_STENCIL_WRITE_BASE = 0x%016" PRIx64,
+		           z.stencil_read_base_addr, z.stencil_write_base_addr);
 	}
 	if (has_htile) {
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
@@ -272,7 +394,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 		    (dc.backface_enable && back_write_mask != 0 &&
 		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
 		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
-			DepthFatal("unsupported stencil compare or replacement state");
+			ReportStencilOpRejection(dc, sc, sm, front_write_mask, back_write_mask);
 		}
 		r.stencil_static_front = {
 		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval),

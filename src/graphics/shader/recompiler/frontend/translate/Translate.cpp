@@ -110,8 +110,8 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
-	return {ir.Select(value, IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))),
-	        IR::U32(IR::Value(0u))};
+	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {value});
+	return {ir.CompositeExtract(ballot, 0), ir.CompositeExtract(ballot, 1)};
 }
 
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
@@ -318,7 +318,9 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			break;
 		case Decoder::OperandKind::VccHi:
 			ir.SetVccHi(IR::U32(value));
-			ir.SetVcc(ThreadBit(ir.GetVccLo()));
+			if (current_wave_size != 32u) {
+				ir.SetVcc(ThreadBit(ir.GetVccLo()));
+			}
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
 		case Decoder::OperandKind::ExecLo:
@@ -327,7 +329,9 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			break;
 		case Decoder::OperandKind::ExecHi:
 			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit(ir.GetExecLo()));
+			if (current_wave_size != 32u) {
+				ir.SetExec(ThreadBit(ir.GetExecLo()));
+			}
 			break;
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
@@ -596,7 +600,10 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 }
 
 IR::U1 Translator::ThreadBit(IR::U32 low) {
-	return ir.INotEqual(low, IR::U32(IR::Value(0u)));
+	const auto lane = ir.BitwiseAnd(IR::U32(ir.Emit(IR::ValueOpcode::LaneId, {})),
+	                                IR::U32(IR::Value(31u)));
+	return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(low, lane), IR::U32(IR::Value(1u))),
+	                    IR::U32(IR::Value(0u)));
 }
 
 IR::U1 Translator::ReadCondition(const Decoder::Operand& operand) {
@@ -623,10 +630,12 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
 			return ir.GetThreadBitScalarReg(reg);
 		}
-		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi: return ir.GetExec();
-		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: return ir.GetVcc();
+		case Decoder::OperandKind::ExecLo: return ir.GetExec();
+		case Decoder::OperandKind::ExecHi:
+			return current_wave_size == 32u ? ThreadBit(ir.GetExecHi()) : ir.GetExec();
+		case Decoder::OperandKind::VccLo: return ir.GetVcc();
+		case Decoder::OperandKind::VccHi:
+			return current_wave_size == 32u ? ThreadBit(ir.GetVccHi()) : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
 		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
 		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
@@ -681,16 +690,26 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value) {
 			}
 			return;
 		}
-		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi: {
+		case Decoder::OperandKind::ExecHi:
+			if (current_wave_size == 32u) {
+				ir.SetExecHi(BallotMask(value)[0]);
+				return;
+			}
+			[[fallthrough]];
+		case Decoder::OperandKind::ExecLo: {
 			const auto mask = BallotMask(value);
 			ir.SetExec(value);
 			ir.SetExecLo(mask[0]);
 			ir.SetExecHi(mask[1]);
 			return;
 		}
-		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: {
+		case Decoder::OperandKind::VccHi:
+			if (current_wave_size == 32u) {
+				ir.SetVccHi(BallotMask(value)[0]);
+				return;
+			}
+			[[fallthrough]];
+		case Decoder::OperandKind::VccLo: {
 			const auto mask = BallotMask(value);
 			ir.SetVcc(value);
 			ir.SetVccLo(mask[0]);

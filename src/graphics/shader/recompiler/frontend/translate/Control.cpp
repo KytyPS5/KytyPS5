@@ -276,6 +276,32 @@ void Translator::S_WQM_B64(const Decoder::Instruction& inst) {
 	ir.SetScc(result);
 }
 
+void Translator::S_WQM_B32(const Decoder::Instruction& inst) {
+	if (!IsExecOrVcc(inst.dst) && !IsExecOrVcc(inst.src0)) {
+		const auto mask_valid = ReadMaskValid(inst.src0);
+		const auto invocation_result =
+		    IR::U1(ir.Emit(IR::ValueOpcode::WqmMask, {ReadMask(inst.src0)}));
+		const auto wide = IR::U64(ir.Emit(
+		    IR::ValueOpcode::WqmU64, {ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)))}));
+		const auto result = ir.CompositeExtract(wide, 0);
+		WriteOperand(DestinationOperand(inst), result);
+		if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+			const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
+			ir.SetThreadBitScalarReg(dst, invocation_result);
+			ir.SetScalarMaskTag(dst, mask_valid);
+			const auto raw_nonzero = ir.INotEqual(result, IR::U32(IR::Value(0u)));
+			ir.SetScc(IR::U1(
+			    ir.Emit(IR::ValueOpcode::SelectU1, {mask_valid, invocation_result, raw_nonzero})));
+		} else {
+			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+		}
+		return;
+	}
+	const auto result = IR::U1(ir.Emit(IR::ValueOpcode::WqmMask, {ReadMask(inst.src0)}));
+	WriteMask(inst.dst, result);
+	ir.SetScc(result);
+}
+
 void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	if (inst.dst.kind != Decoder::OperandKind::Vgpr ||
 	    inst.src0.kind != Decoder::OperandKind::Vgpr) {

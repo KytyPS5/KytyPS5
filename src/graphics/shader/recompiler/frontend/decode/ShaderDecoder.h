@@ -59,6 +59,7 @@ enum class Opcode {
 	S_ANDN1_SAVEEXEC_B64,
 	S_NOT_B32,
 	S_NOT_B64,
+	S_WQM_B32,
 	S_WQM_B64,
 	S_ADD_U32,
 	S_ADDC_U32,

@@ -199,8 +199,8 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	const auto& ps_resources   = ps_input_info.stage.program->info;
 	const auto  sampled_images = std::count_if(
 	    ps_resources.images.begin(), ps_resources.images.end(), [](const auto& image) {
-		    return image.kind == ShaderRecompiler::IR::ResourceKind::Image ||
-		           image.kind == ShaderRecompiler::IR::ResourceKind::ImageUint;
+		    return ShaderRecompiler::IR::ImageResourceKindMatches(
+		        image.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled);
 	    });
 
 	vk::Extent2D extent = color.image_id ? color.extent : vk::Extent2D {};

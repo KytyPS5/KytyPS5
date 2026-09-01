@@ -31,6 +31,7 @@ enum class ResourceKind {
 	Gds,
 	Image,
 	ImageUint,
+	ImageSint,
 	StorageImage,
 	StorageImageUint,
 	Sampler
@@ -45,7 +46,8 @@ enum class ResourceKind {
                                                       ImageResourceClass resource_class) {
 	switch (resource_class) {
 		case ImageResourceClass::Sampled:
-			return kind == ResourceKind::Image || kind == ResourceKind::ImageUint;
+			return kind == ResourceKind::Image || kind == ResourceKind::ImageUint ||
+			       kind == ResourceKind::ImageSint;
 		case ImageResourceClass::Storage:
 			return kind == ResourceKind::StorageImage || kind == ResourceKind::StorageImageUint;
 		case ImageResourceClass::StorageUint: return kind == ResourceKind::StorageImageUint;
@@ -290,6 +292,13 @@ enum class DescriptorBindingKind {
 	SampledUint2DMsaa,
 	SampledUint2DMsaaArray,
 	SampledUint3D,
+	SampledSint1D,
+	SampledSint1DArray,
+	SampledSint2D,
+	SampledSint2DArray,
+	SampledSint2DMsaa,
+	SampledSint2DMsaaArray,
+	SampledSint3D,
 	Storage1D,
 	Storage1DArray,
 	Storage2D,
@@ -347,6 +356,17 @@ DescriptorBindingForImage(const ImageResource& image) {
 				case Dimension::Dim2DMsaa: return Kind::SampledUint2DMsaa;
 				case Dimension::Dim2DMsaaArray: return Kind::SampledUint2DMsaaArray;
 				case Dimension::Dim3D: return Kind::SampledUint3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::ImageSint:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::SampledSint1D;
+				case Dimension::Dim1DArray: return Kind::SampledSint1DArray;
+				case Dimension::Dim2D: return Kind::SampledSint2D;
+				case Dimension::Dim2DArray: return Kind::SampledSint2DArray;
+				case Dimension::Dim2DMsaa: return Kind::SampledSint2DMsaa;
+				case Dimension::Dim2DMsaaArray: return Kind::SampledSint2DMsaaArray;
+				case Dimension::Dim3D: return Kind::SampledSint3D;
 				default: return std::nullopt;
 			}
 		case ResourceKind::StorageImage:

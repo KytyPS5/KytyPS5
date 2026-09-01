@@ -37,13 +37,14 @@ struct RenderTargetFormatEncoding {
 	}
 };
 
+enum class TextureNumericClass { Unsupported, Float, Uint, Sint };
+
 RenderTargetFormatEncoding ResolveRenderTargetFormat(ChannelLayout layout, ChannelType type);
 uint32_t                   NumBytesPerElement(BufferFormat format);
 uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
 uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
-bool                       IsSampledTextureFormat(BufferFormat format);
-bool                       IsUintTextureFormat(BufferFormat format);
+TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 
 } // namespace Libs::Graphics::Prospero

@@ -103,11 +103,11 @@ SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t
 
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	if (resource.kind != ShaderRecompiler::IR::ResourceKind::Image &&
-	    resource.kind != ShaderRecompiler::IR::ResourceKind::ImageUint) {
+	if (!ShaderRecompiler::IR::ImageResourceKindMatches(
+	        resource.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled)) {
 		return false;
 	}
-	if (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint && resource.depth_compare) {
+	if (resource.kind != ShaderRecompiler::IR::ResourceKind::Image && resource.depth_compare) {
 		return false;
 	}
 	return (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||

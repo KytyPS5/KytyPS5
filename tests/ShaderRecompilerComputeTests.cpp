@@ -9531,7 +9531,9 @@ public:
         test.name, "dispatch",
         Count(Kind::Sampled2DArray) == 0 && Count(Kind::Sampled3D) == 0 &&
             Count(Kind::SampledUint2DArray) == 0 &&
-            Count(Kind::SampledUint3D) == 0 && Count(Kind::Storage1D) == 0 &&
+            Count(Kind::SampledUint3D) == 0 &&
+            Count(Kind::SampledSint2DArray) == 0 &&
+            Count(Kind::SampledSint3D) == 0 && Count(Kind::Storage1D) == 0 &&
             Count(Kind::Storage1DArray) == 0 &&
             Count(Kind::Storage2DArray) == 0 && Count(Kind::Storage3D) == 0 &&
             Count(Kind::StorageUint1D) == 0 &&
@@ -9646,7 +9648,10 @@ public:
             Count(Kind::Sampled2D) + Count(Kind::Sampled2DArray) +
             Count(Kind::Sampled3D) + Count(Kind::SampledUint1D) +
             Count(Kind::SampledUint1DArray) + Count(Kind::SampledUint2D) +
-            Count(Kind::SampledUint2DArray) + Count(Kind::SampledUint3D));
+            Count(Kind::SampledUint2DArray) + Count(Kind::SampledUint3D) +
+            Count(Kind::SampledSint1D) + Count(Kind::SampledSint1DArray) +
+            Count(Kind::SampledSint2D) + Count(Kind::SampledSint2DArray) +
+            Count(Kind::SampledSint3D));
     add_pool_size(
         vk::DescriptorType::eStorageImage,
         Count(Kind::Storage1D) + Count(Kind::Storage1DArray) +
@@ -9791,6 +9796,7 @@ public:
     constexpr std::array sampled_kinds{
         Kind::Sampled1D,     Kind::Sampled1DArray,     Kind::Sampled2D,
         Kind::SampledUint1D, Kind::SampledUint1DArray, Kind::SampledUint2D,
+        Kind::SampledSint1D, Kind::SampledSint1DArray, Kind::SampledSint2D,
     };
     for (const auto kind : sampled_kinds) {
       if (const auto *candidate = Binding(kind); candidate != nullptr) {
@@ -10734,8 +10740,8 @@ public:
                                      {16, 0}, {8, 16}, {0, 24}};
       bool valid = built && Prospero::NumBytesPerElement(format) == 4 &&
                    Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
-                   Prospero::IsSampledTextureFormat(format) &&
-                   Prospero::IsUintTextureFormat(format) &&
+                   Prospero::SampledTextureNumericClass(format) ==
+                       Prospero::TextureNumericClass::Uint &&
                    Prospero::RemapTextureFormat(format) ==
                        Prospero::BufferFormat::k32UInt &&
                    surface_format.vk_format == vk::Format::eR32Uint &&
@@ -10756,18 +10762,17 @@ public:
               "PS5 packed integer texture metadata or Standard64KB mip tail "
               "changed");
 
-      const auto storage_only_format = Prospero::BufferFormat::k32SInt;
-      const auto storage_only_surface =
-          TextureGetSurfaceFormatInfo(storage_only_format);
-      Require(name, "storage-only surface mapping",
-              !Prospero::IsSampledTextureFormat(storage_only_format) &&
-                  !Prospero::IsUintTextureFormat(storage_only_format) &&
-                  Prospero::RemapTextureFormat(storage_only_format) ==
-                      storage_only_format &&
-                  storage_only_surface.vk_format == vk::Format::eR32Sint &&
-                  storage_only_surface.conversion_format ==
+      const auto signed_format = Prospero::BufferFormat::k32SInt;
+      const auto signed_surface = TextureGetSurfaceFormatInfo(signed_format);
+      Require(name, "signed sampled surface mapping",
+              Prospero::SampledTextureNumericClass(signed_format) ==
+                      Prospero::TextureNumericClass::Sint &&
+                  Prospero::RemapTextureFormat(signed_format) ==
+                      signed_format &&
+                  signed_surface.vk_format == vk::Format::eR32Sint &&
+                  signed_surface.conversion_format ==
                       Prospero::BufferFormat::kInvalid,
-              "storage-only native backing was conflated with sampled support");
+              "signed sampled texture class or native backing changed");
     }
 
     {
@@ -11820,7 +11825,10 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
       Has(Kind::Sampled2D) || Has(Kind::Sampled2DArray) ||
       Has(Kind::Sampled3D) || Has(Kind::SampledUint2D) ||
       Has(Kind::SampledUint1D) || Has(Kind::SampledUint1DArray) ||
-      Has(Kind::SampledUint2DArray) || Has(Kind::SampledUint3D);
+      Has(Kind::SampledUint2DArray) || Has(Kind::SampledUint3D) ||
+      Has(Kind::SampledSint2D) || Has(Kind::SampledSint1D) ||
+      Has(Kind::SampledSint1DArray) || Has(Kind::SampledSint2DArray) ||
+      Has(Kind::SampledSint3D);
   const bool needs_storage_image =
       Has(Kind::Storage1D) || Has(Kind::Storage1DArray) ||
       Has(Kind::Storage2D) || Has(Kind::Storage2DArray) ||
@@ -19740,6 +19748,34 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadR32SintUsesSignedSampledImage() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadR32SintUsesSignedSampledImage";
+  test.code = code;
+  test.expected = {0xffffff80u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = 0xffffff80u;
+  test.sampled_image_format = vk::Format::eR32Sint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"sampled_sint_2d", "OpTypeImage %int",
+                         "OpImageFetch %v4int", "OpBitcast %uint"};
+  return test;
+}
+
 TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   using O = ShaderOpcode;
 
@@ -21511,6 +21547,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
@@ -23611,15 +23648,48 @@ void CheckImageSamplerSpecialization() {
   sampled_image.kind = ShaderRecompiler::IR::ResourceKind::Image;
   sampled_image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   sampled_image.read = true;
-  mixed_sampler_program.info.images = {sampled_image, sampled_image};
+  mixed_sampler_program.info.images = {sampled_image, sampled_image,
+                                       sampled_image};
   mixed_sampler_program.info.samplers.push_back({0u, 4u});
-  mixed_sampler_program.info.sampled_pairs = {{0u, 0u, 8u}, {1u, 0u, 12u}};
+  mixed_sampler_program.info.sampled_pairs = {
+      {0u, 0u, 8u}, {1u, 0u, 12u}, {2u, 0u, 16u}};
+  ShaderRecompiler::IR::MemoryInfo signed_memory;
+  signed_memory.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  signed_memory.resource = 2u;
+  signed_memory.sampler = 0u;
+  mixed_sampler_program.memory_info.push_back(signed_memory);
+  mixed_sampler_program.block_storage.push_back(
+      std::make_unique<ShaderRecompiler::IR::Block>());
+  auto *mixed_sampler_block = mixed_sampler_program.block_storage.back().get();
+  mixed_sampler_program.blocks.push_back(mixed_sampler_block);
+  using ShaderRecompiler::IR::Value;
+  using ShaderRecompiler::IR::ValueOpcode;
+  auto &image_handle = mixed_sampler_block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)});
+  auto &sampler_handle = mixed_sampler_block->AppendNewInst(
+      ValueOpcode::GetSamplerResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &image_address = mixed_sampler_block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  const ShaderRecompiler::IR::MemoryFlags signed_memory_flags{0u, 16u};
+  uint64_t signed_memory_flag_bits = 0;
+  std::memcpy(&signed_memory_flag_bits, &signed_memory_flags,
+              sizeof(signed_memory_flags));
+  mixed_sampler_block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw,
+      {Value(&image_handle), Value(&sampler_handle), Value(&image_address)},
+      signed_memory_flag_bits);
 
   ShaderRecompiler::IR::DescriptorValue native_image_descriptor{};
   native_image_descriptor.dword_count = 8;
   native_image_descriptor.dwords[0] = 0x1000u;
   native_image_descriptor.dwords[1] =
-      static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u;
+      static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u;
   native_image_descriptor.dwords[2] = 3u | (3u << 14u);
   native_image_descriptor.dwords[3] =
       DstSel(4, 5, 6, 7) |
@@ -23628,10 +23698,15 @@ void CheckImageSamplerSpecialization() {
   packed_image_descriptor.dwords[0] = 0x2000u;
   packed_image_descriptor.dwords[1] =
       static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10UInt) << 20u;
+  auto signed_image_descriptor = native_image_descriptor;
+  signed_image_descriptor.dwords[0] = 0x3000u;
+  signed_image_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u;
 
   ShaderRecompiler::IR::ResourceSnapshot mixed_sampler_snapshot;
   mixed_sampler_snapshot.images = {native_image_descriptor,
-                                   packed_image_descriptor};
+                                   packed_image_descriptor,
+                                   signed_image_descriptor};
   ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
@@ -23643,9 +23718,11 @@ void CheckImageSamplerSpecialization() {
               mixed_sampler_program.info.samplers[1].force_point_filtering &&
               mixed_sampler_program.info.sampled_pairs[0].sampler == 0u &&
               mixed_sampler_program.info.sampled_pairs[1].sampler == 1u &&
+              mixed_sampler_program.info.sampled_pairs[2].sampler == 1u &&
+              mixed_sampler_program.memory_info[0].sampler == 1u &&
               mixed_sampler_snapshot.samplers.size() == 2u,
-          "a shared native/bit-packed sampler was not split into point and "
-          "native variants");
+          "a shared float/integer sampler was not split into point and native "
+          "variants or the signed instruction retained the native sampler");
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
@@ -25699,7 +25776,6 @@ int main(int argc, char **argv) {
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
-  CheckImageSamplerSpecialization();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureVolumeMipRegions();
@@ -25720,6 +25796,7 @@ int main(int argc, char **argv) {
   CheckShaderRecompilerFatalContracts();
   VulkanHarness vulkan;
 #endif
+  CheckImageSamplerSpecialization();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckVulkan13FeatureRequirements();

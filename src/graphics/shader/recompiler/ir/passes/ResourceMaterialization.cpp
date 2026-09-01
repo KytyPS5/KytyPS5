@@ -89,6 +89,20 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
+Prospero::TextureNumericClass SampledResourceNumericClass(ResourceKind kind) {
+	switch (kind) {
+		case ResourceKind::Image: return Prospero::TextureNumericClass::Float;
+		case ResourceKind::ImageUint: return Prospero::TextureNumericClass::Uint;
+		case ResourceKind::ImageSint: return Prospero::TextureNumericClass::Sint;
+		default: return Prospero::TextureNumericClass::Unsupported;
+	}
+}
+
+bool RequiresPointSampler(const ImageResource& image) {
+	return image.kind == ResourceKind::ImageSint ||
+	       image.conversion_format != Prospero::BufferFormat::kInvalid;
+}
+
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	return static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
 	       Prospero::ImageType::kCube;
@@ -378,9 +392,8 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		    DescriptorIsCube(descriptor) != image.cube) {
 			return false;
 		}
-		if (image.kind == ResourceKind::Image || image.kind == ResourceKind::ImageUint ||
-		    image.kind == ResourceKind::StorageImage ||
-		    image.kind == ResourceKind::StorageImageUint) {
+		if (ImageResourceKindMatches(image.kind, ImageResourceClass::Sampled) ||
+		    ImageResourceKindMatches(image.kind, ImageResourceClass::Storage)) {
 			const bool storage = image.kind == ResourceKind::StorageImage ||
 			                     image.kind == ResourceKind::StorageImageUint;
 			const auto format =
@@ -396,16 +409,27 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			    image.shader_swizzle != DescriptorImageSwizzle(descriptor)) {
 				return false;
 			}
-			const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-			                              image.written && !image.read && !image.atomic;
-			const bool uint_descriptor  = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-			const auto uint_program     = image.kind == ResourceKind::ImageUint ||
-			                              image.kind == ResourceKind::StorageImageUint;
-			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
-				return false;
-			}
-			if (image.depth_compare && uint_program) {
-				return false;
+			if (storage) {
+				const bool raw_sint = format == Prospero::BufferFormat::k32SInt && image.written &&
+				                      !image.read && !image.atomic;
+				const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+				if ((!raw_sint && numeric_class == Prospero::TextureNumericClass::Sint) ||
+				    numeric_class == Prospero::TextureNumericClass::Unsupported) {
+					return false;
+				}
+				const bool uint_descriptor =
+				    numeric_class == Prospero::TextureNumericClass::Uint || raw_sint;
+				const bool uint_program = image.kind == ResourceKind::StorageImageUint;
+				if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
+					return false;
+				}
+			} else {
+				const auto numeric_class = SampledResourceNumericClass(image.kind);
+				if (numeric_class != Prospero::SampledTextureNumericClass(format) ||
+				    (image.depth_compare &&
+				     numeric_class != Prospero::TextureNumericClass::Float)) {
+					return false;
+				}
 			}
 		}
 	}
@@ -614,6 +638,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 			image.cube      = false;
 			switch (image.kind) {
 				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
+				case ResourceKind::ImageSint: image.kind = ResourceKind::Image; break;
 				case ResourceKind::StorageImageUint:
 					if (!image.atomic) {
 						image.kind = ResourceKind::StorageImage;
@@ -649,12 +674,30 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              image.written && !image.read && !image.atomic;
-		const bool uint_image       = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-		if (uint_image) {
-			switch (image.kind) {
-				case ResourceKind::Image: image.kind = ResourceKind::ImageUint; break;
-				case ResourceKind::StorageImage: image.kind = ResourceKind::StorageImageUint; break;
-				default: break;
+		const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+		if (storage) {
+			if ((!raw_sint_storage && numeric_class == Prospero::TextureNumericClass::Sint) ||
+			    numeric_class == Prospero::TextureNumericClass::Unsupported) {
+				return SpecializationFail(
+				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
+				                static_cast<uint32_t>(format)));
+			}
+			if (numeric_class == Prospero::TextureNumericClass::Uint || raw_sint_storage) {
+				image.kind = ResourceKind::StorageImageUint;
+			}
+		} else {
+			switch (numeric_class) {
+				case Prospero::TextureNumericClass::Uint:
+					image.kind = ResourceKind::ImageUint;
+					break;
+				case Prospero::TextureNumericClass::Sint:
+					image.kind = ResourceKind::ImageSint;
+					break;
+				case Prospero::TextureNumericClass::Float: break;
+				case Prospero::TextureNumericClass::Unsupported:
+					return SpecializationFail(
+					    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
+					                static_cast<uint32_t>(format)));
 			}
 		}
 	}
@@ -723,7 +766,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 			    fmt::format("sampled resource pair at pc 0x{:08x} is invalid", pair.first_use_pc));
 		}
 		auto& usage = sampler_usage[pair.sampler];
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
+		if (RequiresPointSampler(next.images[pair.image])) {
 			usage.point_only = true;
 		} else {
 			usage.native = true;
@@ -750,7 +793,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 		next_snapshot.samplers.push_back(next_snapshot.samplers[i]);
 	}
 	for (auto& pair: next.sampled_pairs) {
-		if (next.images[pair.image].conversion_format != Prospero::BufferFormat::kInvalid) {
+		if (RequiresPointSampler(next.images[pair.image])) {
 			pair.sampler = point_sampler[pair.sampler];
 		}
 	}
@@ -771,8 +814,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 				    "typed image instruction has invalid resource {}", memory.resource));
 			}
 			const auto& image = next.images[memory.resource];
-			if (image_opcode.needs_sampler &&
-			    image.conversion_format != Prospero::BufferFormat::kInvalid &&
+			if (image_opcode.needs_sampler && RequiresPointSampler(image) &&
 			    memory.sampler < point_sampler.size()) {
 				memory.sampler = point_sampler[memory.sampler];
 			}

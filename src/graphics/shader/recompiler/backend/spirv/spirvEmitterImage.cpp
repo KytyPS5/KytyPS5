@@ -199,8 +199,27 @@ uint32_t FloatBits(ValueEmitContext& ctx, uint32_t value) {
 	return Unary(ctx.state, OpBitcast, TypeU32(ctx.state), value);
 }
 
-uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool dref,
-                      const IR::MemoryInfo& mem, bool gather = false) {
+uint32_t SampledComponentBits(ValueEmitContext& ctx, uint32_t value,
+                              SampledImageClass image_class) {
+	return image_class == SampledImageClass::Uint
+	           ? value
+	           : Unary(ctx.state, OpBitcast, TypeU32(ctx.state), value);
+}
+
+uint32_t SampledComponentZero(EmitterState& state, SampledImageClass image_class) {
+	switch (image_class) {
+		case SampledImageClass::Float: return ZeroF32(state);
+		case SampledImageClass::Uint: return ConstantU32(state, 0);
+		case SampledImageClass::Sint: return ConstantI32(state, 0);
+		case SampledImageClass::Count: return 0;
+	}
+	return 0;
+}
+
+uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, SampledImageClass image_class,
+                      bool dref, const IR::MemoryInfo& mem, bool gather = false) {
+	const auto value_class = dref ? SampledImageClass::Float : image_class;
+	const bool integer     = IsIntegerSampledImage(value_class);
 	if (mem.data_bits == 16u) {
 		uint32_t   packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
 		                        ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
@@ -209,25 +228,27 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool 
 			const auto component = gather ? index : DmaskComponent(mem.dmask, index);
 			const auto result    = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction({OpCompositeExtract,
-			                               integer ? TypeU32(ctx.state) : TypeF32(ctx.state),
-			                               result, value, component});
+			                               SampledImageScalarType(ctx.state, value_class), result,
+			                               value, component});
 			return result;
 		};
 		for (uint32_t word = 0; word < mem.data_dwords; word++) {
 			const auto low_index  = word * 2u;
 			const auto high_index = low_index + 1u;
 			const auto low        = scalar(low_index);
-			const auto high = high_index < mem.component_count
-			                      ? scalar(high_index)
-			                      : (integer ? ConstantU32(ctx.state, 0) : ZeroF32(ctx.state));
+			const auto high       = high_index < mem.component_count
+			                            ? scalar(high_index)
+			                            : SampledComponentZero(ctx.state, value_class);
 			if (integer) {
-				const auto mask = ConstantU32(ctx.state, 0xffffu);
-				packed[word] =
-				    Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
-				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low, mask),
-				           Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-				                  Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high, mask),
-				                  ConstantU32(ctx.state, 16u)));
+				const auto low_bits  = SampledComponentBits(ctx, low, value_class);
+				const auto high_bits = SampledComponentBits(ctx, high, value_class);
+				const auto mask      = ConstantU32(ctx.state, 0xffffu);
+				packed[word]         = Binary(
+				    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+				    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low_bits, mask),
+				    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high_bits, mask),
+				           ConstantU32(ctx.state, 16u)));
 			} else {
 				const auto pair = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(
@@ -250,9 +271,9 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool 
 		}
 		const auto scalar = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction({OpCompositeExtract,
-		                               integer ? TypeU32(ctx.state) : TypeF32(ctx.state), scalar,
+		                               SampledImageScalarType(ctx.state, value_class), scalar,
 		                               value, index});
-		component[index] = integer ? scalar : FloatBits(ctx, scalar);
+		component[index] = SampledComponentBits(ctx, scalar, value_class);
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
@@ -363,8 +384,7 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto format = state.program.info.images[mem.resource].conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
 	const auto info = Format::GetFormatInfo(format);
-	EXIT_IF(!Prospero::IsSampledTextureFormat(format) ||
-	        !Prospero::IsUintTextureFormat(format) ||
+	EXIT_IF(Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Uint ||
 	        Prospero::RemapTextureFormat(format) == format ||
 	        info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
 	        info.byte_size != sizeof(uint32_t) || info.component_count == 0u ||
@@ -440,7 +460,7 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 }
 
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t pc,
-	                                 uint32_t coord, bool integer) {
+                                    uint32_t coord, SampledImageClass image_class) {
 	auto& state = ctx.state;
 	state.builder.RequireCapability(CapabilityImageQuery);
 	const auto image = LoadSampledImageDescriptor(state, mem, pc, ImageViewKind::Dim1D);
@@ -457,8 +477,8 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	            ConstantF32(state, 0x3f000000u))});
 
 	const auto sampled = MakeSampledImage(state, mem, pc, ImageViewKind::Dim1D);
-	const auto vector_type = integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-	const auto scalar_type = integer ? TypeU32(state) : TypeF32(state);
+	const auto vector_type = SampledImageVectorType(state, image_class, 4);
+	const auto scalar_type = SampledImageScalarType(state, image_class);
 	const auto component = ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
 	                           ? ImageGatherComponent(mem.dmask)
 	                           : 0u;
@@ -601,9 +621,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto view      = SampledImageViewKind(state, mem, pc);
-		const bool integer   = mem.kind == IR::ResourceKind::ImageUint;
-		const auto condition = ctx.Arg(inst, 2);
+		const auto view        = SampledImageViewKind(state, mem, pc);
+		const auto image_class = SampledImageClassFor(mem.kind);
+		const auto condition   = ctx.Arg(inst, 2);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
@@ -614,17 +634,15 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			        const auto coord = CoordU32(ctx, mem, *address, view);
 			        if (ImageSpirvMultisampled(view) != 0u) {
 				        state.builder.AddFunction(
-				            {OpImageFetch,
-				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
+				            {OpImageFetch, SampledImageVectorType(state, image_class, 4), color,
 				             image, coord, ImageOperandsSampleMask,
 				             AddressU32(ctx, mem, *address, ImageViewCoordinateComponents(view))});
 			        } else {
 				        state.builder.AddFunction(
-				            {OpImageFetch,
-				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
+				            {OpImageFetch, SampledImageVectorType(state, image_class, 4), color,
 				             image, coord, ImageOperandsLodMask, LodU32(ctx, mem, *address, view)});
 			        }
-			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), integer, false,
+			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), image_class, false,
 			                            mem);
 		        }));
 		return true;
@@ -644,10 +662,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
-		const auto view    = SampledImageViewKind(state, mem, pc);
-		const auto layout  = Layout(mem, view);
-		const bool integer = mem.kind == IR::ResourceKind::ImageUint;
-		const bool dref    = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		const auto view        = SampledImageViewKind(state, mem, pc);
+		const auto layout      = Layout(mem, view);
+		const auto image_class = SampledImageClassFor(mem.kind);
+		const bool dref        = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
@@ -663,8 +681,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
 					return true;
 				}
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, pc, coord, integer);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), integer,
+				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, pc, coord, image_class);
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), image_class,
 				                              false, mem, true));
 				return true;
 			}
@@ -685,7 +703,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                      : ZeroF32(state)}
 			         : std::vector<uint32_t> {
 			               OpImageGather,
-			               integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4),
+			               SampledImageVectorType(state, image_class, 4),
 			               sample,
 			               sampled,
 			               coord,
@@ -702,7 +720,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			state.builder.AddFunction(words);
 			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-			                              integer && !dref, false, mem, true));
+			                              dref ? SampledImageClass::Float : image_class, false, mem,
+			                              true));
 			return true;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
@@ -713,7 +732,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
 		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
 		const auto result_type =
-		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
+		    dref ? TypeF32(state) : SampledImageVectorType(state, image_class, 4);
 		const auto dref_value =
 		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
 		                                            : ZeroF32(state))
@@ -754,7 +773,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
-			                              integer, dref, mem));
+			                              image_class, dref, mem));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -847,7 +866,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(phi_words);
 		ctx.Define(inst,
 		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
-		                        integer, dref, mem));
+		                        image_class, dref, mem));
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

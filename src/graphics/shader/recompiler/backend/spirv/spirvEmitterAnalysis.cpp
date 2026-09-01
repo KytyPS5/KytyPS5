@@ -163,15 +163,32 @@ uint32_t ImageViewSpatialComponents(ImageViewKind view) {
 	}
 }
 
-uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view, bool integer) {
-	const auto component = integer ? TypeU32(state) : TypeF32(state);
-	return state.builder.Type(OpTypeImage,
-	                          {component, ImageSpirvDimension(view), 0, ImageSpirvArrayed(view),
-	                           ImageSpirvMultisampled(view), 1, ImageFormatUnknown});
+uint32_t SampledImageScalarType(EmitterState& state, SampledImageClass image_class) {
+	switch (image_class) {
+		case SampledImageClass::Float: return TypeF32(state);
+		case SampledImageClass::Uint: return TypeU32(state);
+		case SampledImageClass::Sint: return TypeI32(state);
+		case SampledImageClass::Count: break;
+	}
+	return 0;
 }
 
-uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view, bool integer) {
-	return state.builder.Type(OpTypeSampledImage, {ImageViewImageType(state, view, integer)});
+uint32_t SampledImageVectorType(EmitterState& state, SampledImageClass image_class,
+                                uint32_t components) {
+	return state.builder.Type(OpTypeVector,
+	                          {SampledImageScalarType(state, image_class), components});
+}
+
+uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view,
+                            SampledImageClass image_class) {
+	return state.builder.Type(OpTypeImage, {SampledImageScalarType(state, image_class),
+	                                        ImageSpirvDimension(view), 0, ImageSpirvArrayed(view),
+	                                        ImageSpirvMultisampled(view), 1, ImageFormatUnknown});
+}
+
+uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view,
+                                   SampledImageClass image_class) {
+	return state.builder.Type(OpTypeSampledImage, {ImageViewImageType(state, view, image_class)});
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageViewKind view) {
@@ -218,17 +235,18 @@ uint32_t StorageImageVariable(const EmitterState& state, StorageImageClass image
 uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
                                     ImageViewKind view) {
 	(void)use_pc;
-	const bool integer      = mem.kind == IR::ResourceKind::ImageUint;
-	const auto kind         = SampledBindingKind(integer, view);
+	const auto image_class  = SampledImageClassFor(mem.kind);
+	const auto kind         = SampledBindingKind(image_class, view);
 	const auto binding      = ResourceForDescriptor(state, kind, mem.resource);
-	const auto variable     = state.sampled_image_variables[SampledImageIndex(integer, view)];
+	const auto variable     = state.sampled_image_variables[SampledImageIndex(image_class, view)];
 	const auto pointer_type = state.builder.Type(
-	    OpTypePointer, {StorageClassUniformConstant, ImageViewImageType(state, view, integer)});
+	    OpTypePointer, {StorageClassUniformConstant, ImageViewImageType(state, view, image_class)});
 	const auto pointer =
 	    DescriptorElementPointer(state, pointer_type, variable, binding.array_index, kind,
 	                             mem.resource, "sampled image descriptor array was not emitted");
 	const auto image = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, ImageViewImageType(state, view, integer), image, pointer});
+	state.builder.AddFunction(
+	    {OpLoad, ImageViewImageType(state, view, image_class), image, pointer});
 	return image;
 }
 
@@ -252,13 +270,12 @@ uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32
 	const auto sampler = LoadSamplerDescriptor(state, mem.sampler, use_pc);
 	if (image == 0 || sampler == 0) {
 		ExitDescriptorBindingFailure(
-		    state, SampledBindingKind(mem.kind == IR::ResourceKind::ImageUint, view), mem.resource,
+		    state, SampledBindingKind(SampledImageClassFor(mem.kind), view), mem.resource,
 		    "sampled image or sampler descriptor load failed");
 	}
 	const auto sampled_image = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpSampledImage,
-	     ImageViewSampledImageType(state, view, mem.kind == IR::ResourceKind::ImageUint),
+	    {OpSampledImage, ImageViewSampledImageType(state, view, SampledImageClassFor(mem.kind)),
 	     sampled_image, image, sampler});
 	return sampled_image;
 }

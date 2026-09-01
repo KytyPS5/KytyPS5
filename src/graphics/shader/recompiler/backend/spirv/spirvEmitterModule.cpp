@@ -188,14 +188,14 @@ void DefineDescriptorVariables(EmitterState& state) {
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view    = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		const bool integer = i >= SampledImageViewKindCount;
-		const auto kind    = SampledBindingKind(integer, view);
+		const auto view        = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		const auto image_class = static_cast<SampledImageClass>(i / SampledImageViewKindCount);
+		const auto kind        = SampledBindingKind(image_class, view);
 		if (DescriptorBinding(state, kind) == nullptr) {
 			continue;
 		}
 		const auto count        = ConstantU32(state, DescriptorCount(state, kind));
-		const auto image_type   = ImageViewImageType(state, view, integer);
+		const auto image_type   = ImageViewImageType(state, view, image_class);
 		const auto array_type   = state.builder.Type(OpTypeArray, {image_type, count});
 		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
 		state.sampled_image_variables[i] =
@@ -607,11 +607,19 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "sampled_uint_2d_array",
 	                                        "sampled_uint_3d",
 	                                        "sampled_uint_2d_msaa",
-	                                        "sampled_uint_2d_msaa_array"};
+	                                        "sampled_uint_2d_msaa_array",
+	                                        "sampled_sint_1d",
+	                                        "sampled_sint_1d_array",
+	                                        "sampled_sint_2d",
+	                                        "sampled_sint_2d_array",
+	                                        "sampled_sint_3d",
+	                                        "sampled_sint_2d_msaa",
+	                                        "sampled_sint_2d_msaa_array"};
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
 		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		const auto image_class = static_cast<SampledImageClass>(i / SampledImageViewKindCount);
 		Decorate(state.sampled_image_variables[i], SampledNames[i],
-		         SampledBindingKind(i >= SampledImageViewKindCount, view));
+		         SampledBindingKind(image_class, view));
 	}
 	constexpr const char* StorageNames[] = {"storage_1d",
 	                                        "storage_1d_array",

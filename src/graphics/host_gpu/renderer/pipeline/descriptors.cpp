@@ -63,7 +63,14 @@ bool IsSampledImage(BindingKind kind) {
 		case BindingKind::SampledUint2DArray:
 		case BindingKind::SampledUint2DMsaa:
 		case BindingKind::SampledUint2DMsaaArray:
-		case BindingKind::SampledUint3D: return true;
+		case BindingKind::SampledUint3D:
+		case BindingKind::SampledSint1D:
+		case BindingKind::SampledSint1DArray:
+		case BindingKind::SampledSint2D:
+		case BindingKind::SampledSint2DArray:
+		case BindingKind::SampledSint2DMsaa:
+		case BindingKind::SampledSint2DMsaaArray:
+		case BindingKind::SampledSint3D: return true;
 		default: return false;
 	}
 }
@@ -229,8 +236,8 @@ static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageRes
 			break;
 		default: break;
 	}
-	const bool sampled_kind = resource.kind == ShaderRecompiler::IR::ResourceKind::Image ||
-	                          resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint;
+	const bool sampled_kind = ShaderRecompiler::IR::ImageResourceKindMatches(
+	    resource.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled);
 	return sampled_kind && supported_dimension &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic && !resource.depth_compare;
@@ -512,10 +519,13 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
+	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
-	    raw_sint_storage || (Prospero::IsSampledTextureFormat(format) &&
-	                         uint_resource == Prospero::IsUintTextureFormat(format) &&
-	                         (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	    raw_sint_storage ||
+	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	     numeric_class != Prospero::TextureNumericClass::Sint &&
+	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
+	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -547,6 +557,9 @@ struct NullImageSpec {
 };
 
 static NullImageSpec NullTextureSpec(const ShaderRecompiler::IR::ImageResource& resource) {
+	if (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageSint) {
+		return {vk::Format::eR32Sint, Prospero::BufferFormat::k32SInt};
+	}
 	const bool uint_image = resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint ||
 	                        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
 	return uint_image ? NullImageSpec {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt}
@@ -736,13 +749,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
+	Prospero::TextureNumericClass resource_numeric_class =
+	    Prospero::TextureNumericClass::Unsupported;
+	switch (resource.kind) {
+		case ShaderRecompiler::IR::ResourceKind::Image:
+			resource_numeric_class = Prospero::TextureNumericClass::Float;
+			break;
+		case ShaderRecompiler::IR::ResourceKind::ImageUint:
+			resource_numeric_class = Prospero::TextureNumericClass::Uint;
+			break;
+		case ShaderRecompiler::IR::ResourceKind::ImageSint:
+			resource_numeric_class = Prospero::TextureNumericClass::Sint;
+			break;
+		default: break;
+	}
 	const bool sampled_numeric_class =
-	    storage || (Prospero::IsSampledTextureFormat(format) &&
-	                (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) ==
-	                    Prospero::IsUintTextureFormat(format));
+	    storage || resource_numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage &&
-	    (resource.kind == ShaderRecompiler::IR::ResourceKind::Image ||
-	     resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint) &&
+	    ShaderRecompiler::IR::ImageResourceKindMatches(
+	        resource.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled) &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: kind=%u format=%u addr=0x%016" PRIx64 "\n",
 		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(format), address);

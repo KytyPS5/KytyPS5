@@ -337,6 +337,8 @@ enum class ImageViewKind {
 constexpr uint32_t SampledImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
 constexpr uint32_t StorageImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Dim2DMsaa);
 
+enum class SampledImageClass : uint32_t { Float, Uint, Sint, Count };
+
 enum class StorageImageClass : uint32_t {
 	FormatlessFloat,
 	FormatlessUint,
@@ -369,7 +371,9 @@ struct EmitterState {
 	uint32_t                                             flattened_srt_variable  = 0;
 	uint32_t                                             lds_variable            = 0;
 	uint32_t                                             scratch_variable        = 0;
-	std::array<uint32_t, 2u * SampledImageViewKindCount> sampled_image_variables {};
+	std::array<uint32_t,
+	           static_cast<uint32_t>(SampledImageClass::Count) * SampledImageViewKindCount>
+	    sampled_image_variables {};
 	std::array<uint32_t,
 	           static_cast<uint32_t>(StorageImageClass::Count) * StorageImageViewKindCount>
 	                           storage_image_variables {};
@@ -471,8 +475,22 @@ struct ImageSampleLayout {
 	uint32_t grad_y = NoImageComponent;
 };
 
-constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? SampledImageViewKindCount : 0u);
+constexpr SampledImageClass SampledImageClassFor(IR::ResourceKind kind) {
+	switch (kind) {
+		case IR::ResourceKind::Image: return SampledImageClass::Float;
+		case IR::ResourceKind::ImageUint: return SampledImageClass::Uint;
+		case IR::ResourceKind::ImageSint: return SampledImageClass::Sint;
+		default: return SampledImageClass::Count;
+	}
+}
+
+constexpr bool IsIntegerSampledImage(SampledImageClass image_class) {
+	return image_class == SampledImageClass::Uint || image_class == SampledImageClass::Sint;
+}
+
+constexpr uint32_t SampledImageIndex(SampledImageClass image_class, ImageViewKind view) {
+	return static_cast<uint32_t>(view) +
+	       static_cast<uint32_t>(image_class) * SampledImageViewKindCount;
 }
 
 constexpr StorageImageClass StorageImageClassFor(bool uint_image, bool atomic) {
@@ -490,8 +508,9 @@ constexpr uint32_t StorageImageIndex(StorageImageClass image_class, ImageViewKin
 	       static_cast<uint32_t>(image_class) * StorageImageViewKindCount;
 }
 
-constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
-	if (integer) {
+constexpr IR::DescriptorBindingKind SampledBindingKind(SampledImageClass image_class,
+                                                       ImageViewKind     view) {
+	if (image_class == SampledImageClass::Uint) {
 		switch (view) {
 			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::SampledUint1D;
 			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::SampledUint1DArray;
@@ -501,6 +520,19 @@ constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKi
 			case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::SampledUint2DMsaa;
 			case ImageViewKind::Dim2DMsaaArray:
 				return IR::DescriptorBindingKind::SampledUint2DMsaaArray;
+			default: break;
+		}
+	}
+	if (image_class == SampledImageClass::Sint) {
+		switch (view) {
+			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::SampledSint1D;
+			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::SampledSint1DArray;
+			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::SampledSint2D;
+			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::SampledSint2DArray;
+			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::SampledSint3D;
+			case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::SampledSint2DMsaa;
+			case ImageViewKind::Dim2DMsaaArray:
+				return IR::DescriptorBindingKind::SampledSint2DMsaaArray;
 			default: break;
 		}
 	}
@@ -641,9 +673,15 @@ uint32_t ImageViewCoordinateComponents(ImageViewKind view);
 
 uint32_t ImageViewSpatialComponents(ImageViewKind view);
 
-uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view, bool integer);
+uint32_t SampledImageScalarType(EmitterState& state, SampledImageClass image_class);
 
-uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view, bool integer);
+uint32_t SampledImageVectorType(EmitterState& state, SampledImageClass image_class,
+                                uint32_t components);
+
+uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view, SampledImageClass image_class);
+
+uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view,
+                                   SampledImageClass image_class);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageViewKind view);
 

@@ -4691,6 +4691,17 @@ public:
           Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 16, 1);
       const auto compressed_block_image =
           texture_cache.FindImage(compressed_block);
+      auto &compressed_block_native =
+          texture_cache.GetImage(compressed_block_image);
+      ImageViewInfo compressed_storage_info{};
+      compressed_storage_info.format = vk::Format::eR32G32B32A32Uint;
+      compressed_storage_info.type = vk::ImageViewType::e2D;
+      compressed_storage_info.aspect = vk::ImageAspectFlagBits::eColor;
+      compressed_storage_info.level_count = 1;
+      compressed_storage_info.layer_count = 1;
+      compressed_storage_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto compressed_storage_view =
+          compressed_block_native.FindView(compressed_storage_info);
       const bool compressed_block_download =
           TextureCacheTestAccess::TryDownload(texture_cache,
                                               compressed_block_image);
@@ -4703,12 +4714,15 @@ public:
           name, "compressed view expansion",
           compressed_block_image &&
               compressed_block_image != uncompressed_block_image &&
-              texture_cache.GetImage(compressed_block_image).backing.format ==
+              compressed_block_native.backing.format ==
                   vk::Format::eBc3UnormBlock &&
+              static_cast<bool>(compressed_block_native.backing.usage &
+                                vk::ImageUsageFlagBits::eStorage) &&
+              compressed_storage_view != nullptr &&
               compressed_block_download &&
               block_alias_after == block_alias_data,
           "size-compatible compressed alias did not preserve its native "
-          "contents");
+          "contents or create its uncompressed storage view");
 
       ImageInfo resolve_source_info{};
       resolve_source_info.pixel_format = vk::Format::eR8G8B8A8Unorm;

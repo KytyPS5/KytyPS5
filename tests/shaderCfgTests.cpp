@@ -8811,6 +8811,45 @@ void TestNewShaderRecompilerExpVertexOutputs() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerClipDisabledPosition() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+  };
+  const auto compile = [&](const ShaderVertexInputInfo &vertex) {
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    return ShaderRecompiler::Recompile(shader, options);
+  };
+
+  ShaderVertexInputInfo regular{};
+  auto clipped = regular;
+  clipped.clip_space = {
+      .scale = {640.0f, 360.0f},
+      .offset = {640.0f, 360.0f},
+      .half_extent = {8192.0f, 8192.0f},
+      .enabled = true,
+  };
+  const auto regular_result = compile(regular);
+  const auto clipped_result = compile(clipped);
+  CheckSpirvBinaryValidates(clipped_result.spirv);
+  Check(SpirvInstructionOpcodeCount(regular_result.spirv, 136u) == 0u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 133u) == 2u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 129u) == 2u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 136u) == 2u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 131u) == 2u,
+        "clip-disabled position export did not convert both screen coordinates to NDC");
+  Check(MakeStageStaticKey(regular) != MakeStageStaticKey(clipped),
+        "clip-disabled vertex shader shared the regular shader cache key");
+  auto disabled = clipped;
+  disabled.clip_space.enabled = false;
+  Check(MakeStageStaticKey(regular) == MakeStageStaticKey(disabled),
+        "disabled clip-space payload affected the shader cache key");
+  auto shifted = clipped;
+  shifted.clip_space.offset[0] += 1.0f;
+  Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
+        "clip-disabled viewport transform is absent from the shader cache key");
+}
+
 void TestNewShaderRecompilerAuxPositionExports() {
   const auto compile = [](std::span<const uint32_t> shader, uint32_t control) {
     ShaderVertexInputInfo vertex{};
@@ -11908,6 +11947,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();

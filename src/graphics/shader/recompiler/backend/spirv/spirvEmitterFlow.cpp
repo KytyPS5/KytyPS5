@@ -408,6 +408,41 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 	}
 }
 
+uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float scale,
+                               float offset, float half_extent) {
+	const auto window  = state.builder.AllocateId();
+	const auto biased  = state.builder.AllocateId();
+	const auto divided = state.builder.AllocateId();
+	const auto ndc     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFMul, TypeF32(state), window, coordinate, ConstantF32Value(state, scale)});
+	state.builder.AddFunction(
+	    {OpFAdd, TypeF32(state), biased, window, ConstantF32Value(state, offset)});
+	state.builder.AddFunction(
+	    {OpFDiv, TypeF32(state), divided, biased, ConstantF32Value(state, half_extent)});
+	state.builder.AddFunction(
+	    {OpFSub, TypeF32(state), ndc, divided, ConstantF32Value(state, 1.0f)});
+	return ndc;
+}
+
+uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
+	const auto& transform = state.input_info.vertex->clip_space;
+	uint32_t    components[4] {};
+	for (uint32_t i = 0; i < 4; i++) {
+		components[i] = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpCompositeExtract, TypeF32(state), components[i], position, i});
+	}
+	components[0] = ConvertClipCoordinate(state, components[0], transform.scale[0],
+	                                      transform.offset[0], transform.half_extent[0]);
+	components[1] = ConvertClipCoordinate(state, components[1], transform.scale[1],
+	                                      transform.offset[1], transform.half_extent[1]);
+	const auto converted = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 4), converted,
+	                           components[0], components[1], components[2], components[3]});
+	return converted;
+}
+
 void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -467,6 +502,9 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 		}
 		if (exp.kind == IR::ExportTargetKind::Position) {
+			if (state.stage == ShaderType::Vertex && state.input_info.vertex->clip_space.enabled) {
+				value = ConvertPositionToClipSpace(state, value);
+			}
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(
 			    {OpAccessChain, TypePointer(state, StorageClassOutput, TypeF32Vector(state, 4)),

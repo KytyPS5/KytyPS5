@@ -116,7 +116,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	static constexpr std::size_t MaxStaticKeyWords =
-	    5 + ShaderVertexInputInfo::RES_MAX * 17;
+	    12 + ShaderVertexInputInfo::RES_MAX * 17;
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info) {
@@ -340,8 +340,23 @@ void PipelineCache::Save() {
 
 ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
                                               const HW::ShaderRegisters&  sh,
+                                              const HW::Context&          context,
                                               ShaderVertexInputInfo&      input_info) {
 	const auto params = PrepareProgram(regs, sh, input_info);
+	if (context.GetClipControl().clip_disable) {
+		const auto& viewport = context.GetScreenViewport().viewports[0];
+		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
+		auto&       clip     = input_info.clip_space;
+		clip.scale[0]        = viewport.xscale;
+		clip.scale[1]        = viewport.yscale;
+		clip.offset[0]       = viewport.xoffset;
+		clip.offset[1]       = viewport.yoffset;
+		clip.half_extent[0] =
+		    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
+		clip.half_extent[1] =
+		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
+		clip.enabled = true;
+	}
 	Common::LockGuard lock(m_mutex);
 	return m_program_cache->Get(params, input_info);
 }

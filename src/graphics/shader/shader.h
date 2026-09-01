@@ -68,6 +68,13 @@ inline uint8_t GetDstSel(uint32_t swizzle, uint32_t channel) {
 	return (swizzle >> (channel * 3u)) & 0x7u;
 }
 
+struct ShaderClipSpaceTransform {
+	float scale[2]       = {};
+	float offset[2]      = {};
+	float half_extent[2] = {};
+	bool  enabled        = false;
+};
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -84,6 +91,7 @@ struct ShaderVertexInputInfo {
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                param_export_mask   = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	ShaderClipSpaceTransform clip_space;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };

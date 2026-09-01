@@ -331,10 +331,18 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const auto final_scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent);
 
 	vk::Viewport viewport {};
-	viewport.x        = vp.viewports[0].xoffset - vp.viewports[0].xscale;
-	viewport.y        = vp.viewports[0].yoffset - vp.viewports[0].yscale;
-	viewport.width    = vp.viewports[0].xscale * 2.0f;
-	viewport.height   = vp.viewports[0].yscale * 2.0f;
+	if (ctx.GetClipControl().clip_disable) {
+		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+		viewport.x         = 0.0f;
+		viewport.y         = 0.0f;
+		viewport.width     = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
+		viewport.height    = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
+	} else {
+		viewport.x      = vp.viewports[0].xoffset - vp.viewports[0].xscale;
+		viewport.y      = vp.viewports[0].yoffset - vp.viewports[0].yscale;
+		viewport.width  = vp.viewports[0].xscale * 2.0f;
+		viewport.height = vp.viewports[0].yscale * 2.0f;
+	}
 	viewport.minDepth = vp.viewports[0].zoffset;
 	viewport.maxDepth = vp.viewports[0].zscale + vp.viewports[0].zoffset;
 	vk_buffer.setViewport(0, 1, &viewport);
@@ -1013,8 +1021,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 		LogDrawPhase(draw.name, "GetVertexProgram");
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
-	state.vertex_program =
-	    pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, state.vs_input_info);
+	state.vertex_program = pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, ctx,
+	                                                         state.vs_input_info);
 
 	if (!state.ps_active) {
 		return;

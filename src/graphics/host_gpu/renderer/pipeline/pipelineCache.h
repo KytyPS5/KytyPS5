@@ -130,6 +130,7 @@ public:
 
 	ShaderProgram GetVertexProgram(const HW::VertexShaderInfo& regs,
 	                               const HW::ShaderRegisters&  sh,
+	                               const HW::Context&          context,
 	                               ShaderVertexInputInfo&      input_info);
 	ShaderProgram
 	GetPixelProgram(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,

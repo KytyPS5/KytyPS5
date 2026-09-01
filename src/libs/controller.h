@@ -48,6 +48,7 @@ struct PadControllerInformation;
 struct PadData;
 struct PadVibrationParam;
 struct PadLightBarParam;
+struct PadTriggerEffectParam;
 
 inline int controller_get_axis(int min, int max, int value) {
 	int v = (255 * (value - min)) / (max - min);
@@ -66,7 +67,6 @@ void ControllerButton(int id, uint32_t button, bool down);
 void ControllerAxis(int id, Axis axis, int value);
 void ControllerRightStick(int id, int x, int y);
 void ControllerTouchPad(int id, int finger, bool down, float x, float y);
-void ControllerTriggerEffect(const uint8_t* left, const uint8_t* right);
 void ControllerResetInputState();
 
 int KYTY_SYSV_ABI PadInit();
@@ -79,6 +79,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
+int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param);
 int KYTY_SYSV_ABI PadResetLightBar(int handle);
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
 

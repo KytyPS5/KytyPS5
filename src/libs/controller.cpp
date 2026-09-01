@@ -40,16 +40,40 @@ struct PadControllerInformation {
 };
 
 struct PadLightBarParam {
-	uint8_t r       = 0;
-	uint8_t g       = 0;
-	uint8_t b       = 0;
-	uint8_t reserve = 0;
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+	uint8_t reserve;
 };
 
 struct PadVibrationParam {
 	uint8_t large_motor;
 	uint8_t small_motor;
 };
+
+struct PadTriggerEffectCommand {
+	uint32_t mode;
+	uint8_t  reserve[4];
+	uint8_t  data[48];
+};
+
+struct PadTriggerEffectParam {
+	uint8_t                 trigger_mask;
+	uint8_t                 reserve[7];
+	PadTriggerEffectCommand command[2];
+};
+
+static_assert(sizeof(PadTriggerEffectCommand) == 56);
+static_assert(sizeof(PadTriggerEffectParam) == 120);
+
+struct DualSenseEffects {
+	uint8_t enable_bits;
+	uint8_t reserve[9];
+	uint8_t right_trigger[11];
+	uint8_t left_trigger[11];
+};
+
+static_assert(sizeof(DualSenseEffects) == 32);
 
 struct ControllerState {
 	struct Touch {
@@ -81,7 +105,7 @@ public:
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
-	void SetTriggerEffect(const uint8_t* left, const uint8_t* right);
+	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -91,11 +115,6 @@ private:
 	void CheckActive();
 	void AddState();
 
-	SDL_hid_device*  m_hid              = nullptr;
-	bool             m_hid_tried        = false;
-	bool             m_hid_bluetooth    = false;
-	uint8_t          m_last_trigger[22] = {};
-	bool             m_trigger_sent     = false;
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
@@ -137,6 +156,92 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
 	data->device_unique_data_len = 0;
+}
+
+static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, uint8_t type,
+                                 uint8_t frequency = 0) {
+	uint16_t active = 0;
+	uint32_t packed = 0;
+	for (int i = 0; i < 10; i++) {
+		if (strengths[i] > 8) {
+			return false;
+		}
+		if (strengths[i] != 0) {
+			active |= static_cast<uint16_t>(1u << i);
+			packed |= static_cast<uint32_t>(strengths[i] - 1u) << (3 * i);
+		}
+	}
+
+	effect[0] = active != 0 && (type != 0x26 || frequency != 0) ? type : 0x05;
+	effect[1] = static_cast<uint8_t>(active);
+	effect[2] = static_cast<uint8_t>(active >> 8u);
+	effect[3] = static_cast<uint8_t>(packed);
+	effect[4] = static_cast<uint8_t>(packed >> 8u);
+	effect[5] = static_cast<uint8_t>(packed >> 16u);
+	effect[6] = static_cast<uint8_t>(packed >> 24u);
+	effect[9] = frequency;
+	return true;
+}
+
+static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, uint8_t* effect) {
+	std::memset(effect, 0, 11);
+	effect[0] = 0x05;
+
+	uint8_t strengths[10] = {};
+	switch (command.mode) {
+		case 0: return true;
+		case 1:
+			if (command.data[0] > 9 || command.data[1] > 8) {
+				return false;
+			}
+			std::fill(strengths + command.data[0], strengths + 10, command.data[1]);
+			return trigger_effect_zones(effect, strengths, 0x21);
+		case 2: {
+			const auto start    = command.data[0];
+			const auto end      = command.data[1];
+			const auto strength = command.data[2];
+			if (start < 2 || start > 7 || end <= start || end > 8 || strength > 8) {
+				return false;
+			}
+			if (strength == 0) {
+				return true;
+			}
+			const uint16_t zones = static_cast<uint16_t>((1u << start) | (1u << end));
+			effect[0]            = 0x25;
+			effect[1]            = static_cast<uint8_t>(zones);
+			effect[2]            = static_cast<uint8_t>(zones >> 8u);
+			effect[3]            = strength - 1u;
+			return true;
+		}
+		case 3:
+			if (command.data[0] > 9 || command.data[1] > 8) {
+				return false;
+			}
+			std::fill(strengths + command.data[0], strengths + 10, command.data[1]);
+			return trigger_effect_zones(effect, strengths, 0x26, command.data[2]);
+		case 4: return trigger_effect_zones(effect, command.data, 0x21);
+		case 5: {
+			const int start          = command.data[0];
+			const int end            = command.data[1];
+			const int start_strength = command.data[2];
+			const int end_strength   = command.data[3];
+			if (start > 8 || end <= start || end > 9 || start_strength < 1 || start_strength > 8 ||
+			    end_strength < 1 || end_strength > 8) {
+				return false;
+			}
+			for (int i = start; i < 10; i++) {
+				const int delta  = (end_strength - start_strength) * (i - start);
+				const int length = end - start;
+				strengths[i]     = static_cast<uint8_t>(
+				    i >= end ? end_strength
+				             : start_strength +
+				                   (delta + (delta < 0 ? -length / 2 : length / 2)) / length);
+			}
+			return trigger_effect_zones(effect, strengths, 0x21);
+		}
+		case 6: return trigger_effect_zones(effect, command.data + 1, 0x26, command.data[0]);
+		default: return false;
+	}
 }
 
 void Initialize() {
@@ -320,72 +425,40 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
-	if (m_active_id < 0) {
-		return;
+	if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	    pad != nullptr) {
+		(void)SDL_GameControllerSetLED(pad, r, g, b);
 	}
-	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
-	if (pad == nullptr) {
-		return;
-	}
-	// A pad without an LED reports failure; there is nothing to recover from.
-	(void)SDL_GameControllerSetLED(pad, r, g, b);
 }
 
-// SDL owns its own PS5 output report and rejects ours, so trigger effects go straight to the pad
-// over HID. USB is report 0x02 with the payload at offset 1; Bluetooth is 0x31 at offset 2 with a
-// CRC32 over an 0xA2 header byte plus the report. Right trigger sits at payload offset 10, left at
-// 21, and bits 2 and 3 of the first byte say which to apply - leaving rumble and LED state alone.
-void GameController::SetTriggerEffect(const uint8_t* left, const uint8_t* right) {
-	Common::LockGuard lock(m_mutex);
-	if (left == nullptr || right == nullptr) {
-		return;
+bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
+	if ((param.trigger_mask & ~0x03u) != 0) {
+		return false;
 	}
-	if (!m_hid_tried) {
-		m_hid_tried = true;
-		for (const auto product: {0x0ce6, 0x0df2}) {
-			m_hid = SDL_hid_open(0x054c, static_cast<unsigned short>(product), nullptr);
-			if (m_hid != nullptr) {
-				uint8_t   probe[78] = {};
-				const int read      = SDL_hid_read_timeout(m_hid, probe, sizeof(probe), 50);
-				m_hid_bluetooth     = read > 64;
-				break;
-			}
+
+	DualSenseEffects effect {};
+	if ((param.trigger_mask & 0x01u) != 0) {
+		effect.enable_bits |= 0x08;
+		if (!trigger_effect_to_dualsense(param.command[0], effect.left_trigger)) {
+			return false;
 		}
 	}
-	if (m_hid == nullptr) {
-		return;
+	if ((param.trigger_mask & 0x02u) != 0) {
+		effect.enable_bits |= 0x04;
+		if (!trigger_effect_to_dualsense(param.command[1], effect.right_trigger)) {
+			return false;
+		}
 	}
-	uint8_t combined[22] = {};
-	std::memcpy(combined, right, 11);
-	std::memcpy(combined + 11, left, 11);
-	if (m_trigger_sent && std::memcmp(combined, m_last_trigger, sizeof(combined)) == 0) {
-		return; // titles resend every frame; the pad holds the last effect
+	if (effect.enable_bits == 0) {
+		return true;
 	}
-	std::memcpy(m_last_trigger, combined, sizeof(combined));
-	m_trigger_sent = true;
-	uint8_t report[79] = {};
-	int     size       = 0;
-	int     offset     = 0;
-	if (m_hid_bluetooth) {
-		report[0] = 0x31;
-		report[1] = 0x02;
-		size      = 78;
-		offset    = 2;
-	} else {
-		report[0] = 0x02;
-		size      = 48;
-		offset    = 1;
+
+	Common::LockGuard lock(m_mutex);
+	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
+		(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
 	}
-	report[offset + 0] = 0x0c;
-	std::memcpy(report + offset + 10, right, 11);
-	std::memcpy(report + offset + 21, left, 11);
-	if (m_hid_bluetooth) {
-		const uint8_t header = 0xa2;
-		uint32_t      crc    = SDL_crc32(0, &header, 1);
-		crc                  = SDL_crc32(crc, report, static_cast<size_t>(size) - sizeof(crc));
-		std::memcpy(report + size - sizeof(crc), &crc, sizeof(crc));
-	}
-	(void)SDL_hid_write(m_hid, report, static_cast<size_t>(size));
+	return true;
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -476,11 +549,6 @@ void ControllerTouchPad(int id, int finger, bool down, float x, float y) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->TouchPad(id, finger, down, x, y);
-}
-
-void ControllerTriggerEffect(const uint8_t* left, const uint8_t* right) {
-	EXIT_IF(g_controller == nullptr);
-	g_controller->SetTriggerEffect(left, right);
 }
 
 void ControllerResetInputState() {
@@ -706,12 +774,24 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	// Accepted and dropped before: titles signal state through the light bar (police lights,
-	// health, player colour), so drive the real pad.
 	EXIT_IF(g_controller == nullptr);
 	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {
+	PRINT_NAME();
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (param == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	EXIT_IF(g_controller == nullptr);
+	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
 }
 
 } // namespace Libs::Controller

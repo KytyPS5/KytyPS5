@@ -571,7 +571,10 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
-		LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib[in.semantic]);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
+			     attrib[in.semantic]);
+		}
 
 		size_t index = attrib[in.semantic] & 0x1fu;
 		auto   format =

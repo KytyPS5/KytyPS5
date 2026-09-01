@@ -808,7 +808,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 
 } // namespace LibcInternal
 
-LIB_USING(LibC);
+namespace LibC {
 
 LIB_DEFINE(InitLibC_1) {
 	LibcInternal::InitLibcInternal_1(s);
@@ -834,5 +834,7 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 }
+
+} // namespace LibC
 
 } // namespace Libs

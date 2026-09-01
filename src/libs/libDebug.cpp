@@ -16,14 +16,10 @@ static KYTY_SYSV_ABI uint32_t RazorCpuIsCapturing() {
 	return 0;
 }
 
-LIB_DEFINE(InitLibRazorCpu_1) {
+LIB_DEFINE(InitRazorCpu_1) {
 	LIB_FUNC("EboejOQvLL4", LibRazorCpu::RazorCpuIsCapturing);
 }
 
 } // namespace LibRazorCpu
-
-LIB_DEFINE(InitDebug_1) {
-	LibRazorCpu::InitLibRazorCpu_1(s);
-}
 
 } // namespace Libs

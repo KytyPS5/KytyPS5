@@ -23,12 +23,14 @@ Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 } // namespace
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
-                            bool negate_exec, bool negate_source, bool write_64) {
-	const auto old    = ir.GetExec();
-	const auto src    = ReadMask(inst.src0);
-	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
-	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
+                            bool negate_exec, bool negate_source, bool write_64,
+                            bool negate_result) {
+	const auto old      = ir.GetExec();
+	const auto src      = ReadMask(inst.src0);
+	const auto lhs      = negate_exec ? ir.LogicalNot(old) : old;
+	const auto rhs      = negate_source ? ir.LogicalNot(src) : src;
+	const auto combined = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	const auto result   = negate_result ? ir.LogicalNot(combined) : combined;
 	if (write_64) {
 		WriteMask64(inst.dst, old);
 	} else {

@@ -242,7 +242,6 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_ESCAPE: game.need_exit = true; break;
 			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			case SDLK_F1:
 				if (!key.repeat) {

@@ -814,6 +814,7 @@ static void WindowCreate(WindowContext& context) {
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 #endif

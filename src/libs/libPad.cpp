@@ -42,23 +42,6 @@ static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                           
 	return 0;
 }
 
-static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
-	PRINT_NAME();
-
-	LOGF("\t handle = %d\n"
-	     "\t param  = 0x%016" PRIx64 "\n",
-	     handle, reinterpret_cast<uint64_t>(param));
-
-	if (handle != 1) {
-		return -2137915389; /* 0x80920003 */
-	}
-	if (param == nullptr) {
-		return -2137915391; /* 0x80920001 */
-	}
-
-	return OK;
-}
-
 static int KYTY_SYSV_ABI PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
 	PRINT_NAME();
 
@@ -198,7 +181,7 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("rIZnR6eSpvk", Controller::PadResetOrientation);
 	LIB_FUNC("vDLMoJLde8I", PadSetTiltCorrectionState);
 	LIB_FUNC("gjP9-KQzoUk", Controller::PadGetControllerInformation);
-	LIB_FUNC("2JgFB2n9oUM", PadSetTriggerEffect);
+	LIB_FUNC("2JgFB2n9oUM", Controller::PadSetTriggerEffect);
 	LIB_FUNC("YndgXqQVV7c", Controller::PadReadState);
 	LIB_FUNC("q1cHNfGycLI", Controller::PadRead);
 	LIB_FUNC("yFVnOdGxvZY", Controller::PadSetVibration);

@@ -10,7 +10,8 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_ADDC_U32: ADD_U32(inst, true, true); return true;
 		case O::V_SUB_I32: SUB_U32(inst, true, false); return true;
 		case O::V_SUBREV_I32: SUB_U32(inst, true, true); return true;
-		case O::V_SUBREV_CO_CI_U32: SUBB_U32(inst, true); return true;
+		case O::V_SUB_CO_CI_U32: SUBB_U32(inst, true, false); return true;
+		case O::V_SUBREV_CO_CI_U32: SUBB_U32(inst, true, true); return true;
 
 		case O::V_MOV_B32: MOV_B32(inst, true); return true;
 		case O::V_MOVRELS_B32: V_MOVRELS_B32(inst); return true;

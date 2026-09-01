@@ -192,6 +192,7 @@ private:
 	bool V_SAD_U32(const Decoder::Instruction& inst);
 	bool V_ADD3_U32(const Decoder::Instruction& inst);
 	bool S_BITSET_B32(const Decoder::Instruction& inst, bool set);
+	bool S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	bool V_BCNT_U32_B32(const Decoder::Instruction& inst);
 	bool V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low);
 	bool S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst);
@@ -218,7 +219,8 @@ private:
 	                bool negate_source, bool write_64);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
 	void SUB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
-	void SUBB_U32(const Decoder::Instruction& inst, bool vector);
+	void SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
+	void S_ABSDIFF_I32(const Decoder::Instruction& inst);
 	void S_ADD_SUB_I32(const Decoder::Instruction& inst, bool subtract);
 	void S_LSHL_ADD_U32(const Decoder::Instruction& inst, uint32_t shift_amount);
 	void ScalarMinMax32(const Decoder::Instruction& inst, IR::ValueOpcode value_opcode,

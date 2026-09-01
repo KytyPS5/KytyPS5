@@ -27,7 +27,8 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x22u, Opcode::S_ASHR_I32},        {0x24u, Opcode::S_BFM_B32},
     {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
     {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
-    {0x29u, Opcode::S_BFE_U64},         {0x2eu, Opcode::S_LSHL1_ADD_U32},
+    {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
+    {0x2eu, Opcode::S_LSHL1_ADD_U32},
     {0x2fu, Opcode::S_LSHL2_ADD_U32},   {0x30u, Opcode::S_LSHL3_ADD_U32},
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
     {0x33u, Opcode::S_PACK_LH_B32_B16}, {0x34u, Opcode::S_PACK_HH_B32_B16},
@@ -48,7 +49,9 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
     {0x1bu, Opcode::S_BITSET0_B32},
+    {0x1cu, Opcode::S_BITSET0_B64},
     {0x1du, Opcode::S_BITSET1_B32},
+    {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
@@ -93,6 +96,7 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x0au, Opcode::S_BARRIER},
     {0x0cu, Opcode::S_WAITCNT},
     {0x0eu, Opcode::S_SLEEP},
+    {0x0fu, Opcode::S_SETPRIO},
     {0x10u, Opcode::S_SENDMSG},
     {0x12u, Opcode::S_TRAP},
     {0x16u, Opcode::S_TTRACEDATA},
@@ -276,6 +280,7 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                           : static_cast<int32_t>(static_cast<int16_t>(simm));
 	inst.src_count = (inst.opcode == Opcode::S_NOP || inst.opcode == Opcode::S_WAITCNT ||
 	                  inst.opcode == Opcode::S_WAITCNT_DEPCTR || inst.opcode == Opcode::S_SLEEP ||
+	                  inst.opcode == Opcode::S_SETPRIO ||
 	                  inst.opcode == Opcode::S_SENDMSG || inst.opcode == Opcode::S_TRAP ||
 	                  inst.opcode == Opcode::S_TTRACEDATA || inst.opcode == Opcode::S_INST_PREFETCH)
 	                     ? 1

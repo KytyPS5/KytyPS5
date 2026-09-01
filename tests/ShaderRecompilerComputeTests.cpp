@@ -12677,6 +12677,76 @@ TestCase ScalarAbsI32UpdatesScc() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarAbsdiffBitset64AndSetprio() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  auto capture_scc = [&](u32 dst_sgpr) {
+    code.push_back(
+        EncodeSop2(0x0a, dst_sgpr, InlineU32(1), InlineU32(0)));
+  };
+
+  code.push_back(EncodeSMovB32(0, InlineU32(2)));
+  code.push_back(EncodeSMovB32(1, InlineU32(5)));
+  code.push_back(EncodeSop2(0x2c, 10, 0, 1));
+  capture_scc(20);
+  AppendSMovLiteral(&code, 0, 0xffffffffu);
+  code.push_back(EncodeSMovB32(1, InlineU32(0)));
+  code.push_back(EncodeSop2(0x2c, 11, 0, 1));
+  capture_scc(21);
+  AppendSMovLiteral(&code, 0, 0x80000000u);
+  code.push_back(EncodeSop2(0x2c, 12, 0, 1));
+  capture_scc(22);
+  code.push_back(EncodeSMovB32(1, InlineU32(1)));
+  code.push_back(EncodeSop2(0x2c, 13, 0, 1));
+  capture_scc(23);
+  code.push_back(EncodeSop2(0x2c, 14, 0, 0));
+  capture_scc(24);
+
+  AppendSMovLiteral(&code, 2, 65u);
+  AppendSMovLiteral(&code, 3, 101u);
+  code.push_back(EncodeSMovB32(4, InlineU32(0)));
+  code.push_back(EncodeSMovB32(5, InlineU32(0)));
+  code.push_back(EncodeSop1(0x1e, 4, 2));
+  AppendStoreSgprPair(&code, 4, 10);
+  code.push_back(EncodeSop1(0x1e, 4, 3));
+  AppendStoreSgprPair(&code, 4, 12);
+  code.push_back(EncodeSop1(0x1c, 4, 2));
+  AppendStoreSgprPair(&code, 4, 14);
+  code.push_back(EncodeSop1(0x1c, 4, 3));
+  AppendStoreSgprPair(&code, 4, 16);
+  code.push_back(EncodeSopp(0x0f, 3));
+
+  AppendStoreSgpr(&code, 10, 0);
+  AppendStoreSgpr(&code, 11, 1);
+  AppendStoreSgpr(&code, 12, 2);
+  AppendStoreSgpr(&code, 13, 3);
+  AppendStoreSgpr(&code, 14, 4);
+  AppendStoreSgpr(&code, 20, 5);
+  AppendStoreSgpr(&code, 21, 6);
+  AppendStoreSgpr(&code, 22, 7);
+  AppendStoreSgpr(&code, 23, 8);
+  AppendStoreSgpr(&code, 24, 9);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarAbsdiffBitset64AndSetprio";
+  test.code = std::move(code);
+  test.expected = {3u, 1u, 0x80000000u, 0x7fffffffu, 0u,
+                   1u, 1u, 1u,          1u,          0u,
+                   2u, 0u, 2u,          32u,         0u,
+                   32u, 0u, 0u};
+  test.opcodes = {O::S_MOV_B32,     O::S_ABSDIFF_I32, O::S_CSELECT_B32,
+                  O::S_BITSET1_B64, O::S_BITSET0_B64, O::S_SETPRIO,
+                  O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_ABSDIFF_I32", 5},
+                         {"S_BITSET1_B64", 2},
+                         {"S_BITSET0_B64", 2},
+                         {"S_SETPRIO 0x00000003", 1}};
+  return test;
+}
+
 TestCase ScalarShiftLeftAddSccCarryEdges() {
   using O = ShaderOpcode;
 
@@ -14173,6 +14243,55 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorSubCoCiU32CompactAndVop3() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 4);
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  AppendBufferLoadDword(&code, 2, 5);
+  code.push_back(EncodeVop2(0x1b, 3, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 3));
+  code.push_back(EncodeSop1(0x04, 20, 106));
+  code.push_back(EncodeVop2(0x29, 10, Vgpr(1), 2));
+  AppendVMovU32(&code, 6, 1);
+  code.push_back(EncodeVop2(0x01, 11, InlineU32(0), 6));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 0, 4);
+
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 6));
+  AppendVop3B(&code, 0x129u, 12, 22, Vgpr(1), Vgpr(2), 20);
+  AppendVop3(&code, 0x101u, 13, InlineU32(0), Vgpr(6), 22);
+  code.push_back(EncodeVop2(0x01, 14, InlineU32(0), 6));
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 0, 8);
+  AppendStoreVgprAtLaneDwordOffset(&code, 13, 0, 12);
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 0, 16);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorSubCoCiU32CompactAndVop3";
+  test.code = std::move(code);
+  test.initial = {5u, 5u, 3u, 3u, 3u, 3u, 5u, 3u, 0u, 0u,
+                  0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+  test.expected = {2u, 1u, 0xfffffffeu, 0xffffffffu, 0u, 0u, 1u,
+                   1u, 2u, 1u, 0xfffffffeu, 0xffffffffu, 0u, 0u,
+                   1u, 1u, 0u, 0u, 0u, 0u};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_AND_B32, O::V_CMP_NE_U32, O::V_CMP_EQ_U32,
+                  O::V_SUB_CO_CI_U32, O::V_CNDMASK_B32, O::S_MOV_B64,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_SUB_CO_CI_U32", 2}};
+  test.required_spirv = {"OpISub", "OpUGreaterThan", "OpLogicalOr"};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
   test.has_compute_info = true;
   return test;
 }
@@ -21168,6 +21287,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);
   AddCase(ScalarAbsI32UpdatesScc);
+  AddCase(ScalarAbsdiffBitset64AndSetprio);
   AddCase(ScalarShiftLeftAddSccCarryEdges);
   AddCase(ScalarCompareOps);
   AddCase(ScalarShiftAddAndMaskOps);
@@ -21213,6 +21333,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
+  AddCase(VectorSubCoCiU32CompactAndVop3);
   AddCase(VectorSubrevCoCiU32ExactRawOnGpu);
   AddCase(VectorVop3BSubrevCoCiUsesEncodedMasks);
   AddCase(VectorVop3BCarryOutWritesSgprMask);
@@ -23461,6 +23582,7 @@ void CheckStorageTextureDepthTileUploadLayout() {
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
+
 void CheckImageSamplerSpecialization() {
   ShaderSamplerResource filtered_sampler{};
   filtered_sampler.fields[2] =

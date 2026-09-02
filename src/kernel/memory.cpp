@@ -2445,6 +2445,24 @@ int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, cons
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
+	PRINT_NAME();
+
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	auto vaddr = reinterpret_cast<uint64_t>(addr);
+
+	LOGF("\t addr = 0x%016" PRIx64 "\n"
+	     "\t len  = 0x%016" PRIx64 "\n",
+	     vaddr, len);
+
+	g_physical_memory->SetVirtualRangeName(vaddr, len, "");
+	g_flexible_memory->SetVirtualRangeName(vaddr, len, "");
+	g_virtual_ranges->Rename(vaddr, len, "");
+
+	return OK;
+}
+
 static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
 	       g_virtual_ranges->Remove(vaddr, size);

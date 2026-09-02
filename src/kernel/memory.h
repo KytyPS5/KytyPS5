@@ -121,6 +121,7 @@ int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, i
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);
 int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name);
+int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len);
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len);
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize();
 int KYTY_SYSV_ABI    KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,

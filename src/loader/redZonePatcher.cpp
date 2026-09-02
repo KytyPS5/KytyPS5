@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cinttypes>
 #include <climits>
 #include <cstring>
 #include <limits>
@@ -1000,6 +1001,11 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		const auto& rewrite = rewrite_sites.at(site);
 		if (rewrite.protect_red_zone && decoded.accesses_memory) {
 			++result.unrelocatable_memory_instruction_count;
+			LOGF("Windows guest red-zone: unprotected memory instruction at +0x%" PRIx64
+			     " in function +0x%" PRIx64 "\n",
+			     static_cast<u64>(site - reinterpret_cast<uintptr_t>(module->start)),
+			     static_cast<u64>(function.instructions.begin()->first -
+			                      reinterpret_cast<uintptr_t>(module->start)));
 		}
 	};
 	const auto overlaps_patched_span = [&patched_spans](uintptr_t start, uintptr_t end) {

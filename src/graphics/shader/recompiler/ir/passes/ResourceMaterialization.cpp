@@ -418,8 +418,14 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		return false;
 	}
 
-	std::vector<DescriptorSourceRequest> requests;
-	std::vector<uint8_t>                 clean_flat_slots(program.srt_reads.size());
+	// This runs for every shader stage of every draw call, so the scratch buffers are kept
+	// across calls: a dense scene issues over a thousand draws a frame, and allocating these
+	// four vectors each time dominated the cost of materializing resources.
+	thread_local std::vector<DescriptorSourceRequest> requests;
+	thread_local std::vector<uint8_t>                 clean_flat_slots;
+	requests.clear();
+	clean_flat_slots.clear();
+	clean_flat_slots.resize(program.srt_reads.size(), 0u);
 	requests.reserve(program.info.buffers.size() + program.info.images.size() * 2u +
 	                 program.info.samplers.size());
 	for (const auto& buffer: program.info.buffers) {
@@ -442,8 +448,10 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	for (const auto& sampler: program.info.samplers) {
 		requests.push_back({sampler.source});
 	}
-	std::vector<DescriptorValue> values;
-	std::vector<uint32_t>        flattened_srt;
+	thread_local std::vector<DescriptorValue> values;
+	thread_local std::vector<uint32_t>        flattened_srt;
+	values.clear();
+	flattened_srt.clear();
 	if (!EvaluateRuntimeSources(program, requests, runtime, values, flattened_srt,
 	                            clean_flat_slots)) {
 		return false;
@@ -459,10 +467,14 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			descriptor.dwords.fill(0);
 		}
 	}
-	next.flattened_srt = std::move(flattened_srt);
+	// Swapped, not moved or copied: `next` takes the data and `flattened_srt` gets a buffer back
+	// to fill on the next call, so neither side has to allocate.
+	next.flattened_srt.swap(flattened_srt);
 	next.flattened_srt.resize(FlattenedRuntimeDwords(program));
 	next.images.resize(program.info.images.size());
-	std::vector<uint8_t> image_written(program.info.images.size());
+	thread_local std::vector<uint8_t> image_written;
+	image_written.clear();
+	image_written.resize(program.info.images.size(), 0u);
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
 		const auto& image  = program.info.images[image_index];
 		const auto* source = Source(program, image.source);
@@ -538,7 +550,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	if (!ValidateResourceSnapshot(program, next)) {
 		return false;
 	}
-	snapshot = std::move(next);
+	snapshot.Swap(next);
 	return true;
 }
 

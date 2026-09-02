@@ -20,6 +20,17 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<IndirectImage>   indirect_images;
+
+	// Exchanges contents without touching the heap, so a snapshot can hand its storage to
+	// another one and take that one's storage to refill.
+	void Swap(ResourceSnapshot& other) noexcept {
+		buffers.swap(other.buffers);
+		images.swap(other.images);
+		samplers.swap(other.samplers);
+		flattened_srt.swap(other.flattened_srt);
+		user_data.swap(other.user_data);
+		indirect_images.swap(other.indirect_images);
+	}
 };
 
 bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& snapshot);

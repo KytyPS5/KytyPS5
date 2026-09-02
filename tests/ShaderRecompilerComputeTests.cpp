@@ -21795,6 +21795,47 @@ void CheckEmbeddedFetchVertexOffset() {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckCmaskClearColorWordLayout() {
+  using Libs::Graphics::DecodePackedColorClear;
+  using Libs::Graphics::PackedColorClearNeedsHighWord;
+
+  Require("CmaskClearWords", "high word only for formats above 32bpp",
+          !PackedColorClearNeedsHighWord(vk::Format::eR32Sfloat) &&
+              PackedColorClearNeedsHighWord(vk::Format::eR16G16B16A16Sfloat) &&
+              PackedColorClearNeedsHighWord(vk::Format::eR32G32B32A32Sfloat),
+          "CB_COLOR_CLEAR_WORD1 use does not match the documented per-bit-depth layout");
+
+  vk::ClearColorValue c32 {};
+  Require("CmaskClearWords", "32bpp uses word0 alone",
+          DecodePackedColorClear(vk::Format::eR32Sfloat, std::bit_cast<u32>(0.25f),
+                                 0xdeadbeefu, c32) &&
+              c32.float32[0] == 0.25f,
+          "a 32bpp clear did not decode from word0, or was disturbed by word1");
+
+  vk::ClearColorValue c64 {};
+  const u32 rg = 0x3c00u | (0x4000u << 16u);
+  const u32 ba = 0x4200u | (0x4400u << 16u);
+  Require("CmaskClearWords", "64bpp splits RG into word0 and BA into word1",
+          DecodePackedColorClear(vk::Format::eR16G16B16A16Sfloat, rg, ba, c64) &&
+              c64.float32[0] == 1.0f && c64.float32[1] == 2.0f &&
+              c64.float32[2] == 3.0f && c64.float32[3] == 4.0f,
+          "a 64bpp clear did not take its upper channels from CB_COLOR_CLEAR_WORD1");
+
+  vk::ClearColorValue c128 {};
+  Require("CmaskClearWords", "128bpp replicates word0 across RGB and takes A from word1",
+          DecodePackedColorClear(vk::Format::eR32G32B32A32Sfloat, std::bit_cast<u32>(0.5f),
+                                 std::bit_cast<u32>(1.0f), c128) &&
+              c128.float32[0] == 0.5f && c128.float32[1] == 0.5f &&
+              c128.float32[2] == 0.5f && c128.float32[3] == 1.0f,
+          "a 128bpp clear did not follow setCmaskClearColor: word0 is R/G/B, word1 is A");
+
+  vk::ClearColorValue nonfinite {};
+  Require("CmaskClearWords", "non-finite clear rejected",
+          !DecodePackedColorClear(vk::Format::eR32G32B32A32Sfloat, 0x7f800000u,
+                                  std::bit_cast<u32>(1.0f), nonfinite),
+          "an infinite 128bpp clear value was materialized instead of rejected");
+}
+
 void CheckRenderTargetFormatContract() {
   const auto r8_uint = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
@@ -25563,6 +25604,10 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--cmask-clear-only") == 0) {
+    CheckCmaskClearColorWordLayout();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;
@@ -25735,6 +25780,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
     CheckRenderTargetFormatContract();
+    CheckCmaskClearColorWordLayout();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
@@ -25806,6 +25852,7 @@ int main(int argc, char **argv) {
   }
   VulkanHarness vulkan;
   CheckRenderTargetFormatContract();
+  CheckCmaskClearColorWordLayout();
   CheckSampledColorViews();
   CheckSampledVideoOutView(vulkan.RuntimeRenderer());
   CheckImageTransitionState(vulkan.RuntimeRenderer());

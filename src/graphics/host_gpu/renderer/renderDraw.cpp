@@ -510,7 +510,34 @@ struct DrawCallInfo {
 
 static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
                                       const ImageViewInfo& view, vk::ClearColorValue& clear_value) {
-	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
+	const auto metadata_kind = target.desc.info.metadata.kind;
+	if (metadata_kind == ImageMetadataKind::Cmask) {
+		if (!target.metadata_clear_supported) {
+			return false;
+		}
+		for (uint32_t layer = 0; layer < view.layer_count; layer++) {
+			if (!cache.IsMetaCleared(target.desc.info.metadata.range.address,
+			                         view.base_layer + layer)) {
+				return false;
+			}
+		}
+		for (uint32_t layer = 0; layer < view.layer_count; layer++) {
+			if (!cache.TouchMeta(target.desc.info.metadata.range.address, view.base_layer + layer,
+			                     false)) {
+				EXIT("failed to consume CMask clear state\n");
+			}
+		}
+		clear_value = target.color_clear_value;
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("RenderTarget: materialized CMask fast clear cmask=0x%016" PRIx64
+			     " target=0x%016" PRIx64 " rgba=(%f, %f, %f, %f)\n",
+			     target.desc.info.metadata.range.address, target.base_addr, clear_value.float32[0],
+			     clear_value.float32[1], clear_value.float32[2], clear_value.float32[3]);
+		}
+		return true;
+	}
+	if (metadata_kind != ImageMetadataKind::Dcc) {
 		return false;
 	}
 
@@ -1183,9 +1210,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.vertex_program, state.pixel_program);
+	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info,
+	    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+	    primitive_restart_enable, state.vertex_program, state.pixel_program);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

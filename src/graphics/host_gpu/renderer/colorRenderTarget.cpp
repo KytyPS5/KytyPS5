@@ -16,17 +16,20 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
+
 static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool has_dcc,
-                                uint32_t packed_clear) {
+                                bool has_cmask, uint32_t packed_clear, uint32_t packed_clear_hi) {
 	// Register-backed DCC clears use the target's packed clear value. Decode one-word guest
 	// formats here; unsupported encodings remain tracked without unsafe materialization.
 	info.metadata_clear_supported =
-	    has_dcc && DecodePackedColorClear(format, packed_clear, info.color_clear_value);
+	    (has_dcc || has_cmask) &&
+	    DecodePackedColorClear(format, packed_clear, packed_clear_hi, info.color_clear_value);
 	switch (format) {
 		case vk::Format::eR8G8B8A8Unorm:
 		case vk::Format::eR8G8B8A8Srgb:
@@ -139,11 +142,11 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	r.color_clear_enable = false;
 	r.color_clear_value  = {};
 
-	uint32_t   width  = 0;
-	uint32_t   height = 0;
-	uint32_t   pitch  = 0;
-	uint64_t   size   = 0;
-	bool       tile   = false;
+	uint32_t                    width  = 0;
+	uint32_t                    height = 0;
+	uint32_t                    pitch  = 0;
+	uint64_t                    size   = 0;
+	bool                        tile   = false;
 	static constexpr std::array image_types {Prospero::ImageType::kColor1D,
 	                                         Prospero::ImageType::kColor2D,
 	                                         Prospero::ImageType::kColor3D};
@@ -324,23 +327,28 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	}
 
 	TextureCache::ImageDesc desc {};
-	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data         = {rt.base.addr, backing_size};
-	desc.info.pixel_format = target_format.format;
-	desc.info.guest_format = transfer_format;
-	desc.info.type         = image_type;
-	desc.info.extent       = {width, height, depth};
-	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
-	desc.info.pitch        = pitch;
+	desc.type                 = TextureCache::BindingType::RenderTarget;
+	desc.info.data            = {rt.base.addr, backing_size};
+	desc.info.pixel_format    = target_format.format;
+	desc.info.guest_format    = transfer_format;
+	desc.info.type            = image_type;
+	desc.info.extent          = {width, height, depth};
+	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
+	desc.info.pitch           = pitch;
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+	const bool has_cmask = !has_dcc && rt.info.cmask_fast_clear_enable &&
+	                       rt.cmask.addr != 0;
 	if (has_dcc) {
 		// DCC uses a separate metadata allocation. Carry its address through ImageInfo so
 		// TextureCache can associate metadata fills observed before target registration.
 		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
 		desc.info.metadata.range.address = rt.dcc_addr.addr;
+	} else if (has_cmask) {
+		desc.info.metadata.kind          = ImageMetadataKind::Cmask;
+		desc.info.metadata.range.address = rt.cmask.addr;
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
@@ -393,7 +401,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	r.samples                  = samples;
 	r.export_mapping           = target_format.export_mapping;
 	r.color_clear_enable       = false;
-	ResolveDccClearInfo(r, target_format.format, has_dcc, rt.clear_word0.word0);
+	ResolveDccClearInfo(r, target_format.format, has_dcc, has_cmask, rt.clear_word0.word0,
+	                    rt.clear_word1.word1);
 	BindRenderTarget(r.image_id);
 }
 

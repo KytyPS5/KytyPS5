@@ -1293,6 +1293,15 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		} else if (!inserted && metadata->second.type != MetaDataInfo::Type::Dcc) {
 			EXIT("TextureCache: color target reuses non-DCC metadata\n");
 		}
+	} else if (desc.info.metadata.kind == ImageMetadataKind::Cmask) {
+		image.info.metadata       = desc.info.metadata;
+		auto [metadata, inserted] = m_surface_metas.try_emplace(
+		    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::CMask});
+		if (!inserted && metadata->second.type == MetaDataInfo::Type::PendingDcc) {
+			metadata->second.type = MetaDataInfo::Type::CMask;
+		} else if (!inserted && metadata->second.type != MetaDataInfo::Type::CMask) {
+			EXIT("TextureCache: color target reuses non-CMask metadata\n");
+		}
 	}
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
@@ -1406,7 +1415,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	float               depth_clear   = 0.0f;
 	uint8_t             stencil_clear = 0;
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, color_clear)) {
+		if (PackedColorClearNeedsHighWord(image.info.pixel_format) ||
+		    !DecodePackedColorClear(image.info.pixel_format, packed_clear, 0, color_clear)) {
 			return false;
 		}
 	} else {

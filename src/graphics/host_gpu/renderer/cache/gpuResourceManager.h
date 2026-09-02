@@ -31,6 +31,7 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	void               PrepareBdaRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:

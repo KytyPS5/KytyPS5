@@ -3,6 +3,9 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+
+#include <limits>
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -81,6 +84,26 @@ void GpuResourceManager::PrepareBda() {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
 	m_fault_process_pending = true;
+}
+
+void GpuResourceManager::PrepareBdaRange(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("GpuResourceManager: invalid BDA prefetch range\n");
+	}
+	constexpr uint64_t page_size = BufferCache::CACHING_PAGESIZE;
+	const auto end = vaddr + size;
+	const auto first = vaddr & ~(page_size - 1);
+	if (end > std::numeric_limits<uint64_t>::max() - (page_size - 1)) {
+		EXIT("GpuResourceManager: BDA prefetch range overflow\n");
+	}
+	const auto last = (end + page_size - 1) & ~(page_size - 1);
+	for (auto page = first; page < last; page += page_size) {
+		if (IsMapped(page, page_size)) {
+			(void)m_buffer_cache.FindBuffer(page, page_size);
+		}
+	}
+	PrepareBda();
 }
 
 void GpuResourceManager::RunGarbageCollector() {

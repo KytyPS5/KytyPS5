@@ -333,7 +333,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
-		m_context.GetGpuResources().PrepareBda();
+		if (sh_ctx.GetCs().cs_regs.data_addr == 0x0000000242d47200ull &&
+		    bindings.user_data.size() >= 14) {
+			const uint64_t source = bindings.user_data[12] |
+			                        (uint64_t {bindings.user_data[13]} << 32);
+			constexpr uint64_t prefetch_before = 0x40000;
+			constexpr uint64_t prefetch_after  = BufferCache::CACHING_PAGESIZE;
+			if (source >= prefetch_before) {
+				m_context.GetGpuResources().PrepareBdaRange(
+				    source - prefetch_before, prefetch_before + prefetch_after);
+			}
+		} else {
+			m_context.GetGpuResources().PrepareBda();
+		}
 	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);

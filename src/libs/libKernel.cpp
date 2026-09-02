@@ -3227,6 +3227,9 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqdNorrB+gI", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("sIlRvQqsN2Y", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("bIHoZCTomsI", LibKernel::PthreadRwlockTrywrlock);
+	LIB_FUNC("XD3mDeybCnk", LibKernel::PthreadRwlockTryrdlock);
+	LIB_FUNC("iPtZRWICjrM", LibKernel::PthreadRwlockTimedrdlock);
+	LIB_FUNC("adh--6nIqTk", LibKernel::PthreadRwlockTimedwrlock);
 	LIB_FUNC("i2ifZ3fS2fo", LibKernel::PthreadRwlockattrDestroy);
 	LIB_FUNC("yOfGg-I1ZII", LibKernel::PthreadRwlockattrInit);
 	LIB_FUNC("qsdmgXjqSgk", LibKernel::PthreadRwlockattrDestroy);

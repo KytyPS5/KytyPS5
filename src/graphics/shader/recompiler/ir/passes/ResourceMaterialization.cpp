@@ -124,6 +124,18 @@ bool RequiresPointSampler(const ResourceSpecialization::Image& image) {
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 
+bool ReservedImageBitsClear(const DescriptorValue& descriptor) {
+	constexpr std::array<uint32_t, 8> reserved = {0x00000000u, 0x20000000u, 0xf0003000u,
+	                                              0x00000000u, 0xe000e000u, 0xf9000000u,
+	                                              0x00007b00u, 0x00000000u};
+	for (uint32_t dword = 0; dword < reserved.size(); dword++) {
+		if ((descriptor.dwords[dword] & reserved[dword]) != 0u) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	return static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
 	       Prospero::ImageType::kCube;
@@ -358,7 +370,8 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 				return note("dense table entry is not readable");
 			}
 		}
-		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.r128)) {
+		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.r128) ||
+		    !ReservedImageBitsClear(candidate)) {
 			candidate.dwords.fill(0);
 		}
 		next.keys.push_back(key);
@@ -437,7 +450,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 				return note("heap entry is not readable");
 			}
 		}
-		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.r128)) {
+		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.r128) ||
+		    !ReservedImageBitsClear(candidate)) {
 			candidate.dwords.fill(0);
 		}
 		probed.push_back(candidate);

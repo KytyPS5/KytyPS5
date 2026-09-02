@@ -10,8 +10,8 @@ LIB_VERSION("ConvertKeycode", 1, "ConvertKeycode", 1, 0);
 
 namespace ConvertKeycode {
 
-constexpr int CONVERT_KEYCODE_ERROR_INVALID_ADDRESS = -2134900687; // 0x80bc0031
-constexpr int CONVERT_KEYCODE_ERROR_INVALID_USER_ID = -2134900720; // 0x80bc0010
+constexpr int CONVERT_KEYCODE_ERROR_INVALID_ADDRESS = -2135162831; // 0x80bc0031
+constexpr int CONVERT_KEYCODE_ERROR_INVALID_USER_ID = -2135162864; // 0x80bc0010
 
 static int KYTY_SYSV_ABI ConvertKeycodeGetImeKeyboardType(int32_t user_id, uint32_t* type) {
 	PRINT_NAME();
